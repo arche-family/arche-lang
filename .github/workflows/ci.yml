@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  stage0:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build stage0
+        run: make -C stage0 CC=${{ matrix.cc }}
+      - name: Runner self-test
+        run: make -C conformance selftest CC=${{ matrix.cc }}
+      - name: Conformance tests
+        run: make -C conformance check CC=${{ matrix.cc }}
