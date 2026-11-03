@@ -1,0 +1,46 @@
+#!/bin/sh
+# Mock compiler for the runner's self-test: mockc <source> <output>.
+# What the "program" does comes from `//~` lines in the source:
+#
+#   //~ compile-fail <line> [code]   reject the program, pointing at <line>
+#   //~ out <text>                   print a line to stdout (`//~ out` alone: empty line)
+#   //~ err <text>                   print a line to stderr
+#   //~ args                         print each argument on its own line
+#   //~ exit <n>                     exit with status <n>
+#   //~ hang                         never finish
+
+set -eu
+
+if [ "$1" = --run ]; then
+    src=$2
+    shift 2
+    code=0
+    while IFS= read -r line; do
+        case $line in
+            '//~ out '*) printf '%s\n' "${line#'//~ out '}" ;;
+            '//~ out') printf '\n' ;;
+            '//~ err '*) printf '%s\n' "${line#'//~ err '}" >&2 ;;
+            '//~ args') for a in "$@"; do printf '%s\n' "$a"; done ;;
+            '//~ exit '*) code=${line#'//~ exit '} ;;
+            '//~ hang') while :; do sleep 1; done ;;
+        esac
+    done < "$src"
+    exit "$code"
+fi
+
+src=$1
+exe=$2
+while IFS= read -r line; do
+    case $line in
+        '//~ compile-fail '*)
+            set -- ${line#'//~ compile-fail '}
+            echo "$src:$1: error${2:+ [$2]}: mock rejects the program" >&2
+            exit 1
+            ;;
+    esac
+done < "$src"
+
+self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+abs_src=$(cd "$(dirname "$src")" && pwd)/$(basename "$src")
+printf '#!/bin/sh\nexec /bin/sh "%s" --run "%s" "$@"\n' "$self" "$abs_src" > "$exe"
+chmod +x "$exe"

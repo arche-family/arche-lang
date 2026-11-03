@@ -1,0 +1,73 @@
+# Conformance tests
+
+Tests of the Arche specification. Every rule gets at least one positive and one negative test.
+
+| Path | Contents |
+| --- | --- |
+| `tests/` | the tests, grouped by spec chapter |
+| `runner/` | the test runner (C11 + POSIX), until `arche test` replaces it in S23 |
+| `runner/selftest/` | sample tests and a mock compiler that check the runner itself |
+
+```sh
+make -C conformance selftest                 # check the runner
+make -C conformance check                    # run tests/ with stage0
+conformance/runner/build/runner --stage0 --compiler stage0/arche0-build conformance/tests/<chapter>/<name>.arche   # one test
+```
+
+## Test format
+
+A test is one `.arche` file. Its header is the run of `// key: value` lines at the top of the file; the first line of another form ends it. An unknown key is an error, so an ordinary comment in the header must not look like `// word: …`.
+
+```arche
+// test: run
+// spec: 7.2
+// exit: 101
+// stderr: panic:
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    let zero: u32 = 0;
+    sys.out.write_u64((1 / zero) as u64);
+}
+```
+
+```arche
+// test: compile-error
+// spec: 5.6
+// line: 6
+// stage0: skip
+fn f() {
+    let x = 5;
+}
+```
+
+| Key | Test kind | Meaning |
+| --- | --- | --- |
+| `test` | both | `run` or `compile-error`; required |
+| `spec` | both | the spec section the test covers, e.g. `7.2`; required |
+| `stage0` | both | `skip`: the rule is in spec §12, and stage0 may accept the program |
+| `exit` | `run` | expected exit status; default 0 |
+| `stdout` | `run` | one line of expected stdout; repeated lines build it, each followed by `\n`; no `stdout` lines means no output |
+| `stderr` | `run` | text stderr must contain; repeated lines must appear in this order |
+| `args` | `run` | program arguments separated by spaces; may repeat |
+| `line` | `compile-error` | the line the diagnostic points at; required |
+| `code` | `compile-error` | the error code the diagnostic names; not checked with `--stage0` |
+
+Values are taken verbatim after `key: `, without escapes. Codes are assigned when the compiler's diagnostics are built (S5); until then a test may leave `code` out.
+
+## Compiler contract
+
+The runner calls the compiler as `<command> <source> <output>`:
+
+- On success it exits with 0 and leaves an executable at `<output>`.
+- On a compile error it exits with a nonzero status, and the diagnostic contains `<source>:<line>:` with `<source>` exactly as it was passed in.
+
+`stage0/arche0-build` implements this contract for stage0.
+
+## How a test runs
+
+- The compiler runs in the runner's directory. The program runs in the test file's directory, so it can read files that sit beside the test.
+- stdin is `/dev/null`. stdout and stderr are captured separately.
+- Each step has a time limit (`--timeout`, default 10 s). On timeout, or when the step ends, its whole process group is killed.
+- `--stage0` skips tests marked `stage0: skip` and does not check `code`.
+- Tests run in path order. The report has one `PASS`, `FAIL` or `SKIP` line per test, details under each failure, and a count line at the end. The runner exits with 1 if any test failed.
