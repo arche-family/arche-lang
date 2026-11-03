@@ -178,6 +178,8 @@ A type is **copyable** if it is a primitive, a view, an error set, `alloc.Alloca
 
 - There are no implicit conversions between integer types, or between integers and `bool`.
 - An integer literal takes the type its context requires: the declared type of a `let`/`var`, a parameter, a field, a return type, or the other operand of a binary operator. Without context it is an error: `let x = 5;` must be `let x: u32 = 5;`.
+- A literal shift count, as in `x << 3`, has type `u32`.
+- `-` written directly before an integer literal makes a negative literal, so `let x: i8 = -128;` is valid.
 - `x as T` converts between integer types and traps if the value does not fit in `T`.
 - `x as% T` converts and wraps, keeping the low bits.
 
@@ -228,7 +230,7 @@ Rules that remove ambiguity:
 - `+ - * / %` are checked: overflow and division or remainder by zero trap.
 - `/` truncates toward zero; the result of `%` has the sign of the dividend.
 - `+% -% *%` wrap.
-- In `a << b` and `a >> b`, `b` is any unsigned type and must be less than the bit width of `a`, or the shift traps. `>>` is arithmetic on signed types and logical on unsigned ones.
+- In `a << b` and `a >> b`, `b` is any unsigned type and must be less than the bit width of `a`, or the shift traps. `<<` shifts the two's complement bits and drops those shifted out; it does not trap on overflow. `>>` is arithmetic on signed types and logical on unsigned ones.
 - Except for shifts, both operands of a binary operator have the same type.
 
 ### 7.3 Evaluation order
@@ -347,7 +349,7 @@ match lookup(name) {
 ## 10. Functions
 
 - `fn name(p: T, …) -> R {…}`. There are no default arguments, no variadic functions and no overloading: a name refers to one function.
-- A function that returns a value must end every path with `return` or with a `noreturn` expression.
+- A function that returns a value must end every path with `return` or with a `noreturn` expression. An `if` ends a path when it has an `else` and every branch ends it; a `match` does when every arm does; `while true` does when its body has no `break` of its own.
 - Recursion is allowed.
 - **Entry point.** The root module is the file the compiler is given, and its directory is the package root (§3). It declares `fn main(sys: &mut std.System) -> !void`. The capabilities in `sys` are all the program can reach (§11).
 - **Exit.** However the process exits, `sys.stdout` and `sys.stderr` are flushed first. If `main` returns an error, `error: Name` is written to stderr and the process exits with status 1. A trap or `panic` writes `panic: <message>` to stderr, then `  at <file>:<line>:<column>` when the cause is in the source, and the process exits with status 101. `<file>` is relative to the package root; lines and columns count from 1, and columns count bytes.
