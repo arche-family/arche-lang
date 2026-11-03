@@ -1,0 +1,19 @@
+#!/bin/sh
+# Builds an Arche-0 program with stage0: Arche-0 → C11 → executable.
+# This is the compiler command the conformance runner calls.
+#
+# Usage: arche0-build <source.arche> <output>
+# CC selects the C compiler (default: cc).
+
+set -eu
+
+if [ $# -ne 2 ]; then
+    echo "usage: arche0-build <source.arche> <output>" >&2
+    exit 2
+fi
+
+here=$(cd "$(dirname "$0")" && pwd)
+c_file="$2.c"
+
+"$here/build/arche0" "$1" -o "$c_file"
+${CC:-cc} -std=c11 -o "$2" "$c_file"
