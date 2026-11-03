@@ -48,7 +48,15 @@ int main(int argc, char **argv) {
     const char *slash = strrchr(path, '/');
     SourceFile *src = read_source(path, slash ? slash + 1 : path);
 
-    Token *tokens = lex_file(src);
-    (void)tokens;
-    fatal_at((Loc){src, 1, 1}, "stage0 cannot compile programs yet");
+    Module *root = parse_module(src, "main");
+    check_program(root);
+    StrBuf c = {0};
+    emit_program(root, &c);
+
+    const char *out_path = argv[3];
+    FILE *out = fopen(out_path, "wb");
+    if (!out || fwrite(c.data, 1, c.len, out) != c.len || fclose(out) != 0) {
+        fatal("cannot write %s: %s", out_path, strerror(errno));
+    }
+    return 0;
 }

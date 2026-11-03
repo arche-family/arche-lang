@@ -1,6 +1,6 @@
 # stage0: the Arche-0 → C11 translator.
 #
-#   make            build build/arche0
+#   make            build build/arche0, and check that the runtime compiles
 #   make clean      remove build/
 
 CFLAGS ?= -O2 -g
@@ -10,13 +10,18 @@ BUILD := build
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:src/%.c=$(BUILD)/%.o)
 
-all: $(BUILD)/arche0
+all: $(BUILD)/arche0 $(BUILD)/arche0_rt.o
 
 $(BUILD)/arche0: $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(WARN) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+# The runtime is compiled again with every program (arche0-build); this
+# object only checks that it compiles without warnings.
+$(BUILD)/arche0_rt.o: runtime/arche0_rt.c runtime/arche0_rt.h | $(BUILD)
+	$(CC) $(WARN) $(CFLAGS) -c -o $@ runtime/arche0_rt.c
 
 $(BUILD):
 	mkdir -p $@

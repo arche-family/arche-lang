@@ -313,6 +313,9 @@ struct Type {
     bool mut;                    // TY_REF
     Type *elem;                  // TY_REF, TY_ERROR_UNION
     const BuiltinType *builtin;  // TY_BUILTIN
+
+    Type *ref_cache[2];          // &T and &mut T of this type
+    Type *error_union_cache;     // !T of this type
 };
 
 Type *type_void(void);
@@ -345,27 +348,30 @@ struct Method {
 typedef struct {
     const char *name;
     Type *type;
+    const char *c_name;
 } Field;
 
 struct BuiltinType {
     const char *module;
     const char *name;
     const char *c_name;
+    Type *type;
     int nfields;
     Field fields[5];
     int nmethods;
     Method methods[8];
 };
 
-void types_init(void);
 const BuiltinType *builtin_type_lookup(const char *module, const char *name);
 const Method *method_lookup(const Type *t, const char *name);
 const Field *field_lookup(const Type *t, const char *name);
 bool builtin_fn_lookup(const char *name, BuiltinFn *out);
+bool int_type_lookup(const char *name, IntKind *out);
 
 // ---- checking and emission ---------------------------------------------------
 
 void check_program(Module *root);
+bool expr_is_place(const Expr *e);
 void emit_program(Module *root, StrBuf *out);
 
 #endif
