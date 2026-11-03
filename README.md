@@ -46,6 +46,7 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | Path | Contents | Status |
 | --- | --- | --- |
 | [`docs/plan.md`](docs/plan.md) | the full plan (Uzbek) | snapshot, 2026-11-03 |
+| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S0 |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | `spec/` | the full language specification | planned |
 | `conformance/` | specification tests | planned |
