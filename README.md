@@ -53,6 +53,10 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | `compiler/` | the Arche compiler, Arche-0 | planned |
 | `lib/` | `core`, `alloc`, `std` | planned |
 
+## Contributing
+
+Start with [AGENTS.md](AGENTS.md): the origin of the project, the fixed decisions, the next work order, and a prompt for starting an agent session. It is written for people and AI agents alike.
+
 ## Related
 
 [arche-os](https://github.com/arche-family/arche-os) — a capability-based microkernel operating system written in Arche.
