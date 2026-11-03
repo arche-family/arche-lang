@@ -161,7 +161,7 @@ Arche-0 cannot declare generic types or functions. It can use these, which the l
 1. **Where a view may appear.** A view may be the type of a parameter or of a local `let`/`var`. A `const` may have type `str`.
 2. **Where it may not.** A view may not be a struct field, an enum payload, an array element, a `List` element, a `Map` key or value, or the payload of `?` or `!`.
 3. **Projection.** A function may return a view only if exactly one of its parameters is a view, counting `self`. The result is a projection of that argument and lives no longer than it. Slicing, `x[a..b]`, is a projection of `x`.
-4. **Exclusivity.** While a `&mut` view of a place is live, that place cannot be read, written or viewed through any other path. Places are tracked by path, so a view of `sys.args` and a `&mut` view of `sys.out` can be live together.
+4. **Exclusivity.** While a `&mut` view of a place is live, that place cannot be read, written or viewed through any other path. Places are tracked by path, so a view of `sys.args` and a `&mut` view of `sys.stdout` can be live together.
 
 Because a reference is never stored, there is nothing to annotate. Long-lived links between objects are handles (`NodeId`, `alloc.Symbol`) into lists. String literals are views of static memory and satisfy every rule.
 
@@ -294,7 +294,7 @@ while i < items.len() : (i += 1) {
     }
 }
 
-defer sys.out.write("done\n");
+defer sys.stdout.write("done\n");
 ```
 
 - `if` and `while` take a `bool` condition without parentheses, and their bodies are always blocks.
@@ -350,7 +350,7 @@ match lookup(name) {
 - A function that returns a value must end every path with `return` or with a `noreturn` expression.
 - Recursion is allowed.
 - **Entry point.** The root module is the file the compiler is given, and its directory is the package root (§3). It declares `fn main(sys: &mut std.System) -> !void`. The capabilities in `sys` are all the program can reach (§11).
-- **Exit.** However the process exits, `sys.out` and `sys.err` are flushed first. If `main` returns an error, `error: Name` is written to stderr and the process exits with status 1. A trap or `panic` writes `panic: <message>` to stderr, then `  at <file>:<line>:<column>` when the cause is in the source, and the process exits with status 101. `<file>` is relative to the package root; lines and columns count from 1, and columns count bytes.
+- **Exit.** However the process exits, `sys.stdout` and `sys.stderr` are flushed first. If `main` returns an error, `error: Name` is written to stderr and the process exits with status 1. A trap or `panic` writes `panic: <message>` to stderr, then `  at <file>:<line>:<column>` when the cause is in the source, and the process exits with status 101. `<file>` is relative to the package root; lines and columns count from 1, and columns count bytes.
 
 ## 11. Library available to Arche-0
 
@@ -413,8 +413,8 @@ type Interner                                     // move-only
 ```arche
 type System = struct {
     pub fs: Fs,
-    pub out: Output,
-    pub err: Output,
+    pub stdout: Output,
+    pub stderr: Output,
     pub args: Args,
     pub alloc: alloc.Allocator,
 }
@@ -566,13 +566,13 @@ import std;
 
 fn main(sys: &mut std.System) -> !void {
     if sys.args.len() != 2 {
-        sys.err.write("usage: lines <file>\n");
+        sys.stderr.write("usage: lines <file>\n");
         return;
     }
     let path = sys.args.get(1);
     let text = try sys.fs.read_file(path, sys.alloc);
-    sys.out.write_u64(count_lines(text.view()));
-    sys.out.write("\n");
+    sys.stdout.write_u64(count_lines(text.view()));
+    sys.stdout.write("\n");
 }
 
 fn count_lines(text: str) -> u64 {

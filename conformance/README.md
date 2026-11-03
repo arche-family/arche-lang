@@ -27,7 +27,7 @@ import std;
 
 fn main(sys: &mut std.System) -> !void {
     let zero: u32 = 0;
-    sys.out.write_u64((1 / zero) as u64);
+    sys.stdout.write_u64((1 / zero) as u64);
 }
 ```
 

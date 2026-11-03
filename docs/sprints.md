@@ -70,7 +70,7 @@ Bosqich natijasi: stage0 spec'dagi Arche-0'ni to'liq qabul qiladi va stage1 sour
 - C emitter va runtime: `std.System`, `Output`, `Args`. Chiqishda `Output` flush qilinadi.
 - `panic` built-in'i: `panic: <xabar>` source joyi bilan chiqadi va status 101.
 
-**Qabul:** `sys.out.write("hello\n")` dasturi gcc va clang bilan build bo'lib ishlaydi. Lexer conformance testlari o'tadi.
+**Qabul:** `sys.stdout.write("hello\n")` dasturi gcc va clang bilan build bo'lib ishlaydi. Lexer conformance testlari o'tadi.
 
 ### S2. Ifodalar va boshqaruv
 
