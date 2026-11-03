@@ -14,6 +14,7 @@ What Arche-0 leaves out, and why the compiler does not need it, is listed in §1
 ## 2. Source text
 
 - Files are UTF-8 with the extension `.arche`. Lines end with `\n`; a `\r` outside a string literal is an error (`arche fmt` normalizes).
+- Whitespace is space, tab and `\n`. It separates tokens and means nothing else.
 - Identifiers are ASCII: `[A-Za-z_][A-Za-z0-9_]*`. No Unicode identifiers, so there are no look-alike names and a search for a name finds exactly that name. A lone `_` is not an identifier; it is the discard.
 - `//` starts a comment that runs to the end of the line. `///` is a doc comment and attaches to the next item, field, variant or method. There are no block comments.
 
@@ -348,8 +349,8 @@ match lookup(name) {
 - `fn name(p: T, …) -> R {…}`. There are no default arguments, no variadic functions and no overloading: a name refers to one function.
 - A function that returns a value must end every path with `return` or with a `noreturn` expression.
 - Recursion is allowed.
-- **Entry point.** The root module `main` declares `fn main(sys: &mut std.System) -> !void`. The capabilities in `sys` are all the program can reach (§11).
-- **Exit.** If `main` returns an error, its name is written to stderr as `error: Name` and the process exits with status 1. A trap or `panic` writes `panic: <message>` with the source location and exits with status 101.
+- **Entry point.** The root module is the file the compiler is given, and its directory is the package root (§3). It declares `fn main(sys: &mut std.System) -> !void`. The capabilities in `sys` are all the program can reach (§11).
+- **Exit.** However the process exits, `sys.out` and `sys.err` are flushed first. If `main` returns an error, `error: Name` is written to stderr and the process exits with status 1. A trap or `panic` writes `panic: <message>` to stderr, then `  at <file>:<line>:<column>` when the cause is in the source, and the process exits with status 101. `<file>` is relative to the package root; lines and columns count from 1, and columns count bytes.
 
 ## 11. Library available to Arche-0
 
@@ -436,6 +437,8 @@ type Args                                         // move-only
 ```
 
 `write_file` has two `str` parameters, so its calls are labeled: `sys.fs.write_file(path: out_path, data: text.view())`.
+
+`sys.args.get(0)` is the program's own path. If an argument is not valid UTF-8, the program panics before `main` starts.
 
 ## 12. What stage0 may skip
 
