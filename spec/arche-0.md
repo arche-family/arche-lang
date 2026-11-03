@@ -554,7 +554,7 @@ primary     = INT | CHAR | STRING | "true" | "false" | "none"
 cmp_op      = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
 ```
 
-Constraints the grammar does not express: a struct literal follows only a path (§7.4); the mixing rules of §7.1; fields come before methods (§4); `.*` applies only to references.
+Constraints the grammar does not express: a struct literal follows only a path, and it is not the condition of `if` or `while` or the scrutinee of `match` unless it is in parentheses (§7.4); the mixing rules of §7.1; fields come before methods (§4); `.*` applies only to references.
 
 ## 15. A complete program
 

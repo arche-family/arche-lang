@@ -95,7 +95,7 @@ Spetsifikatsiya compiler'dan oldin yoziladi va conformance test suite bilan birg
 | Generics | `comptime` parametrlar + `where` constraint'lar (interface orqali) |
 | Polimorfizm | interface, inheritance yo'q, dynamic dispatch `dyn I` orqali |
 | Capability | `Fs`, `Net`, `Clock`, `Env`, `Proc` faqat parametr orqali keladi; global I/O yo'q |
-| Concurrency | structured scope, task'lar orasida move, shared state faqat `Shared<T>`; async/await yo'q |
+| Concurrency | structured scope, task'lar orasida move, shared state faqat `Shared(T)`; async/await yo'q |
 | Determinizm | map iteration = qo'shilish tartibi; seed'li random; testlar uchun seed'li scheduler |
 | Evolyutsiya | har paketda `edition`; eski kod o'z edition qoidalari bilan compile bo'laveradi |
 | Undefined behavior | faqat `unsafe` ichida bo'lishi mumkin |
@@ -173,8 +173,8 @@ Standard library uch qatlamdan iborat, har biri pastdagisiga tayanadi. Kernel fa
 | Qatlam | Tarkibi | Kim ishlatadi |
 | --- | --- | --- |
 | `core` | primitive op'lar, slice, `?T` / `!T` helper'lari, interface'lar (Eq, Ord, Hash, Iter), allocator'siz fmt, math, UTF-8 | hamma, kernel ham |
-| `alloc` | Allocator interface; page, arena, pool va general allocator'lar; region runtime; List, Map, Set, StringBuilder | kernel va userland |
-| `std` | capability turlari (Fs, Net, Clock, Env, Proc), fayl, process, task/scope, channel, `Shared<T>`, time, path, JSON, test runner | userland |
+| `alloc` | Allocator interface; page, arena, pool va general allocator'lar; region runtime; List, Map, Set, String, Interner | kernel va userland |
+| `std` | capability turlari (Fs, Net, Clock, Env, Proc), fayl, process, task/scope, channel, `Shared(T)`, time, path, JSON, test runner | userland |
 
 **Platformalar:** `std` uch backend'ga ega: bootstrap monitor (gipotetik rejada; faqat Fs va konsol), host (Linux, Windows) va Arche OS (OS rejasidagi syscall API ustida).
 
