@@ -200,6 +200,9 @@ pub type Checker = struct {
     /// before the pass over bodies reaches it.
     pub checked: alloc.Map(u32, bool),
     pub impls: alloc.List(Impl),
+    /// Expressions of type &T used where a &dyn I is expected: the &dyn I,
+    /// by dyn_key (spec/arche.md §5.3).
+    pub dyn_casts: alloc.Map(u64, ty.TypeId),
     /// What `Self` names: inside an interface, the interface; inside an
     /// impl, its type; invalid elsewhere.
     pub self_type: ty.TypeId,
@@ -547,8 +550,23 @@ pub fn assignable(c: &Checker, got: ty.TypeId, want: ty.TypeId) -> bool {
     if g.kind == ty.Kind.Noreturn or g.kind == ty.Kind.Invalid or w.kind == ty.Kind.Invalid {
         return true;
     }
+    if g.kind == ty.Kind.Dyn and w.kind == ty.Kind.Dyn {
+        return g.decl == w.decl and g.mutable and not w.mutable;
+    }
     return g.kind == w.kind and (g.kind == ty.Kind.Ref or g.kind == ty.Kind.Slice) and g.elem == w.elem and g.mutable and
         not w.mutable;
+}
+
+/// Where an expression of the current module or instance is converted to
+/// &dyn I: its module, instance table and node.
+pub fn dyn_key(c: &Checker, n: cst.NodeId) -> u64 {
+    let table = ((c.cur_table +% 1) & 0xFFFFFF) as u64;
+    return (table << 40) | ((c.module as u64) << 28) | n.index as u64;
+}
+
+/// The &dyn I that expression n is converted to, or invalid.
+pub fn dyn_cast(c: &Checker, n: cst.NodeId) -> ty.TypeId {
+    return c.dyn_casts.get(dyn_key(c, n)) orelse ty.invalid();
 }
 
 /// == and != work on the type (§5.5).
@@ -2184,6 +2202,17 @@ pub fn impl_method(c: &Checker, t: ty.TypeId, iface: u32, name: alloc.Symbol) ->
     return NONE;
 }
 
+/// The number of the impl of iface for t, or NONE.
+pub fn impl_index(c: &Checker, t: ty.TypeId, iface: u32) -> u32 {
+    var i: usize = 0;
+    while i < c.impls.len() : (i += 1) {
+        if c.impls[i].iface == iface and c.impls[i].target == t {
+            return i as u32;
+        }
+    }
+    return NONE;
+}
+
 /// Type t implements the interface declared by iface.
 pub fn implements(c: &Checker, t: ty.TypeId, iface: u32) -> bool {
     var i: usize = 0;
@@ -2302,6 +2331,7 @@ pub fn analyze(p: program.Program) -> Checker {
         arg_offset: 0,
         checked: alloc.Map(u32, bool).init(a),
         impls: alloc.List(Impl).init(a),
+        dyn_casts: alloc.Map(u64, ty.TypeId).init(a),
         self_type: ty.invalid(),
         a: a,
     };

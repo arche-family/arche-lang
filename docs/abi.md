@@ -12,6 +12,7 @@ Sizes and alignments are in bytes. A composite value is laid out in memory at it
 | `i8`/`u8` … `i64`/`u64`, `isize`, `usize` | 1, 2, 4, 8 | the same | two's complement, little-endian |
 | `&T`, `&mut T` | 8 | 8 | address |
 | `str`, `[]T`, `[]mut T` | 16 | 8 | `{ptr: address, len: u64}` |
+| `&dyn I`, `&mut dyn I` | 16 | 8 | `{data: address, table: address}`; the table is the addresses of the type's methods of `I`, in the order `I` declares them |
 | `[N]T` | `N × size(T)` | `align(T)` | elements in order |
 | struct | sum of fields, padded | max of fields | fields in declaration order, each at its alignment; the size rounds up to the alignment |
 | enum | | max(4, payloads) | `{tag: u32}` then, at the payload alignment, the payload of the variant: its fields like a struct's |
@@ -35,7 +36,9 @@ Sizes and alignments are in bytes. A composite value is laid out in memory at it
 
 ## Symbols
 
-A function's symbol is `a0` followed by each segment of its module path and then its name, each written as `_<length><text>`: `syntax.lexer.lex` is `a0_6syntax_5lexer_3lex`. A method adds its type's name before its own: `a0_4main_3Ast_4eval`. A method of an `impl` (spec/arche.md §5.1) adds `_X<n>` after its name, `n` the impl's number in the program, since two interfaces of a type may have methods of one name. The root module whose file name is not a module path has the empty name, written `_0`. Runtime symbols start with `a0rt_`.
+A function's symbol is `a0` followed by each segment of its module path and then its name, each written as `_<length><text>`: `syntax.lexer.lex` is `a0_6syntax_5lexer_3lex`. A method adds its type's name before its own: `a0_4main_3Ast_4eval`. A method of an `impl` (spec/arche.md §5.1) adds `_X<n>` after its name, `n` the impl's number in the program, since two interfaces of a type may have methods of one name. The method table of impl `n` is `a0vt_<n>`.
+
+A call through a `&dyn I` loads the method's address from the table and passes the `data` address as `self`; the other parameters and the result follow the rules above. The root module whose file name is not a module path has the empty name, written `_0`. Runtime symbols start with `a0rt_`.
 
 ## The runtime
 

@@ -212,7 +212,9 @@ Inside, a value of type `T` has exactly the methods of its constraints. A call c
 
 - `&x` converts to `&dyn I` where a `&dyn I` is expected, when `x`'s type implements `I`; no other conversion is implicit.
 - An interface is usable with `dyn` when its methods take `self` by reference and have no `comptime` parameters.
-- `dyn I` values are views (A§5.4): they are passed and held in locals, not stored.
+- `dyn I` values are views (A§5.4): they are passed and held in locals, not stored (E0601). A `&dyn I` made from `&x` views `x`, so while it is live `x` obeys A§5.4 rule 4.
+- `&mut dyn I` converts to `&dyn I`, as `&mut T` to `&T`. A method that takes `&mut self` is called only through a `&mut dyn I`.
+- `dyn` of an interface that is not usable with it is E0831; converting a view of a type that does not implement `I` is E0832.
 
 ## 6. Closures
 

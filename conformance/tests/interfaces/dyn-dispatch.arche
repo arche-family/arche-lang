@@ -1,0 +1,73 @@
+// test: run
+// spec: arche/5.3
+// stage0: skip
+// stdout: square=9 rect=10 square=25 rect=20 30
+import std;
+
+type Shape = interface {
+    fn area(self: &Self) -> u64;
+    fn grow(self: &mut Self, by: u64);
+    fn name(self: &Self) -> str;
+}
+
+type Square = struct { side: u64 }
+type Rect = struct { w: u64, h: u64 }
+
+impl Shape for Square {
+    fn area(self: &Square) -> u64 {
+        return self.side * self.side;
+    }
+    fn grow(self: &mut Square, by: u64) {
+        self.side += by;
+    }
+    fn name(self: &Square) -> str {
+        return "square";
+    }
+}
+
+impl Shape for Rect {
+    fn area(self: &Rect) -> u64 {
+        return self.w * self.h;
+    }
+    fn grow(self: &mut Rect, by: u64) {
+        self.w += by;
+    }
+    fn name(self: &Rect) -> str {
+        return "rect";
+    }
+}
+
+fn describe(out: &mut std.Output, s: &dyn Shape) {
+    out.write(s.name());
+    out.write("=");
+    out.write_u64(s.area());
+    out.write(" ");
+}
+
+fn enlarge(s: &mut dyn Shape) {
+    s.grow(2);
+}
+
+// A &mut dyn view is also a &dyn one.
+fn twice(s: &mut dyn Shape) -> u64 {
+    enlarge(s);
+    return area_of(s);
+}
+
+fn area_of(s: &dyn Shape) -> u64 {
+    return s.area();
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var sq = Square { side: 3 };
+    var r = Rect { w: 2, h: 5 };
+    describe(&mut sys.stdout, &sq);
+    describe(&mut sys.stdout, &r);
+    enlarge(&mut sq);
+    enlarge(&mut r);
+    let d: &dyn Shape = &sq;
+    describe(&mut sys.stdout, d);
+    describe(&mut sys.stdout, &r);
+    sys.stdout.write_u64(twice(&mut r));
+    sys.stdout.write("\n");
+}

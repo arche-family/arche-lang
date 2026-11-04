@@ -25,7 +25,7 @@ import sema.types as ty;
 
 pub fn is_view(c: &ck.Checker, t: ty.TypeId) -> bool {
     let k = c.t.kind(t);
-    return k == ty.Kind.Ref or k == ty.Kind.Slice or k == ty.Kind.Str;
+    return k == ty.Kind.Ref or k == ty.Kind.Slice or k == ty.Kind.Str or k == ty.Kind.Dyn;
 }
 
 /// Containers, capabilities, and whatever holds one (§5.5).
@@ -81,7 +81,7 @@ fn misplaced_view(c: &ck.Checker, t: ty.TypeId, top: bool) -> bool {
     match info.kind {
         .Ref => { return misplaced_view(c, info.elem, true) or not top; }
         .Slice => { return misplaced_view(c, info.elem, false) or not top; }
-        .Str => { return not top; }
+        .Str | .Dyn => { return not top; }
         .Array | .List | .Optional | .ErrorUnion => { return misplaced_view(c, info.elem, false); }
         .Map => { return misplaced_view(c, info.key, false) or misplaced_view(c, info.elem, false); }
         _ => { return false; }
@@ -859,7 +859,7 @@ fn call(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> View {
             }
         } else {
             let mutable = mode == ck.SelfMode.MutRef;
-            if c.t.kind(rt) == ty.Kind.Ref {
+            if c.t.kind(rt) == ty.Kind.Ref or c.t.kind(rt) == ty.Kind.Dyn {
                 var v = view_of(c, f, receiver);
                 v.mutable = mutable;
                 add_view(&mut cv, v, receiver);

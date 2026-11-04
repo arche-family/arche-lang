@@ -258,9 +258,35 @@ pub fn constant_of(c: &ck.Checker, n: cst.NodeId) -> ?u32 {
 /// Checks n where a want is expected, and reports when it does not fit.
 pub fn check_value(c: &mut ck.Checker, n: cst.NodeId, want: ty.TypeId) {
     let got = check(c, n, some(want));
+    if c.t.kind(want) == ty.Kind.Dyn and c.t.kind(got) == ty.Kind.Ref {
+        to_dyn(c, n, got: got, want: want);
+        return;
+    }
     if not ck.assignable(c, got: got, want: want) {
         ck.report_mismatch(c, n, want: want, got: got);
     }
+}
+
+/// &x where &dyn I is expected: x's type implements I (spec/arche.md §5.3).
+fn to_dyn(c: &mut ck.Checker, n: cst.NodeId, got: ty.TypeId, want: ty.TypeId) {
+    let g = c.t.get(got);
+    let w = c.t.get(want);
+    if w.mutable and not g.mutable {
+        ck.report_mismatch(c, n, want: want, got: got);
+        return;
+    }
+    if not ck.implements(c, g.elem, w.decl) {
+        var m = ck.new_message(c);
+        ck.write_type(c, &mut m, g.elem);
+        m.push_str(" does not implement ");
+        ck.write_decl_name(c, &mut m, w.decl);
+        m.push_str(", so this cannot be ");
+        ck.write_type(c, &mut m, want);
+        let s = ck.span_of(c, n);
+        ck.report_owned(c, codes.NOT_IMPLEMENTED, s, m);
+        return;
+    }
+    c.dyn_casts.put(ck.dyn_key(c, n), want);
 }
 
 /// Checks an expression and returns its type; expected is the type the
@@ -1268,6 +1294,28 @@ fn require_mutable_receiver(c: &mut ck.Checker, receiver: cst.NodeId, rt: ty.Typ
     }
 }
 
+/// d.name(...) on a &dyn I: the method of I, called through d's table.
+fn dyn_call(c: &mut ck.Checker, call: cst.NodeId, callee: cst.NodeId, rt: ty.TypeId, nt: u32) -> ty.TypeId {
+    let info = c.t.get(rt);
+    let it = c.decls[info.decl as usize].type_id;
+    let sym = ck.symbol(c, nt);
+    match find_method(c, it, sym) {
+        some(d) => {
+            ck.check_signature(c, d);
+            let f = c.fns[c.decls[d as usize].fn_index as usize];
+            if f.self_mode == ck.SelfMode.MutRef and not info.mutable {
+                let s = ck.span_of(c, ck.child(c, callee, 0));
+                ck.report(c, codes.NOT_MUTABLE, s, "this method takes '&mut self', and this view is '&dyn', not '&mut dyn'");
+            }
+            return call_fn(c, call, d: d, skip: 1);
+        }
+        none => { }
+    }
+    report_no_member(c, callee, it, "method", nt);
+    check_args_loosely(c, call);
+    return ty.invalid();
+}
+
 fn check_method_call(c: &mut ck.Checker, call: cst.NodeId, callee: cst.NodeId) -> ty.TypeId {
     let receiver = ck.child(c, callee, 0);
     let rt = check(c, receiver, none);
@@ -1284,6 +1332,9 @@ fn check_method_call(c: &mut ck.Checker, call: cst.NodeId, callee: cst.NodeId) -
     }
     let nt = member_token(c, callee);
     let sym = ck.symbol(c, nt);
+    if c.t.kind(rt) == ty.Kind.Dyn {
+        return dyn_call(c, call: call, callee: callee, rt, nt);
+    }
     if ambiguous_method(c, t, sym) {
         var m = ck.new_message(c);
         m.push_str("two interfaces of ");

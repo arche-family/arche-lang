@@ -1,6 +1,7 @@
 #!/bin/sh
 # Differential test: every `test: run` conformance program, built by stage0
 # and by the Arche compiler, gives the same stdout, stderr and exit status.
+# Programs marked `stage0: skip` are full Arche, which stage0 does not build.
 # Usage: differential.sh <conformance tests dir>
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -10,6 +11,9 @@ trap 'rm -rf "$tmp"' EXIT
 count=0
 failed=0
 for f in $(grep -rl '^// test: run' "$tests" --include='*.arche' | grep -v '/_' | sort); do
+    if grep -q '^// stage0: skip' "$f"; then
+        continue
+    fi
     count=$((count + 1))
     dir=$(dirname "$f")
     args=$(sed -n 's#^// args: ##p' "$f" | tr '\n' ' ')

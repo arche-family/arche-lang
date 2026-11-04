@@ -1,0 +1,46 @@
+// test: compile-error
+// spec: arche/5.3
+// stage0: skip
+// line: 42
+// code: E0412
+import std;
+
+type Shape = interface {
+    fn area(self: &Self) -> u64;
+    fn grow(self: &mut Self, by: u64);
+    fn name(self: &Self) -> str;
+}
+
+type Square = struct { side: u64 }
+type Rect = struct { w: u64, h: u64 }
+
+impl Shape for Square {
+    fn area(self: &Square) -> u64 {
+        return self.side * self.side;
+    }
+    fn grow(self: &mut Square, by: u64) {
+        self.side += by;
+    }
+    fn name(self: &Square) -> str {
+        return "square";
+    }
+}
+
+impl Shape for Rect {
+    fn area(self: &Rect) -> u64 {
+        return self.w * self.h;
+    }
+    fn grow(self: &mut Rect, by: u64) {
+        self.w += by;
+    }
+    fn name(self: &Rect) -> str {
+        return "rect";
+    }
+}
+
+fn enlarge(s: &dyn Shape) {
+    s.grow(1);
+}
+
+fn main(sys: &mut std.System) -> !void {
+}

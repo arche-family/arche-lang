@@ -142,6 +142,63 @@ fn const_value(l: &mut lw.Lower, d: u32) -> lw.Val {
 
 /// The value of an expression.
 pub fn value(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
+    let v = value_of(l, e);
+    let want = ck.dyn_cast(&l.c, e);
+    if ck.is_invalid(&l.c, want) {
+        return v;
+    }
+    return to_dyn(l, e, want: want, v: v);
+}
+
+/// A &T as a &dyn I: the address, and the table of T's impl of I.
+fn to_dyn(l: &mut lw.Lower, e: cst.NodeId, want: ty.TypeId, v: lw.Val) -> lw.Val {
+    let target = l.c.t.elem(type_of(l, e));
+    let imp = ck.impl_index(&l.c, target, l.c.t.get(want).decl);
+    let vt = lw.vtable(l, imp);
+    let tmp = lw.alloca(l, want);
+    lw.store(l, value: v.v, addr: tmp);
+    var i = ir.inst(ir.Op.VTable, ir.Ty.Ptr);
+    i.imm = vt as u64;
+    let table = lw.emit(l, i);
+    lw.store(l, value: table, addr: lw.gep(l, tmp, 8));
+    return fresh_val(tmp);
+}
+
+/// d.name(...) on a &dyn I: the method's address from d's table, called
+/// with d's address as self.
+fn dyn_call(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
+    let callee = child(l, n, 0);
+    let receiver = child(l, callee, 0);
+    let t = type_of(l, n);
+    let fi = l.c.decls[d as usize].fn_index;
+    let info = l.c.fns[fi as usize];
+    let iface = l.c.decls[l.c.decls[d as usize].owner as usize];
+    var slot: u64 = 0;
+    while l.c.methods[(iface.methods_start as u64 + slot) as usize] != d : (slot += 1) {
+    }
+    let dv = in_memory(l, type_of(l, receiver), value(l, receiver));
+    let data = lw.load(l, ir.Ty.Ptr, dv);
+    let table = lw.load(l, ir.Ty.Ptr, lw.gep(l, dv, 8));
+    let fp = lw.load(l, ir.Ty.Ptr, lw.gep(l, table, slot * 8));
+    var args = lw.args0(l);
+    var sret = ck.NONE;
+    if lw.returns_in_memory(&l.c, info.ret) {
+        sret = lw.alloca(l, info.ret);
+        args.push(sret);
+    }
+    args.push(data);
+    let nargs = count(l, n) - 1;
+    var i: u32 = 0;
+    while i < nargs : (i += 1) {
+        let pt = l.c.params[(info.params_start + 1 + i) as usize].type_id;
+        let v = value(l, arg_node(l, n, i));
+        args.push(lw.as_arg(l, pt, v));
+    }
+    let r = lw.call_indirect(l, fp, lw.ret_ty(&l.c, info.ret), &args);
+    return result_of(l, t, r: r, sret: sret);
+}
+
+fn value_of(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
     let t = type_of(l, e);
     match kind(l, e) {
         .IntLit | .CharLit => {
@@ -788,6 +845,10 @@ fn call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
     let nargs = count(l, n) - 1;
     let is_method = kind(l, callee) == cst.Kind.FieldExpr and not ck.is_invalid(&l.c, type_of(l, callee));
     let d = ck.ref_of(&l.c, n);
+    if is_method and d != ck.NONE and l.c.decls[d as usize].owner != ck.NONE and
+        l.c.decls[l.c.decls[d as usize].owner as usize].kind == ck.DeclKind.Interface {
+        return dyn_call(l, n, d);
+    }
     if d != ck.NONE and l.c.decls[d as usize].kind == ck.DeclKind.Fn {
         let fi = l.c.decls[d as usize].fn_index;
         let info = l.c.fns[fi as usize];

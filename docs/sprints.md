@@ -2,7 +2,7 @@
 
 > 2026-11-03 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S12. S0–S4 va S6–S11 yopilgan: compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da, generics monomorphization bilan ishlaydi. Ochiq qolganlar: S5'da parser'ni 24 soat fuzz qilish (CI har commit'da 60 soniya fuzz qiladi); S11'dagi comptime interpreter hozircha faqat integer va `bool` kodni bajaradi — struct, konteyner, `comptime { }` bloklari va `assert` keyingi bosqichda.
+**Joriy sprint:** S13. S0–S4 va S6–S12 yopilgan: compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da, generics monomorphization bilan, interface'lar `impl`, `where` va `&dyn` dynamic dispatch bilan, `for` range, slice va iterator protokoli bilan ishlaydi. Ochiq qolganlar: S5'da parser'ni 24 soat fuzz qilish (CI har commit'da 60 soniya fuzz qiladi); S11'dagi comptime interpreter hozircha faqat integer va `bool` kodni bajaradi — struct, konteyner, `comptime { }` bloklari va `assert` keyingi bosqichda; S12'da `where` bilan cheklangan `T` qiymatida faqat constraint method'lari qolishi hali tekshirilmaydi (instance'lar konkret tur bilan tekshiriladi), generic `impl` va `core.Iter` S15'da kutubxona bilan keladi.
 
 ## Qoidalar
 

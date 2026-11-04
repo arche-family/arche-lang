@@ -51,6 +51,8 @@ pub type Lower = struct {
     /// The address the result is written to, for a composite result.
     pub sret: u32,
     pub ret: ty.TypeId,
+    /// impl number -> its method table in m.vtables.
+    pub vtables: alloc.Map(u32, u32),
     pub a: alloc.Allocator,
 }
 
@@ -299,6 +301,45 @@ pub fn call_with(l: &mut Lower, callee: u32, external: bool, ret: ir.Ty, args: &
     }
     i.args_len = items.len() as u32;
     return emit(l, i);
+}
+
+/// A call through a function's address: a method of a &dyn I.
+pub fn call_indirect(l: &mut Lower, callee: u32, ret: ir.Ty, args: &alloc.List(u32)) -> u32 {
+    var i = ir.inst(ir.Op.CallIndirect, ret);
+    i.a = callee;
+    i.args_start = l.f.args.len() as u32;
+    let items = args.items();
+    var k: usize = 0;
+    while k < items.len() : (k += 1) {
+        l.f.args.push(items[k]);
+    }
+    i.args_len = items.len() as u32;
+    return emit(l, i);
+}
+
+/// The method table of impl i: its methods in the order of its interface's
+/// (spec/arche.md §5.3), made once.
+pub fn vtable(l: &mut Lower, i: u32) -> u32 {
+    match l.vtables.get(i) {
+        some(v) => { return v; }
+        none => { }
+    }
+    let im = l.c.impls[i as usize];
+    let iface = l.c.decls[im.iface as usize];
+    var fns = alloc.List(u32).init(l.a);
+    var k = iface.methods_start;
+    while k < iface.methods_start + iface.methods_len : (k += 1) {
+        let name = l.c.decls[l.c.methods[k as usize] as usize].name;
+        let d = ck.impl_method(&l.c, im.target, im.iface, name);
+        fns.push(l.c.decls[d as usize].fn_index);
+    }
+    var name = alloc.String.init(l.a);
+    name.push_str("a0vt_");
+    ir.write_number(&mut name, i as u64);
+    let id = l.m.vtables.len() as u32;
+    l.m.vtables.push(ir.VTable { name: name, functions: fns });
+    l.vtables.put(i, id);
+    return id;
 }
 
 pub fn args0(l: &Lower) -> alloc.List(u32) {
@@ -626,6 +667,7 @@ pub fn lower(c: ck.Checker) -> ir.Module {
         fn_index: 0,
         sret: ck.NONE,
         ret: ty.void_type(),
+        vtables: alloc.Map(u32, u32).init(a),
         a: a,
     };
     var f: usize = 0;

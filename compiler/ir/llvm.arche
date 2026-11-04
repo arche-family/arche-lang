@@ -58,6 +58,9 @@ fn operand(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, v: u32) {
     } else if i.op == ir.Op.Global {
         out.push_str("@");
         out.push_str(m.globals[i.imm as usize].name.view());
+    } else if i.op == ir.Op.VTable {
+        out.push_str("@");
+        out.push_str(m.vtables[i.imm as usize].name.view());
     } else {
         value_name(out, v);
     }
@@ -123,7 +126,7 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
     let i = f.insts[id as usize];
     let t = ty_text(i.ty);
     match i.op {
-        .Const | .Param | .Alloca => { }
+        .Const | .Param | .Alloca | .VTable => { }
         .Global => {
             line_start(out, id);
             out.push_str("getelementptr i8, ptr @");
@@ -295,6 +298,26 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
             }
             out.push_str(")\n");
         }
+        .CallIndirect => {
+            if i.ty == ir.Ty.Void {
+                out.push_str("  ");
+            } else {
+                line_start(out, id);
+            }
+            out.push_str("call ");
+            out.push_str(t);
+            out.push_str(" ");
+            operand(out, m, f, i.a);
+            out.push_str("(");
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 1) {
+                if k > i.args_start {
+                    out.push_str(", ");
+                }
+                typed(out, m, f, f.args[k as usize]);
+            }
+            out.push_str(")\n");
+        }
         .Br => {
             out.push_str("  br label %bb");
             ir.write_number(out, i.a as u64);
@@ -432,6 +455,25 @@ pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
             out.push_str(", i64 ");
             ir.write_number(&mut out, gs[entries[e] as usize].bytes.len() as u64);
             out.push_str("}");
+        }
+        out.push_str("]\n");
+    }
+    let vts = m.vtables.items();
+    var v: usize = 0;
+    while v < vts.len() : (v += 1) {
+        let fs = vts[v].functions.items();
+        out.push_str("@");
+        out.push_str(vts[v].name.view());
+        out.push_str(" = private unnamed_addr constant [");
+        ir.write_number(&mut out, fs.len() as u64);
+        out.push_str(" x ptr] [");
+        var e: usize = 0;
+        while e < fs.len() : (e += 1) {
+            if e > 0 {
+                out.push_str(", ");
+            }
+            out.push_str("ptr @");
+            out.push_str(m.functions[fs[e] as usize].name.view());
         }
         out.push_str("]\n");
     }

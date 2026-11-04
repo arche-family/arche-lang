@@ -44,6 +44,10 @@ pub type Op = enum {
     Trunc,
     /// imm: the global.
     Global,
+    /// imm: the method table (spec/arche.md §5.3).
+    VTable,
+    /// a: the callee's address; args: as for Call.
+    CallIndirect,
     /// imm: the callee (a function, or an external when flag is 1); args:
     /// a range of the function's args list.
     Call,
@@ -104,6 +108,13 @@ pub type Global = struct {
     pub exported: bool,
 }
 
+/// The methods of one impl, in its interface's order: the table a &dyn I
+/// view points to (spec/arche.md §5.3).
+pub type VTable = struct {
+    pub name: alloc.String,
+    pub functions: alloc.List(u32),
+}
+
 /// A table of str values {ptr, len}, each pointing at a global: the error
 /// names the runtime prints.
 pub type StrTable = struct {
@@ -116,6 +127,7 @@ pub type Module = struct {
     pub externals: alloc.List(External),
     pub globals: alloc.List(Global),
     pub tables: alloc.List(StrTable),
+    pub vtables: alloc.List(VTable),
     a: alloc.Allocator,
 
     pub fn init(a: alloc.Allocator) -> Module {
@@ -124,6 +136,7 @@ pub type Module = struct {
             externals: alloc.List(External).init(a),
             globals: alloc.List(Global).init(a),
             tables: alloc.List(StrTable).init(a),
+            vtables: alloc.List(VTable).init(a),
             a: a,
         };
     }
@@ -223,7 +236,7 @@ pub fn is_terminator(op: Op) -> bool {
 pub fn has_value(i: Inst) -> bool {
     match i.op {
         .Store | .Memcpy | .Memzero | .Br | .CondBr | .Ret | .RetVoid | .Unreachable => { return false; }
-        .Call => { return i.ty != Ty.Void; }
+        .Call | .CallIndirect => { return i.ty != Ty.Void; }
         _ => { return true; }
     }
 }
@@ -365,7 +378,10 @@ pub fn verify(f: &Function) -> Problem {
                         return problem(id, ProblemKind.MissingReturn);
                     }
                 }
-                .Call => {
+                .Call | .CallIndirect => {
+                    if i.op == Op.CallIndirect and not operand_ok(f, user: id, v: i.a) {
+                        return problem(id, ProblemKind.Undefined);
+                    }
                     var j = i.args_start;
                     while j < i.args_start + i.args_len : (j += 1) {
                         if not operand_ok(f, user: id, v: f.args[j as usize]) {

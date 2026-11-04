@@ -1,0 +1,49 @@
+// test: run
+// spec: arche/5.3
+// stage0: skip
+// stdout: 4 7 none 45
+import std;
+
+type Pair = struct { a: u64, b: u64 }
+
+type Split = interface {
+    fn split(self: &Self, at: u64) -> Pair;
+    fn find(self: &Self, x: u64) -> ?u64;
+}
+
+type Number = struct { n: u64 }
+
+impl Split for Number {
+    fn split(self: &Number, at: u64) -> Pair {
+        return Pair { a: self.n / at, b: self.n % at };
+    }
+    fn find(self: &Number, x: u64) -> ?u64 {
+        if x > self.n {
+            return none;
+        }
+        return self.n - x;
+    }
+}
+
+fn use(s: &dyn Split, out: &mut std.Output) {
+    let p = s.split(10);
+    out.write_u64(p.a);
+    out.write(" ");
+    out.write_u64(p.b);
+    out.write(" ");
+    match s.find(100) {
+        some(v) => { out.write_u64(v); }
+        none => { out.write("none"); }
+    }
+    out.write(" ");
+    match s.find(2) {
+        some(v) => { out.write_u64(v); }
+        none => { out.write("none"); }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let n = Number { n: 47 };
+    use(&n, &mut sys.stdout);
+    sys.stdout.write("\n");
+}
