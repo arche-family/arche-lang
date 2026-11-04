@@ -1,0 +1,31 @@
+// test: run
+// spec: 5.5
+// stdout: a==b a!=c a!=d
+import std;
+
+type Kind = enum { A, B }
+
+type Inner = struct { n: u8, flag: bool }
+
+type Outer = struct {
+    inner: Inner,
+    kind: Kind,
+    count: u64,
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = Outer { inner: Inner { n: 1, flag: true }, kind: Kind.A, count: 9 };
+    let b = Outer { inner: Inner { n: 1, flag: true }, kind: Kind.A, count: 9 };
+    let c = Outer { inner: Inner { n: 1, flag: false }, kind: Kind.A, count: 9 };
+    let d = Outer { inner: Inner { n: 1, flag: true }, kind: Kind.B, count: 9 };
+    if a == b {
+        sys.stdout.write("a==b ");
+    }
+    if a != c {
+        sys.stdout.write("a!=c ");
+    }
+    if not (a == d) {
+        sys.stdout.write("a!=d");
+    }
+    sys.stdout.write("\n");
+}

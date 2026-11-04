@@ -190,6 +190,10 @@ typedef struct Module Module;
 typedef struct Type Type;
 typedef struct Binding Binding;
 typedef struct Method Method;
+typedef struct Field Field;
+typedef struct FieldDecl FieldDecl;
+typedef struct VariantDecl VariantDecl;
+typedef struct ErrorName ErrorName;
 
 typedef enum { TE_PATH, TE_REF, TE_OPTIONAL, TE_ERROR_UNION, TE_SLICE, TE_ARRAY } TypeExprKind;
 
@@ -273,9 +277,13 @@ typedef struct {
 // What an identifier names, set by the checker.
 typedef enum { NAME_NONE, NAME_BINDING, NAME_CONST, NAME_FN, NAME_MODULE, NAME_BUILTIN_FN } NameKind;
 
-typedef enum { CALL_FN, CALL_BUILTIN_FN, CALL_METHOD } CallKind;
+typedef enum { CALL_FN, CALL_BUILTIN_FN, CALL_METHOD, CALL_LIST_INIT } CallKind;
+
+typedef enum { FIELD_VALUE, FIELD_VARIANT, FIELD_ERROR, FIELD_CONST } FieldUse;
 
 typedef enum { BUILTIN_PANIC, BUILTIN_ASSERT, BUILTIN_UNREACHABLE } BuiltinFn;
+
+typedef enum { SELF_VALUE, SELF_REF, SELF_MUT_REF } SelfMode;
 
 struct Expr {
     ExprKind kind;
@@ -313,6 +321,11 @@ struct Expr {
     const Method *method; // CALL_METHOD
     Expr *receiver;       // CALL_METHOD
     bool negative_literal; // E_UNARY: '-' written directly before an integer literal
+    FieldUse field_use;    // E_FIELD: what the name after '.' is
+    const Field *field;    // FIELD_VALUE
+    VariantDecl *variant;  // FIELD_VARIANT; E_STRUCT_LIT of an enum variant
+    ErrorName *error;      // FIELD_ERROR
+    SelfMode self_mode;    // CALL_FN with a receiver: how `self` is passed
 };
 
 typedef enum { S_EXPR, S_LET, S_ASSIGN, S_DISCARD, S_IF, S_WHILE, S_MATCH, S_RETURN, S_BREAK, S_CONTINUE, S_DEFER, S_BLOCK } StmtKind;
@@ -360,7 +373,9 @@ typedef struct {
 typedef struct {
     const char *field;
     Loc loc;
-    const char *bind; // the name it binds, or NULL for `_`
+    const char *bind;  // the name it binds, or NULL for `_`
+    FieldDecl *decl;   // set by the checker
+    Binding *binding;  // set by the checker
 } FieldPat;
 
 struct Pattern {
@@ -374,6 +389,9 @@ struct Pattern {
     bool has_fields;  // P_VARIANT: written with { }
     Vec field_pats;   // P_VARIANT: FieldPat *
     bool rest;        // P_VARIANT: ends with ..
+    VariantDecl *variant; // P_VARIANT of an enum, set by the checker
+    ErrorName *error;     // P_VARIANT of an error set, set by the checker
+    Binding *binding;     // P_BIND, set by the checker
 };
 
 struct Binding {
@@ -401,6 +419,8 @@ struct FnDecl {
     TypeDecl *owner;    // the type whose body declares it, or NULL
     Type *ret;          // set by the checker
     const char *c_name; // set by the checker
+    bool has_self;      // set by the checker: a method, callable as x.name(...) (§4)
+    SelfMode self_mode; // has_self: how `self` is passed
 };
 
 // A constant's value. Integers are kept as two's complement bits in `bits`.
@@ -424,36 +444,41 @@ struct ConstDecl {
 
 typedef enum { TD_STRUCT, TD_ENUM, TD_ERROR, TD_ALIAS } TypeDeclKind;
 
-typedef struct {
+struct FieldDecl {
     const char *name;
     Loc loc;
     bool pub;
     TypeExpr *type_expr;
-} FieldDecl;
+    Type *type; // set by the checker
+};
 
-typedef struct {
+struct VariantDecl {
     const char *name;
     Loc loc;
     bool has_fields;
     Vec fields; // FieldDecl *
-} VariantDecl;
+    int tag;    // its position: the enum's tag value
+};
 
-typedef struct {
+struct ErrorName {
     const char *name;
     Loc loc;
-} ErrorName;
+    int id; // the error's number across the program, from 1 (§5.2: error names are global)
+};
 
 struct TypeDecl {
     TypeDeclKind kind;
     const char *name;
     Loc loc;
     bool pub;
-    Vec fields;     // TD_STRUCT: FieldDecl *
-    Vec variants;   // TD_ENUM: VariantDecl *
-    Vec errors;     // TD_ERROR: ErrorName *
-    Vec methods;    // TD_STRUCT, TD_ENUM: FnDecl *
+    Vec fields;      // TD_STRUCT: FieldDecl *
+    Vec variants;    // TD_ENUM: VariantDecl *
+    Vec errors;      // TD_ERROR: ErrorName *
+    Vec methods;     // TD_STRUCT, TD_ENUM: FnDecl *
     TypeExpr *alias; // TD_ALIAS
     Module *module;
+    Type *type; // set by the checker
+    int state;  // 0: not resolved, 1: being resolved, 2: done
 };
 
 typedef struct {
@@ -462,20 +487,50 @@ typedef struct {
     Loc loc;
 } Import;
 
+// A name an import binds: a library root of §11, or a module of the package.
+typedef struct {
+    const char *name;
+    Loc loc;
+    const char *library; // "std" or "alloc", or NULL
+    Module *module;      // when library is NULL
+} ModuleAlias;
+
 struct Module {
-    const char *name; // dotted module path; the root module is "main"
+    const char *name; // dotted module path; "" for a root file whose name is not a path
     const SourceFile *file;
     Vec imports; // Import *
     Vec fns;     // FnDecl *
     Vec consts;  // ConstDecl *
     Vec types;   // TypeDecl *
+    Vec aliases; // ModuleAlias *, set by the checker
 };
 
 Module *parse_module(const SourceFile *f, const char *name);
 
+// The root module and every module it reaches through imports (main.c).
+typedef struct {
+    Vec modules; // Module *, the root first
+    Module *root;
+} Program;
+
 // ---- types (types.c) --------------------------------------------------------
 
-typedef enum { TY_VOID, TY_NORETURN, TY_BOOL, TY_INT, TY_STR, TY_REF, TY_ERROR_UNION, TY_BUILTIN } TypeKind;
+typedef enum {
+    TY_VOID,
+    TY_NORETURN,
+    TY_BOOL,
+    TY_INT,
+    TY_STR,
+    TY_REF,
+    TY_SLICE,
+    TY_ARRAY,
+    TY_LIST,
+    TY_ERROR_UNION,
+    TY_ERROR_SET,
+    TY_STRUCT,
+    TY_ENUM,
+    TY_BUILTIN,
+} TypeKind;
 
 typedef enum { I8, I16, I32, I64, ISIZE, U8, U16, U32, U64, USIZE, INT_KIND_COUNT } IntKind;
 
@@ -484,13 +539,26 @@ typedef struct BuiltinType BuiltinType;
 // Types are interned: two types are equal exactly when their pointers are.
 struct Type {
     TypeKind kind;
-    IntKind int_kind;            // TY_INT
-    bool mut;                    // TY_REF
-    Type *elem;                  // TY_REF, TY_ERROR_UNION
-    const BuiltinType *builtin;  // TY_BUILTIN
+    IntKind int_kind;           // TY_INT
+    bool mut;                   // TY_REF, TY_SLICE
+    Type *elem;                 // TY_REF, TY_SLICE, TY_ARRAY, TY_LIST, TY_ERROR_UNION
+    uint64_t len;               // TY_ARRAY
+    const BuiltinType *builtin; // TY_BUILTIN
+    TypeDecl *decl;             // TY_STRUCT, TY_ENUM, TY_ERROR_SET
+    const char *c_name;         // TY_SLICE, TY_ARRAY, TY_LIST, TY_STRUCT, TY_ENUM
 
-    Type *ref_cache[2];          // &T and &mut T of this type
-    Type *error_union_cache;     // !T of this type
+    Field *fields; // TY_STRUCT: the resolved fields
+    int nfields;
+    Method *methods; // TY_SLICE, TY_ARRAY, TY_LIST: their built-in methods
+    int nmethods;
+
+    unsigned used; // emit.c: which generated helpers the program calls (USE_*)
+
+    Type *ref_cache[2];      // &T and &mut T
+    Type *slice_cache[2];    // []T and []mut T
+    Type *list_cache;        // alloc.List(T)
+    Type *error_union_cache; // !T
+    Vec array_cache;         // [N]T for each N seen
 };
 
 Type *type_void(void);
@@ -499,32 +567,40 @@ Type *type_bool(void);
 Type *type_str(void);
 Type *type_int(IntKind k);
 Type *type_ref(bool mut, Type *elem);
+Type *type_slice(bool mut, Type *elem);
+Type *type_array(Type *elem, uint64_t len);
+Type *type_list(Type *elem);
 Type *type_error_union(Type *elem); // with an inferred error set
+Type *type_declared(TypeKind kind, TypeDecl *decl, const char *c_name);
 const char *type_name(const Type *t);
-
-typedef enum { SELF_VALUE, SELF_REF, SELF_MUT_REF } SelfMode;
+// Every slice, array, list, struct and enum type, in the order they were made.
+Vec *composite_types(void);
 
 typedef struct {
     const char *name;
     Type *type;
 } BuiltinParam;
 
-// A method the runtime implements.
+typedef enum { M_RUNTIME, M_LEN, M_STR_BYTES, M_LIST_PUSH, M_LIST_CLEAR, M_LIST_ITEMS, M_LIST_ITEMS_MUT } MethodOp;
+
+// A built-in method.
 struct Method {
     const char *name;
     SelfMode self;
     int nparams; // not counting self
     BuiltinParam params[3];
     Type *ret;
-    const char *c_name;
-    bool needs_loc; // the runtime function takes the call's location: it can trap
+    const char *c_name; // M_RUNTIME: the runtime function
+    bool needs_loc;     // the runtime function takes the call's location: it can trap
+    MethodOp op;
 };
 
-typedef struct {
+struct Field {
     const char *name;
     Type *type;
     const char *c_name;
-} Field;
+    bool pub;
+};
 
 struct BuiltinType {
     const char *module;
@@ -538,7 +614,7 @@ struct BuiltinType {
 };
 
 const BuiltinType *builtin_type_lookup(const char *module, const char *name);
-const Method *method_lookup(const Type *t, const char *name);
+const Method *method_lookup(Type *t, const char *name);
 const Field *field_lookup(const Type *t, const char *name);
 bool builtin_fn_lookup(const char *name, BuiltinFn *out);
 bool int_type_lookup(const char *name, IntKind *out);
@@ -547,12 +623,15 @@ int int_bits(IntKind k);
 int64_t int_min(IntKind k);
 uint64_t int_max(IntKind k);
 const char *int_suffix(IntKind k);
+bool type_comparable(const Type *t); // == and != work on it (§5.5)
 
 // ---- checking and emission ---------------------------------------------------
 
-void check_program(Module *root);
+void check_program(Program *p);
 bool expr_is_place(const Expr *e);
 bool block_ends(const Block *b); // every path through it ends: return, noreturn, ... (§10)
-void emit_program(Module *root, StrBuf *out);
+const char *error_name(int id);  // the error numbered id, from 1
+int error_count(void);
+void emit_program(Program *p, StrBuf *out);
 
 #endif

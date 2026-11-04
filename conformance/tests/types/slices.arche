@@ -1,0 +1,34 @@
+// test: run
+// spec: 5.4
+// stdout: 15 5 6 0
+import std;
+
+fn sum(xs: []u32) -> u32 {
+    var total: u32 = 0;
+    var i: usize = 0;
+    while i < xs.len() : (i += 1) {
+        total += xs[i];
+    }
+    return total;
+}
+
+fn fill(xs: []mut u32, v: u32) {
+    var i: usize = 0;
+    while i < xs.len() : (i += 1) {
+        xs[i] = v;
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var a: [5]u32 = [1, 2, 3, 4, 5];
+    let all = a[0..5];
+    sys.stdout.write_u64(sum(all) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(sum(all[1..3]) as u64);
+    sys.stdout.write(" ");
+    fill(a[3..5], 0);
+    sys.stdout.write_u64(sum(a[0..5]) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(a[2..2].len() as u64);
+    sys.stdout.write("\n");
+}

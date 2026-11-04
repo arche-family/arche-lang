@@ -1,0 +1,44 @@
+// test: run
+// spec: 7.5
+// stdout: 17 17 17 3
+import std;
+
+type Counter = struct {
+    n: u32,
+
+    fn new(start: u32) -> Counter {
+        return Counter { n: start };
+    }
+
+    fn get(self: Counter) -> u32 {
+        return self.n;
+    }
+
+    fn peek(self: &Counter) -> u32 {
+        return self.n;
+    }
+
+    fn bump(self: &mut Counter, by: u32) {
+        self.n += by;
+    }
+}
+
+fn bump_twice(c: &mut Counter) {
+    c.bump(1);
+    c.bump(1);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var c = Counter.new(10);
+    c.bump(5);
+    bump_twice(&mut c);
+    let r = &c;
+    sys.stdout.write_u64(c.get() as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(r.peek() as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(Counter.get(c) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(Counter.new(3).get() as u64);
+    sys.stdout.write("\n");
+}

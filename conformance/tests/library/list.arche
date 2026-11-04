@@ -1,0 +1,43 @@
+// test: run
+// spec: 11
+// stdout: 100 5950 0 197 0 7
+import std;
+import alloc;
+
+type Pair = struct { a: u32, b: u32 }
+
+fn total(xs: []u32) -> u32 {
+    var t: u32 = 0;
+    var i: usize = 0;
+    while i < xs.len() : (i += 1) {
+        t += xs[i];
+    }
+    return t;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var xs = alloc.List(u32).init(sys.alloc);
+    var i: u32 = 0;
+    while i < 100 : (i += 1) {
+        xs.push(i);
+    }
+    xs[0] = 1000;
+    sys.stdout.write_u64(xs.len() as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(total(xs.items()) as u64);
+    sys.stdout.write(" ");
+    let m = xs.items_mut();
+    m[1] = 0;
+    sys.stdout.write_u64(xs[1] as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(total(xs[98..100]) as u64);
+    xs.clear();
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(xs.len() as u64);
+    var pairs: alloc.List(Pair) = alloc.List(Pair).init(sys.alloc);
+    pairs.push(Pair { a: 1, b: 2 });
+    pairs[0].b = 7;
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(pairs[0].b as u64);
+    sys.stdout.write("\n");
+}

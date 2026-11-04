@@ -1,0 +1,51 @@
+// test: run
+// spec: 9
+// stdout: minus-one zero small medium negative large very negative identdigitspaceother
+import std;
+
+fn kind(n: i32) -> str {
+    match n {
+        -1 => { return "minus-one"; }
+        0 => { return "zero"; }
+        1 | 2 | 3 => { return "small"; }
+        4..=99 => { return "medium"; }
+        -100..=-2 => { return "negative"; }
+        other => {
+            if other > 0 {
+                return "large";
+            }
+            return "very negative";
+        }
+    }
+}
+
+fn class(b: u8) -> str {
+    match b {
+        'a'..='z' | 'A'..='Z' | '_' => { return "ident"; }
+        '0'..='9' => { return "digit"; }
+        ' ' | '\t' | '\n' => { return "space"; }
+        _ => { return "other"; }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write(kind(-1));
+    sys.stdout.write(" ");
+    sys.stdout.write(kind(0));
+    sys.stdout.write(" ");
+    sys.stdout.write(kind(2));
+    sys.stdout.write(" ");
+    sys.stdout.write(kind(50));
+    sys.stdout.write(" ");
+    sys.stdout.write(kind(-7));
+    sys.stdout.write(" ");
+    sys.stdout.write(kind(1000));
+    sys.stdout.write(" ");
+    sys.stdout.write(kind(-1000));
+    sys.stdout.write(" ");
+    sys.stdout.write(class('Q'));
+    sys.stdout.write(class('5'));
+    sys.stdout.write(class(' '));
+    sys.stdout.write(class('#'));
+    sys.stdout.write("\n");
+}

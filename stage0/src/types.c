@@ -21,6 +21,20 @@ static const char *const int_names[INT_KIND_COUNT] = {
     [U8] = "u8", [U16] = "u16", [U32] = "u32", [U64] = "u64", [USIZE] = "usize",
 };
 
+static Vec composites; // Type *
+
+Vec *composite_types(void) {
+    return &composites;
+}
+
+static Type *new_composite(TypeKind kind, const char *c_prefix) {
+    Type *t = NEW(Type);
+    t->kind = kind;
+    t->c_name = arena_printf("a0_%s_%zu", c_prefix, composites.len);
+    vec_push(&composites, t);
+    return t;
+}
+
 Type *type_void(void) {
     return &void_type;
 }
@@ -53,6 +67,51 @@ Type *type_ref(bool mut, Type *elem) {
     return *slot;
 }
 
+// []T and []mut T share one C type: they differ only in what the checker allows.
+Type *type_slice(bool mut, Type *elem) {
+    Type **slot = &elem->slice_cache[mut];
+    if (!*slot) {
+        Type *other = elem->slice_cache[!mut];
+        Type *t;
+        if (other) {
+            t = NEW(Type);
+            t->kind = TY_SLICE;
+            t->c_name = other->c_name;
+        } else {
+            t = new_composite(TY_SLICE, "slice");
+        }
+        t->mut = mut;
+        t->elem = elem;
+        *slot = t;
+    }
+    return *slot;
+}
+
+Type *type_array(Type *elem, uint64_t len) {
+    for (size_t i = 0; i < elem->array_cache.len; i++) {
+        Type *t = elem->array_cache.items[i];
+        if (t->len == len) {
+            return t;
+        }
+    }
+    Type *t = new_composite(TY_ARRAY, "array");
+    t->elem = elem;
+    t->len = len;
+    vec_push(&elem->array_cache, t);
+    return t;
+}
+
+Type *type_list(Type *elem) {
+    if (!elem->list_cache) {
+        Type *t = new_composite(TY_LIST, "list");
+        t->elem = elem;
+        elem->list_cache = t;
+        type_slice(false, elem);
+        type_slice(true, elem);
+    }
+    return elem->list_cache;
+}
+
 Type *type_error_union(Type *elem) {
     if (!elem->error_union_cache) {
         Type *t = NEW(Type);
@@ -61,6 +120,21 @@ Type *type_error_union(Type *elem) {
         elem->error_union_cache = t;
     }
     return elem->error_union_cache;
+}
+
+Type *type_declared(TypeKind kind, TypeDecl *decl, const char *c_name) {
+    Type *t = NEW(Type);
+    t->kind = kind;
+    t->decl = decl;
+    t->c_name = c_name;
+    if (kind == TY_STRUCT || kind == TY_ENUM) {
+        vec_push(&composites, t);
+    }
+    return t;
+}
+
+static const char *decl_name(const TypeDecl *d) {
+    return d->module->name[0] ? arena_printf("%s.%s", d->module->name, d->name) : d->name;
 }
 
 const char *type_name(const Type *t) {
@@ -77,12 +151,47 @@ const char *type_name(const Type *t) {
         return "str";
     case TY_REF:
         return arena_printf("&%s%s", t->mut ? "mut " : "", type_name(t->elem));
+    case TY_SLICE:
+        return arena_printf("[]%s%s", t->mut ? "mut " : "", type_name(t->elem));
+    case TY_ARRAY:
+        return arena_printf("[%llu]%s", (unsigned long long)t->len, type_name(t->elem));
+    case TY_LIST:
+        return arena_printf("alloc.List(%s)", type_name(t->elem));
     case TY_ERROR_UNION:
         return arena_printf("!%s", type_name(t->elem));
+    case TY_ERROR_SET:
+    case TY_STRUCT:
+    case TY_ENUM:
+        return decl_name(t->decl);
     case TY_BUILTIN:
         return arena_printf("%s.%s", t->builtin->module, t->builtin->name);
     }
     return "?";
+}
+
+bool type_comparable(const Type *t) {
+    switch (t->kind) {
+    case TY_INT:
+    case TY_BOOL:
+    case TY_ERROR_SET:
+        return true;
+    case TY_ENUM:
+        for (size_t i = 0; i < t->decl->variants.len; i++) {
+            if (VEC_AT(t->decl->variants, VariantDecl, i)->has_fields) {
+                return false;
+            }
+        }
+        return true;
+    case TY_STRUCT:
+        for (int i = 0; i < t->nfields; i++) {
+            if (!type_comparable(t->fields[i].type)) {
+                return false;
+            }
+        }
+        return true;
+    default:
+        return false;
+    }
 }
 
 // ---- the built-in library ---------------------------------------------------
@@ -107,10 +216,13 @@ static BuiltinType output_bt = {
     .nmethods = 4,
     .methods =
         {
-            {"write", SELF_MUT_REF, 1, {{"text", &str_type}}, &void_type, "a0_std_Output_write", false},
-            {"write_byte", SELF_MUT_REF, 1, {{"byte", &int_types[U8]}}, &void_type, "a0_std_Output_write_byte", false},
-            {"write_u64", SELF_MUT_REF, 1, {{"n", &int_types[U64]}}, &void_type, "a0_std_Output_write_u64", false},
-            {"write_i64", SELF_MUT_REF, 1, {{"n", &int_types[I64]}}, &void_type, "a0_std_Output_write_i64", false},
+            {"write", SELF_MUT_REF, 1, {{"text", &str_type}}, &void_type, "a0_std_Output_write", false, M_RUNTIME},
+            {"write_byte", SELF_MUT_REF, 1, {{"byte", &int_types[U8]}}, &void_type, "a0_std_Output_write_byte", false,
+             M_RUNTIME},
+            {"write_u64", SELF_MUT_REF, 1, {{"n", &int_types[U64]}}, &void_type, "a0_std_Output_write_u64", false,
+             M_RUNTIME},
+            {"write_i64", SELF_MUT_REF, 1, {{"n", &int_types[I64]}}, &void_type, "a0_std_Output_write_i64", false,
+             M_RUNTIME},
         },
 };
 
@@ -122,8 +234,8 @@ static BuiltinType args_bt = {
     .nmethods = 2,
     .methods =
         {
-            {"len", SELF_REF, 0, {{0}}, &int_types[USIZE], "a0_std_Args_len", false},
-            {"get", SELF_REF, 1, {{"i", &int_types[USIZE]}}, &str_type, "a0_std_Args_get", true},
+            {"len", SELF_REF, 0, {{0}}, &int_types[USIZE], "a0_std_Args_len", false, M_RUNTIME},
+            {"get", SELF_REF, 1, {{"i", &int_types[USIZE]}}, &str_type, "a0_std_Args_get", true, M_RUNTIME},
         },
 };
 
@@ -140,18 +252,12 @@ static BuiltinType system_bt = {
     .nfields = 5,
     .fields =
         {
-            {"fs", &fs_type, "fs"},
-            {"stdout", &output_type, "out"},
-            {"stderr", &output_type, "err"},
-            {"args", &args_type, "args"},
-            {"alloc", &allocator_type, "alloc"},
+            {"fs", &fs_type, "fs", true},
+            {"stdout", &output_type, "out", true},
+            {"stderr", &output_type, "err", true},
+            {"args", &args_type, "args", true},
+            {"alloc", &allocator_type, "alloc", true},
         },
-};
-
-static const Method str_methods[] = {
-    {"len", SELF_VALUE, 0, {{0}}, &int_types[USIZE], "a0_str_len", false},
-    {"eq", SELF_VALUE, 1, {{"other", &str_type}}, &bool_type, "a0_str_eq", false},
-    {"starts_with", SELF_VALUE, 1, {{"prefix", &str_type}}, &bool_type, "a0_str_starts_with", false},
 };
 
 static const BuiltinType *const builtin_types[] = {&output_bt, &args_bt, &fs_bt, &allocator_bt, &system_bt};
@@ -166,33 +272,87 @@ const BuiltinType *builtin_type_lookup(const char *module, const char *name) {
     return NULL;
 }
 
-const Method *method_lookup(const Type *t, const char *name) {
-    if (t->kind == TY_STR) {
-        for (size_t i = 0; i < sizeof str_methods / sizeof *str_methods; i++) {
-            if (strcmp(str_methods[i].name, name) == 0) {
-                return &str_methods[i];
-            }
+static Method method(const char *name, SelfMode self, Type *ret, MethodOp op) {
+    Method m = {0};
+    m.name = name;
+    m.self = self;
+    m.ret = ret;
+    m.op = op;
+    return m;
+}
+
+// The methods of str, slices, arrays and lists depend on the element type, so
+// they are made the first time they are looked up.
+static void build_methods(Type *t) {
+    Method *ms = arena_alloc(8 * sizeof *ms);
+    int n = 0;
+    switch (t->kind) {
+    case TY_STR:
+        ms[n++] = method("len", SELF_VALUE, &int_types[USIZE], M_LEN);
+        ms[n] = method("eq", SELF_VALUE, &bool_type, M_RUNTIME);
+        ms[n].nparams = 1;
+        ms[n].params[0] = (BuiltinParam){"other", &str_type};
+        ms[n++].c_name = "a0_str_eq";
+        ms[n] = method("starts_with", SELF_VALUE, &bool_type, M_RUNTIME);
+        ms[n].nparams = 1;
+        ms[n].params[0] = (BuiltinParam){"prefix", &str_type};
+        ms[n++].c_name = "a0_str_starts_with";
+        ms[n++] = method("bytes", SELF_VALUE, type_slice(false, &int_types[U8]), M_STR_BYTES);
+        break;
+    case TY_SLICE:
+    case TY_ARRAY:
+        ms[n++] = method("len", SELF_REF, &int_types[USIZE], M_LEN);
+        break;
+    case TY_LIST:
+        ms[n] = method("push", SELF_MUT_REF, &void_type, M_LIST_PUSH);
+        ms[n].nparams = 1;
+        ms[n++].params[0] = (BuiltinParam){"item", t->elem};
+        ms[n++] = method("len", SELF_REF, &int_types[USIZE], M_LEN);
+        ms[n++] = method("clear", SELF_MUT_REF, &void_type, M_LIST_CLEAR);
+        ms[n++] = method("items", SELF_REF, type_slice(false, t->elem), M_LIST_ITEMS);
+        ms[n++] = method("items_mut", SELF_MUT_REF, type_slice(true, t->elem), M_LIST_ITEMS_MUT);
+        break;
+    default:
+        break;
+    }
+    t->methods = ms;
+    t->nmethods = n;
+}
+
+const Method *method_lookup(Type *t, const char *name) {
+    const Method *ms;
+    int n;
+    if (t->kind == TY_BUILTIN) {
+        ms = t->builtin->methods;
+        n = t->builtin->nmethods;
+    } else {
+        if (!t->methods) {
+            build_methods(t);
         }
-        return NULL;
+        ms = t->methods;
+        n = t->nmethods;
     }
-    if (t->kind != TY_BUILTIN) {
-        return NULL;
-    }
-    for (int i = 0; i < t->builtin->nmethods; i++) {
-        if (strcmp(t->builtin->methods[i].name, name) == 0) {
-            return &t->builtin->methods[i];
+    for (int i = 0; i < n; i++) {
+        if (strcmp(ms[i].name, name) == 0) {
+            return &ms[i];
         }
     }
     return NULL;
 }
 
 const Field *field_lookup(const Type *t, const char *name) {
-    if (t->kind != TY_BUILTIN) {
-        return NULL;
+    const Field *fs = NULL;
+    int n = 0;
+    if (t->kind == TY_BUILTIN) {
+        fs = t->builtin->fields;
+        n = t->builtin->nfields;
+    } else if (t->kind == TY_STRUCT) {
+        fs = t->fields;
+        n = t->nfields;
     }
-    for (int i = 0; i < t->builtin->nfields; i++) {
-        if (strcmp(t->builtin->fields[i].name, name) == 0) {
-            return &t->builtin->fields[i];
+    for (int i = 0; i < n; i++) {
+        if (strcmp(fs[i].name, name) == 0) {
+            return &fs[i];
         }
     }
     return NULL;

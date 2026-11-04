@@ -1,0 +1,42 @@
+// test: run
+// spec: 15
+// stdout: 42
+import std;
+import alloc;
+
+type NodeId = struct { index: u32 }
+
+type Node = enum {
+    Int { value: u64 },
+    Add { lhs: NodeId, rhs: NodeId },
+}
+
+type Ast = struct {
+    nodes: alloc.List(Node),
+
+    fn add(self: &mut Ast, node: Node) -> NodeId {
+        let id = NodeId { index: self.nodes.len() as u32 };
+        self.nodes.push(node);
+        return id;
+    }
+
+    fn eval(self: &Ast, id: NodeId) -> u64 {
+        match self.nodes[id.index as usize] {
+            .Int { value } => {
+                return value;
+            }
+            .Add { lhs, rhs } => {
+                return self.eval(lhs) + self.eval(rhs);
+            }
+        }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var ast = Ast { nodes: alloc.List(Node).init(sys.alloc) };
+    let a = ast.add(Node.Int { value: 40 });
+    let b = ast.add(Node.Int { value: 2 });
+    let sum = ast.add(Node.Add { lhs: a, rhs: b });
+    sys.stdout.write_u64(ast.eval(sum));
+    sys.stdout.write("\n");
+}

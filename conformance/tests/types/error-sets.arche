@@ -1,0 +1,25 @@
+// test: run
+// spec: 5.2
+// stdout: denied, not found, names are global
+import std;
+
+type IoError = error { NotFound, AccessDenied }
+type ParseError = error { UnexpectedEof, NotFound }
+
+fn name(e: IoError) -> str {
+    match e {
+        .NotFound => { return "not found"; }
+        .AccessDenied => { return "denied"; }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let e = IoError.AccessDenied;
+    sys.stdout.write(name(e));
+    sys.stdout.write(", ");
+    sys.stdout.write(name(IoError.NotFound));
+    if IoError.NotFound == ParseError.NotFound and e != ParseError.NotFound {
+        sys.stdout.write(", names are global");
+    }
+    sys.stdout.write("\n");
+}

@@ -1,0 +1,32 @@
+// test: run
+// spec: 9
+// stdout: 11
+import std;
+
+type Shape = enum {
+    Dot,
+    Circle { radius: u32 },
+}
+
+fn grow(s: &mut Shape) {
+    match s {
+        .Circle { radius } => {
+            radius.* += 10;
+        }
+        .Dot => { }
+    }
+}
+
+fn get_radius(s: &Shape) -> u32 {
+    match s {
+        .Circle { radius } => { return radius.*; }
+        .Dot => { return 0; }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var c = Shape.Circle { radius: 1 };
+    grow(&mut c);
+    sys.stdout.write_u64(get_radius(&c) as u64);
+    sys.stdout.write("\n");
+}

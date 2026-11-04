@@ -24,6 +24,25 @@ typedef struct {
     Vec defers; // Stmt *: the deferred statements, in order of declaration
 } Scope;
 
+// Helpers emitted per type, only when the program uses them: C compilers warn
+// about unused static functions.
+enum { USE_LIST_INIT = 1, USE_LIST_PUSH = 2, USE_LIST_CLEAR = 4, USE_LIST_ITEMS = 8, USE_EQ = 16 };
+
+static void use(const Type *t, unsigned what) {
+    ((Type *)t)->used |= what;
+}
+
+// Struct equality calls the equality of the struct fields too.
+static void use_equality(const Type *t) {
+    if (t->kind != TY_STRUCT || (t->used & USE_EQ)) {
+        return;
+    }
+    use(t, USE_EQ);
+    for (int i = 0; i < t->nfields; i++) {
+        use_equality(t->fields[i].type);
+    }
+}
+
 typedef struct {
     int id;
     size_t depth; // scopes.len outside the body: break runs the defers above it
@@ -97,11 +116,19 @@ static const char *c_type(const Type *t) {
         return "a0_str";
     case TY_REF:
         return arena_printf("%s *", c_type(t->elem));
+    case TY_ERROR_SET:
+        return "a0_err";
     case TY_ERROR_UNION:
         if (t->elem->kind == TY_VOID) {
             return "a0_err";
         }
         break;
+    case TY_SLICE:
+    case TY_ARRAY:
+    case TY_LIST:
+    case TY_STRUCT:
+    case TY_ENUM:
+        return t->c_name;
     case TY_BUILTIN:
         return t->builtin->c_name;
     }
@@ -299,63 +326,115 @@ static const char *cast(Emitter *em, const Expr *e, const char *v) {
 
 static const char *emit_expr(Emitter *em, const Expr *e);
 
+// A C expression for e's value that can be named more than once: places as
+// they are, other values in a temporary.
+static const char *emit_lvalue(Emitter *em, const Expr *e);
+
 static const char *emit_place(Emitter *em, const Expr *e) {
     switch (e->kind) {
     case E_IDENT:
         return arena_printf("v_%s", e->name);
     case E_FIELD: {
-        const Type *bt = e->base->type;
-        const Field *f = field_lookup(bt->kind == TY_REF ? bt->elem : bt, e->name);
-        if (bt->kind == TY_REF) {
-            return arena_printf("(*%s).%s", emit_expr(em, e->base), f->c_name);
+        if (e->base->type->kind == TY_REF) {
+            return arena_printf("(*%s).%s", emit_expr(em, e->base), e->field->c_name);
         }
-        return arena_printf("%s.%s", emit_place(em, e->base), f->c_name);
+        return arena_printf("%s.%s", emit_lvalue(em, e->base), e->field->c_name);
     }
     case E_DEREF:
         return arena_printf("(*%s)", emit_expr(em, e->base));
-    default:
-        fatal("internal error: not a place");
+    case E_INDEX: {
+        const Type *bt = e->base->type;
+        const char *base = bt->kind == TY_SLICE ? emit_expr(em, e->base) : emit_lvalue(em, e->base);
+        const char *i = emit_expr(em, e->index);
+        const char *loc = loc_arg(em, e->loc);
+        switch (bt->kind) {
+        case TY_ARRAY:
+            line(em, "a0_check_index(%s, UINT64_C(%llu), %s);", i, (unsigned long long)bt->len, loc);
+            return arena_printf("%s.items[%s]", base, i);
+        case TY_SLICE:
+            line(em, "a0_check_index(%s, %s.len, %s);", i, base, loc);
+            return arena_printf("%s.ptr[%s]", base, i);
+        case TY_LIST:
+            line(em, "a0_check_index(%s, %s.len, %s);", i, base, loc);
+            return arena_printf("%s.data[%s]", base, i);
+        default:
+            break;
+        }
+        break;
     }
+    default:
+        break;
+    }
+    fatal("internal error: not a place");
+}
+
+static const char *emit_lvalue(Emitter *em, const Expr *e) {
+    if (expr_is_place(e)) {
+        return emit_place(em, e);
+    }
+    return to_temp(em, e->type, emit_expr(em, e));
+}
+
+// How the receiver of a method call is passed, as its `self` declares.
+static const char *emit_self(Emitter *em, const Expr *r, SelfMode mode) {
+    if (mode == SELF_VALUE) {
+        return r->type->kind == TY_REF ? arena_printf("(*%s)", emit_expr(em, r)) : emit_expr(em, r);
+    }
+    if (r->type->kind == TY_REF) {
+        return emit_expr(em, r);
+    }
+    return arena_printf("(&%s)", emit_lvalue(em, r));
+}
+
+static const char *emit_builtin_method(const Expr *e, const char *self, const char *args) {
+    const Type *rt = e->receiver->type->kind == TY_REF ? e->receiver->type->elem : e->receiver->type;
+    switch (e->method->op) {
+    case M_LEN:
+        if (rt->kind == TY_STR) {
+            return arena_printf("%s.len", self);
+        }
+        if (rt->kind == TY_ARRAY) {
+            return arena_printf("((void)%s, UINT64_C(%llu))", self, (unsigned long long)rt->len);
+        }
+        return arena_printf("(*%s).len", self);
+    case M_STR_BYTES:
+        return arena_printf("((%s){(uint8_t *)%s.ptr, %s.len})", e->type->c_name, self, self);
+    case M_LIST_PUSH:
+        use(rt, USE_LIST_PUSH);
+        return arena_printf("%s_push(%s, %s)", rt->c_name, self, args);
+    case M_LIST_CLEAR:
+        use(rt, USE_LIST_CLEAR);
+        return arena_printf("%s_clear(%s)", rt->c_name, self);
+    case M_LIST_ITEMS:
+    case M_LIST_ITEMS_MUT:
+        use(rt, USE_LIST_ITEMS);
+        return arena_printf("%s_items(%s)", rt->c_name, self);
+    case M_RUNTIME:
+        break;
+    }
+    return NULL;
 }
 
 static const char *emit_call(Emitter *em, const Expr *e) {
     StrBuf args = {0};
     sb_puts(&args, "");
-    const char *callee = NULL;
-
-    switch (e->call) {
-    case CALL_FN:
-        callee = e->fn->c_name;
-        break;
-    case CALL_METHOD: {
-        const Expr *r = e->receiver;
-        const char *self;
-        if (e->method->self == SELF_VALUE) {
-            self = r->type->kind == TY_REF ? arena_printf("(*%s)", emit_expr(em, r)) : emit_expr(em, r);
-        } else if (r->type->kind == TY_REF) {
-            self = emit_expr(em, r);
-        } else if (expr_is_place(r)) {
-            self = arena_printf("&%s", emit_place(em, r));
-        } else {
-            self = arena_printf("&%s", emit_expr(em, r));
-        }
+    const char *self = NULL;
+    if (e->call == CALL_METHOD) {
+        self = emit_self(em, e->receiver, e->method->self);
+    } else if (e->call == CALL_FN && e->receiver) {
+        self = emit_self(em, e->receiver, e->self_mode);
+    }
+    if (self && !(e->call == CALL_METHOD && e->method->op != M_RUNTIME)) {
         sb_puts(&args, self);
-        callee = e->method->c_name;
-        break;
     }
-    case CALL_BUILTIN_FN:
-        break;
-    }
-
     for (size_t i = 0; i < e->args.len; i++) {
         const char *v = emit_expr(em, VEC_AT(e->args, Arg, i)->value);
-        if (args.len > 0) {
-            sb_puts(&args, ", ");
-        }
-        sb_puts(&args, v);
+        sb_printf(&args, "%s%s", args.len > 0 ? ", " : "", v);
     }
 
-    if (e->call == CALL_BUILTIN_FN) {
+    const char *call = NULL;
+    switch (e->call) {
+    case CALL_BUILTIN_FN:
         switch (e->builtin_fn) {
         case BUILTIN_PANIC:
             line(em, "a0_panic(%s, %s);", args.data, loc_arg(em, e->loc));
@@ -369,12 +448,24 @@ static const char *emit_call(Emitter *em, const Expr *e) {
         }
         free(args.data);
         return NULL;
+    case CALL_FN:
+        call = arena_printf("%s(%s)", e->fn->c_name, args.data);
+        break;
+    case CALL_LIST_INIT:
+        use(e->type, USE_LIST_INIT);
+        call = arena_printf("%s_init(%s)", e->type->c_name, args.data);
+        break;
+    case CALL_METHOD:
+        if (e->method->op != M_RUNTIME) {
+            call = emit_builtin_method(e, self, args.data);
+            break;
+        }
+        if (e->method->needs_loc) {
+            sb_printf(&args, ", %s", loc_arg(em, e->loc));
+        }
+        call = arena_printf("%s(%s)", e->method->c_name, args.data);
+        break;
     }
-
-    if (e->call == CALL_METHOD && e->method->needs_loc) {
-        sb_printf(&args, "%s%s", args.len > 0 ? ", " : "", loc_arg(em, e->loc));
-    }
-    const char *call = arena_printf("%s(%s)", callee, args.data);
     free(args.data);
     if (e->type->kind == TY_VOID || e->type->kind == TY_NORETURN) {
         line(em, "%s;", call);
@@ -407,6 +498,78 @@ static const char *emit_const(const ConstDecl *k) {
     }
 }
 
+// a == b for a comparable type (§5.5).
+static const char *equal(const Type *t, const char *a, const char *b) {
+    switch (t->kind) {
+    case TY_ENUM:
+        return arena_printf("(%s.tag == %s.tag)", a, b);
+    case TY_STRUCT:
+        use_equality(t);
+        return arena_printf("a0_eq_%s(%s, %s)", t->c_name, a, b);
+    default:
+        return arena_printf("(%s == %s)", a, b);
+    }
+}
+
+static const char *emit_slice(Emitter *em, const Expr *e) {
+    const Type *bt = e->base->type;
+    const char *base = bt->kind == TY_STR || bt->kind == TY_SLICE ? emit_expr(em, e->base) : emit_place(em, e->base);
+    const char *a = emit_expr(em, e->index);
+    const char *b = emit_expr(em, e->end);
+    const char *loc = loc_arg(em, e->loc);
+    if (bt->kind == TY_STR) {
+        return to_temp(em, e->type, arena_printf("a0_str_slice(%s, %s, %s, %s)", base, a, b, loc));
+    }
+    const char *len;
+    const char *ptr;
+    switch (bt->kind) {
+    case TY_ARRAY:
+        len = arena_printf("UINT64_C(%llu)", (unsigned long long)bt->len);
+        ptr = arena_printf("%s.items", base);
+        break;
+    case TY_LIST:
+        len = arena_printf("%s.len", base);
+        ptr = arena_printf("%s.data", base);
+        break;
+    default:
+        len = arena_printf("%s.len", base);
+        ptr = arena_printf("%s.ptr", base);
+        break;
+    }
+    line(em, "a0_check_slice(%s, %s, %s, %s);", a, b, len, loc);
+    // An empty list or slice may have a null pointer, and C does not allow
+    // adding even 0 to one.
+    return to_temp(em, e->type, arena_printf("{%s == 0 ? %s : %s + %s, %s - %s}", a, ptr, ptr, a, b, a));
+}
+
+static const char *emit_struct_lit(Emitter *em, const Expr *e) {
+    StrBuf vals = {0};
+    sb_puts(&vals, "");
+    for (size_t i = 0; i < e->fields.len; i++) {
+        const char *v = emit_expr(em, ((FieldInit *)e->fields.items[i])->value);
+        sb_printf(&vals, "%s%s", i > 0 ? ", " : "", v);
+    }
+    const char *init;
+    if (e->variant) {
+        init = arena_printf("{.tag = %d, .as.v_%s = {%s}}", e->variant->tag, e->variant->name, vals.data);
+    } else {
+        init = vals.len > 0 ? arena_printf("{%s}", vals.data) : "{0}";
+    }
+    free(vals.data);
+    return to_temp(em, e->type, init);
+}
+
+static const char *emit_array_lit(Emitter *em, const Expr *e) {
+    StrBuf vals = {0};
+    sb_puts(&vals, "");
+    for (size_t i = 0; i < e->elems.len; i++) {
+        sb_printf(&vals, "%s%s", i > 0 ? ", " : "", emit_expr(em, e->elems.items[i]));
+    }
+    const char *init = vals.len > 0 ? arena_printf("{{%s}}", vals.data) : "{{0}}";
+    free(vals.data);
+    return to_temp(em, e->type, init);
+}
+
 static const char *emit_expr(Emitter *em, const Expr *e) {
     switch (e->kind) {
     case E_INT:
@@ -422,12 +585,36 @@ static const char *emit_expr(Emitter *em, const Expr *e) {
         }
         return to_temp(em, e->type, emit_place(em, e));
     case E_FIELD:
+        switch (e->field_use) {
+        case FIELD_CONST:
+            return emit_const(e->konst);
+        case FIELD_VARIANT:
+            return arena_printf("((%s){.tag = %d})", e->type->c_name, e->variant->tag);
+        case FIELD_ERROR:
+            return arena_printf("((a0_err)%d)", e->error->id);
+        case FIELD_VALUE:
+            break;
+        }
+        return to_temp(em, e->type, emit_place(em, e));
     case E_DEREF:
         return to_temp(em, e->type, emit_place(em, e));
+    case E_INDEX:
+        if (e->base->type->kind == TY_STR) {
+            const char *s = emit_expr(em, e->base);
+            const char *i = emit_expr(em, e->index);
+            return to_temp(em, e->type, arena_printf("a0_str_at(%s, %s, %s)", s, i, loc_arg(em, e->loc)));
+        }
+        return to_temp(em, e->type, emit_place(em, e));
+    case E_SLICE:
+        return emit_slice(em, e);
     case E_CALL:
         return emit_call(em, e);
     case E_REF:
         return arena_printf("(&%s)", emit_place(em, e->base));
+    case E_STRUCT_LIT:
+        return emit_struct_lit(em, e);
+    case E_ARRAY_LIT:
+        return emit_array_lit(em, e);
     case E_UNARY: {
         if (e->negative_literal) {
             return c_int_value(e->type, true, e->value);
@@ -450,9 +637,12 @@ static const char *emit_expr(Emitter *em, const Expr *e) {
         }
         const char *l = emit_expr(em, e->base);
         const char *r = emit_expr(em, e->rhs);
-        static const char *const cmp[] = {[B_EQ] = "==", [B_NE] = "!=", [B_LT] = "<",
-                                          [B_LE] = "<=", [B_GT] = ">",  [B_GE] = ">="};
-        if (e->binary >= B_EQ) {
+        if (e->binary == B_EQ || e->binary == B_NE) {
+            const char *eq = equal(e->base->type, l, r);
+            return to_temp(em, type_bool(), e->binary == B_EQ ? eq : arena_printf("(!%s)", eq));
+        }
+        static const char *const cmp[] = {[B_LT] = "<", [B_LE] = "<=", [B_GT] = ">", [B_GE] = ">="};
+        if (e->binary >= B_LT) {
             return to_temp(em, type_bool(), arena_printf("(%s %s %s)", l, cmp[e->binary], r));
         }
         return to_temp(em, e->type, int_op(em, e->binary, e->type, l, r, e->loc));
@@ -557,6 +747,81 @@ static void emit_while(Emitter *em, const Stmt *s) {
     }
 }
 
+// The C condition for one pattern, without enclosing parentheses; `m` names
+// the scrutinee's value.
+static const char *pattern_cond(const Pattern *p, const Type *t, const char *m) {
+    switch (p->kind) {
+    case P_WILDCARD:
+    case P_BIND:
+        return "true";
+    case P_INT:
+        return arena_printf("%s == %s", m, c_int_value(t, p->lo.negative, p->lo.magnitude));
+    case P_RANGE:
+        return arena_printf("%s >= %s && %s <= %s", m, c_int_value(t, p->lo.negative, p->lo.magnitude), m,
+                            c_int_value(t, p->hi.negative, p->hi.magnitude));
+    case P_BOOL:
+        return p->value ? m : arena_printf("!%s", m);
+    case P_VARIANT:
+        if (p->error) {
+            return arena_printf("%s == %d", m, p->error->id);
+        }
+        return arena_printf("%s.tag == %d", m, p->variant->tag);
+    default:
+        break;
+    }
+    fatal("internal error: cannot emit this pattern yet");
+}
+
+// Bindings: copies of the value, or views of it when the scrutinee is a
+// reference (§9).
+static void bind_pattern(Emitter *em, const Pattern *p, const char *temp, const char *m, bool by_ref) {
+    if (p->kind == P_BIND) {
+        line(em, "%s v_%s = %s;", c_type(p->binding->type), p->name, temp);
+        return;
+    }
+    if (p->kind != P_VARIANT || !p->variant) {
+        return;
+    }
+    for (size_t i = 0; i < p->field_pats.len; i++) {
+        const FieldPat *fp = p->field_pats.items[i];
+        if (!fp->binding) {
+            continue;
+        }
+        const char *field = arena_printf("%s.as.v_%s.f_%s", m, p->variant->name, fp->decl->name);
+        line(em, "%s v_%s = %s%s;", c_type(fp->binding->type), fp->bind, by_ref ? "&" : "", field);
+    }
+}
+
+static void emit_match(Emitter *em, const Stmt *s) {
+    const Type *st = s->expr->type;
+    bool by_ref = st->kind == TY_REF;
+    const Type *t = by_ref ? st->elem : st;
+    const char *temp = to_temp(em, st, emit_expr(em, s->expr));
+    const char *m = by_ref ? arena_printf("(*%s)", temp) : temp;
+    for (size_t i = 0; i < s->arms.len; i++) {
+        const MatchArm *arm = s->arms.items[i];
+        StrBuf cond = {0};
+        for (size_t j = 0; j < arm->patterns.len; j++) {
+            const char *c = pattern_cond(arm->patterns.items[j], t, m);
+            if (arm->patterns.len > 1) {
+                c = arena_printf("(%s)", c);
+            }
+            sb_printf(&cond, "%s%s", j > 0 ? " || " : "", c);
+        }
+        line(em, i == 0 ? "if (%s) {" : "} else if (%s) {", cond.data);
+        free(cond.data);
+        em->indent++;
+        if (arm->patterns.len == 1) {
+            bind_pattern(em, arm->patterns.items[0], temp, m, by_ref);
+        }
+        emit_scoped(em, arm->body);
+        em->indent--;
+    }
+    line(em, s->arms.len > 0 ? "} else {" : "{");
+    line(em, "    a0_trap(\"no match arm matched\", %s);", loc_arg(em, s->loc));
+    line(em, "}");
+}
+
 static void emit_stmt(Emitter *em, const Stmt *s) {
     switch (s->kind) {
     case S_EXPR:
@@ -615,9 +880,127 @@ static void emit_stmt(Emitter *em, const Stmt *s) {
         emit_braced(em, s->block);
         return;
     case S_MATCH:
-        break;
+        emit_match(em, s);
+        return;
     }
-    fatal("internal error: cannot emit this statement yet");
+}
+
+// ---- types ------------------------------------------------------------------
+
+static void define_type(StrBuf *out, const Type *t, Vec *done);
+
+// Defines the composite types t holds by value, then t itself.
+static void define_deps(StrBuf *out, const Type *t, Vec *done) {
+    if (t->kind == TY_SLICE || t->kind == TY_ARRAY || t->kind == TY_LIST || t->kind == TY_STRUCT || t->kind == TY_ENUM) {
+        define_type(out, t, done);
+    }
+}
+
+static void define_type(StrBuf *out, const Type *t, Vec *done) {
+    for (size_t i = 0; i < done->len; i++) {
+        if (done->items[i] == t || ((const Type *)done->items[i])->c_name == t->c_name) {
+            return;
+        }
+    }
+    vec_push(done, (void *)t);
+    switch (t->kind) {
+    case TY_SLICE:
+        sb_printf(out, "struct %s {\n    %s *ptr;\n    uint64_t len;\n};\n\n", t->c_name, c_type(t->elem));
+        return;
+    case TY_LIST:
+        sb_printf(out, "struct %s {\n    %s *data;\n    uint64_t len;\n    uint64_t cap;\n    a0_alloc_Allocator alloc;\n};\n\n",
+                  t->c_name, c_type(t->elem));
+        return;
+    case TY_ARRAY:
+        define_deps(out, t->elem, done);
+        sb_printf(out, "struct %s {\n    %s items[%llu];\n};\n\n", t->c_name, c_type(t->elem),
+                  (unsigned long long)(t->len > 0 ? t->len : 1));
+        return;
+    case TY_STRUCT:
+        for (int i = 0; i < t->nfields; i++) {
+            define_deps(out, t->fields[i].type, done);
+        }
+        sb_printf(out, "struct %s {\n", t->c_name);
+        if (t->nfields == 0) {
+            sb_puts(out, "    char a0_empty;\n");
+        }
+        for (int i = 0; i < t->nfields; i++) {
+            sb_printf(out, "    %s %s;\n", c_type(t->fields[i].type), t->fields[i].c_name);
+        }
+        sb_puts(out, "};\n\n");
+        return;
+    case TY_ENUM: {
+        bool payload = false;
+        for (size_t i = 0; i < t->decl->variants.len; i++) {
+            VariantDecl *v = t->decl->variants.items[i];
+            payload = payload || v->has_fields;
+            for (size_t j = 0; j < v->fields.len; j++) {
+                define_deps(out, ((FieldDecl *)v->fields.items[j])->type, done);
+            }
+        }
+        sb_printf(out, "struct %s {\n    uint32_t tag;\n", t->c_name);
+        if (payload) {
+            sb_puts(out, "    union {\n");
+            for (size_t i = 0; i < t->decl->variants.len; i++) {
+                VariantDecl *v = t->decl->variants.items[i];
+                if (!v->has_fields) {
+                    continue;
+                }
+                sb_puts(out, "        struct {\n");
+                for (size_t j = 0; j < v->fields.len; j++) {
+                    FieldDecl *f = v->fields.items[j];
+                    sb_printf(out, "            %s f_%s;\n", c_type(f->type), f->name);
+                }
+                sb_printf(out, "        } v_%s;\n", v->name);
+            }
+            sb_puts(out, "    } as;\n");
+        }
+        sb_puts(out, "};\n\n");
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+// Operations of alloc.List(T), one set per element type.
+static void define_list_ops(StrBuf *out, const Type *t) {
+    const char *n = t->c_name;
+    const char *e = c_type(t->elem);
+    if (t->used & USE_LIST_INIT) {
+        sb_printf(out, "static inline %s %s_init(a0_alloc_Allocator a) {\n    %s l = {0};\n    l.alloc = a;\n    return l;\n}\n\n",
+              n, n, n);
+    }
+    if (t->used & USE_LIST_PUSH) {
+        sb_printf(out,
+              "static inline void %s_push(%s *self, %s item) {\n"
+              "    if (self->len == self->cap) {\n"
+              "        uint64_t cap = self->cap ? self->cap * 2 : 8;\n"
+              "        self->data = a0_realloc(self->alloc, self->data, cap, sizeof(%s));\n"
+              "        self->cap = cap;\n"
+              "    }\n"
+              "    self->data[self->len++] = item;\n"
+              "}\n\n",
+              n, n, e, e);
+    }
+    if (t->used & USE_LIST_CLEAR) {
+        sb_printf(out, "static inline void %s_clear(%s *self) {\n    self->len = 0;\n}\n\n", n, n);
+    }
+    if (t->used & USE_LIST_ITEMS) {
+        sb_printf(out, "static inline %s %s_items(%s *self) {\n    %s s = {self->data, self->len};\n    return s;\n}\n\n",
+              t->elem->slice_cache[0]->c_name, n, n, t->elem->slice_cache[0]->c_name);
+    }
+}
+
+// a0_eq_T for a struct type that == works on, field by field (§5.5).
+static void define_equality(StrBuf *out, const Type *t) {
+    sb_printf(out, "static inline bool a0_eq_%s(%s a, %s b) {\n    (void)a;\n    (void)b;\n    return true", t->c_name,
+              t->c_name, t->c_name);
+    for (int i = 0; i < t->nfields; i++) {
+        const char *f = t->fields[i].c_name;
+        sb_printf(out, " && %s", equal(t->fields[i].type, arena_printf("a.%s", f), arena_printf("b.%s", f)));
+    }
+    sb_puts(out, ";\n}\n\n");
 }
 
 // ---- functions and the program ----------------------------------------------
@@ -644,6 +1027,9 @@ static void emit_fn(Emitter *em, const FnDecl *fn) {
     em->loops.len = 0;
     line(em, "%s {", signature(fn));
     em->indent++;
+    for (size_t i = 0; i < fn->params.len; i++) {
+        line(em, "(void)v_%s;", VEC_AT(fn->params, Param, i)->name); // Arche allows unused parameters
+    }
     emit_scoped(em, fn->body);
     if (returns_error_code(fn->ret) && !block_ends(fn->body)) {
         line(em, "return 0;");
@@ -653,37 +1039,79 @@ static void emit_fn(Emitter *em, const FnDecl *fn) {
     line(em, "%s", "");
 }
 
-void emit_program(Module *root, StrBuf *out) {
+static void all_fns(const Program *p, Vec *out) {
+    for (size_t i = 0; i < p->modules.len; i++) {
+        const Module *m = p->modules.items[i];
+        for (size_t j = 0; j < m->fns.len; j++) {
+            vec_push(out, m->fns.items[j]);
+        }
+        for (size_t j = 0; j < m->types.len; j++) {
+            const TypeDecl *td = m->types.items[j];
+            for (size_t k = 0; k < td->methods.len; k++) {
+                vec_push(out, td->methods.items[k]);
+            }
+        }
+    }
+}
+
+void emit_program(Program *p, StrBuf *out) {
+    Vec fns = {0};
+    all_fns(p, &fns);
     StrBuf body = {0};
     Emitter em = {.out = &body};
-    for (size_t i = 0; i < root->fns.len; i++) {
-        emit_fn(&em, VEC_AT(root->fns, FnDecl, i));
+    for (size_t i = 0; i < fns.len; i++) {
+        emit_fn(&em, fns.items[i]);
     }
-    FnDecl *main = NULL;
-    for (size_t i = 0; i < root->fns.len; i++) {
-        if (strcmp(VEC_AT(root->fns, FnDecl, i)->name, "main") == 0) {
-            main = VEC_AT(root->fns, FnDecl, i);
+
+    sb_printf(out, "// Generated by arche0 from %s. Do not edit.\n#include \"arche0_rt.h\"\n\n", p->root->file->display);
+    for (size_t i = 0; i < em.files.len; i++) {
+        const SourceFile *f = em.files.items[i];
+        sb_printf(out, "static const char a0_file_%zu[] = %s;\n", i, c_string(f->display, strlen(f->display)));
+    }
+    sb_puts(out, "\n");
+
+    Vec *types = composite_types();
+    for (size_t i = 0; i < types->len; i++) {
+        const Type *t = types->items[i];
+        sb_printf(out, "typedef struct %s %s;\n", t->c_name, t->c_name);
+    }
+    sb_puts(out, "\n");
+    Vec done = {0};
+    for (size_t i = 0; i < types->len; i++) {
+        define_type(out, types->items[i], &done);
+    }
+    for (size_t i = 0; i < types->len; i++) {
+        const Type *t = types->items[i];
+        if (t->kind == TY_LIST) {
+            define_list_ops(out, t);
+        }
+    }
+    // Struct equality, in definition order so that a struct's fields come first.
+    for (size_t i = 0; i < done.len; i++) {
+        const Type *t = done.items[i];
+        if (t->kind == TY_STRUCT && (t->used & USE_EQ)) {
+            define_equality(out, t);
         }
     }
 
-    em.out = out;
-    line(&em, "// Generated by arche0 from %s. Do not edit.", root->file->display);
-    line(&em, "#include \"arche0_rt.h\"");
-    line(&em, "%s", "");
-    for (size_t i = 0; i < em.files.len; i++) {
-        const SourceFile *f = em.files.items[i];
-        line(&em, "static const char a0_file_%zu[] = %s;", i, c_string(f->display, strlen(f->display)));
+    for (size_t i = 0; i < fns.len; i++) {
+        sb_printf(out, "%s;\n", signature(fns.items[i]));
     }
-    line(&em, "%s", "");
-    for (size_t i = 0; i < root->fns.len; i++) {
-        line(&em, "%s;", signature(VEC_AT(root->fns, FnDecl, i)));
-    }
-    line(&em, "%s", "");
+    sb_puts(out, "\n");
     sb_add(out, body.data, body.len);
     free(body.data);
-    line(&em, "a0_err a0_entry(a0_std_System *sys) {");
-    line(&em, "    return %s(sys);", main->c_name);
-    line(&em, "}");
-    line(&em, "%s", "");
-    line(&em, "const char *const a0_error_names[] = {\"\"};");
+
+    FnDecl *main = NULL;
+    for (size_t i = 0; i < p->root->fns.len; i++) {
+        if (strcmp(VEC_AT(p->root->fns, FnDecl, i)->name, "main") == 0) {
+            main = VEC_AT(p->root->fns, FnDecl, i);
+        }
+    }
+    sb_printf(out, "a0_err a0_entry(a0_std_System *sys) {\n    return %s(sys);\n}\n\n", main->c_name);
+    sb_puts(out, "const char *const a0_error_names[] = {\"\"");
+    for (int id = 1; id <= error_count(); id++) {
+        const char *name = error_name(id);
+        sb_printf(out, ", %s", c_string(name, strlen(name)));
+    }
+    sb_puts(out, "};\n");
 }
