@@ -135,3 +135,22 @@ Every diagnostic of the Arche compiler has a stable code. A code never changes m
 | `E0604` | A place used while a view of it is live, through another path: written or viewed `&mut` while viewed, or used at all while viewed `&mut` (§5.4). |
 | `E0605` | A move-only value used after it was moved (§5.5). |
 | `E0606` | A move out of a place reached through a view (§5.5). |
+
+## Packages, generics and interfaces
+
+Reserved for the full language (spec/arche.md); assigned as the compiler implements each chapter.
+
+| Code | Meaning |
+| --- | --- |
+| `E0801` | A capability type that the package manifest does not list in `needs` (§1.3). |
+| `E0830` | A `comptime` type argument that does not implement an interface its `where` bound requires (§5.2). |
+| `E0840` | Compile-time evaluation that runs too many steps or recurses too deep (§4.3). |
+
+## Regions, contracts, concurrency and unsafe
+
+| Code | Meaning |
+| --- | --- |
+| `E0901` | A value bound to a region that leaves the region's block (§7). |
+| `E0902` | A `&mut` view captured by a task while another task or its scope uses the place (§9). |
+| `E0910` | An operation that can panic or trap in a `nopanic` function (§8.2). |
+| `E0920` | An `unsafe` block without a `// SAFETY:` comment, in a package that sets `strict_unsafe` (§10.1). |
