@@ -16,6 +16,7 @@ import syntax.token as tk;
 import sema.types as ty;
 import sema.stmt;
 import sema.consts;
+import sema.memory;
 
 pub const NONE: u32 = 4294967295;
 /// node_refs of a FieldExpr that reads a field of a value: it is a place.
@@ -651,7 +652,10 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
                 return ty.invalid();
             }
             if alias.library != Library.NotLibrary {
-                match library_type(c, alias.library, text(c, second)) {
+                // A copy: library_type changes c, so no view of c may go with it.
+                var name = alloc.String.init(c.a);
+                name.push_str(text(c, second));
+                match library_type(c, alias.library, name.view()) {
                     some(t) => { return t; }
                     none => { }
                 }
@@ -1298,6 +1302,10 @@ pub fn check(p: program.Program) -> program.Program {
                 stmt.check_test(&mut c, m as u32, n);
             }
         }
+    }
+    // The memory model (§5.4, §5.5) is checked once the types are right.
+    if c.p.diags.count() == 0 {
+        memory.check(&mut c);
     }
     return c.p;
 }

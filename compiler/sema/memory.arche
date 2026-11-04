@@ -1,0 +1,1333 @@
+/// The memory checker: the view rules of spec/arche-0.md §5.4 and the move
+/// rules of §5.5. It runs on a program that type-checked cleanly.
+///
+/// Places are tracked by path. A path is text: the number of the binding
+/// it starts from, then ".name" for a field and ".*" for an element or what
+/// a reference refers to: "3.tokens.*". A view binding knows the canonical
+/// path of the place it views, the path that starts from an owning binding
+/// or from a view parameter, so two paths to one place are seen to overlap.
+///
+/// Each function is walked twice. The first walk gives every binding a
+/// number and finds where each is last used: a view is live from where it
+/// is made to its last use, and through the rest of a loop it is used in.
+/// The second walk follows evaluation order with the set of moved paths,
+/// and checks every access against the live views.
+import alloc;
+import codes;
+import diag;
+import syntax.cst;
+import syntax.token as tk;
+import sema.check as ck;
+import sema.expr;
+import sema.types as ty;
+
+// ---- types ------------------------------------------------------------------
+
+pub fn is_view(c: &ck.Checker, t: ty.TypeId) -> bool {
+    let k = c.t.kind(t);
+    return k == ty.Kind.Ref or k == ty.Kind.Slice or k == ty.Kind.Str;
+}
+
+/// Containers, capabilities, and whatever holds one (§5.5).
+pub fn is_move_only(c: &ck.Checker, t: ty.TypeId) -> bool {
+    return move_only_within(c, t, 0);
+}
+
+fn move_only_within(c: &ck.Checker, t: ty.TypeId, depth: u32) -> bool {
+    if depth > 64 {
+        return false; // a type that contains itself: reported already
+    }
+    let info = c.t.get(t);
+    match info.kind {
+        .List | .Map => { return true; }
+        .Builtin => {
+            return info.builtin != ty.Builtin.Allocator and info.builtin != ty.Builtin.Symbol;
+        }
+        .Array | .Optional => { return move_only_within(c, info.elem, depth + 1); }
+        .ErrorUnion => { return move_only_within(c, info.elem, depth + 1); }
+        .Struct => {
+            let d = c.decls[info.decl as usize];
+            var i = d.members_start;
+            while i < d.members_start + d.members_len : (i += 1) {
+                if move_only_within(c, c.fields[i as usize].type_id, depth + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        .Enum => {
+            let d = c.decls[info.decl as usize];
+            var v = d.members_start;
+            while v < d.members_start + d.members_len : (v += 1) {
+                let variant = c.variants[v as usize];
+                var f = variant.fields_start;
+                while f < variant.fields_start + variant.fields_len : (f += 1) {
+                    if move_only_within(c, c.fields[f as usize].type_id, depth + 1) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+}
+
+/// The first view inside t where views cannot be (§5.4 rule 2): t itself
+/// may be one only when `top` (a parameter, local, return or a reference's
+/// target).
+fn misplaced_view(c: &ck.Checker, t: ty.TypeId, top: bool) -> bool {
+    let info = c.t.get(t);
+    match info.kind {
+        .Ref => { return misplaced_view(c, info.elem, true) or not top; }
+        .Slice => { return misplaced_view(c, info.elem, false) or not top; }
+        .Str => { return not top; }
+        .Array | .List | .Optional | .ErrorUnion => { return misplaced_view(c, info.elem, false); }
+        .Map => { return misplaced_view(c, info.key, false) or misplaced_view(c, info.elem, false); }
+        _ => { return false; }
+    }
+}
+
+fn report_misplaced(c: &mut ck.Checker, s: diag.Span, t: ty.TypeId, what: str) {
+    var m = ck.new_message(c);
+    m.push_str(what);
+    m.push_str(" has type ");
+    ck.write_type(c, &mut m, t);
+    m.push_str(", but a view can be only a parameter, a local, a return value or what a reference refers to (§5.4)");
+    ck.report_owned(c, codes.MISPLACED_VIEW, s, m);
+}
+
+/// Rule 2 for declared types: fields and payloads hold no views.
+fn check_declarations(c: &mut ck.Checker) {
+    var d: usize = 0;
+    while d < c.decls.len() : (d += 1) {
+        let decl = c.decls[d];
+        if d as u32 == c.io_error {
+            continue;
+        }
+        c.module = decl.module;
+        if decl.kind == ck.DeclKind.Struct {
+            var f = decl.members_start;
+            while f < decl.members_start + decl.members_len : (f += 1) {
+                let field = c.fields[f as usize];
+                if misplaced_view(c, field.type_id, false) {
+                    let s = ck.token_span(c, field.name_token);
+                    report_misplaced(c, s, field.type_id, "this field");
+                }
+            }
+        } else if decl.kind == ck.DeclKind.Enum {
+            var v = decl.members_start;
+            while v < decl.members_start + decl.members_len : (v += 1) {
+                let variant = c.variants[v as usize];
+                var f = variant.fields_start;
+                while f < variant.fields_start + variant.fields_len : (f += 1) {
+                    let field = c.fields[f as usize];
+                    if misplaced_view(c, field.type_id, false) {
+                        let s = ck.token_span(c, field.name_token);
+                        report_misplaced(c, s, field.type_id, "this payload field");
+                    }
+                }
+            }
+        } else if decl.kind == ck.DeclKind.Fn {
+            check_signature(c, decl.fn_index);
+        }
+    }
+}
+
+/// Rule 2 for parameters and results, and rule 3: a function returns a
+/// view only with at most one view parameter.
+fn check_signature(c: &mut ck.Checker, f: u32) {
+    let info = c.fns[f as usize];
+    var views: u32 = 0;
+    var i = info.params_start;
+    while i < info.params_start + info.params_len : (i += 1) {
+        let p = c.params[i as usize];
+        if misplaced_view(c, p.type_id, true) {
+            let s = ck.token_span(c, p.name_token);
+            report_misplaced(c, s, p.type_id, "this parameter");
+        }
+        if is_view(c, p.type_id) {
+            views += 1;
+        }
+    }
+    let decl = c.decls[info.decl as usize];
+    if misplaced_view(c, info.ret, true) {
+        let s = ck.token_span(c, decl.name_token);
+        report_misplaced(c, s, info.ret, "the result of this function");
+    }
+    if is_view(c, info.ret) and views > 1 {
+        let s = ck.token_span(c, decl.name_token);
+        ck.report(c, codes.TOO_MANY_VIEWS, s, "this function returns a view, so it can take at most one view parameter: the one the result is a projection of (§5.4)");
+    }
+}
+
+// ---- bindings and paths -----------------------------------------------------------
+
+type Binding = struct {
+    name: alloc.Symbol,
+    type_id: ty.TypeId,
+    /// The block depth it is declared at.
+    depth: u32,
+    /// Token positions: where it is declared, and the end of its life.
+    decl_pos: u32,
+    live_end: u32,
+    is_view: bool,
+    is_param: bool,
+    /// A view: whether it is &mut or []mut, whether it views static
+    /// memory, and the view binding its target is reached through.
+    mutable_view: bool,
+    static_target: bool,
+    parent: u32,
+}
+
+type Loop = struct {
+    start: u32,
+    end: u32,
+}
+
+/// What a view expression views.
+type View = struct {
+    target: alloc.String,
+    /// The binding the view is reached through, or NONE.
+    root: u32,
+    is_static: bool,
+    mutable: bool,
+}
+
+type Access = enum { Read, Write, ViewShared, ViewMut, Move }
+
+/// The analysis of one function.
+type Fn = struct {
+    bindings: alloc.List(Binding),
+    /// targets[b]: for a view binding, the canonical path of what it views;
+    /// for any other binding, its own number.
+    targets: alloc.List(alloc.String),
+    scope: alloc.List(u32),
+    depth: u32,
+    /// NameExpr node -> binding, and declaring node -> binding.
+    uses: alloc.Map(u32, u32),
+    decls: alloc.Map(u32, u32),
+    loops: alloc.List(Loop),
+    /// The moved paths, and whether this point can be reached at all.
+    moved: alloc.List(alloc.String),
+    dead: bool,
+    /// The moved paths at each break of the innermost loop, joined.
+    break_moved: alloc.List(alloc.String),
+    reported: alloc.Map(u64, bool),
+    returns_view: bool,
+    deferred: alloc.List(cst.NodeId),
+}
+
+fn new_fn(a: alloc.Allocator) -> Fn {
+    return Fn {
+        bindings: alloc.List(Binding).init(a),
+        targets: alloc.List(alloc.String).init(a),
+        scope: alloc.List(u32).init(a),
+        depth: 0,
+        uses: alloc.Map(u32, u32).init(a),
+        decls: alloc.Map(u32, u32).init(a),
+        loops: alloc.List(Loop).init(a),
+        moved: alloc.List(alloc.String).init(a),
+        dead: false,
+        break_moved: alloc.List(alloc.String).init(a),
+        reported: alloc.Map(u64, bool).init(a),
+        returns_view: false,
+        deferred: alloc.List(cst.NodeId).init(a),
+    };
+}
+
+fn pos_of(c: &ck.Checker, n: cst.NodeId) -> u32 {
+    return ck.tree(c).first_token(n);
+}
+
+fn end_of(c: &ck.Checker, n: cst.NodeId) -> u32 {
+    return ck.node(c, n).end;
+}
+
+fn number_text(m: &mut alloc.String, n: u32) {
+    ck.write_number(m, n as u64);
+}
+
+/// The binding a path starts from.
+fn path_root(path: str) -> u32 {
+    var n: u32 = 0;
+    var i: usize = 0;
+    while i < path.len() and path[i] >= '0' and path[i] <= '9' : (i += 1) {
+        n = n * 10 + (path[i] - '0') as u32;
+    }
+    return n;
+}
+
+/// One path is the other, or a prefix of it at a component boundary.
+fn overlap(a: str, b: str) -> bool {
+    var short = a;
+    var long = b;
+    if a.len() > b.len() {
+        short = b;
+        long = a;
+    }
+    return long.starts_with(short) and (long.len() == short.len() or long[short.len()] == '.');
+}
+
+fn copy_text(s: str, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    out.push_str(s);
+    return out;
+}
+
+fn report_once(c: &mut ck.Checker, f: &mut Fn, code: u16, n: cst.NodeId, message: alloc.String) {
+    let key = (pos_of(c, n) as u64 << 16) | code as u64;
+    match f.reported.get(key) {
+        some(_) => { return; }
+        none => { }
+    }
+    f.reported.put(key, true);
+    let s = ck.span_of(c, n);
+    ck.report_owned(c, code, s, message);
+}
+
+// ---- the first walk: bindings and uses --------------------------------------------
+
+fn new_binding(c: &ck.Checker, f: &mut Fn, name: alloc.Symbol, t: ty.TypeId, pos: u32) -> u32 {
+    let id = f.bindings.len() as u32;
+    f.bindings.push(Binding {
+        name: name,
+        type_id: t,
+        depth: f.depth,
+        decl_pos: pos,
+        live_end: pos,
+        is_view: is_view(c, t),
+        is_param: false,
+        mutable_view: c.t.get(t).mutable,
+        static_target: false,
+        parent: ck.NONE,
+    });
+    var own_path = alloc.String.init(c.a);
+    number_text(&mut own_path, id);
+    f.targets.push(own_path);
+    f.scope.push(id);
+    return id;
+}
+
+fn resolve(f: &Fn, name: alloc.Symbol) -> ?u32 {
+    var i = f.scope.len();
+    while i > 0 : (i -= 1) {
+        let b = f.scope[i - 1];
+        if f.bindings[b as usize].name == name {
+            return b;
+        }
+    }
+    return none;
+}
+
+fn record_use(f: &mut Fn, b: u32, pos: u32) {
+    var end = pos;
+    let loops = f.loops.items();
+    var i: usize = 0;
+    while i < loops.len() : (i += 1) {
+        if f.bindings[b as usize].decl_pos < loops[i].start and loops[i].end > end {
+            end = loops[i].end;
+        }
+    }
+    if end > f.bindings[b as usize].live_end {
+        f.bindings[b as usize].live_end = end;
+    }
+}
+
+fn first_block(c: &mut ck.Checker, f: &mut Fn, b: cst.NodeId) {
+    let saved = f.scope.len();
+    f.depth += 1;
+    let count = ck.child_count(c, b);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        first_node(c, f, ck.child(c, b, i));
+    }
+    f.depth -= 1;
+    while f.scope.len() > saved {
+        _ = f.scope.pop();
+    }
+}
+
+fn declare_at(c: &mut ck.Checker, f: &mut Fn, node: cst.NodeId, name_token: u32) {
+    let sym = ck.symbol(c, name_token);
+    let t = ck.type_of(c, node);
+    let id = new_binding(c, f, sym, t, name_token);
+    f.decls.put(node.index, id);
+}
+
+fn first_pattern(c: &mut ck.Checker, f: &mut Fn, p: cst.NodeId) {
+    match ck.kind_of(c, p) {
+        .BindPat => { declare_at(c, f, p, ck.ident_of(c, p)); }
+        .SomePat | .OkPat | .ErrPat => { first_pattern(c, f, ck.child(c, p, 0)); }
+        .VariantPat => {
+            let count = ck.child_count(c, p);
+            var i: u32 = 0;
+            while i < count : (i += 1) {
+                let fp = ck.child(c, p, i);
+                let toks = ck.own(c, fp);
+                var bind = toks[0];
+                if toks.len() == 3 {
+                    bind = toks[2];
+                }
+                if ck.tok_kind(c, bind) == tk.Kind.Ident {
+                    declare_at(c, f, fp, bind);
+                }
+            }
+        }
+        _ => { }
+    }
+}
+
+fn first_node(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) {
+    let count = ck.child_count(c, n);
+    match ck.kind_of(c, n) {
+        .Block => {
+            first_block(c, f, n);
+            return;
+        }
+        .LetStmt => {
+            first_node(c, f, ck.child(c, n, count - 1));
+            declare_at(c, f, n, ck.ident_of(c, n));
+            return;
+        }
+        .WhileStmt => {
+            f.loops.push(Loop { start: pos_of(c, n), end: end_of(c, n) });
+            var i: u32 = 0;
+            while i < count : (i += 1) {
+                first_node(c, f, ck.child(c, n, i));
+            }
+            _ = f.loops.pop();
+            return;
+        }
+        .MatchStmt => {
+            first_node(c, f, ck.child(c, n, 0));
+            var i: u32 = 1;
+            while i < count : (i += 1) {
+                let arm = ck.child(c, n, i);
+                let saved = f.scope.len();
+                f.depth += 1;
+                let parts = ck.child_count(c, arm);
+                var j: u32 = 0;
+                while j + 1 < parts : (j += 1) {
+                    first_pattern(c, f, ck.child(c, arm, j));
+                }
+                first_block(c, f, ck.child(c, arm, parts - 1));
+                f.depth -= 1;
+                while f.scope.len() > saved {
+                    _ = f.scope.pop();
+                }
+            }
+            return;
+        }
+        .NameExpr => {
+            let sym = ck.symbol(c, ck.ident_of(c, n));
+            match resolve(f, sym) {
+                some(b) => {
+                    f.uses.put(n.index, b);
+                    record_use(f, b: b, pos: pos_of(c, n));
+                }
+                none => { }
+            }
+            return;
+        }
+        .FieldExpr => {
+            first_node(c, f, ck.child(c, n, 0));
+            return;
+        }
+        .StructLit => {
+            var i: u32 = 1;
+            while i < count : (i += 1) {
+                first_node(c, f, ck.child(c, n, i));
+            }
+            return;
+        }
+        .TypePath | .TypeRef | .TypeSlice | .TypeArray | .TypeOptional | .TypeErrorUnion => {
+            return;
+        }
+        _ => { }
+    }
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        first_node(c, f, ck.child(c, n, i));
+    }
+}
+
+// ---- the second walk: accesses ----------------------------------------------------
+
+fn digits_end(path: str) -> usize {
+    var i: usize = 0;
+    while i < path.len() and path[i] >= '0' and path[i] <= '9' : (i += 1) {
+    }
+    return i;
+}
+
+/// The path that starts from an owning binding or a view parameter: a path
+/// through a view binding goes through what it views instead. A path that
+/// is the view binding alone names the variable, not what it views.
+fn canon(f: &Fn, path: str, a: alloc.Allocator) -> alloc.String {
+    let r = path_root(path);
+    let b = f.bindings[r as usize];
+    if b.is_view and not b.is_param and not b.static_target and digits_end(path) < path.len() {
+        var out = copy_text(f.targets[r as usize].view(), a);
+        out.push_str(path[digits_end(path)..path.len()]);
+        return out;
+    }
+    return copy_text(path, a);
+}
+
+/// v is the binding r, or a view binding r is reached through.
+fn in_family(f: &Fn, r: u32, v: u32) -> bool {
+    var b = r;
+    var steps: u32 = 0;
+    while b != ck.NONE and steps < 1000 : (steps += 1) {
+        if b == v {
+            return true;
+        }
+        b = f.bindings[b as usize].parent;
+    }
+    return false;
+}
+
+fn in_scope(f: &Fn, b: u32) -> bool {
+    let items = f.scope.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        if items[i] == b {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn binding_name(c: &ck.Checker, f: &Fn, b: u32, m: &mut alloc.String) {
+    m.push_str("'");
+    m.push_str(c.names.text(f.bindings[b as usize].name));
+    m.push_str("'");
+}
+
+/// Checks one access to a place, at node n, and applies its effect.
+fn access(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId, path: str, kind: Access) {
+    if f.dead {
+        return;
+    }
+    let root = path_root(path);
+    let cp = canon(f, path, c.a);
+    let cpath = cp.view();
+    // §5.5: a moved value is not used again until it is reassigned.
+    // The loops below find a problem first and report it after, so that no
+    // view of f is live while f changes.
+    var used_moved = false;
+    let moved = f.moved.items();
+    var i: usize = 0;
+    while i < moved.len() and not used_moved : (i += 1) {
+        let m = moved[i].view();
+        // Reassigning the moved value, or a whole that holds it, is fine.
+        used_moved = overlap(a: m, b: cpath) and not (kind == Access.Write and cpath.len() <= m.len());
+    }
+    if used_moved {
+        var msg = ck.new_message(c);
+        msg.push_str("this value was moved before; it cannot be used until it is assigned again");
+        report_once(c, f, codes.USE_AFTER_MOVE, n, msg);
+    }
+    // §5.4: the live views of the place, other than the one used, forbid
+    // this access.
+    let pos = pos_of(c, n);
+    let writes = kind == Access.Write or kind == Access.ViewMut or kind == Access.Move;
+    var blocker = ck.NONE;
+    let scope = f.scope.items();
+    var s: usize = 0;
+    while s < scope.len() and blocker == ck.NONE : (s += 1) {
+        let v = scope[s];
+        let b = f.bindings[v as usize];
+        let live = b.is_view and not b.is_param and not b.static_target and b.decl_pos < pos and pos <= b.live_end;
+        if live and (b.mutable_view or writes) and not in_family(f, r: root, v: v) and
+            overlap(a: cpath, b: f.targets[v as usize].view()) {
+            blocker = v;
+        }
+    }
+    if blocker != ck.NONE {
+        var msg = ck.new_message(c);
+        if f.bindings[blocker as usize].mutable_view {
+            msg.push_str("this place is in use: the &mut view ");
+        } else {
+            msg.push_str("this place cannot change here: the view ");
+        }
+        binding_name(c, f, blocker, &mut msg);
+        msg.push_str(" of it is still live (§5.4)");
+        report_once(c, f, codes.EXCLUSIVITY, n, msg);
+    }
+    if kind == Access.Move {
+        if f.bindings[root as usize].is_view {
+            var msg = ck.new_message(c);
+            msg.push_str("this value is reached through a view and cannot be moved out of it; copy it, or move the whole value the view comes from");
+            report_once(c, f, codes.MOVE_FROM_VIEW, n, msg);
+        } else {
+            f.moved.push(copy_text(cpath, c.a));
+        }
+    }
+    if kind == Access.Write {
+        var kept = alloc.List(alloc.String).init(c.a);
+        let all = f.moved.items();
+        var j: usize = 0;
+        while j < all.len() : (j += 1) {
+            let m = all[j].view();
+            let reinit = m.starts_with(cpath) and (m.len() == cpath.len() or m[cpath.len()] == '.');
+            if not reinit {
+                kept.push(copy_text(m, c.a));
+            }
+        }
+        f.moved = kept;
+    }
+}
+
+/// The path of a place expression into out, evaluating the indexes inside
+/// it. False when e is not a place but a temporary.
+fn place(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId, out: &mut alloc.String) -> bool {
+    match ck.kind_of(c, e) {
+        .NameExpr => {
+            match f.uses.get(e.index) {
+                some(b) => {
+                    number_text(out, b);
+                    return true;
+                }
+                none => { return false; }
+            }
+        }
+        .ParenExpr => { return place(c, f, ck.child(c, e, 0), out); }
+        .FieldExpr => {
+            if ck.ref_of(c, e) != ck.VALUE_FIELD {
+                return false;
+            }
+            let base = ck.child(c, e, 0);
+            if not place_or_view(c, f, base, out) {
+                return false;
+            }
+            out.push_str(".");
+            out.push_str(ck.text(c, expr.member_token(c, e)));
+            return true;
+        }
+        .IndexExpr => {
+            let found = place_or_view(c, f, ck.child(c, e, 0), out);
+            eval(c, f, ck.child(c, e, 1), false);
+            if found {
+                out.push_str(".*");
+            }
+            return found;
+        }
+        .DerefExpr => {
+            let found = place_or_view(c, f, ck.child(c, e, 0), out);
+            if found {
+                out.push_str(".*");
+            }
+            return found;
+        }
+        _ => { return false; }
+    }
+}
+
+/// A place, or what a view-valued temporary views (a call returning &T):
+/// both lead to memory that a path names.
+fn place_or_view(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId, out: &mut alloc.String) -> bool {
+    if place(c, f, e, out) {
+        return true;
+    }
+    if is_view(c, ck.type_of(c, e)) {
+        let v = view_of(c, f, e);
+        if v.is_static {
+            return false;
+        }
+        out.push_str(v.target.view());
+        return true;
+    }
+    eval(c, f, e, false);
+    return false;
+}
+
+fn static_view(a: alloc.Allocator) -> View {
+    return View { target: alloc.String.init(a), root: ck.NONE, is_static: true, mutable: false };
+}
+
+fn view_of_binding(c: &ck.Checker, f: &Fn, b: u32) -> View {
+    let info = f.bindings[b as usize];
+    return View {
+        target: copy_text(f.targets[b as usize].view(), c.a),
+        root: b,
+        is_static: info.static_target,
+        mutable: info.mutable_view,
+    };
+}
+
+fn view_of_place(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId, path: str, mutable: bool) -> View {
+    if mutable {
+        access(c, f, n, path, Access.ViewMut);
+    } else {
+        access(c, f, n, path, Access.ViewShared);
+    }
+    return View { target: canon(f, path, c.a), root: path_root(path), is_static: false, mutable: mutable };
+}
+
+/// Evaluates a view-valued expression and says what it views.
+fn view_of(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId) -> View {
+    let t = ck.type_of(c, e);
+    let mutable = c.t.get(t).mutable;
+    match ck.kind_of(c, e) {
+        .StringLit => { return static_view(c.a); }
+        .ParenExpr => { return view_of(c, f, ck.child(c, e, 0)); }
+        .NameExpr => {
+            match f.uses.get(e.index) {
+                some(b) => {
+                    var own_path = alloc.String.init(c.a);
+                    number_text(&mut own_path, b);
+                    access(c, f, e, own_path.view(), Access.Read);
+                    return view_of_binding(c, f, b);
+                }
+                none => { return static_view(c.a); } // a str constant
+            }
+        }
+        .FieldExpr => {
+            if ck.ref_of(c, e) != ck.VALUE_FIELD {
+                return static_view(c.a); // a str constant of another module
+            }
+        }
+        .RefExpr => {
+            var out = alloc.String.init(c.a);
+            if place(c, f, ck.child(c, e, 0), &mut out) {
+                return view_of_place(c, f, e, out.view(), ck.has_own(c, e, tk.Kind.KwMut));
+            }
+            eval(c, f, ck.child(c, e, 0), false);
+            return static_view(c.a);
+        }
+        .SliceExpr => {
+            let base = ck.child(c, e, 0);
+            let k = c.t.kind(ck.type_of(c, base));
+            if k == ty.Kind.Array or k == ty.Kind.List {
+                var out = alloc.String.init(c.a);
+                let found = place(c, f, base, &mut out);
+                eval(c, f, ck.child(c, e, 1), false);
+                eval(c, f, ck.child(c, e, 2), false);
+                if found {
+                    return view_of_place(c, f, e, out.view(), mutable);
+                }
+                return static_view(c.a);
+            }
+            var v = view_of(c, f, base);
+            eval(c, f, ck.child(c, e, 1), false);
+            eval(c, f, ck.child(c, e, 2), false);
+            v.mutable = mutable;
+            return v;
+        }
+        .CallExpr => { return call(c, f, e); }
+        _ => { }
+    }
+    // A view read from a place: r.* of a &str, for one.
+    var out = alloc.String.init(c.a);
+    if place(c, f, e, &mut out) {
+        access(c, f, e, out.view(), Access.Read);
+        return View { target: canon(f, out.view(), c.a), root: path_root(out.view()), is_static: false, mutable: mutable };
+    }
+    eval(c, f, e, false);
+    return static_view(c.a);
+}
+
+/// The view arguments of one call, with where each is written.
+type CallViews = struct {
+    views: alloc.List(View),
+    nodes: alloc.List(cst.NodeId),
+}
+
+fn add_view(cv: &mut CallViews, v: View, n: cst.NodeId) {
+    cv.views.push(v);
+    cv.nodes.push(n);
+}
+
+/// Evaluates an argument passed as a parameter of type pt.
+fn argument(c: &mut ck.Checker, f: &mut Fn, cv: &mut CallViews, e: cst.NodeId, pt: ty.TypeId) {
+    if is_view(c, pt) {
+        var v = view_of(c, f, e);
+        v.mutable = c.t.get(pt).mutable;
+        add_view(cv, v, e);
+    } else {
+        eval(c, f, e, true);
+    }
+}
+
+/// Evaluates a call in order: the receiver, then the arguments. The views
+/// it is given are live during the call, so no two of them may overlap
+/// when one is mutable (§5.4). Returns what the result views, when it is a
+/// view: the projection of the one view argument, or static memory.
+fn call(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> View {
+    let callee = ck.child(c, n, 0);
+    let nargs = ck.child_count(c, n) - 1;
+    var cv = CallViews { views: alloc.List(View).init(c.a), nodes: alloc.List(cst.NodeId).init(c.a) };
+    var params = alloc.List(ty.TypeId).init(c.a);
+    let d = ck.ref_of(c, n);
+    var is_method = false;
+    var mode = ck.SelfMode.Value;
+    if ck.kind_of(c, callee) == cst.Kind.FieldExpr and not ck.is_invalid(c, ck.type_of(c, callee)) {
+        is_method = true;
+    }
+    if d != ck.NONE and c.decls[d as usize].kind == ck.DeclKind.Fn {
+        let info = c.fns[c.decls[d as usize].fn_index as usize];
+        var skip: u32 = 0;
+        if is_method {
+            skip = 1;
+            mode = info.self_mode;
+        }
+        var i = info.params_start + skip;
+        while i < info.params_start + info.params_len : (i += 1) {
+            params.push(c.params[i as usize].type_id);
+        }
+    } else if is_method {
+        var t = ck.type_of(c, callee);
+        if c.t.kind(t) == ty.Kind.Ref {
+            t = c.t.elem(t);
+        }
+        var name = alloc.String.init(c.a);
+        name.push_str(ck.text(c, expr.member_token(c, callee)));
+        match expr.builtin_method(c, t, name.view()) {
+            some(m) => {
+                mode = m.self_mode;
+                if m.nparams > 0 {
+                    params.push(m.p0.type_id);
+                }
+                if m.nparams > 1 {
+                    params.push(m.p1.type_id);
+                }
+            }
+            none => { }
+        }
+    }
+    if is_method {
+        let receiver = ck.child(c, callee, 0);
+        let rt = ck.type_of(c, receiver);
+        if mode == ck.SelfMode.Value {
+            if is_view(c, rt) {
+                let v = view_of(c, f, receiver);
+                add_view(&mut cv, v, receiver);
+            } else {
+                eval(c, f, receiver, true);
+            }
+        } else {
+            let mutable = mode == ck.SelfMode.MutRef;
+            if c.t.kind(rt) == ty.Kind.Ref {
+                var v = view_of(c, f, receiver);
+                v.mutable = mutable;
+                add_view(&mut cv, v, receiver);
+            } else {
+                var out = alloc.String.init(c.a);
+                if place(c, f, receiver, &mut out) {
+                    let v = view_of_place(c, f, receiver, out.view(), mutable);
+                    add_view(&mut cv, v, receiver);
+                } else {
+                    eval(c, f, receiver, false);
+                }
+            }
+        }
+    }
+    var i: u32 = 0;
+    while i < nargs : (i += 1) {
+        let e = ck.child(c, ck.child(c, n, i + 1), 0);
+        var pt = ck.type_of(c, e);
+        if (i as usize) < params.len() {
+            pt = params[i as usize];
+        }
+        argument(c, f, &mut cv, e, pt);
+    }
+    check_call_views(c, f, &cv);
+    let rt = ck.type_of(c, n);
+    if c.t.kind(rt) == ty.Kind.Noreturn {
+        f.dead = true;
+    }
+    if not is_view(c, rt) or cv.views.len() == 0 {
+        return static_view(c.a);
+    }
+    let first = &cv.views[0];
+    return View { target: copy_text(first.target.view(), c.a), root: first.root, is_static: first.is_static, mutable: c.t.get(rt).mutable };
+}
+
+fn check_call_views(c: &mut ck.Checker, f: &mut Fn, cv: &CallViews) {
+    let vs = cv.views.items();
+    var clash = ck.NONE;
+    var i: usize = 0;
+    while i < vs.len() and clash == ck.NONE : (i += 1) {
+        var j: usize = 0;
+        while j < i : (j += 1) {
+            let a = &vs[i];
+            let b = &vs[j];
+            if not a.is_static and not b.is_static and (a.mutable or b.mutable) and
+                overlap(a: a.target.view(), b: b.target.view()) {
+                clash = i as u32;
+            }
+        }
+    }
+    if clash != ck.NONE {
+        var msg = ck.new_message(c);
+        msg.push_str("this call is given two views of one place, and one of them is mutable (§5.4)");
+        report_once(c, f, codes.EXCLUSIVITY, cv.nodes[clash as usize], msg);
+    }
+}
+
+// ---- the second walk: expressions ---------------------------------------------------
+
+/// Evaluates an expression. consume: its value is moved when it is a
+/// move-only place.
+fn eval(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId, consume: bool) {
+    if f.dead {
+        return;
+    }
+    let t = ck.type_of(c, e);
+    match ck.kind_of(c, e) {
+        .IntLit | .CharLit | .StringLit | .BoolLit | .NoneLit => { }
+        .ParenExpr => { eval(c, f, ck.child(c, e, 0), consume); }
+        .NameExpr | .FieldExpr | .IndexExpr | .DerefExpr => {
+            if ck.kind_of(c, e) == cst.Kind.FieldExpr and ck.ref_of(c, e) != ck.VALUE_FIELD {
+                return;
+            }
+            var out = alloc.String.init(c.a);
+            if place(c, f, e, &mut out) {
+                if consume and is_move_only(c, t) {
+                    access(c, f, e, out.view(), Access.Move);
+                } else {
+                    access(c, f, e, out.view(), Access.Read);
+                }
+            }
+        }
+        .RefExpr | .SliceExpr => { _ = view_of(c, f, e); }
+        .CallExpr => { _ = call(c, f, e); }
+        .StructLit => {
+            let count = ck.child_count(c, e);
+            var i: u32 = 1;
+            while i < count : (i += 1) {
+                eval(c, f, ck.child(c, ck.child(c, e, i), 0), true);
+            }
+        }
+        .ArrayLit => {
+            if misplaced_view(c, t, true) {
+                var m = ck.new_message(c);
+                m.push_str("an array cannot hold views (§5.4)");
+                report_once(c, f, codes.MISPLACED_VIEW, e, m);
+            }
+            let count = ck.child_count(c, e);
+            var i: u32 = 0;
+            while i < count : (i += 1) {
+                eval(c, f, ck.child(c, e, i), true);
+            }
+        }
+        .SomeExpr => {
+            if misplaced_view(c, t, true) {
+                var m = ck.new_message(c);
+                m.push_str("an optional cannot hold a view (§5.4)");
+                report_once(c, f, codes.MISPLACED_VIEW, e, m);
+            }
+            eval(c, f, ck.child(c, e, 0), true);
+        }
+        .UnaryExpr | .CastExpr => { eval(c, f, ck.child(c, e, 0), false); }
+        .BinaryExpr => {
+            let op = ck.tok_kind(c, ck.own(c, e)[0]);
+            eval(c, f, ck.child(c, e, 0), false);
+            if op == tk.Kind.KwAnd or op == tk.Kind.KwOr {
+                let before = save(c, f);
+                eval(c, f, ck.child(c, e, 1), false);
+                join(c, f, &before);
+            } else {
+                eval(c, f, ck.child(c, e, 1), false);
+            }
+        }
+        .TryExpr => { eval(c, f, ck.child(c, e, 0), true); }
+        .CatchExpr | .OrelseExpr => {
+            eval(c, f, ck.child(c, e, 0), true);
+            let before = save(c, f);
+            eval(c, f, ck.child(c, e, 1), consume);
+            join(c, f, &before);
+        }
+        _ => { }
+    }
+}
+
+// ---- the second walk: flow ----------------------------------------------------------
+
+/// The moved paths at a point, and whether it is reached.
+type State = struct {
+    moved: alloc.List(alloc.String),
+    dead: bool,
+}
+
+fn copy_paths(paths: &alloc.List(alloc.String), a: alloc.Allocator) -> alloc.List(alloc.String) {
+    var out = alloc.List(alloc.String).init(a);
+    let items = paths.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        out.push(copy_text(items[i].view(), a));
+    }
+    return out;
+}
+
+fn save(c: &ck.Checker, f: &Fn) -> State {
+    return State { moved: copy_paths(&f.moved, c.a), dead: f.dead };
+}
+
+fn restore(c: &ck.Checker, f: &mut Fn, s: &State) {
+    f.moved = copy_paths(&s.moved, c.a);
+    f.dead = s.dead;
+}
+
+fn add_path(paths: &mut alloc.List(alloc.String), p: str, a: alloc.Allocator) {
+    let items = paths.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        if items[i].view().eq(p) {
+            return;
+        }
+    }
+    paths.push(copy_text(p, a));
+}
+
+/// The current state becomes the join of itself and other: a path moved on
+/// either way is moved after; a way that is not reached adds nothing.
+fn join(c: &ck.Checker, f: &mut Fn, other: &State) {
+    if other.dead {
+        return;
+    }
+    if f.dead {
+        restore(c, f, other);
+        return;
+    }
+    let items = other.moved.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        add_path(&mut f.moved, items[i].view(), c.a);
+    }
+}
+
+// ---- the second walk: statements ----------------------------------------------------
+
+fn block(c: &mut ck.Checker, f: &mut Fn, b: cst.NodeId) {
+    let saved_scope = f.scope.len();
+    let saved_defers = f.deferred.len();
+    f.depth += 1;
+    let count = ck.child_count(c, b);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        stmt(c, f, ck.child(c, b, i));
+    }
+    // Deferred code runs when the block ends, last first (§8).
+    while f.deferred.len() > saved_defers {
+        let d = f.deferred.pop() orelse b;
+        stmt(c, f, d);
+    }
+    f.depth -= 1;
+    while f.scope.len() > saved_scope {
+        _ = f.scope.pop();
+    }
+}
+
+fn declared(f: &Fn, n: cst.NodeId) -> u32 {
+    return f.decls.get(n.index) orelse ck.NONE;
+}
+
+/// A new view binding views what v views.
+fn set_target(f: &mut Fn, b: u32, v: View) {
+    f.bindings[b as usize].static_target = v.is_static;
+    f.bindings[b as usize].parent = ck.NONE;
+    if not v.is_static and v.root != ck.NONE and f.bindings[v.root as usize].is_view {
+        f.bindings[b as usize].parent = v.root;
+    }
+    if not v.is_static {
+        f.targets[b as usize] = v.target;
+    }
+}
+
+/// A binding declared again, in the next iteration of a loop, is a new
+/// value: nothing of it is moved.
+fn fresh(c: &ck.Checker, f: &mut Fn, b: u32) {
+    var kept = alloc.List(alloc.String).init(c.a);
+    let all = f.moved.items();
+    var i: usize = 0;
+    while i < all.len() : (i += 1) {
+        if path_root(all[i].view()) != b or all[i].len() == 0 {
+            kept.push(copy_text(all[i].view(), c.a));
+        }
+    }
+    f.moved = kept;
+}
+
+fn let_stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
+    let init = ck.child(c, s, ck.child_count(c, s) - 1);
+    let b = declared(f, s);
+    let t = f.bindings[b as usize].type_id;
+    if misplaced_view(c, t, true) {
+        var m = ck.new_message(c);
+        m.push_str("this binding holds a view inside another type; a view can be only the whole type of a local (§5.4)");
+        report_once(c, f, codes.MISPLACED_VIEW, s, m);
+    }
+    if is_view(c, t) {
+        let v = view_of(c, f, init);
+        set_target(f, b, v);
+    } else {
+        eval(c, f, init, true);
+    }
+    fresh(c, f, b);
+    f.bindings[b as usize].depth = f.depth;
+    f.scope.push(b);
+}
+
+fn assign(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
+    let target = ck.child(c, s, 0);
+    let value = ck.child(c, s, 1);
+    let op = ck.tok_kind(c, ck.own(c, s)[0]);
+    var out = alloc.String.init(c.a);
+    let is_place = place(c, f, target, &mut out);
+    let t = ck.type_of(c, target);
+    if op != tk.Kind.Assign {
+        eval(c, f, value, false);
+        if is_place {
+            access(c, f, target, out.view(), Access.Read);
+            access(c, f, target, out.view(), Access.Write);
+        }
+        return;
+    }
+    if is_view(c, t) and is_place {
+        let v = view_of(c, f, value);
+        let b = path_root(out.view());
+        // §5.4: a view does not outlive what it views.
+        if not v.is_static {
+            let viewed = path_root(v.target.view());
+            let owner = f.bindings[viewed as usize];
+            if not owner.is_view and owner.depth > f.bindings[b as usize].depth {
+                var m = ck.new_message(c);
+                m.push_str("this view outlives what it views: ");
+                binding_name(c, f, viewed, &mut m);
+                m.push_str(" is declared in an inner block");
+                report_once(c, f, codes.VIEW_ESCAPES, value, m);
+            }
+        }
+        access(c, f, target, out.view(), Access.Write);
+        if digits_end(out.view()) == out.len() {
+            set_target(f, b, v);
+        }
+        return;
+    }
+    eval(c, f, value, true);
+    if is_place {
+        access(c, f, target, out.view(), Access.Write);
+    }
+}
+
+fn return_stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
+    if ck.child_count(c, s) > 0 {
+        let e = ck.child(c, s, 0);
+        if f.returns_view {
+            let v = view_of(c, f, e);
+            if not v.is_static {
+                let viewed = path_root(v.target.view());
+                let owner = f.bindings[viewed as usize];
+                if not (owner.is_view and owner.is_param) {
+                    var m = ck.new_message(c);
+                    m.push_str("this view outlives what it views: ");
+                    binding_name(c, f, viewed, &mut m);
+                    m.push_str(" belongs to this function; a returned view is a projection of the view parameter (§5.4)");
+                    report_once(c, f, codes.VIEW_ESCAPES, e, m);
+                }
+            }
+        } else {
+            eval(c, f, e, true);
+        }
+    }
+    f.dead = true;
+}
+
+fn loop_stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
+    let cond = ck.child(c, s, 0);
+    let body = ck.child(c, s, ck.child_count(c, s) - 1);
+    let has_step = ck.child_count(c, s) == 3;
+    let saved_breaks = copy_paths(&f.break_moved, c.a);
+    f.break_moved = alloc.List(alloc.String).init(c.a);
+    eval(c, f, cond, false);
+    let entry = save(c, f);
+    var broke = false;
+    // Twice: the second time with what the first left moved, so that a value
+    // moved in one iteration and used in the next is found.
+    var pass: u32 = 0;
+    while pass < 2 : (pass += 1) {
+        block(c, f, body);
+        if has_step {
+            f.dead = false;
+            stmt(c, f, ck.child(c, s, 1));
+        }
+        broke = broke or f.break_moved.len() > 0;
+        let end = save(c, f);
+        restore(c, f, &entry);
+        join(c, f, &end);
+        if pass == 0 {
+            eval(c, f, cond, false);
+        }
+    }
+    let items = f.break_moved.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        add_path(&mut f.moved, items[i].view(), c.a);
+    }
+    f.break_moved = saved_breaks;
+    // `while true` without a break never ends normally (§10).
+    let is_true = ck.kind_of(c, cond) == cst.Kind.BoolLit and ck.tok_kind(c, pos_of(c, cond)) == tk.Kind.KwTrue;
+    if is_true and not broke {
+        f.dead = true;
+    }
+}
+
+/// Whether a match binds a move-only value: then it moves the scrutinee.
+fn binds_move_only(c: &ck.Checker, f: &Fn, n: cst.NodeId) -> bool {
+    let k = ck.kind_of(c, n);
+    if k == cst.Kind.BindPat or k == cst.Kind.FieldPat {
+        let b = declared(f, n);
+        if b != ck.NONE and is_move_only(c, f.bindings[b as usize].type_id) {
+            return true;
+        }
+    }
+    let count = ck.child_count(c, n);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let ch = ck.child(c, n, i);
+        if ck.kind_of(c, ch) != cst.Kind.Block and binds_move_only(c, f, ch) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Binds the names of a pattern; view bindings view what v views.
+fn bind_pattern(c: &mut ck.Checker, f: &mut Fn, p: cst.NodeId, v: &View) {
+    let k = ck.kind_of(c, p);
+    if k == cst.Kind.BindPat or k == cst.Kind.FieldPat {
+        let b = declared(f, p);
+        if b != ck.NONE {
+            fresh(c, f, b);
+            f.bindings[b as usize].depth = f.depth;
+            if f.bindings[b as usize].is_view {
+                let copy = View { target: copy_text(v.target.view(), c.a), root: v.root, is_static: v.is_static, mutable: v.mutable };
+                set_target(f, b, copy);
+            }
+            f.scope.push(b);
+        }
+    }
+    let count = ck.child_count(c, p);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        bind_pattern(c, f, ck.child(c, p, i), v);
+    }
+}
+
+fn match_stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
+    let scrutinee = ck.child(c, s, 0);
+    var v = static_view(c.a);
+    if c.t.kind(ck.type_of(c, scrutinee)) == ty.Kind.Ref {
+        v = view_of(c, f, scrutinee);
+    } else {
+        eval(c, f, scrutinee, binds_move_only(c, f, s));
+    }
+    let entry = save(c, f);
+    var after = State { moved: alloc.List(alloc.String).init(c.a), dead: true };
+    let count = ck.child_count(c, s);
+    var i: u32 = 1;
+    while i < count : (i += 1) {
+        let arm = ck.child(c, s, i);
+        restore(c, f, &entry);
+        let saved_scope = f.scope.len();
+        f.depth += 1;
+        let parts = ck.child_count(c, arm);
+        var j: u32 = 0;
+        while j + 1 < parts : (j += 1) {
+            bind_pattern(c, f, ck.child(c, arm, j), &v);
+        }
+        block(c, f, ck.child(c, arm, parts - 1));
+        f.depth -= 1;
+        while f.scope.len() > saved_scope {
+            _ = f.scope.pop();
+        }
+        let end = save(c, f);
+        let current = save(c, f);
+        restore(c, f, &after);
+        join(c, f, &end);
+        after = save(c, f);
+        restore(c, f, &current);
+    }
+    restore(c, f, &after);
+}
+
+fn stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
+    if f.dead {
+        return;
+    }
+    match ck.kind_of(c, s) {
+        .Block => { block(c, f, s); }
+        .LetStmt => { let_stmt(c, f, s); }
+        .ExprStmt => { eval(c, f, ck.child(c, s, 0), false); }
+        .DiscardStmt => { eval(c, f, ck.child(c, s, 0), true); }
+        .AssignStmt => { assign(c, f, s); }
+        .IfStmt => {
+            eval(c, f, ck.child(c, s, 0), false);
+            let entry = save(c, f);
+            block(c, f, ck.child(c, s, 1));
+            let then_end = save(c, f);
+            restore(c, f, &entry);
+            if ck.child_count(c, s) > 2 {
+                stmt(c, f, ck.child(c, s, 2));
+            }
+            join(c, f, &then_end);
+        }
+        .WhileStmt => { loop_stmt(c, f, s); }
+        .MatchStmt => { match_stmt(c, f, s); }
+        .ReturnStmt => { return_stmt(c, f, s); }
+        .BreakStmt => {
+            let items = f.moved.items();
+            var i: usize = 0;
+            while i < items.len() : (i += 1) {
+                add_path(&mut f.break_moved, items[i].view(), c.a);
+            }
+            if f.break_moved.len() == 0 {
+                // Remember that the loop has a break, even with nothing moved.
+                add_path(&mut f.break_moved, "", c.a);
+            }
+            f.dead = true;
+        }
+        .ContinueStmt => { f.dead = true; }
+        .DeferStmt => { f.deferred.push(ck.child(c, s, 0)); }
+        _ => { }
+    }
+}
+
+// ---- entry --------------------------------------------------------------------
+
+fn check_body(c: &mut ck.Checker, fn_index: u32, body: cst.NodeId) {
+    let info = c.fns[fn_index as usize];
+    var f = new_fn(c.a);
+    f.returns_view = is_view(c, info.ret);
+    var i = info.params_start;
+    while i < info.params_start + info.params_len : (i += 1) {
+        let p = c.params[i as usize];
+        let b = new_binding(c, &mut f, p.name, p.type_id, p.name_token);
+        f.bindings[b as usize].is_param = true;
+        f.bindings[b as usize].live_end = 4294967295;
+    }
+    let params_end = f.scope.len();
+    first_block(c, &mut f, body);
+    while f.scope.len() > params_end {
+        _ = f.scope.pop();
+    }
+    block(c, &mut f, body);
+}
+
+pub fn check(c: &mut ck.Checker) {
+    check_declarations(c);
+    var i: usize = 0;
+    while i < c.fns.len() : (i += 1) {
+        let info = c.fns[i];
+        if info.decl == ck.NONE {
+            continue; // a test block: checked below with its module
+        }
+        let decl = c.decls[info.decl as usize];
+        c.module = decl.module;
+        let n = decl.node;
+        check_body(c, i as u32, ck.child(c, n, ck.child_count(c, n) - 1));
+    }
+}

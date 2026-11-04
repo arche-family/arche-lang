@@ -627,7 +627,7 @@ fn method2(c: &mut ck.Checker, mode: ck.SelfMode, p0: Param, p1: Param, ret: ty.
 }
 
 /// The built-in method of type t named `name` (§11).
-fn builtin_method(c: &mut ck.Checker, t: ty.TypeId, name: str) -> ?Method {
+pub fn builtin_method(c: &mut ck.Checker, t: ty.TypeId, name: str) -> ?Method {
     let info = c.t.get(t);
     let usize_t = ty.int_type(ty.IntKind.Usize);
     let u8_t = ty.int_type(ty.IntKind.U8);
@@ -1039,6 +1039,9 @@ fn require_mutable_receiver(c: &mut ck.Checker, receiver: cst.NodeId, rt: ty.Typ
 fn check_method_call(c: &mut ck.Checker, call: cst.NodeId, callee: cst.NodeId) -> ty.TypeId {
     let receiver = ck.child(c, callee, 0);
     let rt = check(c, receiver, none);
+    // The callee's type marks the call as a method call, for the memory
+    // checker: it is the receiver's.
+    ck.set_type(c, callee, rt);
     var t = rt;
     if c.t.kind(rt) == ty.Kind.Ref {
         t = c.t.elem(rt);

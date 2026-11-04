@@ -21,7 +21,7 @@ $(BUILD):
 
 check: $(BUILD)/arche
 	$(MAKE) -C ../conformance
-	../conformance/runner/build/runner --codes E01,E02,E03,E04,E05,E07 --compiler ./arche-check ../conformance/tests
+	../conformance/runner/build/runner --codes E01,E02,E03,E04,E05,E06,E07 --compiler ./arche-check ../conformance/tests
 	sh ./check-valid.sh $(BUILD)/arche ../conformance/tests
 	sh ./roundtrip.sh $(BUILD)/arche ../conformance/tests .
 	sh ./tests/run.sh $(BUILD)/arche

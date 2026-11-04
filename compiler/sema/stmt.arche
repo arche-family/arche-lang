@@ -186,6 +186,7 @@ fn check_let(c: &mut ck.Checker, s: cst.NodeId) {
             t = ty.invalid();
         }
     }
+    ck.set_type(c, s, t);
     declare(c, nt, t, mutable);
 }
 
@@ -419,6 +420,7 @@ fn check_pattern(c: &mut ck.Checker, p: cst.NodeId, t: ty.TypeId, by_ref: bool, 
             if by_ref {
                 bt = c.t.reference(ref_mut, t);
             }
+            ck.set_type(c, p, bt);
             declare(c, nt, bt, false);
         }
         .LitPat | .RangePat => {
@@ -587,6 +589,7 @@ fn check_variant_pattern(c: &mut ck.Checker, p: cst.NodeId, t: ty.TypeId, by_ref
             if by_ref {
                 bt = c.t.reference(ref_mut, bt);
             }
+            ck.set_type(c, fp, bt);
             declare(c, bind_token, bt, false);
         }
     }
