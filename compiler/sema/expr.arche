@@ -1457,12 +1457,85 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
         let s = ck.span_of(c, ck.child(c, call, 0));
         ck.require_unsafe(c, s, "calling a foreign function");
     }
+    let is_atomic = ck.is_atomic_op(c, target);
     let f = c.fns[c.decls[target as usize].fn_index as usize];
     let ps = fn_params(c, f, skip);
     c.arg_offset = f.ncomptime;
     check_args(c, call, &ps, true);
     ck.set_ref(c, call, target);
+    if is_atomic {
+        check_atomic(c, call, target);
+    }
     return f.ret;
+}
+
+/// An atomic operation's Ordering, written as a constant: Ordering.Acquire
+/// and the like. 0 to 4, or 5 when it is not one.
+pub fn ordering_of(c: &ck.Checker, e: cst.NodeId) -> u32 {
+    var x = e;
+    while ck.kind_of(c, x) == cst.Kind.ParenExpr {
+        x = ck.child(c, x, 0);
+    }
+    if ck.kind_of(c, x) != cst.Kind.FieldExpr {
+        return 5;
+    }
+    let name = ck.text(c, member_token(c, x));
+    if name.eq("Relaxed") { return 0; }
+    if name.eq("Acquire") { return 1; }
+    if name.eq("Release") { return 2; }
+    if name.eq("AcqRel") { return 3; }
+    if name.eq("SeqCst") { return 4; }
+    return 5;
+}
+
+/// The ordering is a constant the operation can have, and the value type
+/// one the target operates on atomically (spec/arche.md §10.2).
+fn check_atomic(c: &mut ck.Checker, call: cst.NodeId, target: u32) {
+    let decl = c.decls[target as usize];
+    var name = alloc.String.init(c.a);
+    name.push_str(c.names.text(decl.name));
+    let nm = name.view();
+    let nargs = ck.child_count(c, call) - 1;
+    let order_arg = ck.child(c, ck.child(c, call, nargs), 0);
+    let o = ordering_of(c, order_arg);
+    let s = ck.span_of(c, order_arg);
+    if o == 5 {
+        ck.report(c, codes.BAD_ATOMIC, s, "an ordering is written as a constant, such as atomic.Ordering.Acquire, so the compiler can check it");
+        return;
+    }
+    if nm.eq("load") and (o == 2 or o == 3) {
+        ck.report(c, codes.BAD_ATOMIC, s, "a load cannot release: use Relaxed, Acquire or SeqCst");
+    } else if nm.eq("store") and (o == 1 or o == 3) {
+        ck.report(c, codes.BAD_ATOMIC, s, "a store cannot acquire: use Relaxed, Release or SeqCst");
+    } else if nm.eq("fence") and o == 0 {
+        ck.report(c, codes.BAD_ATOMIC, s, "a Relaxed fence orders nothing");
+    }
+    if decl.env_len == 0 {
+        return;
+    }
+    let t = c.env[decl.env_start as usize].type_id;
+    let k = c.t.kind(t);
+    let fetch = nm.starts_with("fetch_");
+    if k == ty.Kind.Int {
+        if ty.bits(c.t.get(t).int_kind) > 64 {
+            ck.report(c, codes.BAD_ATOMIC, s, "atomics work on integers up to 64 bits");
+        }
+        return;
+    }
+    if k == ty.Kind.Ptr and not fetch {
+        return;
+    }
+    var m = ck.new_message(c);
+    m.push_str("atomic ");
+    m.push_str(nm);
+    m.push_str(" works on integers");
+    if not fetch {
+        m.push_str(" and raw pointers");
+    }
+    m.push_str(", not ");
+    ck.write_type(c, &mut m, t);
+    let cs = ck.span_of(c, call);
+    ck.report_owned(c, codes.BAD_ATOMIC, cs, m);
 }
 
 /// The instance a call of a generic function names: its first arguments

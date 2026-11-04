@@ -1299,6 +1299,9 @@ fn intrinsic(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
         t = l.c.env[decl.env_start as usize].type_id;
     }
     let rt = type_of(l, n);
+    if ck.is_atomic_op(&l.c, d) {
+        return atomic(l, n, nm, info.ncomptime);
+    }
     if nm.eq("size_of") {
         return scalar_val(lw.konst(l, ir.Ty.I64, layout.layout(&l.c, t).size));
     }
@@ -1344,6 +1347,59 @@ fn intrinsic(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
     args.push(a2.v);
     _ = lw.call_runtime(l, "a0rt_memmove", ir.Ty.Void, &args);
     return nothing();
+}
+
+/// core.atomic's operations, as LLVM's atomic instructions.
+fn atomic(l: &mut lw.Lower, n: cst.NodeId, nm: str, offset: u32) -> lw.Val {
+    let nargs = count(l, n) - 1;
+    let order = sx.ordering_of(&l.c, child(l, child(l, n, nargs), 0));
+    if nm.eq("fence") {
+        var i = ir.inst(ir.Op.Fence, ir.Ty.Void);
+        i.flag = order;
+        _ = lw.emit(l, i);
+        return nothing();
+    }
+    let p = value(l, runtime_arg(l, n, offset: offset, i: 0)).v;
+    let rt = type_of(l, n);
+    if nm.eq("load") {
+        var i = ir.inst(ir.Op.AtomicLoad, layout.scalar(&l.c, rt));
+        i.a = p;
+        i.flag = order;
+        return scalar_val(lw.emit(l, i));
+    }
+    let v = value(l, runtime_arg(l, n, offset: offset, i: 1)).v;
+    if nm.eq("store") {
+        var i = ir.inst(ir.Op.AtomicStore, ir.Ty.Void);
+        i.a = v;
+        i.b = p;
+        i.flag = order;
+        _ = lw.emit(l, i);
+        return nothing();
+    }
+    if nm.eq("compare_exchange") {
+        let w = value(l, runtime_arg(l, n, offset: offset, i: 2)).v;
+        var i = ir.inst(ir.Op.CmpXchg, layout.scalar(&l.c, rt));
+        i.a = p;
+        i.b = v;
+        i.c = w;
+        i.flag = order;
+        return scalar_val(lw.emit(l, i));
+    }
+    var k = ir.RMW_XCHG;
+    if nm.eq("fetch_add") {
+        k = ir.RMW_ADD;
+    } else if nm.eq("fetch_sub") {
+        k = ir.RMW_SUB;
+    } else if nm.eq("fetch_and") {
+        k = ir.RMW_AND;
+    } else if nm.eq("fetch_or") {
+        k = ir.RMW_OR;
+    }
+    var i = ir.inst(ir.Op.AtomicRmw, layout.scalar(&l.c, rt));
+    i.a = p;
+    i.b = v;
+    i.flag = order | (k << 8);
+    return scalar_val(lw.emit(l, i));
 }
 
 fn call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {

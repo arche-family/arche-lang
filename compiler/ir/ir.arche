@@ -68,6 +68,17 @@ pub type Op = enum {
     IntToPtr,
     /// a: a pointer, as an i64.
     PtrToInt,
+    /// Atomics (spec/arche.md §10.2); flag's low byte is the ordering, 0 to
+    /// 4 as core.atomic.Ordering. a: the address.
+    AtomicLoad,
+    /// a: the value; b: the address.
+    AtomicStore,
+    /// a: the address; b: the value; flag >> 8: an RmwKind.
+    AtomicRmw,
+    /// a: the address; b: the value expected; c: the new one. The value is
+    /// what was there.
+    CmpXchg,
+    Fence,
     /// imm: the callee (a function, or an external when flag is 1); args:
     /// a range of the function's args list.
     Call,
@@ -85,6 +96,13 @@ pub type Op = enum {
 /// §10.2), and one whose address may not be aligned (a packed field).
 pub const LOAD_VOLATILE: u32 = 1;
 pub const LOAD_UNALIGNED: u32 = 2;
+
+/// xchg, add, sub, and, or: atomicrmw's operations, by number.
+pub const RMW_XCHG: u32 = 0;
+pub const RMW_ADD: u32 = 1;
+pub const RMW_SUB: u32 = 2;
+pub const RMW_AND: u32 = 3;
+pub const RMW_OR: u32 = 4;
 
 pub type BinKind = enum { Add, Sub, Mul, SDiv, UDiv, SRem, URem, And, Or, Xor, Shl, LShr, AShr }
 
@@ -333,7 +351,7 @@ pub fn is_terminator(op: Op) -> bool {
 /// The instruction produces a value that others can use.
 pub fn has_value(i: Inst) -> bool {
     match i.op {
-        .Store | .Memcpy | .Memzero | .Br | .CondBr | .Ret | .RetVoid | .Unreachable => { return false; }
+        .Store | .Memcpy | .Memzero | .Br | .CondBr | .Ret | .RetVoid | .Unreachable | .AtomicStore | .Fence => { return false; }
         .Call | .CallIndirect => { return i.ty != Ty.Void; }
         .Asm => { return i.flag > 0; }
         _ => { return true; }
@@ -450,7 +468,17 @@ pub fn verify(f: &Function) -> Problem {
                         return problem(id, ProblemKind.CmpType);
                     }
                 }
-                .Ext | .Trunc | .OverflowBit | .FNeg | .FConv | .FMath | .IntToPtr | .PtrToInt => {
+                .AtomicStore | .AtomicRmw => {
+                    if not operand_ok(f, user: id, v: i.a) or not operand_ok(f, user: id, v: i.b) {
+                        return problem(id, ProblemKind.Undefined);
+                    }
+                }
+                .CmpXchg => {
+                    if not operand_ok(f, user: id, v: i.a) or not operand_ok(f, user: id, v: i.b) or not operand_ok(f, user: id, v: i.c) {
+                        return problem(id, ProblemKind.Undefined);
+                    }
+                }
+                .Ext | .Trunc | .OverflowBit | .FNeg | .FConv | .FMath | .IntToPtr | .PtrToInt | .AtomicLoad => {
                     if not operand_ok(f, user: id, v: i.a) {
                         return problem(id, ProblemKind.Undefined);
                     }

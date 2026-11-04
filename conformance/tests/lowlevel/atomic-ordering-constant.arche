@@ -1,0 +1,16 @@
+// test: compile-error
+// spec: arche/10.2
+// stage0: skip
+// line: 14
+// code: E0927
+import std;
+import core.atomic;
+
+fn main(sys: &mut std.System) -> !void {
+    var n: u32 = 0;
+    let o = atomic.Ordering.SeqCst;
+    unsafe {
+        let p = &mut n as *mut u32;
+        atomic.store(u32, p, 1, order: o);
+    }
+}

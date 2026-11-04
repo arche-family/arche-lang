@@ -294,7 +294,16 @@ pub fn is_intrinsic(c: &Checker, d: u32) -> bool {
         decl = c.decls[decl.template as usize];
     }
     let m = c.p.modules[decl.module as usize].name.view();
-    return decl.kind == DeclKind.Fn and decl.owner == NONE and (m.eq("core.mem") or m.eq("core.ptr"));
+    return decl.kind == DeclKind.Fn and decl.owner == NONE and (m.eq("core.mem") or m.eq("core.ptr") or m.eq("core.atomic"));
+}
+
+/// d is a function of core.atomic, or an instance of one.
+pub fn is_atomic_op(c: &Checker, d: u32) -> bool {
+    var decl = c.decls[d as usize];
+    if decl.template != NONE {
+        decl = c.decls[decl.template as usize];
+    }
+    return is_intrinsic(c, d) and c.p.modules[decl.module as usize].name.view().eq("core.atomic");
 }
 
 /// t is core.Unique, the mark of move-only values (spec/arche.md §11.1).

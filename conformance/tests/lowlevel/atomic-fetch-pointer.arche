@@ -1,0 +1,18 @@
+// test: compile-error
+// spec: arche/10.2
+// stage0: skip
+// line: 16
+// code: E0927
+import std;
+import core.atomic;
+
+type Slot = *mut u32;
+
+fn main(sys: &mut std.System) -> !void {
+    var x: u32 = 0;
+    unsafe {
+        var q = &mut x as *mut u32;
+        let pp = &mut q as *mut *mut u32;
+        let old = atomic.fetch_add(Slot, pp, q, order: atomic.Ordering.SeqCst);
+    }
+}

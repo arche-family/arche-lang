@@ -1,0 +1,36 @@
+// test: run
+// spec: arche/10.2
+// stage0: skip
+// stdout: 40 42 7 9 7 1
+import std;
+import core.atomic;
+
+fn main(sys: &mut std.System) -> !void {
+    var n: u64 = 40;
+    var slot: u32 = 7;
+    unsafe {
+        // SAFETY: n and slot live through the block, and nothing else
+        // reaches them.
+        let p = &mut n as *mut u64;
+        let old = atomic.fetch_add(u64, p, 2, order: atomic.Ordering.AcqRel);
+        sys.stdout.write_u64(old);
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(atomic.load(u64, p as *u64, order: atomic.Ordering.Acquire));
+        let q = &mut slot as *mut u32;
+        let seen = atomic.compare_exchange(u32, q, expected: 7, new: 9, order: atomic.Ordering.SeqCst);
+        let missed = atomic.compare_exchange(u32, q, expected: 7, new: 11, order: atomic.Ordering.SeqCst);
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(seen as u64);
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(missed as u64);
+        atomic.store(u32, q, 3, order: atomic.Ordering.Release);
+        _ = atomic.fetch_or(u32, q, 4, order: atomic.Ordering.Relaxed);
+        let was = atomic.swap(u32, q, 1, order: atomic.Ordering.SeqCst);
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(was as u64);
+    }
+    atomic.fence(atomic.Ordering.SeqCst);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(slot as u64);
+    sys.stdout.write("\n");
+}

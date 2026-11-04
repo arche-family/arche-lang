@@ -336,8 +336,8 @@ These exist for the `freestanding` target (S16) and are all `unsafe`:
 | Naked functions | `naked fn`: no prologue or epilogue; it takes no parameters, returns nothing, and its body is one `asm` statement (E0923) |
 | Volatile access | `p.read_volatile()`, `p.write_volatile(v)` on a raw pointer to a scalar; `p.addr()` is its address and `core.ptr.from_addr(T, n)` a pointer to address `n` |
 | Foreign functions | `extern "c" fn name(x: u64) -> u64;` declares a function of another object file, called by its own name; only integers, `bool`s, floats and raw pointers cross it (E0924). `export("name") fn …` gives an Arche function that name |
-| Atomics | `core.atomic.U32` and friends, with an explicit `Ordering` on every operation: `Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst` |
-| Barriers | `core.atomic.fence(ordering)` |
+| Atomics | `core.atomic.load(T, p, order: o)`, `store`, `swap`, `fetch_add`, `fetch_sub`, `fetch_and`, `fetch_or` and `compare_exchange(T, p, expected: e, new: n, order: o)` on raw pointers to integers (and, without `fetch_`, to raw pointers), with an explicit `Ordering` on every operation: `Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst`. The ordering is written as a constant, and a load cannot release, nor a store acquire (E0927). `fetch_add` and `fetch_sub` wrap. The types `core.atomic.U32` and friends, which need no `unsafe`, come with concurrency (§9) |
+| Barriers | `core.atomic.fence(o)`; a `Relaxed` one is E0927 |
 | Layout | `packed struct`: no padding, alignment 1, and a view of its fields is an error, since it may be unaligned (E0926); `align(N)` after `struct` or a field's type raises the alignment to `N`, a power of two up to 4096 (E0925); `extern struct` for C's layout, which for fields of the types Arche has is the layout it already uses (docs/abi.md) |
 | Sections | `section(".text.boot")` on a function (on a constant: not yet) |
 | Panic handler | `panic_handler: "kernel.panic.halt"` in the manifest names a `noreturn` function that a panic calls, for targets without `std` |

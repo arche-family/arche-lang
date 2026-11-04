@@ -129,6 +129,14 @@ fn overflow_text(k: u32) -> str {
     }
 }
 
+fn ordering_text(o: u32) -> str {
+    if o == 0 { return "monotonic"; }
+    if o == 1 { return "acquire"; }
+    if o == 2 { return "release"; }
+    if o == 3 { return "acq_rel"; }
+    return "seq_cst";
+}
+
 fn volatile_word(out: &mut alloc.String, flag: u32) {
     if (flag & ir.LOAD_VOLATILE) != 0 {
         out.push_str("volatile ");
@@ -254,6 +262,87 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
             out.push_str(", ptr ");
             operand(out, m, f, i.b);
             align_suffix(out, i.flag);
+            out.push_str("\n");
+        }
+        .AtomicLoad => {
+            line_start(out, id);
+            out.push_str("load atomic ");
+            out.push_str(t);
+            out.push_str(", ptr ");
+            operand(out, m, f, i.a);
+            out.push_str(" ");
+            out.push_str(ordering_text(i.flag & 255));
+            out.push_str(", align ");
+            ir.write_number(out, (ir.bits(i.ty) / 8) as u64);
+            out.push_str("\n");
+        }
+        .AtomicStore => {
+            let vt = f.insts[i.a as usize].ty;
+            out.push_str("  store atomic ");
+            typed(out, m, f, i.a);
+            out.push_str(", ptr ");
+            operand(out, m, f, i.b);
+            out.push_str(" ");
+            out.push_str(ordering_text(i.flag & 255));
+            out.push_str(", align ");
+            ir.write_number(out, (ir.bits(vt) / 8) as u64);
+            out.push_str("\n");
+        }
+        .AtomicRmw => {
+            line_start(out, id);
+            out.push_str("atomicrmw ");
+            let k = i.flag >> 8;
+            if k == ir.RMW_XCHG {
+                out.push_str("xchg");
+            } else if k == ir.RMW_ADD {
+                out.push_str("add");
+            } else if k == ir.RMW_SUB {
+                out.push_str("sub");
+            } else if k == ir.RMW_AND {
+                out.push_str("and");
+            } else {
+                out.push_str("or");
+            }
+            out.push_str(" ptr ");
+            operand(out, m, f, i.a);
+            out.push_str(", ");
+            typed(out, m, f, i.b);
+            out.push_str(" ");
+            out.push_str(ordering_text(i.flag & 255));
+            out.push_str("\n");
+        }
+        .CmpXchg => {
+            out.push_str("  %x");
+            ir.write_number(out, id as u64);
+            out.push_str(" = cmpxchg ptr ");
+            operand(out, m, f, i.a);
+            out.push_str(", ");
+            typed(out, m, f, i.b);
+            out.push_str(", ");
+            typed(out, m, f, i.c);
+            out.push_str(" ");
+            out.push_str(ordering_text(i.flag & 255));
+            out.push_str(" ");
+            // The failure ordering only loads: Release and AcqRel drop their
+            // release part.
+            var fail = i.flag & 255;
+            if fail == 2 {
+                fail = 0;
+            } else if fail == 3 {
+                fail = 1;
+            }
+            out.push_str(ordering_text(fail));
+            out.push_str("\n");
+            line_start(out, id);
+            out.push_str("extractvalue {");
+            out.push_str(t);
+            out.push_str(", i1} %x");
+            ir.write_number(out, id as u64);
+            out.push_str(", 0\n");
+        }
+        .Fence => {
+            out.push_str("  fence ");
+            out.push_str(ordering_text(i.flag & 255));
             out.push_str("\n");
         }
         .IntToPtr => {

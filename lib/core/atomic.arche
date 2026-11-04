@@ -1,0 +1,32 @@
+/// Atomic operations (spec/arche.md §10.2): on an integer or bool that
+/// other threads or devices also reach, through a raw pointer, each with
+/// an explicit Ordering. The compiler provides these functions; the types
+/// that wrap them, core.atomic.U32 and the others, come with concurrency
+/// (sprint S18).
+
+/// The C++11 orderings: what other memory operations may not move across
+/// an atomic one.
+pub type Ordering = enum { Relaxed, Acquire, Release, AcqRel, SeqCst }
+
+pub unsafe fn load(comptime T: type, p: *T, order: Ordering) -> T;
+
+pub unsafe fn store(comptime T: type, p: *mut T, value: T, order: Ordering);
+
+/// Stores value and returns what was there.
+pub unsafe fn swap(comptime T: type, p: *mut T, value: T, order: Ordering) -> T;
+
+/// Adds to what is there, wrapping, and returns what was there.
+pub unsafe fn fetch_add(comptime T: type, p: *mut T, value: T, order: Ordering) -> T;
+
+pub unsafe fn fetch_sub(comptime T: type, p: *mut T, value: T, order: Ordering) -> T;
+
+pub unsafe fn fetch_and(comptime T: type, p: *mut T, value: T, order: Ordering) -> T;
+
+pub unsafe fn fetch_or(comptime T: type, p: *mut T, value: T, order: Ordering) -> T;
+
+/// Stores new when expected is there; returns what was there either way,
+/// so it succeeded when that equals expected. Both orderings are order.
+pub unsafe fn compare_exchange(comptime T: type, p: *mut T, expected: T, new: T, order: Ordering) -> T;
+
+/// A memory barrier: no memory operation moves across it as order says.
+pub fn fence(order: Ordering);
