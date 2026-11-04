@@ -49,7 +49,7 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S13 |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | [`spec/arche.md`](spec/arche.md) | the full language, built on Arche-0 | draft 0.1 |
-| [`conformance/`](conformance/README.md) | specification tests | 318 tests |
+| [`conformance/`](conformance/README.md) | specification tests | 299 tests |
 | `stage0/` | bootstrap compiler, C11 | complete: compiles all of Arche-0 |
 | [`compiler/`](compiler/) | the Arche compiler, Arche-0, through LLVM | self-hosting: stage2 == stage3 |
 | [`docs/abi.md`](docs/abi.md) | layouts, calling convention, runtime | version 0 |
