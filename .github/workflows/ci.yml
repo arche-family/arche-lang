@@ -25,3 +25,7 @@ jobs:
         run: make -C compiler check CC=${{ matrix.cc }}
       - name: Fuzz the parser
         run: cd /tmp && python3 -I $GITHUB_WORKSPACE/compiler/fuzz.py $GITHUB_WORKSPACE/compiler/build/arche 60
+      - name: Differential, stage0 against the Arche compiler
+        run: make -C compiler differential CC=${{ matrix.cc }}
+      - name: Bootstrap, stage2 == stage3
+        run: CC=${{ matrix.cc }} ./bootstrap.sh
