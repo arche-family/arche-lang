@@ -75,6 +75,9 @@ pub type Decl = struct {
     pub env_len: u32,
     /// A method of an `impl`: its index in impls; NONE otherwise.
     pub impl_index: u32,
+    /// Struct: align(N) on the type, or 0; whether it is packed.
+    pub align: u32,
+    pub packed: bool,
 }
 
 /// impl I for T (spec/arche.md §5.1): its methods are methods of T.
@@ -131,6 +134,10 @@ pub type Field = struct {
     pub name_token: u32,
     pub type_id: ty.TypeId,
     pub is_pub: bool,
+    /// A field of a packed struct: no padding before it, alignment 1.
+    pub packed: bool,
+    /// align(N) on the field, or 0 (spec/arche.md §10.2).
+    pub align: u32,
 }
 
 pub type Variant = struct {
@@ -1883,6 +1890,8 @@ fn new_decl(kind: DeclKind, module: u32, n: cst.NodeId, name: alloc.Symbol, name
         env_start: 0,
         env_len: 0,
         impl_index: NONE,
+        align: 0,
+        packed: false,
     };
 }
 
@@ -2107,7 +2116,37 @@ type Run = struct {
 /// Adds the FieldDecl children of n, from child `from` on, to c.fields, as
 /// one run. Resolving a field's type may make instances, which add fields
 /// of their own: the run is pushed only once every type is known.
-fn add_fields(c: &mut Checker, n: cst.NodeId, from: u32) -> Run {
+/// The N of align(N): a constant power of two up to 4096 (E0925).
+fn align_value(c: &mut Checker, a: cst.NodeId) -> u32 {
+    let v = consts.array_length(c, child(c, a, 0));
+    if v == 0 or v > 4096 or (v & (v - 1)) != 0 {
+        let s = span_of(c, a);
+        report(c, codes.BAD_ALIGN, s, "an alignment is a power of two from 1 to 4096");
+        return 0;
+    }
+    return v as u32;
+}
+
+/// The type declaration says `packed struct`.
+fn is_packed_decl(c: &Checker, n: cst.NodeId) -> bool {
+    let toks = own(c, n);
+    let items = toks.items();
+    var i: usize = 0;
+    while i + 1 < items.len() : (i += 1) {
+        if tok_kind(c, items[i + 1]) == tk.Kind.KwStruct {
+            return text(c, items[i]).eq("packed");
+        }
+    }
+    return false;
+}
+
+/// t is a packed struct.
+pub fn is_packed(c: &Checker, t: ty.TypeId) -> bool {
+    let info = c.t.get(t);
+    return info.kind == ty.Kind.Struct and c.decls[info.decl as usize].packed;
+}
+
+fn add_fields(c: &mut Checker, n: cst.NodeId, from: u32, packed: bool) -> Run {
     var local = alloc.List(Field).init(c.a);
     let count = child_count(c, n);
     var i = from;
@@ -2128,7 +2167,15 @@ fn add_fields(c: &mut Checker, n: cst.NodeId, from: u32) -> Run {
             report_duplicate_member(c, nt, "field");
         }
         let ft = resolve_type(c, child(c, f, 0));
-        local.push(Field { name: sym, name_token: nt, type_id: ft, is_pub: has_own(c, f, tk.Kind.KwPub) });
+        var falign: u32 = 0;
+        if child_count(c, f) > 1 and kind_of(c, child(c, f, 1)) == cst.Kind.Attribute {
+            falign = align_value(c, child(c, f, 1));
+            if packed {
+                let s = span_of(c, child(c, f, 1));
+                report(c, codes.BAD_ALIGN, s, "a field of a packed struct has no alignment of its own");
+            }
+        }
+        local.push(Field { name: sym, name_token: nt, type_id: ft, is_pub: has_own(c, f, tk.Kind.KwPub), packed: packed, align: falign });
     }
     let start = c.fields.len() as u32;
     let items = local.items();
@@ -2211,7 +2258,14 @@ fn resolve_members_here(c: &mut Checker, d: u32, n: cst.NodeId) {
     let decl = c.decls[d as usize];
     match decl.kind {
         .Struct => {
-            let run = add_fields(c, n, members_from(c, n));
+            let packed = full(c) and is_packed_decl(c, n);
+            c.decls[d as usize].packed = packed;
+            var from = members_from(c, n);
+            if from < child_count(c, n) and kind_of(c, child(c, n, from)) == cst.Kind.Attribute {
+                c.decls[d as usize].align = align_value(c, child(c, n, from));
+                from += 1;
+            }
+            let run = add_fields(c, n, from, packed);
             c.decls[d as usize].members_start = run.start;
             c.decls[d as usize].members_len = run.len;
             add_methods(c, d);
@@ -2237,7 +2291,7 @@ fn resolve_members_here(c: &mut Checker, d: u32, n: cst.NodeId) {
                     report_duplicate_member(c, nt, "variant");
                 }
                 let has_fields = has_own(c, v, tk.Kind.LBrace);
-                let run = add_fields(c, v, 0);
+                let run = add_fields(c, v, 0, false);
                 local.push(Variant {
                     name: sym,
                     name_token: nt,

@@ -499,7 +499,21 @@ fn parse_field(p: &mut Parser) {
     if expect(p, tk.Kind.Colon, "':' and the field's type") {
         parse_type(p);
     }
+    parse_align(p);
     _ = close(p, m, cst.Kind.FieldDecl);
+}
+
+/// align(N) after struct or a field's type (spec/arche.md §10.2): an
+/// Attribute node with the expression in it.
+fn parse_align(p: &mut Parser) {
+    if p.full and at(p, tk.Kind.Ident) and token_is(p, "align") and peek_second(p) == tk.Kind.LParen {
+        let am = open(p);
+        advance(p);
+        advance(p);
+        parse_nested_expr(p);
+        _ = expect(p, tk.Kind.RParen, "')'");
+        _ = close(p, am, cst.Kind.Attribute);
+    }
 }
 
 /// Fields and methods of a struct body, or the methods after an enum's
@@ -564,11 +578,16 @@ fn parse_type_decl(p: &mut Parser, m: cst.Mark) {
         _ = close(p, m, cst.Kind.TypeDecl);
         return;
     }
+    // packed struct, extern struct (spec/arche.md §10.2): contextual words.
+    if p.full and at(p, tk.Kind.Ident) and (token_is(p, "packed") or token_is(p, "extern")) and peek_second(p) == tk.Kind.KwStruct {
+        advance(p);
+    }
     // struct where T: I { ... } (spec/arche.md §5.2)
     if accept(p, tk.Kind.KwStruct) {
         if p.full and at(p, tk.Kind.KwWhere) {
             parse_where(p);
         }
+        parse_align(p);
         if expect(p, tk.Kind.LBrace, "'{'") {
             parse_members(p, true);
             _ = expect(p, tk.Kind.RBrace, "'}'");

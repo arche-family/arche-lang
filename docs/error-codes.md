@@ -173,3 +173,5 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0922` | An `asm` operand that is not `in`, `out`, `inout` or `clobber`, whose value is not an integer, `bool` or pointer, that writes a place it cannot, or a `%N` without an operand (§10.2). |
 | `E0923` | A `naked fn` with parameters or a result, or whose body is not one `asm` statement (§10.2). |
 | `E0924` | A foreign function with another calling convention than `"c"`, or one that takes or returns something other than integers, `bool`s, floats and raw pointers (§10.1). |
+| `E0925` | An `align(N)` whose `N` is not a power of two from 1 to 4096, or one on a field of a packed struct (§10.2). |
+| `E0926` | A view of a field of a packed struct, which may be unaligned (§10.2). |

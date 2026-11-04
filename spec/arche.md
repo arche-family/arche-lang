@@ -338,7 +338,7 @@ These exist for the `freestanding` target (S16) and are all `unsafe`:
 | Foreign functions | `extern "c" fn name(x: u64) -> u64;` declares a function of another object file, called by its own name; only integers, `bool`s, floats and raw pointers cross it (E0924). `export("name") fn …` gives an Arche function that name |
 | Atomics | `core.atomic.U32` and friends, with an explicit `Ordering` on every operation: `Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst` |
 | Barriers | `core.atomic.fence(ordering)` |
-| Layout | `packed struct`, `align(N)` on a type or field, `extern struct` for C's layout |
+| Layout | `packed struct`: no padding, alignment 1, and a view of its fields is an error, since it may be unaligned (E0926); `align(N)` after `struct` or a field's type raises the alignment to `N`, a power of two up to 4096 (E0925); `extern struct` for C's layout, which for fields of the types Arche has is the layout it already uses (docs/abi.md) |
 | Sections | `section(".text.boot")` on a function (on a constant: not yet) |
 | Panic handler | `panic_handler: "kernel.panic.halt"` in the manifest names a `noreturn` function that a panic calls, for targets without `std` |
 | Target features | `target_features: ["-sse", "-avx"]` in the manifest |
@@ -394,7 +394,7 @@ item        = { DOC } ( [ "pub" ] decl | test_decl | impl_decl ) ;
 decl        = const_decl | type_decl | fn_decl | extern_decl ;
 
 type_decl   = "type" IDENT [ "(" cparams ")" ] "=" type_body ;
-type_body   = [ "packed" | "extern" ] "struct" [ where ] [ align ] "{" { member } "}"
+type_body   = [ "packed" | "extern" ] "struct" [ where ] [ align ] "{" { member } "}"   (* a field may end with [ align ] *)
             | "enum" [ where ] "{" variant { "," variant } [ "," ] { member } "}"
             | "error" "{" IDENT { "," IDENT } [ "," ] "}"
             | "interface" "{" { fn_sig ";" } "}"

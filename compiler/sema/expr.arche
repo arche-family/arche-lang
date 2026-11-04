@@ -745,6 +745,8 @@ fn check_closure(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
         env_start: c.env_start,
         env_len: c.env_len,
         impl_index: ck.NONE,
+        align: 0,
+        packed: false,
     });
     let pstart = c.params.len() as u32;
     let ps = params.items();
@@ -1870,6 +1872,23 @@ pub fn place_mutable(c: &mut ck.Checker, e: cst.NodeId) -> bool {
     }
 }
 
+/// The place is a field of a packed struct, or inside one.
+fn in_packed(c: &ck.Checker, e: cst.NodeId) -> bool {
+    match ck.kind_of(c, e) {
+        .ParenExpr => { return in_packed(c, ck.child(c, e, 0)); }
+        .FieldExpr => {
+            let base = ck.child(c, e, 0);
+            var bt = ck.type_of(c, base);
+            if c.t.kind(bt) == ty.Kind.Ref {
+                bt = c.t.elem(bt);
+            }
+            return ck.is_packed(c, bt) or in_packed(c, base);
+        }
+        .IndexExpr => { return in_packed(c, ck.child(c, e, 0)); }
+        _ => { return false; }
+    }
+}
+
 fn check_ref(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     let operand = ck.child(c, n, 0);
     let t = check(c, operand, none);
@@ -1885,6 +1904,10 @@ fn check_ref(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     if mutable and not place_mutable(c, operand) {
         let s = ck.span_of(c, n);
         ck.report(c, codes.NOT_MUTABLE, s, "'&mut' needs a mutable place: a 'var', or a place reached through '&mut'");
+    }
+    if in_packed(c, operand) {
+        let s = ck.span_of(c, n);
+        ck.report(c, codes.PACKED_VIEW, s, "a field of a packed struct may be unaligned, and a view is not: copy the field into a local first");
     }
     return c.t.reference(mutable, t);
 }

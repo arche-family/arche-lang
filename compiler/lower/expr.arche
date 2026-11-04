@@ -745,6 +745,9 @@ pub fn place(l: &mut lw.Lower, e: cst.NodeId) -> u32 {
             }
             let sym = ck.symbol(&mut l.c, sx.member_token(&l.c, e));
             let off = field_offset(l, t, sym);
+            if ck.is_packed(&l.c, t) {
+                return lw.gep_unaligned(l, base_addr, off);
+            }
             return lw.gep(l, base_addr, off);
         }
         .IndexExpr => { return element(l, e); }
@@ -835,7 +838,12 @@ fn struct_lit(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
         let field_init = child(l, e, i + 1);
         let ft = l.c.fields[(start + i) as usize].type_id;
         let v = value(l, child(l, field_init, 0));
-        lw.store_val(l, ft, v, lw.gep(l, base, layout.field_offset(&l.c, start: start, i: start + i)));
+        let off = layout.field_offset(&l.c, start: start, i: start + i);
+        if l.c.fields[(start + i) as usize].packed {
+            lw.store_val(l, ft, v, lw.gep_unaligned(l, base, off));
+        } else {
+            lw.store_val(l, ft, v, lw.gep(l, base, off));
+        }
     }
     return fresh_val(tmp);
 }
@@ -1059,7 +1067,13 @@ fn equal_at(l: &mut lw.Lower, t: ty.TypeId, a: u32, b: u32) -> u32 {
         while f < d.members_start + d.members_len : (f += 1) {
             let off = layout.field_offset(&l.c, start: d.members_start, i: f);
             let ft = l.c.fields[f as usize].type_id;
-            let fe = equal_at(l, ft, a: lw.gep(l, a, off), b: lw.gep(l, b, off));
+            var fa = lw.gep(l, a, off);
+            var fb = lw.gep(l, b, off);
+            if d.packed {
+                fa = lw.gep_unaligned(l, a, off);
+                fb = lw.gep_unaligned(l, b, off);
+            }
+            let fe = equal_at(l, ft, a: fa, b: fb);
             r = lw.bin(l, ir.BinKind.And, x: r, y: fe);
         }
         return r;

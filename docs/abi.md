@@ -15,6 +15,8 @@ Sizes and alignments are in bytes. A composite value is laid out in memory at it
 | `&dyn I`, `&mut dyn I` | 16 | 8 | `{data: address, table: address}`; the table is the addresses of the type's methods of `I`, in the order `I` declares them |
 | `[N]T` | `N × size(T)` | `align(T)` | elements in order |
 | struct | sum of fields, padded | max of fields | fields in declaration order, each at its alignment; the size rounds up to the alignment |
+| `packed struct` | sum of fields | 1 | fields in declaration order, no padding (spec/arche.md §10.2) |
+| struct with `align(N)` | rounded up to `N` | max(fields, `N`) | as a struct; a field with `align(N)` is placed at a multiple of `N` |
 | enum | | max(4, payloads) | `{tag: u32}` then, at the payload alignment, the payload of the variant: its fields like a struct's |
 | `?T` | | `align(T)` | `{has: u8}` then the `T` at its alignment |
 | error set | 2 | 2 | the error's number: 0 for none, from 1 in the order the program first names them |

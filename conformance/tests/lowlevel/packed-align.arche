@@ -1,0 +1,42 @@
+// test: run
+// spec: arche/10.2
+// stage0: skip
+// stdout: 7 1 64 64 32 16909069 eq
+import std;
+import core.mem;
+
+type Header = packed struct {
+    tag: u8,
+    length: u32,
+    flags: u16,
+}
+
+type Line = struct align(64) {
+    x: u64,
+}
+
+type Mixed = struct {
+    a: u8,
+    b: u32 align(16),
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(mem.size_of(Header) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(mem.align_of(Header) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(mem.size_of(Line) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(mem.align_of(Line) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(mem.size_of(Mixed) as u64);
+    var h = Header { tag: 1, length: 0x01020304, flags: 7 };
+    h.length += 1;
+    sys.stdout.write(" ");
+    sys.stdout.write_u64((h.tag as u64) + (h.length as u64) + (h.flags as u64));
+    let copy = h;
+    if copy == h {
+        sys.stdout.write(" eq");
+    }
+    sys.stdout.write("\n");
+}

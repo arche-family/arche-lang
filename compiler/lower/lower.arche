@@ -135,6 +135,15 @@ pub fn gep(l: &mut Lower, addr: u32, offset: u64) -> u32 {
     return emit(l, i);
 }
 
+/// A field's address in a packed struct: always a Gep, marked unaligned.
+pub fn gep_unaligned(l: &mut Lower, addr: u32, offset: u64) -> u32 {
+    var i = ir.inst(ir.Op.Gep, ir.Ty.Ptr);
+    i.a = addr;
+    i.imm = offset;
+    i.flag = ir.LOAD_UNALIGNED;
+    return emit(l, i);
+}
+
 pub fn gep_index(l: &mut Lower, addr: u32, index: u32, size: u64) -> u32 {
     var i = ir.inst(ir.Op.GepIndex, ir.Ty.Ptr);
     i.a = addr;
@@ -484,9 +493,23 @@ pub fn check(l: &mut Lower, fine: u32, message: str, n: cst.NodeId) {
 // ---- values ----------------------------------------------------------------------
 
 /// The value of type t stored at addr.
+/// A load or store at an address of a packed struct's field is unaligned:
+/// the Gep that made it has LOAD_UNALIGNED in its flag.
+fn access_flags(l: &Lower, addr: u32) -> u32 {
+    let i = l.f.insts[addr as usize];
+    if i.op == ir.Op.Gep or i.op == ir.Op.Alloca {
+        return i.flag & ir.LOAD_UNALIGNED;
+    }
+    return 0;
+}
+
 pub fn load_val(l: &mut Lower, t: ty.TypeId, addr: u32) -> Val {
     let s = layout.scalar(&l.c, t);
     if s != ir.Ty.Void {
+        let flags = access_flags(l, addr);
+        if flags != 0 and l.f.insts[addr as usize].op == ir.Op.Gep {
+            return Val { v: load_with(l, s, addr: addr, flags: flags), scalar: true, fresh: true };
+        }
         return Val { v: load(l, s, addr), scalar: true, fresh: true };
     }
     return Val { v: addr, scalar: false, fresh: false };
@@ -498,6 +521,11 @@ pub fn store_val(l: &mut Lower, t: ty.TypeId, v: Val, addr: u32) {
         return;
     }
     if v.scalar {
+        let flags = access_flags(l, addr);
+        if flags != 0 and l.f.insts[addr as usize].op == ir.Op.Gep {
+            store_with(l, value: v.v, addr: addr, flags: flags);
+            return;
+        }
         store(l, value: v.v, addr: addr);
         return;
     }

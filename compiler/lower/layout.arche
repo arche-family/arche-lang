@@ -65,12 +65,25 @@ pub fn is_nothing(c: &ck.Checker, t: ty.TypeId) -> bool {
 }
 
 /// The layout of fields one after another, as in a struct.
+/// A field's layout in its struct: packed, alignment 1; align(N), at
+/// least N (spec/arche.md §10.2).
+fn field_layout(c: &ck.Checker, f: u32) -> Layout {
+    let fd = c.fields[f as usize];
+    var l = layout(c, fd.type_id);
+    if fd.packed {
+        l.align = 1;
+    } else if fd.align as u64 > l.align {
+        l.align = fd.align as u64;
+    }
+    return l;
+}
+
 fn fields_layout(c: &ck.Checker, start: u32, len: u32) -> Layout {
     var size: u64 = 0;
     var align: u64 = 1;
     var i = start;
     while i < start + len : (i += 1) {
-        let l = layout(c, c.fields[i as usize].type_id);
+        let l = field_layout(c, i);
         size = round(n: size, align: l.align) + l.size;
         if l.align > align {
             align = l.align;
@@ -84,7 +97,7 @@ pub fn field_offset(c: &ck.Checker, start: u32, i: u32) -> u64 {
     var offset: u64 = 0;
     var f = start;
     while f <= i : (f += 1) {
-        let l = layout(c, c.fields[f as usize].type_id);
+        let l = field_layout(c, f);
         offset = round(n: offset, align: l.align);
         if f == i {
             return offset;
@@ -195,7 +208,12 @@ pub fn layout(c: &ck.Checker, t: ty.TypeId) -> Layout {
         }
         .Struct => {
             let d = c.decls[info.decl as usize];
-            return fields_layout(c, start: d.members_start, len: d.members_len);
+            var l = fields_layout(c, start: d.members_start, len: d.members_len);
+            if d.align as u64 > l.align {
+                l.align = d.align as u64;
+                l.size = round(n: l.size, align: l.align);
+            }
+            return l;
         }
         .Enum => {
             let d = c.decls[info.decl as usize];
