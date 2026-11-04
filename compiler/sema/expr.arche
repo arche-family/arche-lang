@@ -1,0 +1,1678 @@
+/// Expressions: spec/arche-0.md §5.4–§5.6, §7 and §11.
+import alloc;
+import codes;
+import diag;
+import syntax.cst;
+import syntax.token as tk;
+import sema.check as ck;
+import sema.consts;
+import sema.types as ty;
+
+// ---- paths ------------------------------------------------------------------
+//
+// `shapes.Point`, `Color` and `alloc.List(u32)` written in an expression can
+// name a type or a module rather than a value. path() says which, without
+// reporting anything, so callers can treat values separately.
+
+pub type PathKind = enum { NotPath, Type, Module, Library }
+
+pub type Path = struct {
+    pub kind: PathKind,
+    pub type_id: ty.TypeId,
+    pub alias: ck.Alias,
+}
+
+fn not_path() -> Path {
+    return Path { kind: PathKind.NotPath, type_id: ty.invalid(), alias: ck.Alias { library: ck.Library.NotLibrary, module: 0 } };
+}
+
+pub fn find_binding(c: &ck.Checker, name: alloc.Symbol) -> ?ck.Binding {
+    var i = c.scope.len();
+    while i > 0 : (i -= 1) {
+        if c.scope[i - 1].name == name {
+            return c.scope[i - 1];
+        }
+    }
+    return none;
+}
+
+fn is_value_item(c: &ck.Checker, d: u32) -> bool {
+    let k = c.decls[d as usize].kind;
+    return k == ck.DeclKind.Fn or k == ck.DeclKind.Const;
+}
+
+pub fn path(c: &mut ck.Checker, n: cst.NodeId) -> Path {
+    let k = ck.kind_of(c, n);
+    if k == cst.Kind.NameExpr {
+        let t = ck.ident_of(c, n);
+        let sym = ck.symbol(c, t);
+        match find_binding(c, sym) {
+            some(_) => { return not_path(); }
+            none => { }
+        }
+        match ck.find_item(c, c.module, sym) {
+            some(d) => {
+                if is_value_item(c, d) {
+                    return not_path();
+                }
+                let td = ck.decl_type(c, d);
+                return Path { kind: PathKind.Type, type_id: td, alias: not_path().alias };
+            }
+            none => { }
+        }
+        match ck.find_import(c, sym) {
+            some(a) => {
+                if a.library == ck.Library.NotLibrary {
+                    return Path { kind: PathKind.Module, type_id: ty.invalid(), alias: a };
+                }
+                return Path { kind: PathKind.Library, type_id: ty.invalid(), alias: a };
+            }
+            none => { }
+        }
+        match prim(ck.text(c, t)) {
+            some(pt) => { return Path { kind: PathKind.Type, type_id: pt, alias: not_path().alias }; }
+            none => { }
+        }
+        return not_path();
+    }
+    if k == cst.Kind.FieldExpr {
+        let base = path(c, ck.child(c, n, 0));
+        let nt = member_token(c, n);
+        if base.kind == PathKind.Module {
+            let sym = ck.symbol(c, nt);
+            match ck.find_item(c, base.alias.module, sym) {
+                some(d) => {
+                    if not is_value_item(c, d) {
+                        let decl = c.decls[d as usize];
+                        let s = ck.span_of(c, n);
+                        ck.require_visible(c, s, decl.module, decl.is_pub, "this type");
+                        let td = ck.decl_type(c, d);
+                        return Path { kind: PathKind.Type, type_id: td, alias: base.alias };
+                    }
+                }
+                none => { }
+            }
+        } else if base.kind == PathKind.Library {
+            let name = ck.text(c, nt);
+            var copy = alloc.String.init(c.a);
+            copy.push_str(name);
+            match ck.library_type(c, base.alias.library, copy.view()) {
+                some(lt) => { return Path { kind: PathKind.Type, type_id: lt, alias: base.alias }; }
+                none => { }
+            }
+        }
+        return not_path();
+    }
+    // alloc.List(T) and alloc.Map(K, V) in an expression (§5.3).
+    if k == cst.Kind.CallExpr {
+        let callee = ck.child(c, n, 0);
+        if ck.kind_of(c, callee) != cst.Kind.FieldExpr {
+            return not_path();
+        }
+        let base = path(c, ck.child(c, callee, 0));
+        if base.kind != PathKind.Library or base.alias.library != ck.Library.Alloc {
+            return not_path();
+        }
+        let name = ck.text(c, member_token(c, callee));
+        let is_list = name.eq("List");
+        if not is_list and not name.eq("Map") {
+            return not_path();
+        }
+        let nargs = ck.child_count(c, n) - 1;
+        if (is_list and nargs != 1) or (not is_list and nargs != 2) {
+            let s = ck.span_of(c, n);
+            ck.report(c, codes.BAD_GENERIC, s, "alloc.List takes one type, and alloc.Map two");
+            return Path { kind: PathKind.Type, type_id: ty.invalid(), alias: base.alias };
+        }
+        let first = type_argument(c, ck.child(c, n, 1));
+        if is_list {
+            let lt = c.t.list(first);
+            return Path { kind: PathKind.Type, type_id: lt, alias: base.alias };
+        }
+        let second = type_argument(c, ck.child(c, n, 2));
+        let mt = ck.make_map(c, n, key: first, value: second);
+        return Path { kind: PathKind.Type, type_id: mt, alias: base.alias };
+    }
+    return not_path();
+}
+
+fn prim(name: str) -> ?ty.TypeId {
+    match ty.int_by_name(name) {
+        some(k) => { return ty.int_type(k); }
+        none => { }
+    }
+    if name.eq("bool") {
+        return ty.bool_type();
+    }
+    if name.eq("str") {
+        return ty.str_type();
+    }
+    return none;
+}
+
+/// A type written as an argument of alloc.List(...) in an expression.
+fn type_argument(c: &mut ck.Checker, arg: cst.NodeId) -> ty.TypeId {
+    let e = ck.child(c, arg, 0);
+    let p = path(c, e);
+    if p.kind == PathKind.Type {
+        return p.type_id;
+    }
+    let s = ck.span_of(c, e);
+    ck.report(c, codes.UNKNOWN_TYPE, s, "expected a type, such as u32 or Node");
+    return ty.invalid();
+}
+
+/// The name after the '.' of a FieldExpr.
+pub fn member_token(c: &ck.Checker, n: cst.NodeId) -> u32 {
+    return ck.find_own(c, n, tk.Kind.Ident) orelse ck.tree(c).first_token(n);
+}
+
+/// The constant a checked NameExpr or FieldExpr names, if it names one.
+pub fn constant_of(c: &ck.Checker, n: cst.NodeId) -> ?u32 {
+    let d = ck.ref_of(c, n);
+    if d != ck.NONE and c.decls[d as usize].kind == ck.DeclKind.Const {
+        return d;
+    }
+    return none;
+}
+
+// ---- entry points ---------------------------------------------------------------
+
+/// Checks n where a want is expected, and reports when it does not fit.
+pub fn check_value(c: &mut ck.Checker, n: cst.NodeId, want: ty.TypeId) {
+    let got = check(c, n, some(want));
+    if not ck.assignable(c, got: got, want: want) {
+        ck.report_mismatch(c, n, want: want, got: got);
+    }
+}
+
+/// Checks an expression and returns its type; expected is the type the
+/// context gives it, which integer literals, `none` and array literals
+/// take (§5.6).
+pub fn check(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    let t = check_kind(c, n, expected);
+    ck.set_type(c, n, t);
+    return t;
+}
+
+fn in_constant(c: &ck.Checker) -> bool {
+    return c.fn_index == ck.NONE;
+}
+
+fn not_constant(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let s = ck.span_of(c, n);
+    ck.report(c, codes.NOT_CONSTANT, s, "this is not a constant expression");
+    return ty.invalid();
+}
+
+fn check_kind(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    let k = ck.kind_of(c, n);
+    if in_constant(c) {
+        match k {
+            .IntLit | .CharLit | .StringLit | .BoolLit | .NameExpr | .FieldExpr | .ParenExpr | .UnaryExpr
+            | .BinaryExpr | .CastExpr => { }
+            _ => { return not_constant(c, n); }
+        }
+    }
+    match k {
+        .IntLit => { return check_int(c, n, expected); }
+        .CharLit => { return ty.int_type(ty.IntKind.U8); }
+        .StringLit => { return ty.str_type(); }
+        .BoolLit => { return ty.bool_type(); }
+        .NoneLit => {
+            match expected {
+                some(e) => {
+                    if c.t.kind(e) == ty.Kind.Optional {
+                        return e;
+                    }
+                }
+                none => { }
+            }
+            let s = ck.span_of(c, n);
+            ck.report(c, codes.NEEDS_CONTEXT, s, "'none' takes its type from context, e.g. 'let x: ?u32 = none;'");
+            return ty.invalid();
+        }
+        .SomeExpr => { return check_some(c, n, expected); }
+        .ParenExpr => { return check(c, ck.child(c, n, 0), expected); }
+        .NameExpr => { return check_name(c, n); }
+        .FieldExpr => { return check_field(c, n); }
+        .CallExpr => { return check_call(c, n); }
+        .IndexExpr => { return check_index(c, n); }
+        .SliceExpr => { return check_slice(c, n); }
+        .DerefExpr => {
+            let t = check(c, ck.child(c, n, 0), none);
+            let info = c.t.get(t);
+            if info.kind == ty.Kind.Ref {
+                return info.elem;
+            }
+            if info.kind != ty.Kind.Invalid {
+                var m = ck.new_message(c);
+                m.push_str("'.*' needs a reference, not ");
+                ck.write_type(c, &mut m, t);
+                let s = ck.span_of(c, n);
+                ck.report_owned(c, codes.NOT_A_REFERENCE, s, m);
+            }
+            return ty.invalid();
+        }
+        .RefExpr => { return check_ref(c, n); }
+        .StructLit => { return check_struct_lit(c, n); }
+        .ArrayLit => { return check_array_lit(c, n, expected); }
+        .UnaryExpr => { return check_unary(c, n, expected); }
+        .BinaryExpr => { return check_binary(c, n, expected); }
+        .CastExpr => { return check_cast(c, n); }
+        .TryExpr => { return check_try(c, n); }
+        .CatchExpr | .OrelseExpr => { return check_fallback(c, n, expected); }
+        _ => {
+            let s = ck.span_of(c, n);
+            ck.report(c, codes.UNEXPECTED_TOKEN, s, "expected an expression");
+            return ty.invalid();
+        }
+    }
+}
+
+// ---- literals -----------------------------------------------------------------
+
+fn expected_int(c: &ck.Checker, expected: ?ty.TypeId) -> ?ty.TypeId {
+    match expected {
+        some(e) => {
+            if ck.is_int(c, e) {
+                return e;
+            }
+        }
+        none => { }
+    }
+    return none;
+}
+
+fn report_range(c: &mut ck.Checker, n: cst.NodeId, negative: bool, magnitude: u64, t: ty.TypeId) {
+    var m = ck.new_message(c);
+    if negative {
+        m.push_str("-");
+    }
+    ck.write_number(&mut m, magnitude);
+    m.push_str(" does not fit in ");
+    ck.write_type(c, &mut m, t);
+    let s = ck.span_of(c, n);
+    ck.report_owned(c, codes.LITERAL_RANGE, s, m);
+}
+
+fn check_int(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    match expected_int(c, expected) {
+        some(t) => {
+            let v = ck.tok_value(c, ck.tree(c).first_token(n));
+            if v > ty.max_value(c.t.get(t).int_kind) {
+                report_range(c, n, false, magnitude: v, t);
+            }
+            return t;
+        }
+        none => {
+            // Erasable (§5.6).
+            let s = ck.span_of(c, n);
+            ck.report(c, codes.NEEDS_CONTEXT, s, "an integer literal takes its type from context, e.g. 'let x: u32 = 5;'");
+            return ty.invalid();
+        }
+    }
+}
+
+fn check_some(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    let inner = ck.child(c, n, 0);
+    match expected {
+        some(e) => {
+            if c.t.kind(e) == ty.Kind.Optional {
+                check_value(c, inner, c.t.elem(e));
+                return e;
+            }
+        }
+        none => { }
+    }
+    let t = check(c, inner, none);
+    let k = c.t.kind(t);
+    if k == ty.Kind.Void or k == ty.Kind.Noreturn {
+        let s = ck.span_of(c, n);
+        ck.report(c, codes.NO_VALUE, s, "'some' needs a value");
+        return ty.invalid();
+    }
+    return c.t.optional(t);
+}
+
+// ---- names and fields -----------------------------------------------------------
+
+fn not_a_value(c: &mut ck.Checker, n: cst.NodeId, what: str) -> ty.TypeId {
+    let s = ck.span_of(c, n);
+    ck.report(c, codes.NOT_A_VALUE, s, what);
+    return ty.invalid();
+}
+
+fn check_name(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let t = ck.ident_of(c, n);
+    let sym = ck.symbol(c, t);
+    match find_binding(c, sym) {
+        some(b) => { return b.type_id; }
+        none => { }
+    }
+    match ck.find_item(c, c.module, sym) {
+        some(d) => {
+            let kind = c.decls[d as usize].kind;
+            if kind == ck.DeclKind.Const {
+                consts.check_const(c, d);
+                ck.set_ref(c, n, d);
+                return c.decls[d as usize].type_id;
+            }
+            if kind == ck.DeclKind.Fn {
+                return not_a_value(c, n, "this is a function; in Arche-0 functions can only be called");
+            }
+            return not_a_value(c, n, "this is a type, not a value");
+        }
+        none => { }
+    }
+    match ck.find_import(c, sym) {
+        some(_) => { return not_a_value(c, n, "this is a module, not a value"); }
+        none => { }
+    }
+    if ck.is_predeclared(ck.text(c, t)) {
+        return not_a_value(c, n, "this is a predeclared type or function, not a value");
+    }
+    var m = ck.new_message(c);
+    m.push_str("unknown name '");
+    m.push_str(ck.text(c, t));
+    m.push_str("'");
+    let s = ck.span_of(c, n);
+    ck.report_owned(c, codes.UNKNOWN_NAME, s, m);
+    return ty.invalid();
+}
+
+/// The field of a struct or of std.System, by name.
+pub type FieldRef = struct {
+    pub type_id: ty.TypeId,
+    pub is_pub: bool,
+    pub owner_module: u32,
+    pub found: bool,
+}
+
+pub fn find_field(c: &mut ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> FieldRef {
+    let info = c.t.get(t);
+    var r = FieldRef { type_id: ty.invalid(), is_pub: true, owner_module: c.module, found: false };
+    if info.kind == ty.Kind.Struct {
+        let d = c.decls[info.decl as usize];
+        var i = d.members_start;
+        while i < d.members_start + d.members_len : (i += 1) {
+            let f = c.fields[i as usize];
+            if f.name == name {
+                return FieldRef { type_id: f.type_id, is_pub: f.is_pub, owner_module: d.module, found: true };
+            }
+        }
+        return r;
+    }
+    if info.kind == ty.Kind.Builtin and info.builtin == ty.Builtin.System {
+        let n = c.names.text(name);
+        if n.eq("fs") {
+            r.type_id = c.t.builtin(ty.Builtin.Fs);
+        } else if n.eq("stdout") or n.eq("stderr") {
+            r.type_id = c.t.builtin(ty.Builtin.Output);
+        } else if n.eq("args") {
+            r.type_id = c.t.builtin(ty.Builtin.Args);
+        } else if n.eq("alloc") {
+            r.type_id = c.t.builtin(ty.Builtin.Allocator);
+        } else {
+            return r;
+        }
+        r.found = true;
+    }
+    return r;
+}
+
+pub fn find_variant(c: &ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> ?u32 {
+    let info = c.t.get(t);
+    if info.kind != ty.Kind.Enum {
+        return none;
+    }
+    let d = c.decls[info.decl as usize];
+    var i = d.members_start;
+    while i < d.members_start + d.members_len : (i += 1) {
+        if c.variants[i as usize].name == name {
+            return i;
+        }
+    }
+    return none;
+}
+
+/// The error named `name` in the error set of type t, as its global id; an
+/// inferred set (t is any error) holds every error of the program.
+pub fn find_error(c: &ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> ?u32 {
+    let info = c.t.get(t);
+    if info.kind != ty.Kind.ErrorSet {
+        return none;
+    }
+    let id = c.error_ids.get(name) orelse 0;
+    if id == 0 {
+        return none;
+    }
+    if info.decl == ck.NONE {
+        return id;
+    }
+    let d = c.decls[info.decl as usize];
+    var i = d.members_start;
+    while i < d.members_start + d.members_len : (i += 1) {
+        if c.error_members[i as usize] == id {
+            return id;
+        }
+    }
+    return none;
+}
+
+pub fn find_method(c: &ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> ?u32 {
+    let info = c.t.get(t);
+    if info.kind != ty.Kind.Struct and info.kind != ty.Kind.Enum {
+        return none;
+    }
+    let d = c.decls[info.decl as usize];
+    var i = d.methods_start;
+    while i < d.methods_start + d.methods_len : (i += 1) {
+        let m = c.methods[i as usize];
+        if c.decls[m as usize].name == name {
+            return m;
+        }
+    }
+    return none;
+}
+
+fn report_no_member(c: &mut ck.Checker, n: cst.NodeId, t: ty.TypeId, what: str, name_token: u32) {
+    var m = ck.new_message(c);
+    ck.write_type(c, &mut m, t);
+    m.push_str(" has no ");
+    m.push_str(what);
+    m.push_str(" '");
+    m.push_str(ck.text(c, name_token));
+    m.push_str("'");
+    let s = ck.span_of(c, n);
+    ck.report_owned(c, codes.NO_MEMBER, s, m);
+}
+
+fn check_field(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let base = ck.child(c, n, 0);
+    let nt = member_token(c, n);
+    let sym = ck.symbol(c, nt);
+    let p = path(c, base);
+    if p.kind == PathKind.Type {
+        if in_constant(c) {
+            return not_constant(c, n);
+        }
+        let t = p.type_id;
+        if ck.is_invalid(c, t) {
+            return t;
+        }
+        match find_variant(c, t, sym) {
+            some(v) => {
+                if c.variants[v as usize].has_fields {
+                    return bad_variant_use(c, n, "this variant has fields; construct it as Type.Variant { ... }");
+                }
+                return t;
+            }
+            none => { }
+        }
+        match find_error(c, t, sym) {
+            some(_) => { return t; }
+            none => { }
+        }
+        match find_method(c, t, sym) {
+            some(_) => { return not_a_value(c, n, "this is a function; call it"); }
+            none => { }
+        }
+        report_no_member(c, n, t, "variant or error named", nt);
+        return ty.invalid();
+    }
+    if p.kind == PathKind.Module {
+        let mid = p.alias.module;
+        match ck.find_item(c, mid, sym) {
+            some(d) => {
+                let decl = c.decls[d as usize];
+                if decl.kind == ck.DeclKind.Const {
+                    let s = ck.span_of(c, n);
+                    ck.require_visible(c, s, decl.module, decl.is_pub, "this constant");
+                    consts.check_const(c, d);
+                    ck.set_ref(c, n, d);
+                    return c.decls[d as usize].type_id;
+                }
+                if decl.kind == ck.DeclKind.Fn {
+                    return not_a_value(c, n, "this is a function; in Arche-0 functions can only be called");
+                }
+                return not_a_value(c, n, "this is a type, not a value");
+            }
+            none => { }
+        }
+        var m = ck.new_message(c);
+        m.push_str("module '");
+        m.push_str(c.p.modules[mid as usize].name.view());
+        m.push_str("' has no item named '");
+        m.push_str(ck.text(c, nt));
+        m.push_str("'");
+        let s = ck.span_of(c, n);
+        ck.report_owned(c, codes.NO_ITEM, s, m);
+        return ty.invalid();
+    }
+    if p.kind == PathKind.Library {
+        return not_a_value(c, n, "this is not a value");
+    }
+    if in_constant(c) {
+        return not_constant(c, n);
+    }
+    let bt = check(c, base, none);
+    var t = bt;
+    if c.t.kind(bt) == ty.Kind.Ref {
+        t = c.t.elem(bt);
+    }
+    if ck.is_invalid(c, t) {
+        return t;
+    }
+    let f = find_field(c, t, sym);
+    if not f.found {
+        report_no_member(c, n, t, "field", nt);
+        return ty.invalid();
+    }
+    let s = ck.span_of(c, n);
+    ck.require_visible(c, s, f.owner_module, f.is_pub, "this field");
+    ck.set_ref(c, n, ck.VALUE_FIELD);
+    return f.type_id;
+}
+
+fn bad_variant_use(c: &mut ck.Checker, n: cst.NodeId, what: str) -> ty.TypeId {
+    let s = ck.span_of(c, n);
+    ck.report(c, codes.BAD_VARIANT_USE, s, what);
+    return ty.invalid();
+}
+
+// ---- calls ------------------------------------------------------------------
+
+/// A parameter as a call sees it.
+pub type Param = struct {
+    pub name: alloc.Symbol,
+    pub type_id: ty.TypeId,
+}
+
+/// A built-in method of §11.
+pub type Method = struct {
+    pub self_mode: ck.SelfMode,
+    pub nparams: u32,
+    pub p0: Param,
+    pub p1: Param,
+    pub ret: ty.TypeId,
+    /// Its parameters have one declared type, so calls label them (§7.5).
+    /// Types are compared as written: Map.put(key: K, value: V) needs no
+    /// labels even when K and V are the same type.
+    pub labels: bool,
+}
+
+fn param(c: &mut ck.Checker, name: str, t: ty.TypeId) -> Param {
+    return Param { name: c.names.intern(name), type_id: t };
+}
+
+fn method0(c: &mut ck.Checker, mode: ck.SelfMode, ret: ty.TypeId) -> Method {
+    let empty = Param { name: c.names.intern(""), type_id: ty.invalid() };
+    return Method { self_mode: mode, nparams: 0, p0: empty, p1: empty, ret: ret, labels: false };
+}
+
+fn method1(c: &mut ck.Checker, mode: ck.SelfMode, p0: Param, ret: ty.TypeId) -> Method {
+    var m = method0(c, mode, ret);
+    m.nparams = 1;
+    m.p0 = p0;
+    return m;
+}
+
+fn method2(c: &mut ck.Checker, mode: ck.SelfMode, p0: Param, p1: Param, ret: ty.TypeId) -> Method {
+    var m = method0(c, mode, ret);
+    m.nparams = 2;
+    m.p0 = p0;
+    m.p1 = p1;
+    return m;
+}
+
+/// The built-in method of type t named `name` (§11).
+fn builtin_method(c: &mut ck.Checker, t: ty.TypeId, name: str) -> ?Method {
+    let info = c.t.get(t);
+    let usize_t = ty.int_type(ty.IntKind.Usize);
+    let u8_t = ty.int_type(ty.IntKind.U8);
+    let byval = ck.SelfMode.Value;
+    let shared = ck.SelfMode.Ref;
+    let mutable = ck.SelfMode.MutRef;
+    match info.kind {
+        .Str => {
+            if name.eq("len") { return method0(c, byval, usize_t); }
+            if name.eq("eq") {
+                let p = param(c, "other", ty.str_type());
+                return method1(c, byval, p, ty.bool_type());
+            }
+            if name.eq("starts_with") {
+                let p = param(c, "prefix", ty.str_type());
+                return method1(c, byval, p, ty.bool_type());
+            }
+            if name.eq("bytes") {
+                let s = c.t.slice(false, u8_t);
+                return method0(c, byval, s);
+            }
+        }
+        .Slice | .Array => {
+            if name.eq("len") { return method0(c, shared, usize_t); }
+        }
+        .List => {
+            let e = info.elem;
+            if name.eq("push") {
+                let p = param(c, "item", e);
+                return method1(c, mutable, p, ty.void_type());
+            }
+            if name.eq("pop") {
+                let o = c.t.optional(e);
+                return method0(c, mutable, o);
+            }
+            if name.eq("len") { return method0(c, shared, usize_t); }
+            if name.eq("clear") { return method0(c, mutable, ty.void_type()); }
+            if name.eq("items") {
+                let s = c.t.slice(false, e);
+                return method0(c, shared, s);
+            }
+            if name.eq("items_mut") {
+                let s = c.t.slice(true, e);
+                return method0(c, mutable, s);
+            }
+        }
+        .Map => {
+            let o = c.t.optional(info.elem);
+            if name.eq("put") {
+                let k = param(c, "key", info.key);
+                let v = param(c, "value", info.elem);
+                return method2(c, mutable, p0: k, p1: v, ty.void_type());
+            }
+            if name.eq("get") {
+                let k = param(c, "key", info.key);
+                return method1(c, shared, k, o);
+            }
+            if name.eq("remove") {
+                let k = param(c, "key", info.key);
+                return method1(c, mutable, k, o);
+            }
+            if name.eq("len") { return method0(c, shared, usize_t); }
+        }
+        .Builtin => {
+            return library_method(c, info.builtin, name);
+        }
+        _ => { }
+    }
+    return none;
+}
+
+fn library_method(c: &mut ck.Checker, b: ty.Builtin, name: str) -> ?Method {
+    let usize_t = ty.int_type(ty.IntKind.Usize);
+    let shared = ck.SelfMode.Ref;
+    let mutable = ck.SelfMode.MutRef;
+    match b {
+        .Output => {
+            var pt = ty.invalid();
+            var pn = "";
+            if name.eq("write") {
+                pt = ty.str_type();
+                pn = "text";
+            } else if name.eq("write_byte") {
+                pt = ty.int_type(ty.IntKind.U8);
+                pn = "byte";
+            } else if name.eq("write_u64") {
+                pt = ty.int_type(ty.IntKind.U64);
+                pn = "n";
+            } else if name.eq("write_i64") {
+                pt = ty.int_type(ty.IntKind.I64);
+                pn = "n";
+            } else {
+                return none;
+            }
+            let p = param(c, pn, pt);
+            return method1(c, mutable, p, ty.void_type());
+        }
+        .Args => {
+            if name.eq("len") { return method0(c, shared, usize_t); }
+            if name.eq("get") {
+                let p = param(c, "i", usize_t);
+                return method1(c, shared, p, ty.str_type());
+            }
+        }
+        .Fs => {
+            let alloc_t = c.t.builtin(ty.Builtin.Allocator);
+            let path_p = param(c, "path", ty.str_type());
+            if name.eq("read_file") {
+                let a = param(c, "a", alloc_t);
+                let string_t = c.t.builtin(ty.Builtin.String);
+                let r = c.t.error_union(c.io_error, string_t);
+                return method2(c, shared, p0: path_p, p1: a, r);
+            }
+            if name.eq("read_bytes") {
+                let a = param(c, "a", alloc_t);
+                let bytes = c.t.list(ty.int_type(ty.IntKind.U8));
+                let r = c.t.error_union(c.io_error, bytes);
+                return method2(c, shared, p0: path_p, p1: a, r);
+            }
+            if name.eq("write_file") {
+                let d = param(c, "data", ty.str_type());
+                let r = c.t.error_union(c.io_error, ty.void_type());
+                var m = method2(c, shared, p0: path_p, p1: d, r);
+                m.labels = true;
+                return m;
+            }
+        }
+        .String => {
+            if name.eq("push_str") {
+                let p = param(c, "text", ty.str_type());
+                return method1(c, mutable, p, ty.void_type());
+            }
+            if name.eq("push_ascii") {
+                let p = param(c, "byte", ty.int_type(ty.IntKind.U8));
+                return method1(c, mutable, p, ty.void_type());
+            }
+            if name.eq("view") { return method0(c, shared, ty.str_type()); }
+            if name.eq("len") { return method0(c, shared, usize_t); }
+        }
+        .Interner => {
+            let sym_t = c.t.builtin(ty.Builtin.Symbol);
+            if name.eq("intern") {
+                let p = param(c, "text", ty.str_type());
+                return method1(c, mutable, p, sym_t);
+            }
+            if name.eq("text") {
+                let p = param(c, "sym", sym_t);
+                return method1(c, shared, p, ty.str_type());
+            }
+        }
+        _ => { }
+    }
+    return none;
+}
+
+/// Checks the arguments of a call (children 1.. of the CallExpr) against
+/// params: their number, their types and their labels (§7.5).
+fn check_args(c: &mut ck.Checker, call: cst.NodeId, params: &alloc.List(Param), labels_by_type: bool) {
+    let nargs = ck.child_count(c, call) - 1;
+    let ps = params.items();
+    if nargs as usize != ps.len() {
+        var m = ck.new_message(c);
+        m.push_str("this call has ");
+        ck.write_number(&mut m, nargs as u64);
+        m.push_str(" argument");
+        if nargs != 1 {
+            m.push_str("s");
+        }
+        m.push_str(", but the function takes ");
+        ck.write_number(&mut m, ps.len() as u64);
+        let s = ck.span_of(c, call);
+        ck.report_owned(c, codes.ARGUMENT_COUNT, s, m);
+        var k: u32 = 0;
+        while k < nargs : (k += 1) {
+            _ = check(c, ck.child(c, ck.child(c, call, k + 1), 0), none);
+        }
+        return;
+    }
+    var i: usize = 0;
+    while i < ps.len() : (i += 1) {
+        let arg = ck.child(c, call, i as u32 + 1);
+        match ck.find_own(c, arg, tk.Kind.Ident) {
+            some(label) => {
+                let sym = ck.symbol(c, label);
+                if sym != ps[i].name {
+                    var m = ck.new_message(c);
+                    m.push_str("this argument is labeled '");
+                    m.push_str(ck.text(c, label));
+                    m.push_str("', but the parameter is '");
+                    m.push_str(c.names.text(ps[i].name));
+                    m.push_str("'");
+                    let s = ck.token_span(c, label);
+                    ck.report_owned(c, codes.WRONG_LABEL, s, m);
+                }
+            }
+            none => {
+                // Erasable (§7.5): two parameters of one type need labels.
+                var shared_type = false;
+                var j: usize = 0;
+                while j < ps.len() and labels_by_type : (j += 1) {
+                    shared_type = shared_type or (j != i and ps[j].type_id == ps[i].type_id);
+                }
+                if shared_type {
+                    var m = ck.new_message(c);
+                    m.push_str("label this argument '");
+                    m.push_str(c.names.text(ps[i].name));
+                    m.push_str(":': two parameters have the same type");
+                    let s = ck.span_of(c, arg);
+                    ck.report_owned(c, codes.MISSING_LABEL, s, m);
+                    var label = alloc.String.init(c.a);
+                    label.push_str(c.names.text(ps[i].name));
+                    label.push_str(": ");
+                    c.p.diags.attach_fix(diag.Span { start: s.start, len: 0 }, label.view());
+                }
+            }
+        }
+        let e = ck.child(c, arg, 0);
+        check_value(c, e, ps[i].type_id);
+        ck.set_type(c, arg, ck.type_of(c, e));
+    }
+}
+
+/// The parameters of a declared function, without self when skip is 1.
+fn fn_params(c: &ck.Checker, f: ck.FnInfo, skip: u32) -> alloc.List(Param) {
+    var out = alloc.List(Param).init(c.a);
+    var i = f.params_start + skip;
+    while i < f.params_start + f.params_len : (i += 1) {
+        let pi = c.params[i as usize];
+        out.push(Param { name: pi.name, type_id: pi.type_id });
+    }
+    return out;
+}
+
+fn method_params(c: &ck.Checker, m: Method) -> alloc.List(Param) {
+    var out = alloc.List(Param).init(c.a);
+    if m.nparams > 0 {
+        out.push(m.p0);
+    }
+    if m.nparams > 1 {
+        out.push(m.p1);
+    }
+    return out;
+}
+
+/// Checks only the argument expressions: for calls that already failed.
+fn check_args_loosely(c: &mut ck.Checker, call: cst.NodeId) {
+    let nargs = ck.child_count(c, call) - 1;
+    var k: u32 = 0;
+    while k < nargs : (k += 1) {
+        _ = check(c, ck.child(c, ck.child(c, call, k + 1), 0), none);
+    }
+}
+
+fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId {
+    let f = c.fns[c.decls[d as usize].fn_index as usize];
+    let ps = fn_params(c, f, skip);
+    check_args(c, call, &ps, true);
+    ck.set_ref(c, call, d);
+    return f.ret;
+}
+
+fn check_builtin_fn(c: &mut ck.Checker, call: cst.NodeId, name: str) -> ?ty.TypeId {
+    var ps = alloc.List(Param).init(c.a);
+    if name.eq("panic") {
+        ps.push(param(c, "message", ty.str_type()));
+        check_args(c, call, &ps, true);
+        return ty.noreturn_type();
+    }
+    if name.eq("assert") {
+        ps.push(param(c, "condition", ty.bool_type()));
+        check_args(c, call, &ps, true);
+        return ty.void_type();
+    }
+    if name.eq("unreachable") {
+        check_args(c, call, &ps, true);
+        return ty.noreturn_type();
+    }
+    return none;
+}
+
+fn not_callable(c: &mut ck.Checker, call: cst.NodeId, n: cst.NodeId, what: str) -> ty.TypeId {
+    let s = ck.span_of(c, n);
+    ck.report(c, codes.NOT_CALLABLE, s, what);
+    check_args_loosely(c, call);
+    return ty.invalid();
+}
+
+fn has_init(c: &ck.Checker, t: ty.TypeId) -> bool {
+    let info = c.t.get(t);
+    if info.kind == ty.Kind.List or info.kind == ty.Kind.Map {
+        return true;
+    }
+    return info.kind == ty.Kind.Builtin and (info.builtin == ty.Builtin.String or info.builtin == ty.Builtin.Interner);
+}
+
+fn check_call(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let callee = ck.child(c, n, 0);
+    let ck_kind = ck.kind_of(c, callee);
+    if ck_kind == cst.Kind.FieldExpr {
+        let base = ck.child(c, callee, 0);
+        let nt = member_token(c, callee);
+        let p = path(c, base);
+        if p.kind == PathKind.Type {
+            let t = p.type_id;
+            if ck.is_invalid(c, t) {
+                check_args_loosely(c, n);
+                return t;
+            }
+            if has_init(c, t) and ck.text(c, nt).eq("init") {
+                var ps = alloc.List(Param).init(c.a);
+                let at = c.t.builtin(ty.Builtin.Allocator);
+                ps.push(param(c, "a", at));
+                check_args(c, n, &ps, true);
+                return t;
+            }
+            let sym = ck.symbol(c, nt);
+            match find_method(c, t, sym) {
+                some(d) => {
+                    let decl = c.decls[d as usize];
+                    let s = ck.span_of(c, callee);
+                    ck.require_visible(c, s, decl.module, decl.is_pub, "this function");
+                    return call_fn(c, n, d: d, skip: 0);
+                }
+                none => { }
+            }
+            report_no_member(c, callee, t, "function", nt);
+            check_args_loosely(c, n);
+            return ty.invalid();
+        }
+        if p.kind == PathKind.Module {
+            let sym = ck.symbol(c, nt);
+            match ck.find_item(c, p.alias.module, sym) {
+                some(d) => {
+                    let decl = c.decls[d as usize];
+                    if decl.kind == ck.DeclKind.Fn {
+                        let s = ck.span_of(c, callee);
+                        ck.require_visible(c, s, decl.module, decl.is_pub, "this function");
+                        return call_fn(c, n, d: d, skip: 0);
+                    }
+                    return not_callable(c, call: n, n: callee, "this is not a function");
+                }
+                none => { }
+            }
+            var m = ck.new_message(c);
+            m.push_str("module '");
+            m.push_str(c.p.modules[p.alias.module as usize].name.view());
+            m.push_str("' has no function '");
+            m.push_str(ck.text(c, nt));
+            m.push_str("'");
+            let s = ck.span_of(c, callee);
+            ck.report_owned(c, codes.UNKNOWN_FUNCTION, s, m);
+            check_args_loosely(c, n);
+            return ty.invalid();
+        }
+        if p.kind == PathKind.Library {
+            return not_callable(c, call: n, n: callee, "this is not a function");
+        }
+        return check_method_call(c, call: n, callee: callee);
+    }
+    if ck_kind == cst.Kind.NameExpr {
+        let t = ck.ident_of(c, callee);
+        let sym = ck.symbol(c, t);
+        match find_binding(c, sym) {
+            some(_) => { return not_callable(c, call: n, n: callee, "this is a value, not a function"); }
+            none => { }
+        }
+        match ck.find_item(c, c.module, sym) {
+            some(d) => {
+                if c.decls[d as usize].kind == ck.DeclKind.Fn {
+                    return call_fn(c, n, d: d, skip: 0);
+                }
+                return not_callable(c, call: n, n: callee, "this is not a function");
+            }
+            none => { }
+        }
+        var name = alloc.String.init(c.a);
+        name.push_str(ck.text(c, t));
+        match check_builtin_fn(c, n, name.view()) {
+            some(r) => { return r; }
+            none => { }
+        }
+        var m = ck.new_message(c);
+        m.push_str("unknown function '");
+        m.push_str(name.view());
+        m.push_str("'");
+        let s = ck.span_of(c, callee);
+        ck.report_owned(c, codes.UNKNOWN_FUNCTION, s, m);
+        check_args_loosely(c, n);
+        return ty.invalid();
+    }
+    _ = check(c, callee, none);
+    return not_callable(c, call: n, n: callee, "this expression cannot be called");
+}
+
+fn require_mutable_receiver(c: &mut ck.Checker, receiver: cst.NodeId, rt: ty.TypeId) {
+    let info = c.t.get(rt);
+    var fine = false;
+    if info.kind == ty.Kind.Ref {
+        fine = info.mutable;
+    } else {
+        fine = is_place(c, receiver) and place_mutable(c, receiver);
+    }
+    if not fine {
+        let s = ck.span_of(c, receiver);
+        ck.report(c, codes.NOT_MUTABLE, s, "this method changes its receiver: it needs a 'var', or a place reached through '&mut'");
+    }
+}
+
+fn check_method_call(c: &mut ck.Checker, call: cst.NodeId, callee: cst.NodeId) -> ty.TypeId {
+    let receiver = ck.child(c, callee, 0);
+    let rt = check(c, receiver, none);
+    var t = rt;
+    if c.t.kind(rt) == ty.Kind.Ref {
+        t = c.t.elem(rt);
+    }
+    if ck.is_invalid(c, t) {
+        check_args_loosely(c, call);
+        return t;
+    }
+    let nt = member_token(c, callee);
+    let sym = ck.symbol(c, nt);
+    match find_method(c, t, sym) {
+        some(d) => {
+            let decl = c.decls[d as usize];
+            let f = c.fns[decl.fn_index as usize];
+            if not f.has_self {
+                let s = ck.span_of(c, callee);
+                ck.report(c, codes.BAD_SELF, s, "this function has no 'self' parameter; call it as Type.name(...)");
+                check_args_loosely(c, call);
+                return f.ret;
+            }
+            let s = ck.span_of(c, callee);
+            ck.require_visible(c, s, decl.module, decl.is_pub, "this method");
+            if f.self_mode == ck.SelfMode.MutRef {
+                require_mutable_receiver(c, receiver, rt);
+            }
+            return call_fn(c, call, d: d, skip: 1);
+        }
+        none => { }
+    }
+    var name = alloc.String.init(c.a);
+    name.push_str(ck.text(c, nt));
+    match builtin_method(c, t, name.view()) {
+        some(m) => {
+            if m.self_mode == ck.SelfMode.MutRef {
+                require_mutable_receiver(c, receiver, rt);
+            }
+            let ps = method_params(c, m);
+            check_args(c, call, &ps, m.labels);
+            return m.ret;
+        }
+        none => { }
+    }
+    report_no_member(c, callee, t, "method", nt);
+    check_args_loosely(c, call);
+    return ty.invalid();
+}
+
+// ---- places (§7.6) ------------------------------------------------------------
+
+/// A checked expression is a place: a binding, a field of a place, an
+/// element of a place, or r.* (§7.6).
+pub fn is_place(c: &mut ck.Checker, e: cst.NodeId) -> bool {
+    match ck.kind_of(c, e) {
+        .NameExpr => {
+            let sym = ck.symbol(c, ck.ident_of(c, e));
+            match find_binding(c, sym) {
+                some(_) => { return true; }
+                none => { return false; }
+            }
+        }
+        .ParenExpr => { return is_place(c, ck.child(c, e, 0)); }
+        .FieldExpr => {
+            if ck.ref_of(c, e) != ck.VALUE_FIELD {
+                return false;
+            }
+            let base = ck.child(c, e, 0);
+            return c.t.kind(ck.type_of(c, base)) == ty.Kind.Ref or is_place(c, base);
+        }
+        .DerefExpr => { return true; }
+        .IndexExpr => {
+            let base = ck.child(c, e, 0);
+            let k = c.t.kind(ck.type_of(c, base));
+            if k == ty.Kind.Slice {
+                return true;
+            }
+            return (k == ty.Kind.Array or k == ty.Kind.List) and is_place(c, base);
+        }
+        _ => { return false; }
+    }
+}
+
+pub fn place_mutable(c: &mut ck.Checker, e: cst.NodeId) -> bool {
+    match ck.kind_of(c, e) {
+        .NameExpr => {
+            let sym = ck.symbol(c, ck.ident_of(c, e));
+            match find_binding(c, sym) {
+                some(b) => { return b.mutable; }
+                none => { return false; }
+            }
+        }
+        .ParenExpr => { return place_mutable(c, ck.child(c, e, 0)); }
+        .FieldExpr | .IndexExpr => {
+            let base = ck.child(c, e, 0);
+            let info = c.t.get(ck.type_of(c, base));
+            if info.kind == ty.Kind.Ref or info.kind == ty.Kind.Slice {
+                return info.mutable;
+            }
+            return place_mutable(c, base);
+        }
+        .DerefExpr => {
+            return c.t.get(ck.type_of(c, ck.child(c, e, 0))).mutable;
+        }
+        _ => { return false; }
+    }
+}
+
+fn check_ref(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let operand = ck.child(c, n, 0);
+    let t = check(c, operand, none);
+    let mutable = ck.has_own(c, n, tk.Kind.KwMut);
+    if ck.is_invalid(c, t) {
+        return t;
+    }
+    if not is_place(c, operand) {
+        let s = ck.span_of(c, n);
+        ck.report(c, codes.NOT_A_PLACE, s, "'&' needs a place: a variable, a field, an element or '.*'");
+        return ty.invalid();
+    }
+    if mutable and not place_mutable(c, operand) {
+        let s = ck.span_of(c, n);
+        ck.report(c, codes.NOT_MUTABLE, s, "'&mut' needs a mutable place: a 'var', or a place reached through '&mut'");
+    }
+    return c.t.reference(mutable, t);
+}
+
+// ---- indexing and slicing (§7.7) --------------------------------------------------
+
+fn not_indexable(c: &mut ck.Checker, n: cst.NodeId, t: ty.TypeId, what: str) -> ty.TypeId {
+    var m = ck.new_message(c);
+    ck.write_type(c, &mut m, t);
+    m.push_str(what);
+    let s = ck.span_of(c, n);
+    ck.report_owned(c, codes.NOT_INDEXABLE, s, m);
+    return ty.invalid();
+}
+
+fn check_index(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let bt = check(c, ck.child(c, n, 0), none);
+    check_value(c, ck.child(c, n, 1), ty.int_type(ty.IntKind.Usize));
+    let info = c.t.get(bt);
+    match info.kind {
+        .Array | .Slice | .List => { return info.elem; }
+        .Str => { return ty.int_type(ty.IntKind.U8); }
+        .Invalid => { return bt; }
+        _ => { return not_indexable(c, n, bt, " cannot be indexed"); }
+    }
+}
+
+fn check_slice(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let base = ck.child(c, n, 0);
+    let bt = check(c, base, none);
+    let usize_t = ty.int_type(ty.IntKind.Usize);
+    check_value(c, ck.child(c, n, 1), usize_t);
+    check_value(c, ck.child(c, n, 2), usize_t);
+    let info = c.t.get(bt);
+    match info.kind {
+        .Str => { return bt; }
+        .Slice => { return bt; }
+        .Array | .List => {
+            if not is_place(c, base) {
+                return not_indexable(c, n, bt, " can be sliced only as a place: store it in a variable first");
+            }
+            let mutable = place_mutable(c, base);
+            return c.t.slice(mutable, info.elem);
+        }
+        .Invalid => { return bt; }
+        _ => { return not_indexable(c, n, bt, " cannot be sliced"); }
+    }
+}
+
+// ---- literals of composite types (§7.4) -------------------------------------------
+
+fn check_struct_lit(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let path_node = ck.child(c, n, 0);
+    let p = path(c, path_node);
+    var t = ty.invalid();
+    var fields_start: u32 = 0;
+    var fields_len: u32 = 0;
+    var owner_module = c.module;
+    var is_variant = false;
+    if p.kind == PathKind.Type and c.t.kind(p.type_id) == ty.Kind.Struct {
+        t = p.type_id;
+        let d = c.decls[c.t.get(t).decl as usize];
+        fields_start = d.members_start;
+        fields_len = d.members_len;
+        owner_module = d.module;
+    } else {
+        var found = false;
+        if ck.kind_of(c, path_node) == cst.Kind.FieldExpr {
+            let owner = path(c, ck.child(c, path_node, 0));
+            if owner.kind == PathKind.Type {
+                let vt = member_token(c, path_node);
+                let sym = ck.symbol(c, vt);
+                match find_variant(c, owner.type_id, sym) {
+                    some(v) => {
+                        let variant = c.variants[v as usize];
+                        if not variant.has_fields {
+                            check_fields_loosely(c, n);
+                            return bad_variant_use(c, path_node, "this variant has no fields; write it without '{ }'");
+                        }
+                        t = owner.type_id;
+                        fields_start = variant.fields_start;
+                        fields_len = variant.fields_len;
+                        is_variant = true;
+                        found = true;
+                    }
+                    none => { }
+                }
+            }
+        }
+        if not found {
+            if p.kind == PathKind.Type and ck.is_invalid(c, p.type_id) {
+                check_fields_loosely(c, n);
+                return ty.invalid();
+            }
+            let s = ck.span_of(c, path_node);
+            ck.report(c, codes.BAD_STRUCT_LITERAL, s, "'{' here needs a struct type or an enum variant with fields");
+            check_fields_loosely(c, n);
+            return ty.invalid();
+        }
+    }
+    let ninits = ck.child_count(c, n) - 1;
+    var i: u32 = 0;
+    while i < ninits or i < fields_len : (i += 1) {
+        if i >= ninits {
+            var m = ck.new_message(c);
+            m.push_str("this literal does not set field '");
+            m.push_str(c.names.text(c.fields[(fields_start + i) as usize].name));
+            m.push_str("'; every field is written");
+            let s = ck.span_of(c, n);
+            ck.report_owned(c, codes.BAD_STRUCT_LITERAL, s, m);
+            return t;
+        }
+        let init = ck.child(c, n, i + 1);
+        let ft = ck.ident_of(c, init);
+        let value = ck.child(c, init, 0);
+        if i >= fields_len {
+            let s = ck.token_span(c, ft);
+            ck.report(c, codes.BAD_STRUCT_LITERAL, s, "the type has no more fields");
+            _ = check(c, value, none);
+            continue;
+        }
+        let field = c.fields[(fields_start + i) as usize];
+        let sym = ck.symbol(c, ft);
+        if sym != field.name {
+            var m = ck.new_message(c);
+            m.push_str("fields are written in declaration order: expected '");
+            m.push_str(c.names.text(field.name));
+            m.push_str("', found '");
+            m.push_str(ck.text(c, ft));
+            m.push_str("'");
+            let s = ck.token_span(c, ft);
+            ck.report_owned(c, codes.BAD_STRUCT_LITERAL, s, m);
+        }
+        if not is_variant {
+            let s = ck.token_span(c, ft);
+            ck.require_visible(c, s, owner_module, field.is_pub, "this field");
+        }
+        check_value(c, value, field.type_id);
+    }
+    return t;
+}
+
+fn check_fields_loosely(c: &mut ck.Checker, n: cst.NodeId) {
+    let ninits = ck.child_count(c, n) - 1;
+    var i: u32 = 0;
+    while i < ninits : (i += 1) {
+        _ = check(c, ck.child(c, ck.child(c, n, i + 1), 0), none);
+    }
+}
+
+fn check_array_lit(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    let count = ck.child_count(c, n);
+    match expected {
+        some(e) => {
+            let info = c.t.get(e);
+            if info.kind == ty.Kind.Array {
+                if count as u64 != info.len {
+                    var m = ck.new_message(c);
+                    m.push_str("this literal has ");
+                    ck.write_number(&mut m, count as u64);
+                    m.push_str(" elements, but ");
+                    ck.write_type(c, &mut m, e);
+                    m.push_str(" has ");
+                    ck.write_number(&mut m, info.len);
+                    let s = ck.span_of(c, n);
+                    ck.report_owned(c, codes.ARRAY_LENGTH, s, m);
+                }
+                var i: u32 = 0;
+                while i < count : (i += 1) {
+                    check_value(c, ck.child(c, n, i), info.elem);
+                }
+                return e;
+            }
+        }
+        none => { }
+    }
+    let s = ck.span_of(c, n);
+    ck.report(c, codes.NEEDS_CONTEXT, s, "an array literal takes its type from context, e.g. 'let a: [3]u32 = [1, 2, 3];'");
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        _ = check(c, ck.child(c, n, i), none);
+    }
+    return ty.invalid();
+}
+
+// ---- operators (§7.1, §7.2) ---------------------------------------------------------
+
+fn op_token(c: &ck.Checker, n: cst.NodeId) -> u32 {
+    let toks = ck.own(c, n);
+    return toks[0];
+}
+
+/// An integer literal, or arithmetic of literals only: it takes its type
+/// from context (§5.6).
+fn untyped(c: &ck.Checker, n: cst.NodeId) -> bool {
+    match ck.kind_of(c, n) {
+        .IntLit => { return true; }
+        .ParenExpr => { return untyped(c, ck.child(c, n, 0)); }
+        .UnaryExpr => {
+            return ck.tok_kind(c, op_token(c, n)) != tk.Kind.KwNot and untyped(c, ck.child(c, n, 0));
+        }
+        .BinaryExpr => {
+            match ck.tok_kind(c, op_token(c, n)) {
+                .Plus | .Minus | .Star | .Slash | .Percent | .PlusWrap | .MinusWrap | .StarWrap | .Amp | .Pipe | .Caret => {
+                    return untyped(c, ck.child(c, n, 0)) and untyped(c, ck.child(c, n, 1));
+                }
+                _ => { return false; }
+            }
+        }
+        _ => { return false; }
+    }
+}
+
+fn report_operator(c: &mut ck.Checker, n: cst.NodeId, what: str, t: ty.TypeId) -> ty.TypeId {
+    var m = ck.new_message(c);
+    m.push_str("'");
+    m.push_str(ck.text(c, op_token(c, n)));
+    m.push_str("' ");
+    m.push_str(what);
+    m.push_str(", not ");
+    ck.write_type(c, &mut m, t);
+    let s = ck.token_span(c, op_token(c, n));
+    ck.report_owned(c, codes.BAD_OPERATOR, s, m);
+    return ty.invalid();
+}
+
+fn check_unary(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    let op = ck.tok_kind(c, op_token(c, n));
+    let operand = ck.child(c, n, 0);
+    if op == tk.Kind.KwNot {
+        check_value(c, operand, ty.bool_type());
+        return ty.bool_type();
+    }
+    // '-' directly before an integer literal makes a negative literal (§5.6).
+    if op == tk.Kind.Minus and ck.kind_of(c, operand) == cst.Kind.IntLit {
+        match expected_int(c, expected) {
+            some(t) => {
+                ck.set_type(c, operand, t);
+                let k = c.t.get(t).int_kind;
+                if not ty.is_signed(k) {
+                    return report_operator(c, n, "needs a signed integer type", t);
+                }
+                let v = ck.tok_value(c, ck.tree(c).first_token(operand));
+                if v > ty.min_magnitude(k) {
+                    report_range(c, n, true, magnitude: v, t);
+                }
+                return t;
+            }
+            none => {
+                let s = ck.span_of(c, n);
+                ck.report(c, codes.NEEDS_CONTEXT, s, "an integer literal takes its type from context, e.g. 'let x: i32 = -5;'");
+                return ty.invalid();
+            }
+        }
+    }
+    let t = check(c, operand, expected_int(c, expected));
+    if ck.is_invalid(c, t) {
+        return t;
+    }
+    if not ck.is_int(c, t) {
+        return report_operator(c, n, "works on integers", t);
+    }
+    if op == tk.Kind.Minus and not ty.is_signed(c.t.get(t).int_kind) {
+        return report_operator(c, n, "needs a signed integer type", t);
+    }
+    return t;
+}
+
+/// The operands of a binary operator have one type; a literal takes it
+/// from the other operand.
+fn check_operands(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    let lhs = ck.child(c, n, 0);
+    let rhs = ck.child(c, n, 1);
+    var lt = ty.invalid();
+    var rt = ty.invalid();
+    if untyped(c, lhs) and not untyped(c, rhs) {
+        rt = check(c, rhs, expected);
+        lt = check(c, lhs, some(rt));
+    } else {
+        lt = check(c, lhs, expected);
+        rt = check(c, rhs, some(lt));
+    }
+    if ck.is_invalid(c, lt) or ck.is_invalid(c, rt) {
+        return ty.invalid();
+    }
+    if lt != rt {
+        var m = ck.new_message(c);
+        m.push_str("the operands of '");
+        m.push_str(ck.text(c, op_token(c, n)));
+        m.push_str("' have different types: ");
+        ck.write_type(c, &mut m, lt);
+        m.push_str(" and ");
+        ck.write_type(c, &mut m, rt);
+        let s = ck.token_span(c, op_token(c, n));
+        ck.report_owned(c, codes.OPERAND_TYPES, s, m);
+        return ty.invalid();
+    }
+    return lt;
+}
+
+fn check_binary(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    let op = ck.tok_kind(c, op_token(c, n));
+    let lhs = ck.child(c, n, 0);
+    let rhs = ck.child(c, n, 1);
+    match op {
+        .KwAnd | .KwOr => {
+            check_value(c, lhs, ty.bool_type());
+            check_value(c, rhs, ty.bool_type());
+            return ty.bool_type();
+        }
+        .EqEq | .NotEq => {
+            // Error names are global (§5.2): values of two sets compare.
+            if not untyped(c, lhs) and not untyped(c, rhs) {
+                let lt = check(c, lhs, none);
+                let rt = check(c, rhs, some(lt));
+                if c.t.kind(lt) == ty.Kind.ErrorSet and c.t.kind(rt) == ty.Kind.ErrorSet {
+                    return ty.bool_type();
+                }
+                if ck.is_invalid(c, lt) or ck.is_invalid(c, rt) {
+                    return ty.bool_type();
+                }
+                if lt != rt {
+                    var m = ck.new_message(c);
+                    m.push_str("the operands of '");
+                    m.push_str(ck.text(c, op_token(c, n)));
+                    m.push_str("' have different types: ");
+                    ck.write_type(c, &mut m, lt);
+                    m.push_str(" and ");
+                    ck.write_type(c, &mut m, rt);
+                    let s = ck.token_span(c, op_token(c, n));
+                    ck.report_owned(c, codes.OPERAND_TYPES, s, m);
+                    return ty.bool_type();
+                }
+                if not ck.comparable(c, lt) {
+                    _ = report_operator(c, n, "works on integers, bools, errors, enums without payloads and structs of these (compare text with .eq())", lt);
+                }
+                return ty.bool_type();
+            }
+            let t = check_operands(c, n, none);
+            if not ck.is_invalid(c, t) and not ck.comparable(c, t) {
+                _ = report_operator(c, n, "works on integers, bools, errors, enums without payloads and structs of these", t);
+            }
+            return ty.bool_type();
+        }
+        .Lt | .Le | .Gt | .Ge => {
+            let t = check_operands(c, n, none);
+            if not ck.is_invalid(c, t) and not ck.is_int(c, t) {
+                _ = report_operator(c, n, "compares integers", t);
+            }
+            return ty.bool_type();
+        }
+        .Shl | .Shr => {
+            let t = check(c, lhs, expected_int(c, expected));
+            var count = ty.invalid();
+            if untyped(c, rhs) {
+                count = check(c, rhs, some(ty.int_type(ty.IntKind.U32)));
+            } else {
+                count = check(c, rhs, none);
+            }
+            if ck.is_invalid(c, t) {
+                return t;
+            }
+            if not ck.is_int(c, t) {
+                return report_operator(c, n, "shifts integers", t);
+            }
+            if not ck.is_invalid(c, count) and (not ck.is_int(c, count) or ty.is_signed(c.t.get(count).int_kind)) {
+                var m = ck.new_message(c);
+                m.push_str("a shift count is an unsigned integer, not ");
+                ck.write_type(c, &mut m, count);
+                let s = ck.span_of(c, rhs);
+                ck.report_owned(c, codes.BAD_OPERATOR, s, m);
+            }
+            return t;
+        }
+        _ => {
+            let t = check_operands(c, n, expected_int(c, expected));
+            if ck.is_invalid(c, t) {
+                return t;
+            }
+            if not ck.is_int(c, t) {
+                return report_operator(c, n, "works on integers", t);
+            }
+            return t;
+        }
+    }
+}
+
+fn check_cast(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let operand = ck.child(c, n, 0);
+    let to = ck.resolve_type(c, ck.child(c, n, 1));
+    if untyped(c, operand) {
+        let s = ck.span_of(c, operand);
+        ck.report(c, codes.BAD_CAST, s, "an integer literal takes its type from context; 'as' does not give it one");
+        return to;
+    }
+    let from = check(c, operand, none);
+    if ck.is_invalid(c, from) or ck.is_invalid(c, to) {
+        return to;
+    }
+    if not ck.is_int(c, from) or not ck.is_int(c, to) {
+        var m = ck.new_message(c);
+        m.push_str("'as' converts between integer types, not from ");
+        ck.write_type(c, &mut m, from);
+        m.push_str(" to ");
+        ck.write_type(c, &mut m, to);
+        let s = ck.token_span(c, op_token(c, n));
+        ck.report_owned(c, codes.BAD_CAST, s, m);
+        return ty.invalid();
+    }
+    return to;
+}
+
+// ---- optionals and errors (§7.8) ------------------------------------------------------
+
+/// Every error of the union's set can be returned by a function returning
+/// ret: unknown, and so allowed, when either set is inferred.
+pub fn errors_fit(c: &mut ck.Checker, from_set: u32, ret: ty.TypeId, s: diag.Span) -> bool {
+    let into = c.t.get(ret).decl;
+    if from_set == ck.NONE or into == ck.NONE {
+        return true;
+    }
+    let from = c.decls[from_set as usize];
+    let to = c.decls[into as usize];
+    var i = from.members_start;
+    while i < from.members_start + from.members_len : (i += 1) {
+        let id = c.error_members[i as usize];
+        var found = false;
+        var j = to.members_start;
+        while j < to.members_start + to.members_len : (j += 1) {
+            found = found or c.error_members[j as usize] == id;
+        }
+        if not found {
+            var m = ck.new_message(c);
+            m.push_str("the error '");
+            m.push_str(c.names.text(c.error_names[(id - 1) as usize]));
+            m.push_str("' cannot be returned: ");
+            ck.write_type(c, &mut m, ret);
+            m.push_str(" does not contain it");
+            ck.report_owned(c, codes.ERROR_NOT_IN_SET, s, m);
+            return false;
+        }
+    }
+    return true;
+}
+
+fn check_try(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let operand = ck.child(c, n, 0);
+    if c.defer_loops != ck.NONE {
+        let s = ck.span_of(c, n);
+        ck.report(c, codes.IN_DEFER, s, "deferred code cannot use 'try'");
+    }
+    let ret = c.fns[c.fn_index as usize].ret;
+    let t = check(c, operand, none);
+    if ck.is_invalid(c, t) {
+        return t;
+    }
+    let info = c.t.get(t);
+    if c.t.kind(ret) != ty.Kind.ErrorUnion {
+        var m = ck.new_message(c);
+        m.push_str("'try' returns the error from this function, but it returns ");
+        ck.write_type(c, &mut m, ret);
+        m.push_str(", not an error union");
+        let s = ck.span_of(c, n);
+        ck.report_owned(c, codes.BAD_TRY, s, m);
+        if info.kind == ty.Kind.ErrorUnion {
+            return info.elem;
+        }
+        return ty.invalid();
+    }
+    if info.kind != ty.Kind.ErrorUnion {
+        var m = ck.new_message(c);
+        m.push_str("'try' needs an error union, not ");
+        ck.write_type(c, &mut m, t);
+        let s = ck.span_of(c, n);
+        ck.report_owned(c, codes.BAD_TRY, s, m);
+        return ty.invalid();
+    }
+    let s = ck.span_of(c, n);
+    _ = errors_fit(c, info.decl, ret, s);
+    return info.elem;
+}
+
+fn check_fallback(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    let is_orelse = ck.kind_of(c, n) == cst.Kind.OrelseExpr;
+    let lhs = ck.child(c, n, 0);
+    let rhs = ck.child(c, n, 1);
+    var hint: ?ty.TypeId = none;
+    if is_orelse {
+        match expected {
+            some(e) => { hint = some(c.t.optional(e)); }
+            none => { }
+        }
+    }
+    let t = check(c, lhs, hint);
+    let info = c.t.get(t);
+    if info.kind == ty.Kind.Invalid {
+        _ = check(c, rhs, expected);
+        return t;
+    }
+    let want = ty.Kind.ErrorUnion;
+    if (is_orelse and info.kind != ty.Kind.Optional) or (not is_orelse and info.kind != want) {
+        var m = ck.new_message(c);
+        if is_orelse {
+            m.push_str("'orelse' needs an optional on its left, not ");
+        } else {
+            m.push_str("'catch' needs an error union on its left, not ");
+        }
+        ck.write_type(c, &mut m, t);
+        let s = ck.span_of(c, lhs);
+        ck.report_owned(c, codes.BAD_FALLBACK, s, m);
+        _ = check(c, rhs, expected);
+        return ty.invalid();
+    }
+    check_value(c, rhs, info.elem);
+    return info.elem;
+}

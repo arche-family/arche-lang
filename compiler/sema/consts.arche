@@ -1,0 +1,408 @@
+/// Constants (spec/arche-0.md §4): checked like other expressions, then
+/// evaluated at compile time. An integer value is kept as its two's
+/// complement bits in a u64.
+import alloc;
+import codes;
+import diag;
+import syntax.cst;
+import syntax.token as tk;
+import sema.check as ck;
+import sema.expr;
+import sema.types as ty;
+
+pub fn check_const(c: &mut ck.Checker, d: u32) {
+    let decl = c.decls[d as usize];
+    if decl.state == 2 {
+        return;
+    }
+    let saved_module = c.module;
+    let saved_fn = c.fn_index;
+    let saved_scope = c.scope.len();
+    c.module = decl.module;
+    c.fn_index = ck.NONE;
+    if decl.state == 1 {
+        let s = ck.token_span(c, decl.name_token);
+        ck.report(c, codes.CONST_CYCLE, s, "this constant depends on itself");
+        c.decls[d as usize].type_id = ty.invalid();
+        c.decls[d as usize].state = 2;
+    } else {
+        c.decls[d as usize].state = 1;
+        let t = ck.resolve_type(c, ck.child(c, decl.node, 0));
+        let k = c.t.kind(t);
+        if k != ty.Kind.Int and k != ty.Kind.Bool and k != ty.Kind.Str and k != ty.Kind.Invalid {
+            let s = ck.span_of(c, ck.child(c, decl.node, 0));
+            ck.report(c, codes.CONST_TYPE, s, "a constant's type is an integer type, bool or str");
+        }
+        // The value is evaluated only once the expression checked cleanly.
+        let before = c.p.diags.count();
+        let value = ck.child(c, decl.node, 1);
+        expr.check_value(c, value, t);
+        if c.decls[d as usize].state == 1 {
+            c.decls[d as usize].type_id = t;
+            if c.p.diags.count() == before and k != ty.Kind.Invalid {
+                if k == ty.Kind.Str {
+                    let lit = string_of(c, value);
+                    c.decls[d as usize].value_module = lit.module;
+                    c.decls[d as usize].value_node = lit.node;
+                } else {
+                    c.decls[d as usize].value = eval(c, value);
+                }
+            }
+            c.decls[d as usize].state = 2;
+        }
+    }
+    c.module = saved_module;
+    c.fn_index = saved_fn;
+    while c.scope.len() > saved_scope {
+        _ = c.scope.pop();
+    }
+}
+
+/// The length of an array type, a constant usize (§5.2).
+pub fn array_length(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
+    let saved_fn = c.fn_index;
+    c.fn_index = ck.NONE;
+    let before = c.p.diags.count();
+    expr.check_value(c, n, ty.int_type(ty.IntKind.Usize));
+    var len: u64 = 0;
+    if c.p.diags.count() == before {
+        len = eval(c, n);
+    }
+    c.fn_index = saved_fn;
+    return len;
+}
+
+type StringRef = struct {
+    module: u32,
+    node: cst.NodeId,
+}
+
+/// The string literal a str constant's value comes from.
+fn string_of(c: &ck.Checker, n: cst.NodeId) -> StringRef {
+    let k = ck.kind_of(c, n);
+    if k == cst.Kind.ParenExpr {
+        return string_of(c, ck.child(c, n, 0));
+    }
+    if k == cst.Kind.NameExpr or k == cst.Kind.FieldExpr {
+        match expr.constant_of(c, n) {
+            some(d) => {
+                let decl = c.decls[d as usize];
+                return StringRef { module: decl.value_module, node: decl.value_node };
+            }
+            none => { }
+        }
+    }
+    return StringRef { module: c.module, node: n };
+}
+
+// ---- evaluation ---------------------------------------------------------------
+
+pub fn bits_to_i64(u: u64) -> i64 {
+    if u <= 9223372036854775807 {
+        return u as i64;
+    }
+    return (u - 9223372036854775807 - 1) as i64 - 9223372036854775807 - 1;
+}
+
+fn i64_to_bits(v: i64) -> u64 {
+    if v >= 0 {
+        return v as u64;
+    }
+    return ((v + 9223372036854775807 + 1) as u64) + 9223372036854775808;
+}
+
+/// Truncates bits to the type's width, sign-extended for a signed type.
+pub fn normalize(k: ty.IntKind, bits: u64) -> u64 {
+    let n = ty.bits(k);
+    if n == 64 {
+        return bits;
+    }
+    let one: u64 = 1;
+    let mask = (one << n as u64) - 1;
+    var b = bits & mask;
+    if ty.is_signed(k) and (b >> (n - 1) as u64) & 1 == 1 {
+        b = b | ~mask;
+    }
+    return b;
+}
+
+fn signed_fits(k: ty.IntKind, v: i64) -> bool {
+    let max = ty.max_value(k) as i64;
+    if v > max {
+        return false;
+    }
+    let min_mag = ty.min_magnitude(k);
+    if v >= 0 {
+        return true;
+    }
+    // -v <= min_mag, computed without overflow
+    return (-(v + 1)) as u64 + 1 <= min_mag;
+}
+
+/// v is the smallest value of the signed type k, whose negation overflows.
+fn is_min(k: ty.IntKind, v: i64) -> bool {
+    return v < 0 and (-(v + 1)) as u64 + 1 == ty.min_magnitude(k);
+}
+
+fn int_kind_of(c: &ck.Checker, n: cst.NodeId) -> ty.IntKind {
+    return c.t.get(ck.type_of(c, n)).int_kind;
+}
+
+fn overflow(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
+    var m = ck.new_message(c);
+    m.push_str("this constant expression overflows ");
+    ck.write_type(c, &mut m, ck.type_of(c, n));
+    let s = ck.span_of(c, n);
+    ck.report_owned(c, codes.CONST_OVERFLOW, s, m);
+    return 0;
+}
+
+/// The value of a checked constant expression.
+pub fn eval(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
+    match ck.kind_of(c, n) {
+        .IntLit | .CharLit => {
+            return ck.tok_value(c, ck.tree(c).first_token(n));
+        }
+        .BoolLit => {
+            if ck.tok_kind(c, ck.tree(c).first_token(n)) == tk.Kind.KwTrue {
+                return 1;
+            }
+            return 0;
+        }
+        .ParenExpr => {
+            return eval(c, ck.child(c, n, 0));
+        }
+        .NameExpr | .FieldExpr => {
+            match expr.constant_of(c, n) {
+                some(d) => { return c.decls[d as usize].value; }
+                none => { return 0; }
+            }
+        }
+        .UnaryExpr => {
+            return eval_unary(c, n);
+        }
+        .BinaryExpr => {
+            return eval_binary(c, n);
+        }
+        .CastExpr => {
+            return eval_cast(c, n);
+        }
+        _ => {
+            return 0;
+        }
+    }
+}
+
+fn op_kind(c: &ck.Checker, n: cst.NodeId) -> tk.Kind {
+    let toks = ck.own(c, n);
+    return ck.tok_kind(c, toks[0]);
+}
+
+fn eval_unary(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
+    let op = op_kind(c, n);
+    let operand = ck.child(c, n, 0);
+    if op == tk.Kind.KwNot {
+        if eval(c, operand) == 0 {
+            return 1;
+        }
+        return 0;
+    }
+    let k = int_kind_of(c, n);
+    if op == tk.Kind.Tilde {
+        return normalize(k, ~eval(c, operand));
+    }
+    // '-' before a literal makes a negative literal: -128 is a valid i8.
+    if ck.kind_of(c, operand) == cst.Kind.IntLit {
+        let mag = eval(c, operand);
+        return normalize(k, ~mag +% 1);
+    }
+    let x = bits_to_i64(eval(c, operand));
+    if is_min(k, x) {
+        return overflow(c, n);
+    }
+    return i64_to_bits(-x);
+}
+
+fn eval_binary(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
+    let op = op_kind(c, n);
+    let lhs = ck.child(c, n, 0);
+    let rhs = ck.child(c, n, 1);
+    if op == tk.Kind.KwAnd {
+        if eval(c, lhs) != 0 and eval(c, rhs) != 0 {
+            return 1;
+        }
+        return 0;
+    }
+    if op == tk.Kind.KwOr {
+        if eval(c, lhs) != 0 or eval(c, rhs) != 0 {
+            return 1;
+        }
+        return 0;
+    }
+    let a = eval(c, lhs);
+    let b = eval(c, rhs);
+    match op {
+        .EqEq | .NotEq | .Lt | .Le | .Gt | .Ge => {
+            return compare(c, lhs, op, a: a, b: b);
+        }
+        _ => { }
+    }
+    let k = int_kind_of(c, n);
+    let sig = ty.is_signed(k);
+    let sa = bits_to_i64(a);
+    let sb = bits_to_i64(b);
+    let max = ty.max_value(k);
+    match op {
+        .Plus => {
+            if sig {
+                if (sb > 0 and sa > 9223372036854775807 - sb) or (sb < 0 and sa < -9223372036854775807 - 1 - sb) or
+                    not signed_fits(k, sa + sb) {
+                    return overflow(c, n);
+                }
+                return i64_to_bits(sa + sb);
+            }
+            if a > max - b {
+                return overflow(c, n);
+            }
+            return a + b;
+        }
+        .Minus => {
+            if sig {
+                if (sb < 0 and sa > 9223372036854775807 + sb) or (sb > 0 and sa < -9223372036854775807 - 1 + sb) or
+                    not signed_fits(k, sa - sb) {
+                    return overflow(c, n);
+                }
+                return i64_to_bits(sa - sb);
+            }
+            if a < b {
+                return overflow(c, n);
+            }
+            return a - b;
+        }
+        .Star => {
+            if sig {
+                let min: i64 = -9223372036854775807 - 1;
+                let max64: i64 = 9223372036854775807;
+                let over = sa != 0 and sb != 0 and ((sa > 0 and sb > 0 and sa > max64 / sb) or
+                    (sa > 0 and sb < 0 and sb < min / sa) or (sa < 0 and sb > 0 and sa < min / sb) or
+                    (sa < 0 and sb < 0 and sb < max64 / sa));
+                if over or not signed_fits(k, sa *% sb) {
+                    return overflow(c, n);
+                }
+                return i64_to_bits(sa * sb);
+            }
+            if b != 0 and a > max / b {
+                return overflow(c, n);
+            }
+            return a * b;
+        }
+        .Slash | .Percent => {
+            if b == 0 {
+                let s = ck.span_of(c, n);
+                ck.report(c, codes.CONST_DIVISION_BY_ZERO, s, "division by zero in a constant expression");
+                return 0;
+            }
+            if sig {
+                if sb == -1 {
+                    if op == tk.Kind.Percent {
+                        return 0;
+                    }
+                    if is_min(k, sa) {
+                        return overflow(c, n);
+                    }
+                    return i64_to_bits(-sa);
+                }
+                if op == tk.Kind.Slash {
+                    return i64_to_bits(sa / sb);
+                }
+                return i64_to_bits(sa % sb);
+            }
+            if op == tk.Kind.Slash {
+                return a / b;
+            }
+            return a % b;
+        }
+        .PlusWrap => { return normalize(k, a +% b); }
+        .MinusWrap => { return normalize(k, a -% b); }
+        .StarWrap => { return normalize(k, a *% b); }
+        .Shl | .Shr => {
+            if b >= ty.bits(k) as u64 {
+                let s = ck.span_of(c, n);
+                ck.report(c, codes.CONST_OVERFLOW, s, "the shift amount is not less than the width of the type");
+                return 0;
+            }
+            if op == tk.Kind.Shl {
+                return normalize(k, a << b);
+            }
+            if sig and sa < 0 {
+                return i64_to_bits(~(~sa >> b));
+            }
+            return a >> b;
+        }
+        .Amp => { return a & b; }
+        .Pipe => { return a | b; }
+        .Caret => { return a ^ b; }
+        _ => { return 0; }
+    }
+}
+
+fn compare(c: &ck.Checker, lhs: cst.NodeId, op: tk.Kind, a: u64, b: u64) -> u64 {
+    var cmp: i32 = 0;
+    let info = c.t.get(ck.type_of(c, lhs));
+    if info.kind == ty.Kind.Int and ty.is_signed(info.int_kind) {
+        let x = bits_to_i64(a);
+        let y = bits_to_i64(b);
+        if x < y {
+            cmp = -1;
+        } else if x > y {
+            cmp = 1;
+        }
+    } else if a < b {
+        cmp = -1;
+    } else if a > b {
+        cmp = 1;
+    }
+    var r = false;
+    match op {
+        .EqEq => { r = cmp == 0; }
+        .NotEq => { r = cmp != 0; }
+        .Lt => { r = cmp < 0; }
+        .Le => { r = cmp <= 0; }
+        .Gt => { r = cmp > 0; }
+        _ => { r = cmp >= 0; }
+    }
+    if r {
+        return 1;
+    }
+    return 0;
+}
+
+fn eval_cast(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
+    let operand = ck.child(c, n, 0);
+    let x = eval(c, operand);
+    let from = int_kind_of(c, operand);
+    let to = int_kind_of(c, n);
+    if op_kind(c, n) == tk.Kind.KwAsWrap {
+        return normalize(to, x);
+    }
+    var fits = false;
+    if ty.is_signed(from) {
+        let v = bits_to_i64(x);
+        if ty.is_signed(to) {
+            fits = signed_fits(to, v);
+        } else {
+            fits = v >= 0 and x <= ty.max_value(to);
+        }
+    } else {
+        fits = x <= ty.max_value(to);
+    }
+    if not fits {
+        var m = ck.new_message(c);
+        m.push_str("this constant does not fit in ");
+        ck.write_type(c, &mut m, ck.type_of(c, n));
+        let s = ck.span_of(c, n);
+        ck.report_owned(c, codes.CONST_OVERFLOW, s, m);
+        return 0;
+    }
+    return x;
+}

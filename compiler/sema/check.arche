@@ -1,6 +1,1303 @@
 /// Name resolution and type checking: spec/arche-0.md §3–§10.
+///
+/// The whole program is checked at once, in passes: imports and the names
+/// of every module's items; the members of type declarations; constants;
+/// function signatures; `main`; and last the bodies (sema.stmt and
+/// sema.expr). The checker reads the CST directly and keeps what it learns
+/// in tables indexed by handles: declarations, fields, variants,
+/// functions, and the type of every expression node.
+import std;
+import alloc;
+import codes;
+import diag;
 import program;
+import syntax.cst;
+import syntax.token as tk;
+import sema.types as ty;
+import sema.stmt;
+import sema.consts;
 
-pub fn check(p: &mut program.Program) {
-    _ = p;
+pub const NONE: u32 = 4294967295;
+/// node_refs of a FieldExpr that reads a field of a value: it is a place.
+pub const VALUE_FIELD: u32 = 4294967294;
+
+pub type Library = enum { NotLibrary, Std, Alloc }
+
+/// What an import binds: a library root of §11, or a module of the package.
+pub type Alias = struct {
+    pub library: Library,
+    pub module: u32,
+}
+
+pub type DeclKind = enum { Fn, Const, Struct, Enum, ErrorSet, Alias }
+
+pub type SelfMode = enum { Value, Ref, MutRef }
+
+pub type Decl = struct {
+    pub kind: DeclKind,
+    pub module: u32,
+    pub node: cst.NodeId,
+    pub name: alloc.Symbol,
+    pub name_token: u32,
+    pub is_pub: bool,
+    /// Struct, Enum, ErrorSet: its type. Alias and Const: their type, once
+    /// resolved.
+    pub type_id: ty.TypeId,
+    /// Alias and Const: 0 before, 1 while and 2 after they are resolved.
+    pub state: u32,
+    /// A method: the declaration of its type; NONE otherwise.
+    pub owner: u32,
+    /// Struct: a range of fields; Enum: of variants; ErrorSet: of
+    /// error_members.
+    pub members_start: u32,
+    pub members_len: u32,
+    /// Struct and Enum: a range of methods.
+    pub methods_start: u32,
+    pub methods_len: u32,
+    /// Fn: its index in fns.
+    pub fn_index: u32,
+    /// Const: an integer or bool value as two's complement bits; a str
+    /// value as the string literal it comes from.
+    pub value: u64,
+    pub value_module: u32,
+    pub value_node: cst.NodeId,
+}
+
+pub type Field = struct {
+    pub name: alloc.Symbol,
+    pub name_token: u32,
+    pub type_id: ty.TypeId,
+    pub is_pub: bool,
+}
+
+pub type Variant = struct {
+    pub name: alloc.Symbol,
+    pub name_token: u32,
+    pub has_fields: bool,
+    pub fields_start: u32,
+    pub fields_len: u32,
+}
+
+pub type ParamInfo = struct {
+    pub name: alloc.Symbol,
+    pub name_token: u32,
+    pub type_id: ty.TypeId,
+}
+
+pub type FnInfo = struct {
+    pub decl: u32,
+    pub params_start: u32,
+    pub params_len: u32,
+    pub ret: ty.TypeId,
+    pub has_self: bool,
+    pub self_mode: SelfMode,
+}
+
+pub type Binding = struct {
+    pub name: alloc.Symbol,
+    pub name_token: u32,
+    pub type_id: ty.TypeId,
+    pub mutable: bool,
+}
+
+pub type Checker = struct {
+    pub p: program.Program,
+    pub t: ty.Types,
+    pub names: alloc.Interner,
+    pub decls: alloc.List(Decl),
+    pub fields: alloc.List(Field),
+    pub variants: alloc.List(Variant),
+    pub fns: alloc.List(FnInfo),
+    pub params: alloc.List(ParamInfo),
+    pub methods: alloc.List(u32),
+    pub error_members: alloc.List(u32),
+    /// Error names are global (§5.2): each has one number, from 1.
+    pub error_ids: alloc.Map(alloc.Symbol, u32),
+    pub error_names: alloc.List(alloc.Symbol),
+    /// Per module: its items, and the names its imports bind.
+    pub items: alloc.List(alloc.Map(alloc.Symbol, u32)),
+    pub imports: alloc.List(alloc.Map(alloc.Symbol, Alias)),
+    /// Per module, per CST node: the type of the expression.
+    pub node_types: alloc.List(alloc.List(ty.TypeId)),
+    /// Per module, per CST node: the declaration a name or call refers to
+    /// (a constant, a function), or NONE.
+    pub node_refs: alloc.List(alloc.List(u32)),
+    pub scope: alloc.List(Binding),
+    /// The module whose code is being checked.
+    pub module: u32,
+    /// The function being checked; NONE in a constant.
+    pub fn_index: u32,
+    pub loops: u32,
+    /// The loop depth where the innermost defer began; NONE outside defers.
+    pub defer_loops: u32,
+    /// The declaration of std.IoError.
+    pub io_error: u32,
+    pub a: alloc.Allocator,
+}
+
+// ---- the current module ---------------------------------------------------------
+
+pub fn tree(c: &Checker) -> &cst.Tree {
+    return &c.p.modules[c.module as usize].tree;
+}
+
+pub fn node(c: &Checker, n: cst.NodeId) -> cst.Node {
+    return c.p.modules[c.module as usize].tree.node(n);
+}
+
+pub fn kind_of(c: &Checker, n: cst.NodeId) -> cst.Kind {
+    return c.p.modules[c.module as usize].tree.node(n).kind;
+}
+
+pub fn child(c: &Checker, n: cst.NodeId, i: u32) -> cst.NodeId {
+    let t = &c.p.modules[c.module as usize].tree;
+    return t.child(t.node(n), i);
+}
+
+pub fn child_count(c: &Checker, n: cst.NodeId) -> u32 {
+    return c.p.modules[c.module as usize].tree.node(n).children_len;
+}
+
+pub fn own(c: &Checker, n: cst.NodeId) -> alloc.List(u32) {
+    return c.p.modules[c.module as usize].tree.own_tokens(n, c.a);
+}
+
+pub fn has_own(c: &Checker, n: cst.NodeId, k: tk.Kind) -> bool {
+    match c.p.modules[c.module as usize].tree.find_own(n, k, c.a) {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
+pub fn find_own(c: &Checker, n: cst.NodeId, k: tk.Kind) -> ?u32 {
+    return c.p.modules[c.module as usize].tree.find_own(n, k, c.a);
+}
+
+pub fn tok_kind(c: &Checker, t: u32) -> tk.Kind {
+    return c.p.modules[c.module as usize].tree.token(t).kind;
+}
+
+pub fn tok_value(c: &Checker, t: u32) -> u64 {
+    return c.p.modules[c.module as usize].tree.token(t).value;
+}
+
+pub fn text(c: &Checker, t: u32) -> str {
+    return c.p.modules[c.module as usize].token_text(t);
+}
+
+pub fn symbol(c: &mut Checker, t: u32) -> alloc.Symbol {
+    return c.names.intern(c.p.modules[c.module as usize].token_text(t));
+}
+
+pub fn span_of(c: &Checker, n: cst.NodeId) -> diag.Span {
+    return c.p.modules[c.module as usize].node_span(n);
+}
+
+pub fn token_span(c: &Checker, t: u32) -> diag.Span {
+    return c.p.modules[c.module as usize].token_span(t);
+}
+
+/// The first identifier a node owns: the name of a declaration.
+pub fn ident_of(c: &Checker, n: cst.NodeId) -> u32 {
+    return find_own(c, n, tk.Kind.Ident) orelse c.p.modules[c.module as usize].tree.first_token(n);
+}
+
+pub fn name_text(c: &Checker, sym: alloc.Symbol) -> str {
+    return c.names.text(sym);
+}
+
+/// The type checked for an expression node of the current module.
+pub fn type_of(c: &Checker, n: cst.NodeId) -> ty.TypeId {
+    return c.node_types[c.module as usize][n.index as usize];
+}
+
+pub fn set_type(c: &mut Checker, n: cst.NodeId, t: ty.TypeId) {
+    c.node_types[c.module as usize][n.index as usize] = t;
+}
+
+pub fn ref_of(c: &Checker, n: cst.NodeId) -> u32 {
+    return c.node_refs[c.module as usize][n.index as usize];
+}
+
+pub fn set_ref(c: &mut Checker, n: cst.NodeId, d: u32) {
+    c.node_refs[c.module as usize][n.index as usize] = d;
+}
+
+// ---- diagnostics ------------------------------------------------------------------
+
+pub fn report(c: &mut Checker, code: u16, span: diag.Span, message: str) {
+    c.p.diags.file = c.module;
+    c.p.diags.report(code, span, message);
+}
+
+pub fn report_owned(c: &mut Checker, code: u16, span: diag.Span, message: alloc.String) {
+    c.p.diags.file = c.module;
+    c.p.diags.report_owned(code, span, message);
+}
+
+pub fn new_message(c: &Checker) -> alloc.String {
+    return c.p.diags.new_message();
+}
+
+/// A type as the source writes it: "&mut alloc.List(u32)".
+pub fn write_type(c: &Checker, m: &mut alloc.String, t: ty.TypeId) {
+    let info = c.t.get(t);
+    match info.kind {
+        .Invalid => { m.push_str("<invalid>"); }
+        .Void => { m.push_str("void"); }
+        .Noreturn => { m.push_str("noreturn"); }
+        .Bool => { m.push_str("bool"); }
+        .Str => { m.push_str("str"); }
+        .Int => { m.push_str(ty.int_name(info.int_kind)); }
+        .Ref => {
+            m.push_str("&");
+            if info.mutable {
+                m.push_str("mut ");
+            }
+            write_type(c, m, info.elem);
+        }
+        .Slice => {
+            m.push_str("[]");
+            if info.mutable {
+                m.push_str("mut ");
+            }
+            write_type(c, m, info.elem);
+        }
+        .Array => {
+            m.push_str("[");
+            write_number(m, info.len);
+            m.push_str("]");
+            write_type(c, m, info.elem);
+        }
+        .List => {
+            m.push_str("alloc.List(");
+            write_type(c, m, info.elem);
+            m.push_str(")");
+        }
+        .Map => {
+            m.push_str("alloc.Map(");
+            write_type(c, m, info.key);
+            m.push_str(", ");
+            write_type(c, m, info.elem);
+            m.push_str(")");
+        }
+        .Optional => {
+            m.push_str("?");
+            write_type(c, m, info.elem);
+        }
+        .ErrorUnion => {
+            if info.decl != NONE {
+                write_decl_name(c, m, info.decl);
+            }
+            m.push_str("!");
+            write_type(c, m, info.elem);
+        }
+        .ErrorSet => {
+            if info.decl == NONE {
+                m.push_str("error");
+            } else {
+                write_decl_name(c, m, info.decl);
+            }
+        }
+        .Struct | .Enum => { write_decl_name(c, m, info.decl); }
+        .Builtin => {
+            match info.builtin {
+                .Output => { m.push_str("std.Output"); }
+                .Args => { m.push_str("std.Args"); }
+                .Fs => { m.push_str("std.Fs"); }
+                .System => { m.push_str("std.System"); }
+                .Allocator => { m.push_str("alloc.Allocator"); }
+                .String => { m.push_str("alloc.String"); }
+                .Interner => { m.push_str("alloc.Interner"); }
+                .Symbol => { m.push_str("alloc.Symbol"); }
+                .NotBuiltin => { m.push_str("?"); }
+            }
+        }
+    }
+}
+
+pub fn write_decl_name(c: &Checker, m: &mut alloc.String, d: u32) {
+    if d == c.io_error {
+        m.push_str("std.IoError");
+        return;
+    }
+    let decl = c.decls[d as usize];
+    let module_name = c.p.modules[decl.module as usize].name.view();
+    if decl.module != c.module and module_name.len() > 0 {
+        m.push_str(module_name);
+        m.push_str(".");
+    }
+    m.push_str(c.names.text(decl.name));
+}
+
+pub fn write_number(m: &mut alloc.String, n: u64) {
+    if n >= 10 {
+        write_number(m, n / 10);
+    }
+    m.push_ascii('0' + (n % 10) as u8);
+}
+
+/// "expected T, found U" at a node.
+pub fn report_mismatch(c: &mut Checker, n: cst.NodeId, want: ty.TypeId, got: ty.TypeId) {
+    var m = new_message(c);
+    m.push_str("expected ");
+    write_type(c, &mut m, want);
+    m.push_str(", found ");
+    write_type(c, &mut m, got);
+    let s = span_of(c, n);
+    report_owned(c, codes.TYPE_MISMATCH, s, m);
+}
+
+// ---- types ------------------------------------------------------------------
+
+pub fn is_int(c: &Checker, t: ty.TypeId) -> bool {
+    return c.t.kind(t) == ty.Kind.Int;
+}
+
+pub fn is_invalid(c: &Checker, t: ty.TypeId) -> bool {
+    return c.t.kind(t) == ty.Kind.Invalid;
+}
+
+/// A value of type got can be used where want is expected: they are the
+/// same, or got never completes, or one is invalid already, or got is a
+/// &mut T or []mut T where &T or []T is expected (§5.4).
+pub fn assignable(c: &Checker, got: ty.TypeId, want: ty.TypeId) -> bool {
+    if got == want {
+        return true;
+    }
+    let g = c.t.get(got);
+    let w = c.t.get(want);
+    if g.kind == ty.Kind.Noreturn or g.kind == ty.Kind.Invalid or w.kind == ty.Kind.Invalid {
+        return true;
+    }
+    return g.kind == w.kind and (g.kind == ty.Kind.Ref or g.kind == ty.Kind.Slice) and g.elem == w.elem and g.mutable and
+        not w.mutable;
+}
+
+/// == and != work on the type (§5.5).
+pub fn comparable(c: &Checker, t: ty.TypeId) -> bool {
+    return comparable_within(c, t, 0);
+}
+
+/// A type that contains itself (E0423) would make the walk endless; past
+/// this depth the error is already reported, and the answer does not
+/// matter.
+const MAX_TYPE_DEPTH: u32 = 64;
+
+fn comparable_within(c: &Checker, t: ty.TypeId, depth: u32) -> bool {
+    if depth > MAX_TYPE_DEPTH {
+        return true;
+    }
+    let info = c.t.get(t);
+    match info.kind {
+        .Int | .Bool | .ErrorSet | .Invalid => { return true; }
+        .Builtin => { return info.builtin == ty.Builtin.Symbol; }
+        .Enum => {
+            let d = c.decls[info.decl as usize];
+            var i = d.members_start;
+            while i < d.members_start + d.members_len : (i += 1) {
+                if c.variants[i as usize].has_fields {
+                    return false;
+                }
+            }
+            return true;
+        }
+        .Struct => {
+            let d = c.decls[info.decl as usize];
+            var i = d.members_start;
+            while i < d.members_start + d.members_len : (i += 1) {
+                if not comparable_within(c, c.fields[i as usize].type_id, depth + 1) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        _ => { return false; }
+    }
+}
+
+/// The type can be a Map key (§5.5).
+pub fn is_key(c: &Checker, t: ty.TypeId) -> bool {
+    return is_key_within(c, t, 0);
+}
+
+fn is_key_within(c: &Checker, t: ty.TypeId, depth: u32) -> bool {
+    if depth > MAX_TYPE_DEPTH {
+        return true;
+    }
+    let info = c.t.get(t);
+    if info.kind == ty.Kind.ErrorSet {
+        return false;
+    }
+    if info.kind == ty.Kind.Struct {
+        let d = c.decls[info.decl as usize];
+        var i = d.members_start;
+        while i < d.members_start + d.members_len : (i += 1) {
+            if not is_key_within(c, c.fields[i as usize].type_id, depth + 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return comparable_within(c, t, depth);
+}
+
+fn primitive(name: str) -> ?ty.TypeId {
+    match ty.int_by_name(name) {
+        some(k) => { return ty.int_type(k); }
+        none => { }
+    }
+    if name.eq("bool") {
+        return ty.bool_type();
+    }
+    if name.eq("str") {
+        return ty.str_type();
+    }
+    if name.eq("void") {
+        return ty.void_type();
+    }
+    if name.eq("noreturn") {
+        return ty.noreturn_type();
+    }
+    return none;
+}
+
+pub fn is_predeclared(name: str) -> bool {
+    match primitive(name) {
+        some(_) => { return true; }
+        none => { }
+    }
+    return name.eq("panic") or name.eq("assert") or name.eq("unreachable");
+}
+
+/// A type of §11 by its library and name.
+pub fn library_type(c: &mut Checker, lib: Library, name: str) -> ?ty.TypeId {
+    if lib == Library.Std {
+        if name.eq("Output") { return c.t.builtin(ty.Builtin.Output); }
+        if name.eq("Args") { return c.t.builtin(ty.Builtin.Args); }
+        if name.eq("Fs") { return c.t.builtin(ty.Builtin.Fs); }
+        if name.eq("System") { return c.t.builtin(ty.Builtin.System); }
+        if name.eq("IoError") { return c.decls[c.io_error as usize].type_id; }
+    } else if lib == Library.Alloc {
+        if name.eq("Allocator") { return c.t.builtin(ty.Builtin.Allocator); }
+        if name.eq("String") { return c.t.builtin(ty.Builtin.String); }
+        if name.eq("Interner") { return c.t.builtin(ty.Builtin.Interner); }
+        if name.eq("Symbol") { return c.t.builtin(ty.Builtin.Symbol); }
+    }
+    return none;
+}
+
+pub fn find_item(c: &Checker, module: u32, name: alloc.Symbol) -> ?u32 {
+    return c.items[module as usize].get(name);
+}
+
+pub fn find_import(c: &Checker, name: alloc.Symbol) -> ?Alias {
+    return c.imports[c.module as usize].get(name);
+}
+
+/// Erasable (§4), but cheap: another module reaches only what is pub.
+pub fn require_visible(c: &mut Checker, span: diag.Span, owner_module: u32, is_pub: bool, what: str) {
+    if owner_module == c.module or is_pub {
+        return;
+    }
+    var m = new_message(c);
+    m.push_str(what);
+    m.push_str(" is private to module '");
+    m.push_str(c.p.modules[owner_module as usize].name.view());
+    m.push_str("'; mark it 'pub' to use it here");
+    report_owned(c, codes.PRIVATE, span, m);
+}
+
+/// The type a declaration names, resolving an alias the first time.
+pub fn decl_type(c: &mut Checker, d: u32) -> ty.TypeId {
+    let decl = c.decls[d as usize];
+    if decl.kind != DeclKind.Alias or decl.state == 2 {
+        return decl.type_id;
+    }
+    if decl.state == 1 {
+        let saved = c.module;
+        c.module = decl.module;
+        let s = token_span(c, decl.name_token);
+        report(c, codes.ALIAS_CYCLE, s, "this type alias refers to itself");
+        c.module = saved;
+        c.decls[d as usize].state = 2;
+        c.decls[d as usize].type_id = ty.invalid();
+        return ty.invalid();
+    }
+    c.decls[d as usize].state = 1;
+    let saved = c.module;
+    c.module = decl.module;
+    let target = resolve_type(c, child(c, decl.node, 0));
+    c.module = saved;
+    if c.decls[d as usize].state == 1 {
+        c.decls[d as usize].type_id = target;
+        c.decls[d as usize].state = 2;
+    }
+    return c.decls[d as usize].type_id;
+}
+
+/// The type a type node of the current module names (§5).
+pub fn resolve_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
+    match kind_of(c, n) {
+        .TypeRef => {
+            let elem = resolve_type(c, child(c, n, 0));
+            return c.t.reference(has_own(c, n, tk.Kind.KwMut), elem);
+        }
+        .TypeSlice => {
+            let elem = resolve_type(c, child(c, n, 0));
+            return c.t.slice(has_own(c, n, tk.Kind.KwMut), elem);
+        }
+        .TypeOptional => {
+            let elem = resolve_type(c, child(c, n, 0));
+            return c.t.optional(elem);
+        }
+        .TypeArray => {
+            let len = consts.array_length(c, child(c, n, 0));
+            let elem = resolve_type(c, child(c, n, 1));
+            return c.t.array(elem, len);
+        }
+        .TypeErrorUnion => {
+            if child_count(c, n) == 1 {
+                let elem = resolve_type(c, child(c, n, 0));
+                return c.t.error_union(NONE, elem);
+            }
+            let set = resolve_type(c, child(c, n, 0));
+            let elem = resolve_type(c, child(c, n, 1));
+            let info = c.t.get(set);
+            if info.kind == ty.Kind.Invalid {
+                return ty.invalid();
+            }
+            if info.kind != ty.Kind.ErrorSet {
+                var m = new_message(c);
+                write_type(c, &mut m, set);
+                m.push_str(" is not an error set; E!T needs one");
+                let s = span_of(c, child(c, n, 0));
+                report_owned(c, codes.TYPE_MISMATCH, s, m);
+                return ty.invalid();
+            }
+            return c.t.error_union(info.decl, elem);
+        }
+        .TypePath => {
+            return resolve_path_type(c, n);
+        }
+        _ => {
+            let s = span_of(c, n);
+            report(c, codes.UNKNOWN_TYPE, s, "expected a type");
+            return ty.invalid();
+        }
+    }
+}
+
+fn report_unknown_type(c: &mut Checker, n: cst.NodeId) {
+    var m = new_message(c);
+    m.push_str("unknown type '");
+    let toks = own(c, n);
+    let items = toks.items();
+    var i: usize = 0;
+    while i < items.len() and tok_kind(c, items[i]) != tk.Kind.LParen : (i += 1) {
+        m.push_str(text(c, items[i]));
+    }
+    m.push_str("'");
+    let s = span_of(c, n);
+    report_owned(c, codes.UNKNOWN_TYPE, s, m);
+}
+
+fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
+    let toks = own(c, n);
+    let items = toks.items();
+    var segments = alloc.List(u32).init(c.a);
+    var i: usize = 0;
+    while i < items.len() and tok_kind(c, items[i]) != tk.Kind.LParen : (i += 1) {
+        if tok_kind(c, items[i]) == tk.Kind.Ident {
+            segments.push(items[i]);
+        }
+    }
+    let nargs = child_count(c, n);
+    let first = segments[0];
+    if segments.len() == 1 {
+        if nargs == 0 {
+            match primitive(text(c, first)) {
+                some(t) => { return t; }
+                none => { }
+            }
+            let sym = symbol(c, first);
+            match find_item(c, c.module, sym) {
+                some(d) => {
+                    let k = c.decls[d as usize].kind;
+                    if k != DeclKind.Fn and k != DeclKind.Const {
+                        return decl_type(c, d);
+                    }
+                }
+                none => { }
+            }
+        }
+        report_unknown_type(c, n);
+        return ty.invalid();
+    }
+    if segments.len() != 2 {
+        report_unknown_type(c, n);
+        return ty.invalid();
+    }
+    let alias_sym = symbol(c, first);
+    let second = segments[1];
+    match find_import(c, alias_sym) {
+        some(alias) => {
+            if alias.library == Library.Alloc and (text(c, second).eq("List") or text(c, second).eq("Map")) {
+                return resolve_generic(c, n, text(c, second).eq("List"));
+            }
+            if nargs > 0 {
+                let s = span_of(c, n);
+                report(c, codes.BAD_GENERIC, s, "Arche-0 has no generic types besides alloc.List and alloc.Map");
+                return ty.invalid();
+            }
+            if alias.library != Library.NotLibrary {
+                match library_type(c, alias.library, text(c, second)) {
+                    some(t) => { return t; }
+                    none => { }
+                }
+            } else {
+                let sym = symbol(c, second);
+                match find_item(c, alias.module, sym) {
+                    some(d) => {
+                        let decl = c.decls[d as usize];
+                        if decl.kind != DeclKind.Fn and decl.kind != DeclKind.Const {
+                            let s = span_of(c, n);
+                            require_visible(c, s, decl.module, decl.is_pub, "this type");
+                            return decl_type(c, d);
+                        }
+                    }
+                    none => { }
+                }
+            }
+        }
+        none => { }
+    }
+    report_unknown_type(c, n);
+    return ty.invalid();
+}
+
+fn resolve_generic(c: &mut Checker, n: cst.NodeId, is_list: bool) -> ty.TypeId {
+    let nargs = child_count(c, n);
+    if (is_list and nargs != 1) or (not is_list and nargs != 2) {
+        let s = span_of(c, n);
+        if is_list {
+            report(c, codes.BAD_GENERIC, s, "alloc.List takes one type");
+        } else {
+            report(c, codes.BAD_GENERIC, s, "alloc.Map takes two types: the key and the value");
+        }
+        return ty.invalid();
+    }
+    let a = resolve_type(c, child(c, n, 0));
+    if is_list {
+        return c.t.list(a);
+    }
+    let b = resolve_type(c, child(c, n, 1));
+    return make_map(c, n, key: a, value: b);
+}
+
+/// alloc.Map(key, value), when key can be a key (§5.5).
+pub fn make_map(c: &mut Checker, n: cst.NodeId, key: ty.TypeId, value: ty.TypeId) -> ty.TypeId {
+    if not is_key(c, key) {
+        var m = new_message(c);
+        write_type(c, &mut m, key);
+        m.push_str(" cannot be a Map key (§5.5)");
+        let s = span_of(c, n);
+        report_owned(c, codes.BAD_KEY, s, m);
+        return ty.invalid();
+    }
+    return c.t.map(key: key, value: value);
+}
+
+// ---- declarations -------------------------------------------------------------
+
+fn new_decl(kind: DeclKind, module: u32, n: cst.NodeId, name: alloc.Symbol, name_token: u32, is_pub: bool) -> Decl {
+    return Decl {
+        kind: kind,
+        module: module,
+        node: n,
+        name: name,
+        name_token: name_token,
+        is_pub: is_pub,
+        type_id: ty.invalid(),
+        state: 0,
+        owner: NONE,
+        members_start: 0,
+        members_len: 0,
+        methods_start: 0,
+        methods_len: 0,
+        fn_index: NONE,
+        value: 0,
+        value_module: 0,
+        value_node: cst.NodeId { index: 0 },
+    };
+}
+
+fn library_of(name: str) -> Library {
+    if name.eq("std") {
+        return Library.Std;
+    }
+    if name.eq("alloc") {
+        return Library.Alloc;
+    }
+    return Library.NotLibrary;
+}
+
+fn collect_import(c: &mut Checker, n: cst.NodeId) {
+    let toks = own(c, n);
+    let items = toks.items();
+    var path = alloc.String.init(c.a);
+    var last: u32 = items[1];
+    var segments: u32 = 0;
+    var i: usize = 1;
+    while i < items.len() and tok_kind(c, items[i]) != tk.Kind.KwAs and tok_kind(c, items[i]) != tk.Kind.Semi : (i += 1) {
+        if tok_kind(c, items[i]) == tk.Kind.Ident {
+            if segments > 0 {
+                path.push_str(".");
+            }
+            path.push_str(text(c, items[i]));
+            last = items[i];
+            segments += 1;
+        }
+    }
+    var bound = last;
+    if i < items.len() and tok_kind(c, items[i]) == tk.Kind.KwAs {
+        bound = items[i + 1];
+    }
+    let first = text(c, items[1]);
+    var alias = Alias { library: library_of(first), module: 0 };
+    let s = span_of(c, n);
+    if first.eq("core") or (alias.library != Library.NotLibrary and segments > 1) {
+        report(c, codes.BAD_IMPORT, s, "Arche-0 provides only the modules 'std' and 'alloc'");
+        return;
+    }
+    if alias.library == Library.NotLibrary {
+        match c.p.find(path.view()) {
+            some(id) => { alias.module = id.index; }
+            none => { return; } // reported by program.load
+        }
+    }
+    let sym = symbol(c, bound);
+    match find_import(c, sym) {
+        some(_) => {
+            var m = new_message(c);
+            m.push_str("'");
+            m.push_str(text(c, bound));
+            m.push_str("' is already imported");
+            report_owned(c, codes.BAD_IMPORT, s, m);
+            return;
+        }
+        none => { }
+    }
+    c.imports[c.module as usize].put(sym, alias);
+}
+
+/// Adds a declaration to the module's items, unless the name is taken.
+fn add_item(c: &mut Checker, d: Decl) -> u32 {
+    let id = c.decls.len() as u32;
+    let s = token_span(c, d.name_token);
+    match find_item(c, c.module, d.name) {
+        some(_) => {
+            var m = new_message(c);
+            m.push_str("'");
+            m.push_str(c.names.text(d.name));
+            m.push_str("' is already declared in this module");
+            report_owned(c, codes.DUPLICATE, s, m);
+            c.decls.push(d);
+            return id;
+        }
+        none => { }
+    }
+    match find_import(c, d.name) {
+        some(_) => {
+            report(c, codes.SHADOWING, s, "this name is already imported; Arche has no shadowing");
+        }
+        none => { }
+    }
+    if is_predeclared(c.names.text(d.name)) {
+        report(c, codes.SHADOWING, s, "this is a predeclared name; Arche has no shadowing");
+    }
+    c.items[c.module as usize].put(d.name, id);
+    c.decls.push(d);
+    return id;
+}
+
+fn type_decl_kind(c: &Checker, n: cst.NodeId) -> DeclKind {
+    if has_own(c, n, tk.Kind.KwStruct) {
+        return DeclKind.Struct;
+    }
+    if has_own(c, n, tk.Kind.KwEnum) {
+        return DeclKind.Enum;
+    }
+    if has_own(c, n, tk.Kind.KwError) {
+        return DeclKind.ErrorSet;
+    }
+    return DeclKind.Alias;
+}
+
+fn collect_items(c: &mut Checker) {
+    let root = tree(c).root;
+    let count = child_count(c, root);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let n = child(c, root, i);
+        let k = kind_of(c, n);
+        if k == cst.Kind.Import {
+            collect_import(c, n);
+            continue;
+        }
+        if k != cst.Kind.FnDecl and k != cst.Kind.ConstDecl and k != cst.Kind.TypeDecl {
+            continue;
+        }
+        let nt = ident_of(c, n);
+        let sym = symbol(c, nt);
+        let is_pub = has_own(c, n, tk.Kind.KwPub);
+        if k == cst.Kind.FnDecl {
+            _ = add_item(c, new_decl(DeclKind.Fn, module: c.module, n, sym, name_token: nt, is_pub));
+        } else if k == cst.Kind.ConstDecl {
+            _ = add_item(c, new_decl(DeclKind.Const, module: c.module, n, sym, name_token: nt, is_pub));
+        } else {
+            let dk = type_decl_kind(c, n);
+            let id = add_item(c, new_decl(dk, module: c.module, n, sym, name_token: nt, is_pub));
+            if dk == DeclKind.Struct {
+                c.decls[id as usize].type_id = c.t.declared(ty.Kind.Struct, id);
+            } else if dk == DeclKind.Enum {
+                c.decls[id as usize].type_id = c.t.declared(ty.Kind.Enum, id);
+            } else if dk == DeclKind.ErrorSet {
+                c.decls[id as usize].type_id = c.t.declared(ty.Kind.ErrorSet, id);
+            }
+        }
+    }
+}
+
+pub fn error_id(c: &mut Checker, name: alloc.Symbol) -> u32 {
+    match c.error_ids.get(name) {
+        some(id) => { return id; }
+        none => { }
+    }
+    c.error_names.push(name);
+    let id = c.error_names.len() as u32;
+    c.error_ids.put(name, id);
+    return id;
+}
+
+fn report_duplicate_member(c: &mut Checker, t: u32, what: str) {
+    var m = new_message(c);
+    m.push_str(what);
+    m.push_str(" '");
+    m.push_str(text(c, t));
+    m.push_str("' is declared twice");
+    let s = token_span(c, t);
+    report_owned(c, codes.DUPLICATE, s, m);
+}
+
+/// Adds the FieldDecl children of n, from child `from` on, to c.fields.
+fn add_fields(c: &mut Checker, n: cst.NodeId, from: u32) -> u32 {
+    let start = c.fields.len() as u32;
+    let count = child_count(c, n);
+    var i = from;
+    while i < count : (i += 1) {
+        let f = child(c, n, i);
+        if kind_of(c, f) != cst.Kind.FieldDecl {
+            break;
+        }
+        let nt = ident_of(c, f);
+        let sym = symbol(c, nt);
+        var j = start;
+        while j < c.fields.len() as u32 : (j += 1) {
+            if c.fields[j as usize].name == sym {
+                report_duplicate_member(c, nt, "field");
+            }
+        }
+        let ft = resolve_type(c, child(c, f, 0));
+        c.fields.push(Field { name: sym, name_token: nt, type_id: ft, is_pub: has_own(c, f, tk.Kind.KwPub) });
+    }
+    return c.fields.len() as u32 - start;
+}
+
+fn add_methods(c: &mut Checker, d: u32) {
+    let n = c.decls[d as usize].node;
+    let start = c.methods.len() as u32;
+    let count = child_count(c, n);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let f = child(c, n, i);
+        if kind_of(c, f) != cst.Kind.FnDecl {
+            continue;
+        }
+        let nt = ident_of(c, f);
+        let sym = symbol(c, nt);
+        var j = start;
+        while j < c.methods.len() as u32 : (j += 1) {
+            if c.decls[c.methods[j as usize] as usize].name == sym {
+                report_duplicate_member(c, nt, "function");
+            }
+        }
+        var clash = false;
+        let decl = c.decls[d as usize];
+        var k = decl.members_start;
+        while k < decl.members_start + decl.members_len : (k += 1) {
+            if decl.kind == DeclKind.Struct {
+                clash = clash or c.fields[k as usize].name == sym;
+            } else {
+                clash = clash or c.variants[k as usize].name == sym;
+            }
+        }
+        if clash {
+            let s = token_span(c, nt);
+            if decl.kind == DeclKind.Struct {
+                report(c, codes.METHOD_CLASH, s, "this name is already a field of the type");
+            } else {
+                report(c, codes.METHOD_CLASH, s, "this name is already a variant of the type");
+            }
+        }
+        var md = new_decl(DeclKind.Fn, module: c.module, f, sym, name_token: nt, has_own(c, f, tk.Kind.KwPub));
+        md.owner = d;
+        c.methods.push(c.decls.len() as u32);
+        c.decls.push(md);
+    }
+    c.decls[d as usize].methods_start = start;
+    c.decls[d as usize].methods_len = c.methods.len() as u32 - start;
+}
+
+fn resolve_members(c: &mut Checker, d: u32) {
+    let decl = c.decls[d as usize];
+    c.module = decl.module;
+    let n = decl.node;
+    match decl.kind {
+        .Struct => {
+            let start = c.fields.len() as u32;
+            let len = add_fields(c, n, 0);
+            c.decls[d as usize].members_start = start;
+            c.decls[d as usize].members_len = len;
+            add_methods(c, d);
+        }
+        .Enum => {
+            let start = c.variants.len() as u32;
+            let count = child_count(c, n);
+            var i: u32 = 0;
+            while i < count : (i += 1) {
+                let v = child(c, n, i);
+                if kind_of(c, v) != cst.Kind.Variant {
+                    continue;
+                }
+                let nt = ident_of(c, v);
+                let sym = symbol(c, nt);
+                var j = start;
+                while j < c.variants.len() as u32 : (j += 1) {
+                    if c.variants[j as usize].name == sym {
+                        report_duplicate_member(c, nt, "variant");
+                    }
+                }
+                let fields_start = c.fields.len() as u32;
+                let has_fields = has_own(c, v, tk.Kind.LBrace);
+                let fields_len = add_fields(c, v, 0);
+                c.variants.push(Variant {
+                    name: sym,
+                    name_token: nt,
+                    has_fields: has_fields,
+                    fields_start: fields_start,
+                    fields_len: fields_len,
+                });
+            }
+            c.decls[d as usize].members_start = start;
+            c.decls[d as usize].members_len = c.variants.len() as u32 - start;
+            add_methods(c, d);
+        }
+        .ErrorSet => {
+            let start = c.error_members.len() as u32;
+            let toks = own(c, n);
+            let items = toks.items();
+            var after_error = false;
+            var i: usize = 0;
+            while i < items.len() : (i += 1) {
+                let t = items[i];
+                if tok_kind(c, t) == tk.Kind.KwError {
+                    after_error = true;
+                    continue;
+                }
+                if not after_error or tok_kind(c, t) != tk.Kind.Ident {
+                    continue;
+                }
+                let sym = symbol(c, t);
+                let id = error_id(c, sym);
+                var j = start;
+                while j < c.error_members.len() as u32 : (j += 1) {
+                    if c.error_members[j as usize] == id {
+                        report_duplicate_member(c, t, "error");
+                    }
+                }
+                c.error_members.push(id);
+            }
+            c.decls[d as usize].members_start = start;
+            c.decls[d as usize].members_len = c.error_members.len() as u32 - start;
+        }
+        .Alias => {
+            _ = decl_type(c, d);
+        }
+        .Fn | .Const => { }
+    }
+}
+
+/// A struct or enum that contains itself by value has no size (E0423).
+fn check_contains(c: &mut Checker, t: ty.TypeId, path: &mut alloc.List(u32), done: &mut alloc.Map(u32, bool)) {
+    var info = c.t.get(t);
+    while info.kind == ty.Kind.Array {
+        info = c.t.get(info.elem);
+    }
+    if info.kind != ty.Kind.Struct and info.kind != ty.Kind.Enum {
+        return;
+    }
+    let d = info.decl;
+    match done.get(d) {
+        some(_) => { return; }
+        none => { }
+    }
+    let on_path = path.items();
+    var i: usize = 0;
+    while i < on_path.len() : (i += 1) {
+        if on_path[i] == d {
+            let decl = c.decls[d as usize];
+            let saved = c.module;
+            c.module = decl.module;
+            let s = token_span(c, decl.name_token);
+            report(c, codes.CONTAINS_ITSELF, s, "this type contains itself; link values with a handle, such as an index into a list");
+            c.module = saved;
+            done.put(d, true);
+            return;
+        }
+    }
+    path.push(d);
+    let decl = c.decls[d as usize];
+    if info.kind == ty.Kind.Struct {
+        var f = decl.members_start;
+        while f < decl.members_start + decl.members_len : (f += 1) {
+            check_contains(c, c.fields[f as usize].type_id, path, done);
+        }
+    } else {
+        var v = decl.members_start;
+        while v < decl.members_start + decl.members_len : (v += 1) {
+            let variant = c.variants[v as usize];
+            var f = variant.fields_start;
+            while f < variant.fields_start + variant.fields_len : (f += 1) {
+                check_contains(c, c.fields[f as usize].type_id, path, done);
+            }
+        }
+    }
+    _ = path.pop();
+    done.put(d, true);
+}
+
+fn check_signature(c: &mut Checker, d: u32) {
+    let decl = c.decls[d as usize];
+    c.module = decl.module;
+    let n = decl.node;
+    let start = c.params.len() as u32;
+    let count = child_count(c, n);
+    var ret = ty.void_type();
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let ch = child(c, n, i);
+        let k = kind_of(c, ch);
+        if k == cst.Kind.Param {
+            let nt = ident_of(c, ch);
+            let sym = symbol(c, nt);
+            var j = start;
+            while j < c.params.len() as u32 : (j += 1) {
+                if c.params[j as usize].name == sym {
+                    report_duplicate_member(c, nt, "parameter");
+                }
+            }
+            let pt = resolve_type(c, child(c, ch, 0));
+            c.params.push(ParamInfo { name: sym, name_token: nt, type_id: pt });
+        } else if k != cst.Kind.Block {
+            ret = resolve_type(c, ch);
+        }
+    }
+    var info = FnInfo {
+        decl: d,
+        params_start: start,
+        params_len: c.params.len() as u32 - start,
+        ret: ret,
+        has_self: false,
+        self_mode: SelfMode.Value,
+    };
+    if decl.owner != NONE and info.params_len > 0 and c.names.text(c.params[start as usize].name).eq("self") {
+        let owner_type = c.decls[decl.owner as usize].type_id;
+        let pt = c.params[start as usize].type_id;
+        let pi = c.t.get(pt);
+        info.has_self = true;
+        if pt == owner_type {
+            info.self_mode = SelfMode.Value;
+        } else if pi.kind == ty.Kind.Ref and pi.elem == owner_type {
+            if pi.mutable {
+                info.self_mode = SelfMode.MutRef;
+            } else {
+                info.self_mode = SelfMode.Ref;
+            }
+        } else if not is_invalid(c, pt) {
+            let s = token_span(c, c.params[start as usize].name_token);
+            var m = new_message(c);
+            m.push_str("'self' is ");
+            write_type(c, &mut m, owner_type);
+            m.push_str(", &");
+            write_type(c, &mut m, owner_type);
+            m.push_str(" or &mut ");
+            write_type(c, &mut m, owner_type);
+            report_owned(c, codes.BAD_SELF, s, m);
+        }
+    }
+    c.decls[d as usize].fn_index = c.fns.len() as u32;
+    c.fns.push(info);
+}
+
+fn check_main(c: &mut Checker) {
+    c.module = 0;
+    let main_sym = c.names.intern("main");
+    let system = c.t.builtin(ty.Builtin.System);
+    let want_param = c.t.reference(true, system);
+    let want_ret = c.t.error_union(NONE, ty.void_type());
+    match find_item(c, 0, main_sym) {
+        some(d) => {
+            let decl = c.decls[d as usize];
+            if decl.kind == DeclKind.Fn {
+                let f = c.fns[decl.fn_index as usize];
+                if f.params_len == 1 and c.params[f.params_start as usize].type_id == want_param and f.ret == want_ret {
+                    return;
+                }
+                let s = token_span(c, decl.name_token);
+                report(c, codes.BAD_MAIN, s, "main must be declared as 'fn main(sys: &mut std.System) -> !void'");
+                return;
+            }
+        }
+        none => { }
+    }
+    report(c, codes.BAD_MAIN, diag.Span { start: 0, len: 0 }, "the root module has no 'fn main(sys: &mut std.System) -> !void'");
+}
+
+fn io_error_name(i: u32) -> str {
+    match i {
+        0 => { return "NotFound"; }
+        1 => { return "AccessDenied"; }
+        2 => { return "IsDirectory"; }
+        3 => { return "InvalidUtf8"; }
+        _ => { return "IoFailed"; }
+    }
+}
+
+/// std.IoError (§11): its errors are numbered first, 1 to 5, so that the
+/// runtime can return them.
+fn add_io_error(c: &mut Checker) {
+    let name = c.names.intern("IoError");
+    var d = new_decl(DeclKind.ErrorSet, module: 0, cst.NodeId { index: 0 }, name, name_token: 0, true);
+    d.members_start = c.error_members.len() as u32;
+    d.members_len = 5;
+    let id = c.decls.len() as u32;
+    c.decls.push(d);
+    c.io_error = id;
+    c.decls[id as usize].type_id = c.t.declared(ty.Kind.ErrorSet, id);
+    var i: u32 = 0;
+    while i < 5 : (i += 1) {
+        let sym = c.names.intern(io_error_name(i));
+        let eid = error_id(c, sym);
+        c.error_members.push(eid);
+    }
+}
+
+pub fn check(p: program.Program) -> program.Program {
+    let a = p.a;
+    let nmodules = p.modules.len();
+    var c = Checker {
+        p: p,
+        t: ty.Types.init(a),
+        names: alloc.Interner.init(a),
+        decls: alloc.List(Decl).init(a),
+        fields: alloc.List(Field).init(a),
+        variants: alloc.List(Variant).init(a),
+        fns: alloc.List(FnInfo).init(a),
+        params: alloc.List(ParamInfo).init(a),
+        methods: alloc.List(u32).init(a),
+        error_members: alloc.List(u32).init(a),
+        error_ids: alloc.Map(alloc.Symbol, u32).init(a),
+        error_names: alloc.List(alloc.Symbol).init(a),
+        items: alloc.List(alloc.Map(alloc.Symbol, u32)).init(a),
+        imports: alloc.List(alloc.Map(alloc.Symbol, Alias)).init(a),
+        node_types: alloc.List(alloc.List(ty.TypeId)).init(a),
+        node_refs: alloc.List(alloc.List(u32)).init(a),
+        scope: alloc.List(Binding).init(a),
+        module: 0,
+        fn_index: NONE,
+        loops: 0,
+        defer_loops: NONE,
+        io_error: NONE,
+        a: a,
+    };
+    add_io_error(&mut c);
+    var m: usize = 0;
+    while m < nmodules : (m += 1) {
+        c.items.push(alloc.Map(alloc.Symbol, u32).init(a));
+        c.imports.push(alloc.Map(alloc.Symbol, Alias).init(a));
+        var nt = alloc.List(ty.TypeId).init(a);
+        var nr = alloc.List(u32).init(a);
+        var k: usize = 0;
+        while k < c.p.modules[m].tree.nodes.len() : (k += 1) {
+            nt.push(ty.invalid());
+            nr.push(NONE);
+        }
+        c.node_types.push(nt);
+        c.node_refs.push(nr);
+    }
+    m = 0;
+    while m < nmodules : (m += 1) {
+        c.module = m as u32;
+        collect_items(&mut c);
+    }
+    // Members of the module-level types; methods become declarations here.
+    let ntop = c.decls.len();
+    var d: usize = 0;
+    while d < ntop : (d += 1) {
+        if d as u32 != c.io_error { // std.IoError has no source to resolve
+            resolve_members(&mut c, d as u32);
+        }
+    }
+    var path = alloc.List(u32).init(a);
+    var done = alloc.Map(u32, bool).init(a);
+    d = 0;
+    while d < ntop : (d += 1) {
+        let k = c.decls[d].kind;
+        if k == DeclKind.Struct or k == DeclKind.Enum {
+            check_contains(&mut c, c.decls[d].type_id, &mut path, &mut done);
+        }
+    }
+    d = 0;
+    while d < c.decls.len() : (d += 1) {
+        if c.decls[d].kind == DeclKind.Const {
+            consts.check_const(&mut c, d as u32);
+        }
+    }
+    d = 0;
+    while d < c.decls.len() : (d += 1) {
+        if c.decls[d].kind == DeclKind.Fn {
+            check_signature(&mut c, d as u32);
+        }
+    }
+    check_main(&mut c);
+    let nfns = c.fns.len();
+    var f: usize = 0;
+    while f < nfns : (f += 1) {
+        stmt.check_fn(&mut c, f as u32);
+    }
+    m = 0;
+    while m < nmodules : (m += 1) {
+        c.module = m as u32;
+        let root = tree(&c).root;
+        let count = child_count(&c, root);
+        var i: u32 = 0;
+        while i < count : (i += 1) {
+            let n = child(&c, root, i);
+            if kind_of(&c, n) == cst.Kind.TestDecl {
+                stmt.check_test(&mut c, m as u32, n);
+            }
+        }
+    }
+    return c.p;
 }

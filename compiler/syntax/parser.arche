@@ -227,7 +227,7 @@ fn parse_import(p: &mut Parser) {
     }
     if not accept(p, tk.Kind.Semi) {
         unexpected(p, "';'");
-        skip_to(p, tk.Kind.Semi, tk.Kind.KwImport);
+        skip_to(p, stop_a: tk.Kind.Semi, stop_b: tk.Kind.KwImport);
         _ = accept(p, tk.Kind.Semi);
     }
     _ = close(p, m, cst.Kind.Import);
@@ -261,7 +261,7 @@ fn parse_item(p: &mut Parser) {
         }
         .KwVar | .KwLet => {
             report_here(p, codes.MODULE_BINDING, "a module has no 'var' or 'let' bindings; use 'const' for a module-level value");
-            skip_to(p, tk.Kind.Semi, tk.Kind.RBrace);
+            skip_to(p, stop_a: tk.Kind.Semi, stop_b: tk.Kind.RBrace);
             _ = accept(p, tk.Kind.Semi);
             _ = close(p, m, cst.Kind.Error);
         }
@@ -324,7 +324,7 @@ fn parse_fn(p: &mut Parser, m: cst.Mark) {
         while not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Eof) and not at(p, tk.Kind.LBrace) {
             let pm = open(p);
             if not expect(p, tk.Kind.Ident, "a parameter name") {
-                skip_to(p, tk.Kind.Comma, tk.Kind.RParen);
+                skip_to(p, stop_a: tk.Kind.Comma, stop_b: tk.Kind.RParen);
             } else if expect(p, tk.Kind.Colon, "':' and the parameter's type") {
                 parse_type(p);
             }
@@ -389,7 +389,7 @@ fn parse_members(p: &mut Parser, is_struct: bool) {
             }
         } else {
             unexpected(p, "a field or 'fn'");
-            skip_to(p, tk.Kind.Comma, tk.Kind.RBrace);
+            skip_to(p, stop_a: tk.Kind.Comma, stop_b: tk.Kind.RBrace);
             _ = accept(p, tk.Kind.Comma);
         }
         if p.pos == before {
@@ -432,7 +432,7 @@ fn parse_type_decl(p: &mut Parser, m: cst.Mark) {
             }
             if not accept(p, tk.Kind.RBrace) {
                 unexpected(p, "',' or '}'");
-                skip_to(p, tk.Kind.RBrace, tk.Kind.RBrace);
+                skip_to(p, stop_a: tk.Kind.RBrace, stop_b: tk.Kind.RBrace);
                 _ = accept(p, tk.Kind.RBrace);
             }
         }
@@ -496,7 +496,7 @@ fn end_statement(p: &mut Parser) {
             return; // go on as if the ';' were there: the next line is a statement of its own
         }
     }
-    skip_to(p, tk.Kind.Semi, tk.Kind.RBrace);
+    skip_to(p, stop_a: tk.Kind.Semi, stop_b: tk.Kind.RBrace);
     _ = accept(p, tk.Kind.Semi);
 }
 
@@ -738,7 +738,7 @@ fn parse_arm(p: &mut Parser) {
     if expect(p, tk.Kind.FatArrow, "'=>'") {
         parse_block(p);
     } else {
-        skip_to(p, tk.Kind.LBrace, tk.Kind.RBrace);
+        skip_to(p, stop_a: tk.Kind.LBrace, stop_b: tk.Kind.RBrace);
         if at(p, tk.Kind.LBrace) {
             parse_block(p);
         }
@@ -1040,7 +1040,7 @@ fn parse_struct_lit(p: &mut Parser) {
     while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {
         let fm = open(p);
         if not expect(p, tk.Kind.Ident, "a field name") {
-            skip_to(p, tk.Kind.Comma, tk.Kind.RBrace);
+            skip_to(p, stop_a: tk.Kind.Comma, stop_b: tk.Kind.RBrace);
         } else if expect(p, tk.Kind.Colon, "':'") {
             parse_nested_expr(p);
         }

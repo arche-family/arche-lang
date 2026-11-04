@@ -1,0 +1,826 @@
+/// Statements, patterns and function bodies: spec/arche-0.md §6, §8, §9
+/// and §10.
+import alloc;
+import codes;
+import diag;
+import syntax.cst;
+import syntax.token as tk;
+import sema.check as ck;
+import sema.expr;
+import sema.types as ty;
+
+// ---- bindings (§6) ------------------------------------------------------------
+
+/// Declares a binding. Erasable (§6.3), but cheap: a name cannot be
+/// declared while the same name is visible.
+fn declare(c: &mut ck.Checker, name_token: u32, t: ty.TypeId, mutable: bool) {
+    let sym = ck.symbol(c, name_token);
+    let s = ck.token_span(c, name_token);
+    var visible = false;
+    match expr.find_binding(c, sym) {
+        some(_) => { visible = true; }
+        none => { }
+    }
+    match ck.find_item(c, c.module, sym) {
+        some(_) => { visible = true; }
+        none => { }
+    }
+    match ck.find_import(c, sym) {
+        some(_) => { visible = true; }
+        none => { }
+    }
+    if visible or ck.is_predeclared(ck.text(c, name_token)) {
+        var m = ck.new_message(c);
+        m.push_str("'");
+        m.push_str(ck.text(c, name_token));
+        m.push_str("' is already declared and visible here; Arche has no shadowing");
+        ck.report_owned(c, codes.SHADOWING, s, m);
+    }
+    c.scope.push(ck.Binding { name: sym, name_token: name_token, type_id: t, mutable: mutable });
+}
+
+fn is_void_result(c: &ck.Checker, t: ty.TypeId) -> bool {
+    let info = c.t.get(t);
+    return info.kind == ty.Kind.Void or (info.kind == ty.Kind.ErrorUnion and c.t.kind(info.elem) == ty.Kind.Void);
+}
+
+// ---- functions ----------------------------------------------------------------
+
+pub fn check_fn(c: &mut ck.Checker, f: u32) {
+    let info = c.fns[f as usize];
+    let decl = c.decls[info.decl as usize];
+    c.module = decl.module;
+    c.fn_index = f;
+    c.loops = 0;
+    c.defer_loops = ck.NONE;
+    while c.scope.len() > 0 {
+        _ = c.scope.pop();
+    }
+    var i = info.params_start;
+    while i < info.params_start + info.params_len : (i += 1) {
+        let p = c.params[i as usize];
+        declare(c, p.name_token, p.type_id, false);
+    }
+    let n = decl.node;
+    let body = ck.child(c, n, ck.child_count(c, n) - 1);
+    check_block(c, body);
+    if not is_void_result(c, info.ret) and not block_ends(c, body) {
+        var m = ck.new_message(c);
+        m.push_str("this function can reach its end without returning ");
+        ck.write_type(c, &mut m, info.ret);
+        let s = ck.token_span(c, decl.name_token);
+        ck.report_owned(c, codes.MISSING_RETURN, s, m);
+    }
+    c.fn_index = ck.NONE;
+}
+
+/// A test block (§4): a body like a function's that takes nothing and
+/// returns nothing.
+pub fn check_test(c: &mut ck.Checker, module: u32, n: cst.NodeId) {
+    c.module = module;
+    c.fn_index = c.fns.len() as u32;
+    c.fns.push(ck.FnInfo {
+        decl: ck.NONE,
+        params_start: 0,
+        params_len: 0,
+        ret: ty.void_type(),
+        has_self: false,
+        self_mode: ck.SelfMode.Value,
+    });
+    c.loops = 0;
+    c.defer_loops = ck.NONE;
+    while c.scope.len() > 0 {
+        _ = c.scope.pop();
+    }
+    check_block(c, ck.child(c, n, 0));
+    c.fn_index = ck.NONE;
+}
+
+// ---- statements (§8) ----------------------------------------------------------
+
+pub fn check_block(c: &mut ck.Checker, b: cst.NodeId) {
+    let depth = c.scope.len();
+    let count = ck.child_count(c, b);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        check_stmt(c, ck.child(c, b, i));
+    }
+    while c.scope.len() > depth {
+        _ = c.scope.pop();
+    }
+}
+
+fn check_stmt(c: &mut ck.Checker, s: cst.NodeId) {
+    match ck.kind_of(c, s) {
+        .Block => { check_block(c, s); }
+        .LetStmt => { check_let(c, s); }
+        .ExprStmt => {
+            let e = ck.child(c, s, 0);
+            let t = expr.check(c, e, none);
+            let k = c.t.kind(t);
+            if k != ty.Kind.Void and k != ty.Kind.Noreturn and k != ty.Kind.Invalid {
+                // Erasable (§7.8).
+                var m = ck.new_message(c);
+                m.push_str("the ");
+                ck.write_type(c, &mut m, t);
+                m.push_str(" result is not used; write '_ = ...' to discard it");
+                let sp = ck.span_of(c, e);
+                ck.report_owned(c, codes.UNUSED_RESULT, sp, m);
+            }
+        }
+        .DiscardStmt => {
+            _ = expr.check(c, ck.child(c, s, 0), none);
+        }
+        .AssignStmt => { check_assign(c, s); }
+        .IfStmt => {
+            expr.check_value(c, ck.child(c, s, 0), ty.bool_type());
+            check_block(c, ck.child(c, s, 1));
+            if ck.child_count(c, s) > 2 {
+                check_stmt(c, ck.child(c, s, 2));
+            }
+        }
+        .WhileStmt => {
+            expr.check_value(c, ck.child(c, s, 0), ty.bool_type());
+            let has_step = ck.child_count(c, s) == 3;
+            c.loops += 1;
+            check_block(c, ck.child(c, s, ck.child_count(c, s) - 1));
+            c.loops -= 1;
+            if has_step {
+                check_stmt(c, ck.child(c, s, 1));
+            }
+        }
+        .MatchStmt => { check_match(c, s); }
+        .ReturnStmt => { check_return(c, s); }
+        .BreakStmt | .ContinueStmt => {
+            let sp = ck.span_of(c, s);
+            if c.loops == 0 {
+                ck.report(c, codes.OUTSIDE_LOOP, sp, "'break' and 'continue' are allowed only inside a 'while' loop");
+            } else if c.defer_loops != ck.NONE and c.loops == c.defer_loops {
+                ck.report(c, codes.IN_DEFER, sp, "deferred code cannot 'break' or 'continue' out of its block");
+            }
+        }
+        .DeferStmt => {
+            let saved = c.defer_loops;
+            c.defer_loops = c.loops;
+            check_stmt(c, ck.child(c, s, 0));
+            c.defer_loops = saved;
+        }
+        _ => { }
+    }
+}
+
+fn check_let(c: &mut ck.Checker, s: cst.NodeId) {
+    let nt = ck.ident_of(c, s);
+    let mutable = ck.has_own(c, s, tk.Kind.KwVar);
+    var t = ty.invalid();
+    if ck.has_own(c, s, tk.Kind.Colon) {
+        t = ck.resolve_type(c, ck.child(c, s, 0));
+        expr.check_value(c, ck.child(c, s, 1), t);
+    } else {
+        let e = ck.child(c, s, 0);
+        t = expr.check(c, e, none);
+        let k = c.t.kind(t);
+        if k == ty.Kind.Void or k == ty.Kind.Noreturn {
+            let sp = ck.span_of(c, e);
+            ck.report(c, codes.NO_VALUE, sp, "this expression has no value to bind");
+            t = ty.invalid();
+        }
+    }
+    declare(c, nt, t, mutable);
+}
+
+fn check_assign(c: &mut ck.Checker, s: cst.NodeId) {
+    let target = ck.child(c, s, 0);
+    let value = ck.child(c, s, 1);
+    let op_t = ck.own(c, s);
+    let op = ck.tok_kind(c, op_t[0]);
+    let t = expr.check(c, target, none);
+    if not ck.is_invalid(c, t) {
+        if not expr.is_place(c, target) {
+            let sp = ck.span_of(c, target);
+            ck.report(c, codes.NOT_A_PLACE, sp, "only a place can be assigned: a variable, a field, an element or '.*'");
+        } else if not expr.place_mutable(c, target) {
+            let sp = ck.span_of(c, target);
+            ck.report(c, codes.NOT_MUTABLE, sp, "this place cannot be changed: it is not a 'var' and not reached through '&mut'");
+        }
+    }
+    if op == tk.Kind.Assign {
+        expr.check_value(c, value, t);
+        return;
+    }
+    if op == tk.Kind.ShlAssign or op == tk.Kind.ShrAssign {
+        var count = ty.invalid();
+        if ck.kind_of(c, value) == cst.Kind.IntLit {
+            count = expr.check(c, value, some(ty.int_type(ty.IntKind.U32)));
+        } else {
+            count = expr.check(c, value, none);
+        }
+        if not ck.is_invalid(c, count) and (not ck.is_int(c, count) or ty.is_signed(c.t.get(count).int_kind)) {
+            let sp = ck.span_of(c, value);
+            ck.report(c, codes.BAD_OPERATOR, sp, "a shift count is an unsigned integer");
+        }
+    } else {
+        expr.check_value(c, value, t);
+    }
+    if not ck.is_invalid(c, t) and not ck.is_int(c, t) {
+        var m = ck.new_message(c);
+        m.push_str("'");
+        m.push_str(ck.text(c, op_t[0]));
+        m.push_str("' works on integers, not ");
+        ck.write_type(c, &mut m, t);
+        let sp = ck.token_span(c, op_t[0]);
+        ck.report_owned(c, codes.BAD_OPERATOR, sp, m);
+    }
+}
+
+/// Return lifting (§7.8): returning ?T, `return v` with v: T returns
+/// some(v); returning E!T, `return v` returns the value and `return e`
+/// with an error returns the error.
+fn check_return(c: &mut ck.Checker, s: cst.NodeId) {
+    let sp = ck.span_of(c, s);
+    if c.defer_loops != ck.NONE {
+        ck.report(c, codes.IN_DEFER, sp, "deferred code cannot 'return'");
+    }
+    let ret = c.fns[c.fn_index as usize].ret;
+    let info = c.t.get(ret);
+    if ck.child_count(c, s) == 0 {
+        if not is_void_result(c, ret) {
+            var m = ck.new_message(c);
+            m.push_str("this function returns ");
+            ck.write_type(c, &mut m, ret);
+            m.push_str(", so 'return' needs a value");
+            ck.report_owned(c, codes.BAD_RETURN, sp, m);
+        }
+        return;
+    }
+    let e = ck.child(c, s, 0);
+    if info.kind == ty.Kind.Void {
+        _ = expr.check(c, e, none);
+        let ep = ck.span_of(c, e);
+        ck.report(c, codes.BAD_RETURN, ep, "this function returns nothing, so 'return' takes no value");
+        return;
+    }
+    if info.kind == ty.Kind.Optional {
+        let k = ck.kind_of(c, e);
+        if k == cst.Kind.NoneLit or k == cst.Kind.SomeExpr {
+            expr.check_value(c, e, ret);
+            return;
+        }
+        let t = expr.check(c, e, some(info.elem));
+        if not ck.assignable(c, got: t, want: info.elem) and not ck.assignable(c, got: t, want: ret) {
+            ck.report_mismatch(c, e, want: info.elem, got: t);
+        }
+        return;
+    }
+    if info.kind == ty.Kind.ErrorUnion {
+        var hint: ?ty.TypeId = none;
+        if c.t.kind(info.elem) != ty.Kind.Void {
+            hint = some(info.elem);
+        }
+        let t = expr.check(c, e, hint);
+        let tk_kind = c.t.kind(t);
+        if tk_kind == ty.Kind.ErrorSet and c.t.kind(info.elem) != ty.Kind.ErrorSet {
+            check_returned_error(c, e, t: t, ret: ret);
+            return;
+        }
+        if c.t.kind(info.elem) != ty.Kind.Void and ck.assignable(c, got: t, want: info.elem) {
+            return;
+        }
+        if not ck.assignable(c, got: t, want: ret) {
+            ck.report_mismatch(c, e, want: ret, got: t);
+        }
+        return;
+    }
+    expr.check_value(c, e, ret);
+}
+
+/// `return e` of an error: a named error must be in the function's set, and
+/// every error of e's set must be.
+fn check_returned_error(c: &mut ck.Checker, e: cst.NodeId, t: ty.TypeId, ret: ty.TypeId) {
+    let into = c.t.get(ret).decl;
+    let ep = ck.span_of(c, e);
+    if into == ck.NONE {
+        return;
+    }
+    if ck.kind_of(c, e) == cst.Kind.FieldExpr {
+        let sym = ck.symbol(c, expr.member_token(c, e));
+        match expr.find_error(c, c.decls[into as usize].type_id, sym) {
+            some(_) => { return; }
+            none => { }
+        }
+        match expr.find_error(c, t, sym) {
+            some(_) => {
+                var m = ck.new_message(c);
+                m.push_str("the error '");
+                m.push_str(c.names.text(sym));
+                m.push_str("' cannot be returned: ");
+                ck.write_type(c, &mut m, ret);
+                m.push_str(" does not contain it");
+                ck.report_owned(c, codes.ERROR_NOT_IN_SET, ep, m);
+                return;
+            }
+            none => { }
+        }
+    }
+    _ = expr.errors_fit(c, c.t.get(t).decl, ret, ep);
+}
+
+// ---- patterns (§9) ------------------------------------------------------------
+
+type Literal = struct {
+    negative: bool,
+    magnitude: u64,
+    is_char: bool,
+    at: u32,
+}
+
+/// The literal of a LitPat or RangePat that starts at own token `from`;
+/// `from` moves past it.
+fn literal(c: &ck.Checker, toks: []u32, from: &mut usize) -> Literal {
+    var lit = Literal { negative: false, magnitude: 0, is_char: false, at: toks[from.*] };
+    if ck.tok_kind(c, toks[from.*]) == tk.Kind.Minus {
+        lit.negative = true;
+        from.* += 1;
+    }
+    let t = toks[from.*];
+    lit.magnitude = ck.tok_value(c, t);
+    lit.is_char = ck.tok_kind(c, t) == tk.Kind.Char;
+    from.* += 1;
+    return lit;
+}
+
+fn check_literal(c: &mut ck.Checker, lit: Literal, t: ty.TypeId) -> bool {
+    let s = ck.token_span(c, lit.at);
+    let k = c.t.get(t).int_kind;
+    if lit.is_char and k != ty.IntKind.U8 {
+        var m = ck.new_message(c);
+        m.push_str("a character pattern matches a u8, not ");
+        ck.write_type(c, &mut m, t);
+        ck.report_owned(c, codes.PATTERN_TYPE, s, m);
+        return false;
+    }
+    if lit.negative and not ty.is_signed(k) {
+        var m = ck.new_message(c);
+        m.push_str("a negative pattern needs a signed type, not ");
+        ck.write_type(c, &mut m, t);
+        ck.report_owned(c, codes.PATTERN_TYPE, s, m);
+        return false;
+    }
+    var limit = ty.max_value(k);
+    if lit.negative {
+        limit = ty.min_magnitude(k);
+    }
+    if lit.magnitude > limit {
+        var m = ck.new_message(c);
+        m.push_str("this pattern does not fit in ");
+        ck.write_type(c, &mut m, t);
+        ck.report_owned(c, codes.LITERAL_RANGE, s, m);
+        return false;
+    }
+    return true;
+}
+
+fn literal_le(a: Literal, b: Literal) -> bool {
+    if a.negative != b.negative {
+        return a.negative;
+    }
+    if a.negative {
+        return a.magnitude >= b.magnitude;
+    }
+    return a.magnitude <= b.magnitude;
+}
+
+fn pattern_type_error(c: &mut ck.Checker, p: cst.NodeId, what: str, t: ty.TypeId) {
+    var m = ck.new_message(c);
+    m.push_str(what);
+    m.push_str(", not ");
+    ck.write_type(c, &mut m, t);
+    let s = ck.span_of(c, p);
+    ck.report_owned(c, codes.PATTERN_TYPE, s, m);
+}
+
+/// Checks pattern p against a value of type t. When by_ref, the value is
+/// reached through a reference (mutable when ref_mut), and the pattern
+/// binds views of it rather than copies (§9).
+fn check_pattern(c: &mut ck.Checker, p: cst.NodeId, t: ty.TypeId, by_ref: bool, ref_mut: bool, alternatives: bool) {
+    if ck.is_invalid(c, t) {
+        return;
+    }
+    let info = c.t.get(t);
+    match ck.kind_of(c, p) {
+        .WildcardPat => { }
+        .BindPat => {
+            let nt = ck.ident_of(c, p);
+            if alternatives {
+                let s = ck.token_span(c, nt);
+                ck.report(c, codes.BINDING_ALTERNATIVES, s, "patterns joined with '|' cannot bind names");
+            }
+            var bt = t;
+            if by_ref {
+                bt = c.t.reference(ref_mut, t);
+            }
+            declare(c, nt, bt, false);
+        }
+        .LitPat | .RangePat => {
+            if info.kind != ty.Kind.Int {
+                pattern_type_error(c, p, "an integer pattern needs an integer to match", t);
+                return;
+            }
+            let toks = ck.own(c, p);
+            var at: usize = 0;
+            let lo = literal(c, toks.items(), &mut at);
+            if not check_literal(c, lo, t) {
+                return;
+            }
+            if ck.kind_of(c, p) == cst.Kind.RangePat {
+                at += 1; // ..=
+                let hi = literal(c, toks.items(), &mut at);
+                if check_literal(c, hi, t) and not literal_le(a: lo, b: hi) {
+                    let s = ck.span_of(c, p);
+                    ck.report(c, codes.EMPTY_RANGE, s, "this range is empty");
+                }
+            }
+        }
+        .BoolPat => {
+            if info.kind != ty.Kind.Bool {
+                pattern_type_error(c, p, "'true' and 'false' match a bool", t);
+            }
+        }
+        .NonePat => {
+            if info.kind != ty.Kind.Optional {
+                pattern_type_error(c, p, "'none' matches an optional", t);
+            }
+        }
+        .SomePat => {
+            if info.kind != ty.Kind.Optional {
+                pattern_type_error(c, p, "'some(...)' matches an optional", t);
+                return;
+            }
+            check_pattern(c, ck.child(c, p, 0), info.elem, by_ref: by_ref, ref_mut: ref_mut, alternatives: alternatives);
+        }
+        .OkPat => {
+            if info.kind != ty.Kind.ErrorUnion {
+                pattern_type_error(c, p, "'ok(...)' matches an error union", t);
+                return;
+            }
+            let inner = ck.child(c, p, 0);
+            if c.t.kind(info.elem) == ty.Kind.Void {
+                if ck.kind_of(c, inner) != cst.Kind.WildcardPat {
+                    let s = ck.span_of(c, inner);
+                    ck.report(c, codes.PATTERN_TYPE, s, "a void result has no value: write 'ok(_)'");
+                }
+                return;
+            }
+            check_pattern(c, inner, info.elem, by_ref: by_ref, ref_mut: ref_mut, alternatives: alternatives);
+        }
+        .ErrPat => {
+            if info.kind != ty.Kind.ErrorUnion {
+                pattern_type_error(c, p, "'err(...)' matches an error union", t);
+                return;
+            }
+            var set = ty.any_error();
+            if info.decl != ck.NONE {
+                set = c.decls[info.decl as usize].type_id;
+            }
+            check_pattern(c, ck.child(c, p, 0), set, by_ref: by_ref, ref_mut: ref_mut, alternatives: alternatives);
+        }
+        .VariantPat => { check_variant_pattern(c, p, t, by_ref: by_ref, ref_mut: ref_mut, alternatives: alternatives); }
+        _ => { }
+    }
+}
+
+fn check_variant_pattern(c: &mut ck.Checker, p: cst.NodeId, t: ty.TypeId, by_ref: bool, ref_mut: bool, alternatives: bool) {
+    let info = c.t.get(t);
+    let nt = ck.ident_of(c, p);
+    let sym = ck.symbol(c, nt);
+    let has_fields = ck.has_own(c, p, tk.Kind.LBrace);
+    if info.kind == ty.Kind.ErrorSet {
+        match expr.find_error(c, t, sym) {
+            some(_) => { }
+            none => {
+                var m = ck.new_message(c);
+                ck.write_type(c, &mut m, t);
+                m.push_str(" has no error named '");
+                m.push_str(ck.text(c, nt));
+                m.push_str("'");
+                let s = ck.span_of(c, p);
+                ck.report_owned(c, codes.NO_MEMBER, s, m);
+            }
+        }
+        if has_fields {
+            let s = ck.span_of(c, p);
+            ck.report(c, codes.BAD_VARIANT_USE, s, "an error has no fields");
+        }
+        return;
+    }
+    if info.kind != ty.Kind.Enum {
+        pattern_type_error(c, p, "a '.Name' pattern matches an enum or an error", t);
+        return;
+    }
+    let v = expr.find_variant(c, t, sym) orelse ck.NONE;
+    if v == ck.NONE {
+        var m = ck.new_message(c);
+        ck.write_type(c, &mut m, t);
+        m.push_str(" has no variant named '");
+        m.push_str(ck.text(c, nt));
+        m.push_str("'");
+        let s = ck.span_of(c, p);
+        ck.report_owned(c, codes.NO_MEMBER, s, m);
+        return;
+    }
+    let variant = c.variants[v as usize];
+    if variant.has_fields and not has_fields {
+        let s = ck.span_of(c, p);
+        ck.report(c, codes.BAD_VARIANT_USE, s, "this variant has fields: write '.Name { ... }', or '.Name { .. }' to ignore them");
+        return;
+    }
+    if not variant.has_fields and has_fields {
+        let s = ck.span_of(c, p);
+        ck.report(c, codes.BAD_VARIANT_USE, s, "this variant has no fields; write it without '{ }'");
+        return;
+    }
+    var named = alloc.List(u32).init(c.a);
+    let count = ck.child_count(c, p);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let fp = ck.child(c, p, i);
+        let toks = ck.own(c, fp);
+        let field_token = toks[0];
+        let fsym = ck.symbol(c, field_token);
+        var field = ck.NONE;
+        var f = variant.fields_start;
+        while f < variant.fields_start + variant.fields_len : (f += 1) {
+            if c.fields[f as usize].name == fsym {
+                field = f;
+            }
+        }
+        if field == ck.NONE {
+            var m = ck.new_message(c);
+            m.push_str("this variant has no field '");
+            m.push_str(ck.text(c, field_token));
+            m.push_str("'");
+            let s = ck.token_span(c, field_token);
+            ck.report_owned(c, codes.NO_MEMBER, s, m);
+            continue;
+        }
+        let seen = named.items();
+        var j: usize = 0;
+        while j < seen.len() : (j += 1) {
+            if seen[j] == field {
+                let s = ck.token_span(c, field_token);
+                ck.report(c, codes.DUPLICATE, s, "this field is named twice");
+            }
+        }
+        named.push(field);
+        var bind_token = field_token;
+        var binds = true;
+        if toks.len() == 3 {
+            bind_token = toks[2];
+            binds = ck.tok_kind(c, bind_token) == tk.Kind.Ident;
+        }
+        if binds {
+            if alternatives {
+                let s = ck.token_span(c, bind_token);
+                ck.report(c, codes.BINDING_ALTERNATIVES, s, "patterns joined with '|' cannot bind names");
+            }
+            var bt = c.fields[field as usize].type_id;
+            if by_ref {
+                bt = c.t.reference(ref_mut, bt);
+            }
+            declare(c, bind_token, bt, false);
+        }
+    }
+    if not ck.has_own(c, p, tk.Kind.DotDot) and named.len() < variant.fields_len as usize {
+        var f = variant.fields_start;
+        while f < variant.fields_start + variant.fields_len : (f += 1) {
+            var found = false;
+            let seen = named.items();
+            var j: usize = 0;
+            while j < seen.len() : (j += 1) {
+                found = found or seen[j] == f;
+            }
+            if not found {
+                var m = ck.new_message(c);
+                m.push_str("this pattern does not name field '");
+                m.push_str(c.names.text(c.fields[f as usize].name));
+                m.push_str("'; name it, or end with '..'");
+                let s = ck.span_of(c, p);
+                ck.report_owned(c, codes.MISSING_FIELDS, s, m);
+                return;
+            }
+        }
+    }
+}
+
+fn check_match(c: &mut ck.Checker, s: cst.NodeId) {
+    let st = expr.check(c, ck.child(c, s, 0), none);
+    let info = c.t.get(st);
+    var t = st;
+    var by_ref = false;
+    var ref_mut = false;
+    if info.kind == ty.Kind.Ref {
+        t = info.elem;
+        by_ref = true;
+        ref_mut = info.mutable;
+    }
+    let count = ck.child_count(c, s);
+    var patterns = alloc.List(cst.NodeId).init(c.a);
+    var i: u32 = 1;
+    while i < count : (i += 1) {
+        let arm = ck.child(c, s, i);
+        let depth = c.scope.len();
+        let parts = ck.child_count(c, arm);
+        var j: u32 = 0;
+        while j + 1 < parts : (j += 1) {
+            let p = ck.child(c, arm, j);
+            patterns.push(p);
+            check_pattern(c, p, t, by_ref: by_ref, ref_mut: ref_mut, alternatives: parts > 2);
+        }
+        check_block(c, ck.child(c, arm, parts - 1));
+        while c.scope.len() > depth {
+            _ = c.scope.pop();
+        }
+    }
+    if c.p.diags.count() == 0 and not covers(c, &patterns, t) {
+        // Erasable (§9): stage0 traps at run time instead.
+        let sp = ck.span_of(c, ck.child(c, s, 0));
+        ck.report(c, codes.NOT_EXHAUSTIVE, sp, "this match does not cover every value; add the missing cases or '_'");
+    }
+}
+
+// ---- exhaustiveness (§9) ----------------------------------------------------------
+
+fn irrefutable(c: &ck.Checker, p: cst.NodeId) -> bool {
+    let k = ck.kind_of(c, p);
+    return k == cst.Kind.WildcardPat or k == cst.Kind.BindPat;
+}
+
+/// The inner patterns of every `kind(...)` in ps.
+fn inner_patterns(c: &ck.Checker, ps: &alloc.List(cst.NodeId), kind: cst.Kind) -> alloc.List(cst.NodeId) {
+    var out = alloc.List(cst.NodeId).init(c.a);
+    let items = ps.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        if ck.kind_of(c, items[i]) == kind {
+            out.push(ck.child(c, items[i], 0));
+        }
+    }
+    return out;
+}
+
+fn has_kind(c: &ck.Checker, ps: &alloc.List(cst.NodeId), kind: cst.Kind) -> bool {
+    let items = ps.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        if ck.kind_of(c, items[i]) == kind {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Some VariantPat in ps names `name`, or a BoolPat says `value`.
+fn names_variant(c: &mut ck.Checker, ps: &alloc.List(cst.NodeId), name: alloc.Symbol) -> bool {
+    let items = ps.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        if ck.kind_of(c, items[i]) == cst.Kind.VariantPat and ck.symbol(c, ck.ident_of(c, items[i])) == name {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_bool(c: &ck.Checker, ps: &alloc.List(cst.NodeId), value: bool) -> bool {
+    let items = ps.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        if ck.kind_of(c, items[i]) == cst.Kind.BoolPat {
+            let is_true = ck.tok_kind(c, ck.tree(c).first_token(items[i])) == tk.Kind.KwTrue;
+            if is_true == value {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// The patterns ps together match every value of type t.
+fn covers(c: &mut ck.Checker, ps: &alloc.List(cst.NodeId), t: ty.TypeId) -> bool {
+    let items = ps.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        if irrefutable(c, items[i]) {
+            return true;
+        }
+    }
+    let info = c.t.get(t);
+    match info.kind {
+        .Bool => {
+            return has_bool(c, ps, true) and has_bool(c, ps, false);
+        }
+        .Enum => {
+            let d = c.decls[info.decl as usize];
+            var v = d.members_start;
+            while v < d.members_start + d.members_len : (v += 1) {
+                if not names_variant(c, ps, c.variants[v as usize].name) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        .ErrorSet => {
+            if info.decl == ck.NONE {
+                return false;
+            }
+            let d = c.decls[info.decl as usize];
+            var e = d.members_start;
+            while e < d.members_start + d.members_len : (e += 1) {
+                let id = c.error_members[e as usize];
+                if not names_variant(c, ps, c.error_names[(id - 1) as usize]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        .Optional => {
+            let inner = inner_patterns(c, ps, cst.Kind.SomePat);
+            return has_kind(c, ps, cst.Kind.NonePat) and covers(c, &inner, info.elem);
+        }
+        .ErrorUnion => {
+            let oks = inner_patterns(c, ps, cst.Kind.OkPat);
+            let errs = inner_patterns(c, ps, cst.Kind.ErrPat);
+            var set = ty.any_error();
+            if info.decl != ck.NONE {
+                set = c.decls[info.decl as usize].type_id;
+            }
+            var ok_covered = oks.len() > 0;
+            if c.t.kind(info.elem) != ty.Kind.Void {
+                ok_covered = covers(c, &oks, info.elem);
+            }
+            return ok_covered and covers(c, &errs, set);
+        }
+        .Invalid => { return true; }
+        _ => { return false; }
+    }
+}
+
+// ---- where paths end (§10) --------------------------------------------------------
+
+fn has_own_break(c: &ck.Checker, n: cst.NodeId) -> bool {
+    match ck.kind_of(c, n) {
+        .BreakStmt => { return true; }
+        .Block | .IfStmt | .MatchStmt | .MatchArm => {
+            let count = ck.child_count(c, n);
+            var i: u32 = 0;
+            while i < count : (i += 1) {
+                if has_own_break(c, ck.child(c, n, i)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        _ => { return false; } // a nested while owns its breaks
+    }
+}
+
+fn stmt_ends(c: &ck.Checker, s: cst.NodeId) -> bool {
+    match ck.kind_of(c, s) {
+        .ReturnStmt => { return true; }
+        .ExprStmt => { return c.t.kind(ck.type_of(c, ck.child(c, s, 0))) == ty.Kind.Noreturn; }
+        .Block => { return block_ends(c, s); }
+        .IfStmt => {
+            return ck.child_count(c, s) == 3 and block_ends(c, ck.child(c, s, 1)) and stmt_ends(c, ck.child(c, s, 2));
+        }
+        .WhileStmt => {
+            let cond = ck.child(c, s, 0);
+            let is_true = ck.kind_of(c, cond) == cst.Kind.BoolLit and
+                ck.tok_kind(c, ck.tree(c).first_token(cond)) == tk.Kind.KwTrue;
+            return is_true and not has_own_break(c, ck.child(c, s, ck.child_count(c, s) - 1));
+        }
+        .MatchStmt => {
+            let count = ck.child_count(c, s);
+            var i: u32 = 1;
+            while i < count : (i += 1) {
+                let arm = ck.child(c, s, i);
+                if not block_ends(c, ck.child(c, arm, ck.child_count(c, arm) - 1)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        _ => { return false; }
+    }
+}
+
+/// Every path through the block ends: in a return or a noreturn expression.
+pub fn block_ends(c: &ck.Checker, b: cst.NodeId) -> bool {
+    let count = ck.child_count(c, b);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        if stmt_ends(c, ck.child(c, b, i)) {
+            return true;
+        }
+    }
+    return false;
+}

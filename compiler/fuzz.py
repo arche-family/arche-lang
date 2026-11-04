@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Fuzzes the parser: mutates .arche files and checks that `arche cst`
-never crashes or hangs and always gives the input back byte for byte.
+"""Fuzzes the parser and the checker: mutates .arche files and checks that
+`arche cst` gives the input back byte for byte, and that neither `arche cst`
+nor `arche check` crashes or hangs.
 
 Usage: python3 -I compiler/fuzz.py <arche> <seconds> [seed]
 Failing inputs are kept as fuzz-<n>.arche in the current directory.
@@ -9,6 +10,7 @@ A development tool: the bootstrap does not need Python.
 import glob
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -17,7 +19,34 @@ TOKENS = [b"{", b"}", b"(", b")", b"[", b"]", b";", b",", b".", b"..", b"=", b"|
           b"'\\", b".{", b"some(", b"x:", b"&mut ", b"0x", b"\n", b"type T = enum {", b"pub ", b"struct {", b"=>"]
 
 
+WORD = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*|[0-9]+")
+
+
+def mutate_meaning(rng, b):
+    """Changes what a program means while its syntax mostly stays valid:
+    swaps names and numbers, or drops a line, so the checker runs."""
+    words = list(WORD.finditer(b))
+    if not words:
+        return b
+    for _ in range(rng.randint(1, 3)):
+        if rng.random() < 0.25:
+            lines = b.split(b"\n")
+            del lines[rng.randrange(len(lines))]
+            b = b"\n".join(lines)
+            words = list(WORD.finditer(b))
+            if not words:
+                return b
+            continue
+        target = rng.choice(words)
+        source = rng.choice(words).group()
+        b = b[:target.start()] + source + b[target.end():]
+        words = list(WORD.finditer(b))
+    return b
+
+
 def mutate(rng, b):
+    if rng.random() < 0.5:
+        return mutate_meaning(rng, b)
     b = bytearray(b)
     for _ in range(rng.randint(1, 6)):
         i = rng.randrange(len(b) + 1)
@@ -58,6 +87,10 @@ def main():
         try:
             r = subprocess.run([arche, "cst", path], capture_output=True, timeout=5)
             ok = r.returncode == 0 and r.stdout == data
+            # The checker may reject the program, but never crash (status
+            # 101) or hang.
+            r = subprocess.run([arche, "check", path], capture_output=True, timeout=5)
+            ok = ok and r.returncode in (0, 1)
         except subprocess.TimeoutExpired:
             ok = False
         if not ok:

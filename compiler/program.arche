@@ -152,8 +152,12 @@ fn import_path(m: &Module, node: cst.NodeId, a: alloc.Allocator) -> ImportPath {
         }
     }
     file.push_str(".arche");
-    let first = m.token_text(toks[1]);
-    let library = first.eq("std") or first.eq("alloc") or first.eq("core");
+    // An import with a syntax error may have no name: it loads nothing.
+    var library = true;
+    if toks.len() > 1 and m.tree.token(toks[1]).kind == tk.Kind.Ident {
+        let first = m.token_text(toks[1]);
+        library = first.eq("std") or first.eq("alloc") or first.eq("core");
+    }
     return ImportPath { dotted: dotted, file: file, library: library, span: m.node_span(node) };
 }
 
@@ -206,7 +210,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator) -> P
     if is_identifier(stem) {
         root_name = stem;
     }
-    _ = add_module(&mut p, root_name, path, text);
+    _ = add_module(&mut p, name: root_name, path: path, text);
 
     var next: usize = 0;
     while next < p.modules.len() : (next += 1) {
@@ -226,7 +230,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator) -> P
             full.push_str(ip.file.view());
             match fs.read_file(full.view(), a) {
                 ok(source) => {
-                    _ = add_module(&mut p, ip.dotted.view(), full.view(), source);
+                    _ = add_module(&mut p, name: ip.dotted.view(), path: full.view(), source);
                 }
                 err(_) => {
                     p.diags.file = next as u32;

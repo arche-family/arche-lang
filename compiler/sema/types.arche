@@ -1,0 +1,272 @@
+/// The types of a program (spec/arche-0.md §5), interned: two types are
+/// the same exactly when their TypeIds are.
+import alloc;
+
+pub type TypeId = struct { pub index: u32 }
+
+pub type IntKind = enum { I8, I16, I32, I64, Isize, U8, U16, U32, U64, Usize }
+
+pub type Builtin = enum { NotBuiltin, Output, Args, Fs, Allocator, System, String, Interner, Symbol }
+
+pub type Kind = enum {
+    /// The type of an expression that already has an error: it fits
+    /// everywhere, so one mistake is reported once.
+    Invalid,
+    Void,
+    Noreturn,
+    Bool,
+    Int,
+    Str,
+    Ref,
+    Slice,
+    Array,
+    List,
+    Map,
+    Optional,
+    ErrorUnion,
+    ErrorSet,
+    Struct,
+    Enum,
+    Builtin,
+}
+
+/// No declaration: an error union with an inferred set, or the error set
+/// of any error.
+pub const NO_DECL: u32 = 4294967295;
+
+pub type TypeInfo = struct {
+    pub kind: Kind,
+    pub int_kind: IntKind,
+    /// Ref and Slice: &mut and []mut.
+    pub mutable: bool,
+    /// Ref, Slice, Array, List, Optional, ErrorUnion; Map: the value.
+    pub elem: TypeId,
+    /// Map: the key.
+    pub key: TypeId,
+    /// Array: the length.
+    pub len: u64,
+    /// Struct, Enum, ErrorSet; ErrorUnion: its error set. NO_DECL when
+    /// there is none.
+    pub decl: u32,
+    pub builtin: Builtin,
+}
+
+pub type Types = struct {
+    pub infos: alloc.List(TypeInfo),
+    index: alloc.Map(TypeInfo, TypeId),
+
+    pub fn init(a: alloc.Allocator) -> Types {
+        var t = Types { infos: alloc.List(TypeInfo).init(a), index: alloc.Map(TypeInfo, TypeId).init(a) };
+        // The fixed types come first, in the order of the functions below.
+        _ = t.intern(plain(Kind.Invalid));
+        _ = t.intern(plain(Kind.Void));
+        _ = t.intern(plain(Kind.Noreturn));
+        _ = t.intern(plain(Kind.Bool));
+        _ = t.intern(plain(Kind.Str));
+        var k: u32 = 0;
+        while k < 10 : (k += 1) {
+            var info = plain(Kind.Int);
+            info.int_kind = int_kind_at(k);
+            _ = t.intern(info);
+        }
+        var any = plain(Kind.ErrorSet);
+        any.decl = NO_DECL;
+        _ = t.intern(any);
+        return t;
+    }
+
+    pub fn intern(self: &mut Types, info: TypeInfo) -> TypeId {
+        match self.index.get(info) {
+            some(id) => { return id; }
+            none => { }
+        }
+        let id = TypeId { index: self.infos.len() as u32 };
+        self.infos.push(info);
+        self.index.put(info, id);
+        return id;
+    }
+
+    pub fn get(self: &Types, id: TypeId) -> TypeInfo {
+        return self.infos[id.index as usize];
+    }
+
+    pub fn kind(self: &Types, id: TypeId) -> Kind {
+        return self.infos[id.index as usize].kind;
+    }
+
+    pub fn elem(self: &Types, id: TypeId) -> TypeId {
+        return self.infos[id.index as usize].elem;
+    }
+
+    pub fn reference(self: &mut Types, mutable: bool, elem: TypeId) -> TypeId {
+        var info = plain(Kind.Ref);
+        info.mutable = mutable;
+        info.elem = elem;
+        return self.intern(info);
+    }
+
+    pub fn slice(self: &mut Types, mutable: bool, elem: TypeId) -> TypeId {
+        var info = plain(Kind.Slice);
+        info.mutable = mutable;
+        info.elem = elem;
+        return self.intern(info);
+    }
+
+    pub fn array(self: &mut Types, elem: TypeId, len: u64) -> TypeId {
+        var info = plain(Kind.Array);
+        info.elem = elem;
+        info.len = len;
+        return self.intern(info);
+    }
+
+    pub fn list(self: &mut Types, elem: TypeId) -> TypeId {
+        var info = plain(Kind.List);
+        info.elem = elem;
+        return self.intern(info);
+    }
+
+    pub fn map(self: &mut Types, key: TypeId, value: TypeId) -> TypeId {
+        var info = plain(Kind.Map);
+        info.key = key;
+        info.elem = value;
+        return self.intern(info);
+    }
+
+    pub fn optional(self: &mut Types, elem: TypeId) -> TypeId {
+        var info = plain(Kind.Optional);
+        info.elem = elem;
+        return self.intern(info);
+    }
+
+    /// E!T; set is the error set's declaration, or NO_DECL when inferred.
+    pub fn error_union(self: &mut Types, set: u32, elem: TypeId) -> TypeId {
+        var info = plain(Kind.ErrorUnion);
+        info.decl = set;
+        info.elem = elem;
+        return self.intern(info);
+    }
+
+    pub fn declared(self: &mut Types, kind: Kind, decl: u32) -> TypeId {
+        var info = plain(kind);
+        info.decl = decl;
+        return self.intern(info);
+    }
+
+    pub fn builtin(self: &mut Types, b: Builtin) -> TypeId {
+        var info = plain(Kind.Builtin);
+        info.builtin = b;
+        return self.intern(info);
+    }
+}
+
+fn plain(kind: Kind) -> TypeInfo {
+    return TypeInfo {
+        kind: kind,
+        int_kind: IntKind.I8,
+        mutable: false,
+        elem: invalid(),
+        key: invalid(),
+        len: 0,
+        decl: NO_DECL,
+        builtin: Builtin.NotBuiltin,
+    };
+}
+
+fn int_kind_at(k: u32) -> IntKind {
+    match k {
+        0 => { return IntKind.I8; }
+        1 => { return IntKind.I16; }
+        2 => { return IntKind.I32; }
+        3 => { return IntKind.I64; }
+        4 => { return IntKind.Isize; }
+        5 => { return IntKind.U8; }
+        6 => { return IntKind.U16; }
+        7 => { return IntKind.U32; }
+        8 => { return IntKind.U64; }
+        _ => { return IntKind.Usize; }
+    }
+}
+
+pub fn invalid() -> TypeId { return TypeId { index: 0 }; }
+pub fn void_type() -> TypeId { return TypeId { index: 1 }; }
+pub fn noreturn_type() -> TypeId { return TypeId { index: 2 }; }
+pub fn bool_type() -> TypeId { return TypeId { index: 3 }; }
+pub fn str_type() -> TypeId { return TypeId { index: 4 }; }
+pub fn any_error() -> TypeId { return TypeId { index: 15 }; }
+
+/// The integer type of the kind: i8 is 5, up to usize at 14.
+pub fn int_type(k: IntKind) -> TypeId {
+    match k {
+        .I8 => { return TypeId { index: 5 }; }
+        .I16 => { return TypeId { index: 6 }; }
+        .I32 => { return TypeId { index: 7 }; }
+        .I64 => { return TypeId { index: 8 }; }
+        .Isize => { return TypeId { index: 9 }; }
+        .U8 => { return TypeId { index: 10 }; }
+        .U16 => { return TypeId { index: 11 }; }
+        .U32 => { return TypeId { index: 12 }; }
+        .U64 => { return TypeId { index: 13 }; }
+        .Usize => { return TypeId { index: 14 }; }
+    }
+}
+
+pub fn int_name(k: IntKind) -> str {
+    match k {
+        .I8 => { return "i8"; }
+        .I16 => { return "i16"; }
+        .I32 => { return "i32"; }
+        .I64 => { return "i64"; }
+        .Isize => { return "isize"; }
+        .U8 => { return "u8"; }
+        .U16 => { return "u16"; }
+        .U32 => { return "u32"; }
+        .U64 => { return "u64"; }
+        .Usize => { return "usize"; }
+    }
+}
+
+pub fn int_by_name(name: str) -> ?IntKind {
+    var k: u32 = 0;
+    while k < 10 : (k += 1) {
+        if int_name(int_kind_at(k)).eq(name) {
+            return int_kind_at(k);
+        }
+    }
+    return none;
+}
+
+pub fn is_signed(k: IntKind) -> bool {
+    match k {
+        .I8 | .I16 | .I32 | .I64 | .Isize => { return true; }
+        _ => { return false; }
+    }
+}
+
+pub fn bits(k: IntKind) -> u32 {
+    match k {
+        .I8 | .U8 => { return 8; }
+        .I16 | .U16 => { return 16; }
+        .I32 | .U32 => { return 32; }
+        _ => { return 64; }
+    }
+}
+
+/// The largest value of the type.
+pub fn max_value(k: IntKind) -> u64 {
+    let n = bits(k);
+    if is_signed(k) {
+        return (1 << (n - 1) as u64) - 1;
+    }
+    if n == 64 {
+        return 18446744073709551615;
+    }
+    return (1 << n as u64) - 1;
+}
+
+/// The magnitude of the smallest value: 128 for i8, 0 for unsigned types.
+pub fn min_magnitude(k: IntKind) -> u64 {
+    if not is_signed(k) {
+        return 0;
+    }
+    return 1 << (bits(k) - 1) as u64;
+}
