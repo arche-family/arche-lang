@@ -204,7 +204,59 @@ struct TypeExpr {
     Expr *len;      // TE_ARRAY
 };
 
-typedef enum { E_INT, E_CHAR, E_STRING, E_BOOL, E_IDENT, E_FIELD, E_CALL, E_REF } ExprKind;
+typedef struct ConstDecl ConstDecl;
+typedef struct TypeDecl TypeDecl;
+typedef struct Pattern Pattern;
+
+typedef enum {
+    E_INT,
+    E_CHAR,
+    E_STRING,
+    E_BOOL,
+    E_NONE,
+    E_SOME,
+    E_IDENT,
+    E_FIELD,
+    E_CALL,
+    E_INDEX,
+    E_SLICE,
+    E_DEREF,
+    E_STRUCT_LIT,
+    E_ARRAY_LIT,
+    E_UNARY,
+    E_BINARY,
+    E_CAST,
+    E_TRY,
+    E_CATCH,
+    E_ORELSE,
+    E_REF,
+} ExprKind;
+
+typedef enum { U_NEG, U_BITNOT, U_NOT } UnaryOp;
+
+typedef enum {
+    B_ADD,
+    B_SUB,
+    B_MUL,
+    B_DIV,
+    B_REM,
+    B_WADD,
+    B_WSUB,
+    B_WMUL,
+    B_SHL,
+    B_SHR,
+    B_BITAND,
+    B_BITOR,
+    B_BITXOR,
+    B_EQ,
+    B_NE,
+    B_LT,
+    B_LE,
+    B_GT,
+    B_GE,
+    B_AND,
+    B_OR,
+} BinaryOp;
 
 typedef struct {
     const char *label; // NULL when unlabeled
@@ -212,8 +264,14 @@ typedef struct {
     Expr *value;
 } Arg;
 
+typedef struct {
+    const char *name;
+    Loc loc;
+    Expr *value;
+} FieldInit;
+
 // What an identifier names, set by the checker.
-typedef enum { NAME_NONE, NAME_BINDING, NAME_FN, NAME_MODULE, NAME_BUILTIN_FN } NameKind;
+typedef enum { NAME_NONE, NAME_BINDING, NAME_CONST, NAME_FN, NAME_MODULE, NAME_BUILTIN_FN } NameKind;
 
 typedef enum { CALL_FN, CALL_BUILTIN_FN, CALL_METHOD } CallKind;
 
@@ -221,40 +279,101 @@ typedef enum { BUILTIN_PANIC, BUILTIN_ASSERT, BUILTIN_UNREACHABLE } BuiltinFn;
 
 struct Expr {
     ExprKind kind;
-    Loc loc;
-    Type *type; // set by the checker
+    Loc loc;     // binary and cast expressions: the operator
+    Type *type;  // set by the checker
+    bool parens; // written inside parentheses
 
     uint64_t value;    // E_INT, E_CHAR; E_BOOL: 0 or 1
     const char *bytes; // E_STRING
     size_t bytes_len;
-    const char *name; // E_IDENT, E_FIELD
-    Expr *base;       // E_FIELD: the value; E_REF: the place
-    bool mut;         // E_REF
-    Expr *callee;     // E_CALL
-    Vec args;         // E_CALL: Arg *
+    const char *name;   // E_IDENT; E_FIELD: the field
+    Expr *base;         // the operand of E_FIELD, E_INDEX, E_SLICE, E_DEREF, E_SOME, E_UNARY, E_CAST,
+                        // E_TRY and E_REF; the left side of E_BINARY, E_CATCH and E_ORELSE
+    Expr *rhs;          // E_BINARY, E_CATCH, E_ORELSE
+    Expr *index;        // E_INDEX; E_SLICE: the start
+    Expr *end;          // E_SLICE
+    bool mut;           // E_REF
+    bool wrapping;      // E_CAST: as%
+    UnaryOp unary;      // E_UNARY
+    BinaryOp binary;    // E_BINARY
+    TypeExpr *cast_to;  // E_CAST
+    Expr *callee;       // E_CALL
+    Vec args;           // E_CALL: Arg *
+    Vec elems;          // E_ARRAY_LIT: Expr *
+    Expr *type_path;    // E_STRUCT_LIT: the type, an E_IDENT or E_FIELD path
+    Vec fields;         // E_STRUCT_LIT: FieldInit *
 
-    // resolution, set by the checker
+    // set by the checker
     NameKind name_kind;
     Binding *binding;     // NAME_BINDING
+    ConstDecl *konst;     // NAME_CONST
     FnDecl *fn;           // NAME_FN, CALL_FN
     BuiltinFn builtin_fn; // NAME_BUILTIN_FN, CALL_BUILTIN_FN
     CallKind call;
     const Method *method; // CALL_METHOD
     Expr *receiver;       // CALL_METHOD
+    bool negative_literal; // E_UNARY: '-' written directly before an integer literal
 };
 
-typedef enum { S_EXPR, S_RETURN, S_BLOCK } StmtKind;
+typedef enum { S_EXPR, S_LET, S_ASSIGN, S_DISCARD, S_IF, S_WHILE, S_MATCH, S_RETURN, S_BREAK, S_CONTINUE, S_DEFER, S_BLOCK } StmtKind;
+
+typedef enum { A_SET, A_ADD, A_SUB, A_MUL, A_DIV, A_REM, A_WADD, A_WSUB, A_WMUL, A_BITAND, A_BITOR, A_BITXOR, A_SHL, A_SHR } AssignOp;
+
+typedef struct {
+    Vec patterns; // Pattern *: the alternatives
+    Block *body;
+    Loc loc;
+} MatchArm;
 
 struct Stmt {
     StmtKind kind;
     Loc loc;
-    Expr *expr;   // S_EXPR; S_RETURN (NULL for a bare return)
-    Block *block; // S_BLOCK
+    Expr *expr;   // S_EXPR, S_DISCARD; S_LET: the initializer; S_ASSIGN: the value; S_IF, S_WHILE: the
+                  // condition; S_MATCH: the scrutinee; S_RETURN: NULL for a bare return
+    Expr *target; // S_ASSIGN: the place
+    AssignOp op;  // S_ASSIGN
+    Block *block; // S_BLOCK; S_IF: the then branch; S_WHILE: the body
+    Stmt *els;    // S_IF: an S_IF (else if) or an S_BLOCK, or NULL
+    Stmt *step;   // S_WHILE: the step, or NULL; S_DEFER: the deferred statement
+    Vec arms;     // S_MATCH: MatchArm *
+
+    // S_LET
+    const char *name;
+    bool mutable; // var
+    TypeExpr *type_expr;
+    Binding *binding; // set by the checker
 };
 
 struct Block {
     Loc loc;
     Vec stmts; // Stmt *
+};
+
+typedef enum { P_WILDCARD, P_BIND, P_INT, P_RANGE, P_BOOL, P_NONE, P_SOME, P_OK, P_ERR, P_VARIANT } PatternKind;
+
+typedef struct {
+    bool negative;
+    uint64_t magnitude;
+    bool is_char;
+} PatLit;
+
+typedef struct {
+    const char *field;
+    Loc loc;
+    const char *bind; // the name it binds, or NULL for `_`
+} FieldPat;
+
+struct Pattern {
+    PatternKind kind;
+    Loc loc;
+    const char *name; // P_BIND, P_VARIANT
+    PatLit lo;        // P_INT, P_RANGE
+    PatLit hi;        // P_RANGE
+    bool value;       // P_BOOL
+    Pattern *inner;   // P_SOME, P_OK, P_ERR
+    bool has_fields;  // P_VARIANT: written with { }
+    Vec field_pats;   // P_VARIANT: FieldPat *
+    bool rest;        // P_VARIANT: ends with ..
 };
 
 struct Binding {
@@ -279,8 +398,62 @@ struct FnDecl {
     TypeExpr *ret_expr; // NULL: returns void
     Block *body;
     Module *module;
+    TypeDecl *owner;    // the type whose body declares it, or NULL
     Type *ret;          // set by the checker
     const char *c_name; // set by the checker
+};
+
+// A constant's value. Integers are kept as two's complement bits in `bits`.
+typedef struct {
+    uint64_t bits;
+    const char *bytes; // str
+    size_t len;
+} ConstValue;
+
+struct ConstDecl {
+    const char *name;
+    Loc loc;
+    bool pub;
+    TypeExpr *type_expr;
+    Expr *value;
+    Module *module;
+    Type *type;     // set by the checker
+    int state;      // 0: not evaluated, 1: being evaluated, 2: done
+    ConstValue val; // set by the checker
+};
+
+typedef enum { TD_STRUCT, TD_ENUM, TD_ERROR, TD_ALIAS } TypeDeclKind;
+
+typedef struct {
+    const char *name;
+    Loc loc;
+    bool pub;
+    TypeExpr *type_expr;
+} FieldDecl;
+
+typedef struct {
+    const char *name;
+    Loc loc;
+    bool has_fields;
+    Vec fields; // FieldDecl *
+} VariantDecl;
+
+typedef struct {
+    const char *name;
+    Loc loc;
+} ErrorName;
+
+struct TypeDecl {
+    TypeDeclKind kind;
+    const char *name;
+    Loc loc;
+    bool pub;
+    Vec fields;     // TD_STRUCT: FieldDecl *
+    Vec variants;   // TD_ENUM: VariantDecl *
+    Vec errors;     // TD_ERROR: ErrorName *
+    Vec methods;    // TD_STRUCT, TD_ENUM: FnDecl *
+    TypeExpr *alias; // TD_ALIAS
+    Module *module;
 };
 
 typedef struct {
@@ -294,6 +467,8 @@ struct Module {
     const SourceFile *file;
     Vec imports; // Import *
     Vec fns;     // FnDecl *
+    Vec consts;  // ConstDecl *
+    Vec types;   // TypeDecl *
 };
 
 Module *parse_module(const SourceFile *f, const char *name);
@@ -367,11 +542,17 @@ const Method *method_lookup(const Type *t, const char *name);
 const Field *field_lookup(const Type *t, const char *name);
 bool builtin_fn_lookup(const char *name, BuiltinFn *out);
 bool int_type_lookup(const char *name, IntKind *out);
+bool int_signed(IntKind k);
+int int_bits(IntKind k);
+int64_t int_min(IntKind k);
+uint64_t int_max(IntKind k);
+const char *int_suffix(IntKind k);
 
 // ---- checking and emission ---------------------------------------------------
 
 void check_program(Module *root);
 bool expr_is_place(const Expr *e);
+bool block_ends(const Block *b); // every path through it ends: return, noreturn, ... (§10)
 void emit_program(Module *root, StrBuf *out);
 
 #endif

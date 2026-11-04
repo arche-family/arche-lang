@@ -148,6 +148,12 @@ static BuiltinType system_bt = {
         },
 };
 
+static const Method str_methods[] = {
+    {"len", SELF_VALUE, 0, {{0}}, &int_types[USIZE], "a0_str_len", false},
+    {"eq", SELF_VALUE, 1, {{"other", &str_type}}, &bool_type, "a0_str_eq", false},
+    {"starts_with", SELF_VALUE, 1, {{"prefix", &str_type}}, &bool_type, "a0_str_starts_with", false},
+};
+
 static const BuiltinType *const builtin_types[] = {&output_bt, &args_bt, &fs_bt, &allocator_bt, &system_bt};
 
 const BuiltinType *builtin_type_lookup(const char *module, const char *name) {
@@ -161,6 +167,14 @@ const BuiltinType *builtin_type_lookup(const char *module, const char *name) {
 }
 
 const Method *method_lookup(const Type *t, const char *name) {
+    if (t->kind == TY_STR) {
+        for (size_t i = 0; i < sizeof str_methods / sizeof *str_methods; i++) {
+            if (strcmp(str_methods[i].name, name) == 0) {
+                return &str_methods[i];
+            }
+        }
+        return NULL;
+    }
     if (t->kind != TY_BUILTIN) {
         return NULL;
     }
@@ -210,4 +224,50 @@ bool int_type_lookup(const char *name, IntKind *out) {
         }
     }
     return false;
+}
+
+bool int_signed(IntKind k) {
+    return k <= ISIZE;
+}
+
+int int_bits(IntKind k) {
+    switch (k) {
+    case I8:
+    case U8:
+        return 8;
+    case I16:
+    case U16:
+        return 16;
+    case I32:
+    case U32:
+        return 32;
+    default:
+        return 64;
+    }
+}
+
+int64_t int_min(IntKind k) {
+    if (!int_signed(k)) {
+        return 0;
+    }
+    int bits = int_bits(k);
+    return bits == 64 ? INT64_MIN : -((int64_t)1 << (bits - 1));
+}
+
+uint64_t int_max(IntKind k) {
+    int bits = int_bits(k);
+    if (int_signed(k)) {
+        return ((uint64_t)1 << (bits - 1)) - 1;
+    }
+    return bits == 64 ? UINT64_MAX : ((uint64_t)1 << bits) - 1;
+}
+
+// The suffix of the runtime's helpers for this type: isize and usize share
+// i64's and u64's.
+const char *int_suffix(IntKind k) {
+    static const char *const names[INT_KIND_COUNT] = {
+        [I8] = "i8", [I16] = "i16", [I32] = "i32", [I64] = "i64", [ISIZE] = "i64",
+        [U8] = "u8", [U16] = "u16", [U32] = "u32", [U64] = "u64", [USIZE] = "u64",
+    };
+    return names[k];
 }

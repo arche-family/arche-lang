@@ -1,0 +1,31 @@
+// test: run
+// spec: 4
+// stdout: 42 1099511627775 -128 255 -128 hi
+import std;
+
+const MAX: u32 = BASE * 4 + 2;
+const BASE: u32 = 10;
+const SHIFTED: u64 = (1 << 40) - 1;
+const MIN8: i8 = -128;
+const FLAG: bool = MAX > 40 and not (BASE == 0);
+const GREETING: str = "hi";
+const WIDE16: u16 = 0x1FF;
+const NARROW: u8 = WIDE16 as% u8;
+const WIDE: i64 = MIN8 as i64;
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(MAX as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(SHIFTED);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(MIN8 as i64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(NARROW as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(WIDE);
+    sys.stdout.write(" ");
+    if FLAG {
+        sys.stdout.write(GREETING);
+    }
+    sys.stdout.write("\n");
+}

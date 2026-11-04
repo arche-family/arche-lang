@@ -1,0 +1,21 @@
+// test: run
+// spec: 8
+// stdout: deferred 2
+import std;
+
+fn compute(out: &mut std.Output) -> u32 {
+    var x: u32 = 1;
+    defer out.write("deferred ");
+    defer x = 100;
+    x = 2;
+    if x == 2 {
+        return x;
+    }
+    return 0;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let v: u32 = compute(&mut sys.stdout);
+    sys.stdout.write_u64(v as u64);
+    sys.stdout.write("\n");
+}
