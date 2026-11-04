@@ -67,6 +67,186 @@ a0_str a0_std_Args_get(a0_std_Args *self, uint64_t i, a0_loc loc);
 _Noreturn void a0_panic(a0_str message, a0_loc loc);
 _Noreturn void a0_trap(const char *message, a0_loc loc);
 
+_Noreturn void a0_trap_fit(const char *type, a0_loc loc);
+
+// ---- str ----------------------------------------------------------------------
+
+uint64_t a0_str_len(a0_str s);
+bool a0_str_eq(a0_str s, a0_str other);
+bool a0_str_starts_with(a0_str s, a0_str prefix);
+
+// ---- integers (§7.2) ------------------------------------------------------------
+//
+// Checked operators trap on overflow, division by zero and shifts at least as
+// wide as the type. Narrow types compute in 64 bits and check the range; the
+// 64-bit types check before they compute. Wrapping operators work on unsigned
+// bits, and a0_from_bits_* turns bits back into a signed value with
+// arithmetic only, so nothing depends on how C converts out-of-range values.
+
+#define A0_OVERFLOW(loc) a0_trap("integer overflow", loc)
+#define A0_DIV_ZERO(loc) a0_trap("division by zero", loc)
+#define A0_SHIFT(loc) a0_trap("shift amount too large", loc)
+
+#define A0_FROM_BITS(S, T, UT, MIN, MAX)                                                                               \
+    static inline T a0_from_bits_##S(UT u) {                                                                           \
+        return u <= (UT)MAX ? (T)u : (T)((T)(u - (UT)MAX - 1u) + MIN);                                                 \
+    }
+
+#define A0_SIGNED_COMMON(S, T, UT, MIN, MAX, BITS)                                                                     \
+    static inline T a0_neg_##S(T a, a0_loc loc) {                                                                      \
+        if (a == MIN) A0_OVERFLOW(loc);                                                                                \
+        return (T)-a;                                                                                                  \
+    }                                                                                                                  \
+    static inline T a0_div_##S(T a, T b, a0_loc loc) {                                                                 \
+        if (b == 0) A0_DIV_ZERO(loc);                                                                                  \
+        if (a == MIN && b == -1) A0_OVERFLOW(loc);                                                                     \
+        return (T)(a / b);                                                                                             \
+    }                                                                                                                  \
+    static inline T a0_rem_##S(T a, T b, a0_loc loc) {                                                                 \
+        if (b == 0) A0_DIV_ZERO(loc);                                                                                  \
+        if (b == -1) return 0;                                                                                         \
+        return (T)(a % b);                                                                                             \
+    }                                                                                                                  \
+    static inline T a0_wadd_##S(T a, T b) {                                                                            \
+        return a0_from_bits_##S((UT)((uint64_t)a + (uint64_t)b));                                                      \
+    }                                                                                                                  \
+    static inline T a0_wsub_##S(T a, T b) {                                                                            \
+        return a0_from_bits_##S((UT)((uint64_t)a - (uint64_t)b));                                                      \
+    }                                                                                                                  \
+    static inline T a0_wmul_##S(T a, T b) {                                                                            \
+        return a0_from_bits_##S((UT)((uint64_t)a * (uint64_t)b));                                                      \
+    }                                                                                                                  \
+    static inline T a0_shl_##S(T a, uint64_t n, a0_loc loc) {                                                          \
+        if (n >= BITS) A0_SHIFT(loc);                                                                                  \
+        return a0_from_bits_##S((UT)((uint64_t)(UT)a << n));                                                           \
+    }                                                                                                                  \
+    static inline T a0_shr_##S(T a, uint64_t n, a0_loc loc) {                                                          \
+        if (n >= BITS) A0_SHIFT(loc);                                                                                  \
+        return a >= 0 ? (T)(a >> n) : (T)~(~a >> n);                                                                   \
+    }
+
+#define A0_SIGNED_NARROW(S, T, UT, MIN, MAX, BITS)                                                                     \
+    A0_FROM_BITS(S, T, UT, MIN, MAX)                                                                                   \
+    A0_SIGNED_COMMON(S, T, UT, MIN, MAX, BITS)                                                                         \
+    static inline T a0_add_##S(T a, T b, a0_loc loc) {                                                                 \
+        int64_t r = (int64_t)a + b;                                                                                    \
+        if (r < MIN || r > MAX) A0_OVERFLOW(loc);                                                                      \
+        return (T)r;                                                                                                   \
+    }                                                                                                                  \
+    static inline T a0_sub_##S(T a, T b, a0_loc loc) {                                                                 \
+        int64_t r = (int64_t)a - b;                                                                                    \
+        if (r < MIN || r > MAX) A0_OVERFLOW(loc);                                                                      \
+        return (T)r;                                                                                                   \
+    }                                                                                                                  \
+    static inline T a0_mul_##S(T a, T b, a0_loc loc) {                                                                 \
+        int64_t r = (int64_t)a * b;                                                                                    \
+        if (r < MIN || r > MAX) A0_OVERFLOW(loc);                                                                      \
+        return (T)r;                                                                                                   \
+    }
+
+A0_SIGNED_NARROW(i8, int8_t, uint8_t, INT8_MIN, INT8_MAX, 8)
+A0_SIGNED_NARROW(i16, int16_t, uint16_t, INT16_MIN, INT16_MAX, 16)
+A0_SIGNED_NARROW(i32, int32_t, uint32_t, INT32_MIN, INT32_MAX, 32)
+A0_FROM_BITS(i64, int64_t, uint64_t, INT64_MIN, INT64_MAX)
+A0_SIGNED_COMMON(i64, int64_t, uint64_t, INT64_MIN, INT64_MAX, 64)
+
+static inline int64_t a0_add_i64(int64_t a, int64_t b, a0_loc loc) {
+    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) A0_OVERFLOW(loc);
+    return a + b;
+}
+
+static inline int64_t a0_sub_i64(int64_t a, int64_t b, a0_loc loc) {
+    if ((b < 0 && a > INT64_MAX + b) || (b > 0 && a < INT64_MIN + b)) A0_OVERFLOW(loc);
+    return a - b;
+}
+
+static inline int64_t a0_mul_i64(int64_t a, int64_t b, a0_loc loc) {
+    if (a > 0 ? (b > 0 ? a > INT64_MAX / b : b < INT64_MIN / a) : (b > 0 ? a < INT64_MIN / b : a != 0 && b < INT64_MAX / a)) {
+        A0_OVERFLOW(loc);
+    }
+    return a * b;
+}
+
+#define A0_UNSIGNED_COMMON(S, T, BITS)                                                                                 \
+    static inline T a0_sub_##S(T a, T b, a0_loc loc) {                                                                 \
+        if (a < b) A0_OVERFLOW(loc);                                                                                   \
+        return (T)(a - b);                                                                                             \
+    }                                                                                                                  \
+    static inline T a0_div_##S(T a, T b, a0_loc loc) {                                                                 \
+        if (b == 0) A0_DIV_ZERO(loc);                                                                                  \
+        return (T)(a / b);                                                                                             \
+    }                                                                                                                  \
+    static inline T a0_rem_##S(T a, T b, a0_loc loc) {                                                                 \
+        if (b == 0) A0_DIV_ZERO(loc);                                                                                  \
+        return (T)(a % b);                                                                                             \
+    }                                                                                                                  \
+    static inline T a0_wadd_##S(T a, T b) {                                                                            \
+        return (T)((uint64_t)a + b);                                                                                   \
+    }                                                                                                                  \
+    static inline T a0_wsub_##S(T a, T b) {                                                                            \
+        return (T)((uint64_t)a - b);                                                                                   \
+    }                                                                                                                  \
+    static inline T a0_wmul_##S(T a, T b) {                                                                            \
+        return (T)((uint64_t)a * b);                                                                                   \
+    }                                                                                                                  \
+    static inline T a0_shl_##S(T a, uint64_t n, a0_loc loc) {                                                          \
+        if (n >= BITS) A0_SHIFT(loc);                                                                                  \
+        return (T)((uint64_t)a << n);                                                                                  \
+    }                                                                                                                  \
+    static inline T a0_shr_##S(T a, uint64_t n, a0_loc loc) {                                                          \
+        if (n >= BITS) A0_SHIFT(loc);                                                                                  \
+        return (T)(a >> n);                                                                                            \
+    }
+
+#define A0_UNSIGNED_NARROW(S, T, MAX, BITS)                                                                            \
+    A0_UNSIGNED_COMMON(S, T, BITS)                                                                                     \
+    static inline T a0_add_##S(T a, T b, a0_loc loc) {                                                                 \
+        uint64_t r = (uint64_t)a + b;                                                                                  \
+        if (r > MAX) A0_OVERFLOW(loc);                                                                                 \
+        return (T)r;                                                                                                   \
+    }                                                                                                                  \
+    static inline T a0_mul_##S(T a, T b, a0_loc loc) {                                                                 \
+        uint64_t r = (uint64_t)a * b;                                                                                  \
+        if (r > MAX) A0_OVERFLOW(loc);                                                                                 \
+        return (T)r;                                                                                                   \
+    }
+
+A0_UNSIGNED_NARROW(u8, uint8_t, UINT8_MAX, 8)
+A0_UNSIGNED_NARROW(u16, uint16_t, UINT16_MAX, 16)
+A0_UNSIGNED_NARROW(u32, uint32_t, UINT32_MAX, 32)
+A0_UNSIGNED_COMMON(u64, uint64_t, 64)
+
+static inline uint64_t a0_add_u64(uint64_t a, uint64_t b, a0_loc loc) {
+    if (a + b < a) A0_OVERFLOW(loc);
+    return a + b;
+}
+
+static inline uint64_t a0_mul_u64(uint64_t a, uint64_t b, a0_loc loc) {
+    if (b != 0 && a > UINT64_MAX / b) A0_OVERFLOW(loc);
+    return a * b;
+}
+
+// `as`: the value must fit in the target type, given by its range.
+static inline int64_t a0_fit_ss(int64_t v, int64_t min, int64_t max, const char *type, a0_loc loc) {
+    if (v < min || v > max) a0_trap_fit(type, loc);
+    return v;
+}
+
+static inline uint64_t a0_fit_su(int64_t v, uint64_t max, const char *type, a0_loc loc) {
+    if (v < 0 || (uint64_t)v > max) a0_trap_fit(type, loc);
+    return (uint64_t)v;
+}
+
+static inline int64_t a0_fit_us(uint64_t v, int64_t max, const char *type, a0_loc loc) {
+    if (v > (uint64_t)max) a0_trap_fit(type, loc);
+    return (int64_t)v;
+}
+
+static inline uint64_t a0_fit_uu(uint64_t v, uint64_t max, const char *type, a0_loc loc) {
+    if (v > max) a0_trap_fit(type, loc);
+    return v;
+}
+
 // ---- provided by the generated program --------------------------------------
 
 a0_err a0_entry(a0_std_System *sys);

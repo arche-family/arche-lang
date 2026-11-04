@@ -34,6 +34,12 @@ void a0_trap(const char *message, a0_loc loc) {
     die(message, strlen(message), &loc);
 }
 
+void a0_trap_fit(const char *type, a0_loc loc) {
+    char message[64];
+    int n = snprintf(message, sizeof message, "value does not fit in %s", type);
+    die(message, (size_t)n, &loc);
+}
+
 // ---- UTF-8 ------------------------------------------------------------------
 
 static bool valid_utf8(const uint8_t *s, size_t n) {
@@ -76,6 +82,20 @@ static bool valid_utf8(const uint8_t *s, size_t n) {
         i += len;
     }
     return true;
+}
+
+// ---- str ----------------------------------------------------------------------
+
+uint64_t a0_str_len(a0_str s) {
+    return s.len;
+}
+
+bool a0_str_eq(a0_str s, a0_str other) {
+    return s.len == other.len && (s.len == 0 || memcmp(s.ptr, other.ptr, (size_t)s.len) == 0);
+}
+
+bool a0_str_starts_with(a0_str s, a0_str prefix) {
+    return s.len >= prefix.len && (prefix.len == 0 || memcmp(s.ptr, prefix.ptr, (size_t)prefix.len) == 0);
 }
 
 // ---- std.Output -------------------------------------------------------------
