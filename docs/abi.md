@@ -1,0 +1,48 @@
+# Arche ABI, version 0
+
+This is the binary interface of code the Arche compiler builds: layouts, calling convention, symbol names and the runtime it calls. Version 0 covers Arche-0 on x86-64 Linux, built through LLVM (sprint S8). It changes only with a major release once it is stable (S29).
+
+## Layouts
+
+Sizes and alignments are in bytes. A composite value is laid out in memory at its alignment; padding is zero, because every value is made from zeroed memory, so values of key types (§5.5) can be hashed and compared byte by byte.
+
+| Type | Size | Align | Layout |
+| --- | --- | --- | --- |
+| `bool` | 1 | 1 | 0 or 1 |
+| `i8`/`u8` … `i64`/`u64`, `isize`, `usize` | 1, 2, 4, 8 | the same | two's complement, little-endian |
+| `&T`, `&mut T` | 8 | 8 | address |
+| `str`, `[]T`, `[]mut T` | 16 | 8 | `{ptr: address, len: u64}` |
+| `[N]T` | `N × size(T)` | `align(T)` | elements in order |
+| struct | sum of fields, padded | max of fields | fields in declaration order, each at its alignment; the size rounds up to the alignment |
+| enum | | max(4, payloads) | `{tag: u32}` then, at the payload alignment, the payload of the variant: its fields like a struct's |
+| `?T` | | `align(T)` | `{has: u8}` then the `T` at its alignment |
+| error set | 2 | 2 | the error's number: 0 for none, from 1 in the order the program first names them |
+| `E!T` | | max(2, `align(T)`) | `{error: u16}` then the `T` at its alignment; `E!void` is the `u16` alone |
+| `alloc.Allocator` | 8 | 8 | a handle |
+| `alloc.Symbol` | 4 | 4 | an index |
+| `alloc.List(T)`, `alloc.String` | 32 | 8 | `{data: address, len: u64, cap: u64, allocator}` |
+| `alloc.Map(K, V)` | 56 | 8 | runtime-defined |
+| `alloc.Interner` | 48 | 8 | runtime-defined |
+| `std.Output` | 8 | 8 | runtime-defined |
+| `std.Args`, `std.Fs` | 16, 8 | 8 | runtime-defined |
+| `std.System` | | 8 | `{fs, stdout, stderr, args, alloc}` in that order |
+
+## Calling convention
+
+- A parameter of a scalar type (`bool`, integers, `&T`, error sets, `Allocator`, `Symbol`) is passed as that scalar. A parameter of any other type is passed as the address of the value. The callee does not change it, because parameters are immutable (§6.1).
+- A scalar result is returned as that scalar. Any other result is written to memory the caller provides, whose address is passed before the parameters.
+- `void` and `noreturn` functions return nothing.
+
+## Symbols
+
+A function's symbol is `a0` followed by each segment of its module path and then its name, each written as `_<length><text>`: `syntax.lexer.lex` is `a0_6syntax_5lexer_3lex`. A method adds its type's name before its own: `a0_4main_3Ast_4eval`. The root module whose file name is not a module path has the empty name, written `_0`. Runtime symbols start with `a0rt_`.
+
+## The runtime
+
+The runtime (`compiler/runtime/rt.c`) has its own entry point and calls no C library. It talks to Linux through system calls only. It owns `_start`, builds `std.System` from the arguments, calls `a0_entry` (the program's `main`), and exits:
+
+- with 0 when `main` returns;
+- with 1 after writing `error: <name>` when `main` returns an error, using the table `a0_error_names` that the program defines;
+- with 101 after writing `panic: <message>` and `  at <file>:<line>:<column>` on a panic or a trap.
+
+Outputs are flushed on every exit.
