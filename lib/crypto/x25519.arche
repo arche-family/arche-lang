@@ -1,0 +1,56 @@
+/// X25519 (RFC 7748): Diffie-Hellman on Curve25519, by the Montgomery
+/// ladder, which does the same work for every bit of the scalar.
+import crypto.f25519 as f;
+
+/// The scalar k times the point u (both 32 bytes, little-endian).
+pub fn scalarmult(k: []u8, u: []u8) -> [32]u8 {
+    var z: [32]u8 = [0; 32];
+    var i: usize = 0;
+    while i < 32 : (i += 1) {
+        z[i] = k[i];
+    }
+    z[31] = (z[31] & 127) | 64;
+    z[0] = z[0] & 248;
+    let x = f.Fe.unpack(u);
+    var a = f.Fe.one();
+    var b = x;
+    var c = f.Fe.zero();
+    var d = f.Fe.one();
+    var a24 = f.Fe.zero();
+    a24.v[0] = 0xDB41;
+    a24.v[1] = 1;
+    var bit: i32 = 254;
+    while bit >= 0 : (bit -= 1) {
+        let r = ((z[(bit as usize) >> 3] >> ((bit as u32) & 7)) & 1) as i64;
+        f.cswap(p: &mut a, q: &mut b, bit: r);
+        f.cswap(p: &mut c, q: &mut d, bit: r);
+        var e = a.add(c);
+        a = a.sub(c);
+        c = b.add(d);
+        b = b.sub(d);
+        d = e.sqr();
+        let ff = a.sqr();
+        a = c.mul(a);
+        c = b.mul(e);
+        e = a.add(c);
+        a = a.sub(c);
+        b = a.sqr();
+        c = d.sub(ff);
+        a = c.mul(a24);
+        a = a.add(d);
+        c = c.mul(a);
+        a = d.mul(ff);
+        d = b.mul(x);
+        b = e.sqr();
+        f.cswap(p: &mut a, q: &mut b, bit: r);
+        f.cswap(p: &mut c, q: &mut d, bit: r);
+    }
+    return a.mul(c.inv()).pack();
+}
+
+/// The public key of a secret one: k times the base point 9.
+pub fn public_key(secret: []u8) -> [32]u8 {
+    var nine: [32]u8 = [0; 32];
+    nine[0] = 9;
+    return scalarmult(k: secret, u: nine[0..32]);
+}

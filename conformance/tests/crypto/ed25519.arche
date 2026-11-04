@@ -1,0 +1,55 @@
+// test: run
+// spec: crypto (RFC 8032)
+// stage0: skip
+// stdout: d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+// stdout: e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b
+// stdout: 92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00
+// stdout: valid
+// stdout: other message rejected
+// stdout: large S rejected
+import std;
+import crypto.ed25519;
+import _hex;
+
+fn unhex(text: str, out: []mut u8) {
+    let b = text.bytes();
+    var i: usize = 0;
+    while i < out.len() : (i += 1) {
+        out[i] = nibble(b[2 * i]) * 16 + nibble(b[2 * i + 1]);
+    }
+}
+
+fn nibble(c: u8) -> u8 {
+    if c >= 'a' {
+        return c - 'a' + 10;
+    }
+    return c - '0';
+}
+
+fn main(sys: &mut std.System) -> !void {
+    // RFC 8032 7.1, tests 1 and 2.
+    var sk1: [32]u8 = [0; 32];
+    unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", sk1[0..32]);
+    let pk1 = ed25519.public_key(sk1[0..32]);
+    _hex.hex(&mut sys.stdout, pk1[0..32]);
+    let sig1 = ed25519.sign(seed: sk1[0..32], message: "".bytes());
+    _hex.hex(&mut sys.stdout, sig1[0..64]);
+    var sk2: [32]u8 = [0; 32];
+    unhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb", sk2[0..32]);
+    let pk2 = ed25519.public_key(sk2[0..32]);
+    let m2: [1]u8 = [0x72];
+    let sig2 = ed25519.sign(seed: sk2[0..32], message: m2[0..1]);
+    _hex.hex(&mut sys.stdout, sig2[0..64]);
+    if ed25519.verify(key: pk2[0..32], message: m2[0..1], sig: sig2[0..64]) {
+        sys.stdout.write("valid\n");
+    }
+    let m3: [1]u8 = [0x73];
+    if not ed25519.verify(key: pk2[0..32], message: m3[0..1], sig: sig2[0..64]) {
+        sys.stdout.write("other message rejected\n");
+    }
+    var bad = sig2;
+    bad[63] = bad[63] | 0x80;
+    if not ed25519.verify(key: pk2[0..32], message: m2[0..1], sig: bad[0..64]) {
+        sys.stdout.write("large S rejected\n");
+    }
+}

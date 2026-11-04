@@ -1,0 +1,257 @@
+/// Ed25519 signatures (RFC 8032), after TweetNaCl: extended coordinates,
+/// one complete addition for doubling too, and a ladder that does the same
+/// work for every bit of a secret scalar. Verification works on public
+/// data only.
+import crypto.ct;
+import crypto.f25519 as f;
+import crypto.sha2;
+
+fn fe(v: [16]i64) -> f.Fe {
+    return f.limbs(v);
+}
+
+fn d() -> f.Fe {
+    return fe([0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070, 0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203]);
+}
+
+fn d2() -> f.Fe {
+    return fe([0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0, 0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406]);
+}
+
+fn base_x() -> f.Fe {
+    return fe([0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c, 0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169]);
+}
+
+fn base_y() -> f.Fe {
+    return fe([0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666]);
+}
+
+/// sqrt(-1)
+fn sqrt_m1() -> f.Fe {
+    return fe([0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43, 0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83]);
+}
+
+/// A point (X : Y : Z : T), with x = X/Z, y = Y/Z, x * y = T/Z.
+type Point = struct {
+    x: f.Fe,
+    y: f.Fe,
+    z: f.Fe,
+    t: f.Fe,
+
+    /// The sum: one formula for every pair, doubling included.
+    fn add(self: Point, q: Point) -> Point {
+        let a = self.y.sub(self.x).mul(q.y.sub(q.x));
+        let b = self.x.add(self.y).mul(q.x.add(q.y));
+        let c = self.t.mul(q.t).mul(d2());
+        let dd = self.z.mul(q.z);
+        let d2z = dd.add(dd);
+        let e = b.sub(a);
+        let ff = d2z.sub(c);
+        let g = d2z.add(c);
+        let h = b.add(a);
+        return Point { x: e.mul(ff), y: h.mul(g), z: g.mul(ff), t: e.mul(h) };
+    }
+
+    fn pack(self: Point) -> [32]u8 {
+        let zi = self.z.inv();
+        let tx = self.x.mul(zi);
+        let ty = self.y.mul(zi);
+        var r = ty.pack();
+        r[31] = r[31] ^ (tx.parity() << 7);
+        return r;
+    }
+}
+
+fn identity() -> Point {
+    return Point { x: f.Fe.zero(), y: f.Fe.one(), z: f.Fe.one(), t: f.Fe.zero() };
+}
+
+fn base() -> Point {
+    return Point { x: base_x(), y: base_y(), z: f.Fe.one(), t: base_x().mul(base_y()) };
+}
+
+fn cswap(p: &mut Point, q: &mut Point, bit: i64) {
+    f.cswap(p: &mut p.x, q: &mut q.x, bit: bit);
+    f.cswap(p: &mut p.y, q: &mut q.y, bit: bit);
+    f.cswap(p: &mut p.z, q: &mut q.z, bit: bit);
+    f.cswap(p: &mut p.t, q: &mut q.t, bit: bit);
+}
+
+/// s times q, for a 32-byte little-endian scalar s.
+fn scalarmult(q: Point, s: []u8) -> Point {
+    var p = identity();
+    var qq = q;
+    var i: i32 = 255;
+    while i >= 0 : (i -= 1) {
+        let bit = ((s[(i as usize) / 8] >> ((i as u32) & 7)) & 1) as i64;
+        cswap(p: &mut p, q: &mut qq, bit: bit);
+        qq = qq.add(p);
+        p = p.add(p);
+        cswap(p: &mut p, q: &mut qq, bit: bit);
+    }
+    return p;
+}
+
+/// The group order L, little-endian.
+fn order() -> [32]i64 {
+    return [0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10];
+}
+
+/// x mod L, for x of 64 limbs of 8 bits (or a little more).
+fn mod_l(x: &mut [64]i64) -> [32]u8 {
+    let l = order();
+    var i: usize = 63;
+    while i >= 32 : (i -= 1) {
+        var c: i64 = 0;
+        var j = i - 32;
+        while j < i - 12 : (j += 1) {
+            x.*[j] += c - 16 * x.*[i] * l[j - (i - 32)];
+            c = (x.*[j] + 128) >> 8;
+            x.*[j] -= c * 256;
+        }
+        x.*[j] += c;
+        x.*[i] = 0;
+    }
+    var c: i64 = 0;
+    var j: usize = 0;
+    while j < 32 : (j += 1) {
+        x.*[j] += c - (x.*[31] >> 4) * l[j];
+        c = x.*[j] >> 8;
+        x.*[j] = x.*[j] & 255;
+    }
+    j = 0;
+    while j < 32 : (j += 1) {
+        x.*[j] -= c * l[j];
+    }
+    var r: [32]u8 = [0; 32];
+    i = 0;
+    while i < 32 : (i += 1) {
+        x.*[i + 1] += x.*[i] >> 8;
+        r[i] = (x.*[i] & 255) as u8;
+    }
+    return r;
+}
+
+/// A 64-byte hash as a scalar mod L.
+fn reduce(h: [64]u8) -> [32]u8 {
+    var x: [64]i64 = [0; 64];
+    var i: usize = 0;
+    while i < 64 : (i += 1) {
+        x[i] = h[i] as i64;
+    }
+    return mod_l(&mut x);
+}
+
+fn expand(seed: []u8) -> [64]u8 {
+    var h = sha2.sha512(seed);
+    h[0] = h[0] & 248;
+    h[31] = h[31] & 127;
+    h[31] = h[31] | 64;
+    return h;
+}
+
+/// The public key of a 32-byte secret seed.
+pub fn public_key(seed: []u8) -> [32]u8 {
+    let h = expand(seed);
+    return scalarmult(q: base(), s: h[0..32]).pack();
+}
+
+/// The 64-byte signature of message by the secret seed.
+pub fn sign(seed: []u8, message: []u8) -> [64]u8 {
+    let h = expand(seed);
+    let pk = scalarmult(q: base(), s: h[0..32]).pack();
+    var nonce_hash = sha2.Sha512.init();
+    nonce_hash.update(h[32..64]);
+    nonce_hash.update(message);
+    let r = reduce(nonce_hash.finish());
+    let big_r = scalarmult(q: base(), s: r[0..32]).pack();
+    var kh = sha2.Sha512.init();
+    kh.update(big_r[0..32]);
+    kh.update(pk[0..32]);
+    kh.update(message);
+    let k = reduce(kh.finish());
+    var x: [64]i64 = [0; 64];
+    var i: usize = 0;
+    while i < 32 : (i += 1) {
+        x[i] = r[i] as i64;
+    }
+    i = 0;
+    while i < 32 : (i += 1) {
+        var j: usize = 0;
+        while j < 32 : (j += 1) {
+            x[i + j] += (k[i] as i64) * (h[j] as i64);
+        }
+    }
+    let s = mod_l(&mut x);
+    var sig: [64]u8 = [0; 64];
+    i = 0;
+    while i < 32 : (i += 1) {
+        sig[i] = big_r[i];
+        sig[32 + i] = s[i];
+    }
+    return sig;
+}
+
+/// -A from its encoding, or none when it is not a point.
+fn unpack_negative(p: []u8) -> ?Point {
+    let y = f.Fe.unpack(p);
+    let z = f.Fe.one();
+    let num0 = y.sqr();
+    let den = num0.mul(d());
+    let num = num0.sub(z);
+    let den1 = z.add(den);
+    let den2 = den1.sqr();
+    let den4 = den2.sqr();
+    let den6 = den4.mul(den2);
+    var t = den6.mul(num).mul(den1);
+    t = t.pow2523();
+    t = t.mul(num).mul(den1).mul(den1);
+    var x = t.mul(den1);
+    if not x.sqr().mul(den1).equals(num) {
+        x = x.mul(sqrt_m1());
+    }
+    if not x.sqr().mul(den1).equals(num) {
+        return none;
+    }
+    if x.parity() == (p[31] >> 7) {
+        x = f.Fe.zero().sub(x);
+    }
+    return Point { x: x, y: y, z: z, t: x.mul(y) };
+}
+
+/// Whether sig is key's signature of message.
+pub fn verify(key: []u8, message: []u8, sig: []u8) -> bool {
+    if key.len() != 32 or sig.len() != 64 {
+        return false;
+    }
+    let s = sig[32..64];
+    // S < L: a larger S would give a second signature of the message.
+    let l = order();
+    var i: usize = 32;
+    var below = false;
+    var decided = false;
+    while i > 0 and not decided : (i -= 1) {
+        let a = s[i - 1] as i64;
+        if a != l[i - 1] {
+            below = a < l[i - 1];
+            decided = true;
+        }
+    }
+    if not below {
+        return false;
+    }
+    var neg_a = identity();
+    match unpack_negative(key) {
+        some(p) => { neg_a = p; }
+        none => { return false; }
+    }
+    var kh = sha2.Sha512.init();
+    kh.update(sig[0..32]);
+    kh.update(key);
+    kh.update(message);
+    let k = reduce(kh.finish());
+    let p = scalarmult(q: neg_a, s: k[0..32]).add(scalarmult(q: base(), s: s));
+    let r = p.pack();
+    return ct.eq(a: r[0..32], b: sig[0..32]);
+}

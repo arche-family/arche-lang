@@ -1,0 +1,53 @@
+/// A cryptographic random generator: ChaCha20 keyed from the kernel's
+/// randomness. After each request it replaces its key with fresh key
+/// stream, so a key read later does not reveal what it gave before.
+import crypto.chacha20poly1305 as cc;
+import std;
+
+pub type Csprng = struct {
+    key: [32]u8,
+
+    /// Seeded from the kernel (std.Rand).
+    pub fn init(rand: &mut std.Rand) -> Csprng {
+        var key: [32]u8 = [0; 32];
+        rand.fill(key[0..32]);
+        return Csprng { key: key };
+    }
+
+    /// Seeded from seed: the same bytes every time, for tests only.
+    pub fn from_seed(seed: [32]u8) -> Csprng {
+        return Csprng { key: seed };
+    }
+
+    pub fn fill(self: &mut Csprng, out: []mut u8) {
+        let nonce: [12]u8 = [0; 12];
+        var counter: u32 = 1;
+        var done: usize = 0;
+        while done < out.len() {
+            let block = cc.block(key: self.key[0..32], counter: counter, nonce: nonce[0..12]);
+            var i: usize = 0;
+            while i < 64 and done < out.len() : (i += 1) {
+                out[done] = block[i];
+                done += 1;
+            }
+            counter += 1;
+        }
+        // Forward secrecy: block 0 becomes the next key.
+        let fresh = cc.block(key: self.key[0..32], counter: 0, nonce: nonce[0..12]);
+        var k: usize = 0;
+        while k < 32 : (k += 1) {
+            self.key[k] = fresh[k];
+        }
+    }
+
+    pub fn next_u64(self: &mut Csprng) -> u64 {
+        var b: [8]u8 = [0; 8];
+        self.fill(b[0..8]);
+        var v: u64 = 0;
+        var i: usize = 0;
+        while i < 8 : (i += 1) {
+            v = (v << 8) | b[i] as u64;
+        }
+        return v;
+    }
+}

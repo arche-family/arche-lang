@@ -45,3 +45,15 @@ jobs:
         run: make -C stage0 && make -C compiler
       - name: Boot the freestanding examples
         run: ./freestanding/run.sh x86_64 riscv64
+
+  # docs/sprints.md S20: the crypto library runs in the same time whatever
+  # its secrets are (dudect: Welch's t-test on two classes of inputs), and a
+  # function that leaks on purpose is caught.
+  constant-time:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Arche compiler
+        run: make -C stage0 && make -C compiler
+      - name: Time lib/crypto on fixed and random secrets
+        run: ./ctcheck/run.sh

@@ -1,0 +1,27 @@
+// test: run
+// spec: crypto (ChaCha20 CSPRNG)
+// stage0: skip
+// stdout: d1369e25ae29153584f4f2e32e8f16d669cbefe997cbe6ca6036767ac18cd9b3d716244735d29d05
+// stdout: rekeyed
+// stdout: kernel seeded
+import std;
+import crypto.random;
+import _hex;
+
+fn main(sys: &mut std.System) -> !void {
+    var a = random.Csprng.from_seed([5; 32]);
+    var b = random.Csprng.from_seed([5; 32]);
+    var x: [40]u8 = [0; 40];
+    var y: [40]u8 = [0; 40];
+    a.fill(x[0..40]);
+    b.fill(y[0..40]);
+    _hex.hex(&mut sys.stdout, x[0..40]);
+    a.fill(x[0..40]);
+    if x[0] != y[0] or x[1] != y[1] {
+        sys.stdout.write("rekeyed\n");
+    }
+    var c = random.Csprng.init(&mut sys.rand);
+    if c.next_u64() != c.next_u64() {
+        sys.stdout.write("kernel seeded\n");
+    }
+}

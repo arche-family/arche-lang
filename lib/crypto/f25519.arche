@@ -1,0 +1,182 @@
+/// Arithmetic modulo 2^255 - 19 for X25519 and Ed25519, in sixteen 16-bit
+/// limbs held in i64 (the approach of TweetNaCl): every product of two
+/// limbs, and their sums, fit an i64 without a 128-bit type. No branch or
+/// index depends on a value.
+import crypto.ct;
+
+pub type Fe = struct {
+    pub v: [16]i64,
+
+    pub fn zero() -> Fe {
+        return Fe { v: [0; 16] };
+    }
+
+    pub fn one() -> Fe {
+        var v: [16]i64 = [0; 16];
+        v[0] = 1;
+        return Fe { v: v };
+    }
+
+    pub fn add(self: Fe, o: Fe) -> Fe {
+        var r = self;
+        var i: usize = 0;
+        while i < 16 : (i += 1) {
+            r.v[i] = self.v[i] + o.v[i];
+        }
+        return r;
+    }
+
+    pub fn sub(self: Fe, o: Fe) -> Fe {
+        var r = self;
+        var i: usize = 0;
+        while i < 16 : (i += 1) {
+            r.v[i] = self.v[i] - o.v[i];
+        }
+        return r;
+    }
+
+    pub fn mul(self: Fe, o: Fe) -> Fe {
+        var t: [31]i64 = [0; 31];
+        var i: usize = 0;
+        while i < 16 : (i += 1) {
+            var j: usize = 0;
+            while j < 16 : (j += 1) {
+                t[i + j] += self.v[i] * o.v[j];
+            }
+        }
+        i = 0;
+        while i < 15 : (i += 1) {
+            t[i] += 38 * t[i + 16];
+        }
+        var r = Fe.zero();
+        i = 0;
+        while i < 16 : (i += 1) {
+            r.v[i] = t[i];
+        }
+        carry(&mut r.v);
+        carry(&mut r.v);
+        return r;
+    }
+
+    pub fn sqr(self: Fe) -> Fe {
+        return self.mul(self);
+    }
+
+    /// self^(p - 2): the inverse, and 0 for 0.
+    pub fn inv(self: Fe) -> Fe {
+        var c = self;
+        var a: i32 = 253;
+        while a >= 0 : (a -= 1) {
+            c = c.sqr();
+            if a != 2 and a != 4 {
+                c = c.mul(self);
+            }
+        }
+        return c;
+    }
+
+    /// self^((p - 5) / 8), for square roots.
+    pub fn pow2523(self: Fe) -> Fe {
+        var c = self;
+        var a: i32 = 250;
+        while a >= 0 : (a -= 1) {
+            c = c.sqr();
+            if a != 1 {
+                c = c.mul(self);
+            }
+        }
+        return c;
+    }
+
+    /// The 32-byte little-endian form, fully reduced.
+    pub fn pack(self: Fe) -> [32]u8 {
+        var t = self.v;
+        carry(&mut t);
+        carry(&mut t);
+        carry(&mut t);
+        var m: [16]i64 = [0; 16];
+        var j: u32 = 0;
+        while j < 2 : (j += 1) {
+            m[0] = t[0] - 0xffed;
+            var i: usize = 1;
+            while i < 15 : (i += 1) {
+                m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1);
+                m[i - 1] = m[i - 1] & 0xffff;
+            }
+            m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1);
+            let b = (m[15] >> 16) & 1;
+            m[14] = m[14] & 0xffff;
+            select(&mut t, m: &m, take_m: 1 - b);
+        }
+        var out: [32]u8 = [0; 32];
+        var i: usize = 0;
+        while i < 16 : (i += 1) {
+            out[2 * i] = (t[i] & 0xff) as u8;
+            out[2 * i + 1] = ((t[i] >> 8) & 0xff) as u8;
+        }
+        return out;
+    }
+
+    pub fn unpack(b: []u8) -> Fe {
+        var r = Fe.zero();
+        var i: usize = 0;
+        while i < 16 : (i += 1) {
+            r.v[i] = (b[2 * i] as i64) + ((b[2 * i + 1] as i64) << 8);
+        }
+        r.v[15] = r.v[15] & 0x7fff;
+        return r;
+    }
+
+    /// The low bit of the reduced value.
+    pub fn parity(self: Fe) -> u8 {
+        let p = self.pack();
+        return p[0] & 1;
+    }
+
+    pub fn equals(self: Fe, o: Fe) -> bool {
+        let a = self.pack();
+        let b = o.pack();
+        return ct.eq(a: a[0..32], b: b[0..32]);
+    }
+}
+
+/// Carries each limb's excess into the next; the top one wraps around as
+/// 38 times itself (2^256 = 38 mod p).
+fn carry(o: &mut [16]i64) {
+    var i: usize = 0;
+    while i < 16 : (i += 1) {
+        o.*[i] += 65536;
+        let c = o.*[i] >> 16;
+        if i < 15 {
+            o.*[i + 1] += c - 1;
+        } else {
+            o.*[0] += 38 * (c - 1);
+        }
+        o.*[i] -= c * 65536;
+    }
+}
+
+/// t = m where take_m is 1; unchanged where it is 0. No branch on take_m.
+fn select(t: &mut [16]i64, m: &[16]i64, take_m: i64) {
+    let mask = ~(take_m - 1);
+    var i: usize = 0;
+    while i < 16 : (i += 1) {
+        let x = mask & (t.*[i] ^ m.*[i]);
+        t.*[i] = t.*[i] ^ x;
+    }
+}
+
+/// Swaps p and q when bit is 1, without a branch on bit.
+pub fn cswap(p: &mut Fe, q: &mut Fe, bit: i64) {
+    let mask = ~(bit - 1);
+    var i: usize = 0;
+    while i < 16 : (i += 1) {
+        let x = mask & (p.v[i] ^ q.v[i]);
+        p.v[i] = p.v[i] ^ x;
+        q.v[i] = q.v[i] ^ x;
+    }
+}
+
+pub fn limbs(v: [16]i64) -> Fe {
+    return Fe { v: v };
+}

@@ -1,0 +1,475 @@
+/// ECDSA on P-256 (FIPS 186-5) with SHA-256, nonces by RFC 6979. The field
+/// and the scalars are eight 32-bit limbs in Montgomery form, so products
+/// fit a u64; points use the complete addition of Renes, Costello and
+/// Batina (2016), one formula for every pair, and secret scalars go
+/// through a ladder that does the same work for every bit.
+import crypto.ct;
+import crypto.hmac;
+
+type Limbs = [8]u32;
+
+fn modulus_p() -> Limbs {
+    return [0xffffffff, 0xffffffff, 0xffffffff, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0xffffffff];
+}
+
+fn modulus_n() -> Limbs {
+    return [0xfc632551, 0xf3b9cac2, 0xa7179e84, 0xbce6faad, 0xffffffff, 0xffffffff, 0x00000000, 0xffffffff];
+}
+
+/// R^2 mod p and R^2 mod n, R = 2^256: into Montgomery form.
+fn r2_p() -> Limbs {
+    return [0x00000003, 0x00000000, 0xffffffff, 0xfffffffb, 0xfffffffe, 0xffffffff, 0xfffffffd, 0x00000004];
+}
+
+fn r2_n() -> Limbs {
+    return [0xbe79eea2, 0x83244c95, 0x49bd6fa6, 0x4699799c, 0x2b6bec59, 0x2845b239, 0xf3d95620, 0x66e12d94];
+}
+
+const P_INV: u32 = 1;
+const N_INV: u32 = 0xee00bc4f;
+
+/// a - b, and the borrow out (1 when a < b).
+fn sub_borrow(a: Limbs, b: Limbs) -> [9]u32 {
+    var r: [9]u32 = [0; 9];
+    var borrow: u64 = 0;
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        let d = (a[i] as u64) -% (b[i] as u64) -% borrow;
+        r[i] = (d & 0xffffffff) as u32;
+        borrow = (d >> 63) & 1;
+    }
+    r[8] = borrow as u32;
+    return r;
+}
+
+fn select(mask: u32, yes: Limbs, no: Limbs) -> Limbs {
+    var r: Limbs = [0; 8];
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        r[i] = (yes[i] & mask) | (no[i] & ~mask);
+    }
+    return r;
+}
+
+/// a * b / R mod m (CIOS), for a, b < m.
+fn mont_mul(a: Limbs, b: Limbs, m: Limbs, minv: u32) -> Limbs {
+    var t: [10]u32 = [0; 10];
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        var c: u64 = 0;
+        var j: usize = 0;
+        while j < 8 : (j += 1) {
+            let s = (t[j] as u64) + (a[j] as u64) * (b[i] as u64) + c;
+            t[j] = (s & 0xffffffff) as u32;
+            c = s >> 32;
+        }
+        var s = (t[8] as u64) + c;
+        t[8] = (s & 0xffffffff) as u32;
+        t[9] = (s >> 32) as u32;
+        let q = t[0] *% minv;
+        s = (t[0] as u64) + (q as u64) * (m[0] as u64);
+        c = s >> 32;
+        j = 1;
+        while j < 8 : (j += 1) {
+            s = (t[j] as u64) + (q as u64) * (m[j] as u64) + c;
+            t[j - 1] = (s & 0xffffffff) as u32;
+            c = s >> 32;
+        }
+        s = (t[8] as u64) + c;
+        t[7] = (s & 0xffffffff) as u32;
+        t[8] = t[9] + (s >> 32) as u32;
+    }
+    var r: Limbs = [0; 8];
+    i = 0;
+    while i < 8 : (i += 1) {
+        r[i] = t[i];
+    }
+    // r < 2m: subtract m once, unless that borrows and nothing carried.
+    let d = sub_borrow(a: r, b: m);
+    var dl: Limbs = [0; 8];
+    i = 0;
+    while i < 8 : (i += 1) {
+        dl[i] = d[i];
+    }
+    let take_d = ct.mask32(t[8] | (d[8] ^ 1));
+    return select(take_d, yes: dl, no: r);
+}
+
+fn add_mod(a: Limbs, b: Limbs, m: Limbs) -> Limbs {
+    var r: Limbs = [0; 8];
+    var c: u64 = 0;
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        let s = (a[i] as u64) + (b[i] as u64) + c;
+        r[i] = (s & 0xffffffff) as u32;
+        c = s >> 32;
+    }
+    let d = sub_borrow(a: r, b: m);
+    var dl: Limbs = [0; 8];
+    i = 0;
+    while i < 8 : (i += 1) {
+        dl[i] = d[i];
+    }
+    let take_d = ct.mask32((c as u32) | (d[8] ^ 1));
+    return select(take_d, yes: dl, no: r);
+}
+
+fn sub_mod(a: Limbs, b: Limbs, m: Limbs) -> Limbs {
+    let d = sub_borrow(a: a, b: b);
+    var r: Limbs = [0; 8];
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        r[i] = d[i];
+    }
+    // When it borrowed, add m back.
+    let mask = ct.mask32(d[8]);
+    var c: u64 = 0;
+    i = 0;
+    while i < 8 : (i += 1) {
+        let s = (r[i] as u64) + ((m[i] & mask) as u64) + c;
+        r[i] = (s & 0xffffffff) as u32;
+        c = s >> 32;
+    }
+    return r;
+}
+
+fn from_bytes(b: []u8) -> Limbs {
+    var r: Limbs = [0; 8];
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        let at = 28 - 4 * i;
+        r[i] = ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | b[at + 3] as u32;
+    }
+    return r;
+}
+
+fn to_bytes(x: Limbs, out: []mut u8) {
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        let at = 28 - 4 * i;
+        out[at] = (x[i] >> 24) as u8;
+        out[at + 1] = ((x[i] >> 16) & 0xFF) as u8;
+        out[at + 2] = ((x[i] >> 8) & 0xFF) as u8;
+        out[at + 3] = (x[i] & 0xFF) as u8;
+    }
+}
+
+/// x < m, for public values.
+fn below(x: Limbs, m: Limbs) -> bool {
+    return sub_borrow(a: x, b: m)[8] == 1;
+}
+
+fn is_zero(x: Limbs) -> bool {
+    var acc: u32 = 0;
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        acc = acc | x[i];
+    }
+    return acc == 0;
+}
+
+fn one() -> Limbs {
+    return [1, 0, 0, 0, 0, 0, 0, 0];
+}
+
+/// An element of GF(p), in Montgomery form.
+type Fp = struct {
+    v: Limbs,
+
+    fn of(x: Limbs) -> Fp {
+        return Fp { v: mont_mul(a: x, b: r2_p(), m: modulus_p(), minv: P_INV) };
+    }
+
+    fn value(self: Fp) -> Limbs {
+        return mont_mul(a: self.v, b: one(), m: modulus_p(), minv: P_INV);
+    }
+
+    fn mul(self: Fp, o: Fp) -> Fp {
+        return Fp { v: mont_mul(a: self.v, b: o.v, m: modulus_p(), minv: P_INV) };
+    }
+
+    fn add(self: Fp, o: Fp) -> Fp {
+        return Fp { v: add_mod(a: self.v, b: o.v, m: modulus_p()) };
+    }
+
+    fn sub(self: Fp, o: Fp) -> Fp {
+        return Fp { v: sub_mod(a: self.v, b: o.v, m: modulus_p()) };
+    }
+
+    /// self^(p - 2), the inverse; the exponent is public.
+    fn inv(self: Fp) -> Fp {
+        let e = sub_borrow(a: modulus_p(), b: [2, 0, 0, 0, 0, 0, 0, 0]);
+        var r = Fp.of(one());
+        var bit: i32 = 255;
+        while bit >= 0 : (bit -= 1) {
+            r = r.mul(r);
+            if ((e[(bit as usize) / 32] >> ((bit as u32) % 32)) & 1) == 1 {
+                r = r.mul(self);
+            }
+        }
+        return r;
+    }
+
+    fn equals(self: Fp, o: Fp) -> bool {
+        return is_zero(sub_mod(a: self.v, b: o.v, m: modulus_p()));
+    }
+}
+
+/// A scalar modulo n, in Montgomery form.
+type Scalar = struct {
+    v: Limbs,
+
+    fn of(x: Limbs) -> Scalar {
+        return Scalar { v: mont_mul(a: x, b: r2_n(), m: modulus_n(), minv: N_INV) };
+    }
+
+    fn value(self: Scalar) -> Limbs {
+        return mont_mul(a: self.v, b: one(), m: modulus_n(), minv: N_INV);
+    }
+
+    fn mul(self: Scalar, o: Scalar) -> Scalar {
+        return Scalar { v: mont_mul(a: self.v, b: o.v, m: modulus_n(), minv: N_INV) };
+    }
+
+    fn add(self: Scalar, o: Scalar) -> Scalar {
+        return Scalar { v: add_mod(a: self.v, b: o.v, m: modulus_n()) };
+    }
+
+    /// self^(n - 2): the exponent is public, the base may be secret.
+    fn inv(self: Scalar) -> Scalar {
+        let e = sub_borrow(a: modulus_n(), b: [2, 0, 0, 0, 0, 0, 0, 0]);
+        var r = Scalar.of(one());
+        var bit: i32 = 255;
+        while bit >= 0 : (bit -= 1) {
+            r = r.mul(r);
+            if ((e[(bit as usize) / 32] >> ((bit as u32) % 32)) & 1) == 1 {
+                r = r.mul(self);
+            }
+        }
+        return r;
+    }
+}
+
+/// x mod n for x < 2^256 < 2n: one subtraction, chosen by a mask.
+fn reduce_n(x: Limbs) -> Limbs {
+    let d = sub_borrow(a: x, b: modulus_n());
+    var dl: Limbs = [0; 8];
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        dl[i] = d[i];
+    }
+    return select(ct.mask32(d[8] ^ 1), yes: dl, no: x);
+}
+
+fn curve_b() -> Fp {
+    return Fp.of([0x27d2604b, 0x3bce3c3e, 0xcc53b0f6, 0x651d06b0, 0x769886bc, 0xb3ebbd55, 0xaa3a93e7, 0x5ac635d8]);
+}
+
+/// A point (X : Y : Z), the identity (0 : 1 : 0).
+type Point = struct {
+    x: Fp,
+    y: Fp,
+    z: Fp,
+
+    /// Algorithm 4 of Renes, Costello and Batina for a = -3: complete, so
+    /// doubling and the identity need no case of their own.
+    fn add(self: Point, q: Point) -> Point {
+        let b = curve_b();
+        var t0 = self.x.mul(q.x);
+        var t1 = self.y.mul(q.y);
+        var t2 = self.z.mul(q.z);
+        var t3 = self.x.add(self.y);
+        var t4 = q.x.add(q.y);
+        t3 = t3.mul(t4);
+        t4 = t0.add(t1);
+        t3 = t3.sub(t4);
+        t4 = self.y.add(self.z);
+        var x3 = q.y.add(q.z);
+        t4 = t4.mul(x3);
+        x3 = t1.add(t2);
+        t4 = t4.sub(x3);
+        x3 = self.x.add(self.z);
+        var y3 = q.x.add(q.z);
+        x3 = x3.mul(y3);
+        y3 = t0.add(t2);
+        y3 = x3.sub(y3);
+        var z3 = b.mul(t2);
+        x3 = y3.sub(z3);
+        z3 = x3.add(x3);
+        x3 = x3.add(z3);
+        z3 = t1.sub(x3);
+        x3 = t1.add(x3);
+        y3 = b.mul(y3);
+        t1 = t2.add(t2);
+        t2 = t1.add(t2);
+        y3 = y3.sub(t2);
+        y3 = y3.sub(t0);
+        t1 = y3.add(y3);
+        y3 = t1.add(y3);
+        t1 = t0.add(t0);
+        t0 = t1.add(t0);
+        t0 = t0.sub(t2);
+        t1 = t4.mul(y3);
+        t2 = t0.mul(y3);
+        y3 = x3.mul(z3);
+        y3 = y3.add(t2);
+        x3 = t3.mul(x3);
+        x3 = x3.sub(t1);
+        z3 = t4.mul(z3);
+        t1 = t3.mul(t0);
+        z3 = z3.add(t1);
+        return Point { x: x3, y: y3, z: z3 };
+    }
+
+    fn is_identity(self: Point) -> bool {
+        return is_zero(self.z.value());
+    }
+
+    /// The affine coordinates as 32 bytes each.
+    fn affine(self: Point) -> [64]u8 {
+        let zi = self.z.inv();
+        var out: [64]u8 = [0; 64];
+        to_bytes(self.x.mul(zi).value(), out[0..32]);
+        to_bytes(self.y.mul(zi).value(), out[32..64]);
+        return out;
+    }
+}
+
+fn identity() -> Point {
+    return Point { x: Fp.of([0; 8]), y: Fp.of(one()), z: Fp.of([0; 8]) };
+}
+
+fn generator() -> Point {
+    let gx: Limbs = [0xd898c296, 0xf4a13945, 0x2deb33a0, 0x77037d81, 0x63a440f2, 0xf8bce6e5, 0xe12c4247, 0x6b17d1f2];
+    let gy: Limbs = [0x37bf51f5, 0xcbb64068, 0x6b315ece, 0x2bce3357, 0x7c0f9e16, 0x8ee7eb4a, 0xfe1a7f9b, 0x4fe342e2];
+    return Point { x: Fp.of(gx), y: Fp.of(gy), z: Fp.of(one()) };
+}
+
+fn cswap(p: &mut Point, q: &mut Point, bit: u32) {
+    let m = ct.mask32(bit);
+    let px = p.x.v;
+    let py = p.y.v;
+    let pz = p.z.v;
+    p.x.v = select(m, yes: q.x.v, no: px);
+    p.y.v = select(m, yes: q.y.v, no: py);
+    p.z.v = select(m, yes: q.z.v, no: pz);
+    q.x.v = select(m, yes: px, no: q.x.v);
+    q.y.v = select(m, yes: py, no: q.y.v);
+    q.z.v = select(m, yes: pz, no: q.z.v);
+}
+
+/// k times p, k in normal (not Montgomery) form.
+fn scalarmult(p: Point, k: Limbs) -> Point {
+    var r0 = identity();
+    var r1 = p;
+    var bit: i32 = 255;
+    while bit >= 0 : (bit -= 1) {
+        let b = (k[(bit as usize) / 32] >> ((bit as u32) % 32)) & 1;
+        cswap(p: &mut r0, q: &mut r1, bit: b);
+        r1 = r0.add(r1);
+        r0 = r0.add(r0);
+        cswap(p: &mut r0, q: &mut r1, bit: b);
+    }
+    return r0;
+}
+
+/// The public key of a 32-byte private key: 0x04, x, y.
+pub fn public_key(private: []u8) -> [65]u8 {
+    let q = scalarmult(p: generator(), k: from_bytes(private)).affine();
+    var out: [65]u8 = [0; 65];
+    out[0] = 4;
+    var i: usize = 0;
+    while i < 64 : (i += 1) {
+        out[1 + i] = q[i];
+    }
+    return out;
+}
+
+/// RFC 6979's nonce for SHA-256: from the key and the digest, so the same
+/// message gets the same signature and no bad randomness can leak the key.
+fn nonce(private: []u8, digest: []u8) -> Limbs {
+    var h: [32]u8 = [0; 32];
+    to_bytes(reduce_n(from_bytes(digest)), h[0..32]);
+    var v: [32]u8 = [1; 32];
+    var k: [32]u8 = [0; 32];
+    var round: u8 = 0;
+    while round < 2 : (round += 1) {
+        var m = hmac.HmacSha256.init(k[0..32]);
+        m.update(v[0..32]);
+        let sep: [1]u8 = [round];
+        m.update(sep[0..1]);
+        m.update(private);
+        m.update(h[0..32]);
+        k = m.finish();
+        v = hmac.hmac_sha256(key: k[0..32], data: v[0..32]);
+    }
+    while true {
+        v = hmac.hmac_sha256(key: k[0..32], data: v[0..32]);
+        let cand = from_bytes(v[0..32]);
+        if not is_zero(cand) and below(x: cand, m: modulus_n()) {
+            return cand;
+        }
+        var m = hmac.HmacSha256.init(k[0..32]);
+        m.update(v[0..32]);
+        let zero: [1]u8 = [0];
+        m.update(zero[0..1]);
+        k = m.finish();
+        v = hmac.hmac_sha256(key: k[0..32], data: v[0..32]);
+    }
+    return one();
+}
+
+/// The signature r, s (32 bytes each) of a SHA-256 digest.
+pub fn sign(private: []u8, digest: []u8) -> [64]u8 {
+    let d = Scalar.of(from_bytes(private));
+    let e = Scalar.of(reduce_n(from_bytes(digest)));
+    let k = nonce(private: private, digest: digest);
+    let big_r = scalarmult(p: generator(), k: k).affine();
+    let r = reduce_n(from_bytes(big_r[0..32]));
+    let s = Scalar.of(k).inv().mul(e.add(Scalar.of(r).mul(d))).value();
+    var out: [64]u8 = [0; 64];
+    to_bytes(r, out[0..32]);
+    to_bytes(s, out[32..64]);
+    return out;
+}
+
+/// Whether sig is the signature of digest by the key 0x04 || x || y.
+pub fn verify(key: []u8, digest: []u8, sig: []u8) -> bool {
+    if key.len() != 65 or key[0] != 4 or sig.len() != 64 or digest.len() != 32 {
+        return false;
+    }
+    let qx = from_bytes(key[1..33]);
+    let qy = from_bytes(key[33..65]);
+    if not below(x: qx, m: modulus_p()) or not below(x: qy, m: modulus_p()) {
+        return false;
+    }
+    // y^2 = x^3 - 3x + b
+    let x = Fp.of(qx);
+    let y = Fp.of(qy);
+    let three = Fp.of([3, 0, 0, 0, 0, 0, 0, 0]);
+    let rhs = x.mul(x).mul(x).sub(three.mul(x)).add(curve_b());
+    if not y.mul(y).equals(rhs) {
+        return false;
+    }
+    let r = from_bytes(sig[0..32]);
+    let s = from_bytes(sig[32..64]);
+    if is_zero(r) or is_zero(s) or not below(x: r, m: modulus_n()) or not below(x: s, m: modulus_n()) {
+        return false;
+    }
+    let w = Scalar.of(s).inv();
+    let e = Scalar.of(reduce_n(from_bytes(digest)));
+    let u1 = e.mul(w).value();
+    let u2 = Scalar.of(r).mul(w).value();
+    let q = Point { x: x, y: y, z: Fp.of(one()) };
+    let sum = scalarmult(p: generator(), k: u1).add(scalarmult(p: q, k: u2));
+    if sum.is_identity() {
+        return false;
+    }
+    let xy = sum.affine();
+    let v = reduce_n(from_bytes(xy[0..32]));
+    var vb: [32]u8 = [0; 32];
+    var rb: [32]u8 = [0; 32];
+    to_bytes(v, vb[0..32]);
+    to_bytes(r, rb[0..32]);
+    return ct.eq(a: vb[0..32], b: rb[0..32]);
+}
