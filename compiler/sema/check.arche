@@ -263,6 +263,16 @@ pub fn require_unsafe(c: &mut Checker, s: diag.Span, what: str) {
     report_owned(c, codes.NEEDS_UNSAFE, s, m);
 }
 
+/// Declaration d is a nopanic fn (spec/arche.md §8.2).
+pub fn is_nopanic_fn(c: &Checker, d: u32) -> bool {
+    let decl = c.decls[d as usize];
+    let t = &c.p.modules[decl.module as usize].tree;
+    match t.find_own(decl.node, tk.Kind.KwNopanic, c.a) {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
 /// Declaration d is an unsafe fn.
 pub fn is_unsafe_fn(c: &Checker, d: u32) -> bool {
     let decl = c.decls[d as usize];
@@ -2176,7 +2186,7 @@ fn check_signature_here(c: &mut Checker, d: u32) {
             }
             let pt = resolve_type(c, child(c, ch, 0));
             local.push(ParamInfo { name: sym, name_token: nt, type_id: pt });
-        } else if k != cst.Kind.Block and k != cst.Kind.WhereClause {
+        } else if k != cst.Kind.Block and k != cst.Kind.WhereClause and k != cst.Kind.Contract {
             ret = resolve_type(c, ch);
         }
     }

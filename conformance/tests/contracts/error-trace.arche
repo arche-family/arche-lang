@@ -1,0 +1,30 @@
+// test: run
+// spec: arche/8.3
+// stage0: skip
+// exit: 1
+// stdout: 3
+// stderr: error: Missing
+// stderr:   at error-trace.arche:16:16
+// stderr:   at error-trace.arche:22:13
+// stderr:   at error-trace.arche:29:9
+import std;
+
+type Bad = error { Missing }
+
+fn find(n: u32) -> Bad!u32 {
+    if n > 10 {
+        return Bad.Missing;
+    }
+    return n;
+}
+
+fn outer(n: u32) -> Bad!u32 {
+    let v = try find(n);
+    return v + 1;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(try outer(2) as u64);
+    sys.stdout.write("\n");
+    _ = try outer(20);
+}

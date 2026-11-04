@@ -274,10 +274,7 @@ fn parse_item(p: &mut Parser) {
         return;
     }
     let is_pub = accept(p, tk.Kind.KwPub);
-    // unsafe fn (spec/arche.md §10.1)
-    if p.full and at(p, tk.Kind.KwUnsafe) and peek_second(p) == tk.Kind.KwFn {
-        advance(p);
-    }
+    fn_mods(p);
     match peek(p) {
         .KwFn => {
             parse_fn(p, m);
@@ -357,6 +354,7 @@ fn parse_impl(p: &mut Parser, m: cst.Mark) {
             let before = p.pos;
             let fm = open(p);
             _ = accept(p, tk.Kind.KwPub);
+            fn_mods(p);
             if at(p, tk.Kind.KwFn) {
                 parse_fn(p, fm);
             } else {
@@ -397,6 +395,14 @@ fn parse_where(p: &mut Parser) {
     _ = close(p, m, cst.Kind.WhereClause);
 }
 
+/// nopanic fn, unsafe fn (spec/arche.md §8.2, §10.1): own tokens of the fn.
+fn fn_mods(p: &mut Parser) {
+    while p.full and (at(p, tk.Kind.KwUnsafe) or at(p, tk.Kind.KwNopanic)) and
+        (peek_second(p) == tk.Kind.KwFn or peek_second(p) == tk.Kind.KwUnsafe or peek_second(p) == tk.Kind.KwNopanic) {
+        advance(p);
+    }
+}
+
 fn parse_fn(p: &mut Parser, m: cst.Mark) {
     advance(p);
     if not expect(p, tk.Kind.Ident, "a function name") {
@@ -425,6 +431,12 @@ fn parse_fn(p: &mut Parser, m: cst.Mark) {
     }
     if p.full and at(p, tk.Kind.KwWhere) {
         parse_where(p);
+    }
+    while p.full and (at(p, tk.Kind.KwRequires) or at(p, tk.Kind.KwEnsures)) {
+        let cm = open(p);
+        advance(p);
+        parse_condition(p);
+        _ = close(p, cm, cst.Kind.Contract);
     }
     // An interface lists signatures: no body, a ';' (spec/arche.md §5.1).
     if p.full and accept(p, tk.Kind.Semi) {
@@ -466,8 +478,11 @@ fn parse_members(p: &mut Parser, is_struct: bool) {
         let before = p.pos;
         let m = open(p);
         let next = peek_second(p);
-        if at(p, tk.Kind.KwFn) or (at(p, tk.Kind.KwPub) and next == tk.Kind.KwFn) {
+        let is_mod = p.full and (at(p, tk.Kind.KwUnsafe) or at(p, tk.Kind.KwNopanic) or
+            (at(p, tk.Kind.KwPub) and (next == tk.Kind.KwUnsafe or next == tk.Kind.KwNopanic)));
+        if at(p, tk.Kind.KwFn) or (at(p, tk.Kind.KwPub) and next == tk.Kind.KwFn) or is_mod {
             _ = accept(p, tk.Kind.KwPub);
+            fn_mods(p);
             parse_fn(p, m);
             seen_method = true;
         } else if at(p, tk.Kind.Ident) or (at(p, tk.Kind.KwPub) and next == tk.Kind.Ident) {

@@ -392,6 +392,7 @@ fn return_stmt(l: &mut lw.Lower, s: cst.NodeId) {
             result = expr.wrap_some(l, rt, v);
         } else if info.kind == ty.Kind.ErrorUnion and l.c.t.kind(et) == ty.Kind.ErrorSet and
             l.c.t.kind(info.elem) != ty.Kind.ErrorSet {
+            lw.trace(l, e, true); // an error starts here (spec/arche.md §8.3)
             result = expr.wrap_error(l, rt, v.v);
         } else if info.kind == ty.Kind.ErrorUnion {
             result = expr.wrap_ok(l, rt, v);
@@ -412,7 +413,45 @@ fn return_stmt(l: &mut lw.Lower, s: cst.NodeId) {
     emit_return(l, has_result, result);
 }
 
+/// A requires or ensures condition: a trap with its text when false.
+pub fn check_contract(l: &mut lw.Lower, ch: cst.NodeId) {
+    let cond = child(l, ch, 0);
+    let v = expr.value(l, cond).v;
+    let m = &l.c.p.modules[l.c.module as usize];
+    let sp = m.node_span(cond);
+    var msg = alloc.String.init(l.a);
+    msg.push_str("contract failed: ");
+    msg.push_str(m.text.view()[sp.start as usize..sp.end() as usize]);
+    lw.check(l, v, msg.view(), cond);
+}
+
+/// The ensures conditions before a return, with `result` the value.
+pub fn check_ensures(l: &mut lw.Lower, has_result: bool, result: lw.Val) {
+    if l.post_conditions.len() == 0 or lw.terminated(l) {
+        return;
+    }
+    let vars = l.vars.len();
+    if has_result {
+        let rt = l.ret;
+        var addr = result.v;
+        if result.scalar {
+            addr = lw.alloca(l, rt);
+            lw.store(l, value: result.v, addr: addr);
+        }
+        let sym = l.c.names.intern("result");
+        lw.bind(l, sym, addr, rt);
+    }
+    var i: usize = 0;
+    while i < l.post_conditions.len() : (i += 1) {
+        check_contract(l, l.post_conditions[i]);
+    }
+    while l.vars.len() > vars {
+        _ = l.vars.pop();
+    }
+}
+
 pub fn emit_return(l: &mut lw.Lower, has_result: bool, result: lw.Val) {
+    check_ensures(l, has_result, result);
     let rt = l.ret;
     if l.sret != ck.NONE {
         lw.store_val(l, rt, result, l.sret);

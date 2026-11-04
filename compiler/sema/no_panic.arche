@@ -1,0 +1,199 @@
+/// nopanic (spec/arche.md §8.2): a nopanic function's body calls only
+/// nopanic functions and does nothing that can trap, unless the compiler
+/// sees that it cannot: an operation on literals, a division by a nonzero
+/// literal, an index into an array by a literal inside it, a cast that
+/// widens. Otherwise it is written in a form that cannot trap (E0910).
+import alloc;
+import codes;
+import syntax.cst;
+import syntax.token as tk;
+import sema.check as ck;
+import sema.expr;
+import sema.types as ty;
+
+pub fn check(c: &mut ck.Checker, body: cst.NodeId) {
+    walk(c, body);
+}
+
+fn report(c: &mut ck.Checker, n: cst.NodeId, what: str) {
+    var m = ck.new_message(c);
+    m.push_str(what);
+    m.push_str(", and this function is nopanic (spec/arche.md §8.2)");
+    var s = ck.span_of(c, n);
+    let k = ck.kind_of(c, n);
+    if k == cst.Kind.BinaryExpr or k == cst.Kind.AssignStmt or k == cst.Kind.CastExpr {
+        s = ck.token_span(c, ck.first_own(c, n)); // the operator
+    }
+    ck.report_owned(c, codes.NOPANIC, s, m);
+}
+
+fn op_kind(c: &ck.Checker, n: cst.NodeId) -> tk.Kind {
+    return ck.tok_kind(c, ck.first_own(c, n));
+}
+
+/// A positive integer literal, possibly in parentheses.
+fn literal_value(c: &ck.Checker, n: cst.NodeId) -> ?u64 {
+    match ck.kind_of(c, n) {
+        .ParenExpr => { return literal_value(c, ck.child(c, n, 0)); }
+        .IntLit => { return ck.tok_value(c, ck.tree(c).first_token(n)); }
+        _ => { return none; }
+    }
+}
+
+/// Every value of `from` is a value of `to`.
+fn widens(c: &ck.Checker, from: ty.TypeId, to: ty.TypeId) -> bool {
+    let f = c.t.get(from).int_kind;
+    let t = c.t.get(to).int_kind;
+    if ty.is_signed(f) and not ty.is_signed(t) {
+        return false;
+    }
+    if ty.is_signed(f) == ty.is_signed(t) {
+        return ty.bits(t) >= ty.bits(f);
+    }
+    return ty.bits(t) > ty.bits(f); // unsigned into a wider signed type
+}
+
+/// Builtin methods that never trap.
+fn safe_method(name: str) -> bool {
+    return name.eq("len") or name.eq("items") or name.eq("items_mut") or name.eq("get") or name.eq("eq") or
+        name.eq("starts_with") or name.eq("bytes") or name.eq("view") or name.eq("contains") or name.eq("addr");
+}
+
+fn arithmetic(c: &mut ck.Checker, n: cst.NodeId, op: tk.Kind, t: ty.TypeId, rhs: cst.NodeId) {
+    if not ck.is_int(c, t) {
+        return; // floats do not trap (spec/arche.md §2.2)
+    }
+    match op {
+        .Plus | .Minus | .Star | .PlusAssign | .MinusAssign | .StarAssign => {
+            report(c, n, "checked arithmetic traps on overflow; write +%, -% or *% to wrap");
+        }
+        .Slash | .Percent | .SlashAssign | .PercentAssign => {
+            match literal_value(c, rhs) {
+                some(v) => {
+                    if v == 0 {
+                        report(c, n, "this divides by zero");
+                    }
+                }
+                none => { report(c, n, "a division traps when the divisor is zero; divide by a nonzero literal"); }
+            }
+        }
+        .Shl | .Shr | .ShlAssign | .ShrAssign => {
+            let bits = ty.bits(c.t.get(t).int_kind) as u64;
+            match literal_value(c, rhs) {
+                some(v) => {
+                    if v >= bits {
+                        report(c, n, "this shifts by the type's width or more");
+                    }
+                }
+                none => { report(c, n, "a shift traps when its count is the type's width or more; shift by a literal"); }
+            }
+        }
+        _ => { }
+    }
+}
+
+fn call(c: &mut ck.Checker, n: cst.NodeId) {
+    let callee = ck.child(c, n, 0);
+    let d = ck.ref_of(c, n);
+    if d != ck.NONE and c.decls[d as usize].kind == ck.DeclKind.Fn {
+        let owner = c.decls[d as usize].owner;
+        if owner != ck.NONE and c.decls[owner as usize].kind == ck.DeclKind.Interface {
+            report(c, n, "a call through '&dyn' may reach a function that panics");
+            return;
+        }
+        if not ck.is_nopanic_fn(c, d) {
+            var m = ck.new_message(c);
+            m.push_str("this calls '");
+            m.push_str(c.names.text(c.decls[d as usize].name));
+            m.push_str("', which is not nopanic");
+            let s = ck.span_of(c, callee);
+            m.push_str(", and this function is nopanic (spec/arche.md §8.2)");
+            ck.report_owned(c, codes.NOPANIC, s, m);
+        }
+        return;
+    }
+    let k = ck.kind_of(c, callee);
+    if k == cst.Kind.FieldExpr and not ck.is_invalid(c, ck.type_of(c, callee)) {
+        var name = alloc.String.init(c.a);
+        name.push_str(ck.text(c, expr.member_token(c, callee)));
+        if not safe_method(name.view()) {
+            var m = ck.new_message(c);
+            m.push_str("'");
+            m.push_str(name.view());
+            m.push_str("' can panic (it may allocate, or check its argument)");
+            m.push_str(", and this function is nopanic (spec/arche.md §8.2)");
+            let s = ck.span_of(c, callee);
+            ck.report_owned(c, codes.NOPANIC, s, m);
+        }
+        return;
+    }
+    if k == cst.Kind.NameExpr and not ck.is_invalid(c, ck.type_of(c, callee)) {
+        report(c, n, "a closure or a '&dyn fn' may panic");
+        return;
+    }
+    if k == cst.Kind.FieldExpr {
+        return; // T.init(a): makes an empty container
+    }
+    report(c, n, "this built-in function can panic");
+}
+
+fn walk(c: &mut ck.Checker, n: cst.NodeId) {
+    match ck.kind_of(c, n) {
+        .ClosureExpr => { return; } // its body is a function of its own
+        .BinaryExpr => {
+            if not expr.untyped(c, n) {
+                arithmetic(c, n: n, op_kind(c, n), ck.type_of(c, n), rhs: ck.child(c, n, 1));
+            }
+        }
+        .AssignStmt => {
+            let op = op_kind(c, n);
+            if op != tk.Kind.Assign {
+                arithmetic(c, n: n, op, ck.type_of(c, ck.child(c, n, 0)), rhs: ck.child(c, n, 1));
+            }
+        }
+        .UnaryExpr => {
+            let operand = ck.child(c, n, 0);
+            let t = ck.type_of(c, n);
+            if op_kind(c, n) == tk.Kind.Minus and ck.is_int(c, t) and ck.kind_of(c, operand) != cst.Kind.IntLit {
+                report(c, n, "negating a signed integer traps on its smallest value; write 0 -% x");
+            }
+        }
+        .IndexExpr => {
+            let base = ck.child(c, n, 0);
+            var bt = ck.type_of(c, base);
+            if c.t.kind(bt) == ty.Kind.Ref {
+                bt = c.t.elem(bt);
+            }
+            var fine = false;
+            if c.t.kind(bt) == ty.Kind.Array {
+                match literal_value(c, ck.child(c, n, 1)) {
+                    some(v) => { fine = v < c.t.get(bt).len; }
+                    none => { }
+                }
+            }
+            if not fine {
+                report(c, n, "indexing traps out of range; use .get(i)");
+            }
+        }
+        .SliceExpr => { report(c, n, "slicing traps out of range"); }
+        .CastExpr => {
+            let from = ck.type_of(c, ck.child(c, n, 0));
+            let to = ck.type_of(c, n);
+            let wrapping = op_kind(c, n) == tk.Kind.KwAsWrap;
+            if not wrapping and ck.is_int(c, to) {
+                if ck.is_float(c, from) {
+                    report(c, n, "'as' from a float traps out of range or on NaN; write 'as%' to saturate");
+                } else if ck.is_int(c, from) and not widens(c, from: from, to: to) {
+                    report(c, n, "'as' traps when the value does not fit; write 'as%' to wrap");
+                }
+            }
+        }
+        .CallExpr => { call(c, n); }
+        _ => { }
+    }
+    let count = ck.child_count(c, n);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        walk(c, ck.child(c, n, i));
+    }
+}

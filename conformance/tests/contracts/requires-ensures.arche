@@ -1,0 +1,21 @@
+// test: run
+// spec: arche/8.1
+// stage0: skip
+// stdout: 7
+import std;
+
+type Halves = struct { left: u32, right: u32 }
+
+fn split(total: u32, at: u32) -> Halves
+    requires at <= total
+    ensures result.left == at
+    ensures result.left + result.right == total
+{
+    return Halves { left: at, right: total - at };
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let h = split(total: 10, at: 3);
+    sys.stdout.write_u64(h.right as u64);
+    sys.stdout.write("\n");
+}

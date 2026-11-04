@@ -628,6 +628,37 @@ void a0rt_write_f32(const i64 *output, float x) {
     }
 }
 
+// ---- error return traces (spec/arche.md §8.3) ---------------------------------------
+//
+// Where an error was made and each `try` that passed it up. Only failing
+// paths record, so success costs nothing.
+
+enum { TRACE_SIZE = 32 };
+
+typedef struct {
+    const u8 *file;
+    u64 file_len;
+    u32 line, col;
+} TraceEntry;
+
+static TraceEntry trace[TRACE_SIZE];
+static u32 trace_len;
+
+void a0rt_trace_push(const u8 *file, u64 file_len, u32 line, u32 col) {
+    if (trace_len < TRACE_SIZE) {
+        trace[trace_len].file = file;
+        trace[trace_len].file_len = file_len;
+        trace[trace_len].line = line;
+        trace[trace_len].col = col;
+        trace_len++;
+    }
+}
+
+void a0rt_trace_start(const u8 *file, u64 file_len, u32 line, u32 col) {
+    trace_len = 0;
+    a0rt_trace_push(file, file_len, line, col);
+}
+
 // ---- exit -------------------------------------------------------------------------
 
 static _Noreturn void exit_with(int status) {
@@ -1036,6 +1067,15 @@ _Noreturn void a0rt_start(i64 *sp) {
         a0rt_write(&err_fd, (const u8 *)"error: ", 7);
         a0rt_write(&err_fd, a0_error_names[err].ptr, a0_error_names[err].len);
         a0rt_write(&err_fd, (const u8 *)"\n", 1);
+        for (u32 i = 0; i < trace_len; i++) {
+            a0rt_write(&err_fd, (const u8 *)"  at ", 5);
+            a0rt_write(&err_fd, trace[i].file, trace[i].file_len);
+            a0rt_write_byte(&err_fd, ':');
+            a0rt_write_u64(&err_fd, trace[i].line);
+            a0rt_write_byte(&err_fd, ':');
+            a0rt_write_u64(&err_fd, trace[i].col);
+            a0rt_write_byte(&err_fd, '\n');
+        }
         exit_with(1);
     }
     exit_with(0);

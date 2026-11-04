@@ -55,6 +55,8 @@ pub type Lower = struct {
     pub ret: ty.TypeId,
     /// impl number -> its method table in m.vtables.
     pub vtables: alloc.Map(u32, u32),
+    /// The ensures conditions of the function being lowered (§8.1).
+    pub post_conditions: alloc.List(cst.NodeId),
     pub a: alloc.Allocator,
 }
 
@@ -396,8 +398,13 @@ pub fn op_token(l: &Lower, n: cst.NodeId) -> u32 {
 }
 
 /// Stops the program with "panic: <message>" and where the token is (§10).
-pub fn trap_with(l: &mut Lower, message_ptr: u32, message_len: u32, n: cst.NodeId) {
-    let tok = op_token(l, n);
+/// The location of node n as runtime arguments: file, its length, line
+/// and column.
+pub fn location_args(l: &mut Lower, n: cst.NodeId, args: &mut alloc.List(u32), at_start: bool) {
+    var tok = op_token(l, n);
+    if at_start {
+        tok = ck.tree(&l.c).first_token(n);
+    }
     let m = &l.c.p.modules[l.c.module as usize];
     var file = alloc.String.init(l.a);
     file.push_str(m.display.view());
@@ -407,13 +414,32 @@ pub fn trap_with(l: &mut Lower, message_ptr: u32, message_len: u32, n: cst.NodeI
     var gi = ir.inst(ir.Op.Global, ir.Ty.Ptr);
     gi.imm = fg as u64;
     let fp = emit(l, gi);
-    var args = args0(l);
-    args.push(message_ptr);
-    args.push(message_len);
     args.push(fp);
     args.push(konst(l, ir.Ty.I64, file.len() as u64));
     args.push(konst(l, ir.Ty.I32, pos.line as u64));
     args.push(konst(l, ir.Ty.I32, pos.column as u64));
+}
+
+/// Records n in the error return trace (spec/arche.md §8.3): `start` for
+/// where an error is made, else a `try` that passes it up.
+pub fn trace(l: &mut Lower, n: cst.NodeId, start: bool) {
+    if not l.c.p.full {
+        return;
+    }
+    var args = args0(l);
+    location_args(l, n, &mut args, at_start: start);
+    if start {
+        _ = call_runtime(l, "a0rt_trace_start", ir.Ty.Void, &args);
+    } else {
+        _ = call_runtime(l, "a0rt_trace_push", ir.Ty.Void, &args);
+    }
+}
+
+pub fn trap_with(l: &mut Lower, message_ptr: u32, message_len: u32, n: cst.NodeId) {
+    var args = args0(l);
+    args.push(message_ptr);
+    args.push(message_len);
+    location_args(l, n, &mut args, at_start: false);
     _ = call_runtime(l, "a0rt_trap", ir.Ty.Void, &args);
     _ = emit(l, ir.inst(ir.Op.Unreachable, ir.Ty.Void));
     after_terminator(l);
@@ -647,10 +673,28 @@ fn lower_fn(l: &mut Lower, f: u32) {
         }
     }
     let n = decl.node;
+    // requires before the body; ensures at every return (spec/arche.md §8.1).
+    l.post_conditions = alloc.List(cst.NodeId).init(l.a);
+    let nc = ck.child_count(&l.c, n);
+    var ci: u32 = 0;
+    while ci < nc : (ci += 1) {
+        let ch = ck.child(&l.c, n, ci);
+        if ck.kind_of(&l.c, ch) != cst.Kind.Contract {
+            continue;
+        }
+        if ck.has_own(&l.c, ch, tk.Kind.KwEnsures) {
+            l.post_conditions.push(ch);
+        } else {
+            stmt.check_contract(l, ch);
+        }
+    }
     let body = ck.child(&l.c, n, ck.child_count(&l.c, n) - 1);
     stmt.block(l, body);
     if not terminated(l) {
         let k = l.c.t.kind(info.ret);
+        if k == ty.Kind.Void or (l.f.ret == ir.Ty.I16 and k == ty.Kind.ErrorUnion) {
+            stmt.check_ensures(l, false, Val { v: 0, scalar: true, fresh: true });
+        }
         if k == ty.Kind.Void {
             _ = emit(l, ir.inst(ir.Op.RetVoid, ir.Ty.Void));
         } else if l.f.ret == ir.Ty.I16 and k == ty.Kind.ErrorUnion {
@@ -715,6 +759,7 @@ pub fn lower(c: ck.Checker) -> ir.Module {
         sret: ck.NONE,
         ret: ty.void_type(),
         vtables: alloc.Map(u32, u32).init(a),
+        post_conditions: alloc.List(cst.NodeId).init(a),
         a: a,
     };
     var f: usize = 0;

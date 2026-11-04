@@ -269,17 +269,28 @@ fn split(s: str, at: usize) -> Halves
 }
 ```
 
-- `requires` conditions are checked at every call, before the body; `ensures` conditions after it, where `result` names the result. A failed condition traps with `contract failed: <condition>` and the location of the call.
-- Debug builds check every condition. Release builds remove those the compiler proves always true, and keep the rest.
-- A condition is a `bool` expression over the parameters (and `result`) that calls only functions without capabilities, side effects or `unsafe`.
+- `requires` conditions are checked at every call, before the body; `ensures` conditions after it, at every return, where `result` names the result (a parameter cannot be named `result` then, E0305). A failed condition traps with `contract failed: <condition>` and the location of the condition. The checks live in the function itself, so every way of calling it, directly, through `&dyn` or as an instance, checks them.
+- Debug builds check every condition. Release builds remove those the compiler proves always true, and keep the rest. (There is one build mode until `arche build` has release builds, sprint S24: every condition is checked.)
+- A condition is a `bool` expression over the parameters (and `result`) (E0401) that calls only functions without capabilities, side effects or `unsafe`; the compiler does not check that last part yet.
 
 ### 8.2 `nopanic`
 
 `nopanic fn` declares that the function never panics or traps. The compiler checks it: the body may call only `nopanic` functions, and every operation that could trap (checked arithmetic, indexing, `as`) must be one the compiler proves safe, or be written in a form that cannot trap (`+%`, `.get(i)`, `as%`) (E0910). Kernel interrupt handlers and the allocator are `nopanic`.
 
+- The compiler proves safe: arithmetic on literals alone, division and remainder by a nonzero literal, a shift by a literal below the width, an array indexed by a literal inside it, an integer `as` that widens, and float arithmetic, which never traps. It knows nothing more yet; a later proof engine may accept more, never less.
+- Calls through a closure or a `&dyn` view are not `nopanic`. Of the built-in methods, those that cannot fail are allowed: `len`, `items`, `items_mut`, `get`, `eq`, `starts_with`, `bytes`, `view`; methods that allocate, such as `push`, can fail and are not.
+
 ### 8.3 Error return traces
 
 When `try` passes an error up, the location is recorded in a per-task trace of fixed size. `main` returning an error prints the trace after `error: <name>` in debug builds. Recording costs nothing on the success path.
+
+- `return E.Name` starts a new trace at the error's location; each `try` that passes it on adds its own. The trace keeps the first 32 entries and prints them as A§13 prints a panic's location, one per line, from where the error was made to `main`:
+
+```
+error: Missing
+  at main.arche:16:16
+  at main.arche:22:13
+```
 
 ## 9. Concurrency
 
@@ -381,9 +392,9 @@ file        = { import } { item } ;
 item        = { DOC } ( [ "pub" ] decl | test_decl | impl_decl ) ;
 decl        = const_decl | type_decl | fn_decl | extern_decl ;
 
-type_decl   = "type" IDENT [ "(" cparams ")" ] [ where ] "=" type_body ;
-type_body   = [ "packed" | "extern" ] "struct" [ align ] "{" { member } "}"
-            | "enum" "{" variant { "," variant } [ "," ] { member } "}"
+type_decl   = "type" IDENT [ "(" cparams ")" ] "=" type_body ;
+type_body   = [ "packed" | "extern" ] "struct" [ where ] [ align ] "{" { member } "}"
+            | "enum" [ where ] "{" variant { "," variant } [ "," ] { member } "}"
             | "error" "{" IDENT { "," IDENT } [ "," ] "}"
             | "interface" "{" { fn_sig ";" } "}"
             | type ";" ;

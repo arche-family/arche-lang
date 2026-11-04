@@ -1,0 +1,23 @@
+// test: run
+// spec: arche/8.2
+// stage0: skip
+// stdout: 21
+import std;
+
+nopanic fn clamp(x: u32, hi: u32) -> u32 {
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+nopanic fn mix(a: u32, b: u32) -> u32 {
+    let arr: [4]u32 = [1, 2, 3, 4];
+    let wide = a as u64;
+    return (a +% b *% 3) / 2 +% arr[3] +% clamp(x: wide as% u32, hi: 9);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(mix(a: 10, b: 2) as u64);
+    sys.stdout.write("\n");
+}

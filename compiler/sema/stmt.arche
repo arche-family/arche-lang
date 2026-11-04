@@ -7,6 +7,7 @@ import syntax.cst;
 import syntax.token as tk;
 import sema.check as ck;
 import sema.expr;
+import sema.no_panic;
 import sema.types as ty;
 
 // ---- bindings (§6) ------------------------------------------------------------
@@ -112,8 +113,12 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
         declare(c, p.name_token, p.type_id, false);
     }
     let n = decl.node;
+    check_contracts(c, n, info.ret);
     let body = ck.child(c, n, ck.child_count(c, n) - 1);
     check_block(c, body);
+    if c.p.full and ck.is_nopanic_fn(c, info.decl) {
+        no_panic.check(c, body);
+    }
     if not is_void_result(c, info.ret) and not block_ends(c, body) {
         var m = ck.new_message(c);
         m.push_str("this function can reach its end without returning ");
@@ -125,6 +130,35 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
     c.unsafe_depth = saved_unsafe;
     c.labels = outer_labels;
     ck.restore_context(c, saved);
+}
+
+/// requires e and ensures e (spec/arche.md §8.1): bool conditions over the
+/// parameters, and in ensures `result`.
+fn check_contracts(c: &mut ck.Checker, n: cst.NodeId, ret: ty.TypeId) {
+    let count = ck.child_count(c, n);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let ch = ck.child(c, n, i);
+        if ck.kind_of(c, ch) != cst.Kind.Contract {
+            continue;
+        }
+        let depth = c.scope.len();
+        if ck.has_own(c, ch, tk.Kind.KwEnsures) and not is_void_result(c, ret) {
+            let sym = c.names.intern("result");
+            match expr.find_binding(c, sym) {
+                some(_) => {
+                    let s = ck.token_span(c, ck.first_own(c, ch));
+                    ck.report(c, codes.SHADOWING, s, "'ensures' names the result 'result', and a parameter has that name");
+                }
+                none => { }
+            }
+            c.scope.push(ck.Binding { name: sym, name_token: ck.first_own(c, ch), type_id: ret, mutable: false });
+        }
+        expr.check_value(c, ck.child(c, ch, 0), ty.bool_type());
+        while c.scope.len() > depth {
+            _ = c.scope.pop();
+        }
+    }
 }
 
 /// A closure's body, where it is written: its captures and parameters are
