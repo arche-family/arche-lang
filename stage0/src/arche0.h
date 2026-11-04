@@ -277,7 +277,8 @@ typedef struct {
 // What an identifier names, set by the checker.
 typedef enum { NAME_NONE, NAME_BINDING, NAME_CONST, NAME_FN, NAME_MODULE, NAME_BUILTIN_FN } NameKind;
 
-typedef enum { CALL_FN, CALL_BUILTIN_FN, CALL_METHOD, CALL_LIST_INIT } CallKind;
+// CALL_INIT: T.init(a) of alloc.List, alloc.Map, alloc.String and alloc.Interner.
+typedef enum { CALL_FN, CALL_BUILTIN_FN, CALL_METHOD, CALL_INIT } CallKind;
 
 typedef enum { FIELD_VALUE, FIELD_VARIANT, FIELD_ERROR, FIELD_CONST } FieldUse;
 
@@ -330,6 +331,9 @@ struct Expr {
 
 typedef enum { S_EXPR, S_LET, S_ASSIGN, S_DISCARD, S_IF, S_WHILE, S_MATCH, S_RETURN, S_BREAK, S_CONTINUE, S_DEFER, S_BLOCK } StmtKind;
 
+// Return lifting (§7.8): RET_VALUE wraps a T as ?T or E!T; RET_ERROR returns an error.
+typedef enum { RET_PLAIN, RET_VALUE, RET_ERROR } ReturnKind;
+
 typedef enum { A_SET, A_ADD, A_SUB, A_MUL, A_DIV, A_REM, A_WADD, A_WSUB, A_WMUL, A_BITAND, A_BITOR, A_BITXOR, A_SHL, A_SHR } AssignOp;
 
 typedef struct {
@@ -355,6 +359,8 @@ struct Stmt {
     bool mutable; // var
     TypeExpr *type_expr;
     Binding *binding; // set by the checker
+
+    ReturnKind ret_kind; // S_RETURN, set by the checker: how the value becomes the result (§7.8)
 };
 
 struct Block {
@@ -525,6 +531,8 @@ typedef enum {
     TY_SLICE,
     TY_ARRAY,
     TY_LIST,
+    TY_MAP,
+    TY_OPTIONAL,
     TY_ERROR_UNION,
     TY_ERROR_SET,
     TY_STRUCT,
@@ -541,11 +549,14 @@ struct Type {
     TypeKind kind;
     IntKind int_kind;           // TY_INT
     bool mut;                   // TY_REF, TY_SLICE
-    Type *elem;                 // TY_REF, TY_SLICE, TY_ARRAY, TY_LIST, TY_ERROR_UNION
+    Type *elem;                 // TY_REF, TY_SLICE, TY_ARRAY, TY_LIST, TY_OPTIONAL, TY_ERROR_UNION;
+                                // TY_MAP: the value type
+    Type *key;                  // TY_MAP
     uint64_t len;               // TY_ARRAY
     const BuiltinType *builtin; // TY_BUILTIN
-    TypeDecl *decl;             // TY_STRUCT, TY_ENUM, TY_ERROR_SET
-    const char *c_name;         // TY_SLICE, TY_ARRAY, TY_LIST, TY_STRUCT, TY_ENUM
+    TypeDecl *decl;             // TY_STRUCT, TY_ENUM, TY_ERROR_SET; TY_ERROR_UNION: its error set,
+                                // NULL when inferred. An error set with no decl is any error.
+    const char *c_name;         // composite types
 
     Field *fields; // TY_STRUCT: the resolved fields
     int nfields;
@@ -557,7 +568,9 @@ struct Type {
     Type *ref_cache[2];      // &T and &mut T
     Type *slice_cache[2];    // []T and []mut T
     Type *list_cache;        // alloc.List(T)
-    Type *error_union_cache; // !T
+    Type *optional_cache;    // ?T
+    Vec union_cache;         // E!T for each E seen; the first is !T
+    Vec map_cache;           // alloc.Map(K, T) for each K seen
     Vec array_cache;         // [N]T for each N seen
 };
 
@@ -570,7 +583,13 @@ Type *type_ref(bool mut, Type *elem);
 Type *type_slice(bool mut, Type *elem);
 Type *type_array(Type *elem, uint64_t len);
 Type *type_list(Type *elem);
-Type *type_error_union(Type *elem); // with an inferred error set
+Type *type_map(Type *key, Type *value);
+Type *type_optional(Type *elem);
+Type *type_error_union(Type *elem);                    // with an inferred error set
+Type *type_error_union_of(TypeDecl *set, Type *elem); // set NULL: inferred
+Type *type_any_error(void);                            // the error of an inferred set
+Type *library_type(const char *library, const char *name); // std.Output, std.IoError, alloc.String...
+void types_init(void);
 Type *type_declared(TypeKind kind, TypeDecl *decl, const char *c_name);
 const char *type_name(const Type *t);
 // Every slice, array, list, struct and enum type, in the order they were made.
@@ -581,7 +600,19 @@ typedef struct {
     Type *type;
 } BuiltinParam;
 
-typedef enum { M_RUNTIME, M_LEN, M_STR_BYTES, M_LIST_PUSH, M_LIST_CLEAR, M_LIST_ITEMS, M_LIST_ITEMS_MUT } MethodOp;
+typedef enum {
+    M_RUNTIME,
+    M_LEN,
+    M_STR_BYTES,
+    M_LIST_PUSH,
+    M_LIST_POP,
+    M_LIST_CLEAR,
+    M_LIST_ITEMS,
+    M_LIST_ITEMS_MUT,
+    M_MAP_PUT,
+    M_MAP_GET,
+    M_MAP_REMOVE,
+} MethodOp;
 
 // A built-in method.
 struct Method {
@@ -607,6 +638,7 @@ struct BuiltinType {
     const char *name;
     const char *c_name;
     Type *type;
+    bool has_init; // T.init(a: alloc.Allocator) -> T
     int nfields;
     Field fields[5];
     int nmethods;
@@ -624,6 +656,7 @@ int64_t int_min(IntKind k);
 uint64_t int_max(IntKind k);
 const char *int_suffix(IntKind k);
 bool type_comparable(const Type *t); // == and != work on it (§5.5)
+bool type_is_key(const Type *t);     // it can be a Map key (§5.5)
 
 // ---- checking and emission ---------------------------------------------------
 

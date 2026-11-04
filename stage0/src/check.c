@@ -159,6 +159,19 @@ static void require_visible(const Checker *c, Loc loc, const Module *owner, bool
     }
 }
 
+// An error of an inferred set: any error name of the program.
+static ErrorName *global_error(const char *name) {
+    for (size_t i = 0; i < error_names.len; i++) {
+        if (strcmp(error_names.items[i], name) == 0) {
+            ErrorName *e = NEW(ErrorName);
+            e->name = name;
+            e->id = (int)i + 1;
+            return e;
+        }
+    }
+    return NULL;
+}
+
 static int error_id(const char *name) {
     for (size_t i = 0; i < error_names.len; i++) {
         if (strcmp(error_names.items[i], name) == 0) {
@@ -230,6 +243,16 @@ static Type *resolve_path_type(Checker *c, TypeExpr *te) {
             }
             return type_list(resolve_type(c, te->args.items[0]));
         }
+        if (a && a->library && strcmp(a->library, "alloc") == 0 && strcmp(second, "Map") == 0) {
+            if (te->args.len != 2) {
+                fatal_at(te->loc, "alloc.Map takes two types: the key and the value");
+            }
+            Type *key = resolve_type(c, te->args.items[0]);
+            if (!type_is_key(key)) {
+                fatal_at(te->loc, "%s cannot be a Map key (§5.5)", type_name(key));
+            }
+            return type_map(key, resolve_type(c, te->args.items[1]));
+        }
         fatal_at(te->loc, "stage0 does not support the generic type '%s' yet", path_text(te));
     }
     if (te->segments.len == 1) {
@@ -242,9 +265,9 @@ static Type *resolve_path_type(Checker *c, TypeExpr *te) {
             return decl_type(c, td);
         }
     } else if (a && a->library) {
-        const BuiltinType *b = builtin_type_lookup(a->library, second);
-        if (b) {
-            return b->type;
+        Type *t = library_type(a->library, second);
+        if (t) {
+            return t;
         }
     } else if (a) {
         TypeDecl *td = find_type(a->module, second);
@@ -268,15 +291,21 @@ static Type *resolve_type(Checker *c, TypeExpr *te) {
         uint64_t n = const_usize(c, te->len);
         return type_array(resolve_type(c, te->elem), n);
     }
-    case TE_ERROR_UNION:
+    case TE_ERROR_UNION: {
+        TypeDecl *set = NULL;
         if (te->set) {
-            fatal_at(te->set->loc, "stage0 does not support named error sets in error unions yet");
+            Type *s = resolve_type(c, te->set);
+            if (s->kind != TY_ERROR_SET) {
+                fatal_at(te->set->loc, "%s is not an error set; E!T needs one", type_name(s));
+            }
+            set = s->decl;
         }
-        return type_error_union(resolve_type(c, te->elem));
-    case TE_OPTIONAL:
-        break;
+        return type_error_union_of(set, resolve_type(c, te->elem));
     }
-    fatal_at(te->loc, "stage0 does not support optional types yet");
+    case TE_OPTIONAL:
+        return type_optional(resolve_type(c, te->elem));
+    }
+    fatal_at(te->loc, "internal error: unknown type");
 }
 
 static bool is_void_result(const Type *t) {
@@ -618,25 +647,40 @@ static PathRef resolve_path(Checker *c, Expr *e) {
                 r.type = decl_type(c, td);
             }
         } else if (b.kind == PATH_LIBRARY) {
-            const BuiltinType *bt = builtin_type_lookup(b.alias->library, e->name);
-            if (bt) {
+            Type *t = library_type(b.alias->library, e->name);
+            if (t) {
                 r.kind = PATH_TYPE;
-                r.type = bt->type;
+                r.type = t;
             }
         }
         return r;
     }
-    if (e->kind == E_CALL && e->callee->kind == E_FIELD && e->args.len == 1) {
+    // alloc.List(T) and alloc.Map(K, V) written in an expression (§5.3).
+    if (e->kind == E_CALL && e->callee->kind == E_FIELD) {
         PathRef b = resolve_path(c, e->callee->base);
-        if (b.kind == PATH_LIBRARY && strcmp(b.alias->library, "alloc") == 0 && strcmp(e->callee->name, "List") == 0) {
-            Arg *a = e->args.items[0];
+        const char *name = e->callee->name;
+        bool list = strcmp(name, "List") == 0;
+        bool map = strcmp(name, "Map") == 0;
+        if (b.kind != PATH_LIBRARY || strcmp(b.alias->library, "alloc") != 0 || (!list && !map)) {
+            return r;
+        }
+        if (e->args.len != (list ? 1u : 2u)) {
+            fatal_at(e->loc, list ? "alloc.List takes one type" : "alloc.Map takes two types: the key and the value");
+        }
+        Type *args[2];
+        for (size_t i = 0; i < e->args.len; i++) {
+            Arg *a = e->args.items[i];
             PathRef t = a->label ? r : resolve_path(c, a->value);
             if (t.kind != PATH_TYPE) {
-                fatal_at(a->value->loc, "alloc.List takes a type, such as alloc.List(u32)");
+                fatal_at(a->value->loc, "alloc.%s takes types, such as alloc.List(u32)", name);
             }
-            r.kind = PATH_TYPE;
-            r.type = type_list(t.type);
+            args[i] = t.type;
         }
+        if (map && !type_is_key(args[0])) {
+            fatal_at(e->loc, "%s cannot be a Map key (§5.5)", type_name(args[0]));
+        }
+        r.kind = PATH_TYPE;
+        r.type = list ? type_list(args[0]) : type_map(args[0], args[1]);
     }
     return r;
 }
@@ -644,6 +688,20 @@ static PathRef resolve_path(Checker *c, Expr *e) {
 // ---- expressions ------------------------------------------------------------
 
 static Type *check_expr(Checker *c, Expr *e, Type *expected);
+
+// Every error of `set` must be one that ret, an error union, can return.
+// Unknown when either set is inferred: stage0 does not infer sets.
+static void require_errors_fit(const TypeDecl *set, const Type *ret, Loc loc) {
+    if (!set || !ret->decl) {
+        return;
+    }
+    for (size_t i = 0; i < set->errors.len; i++) {
+        ErrorName *e = set->errors.items[i];
+        if (!find_error(ret->decl, e->name)) {
+            fatal_at(loc, "the error '%s' cannot be returned: %s does not contain it", e->name, type_name(ret));
+        }
+    }
+}
 static void check_const(Checker *c, ConstDecl *k);
 
 static void expect_type(const Expr *e, const Type *got, const Type *want) {
@@ -777,10 +835,11 @@ static Type *check_call(Checker *c, Expr *call) {
         const char *name = callee->name;
         if (r.kind == PATH_TYPE) {
             Type *t = r.type;
-            if (t->kind == TY_LIST && strcmp(name, "init") == 0) {
-                ParamInfo params[] = {{"a", builtin_type_lookup("alloc", "Allocator")->type}};
-                check_args(c, call, "alloc.List.init", params, 1);
-                call->call = CALL_LIST_INIT;
+            bool has_init = t->kind == TY_LIST || t->kind == TY_MAP || (t->kind == TY_BUILTIN && t->builtin->has_init);
+            if (has_init && strcmp(name, "init") == 0) {
+                ParamInfo params[] = {{"a", library_type("alloc", "Allocator")}};
+                check_args(c, call, arena_printf("%s.init", type_name(t)), params, 1);
+                call->call = CALL_INIT;
                 return t;
             }
             FnDecl *fn = t->kind == TY_STRUCT || t->kind == TY_ENUM ? find_method(t->decl, name) : NULL;
@@ -1228,12 +1287,56 @@ static Type *check_expr_kind(Checker *c, Expr *e, Type *expected) {
         return to;
     }
     case E_NONE:
-    case E_SOME:
-        fatal_at(e->loc, "stage0 does not support optionals yet");
-    case E_TRY:
-    case E_CATCH:
-    case E_ORELSE:
-        fatal_at(e->loc, "stage0 does not support error handling yet");
+        if (!expected || expected->kind != TY_OPTIONAL) {
+            fatal_at(e->loc, "'none' takes its type from context, e.g. 'let x: ?u32 = none;'");
+        }
+        return expected;
+    case E_SOME: {
+        Type *inner = expected && expected->kind == TY_OPTIONAL ? expected->elem : NULL;
+        Type *t;
+        if (inner) {
+            check_value(c, e->base, inner);
+            t = inner;
+        } else {
+            t = check_expr(c, e->base, NULL);
+        }
+        if (t->kind == TY_VOID || t->kind == TY_NORETURN) {
+            fatal_at(e->loc, "'some' needs a value");
+        }
+        return type_optional(t);
+    }
+    case E_ORELSE: {
+        Type *t = check_expr(c, e->base, expected ? type_optional(expected) : NULL);
+        if (t->kind != TY_OPTIONAL) {
+            fatal_at(e->loc, "'orelse' needs an optional on its left, not %s", type_name(t));
+        }
+        check_value(c, e->rhs, t->elem);
+        return t->elem;
+    }
+    case E_CATCH: {
+        Type *t = check_expr(c, e->base, NULL);
+        if (t->kind != TY_ERROR_UNION) {
+            fatal_at(e->loc, "'catch' needs an error union on its left, not %s", type_name(t));
+        }
+        check_value(c, e->rhs, t->elem);
+        return t->elem;
+    }
+    case E_TRY: {
+        if (c->defer_loops >= 0) {
+            fatal_at(e->loc, "deferred code cannot use 'try'");
+        }
+        Type *ret = c->fn->ret;
+        if (ret->kind != TY_ERROR_UNION) {
+            fatal_at(e->loc, "'try' returns the error from '%s', which returns %s, not an error union", c->fn->name,
+                     type_name(ret));
+        }
+        Type *t = check_expr(c, e->base, NULL);
+        if (t->kind != TY_ERROR_UNION) {
+            fatal_at(e->loc, "'try' needs an error union, not %s", type_name(t));
+        }
+        require_errors_fit(t->decl, ret, e->loc);
+        return t->elem;
+    }
     }
     fatal_at(e->loc, "internal error: unknown expression");
 }
@@ -1361,7 +1464,7 @@ static void check_pattern(Checker *c, Pattern *p, Type *st, Type *t, bool altern
         return;
     case P_VARIANT:
         if (t->kind == TY_ERROR_SET) {
-            p->error = find_error(t->decl, p->name);
+            p->error = t->decl ? find_error(t->decl, p->name) : global_error(p->name);
             if (!p->error) {
                 fatal_at(p->loc, "%s has no error named '%s'", type_name(t), p->name);
             }
@@ -1422,12 +1525,28 @@ static void check_pattern(Checker *c, Pattern *p, Type *st, Type *t, bool altern
         }
         return;
     case P_NONE:
+        if (t->kind != TY_OPTIONAL) {
+            fatal_at(p->loc, "'none' matches an optional, not %s", type_name(t));
+        }
+        return;
     case P_SOME:
     case P_OK:
-    case P_ERR:
-        break;
+    case P_ERR: {
+        const char *word = p->kind == P_SOME ? "some" : p->kind == P_OK ? "ok" : "err";
+        TypeKind want = p->kind == P_SOME ? TY_OPTIONAL : TY_ERROR_UNION;
+        if (t->kind != want) {
+            fatal_at(p->loc, "'%s(...)' matches %s, not %s", word, want == TY_OPTIONAL ? "an optional" : "an error union",
+                     type_name(t));
+        }
+        Type *inner = p->kind == P_ERR ? (t->decl ? t->decl->type : type_any_error()) : t->elem;
+        if (inner->kind == TY_VOID && p->inner->kind != P_WILDCARD) {
+            fatal_at(p->inner->loc, "a void result has no value: write 'ok(_)'");
+        }
+        Type *bind = st->kind == TY_REF ? type_ref(st->mut, inner) : inner;
+        check_pattern(c, p->inner, bind, inner, alternatives);
+        return;
     }
-    fatal_at(p->loc, "stage0 does not support optional and error-union patterns yet");
+    }
 }
 
 static void check_match(Checker *c, Stmt *s) {
@@ -1442,6 +1561,48 @@ static void check_match(Checker *c, Stmt *s) {
         check_block(c, arm->body);
         c->scope.len = depth;
     }
+}
+
+// Return lifting (§7.8): in a function returning ?T, `return v` with v: T
+// returns some(v); returning E!T, `return v` returns the value and
+// `return e` with an error returns the error.
+static void check_return_value(Checker *c, Stmt *s, Type *ret) {
+    Expr *e = s->expr;
+    if (ret->kind == TY_OPTIONAL) {
+        if (e->kind == E_NONE || e->kind == E_SOME) {
+            check_value(c, e, ret);
+            return;
+        }
+        Type *t = check_expr(c, e, ret->elem);
+        if (assignable(t, ret->elem)) {
+            s->ret_kind = RET_VALUE;
+            return;
+        }
+        expect_type(e, t, ret);
+        return;
+    }
+    if (ret->kind == TY_ERROR_UNION) {
+        Type *t = check_expr(c, e, ret->elem->kind == TY_VOID ? NULL : ret->elem);
+        if (t->kind == TY_ERROR_SET && ret->elem->kind != TY_ERROR_SET) {
+            if (e->kind == E_FIELD && e->field_use == FIELD_ERROR) {
+                if (ret->decl && !find_error(ret->decl, e->error->name)) {
+                    fatal_at(e->loc, "the error '%s' cannot be returned: %s does not contain it", e->error->name,
+                             type_name(ret));
+                }
+            } else {
+                require_errors_fit(t->decl, ret, e->loc);
+            }
+            s->ret_kind = RET_ERROR;
+            return;
+        }
+        if (ret->elem->kind != TY_VOID && assignable(t, ret->elem)) {
+            s->ret_kind = RET_VALUE;
+            return;
+        }
+        expect_type(e, t, ret);
+        return;
+    }
+    check_value(c, e, ret);
 }
 
 static void check_stmt(Checker *c, Stmt *s) {
@@ -1498,6 +1659,7 @@ static void check_stmt(Checker *c, Stmt *s) {
             fatal_at(s->loc, "deferred code cannot 'return'");
         }
         Type *ret = c->fn->ret;
+        s->ret_kind = RET_PLAIN;
         if (!s->expr) {
             if (!is_void_result(ret)) {
                 fatal_at(s->loc, "'%s' returns %s, so 'return' needs a value", c->fn->name, type_name(ret));
@@ -1507,7 +1669,7 @@ static void check_stmt(Checker *c, Stmt *s) {
         if (ret->kind == TY_VOID) {
             fatal_at(s->expr->loc, "'%s' returns nothing, so 'return' takes no value", c->fn->name);
         }
-        check_value(c, s->expr, ret);
+        check_return_value(c, s, ret);
         return;
     }
     case S_BREAK:
@@ -1925,6 +2087,12 @@ int error_count(void) {
 }
 
 void check_program(Program *p) {
+    types_init();
+    TypeDecl *io_error = library_type("std", "IoError")->decl;
+    for (size_t i = 0; i < io_error->errors.len; i++) {
+        // std.IoError's errors are numbered first, 1 to 5: the runtime returns them.
+        error_id(((ErrorName *)io_error->errors.items[i])->name);
+    }
     Checker c = {.program = p, .module = p->root, .defer_loops = -1};
     Vec *modules = &p->modules;
     for (size_t i = 0; i < modules->len; i++) {

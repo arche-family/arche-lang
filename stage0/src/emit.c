@@ -26,7 +26,18 @@ typedef struct {
 
 // Helpers emitted per type, only when the program uses them: C compilers warn
 // about unused static functions.
-enum { USE_LIST_INIT = 1, USE_LIST_PUSH = 2, USE_LIST_CLEAR = 4, USE_LIST_ITEMS = 8, USE_EQ = 16 };
+enum {
+    USE_INIT = 1,
+    USE_LIST_PUSH = 2,
+    USE_LIST_CLEAR = 4,
+    USE_LIST_ITEMS = 8,
+    USE_EQ = 16,
+    USE_LIST_POP = 32,
+    USE_MAP_PUT = 64,
+    USE_MAP_GET = 128,
+    USE_MAP_REMOVE = 256,
+    USE_HASH = 512,
+};
 
 static void use(const Type *t, unsigned what) {
     ((Type *)t)->used |= what;
@@ -119,10 +130,8 @@ static const char *c_type(const Type *t) {
     case TY_ERROR_SET:
         return "a0_err";
     case TY_ERROR_UNION:
-        if (t->elem->kind == TY_VOID) {
-            return "a0_err";
-        }
-        break;
+    case TY_OPTIONAL:
+    case TY_MAP:
     case TY_SLICE:
     case TY_ARRAY:
     case TY_LIST:
@@ -393,6 +402,9 @@ static const char *emit_builtin_method(const Expr *e, const char *self, const ch
         if (rt->kind == TY_STR) {
             return arena_printf("%s.len", self);
         }
+        if (rt->kind == TY_MAP) {
+            return arena_printf("(*%s).live", self);
+        }
         if (rt->kind == TY_ARRAY) {
             return arena_printf("((void)%s, UINT64_C(%llu))", self, (unsigned long long)rt->len);
         }
@@ -402,6 +414,18 @@ static const char *emit_builtin_method(const Expr *e, const char *self, const ch
     case M_LIST_PUSH:
         use(rt, USE_LIST_PUSH);
         return arena_printf("%s_push(%s, %s)", rt->c_name, self, args);
+    case M_LIST_POP:
+        use(rt, USE_LIST_POP);
+        return arena_printf("%s_pop(%s)", rt->c_name, self);
+    case M_MAP_PUT:
+        use(rt, USE_MAP_PUT);
+        return arena_printf("%s_put(%s, %s)", rt->c_name, self, args);
+    case M_MAP_GET:
+        use(rt, USE_MAP_GET);
+        return arena_printf("%s_get(%s, %s)", rt->c_name, self, args);
+    case M_MAP_REMOVE:
+        use(rt, USE_MAP_REMOVE);
+        return arena_printf("%s_remove(%s, %s)", rt->c_name, self, args);
     case M_LIST_CLEAR:
         use(rt, USE_LIST_CLEAR);
         return arena_printf("%s_clear(%s)", rt->c_name, self);
@@ -451,9 +475,9 @@ static const char *emit_call(Emitter *em, const Expr *e) {
     case CALL_FN:
         call = arena_printf("%s(%s)", e->fn->c_name, args.data);
         break;
-    case CALL_LIST_INIT:
-        use(e->type, USE_LIST_INIT);
-        call = arena_printf("%s_init(%s)", e->type->c_name, args.data);
+    case CALL_INIT:
+        use(e->type, USE_INIT);
+        call = arena_printf("%s_init(%s)", c_type(e->type), args.data);
         break;
     case CALL_METHOD:
         if (e->method->op != M_RUNTIME) {
@@ -570,8 +594,96 @@ static const char *emit_array_lit(Emitter *em, const Expr *e) {
     return to_temp(em, e->type, init);
 }
 
+// A zero value of t, to declare a temporary that is assigned on each path.
+static const char *zero_value(const Type *t) {
+    switch (t->kind) {
+    case TY_INT:
+    case TY_BOOL:
+    case TY_REF:
+    case TY_ERROR_SET:
+        return "0";
+    case TY_ERROR_UNION:
+        return t->elem->kind == TY_VOID ? "0" : "{0}";
+    default:
+        return "{0}";
+    }
+}
+
+// The C condition that an optional or error union holds a value.
+static const char *has_value(const Type *t, const char *x) {
+    if (t->kind == TY_OPTIONAL) {
+        return arena_printf("%s.has", x);
+    }
+    return t->elem->kind == TY_VOID ? arena_printf("%s == 0", x) : arena_printf("%s.err == 0", x);
+}
+
+// x orelse y, x catch y: y is evaluated only when x has no value.
+static const char *emit_fallback(Emitter *em, const Expr *e) {
+    const Type *xt = e->base->type;
+    const char *x = emit_expr(em, e->base);
+    if (xt->elem->kind == TY_VOID) {
+        line(em, "if (!(%s)) {", has_value(xt, x));
+        em->indent++;
+        emit_expr(em, e->rhs);
+        em->indent--;
+        line(em, "}");
+        return NULL;
+    }
+    const char *r = new_temp(em);
+    line(em, "%s %s = %s;", c_type(e->type), r, zero_value(e->type));
+    line(em, "if (%s) {", has_value(xt, x));
+    line(em, "    %s = %s.value;", r, x);
+    line(em, "} else {");
+    em->indent++;
+    const char *y = emit_expr(em, e->rhs);
+    if (y) {
+        line(em, "%s = %s;", r, y);
+    }
+    em->indent--;
+    line(em, "}");
+    return r;
+}
+
+static void run_defers(Emitter *em, size_t depth);
+
+// Returns the error numbered `code` from the current function.
+static void return_error(Emitter *em, const char *code) {
+    const Type *ret = em->fn->ret;
+    if (ret->elem->kind == TY_VOID) {
+        line(em, "return %s;", code);
+        return;
+    }
+    const char *r = new_temp(em);
+    line(em, "%s %s = {0};", c_type(ret), r);
+    line(em, "%s.err = %s;", r, code);
+    line(em, "return %s;", r);
+}
+
+// try x: on an error, the deferred code runs and the function returns it.
+static const char *emit_try(Emitter *em, const Expr *e) {
+    const Type *xt = e->base->type;
+    const char *x = emit_expr(em, e->base);
+    const char *code = xt->elem->kind == TY_VOID ? x : arena_printf("%s.err", x);
+    line(em, "if (%s != 0) {", code);
+    em->indent++;
+    run_defers(em, 0);
+    return_error(em, code);
+    em->indent--;
+    line(em, "}");
+    return xt->elem->kind == TY_VOID ? NULL : arena_printf("%s.value", x);
+}
+
 static const char *emit_expr(Emitter *em, const Expr *e) {
     switch (e->kind) {
+    case E_NONE:
+        return to_temp(em, e->type, "{0}");
+    case E_SOME:
+        return to_temp(em, e->type, arena_printf("{true, %s}", emit_expr(em, e->base)));
+    case E_ORELSE:
+    case E_CATCH:
+        return emit_fallback(em, e);
+    case E_TRY:
+        return emit_try(em, e);
     case E_INT:
     case E_CHAR:
         return c_int_value(e->type, false, e->value);
@@ -747,8 +859,8 @@ static void emit_while(Emitter *em, const Stmt *s) {
     }
 }
 
-// The C condition for one pattern, without enclosing parentheses; `m` names
-// the scrutinee's value.
+// The C condition for one pattern, without enclosing parentheses; `m` is a
+// C expression for the value matched, of type t.
 static const char *pattern_cond(const Pattern *p, const Type *t, const char *m) {
     switch (p->kind) {
     case P_WILDCARD:
@@ -766,29 +878,66 @@ static const char *pattern_cond(const Pattern *p, const Type *t, const char *m) 
             return arena_printf("%s == %d", m, p->error->id);
         }
         return arena_printf("%s.tag == %d", m, p->variant->tag);
-    default:
-        break;
+    case P_NONE:
+        return arena_printf("!%s.has", m);
+    case P_SOME:
+    case P_OK:
+    case P_ERR: {
+        const char *outer;
+        const char *inner;
+        if (p->kind == P_SOME) {
+            outer = arena_printf("%s.has", m);
+            inner = pattern_cond(p->inner, t->elem, arena_printf("%s.value", m));
+        } else {
+            bool v = t->elem->kind == TY_VOID;
+            const char *code = v ? m : arena_printf("%s.err", m);
+            outer = arena_printf(p->kind == P_OK ? "%s == 0" : "%s != 0", code);
+            const Type *it = p->kind == P_OK ? t->elem : (t->decl ? t->decl->type : type_any_error());
+            inner = v && p->kind == P_OK ? "true" : pattern_cond(p->inner, it, p->kind == P_OK ? arena_printf("%s.value", m) : code);
+        }
+        return strcmp(inner, "true") == 0 ? outer : arena_printf("%s && (%s)", outer, inner);
     }
-    fatal("internal error: cannot emit this pattern yet");
+    }
+    return "true";
 }
 
 // Bindings: copies of the value, or views of it when the scrutinee is a
-// reference (§9).
-static void bind_pattern(Emitter *em, const Pattern *p, const char *temp, const char *m, bool by_ref) {
-    if (p->kind == P_BIND) {
-        line(em, "%s v_%s = %s;", c_type(p->binding->type), p->name, temp);
+// reference (§9). At the top, a name binds the scrutinee itself, `temp`.
+static void bind_pattern(Emitter *em, const Pattern *p, const Type *t, const char *m, bool by_ref, const char *temp) {
+    switch (p->kind) {
+    case P_BIND: {
+        const char *v = temp ? temp : by_ref ? arena_printf("&%s", m) : m;
+        line(em, "%s v_%s = %s;", c_type(p->binding->type), p->name, v);
         return;
     }
-    if (p->kind != P_VARIANT || !p->variant) {
+    case P_SOME:
+        bind_pattern(em, p->inner, t->elem, arena_printf("%s.value", m), by_ref, NULL);
         return;
-    }
-    for (size_t i = 0; i < p->field_pats.len; i++) {
-        const FieldPat *fp = p->field_pats.items[i];
-        if (!fp->binding) {
-            continue;
+    case P_OK:
+        if (t->elem->kind != TY_VOID) {
+            bind_pattern(em, p->inner, t->elem, arena_printf("%s.value", m), by_ref, NULL);
         }
-        const char *field = arena_printf("%s.as.v_%s.f_%s", m, p->variant->name, fp->decl->name);
-        line(em, "%s v_%s = %s%s;", c_type(fp->binding->type), fp->bind, by_ref ? "&" : "", field);
+        return;
+    case P_ERR: {
+        const Type *it = t->decl ? t->decl->type : type_any_error();
+        bind_pattern(em, p->inner, it, t->elem->kind == TY_VOID ? m : arena_printf("%s.err", m), by_ref, NULL);
+        return;
+    }
+    case P_VARIANT:
+        if (!p->variant) {
+            return;
+        }
+        for (size_t i = 0; i < p->field_pats.len; i++) {
+            const FieldPat *fp = p->field_pats.items[i];
+            if (!fp->binding) {
+                continue;
+            }
+            const char *field = arena_printf("%s.as.v_%s.f_%s", m, p->variant->name, fp->decl->name);
+            line(em, "%s v_%s = %s%s;", c_type(fp->binding->type), fp->bind, by_ref ? "&" : "", field);
+        }
+        return;
+    default:
+        return;
     }
 }
 
@@ -812,7 +961,7 @@ static void emit_match(Emitter *em, const Stmt *s) {
         free(cond.data);
         em->indent++;
         if (arm->patterns.len == 1) {
-            bind_pattern(em, arm->patterns.items[0], temp, m, by_ref);
+            bind_pattern(em, arm->patterns.items[0], t, m, by_ref, temp);
         }
         emit_scoped(em, arm->body);
         em->indent--;
@@ -848,6 +997,12 @@ static void emit_stmt(Emitter *em, const Stmt *s) {
         return;
     case S_RETURN: {
         const char *v = s->expr ? emit_expr(em, s->expr) : NULL;
+        const Type *ret = em->fn->ret;
+        if (s->ret_kind == RET_VALUE) {
+            v = to_temp(em, ret, ret->kind == TY_OPTIONAL ? arena_printf("{true, %s}", v) : arena_printf("{0, %s}", v));
+        } else if (s->ret_kind == RET_ERROR && ret->elem->kind != TY_VOID) {
+            v = to_temp(em, ret, arena_printf("{.err = %s}", v));
+        }
         run_defers(em, 0);
         if (v) {
             line(em, "return %s;", v);
@@ -891,8 +1046,23 @@ static void define_type(StrBuf *out, const Type *t, Vec *done);
 
 // Defines the composite types t holds by value, then t itself.
 static void define_deps(StrBuf *out, const Type *t, Vec *done) {
-    if (t->kind == TY_SLICE || t->kind == TY_ARRAY || t->kind == TY_LIST || t->kind == TY_STRUCT || t->kind == TY_ENUM) {
+    switch (t->kind) {
+    case TY_SLICE:
+    case TY_ARRAY:
+    case TY_LIST:
+    case TY_MAP:
+    case TY_OPTIONAL:
+    case TY_STRUCT:
+    case TY_ENUM:
         define_type(out, t, done);
+        return;
+    case TY_ERROR_UNION:
+        if (t->elem->kind != TY_VOID && strcmp(t->c_name, "a0_res_String") != 0) {
+            define_type(out, t, done);
+        }
+        return;
+    default:
+        return;
     }
 }
 
@@ -915,6 +1085,25 @@ static void define_type(StrBuf *out, const Type *t, Vec *done) {
         define_deps(out, t->elem, done);
         sb_printf(out, "struct %s {\n    %s items[%llu];\n};\n\n", t->c_name, c_type(t->elem),
                   (unsigned long long)(t->len > 0 ? t->len : 1));
+        return;
+    case TY_OPTIONAL:
+        define_deps(out, t->elem, done);
+        sb_printf(out, "struct %s {\n    bool has;\n    %s value;\n};\n\n", t->c_name, c_type(t->elem));
+        return;
+    case TY_ERROR_UNION:
+        define_deps(out, t->elem, done);
+        sb_printf(out, "struct %s {\n    a0_err err;\n    %s value;\n};\n\n", t->c_name, c_type(t->elem));
+        return;
+    case TY_MAP:
+        // Entries in insertion order, and an open-addressing index into them:
+        // a slot holds 0 (empty), UINT64_MAX (removed) or an entry's index + 1.
+        define_deps(out, t->key, done);
+        define_deps(out, t->elem, done);
+        sb_printf(out,
+                  "struct %s_entry {\n    %s key;\n    %s value;\n    bool live;\n};\n\n"
+                  "struct %s {\n    struct %s_entry *entries;\n    uint64_t len;\n    uint64_t cap;\n"
+                  "    uint64_t *slots;\n    uint64_t nslots;\n    uint64_t live;\n    a0_alloc_Allocator alloc;\n};\n\n",
+                  t->c_name, c_type(t->key), c_type(t->elem), t->c_name, t->c_name);
         return;
     case TY_STRUCT:
         for (int i = 0; i < t->nfields; i++) {
@@ -967,7 +1156,7 @@ static void define_type(StrBuf *out, const Type *t, Vec *done) {
 static void define_list_ops(StrBuf *out, const Type *t) {
     const char *n = t->c_name;
     const char *e = c_type(t->elem);
-    if (t->used & USE_LIST_INIT) {
+    if (t->used & USE_INIT) {
         sb_printf(out, "static inline %s %s_init(a0_alloc_Allocator a) {\n    %s l = {0};\n    l.alloc = a;\n    return l;\n}\n\n",
               n, n, n);
     }
@@ -986,9 +1175,169 @@ static void define_list_ops(StrBuf *out, const Type *t) {
     if (t->used & USE_LIST_CLEAR) {
         sb_printf(out, "static inline void %s_clear(%s *self) {\n    self->len = 0;\n}\n\n", n, n);
     }
+    if (t->used & USE_LIST_POP) {
+        const char *opt = t->elem->optional_cache->c_name;
+        sb_printf(out,
+                  "static inline %s %s_pop(%s *self) {\n    %s r = {0};\n    if (self->len > 0) {\n"
+                  "        r.has = true;\n        r.value = self->data[--self->len];\n    }\n    return r;\n}\n\n",
+                  opt, n, n, opt);
+    }
     if (t->used & USE_LIST_ITEMS) {
         sb_printf(out, "static inline %s %s_items(%s *self) {\n    %s s = {self->data, self->len};\n    return s;\n}\n\n",
               t->elem->slice_cache[0]->c_name, n, n, t->elem->slice_cache[0]->c_name);
+    }
+}
+
+// The hash of a Map key (§5.5 key types).
+static const char *hash(const Type *t, const char *v) {
+    switch (t->kind) {
+    case TY_ENUM:
+        return arena_printf("a0_hash_word((uint64_t)%s.tag)", v);
+    case TY_STRUCT:
+        return arena_printf("a0_hash_%s(%s)", t->c_name, v);
+    default:
+        return arena_printf("a0_hash_word((uint64_t)%s)", v);
+    }
+}
+
+static void use_hash(const Type *t) {
+    if (t->kind != TY_STRUCT || (t->used & USE_HASH)) {
+        return;
+    }
+    use(t, USE_HASH);
+    for (int i = 0; i < t->nfields; i++) {
+        use_hash(t->fields[i].type);
+    }
+}
+
+static void define_hash(StrBuf *out, const Type *t) {
+    sb_printf(out, "static inline uint64_t a0_hash_%s(%s v) {\n    uint64_t h = 0;\n    (void)v;\n", t->c_name, t->c_name);
+    for (int i = 0; i < t->nfields; i++) {
+        sb_printf(out, "    h = a0_hash_mix(h, %s);\n", hash(t->fields[i].type, arena_printf("v.%s", t->fields[i].c_name)));
+    }
+    sb_puts(out, "    return h;\n}\n\n");
+}
+
+// Operations of alloc.Map(K, V) (§11): entries stay in insertion order; the
+// slots index them by hash, with linear probing. A put keeps at least half of
+// the slots empty, counting removed entries, so every probe ends.
+static void define_map_ops(StrBuf *out, const Type *t) {
+    const char *n = t->c_name;
+    const char *k = c_type(t->key);
+    const char *v = c_type(t->elem);
+    const char *opt = t->elem->optional_cache->c_name;
+    bool find = t->used & (USE_MAP_PUT | USE_MAP_GET | USE_MAP_REMOVE);
+    if (find) {
+        use_hash(t->key);
+    }
+    if (t->used & USE_INIT) {
+        sb_printf(out, "static inline %s %s_init(a0_alloc_Allocator a) {\n    %s m = {0};\n    m.alloc = a;\n    return m;\n}\n\n",
+                  n, n, n);
+    }
+    if (find) {
+        sb_printf(out,
+                  "static inline uint64_t %s_find(%s *self, %s key, bool *found) {\n"
+                  "    uint64_t mask = self->nslots - 1;\n"
+                  "    uint64_t i = %s & mask;\n"
+                  "    uint64_t free = UINT64_MAX;\n"
+                  "    for (;;) {\n"
+                  "        uint64_t s = self->slots[i];\n"
+                  "        if (s == 0) {\n"
+                  "            *found = false;\n"
+                  "            return free != UINT64_MAX ? free : i;\n"
+                  "        }\n"
+                  "        if (s == UINT64_MAX) {\n"
+                  "            if (free == UINT64_MAX) {\n"
+                  "                free = i;\n"
+                  "            }\n"
+                  "        } else if (%s) {\n"
+                  "            *found = true;\n"
+                  "            return i;\n"
+                  "        }\n"
+                  "        i = (i + 1) & mask;\n"
+                  "    }\n"
+                  "}\n\n",
+                  n, n, k, hash(t->key, "key"), equal(t->key, "self->entries[s - 1].key", "key"));
+    }
+    if (t->used & USE_MAP_PUT) {
+        sb_printf(out,
+                  "static inline void %s_rebuild(%s *self, uint64_t nslots) {\n"
+                  "    uint64_t live = 0;\n"
+                  "    for (uint64_t i = 0; i < self->len; i++) {\n"
+                  "        if (self->entries[i].live) {\n"
+                  "            self->entries[live++] = self->entries[i];\n"
+                  "        }\n"
+                  "    }\n"
+                  "    self->len = live;\n"
+                  "    self->slots = a0_realloc(self->alloc, self->slots, nslots, sizeof(uint64_t));\n"
+                  "    self->nslots = nslots;\n"
+                  "    for (uint64_t i = 0; i < nslots; i++) {\n"
+                  "        self->slots[i] = 0;\n"
+                  "    }\n"
+                  "    for (uint64_t i = 0; i < live; i++) {\n"
+                  "        bool found;\n"
+                  "        self->slots[%s_find(self, self->entries[i].key, &found)] = i + 1;\n"
+                  "    }\n"
+                  "}\n\n",
+                  n, n, n);
+        sb_printf(out,
+                  "static inline void %s_put(%s *self, %s key, %s value) {\n"
+                  "    if ((self->len + 1) * 2 > self->nslots) {\n"
+                  "        uint64_t nslots = 16;\n"
+                  "        while (nslots < (self->live + 1) * 4) {\n"
+                  "            nslots *= 2;\n"
+                  "        }\n"
+                  "        %s_rebuild(self, nslots);\n"
+                  "    }\n"
+                  "    bool found;\n"
+                  "    uint64_t s = %s_find(self, key, &found);\n"
+                  "    if (found) {\n"
+                  "        self->entries[self->slots[s] - 1].value = value;\n"
+                  "        return;\n"
+                  "    }\n"
+                  "    if (self->len == self->cap) {\n"
+                  "        self->cap = self->cap ? self->cap * 2 : 8;\n"
+                  "        self->entries = a0_realloc(self->alloc, self->entries, self->cap, sizeof *self->entries);\n"
+                  "    }\n"
+                  "    self->entries[self->len].key = key;\n"
+                  "    self->entries[self->len].value = value;\n"
+                  "    self->entries[self->len].live = true;\n"
+                  "    self->slots[s] = ++self->len;\n"
+                  "    self->live++;\n"
+                  "}\n\n",
+                  n, n, k, v, n, n);
+    }
+    if (t->used & USE_MAP_GET) {
+        sb_printf(out,
+                  "static inline %s %s_get(%s *self, %s key) {\n"
+                  "    %s r = {0};\n"
+                  "    bool found = false;\n"
+                  "    uint64_t s = self->nslots ? %s_find(self, key, &found) : 0;\n"
+                  "    if (found) {\n"
+                  "        r.has = true;\n"
+                  "        r.value = self->entries[self->slots[s] - 1].value;\n"
+                  "    }\n"
+                  "    return r;\n"
+                  "}\n\n",
+                  opt, n, n, k, opt, n);
+    }
+    if (t->used & USE_MAP_REMOVE) {
+        sb_printf(out,
+                  "static inline %s %s_remove(%s *self, %s key) {\n"
+                  "    %s r = {0};\n"
+                  "    bool found = false;\n"
+                  "    uint64_t s = self->nslots ? %s_find(self, key, &found) : 0;\n"
+                  "    if (found) {\n"
+                  "        uint64_t e = self->slots[s] - 1;\n"
+                  "        r.has = true;\n"
+                  "        r.value = self->entries[e].value;\n"
+                  "        self->entries[e].live = false;\n"
+                  "        self->slots[s] = UINT64_MAX;\n"
+                  "        self->live--;\n"
+                  "    }\n"
+                  "    return r;\n"
+                  "}\n\n",
+                  opt, n, n, k, opt, n);
     }
 }
 
@@ -1080,19 +1429,31 @@ void emit_program(Program *p, StrBuf *out) {
     for (size_t i = 0; i < types->len; i++) {
         define_type(out, types->items[i], &done);
     }
+    // Container operations go after the equality and hash helpers they
+    // call; generating them first records which of those are used.
+    StrBuf ops = {0};
+    sb_add(&ops, "", 0);
     for (size_t i = 0; i < types->len; i++) {
         const Type *t = types->items[i];
         if (t->kind == TY_LIST) {
-            define_list_ops(out, t);
+            define_list_ops(&ops, t);
+        } else if (t->kind == TY_MAP) {
+            define_map_ops(&ops, t);
         }
     }
-    // Struct equality, in definition order so that a struct's fields come first.
+    // Struct equality and hashing, in definition order so that a struct's
+    // fields come first.
     for (size_t i = 0; i < done.len; i++) {
         const Type *t = done.items[i];
         if (t->kind == TY_STRUCT && (t->used & USE_EQ)) {
             define_equality(out, t);
         }
+        if (t->kind == TY_STRUCT && (t->used & USE_HASH)) {
+            define_hash(out, t);
+        }
     }
+    sb_add(out, ops.data, ops.len);
+    free(ops.data);
 
     for (size_t i = 0; i < fns.len; i++) {
         sb_printf(out, "%s;\n", signature(fns.items[i]));
