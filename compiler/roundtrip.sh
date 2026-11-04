@@ -10,6 +10,10 @@ trap 'rm -f "$out"' EXIT
 count=0
 failed=0
 for f in $(find "$@" -name '*.arche' | sort); do
+    # A file that is not UTF-8 has no syntax tree.
+    if ! iconv -f UTF-8 -t UTF-8 "$f" > /dev/null 2>&1; then
+        continue
+    fi
     count=$((count + 1))
     "$arche" cst "$f" > "$out" 2>/dev/null
     if ! cmp -s "$f" "$out"; then

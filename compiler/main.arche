@@ -127,10 +127,10 @@ fn check(
 ) -> ExitError!void {
     let source = try read(fs, err_out, path, a);
     let text = source.view();
-    var diags = diag.Diagnostics.init(a);
-    let tokens = lexer.lex(text, &mut diags, a);
-    let tree = parser.parse(text, &tokens, &mut diags, a);
-    _ = tree;
+    var lexed = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(text, &mut lexed, a);
+    let parsed = parser.parse(tokens, text, lexed, a);
+    let diags = parsed.diags;
     if json {
         diag.write_json(out, &diags, path: path, text: text);
     } else {
@@ -153,10 +153,10 @@ fn dump_tokens(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: a
 fn print_cst(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> ExitError!void {
     let source = try read(fs, err_out, path, a);
     let text = source.view();
-    var diags = diag.Diagnostics.init(a);
-    let tokens = lexer.lex(text, &mut diags, a);
-    let tree = parser.parse(text, &tokens, &mut diags, a);
-    cst.write_source(out, &tree, &tokens, text);
+    var lexed = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(text, &mut lexed, a);
+    let parsed = parser.parse(tokens, text, lexed, a);
+    cst.write_source(out, &parsed.tree, text);
 }
 
 fn main(sys: &mut std.System) -> !void {

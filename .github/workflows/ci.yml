@@ -19,3 +19,9 @@ jobs:
         run: make -C conformance selftest CC=${{ matrix.cc }}
       - name: Conformance tests
         run: make -C conformance check CC=${{ matrix.cc }}
+      - name: Build the Arche compiler with stage0
+        run: make -C compiler CC=${{ matrix.cc }}
+      - name: Compiler tests
+        run: make -C compiler check CC=${{ matrix.cc }}
+      - name: Fuzz the parser
+        run: cd /tmp && python3 -I $GITHUB_WORKSPACE/compiler/fuzz.py $GITHUB_WORKSPACE/compiler/build/arche 60

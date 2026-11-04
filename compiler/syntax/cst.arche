@@ -1,23 +1,194 @@
-/// The concrete syntax tree. Each node covers a run of tokens, and the
-/// children of a node cover runs inside it, so writing the tokens in tree
-/// order gives the file back (S5: lossless).
+/// The concrete syntax tree.
+///
+/// A node covers a run of tokens [first, end). Its children cover runs
+/// inside it, in order and without overlap; whatever lies between them, such
+/// as punctuation, whitespace and comments, belongs to the node itself. So
+/// writing the tokens in tree order gives the file back, byte for byte
+/// (S5: a lossless CST). Nodes link to each other with NodeId handles into
+/// Tree.nodes, and a node's children are a range of Tree.children.
 import std;
 import alloc;
 import syntax.token as tk;
 
 pub type NodeId = struct { pub index: u32 }
 
-pub type Tree = struct {
-    pub tokens: u32,
+pub type Kind = enum {
+    File,
+    Import,
+    FnDecl,
+    Param,
+    ConstDecl,
+    TypeDecl,
+    FieldDecl,
+    Variant,
+    TestDecl,
+    TypePath,
+    TypeRef,
+    TypeOptional,
+    TypeErrorUnion,
+    TypeSlice,
+    TypeArray,
+    Block,
+    LetStmt,
+    IfStmt,
+    WhileStmt,
+    MatchStmt,
+    MatchArm,
+    ReturnStmt,
+    BreakStmt,
+    ContinueStmt,
+    DeferStmt,
+    ExprStmt,
+    AssignStmt,
+    DiscardStmt,
+    IntLit,
+    CharLit,
+    StringLit,
+    BoolLit,
+    NoneLit,
+    SomeExpr,
+    NameExpr,
+    ParenExpr,
+    ArrayLit,
+    FieldExpr,
+    CallExpr,
+    Arg,
+    IndexExpr,
+    SliceExpr,
+    DerefExpr,
+    StructLit,
+    FieldInit,
+    UnaryExpr,
+    BinaryExpr,
+    CastExpr,
+    TryExpr,
+    CatchExpr,
+    OrelseExpr,
+    RefExpr,
+    WildcardPat,
+    BindPat,
+    LitPat,
+    RangePat,
+    BoolPat,
+    NonePat,
+    SomePat,
+    OkPat,
+    ErrPat,
+    VariantPat,
+    FieldPat,
+    /// Text the parser could not make sense of; a diagnostic says why.
+    Error,
 }
 
-/// The file again, from the tree.
-pub fn write_source(out: &mut std.Output, tree: &Tree, tokens: &alloc.List(tk.Token), text: str) {
-    _ = tree;
-    let items = tokens.items();
-    var i: usize = 0;
-    while i < items.len() : (i += 1) {
-        let t = items[i];
+pub type Node = struct {
+    pub kind: Kind,
+    pub first: u32,
+    pub end: u32,
+    pub children_start: u32,
+    pub children_len: u32,
+}
+
+pub type Tree = struct {
+    pub tokens: alloc.List(tk.Token),
+    pub nodes: alloc.List(Node),
+    pub children: alloc.List(NodeId),
+    pub root: NodeId,
+
+    pub fn node(self: &Tree, id: NodeId) -> Node {
+        return self.nodes[id.index as usize];
+    }
+
+    pub fn child(self: &Tree, n: Node, i: u32) -> NodeId {
+        return self.children[(n.children_start + i) as usize];
+    }
+}
+
+/// Where a node began: what open() returned.
+pub type Mark = struct {
+    pub stack_len: u32,
+    pub first: u32,
+}
+
+/// Builds a tree bottom-up. A node's children are the nodes closed since
+/// it was opened; they wait on a stack until their parent closes.
+pub type Builder = struct {
+    pub nodes: alloc.List(Node),
+    pub children: alloc.List(NodeId),
+    stack: alloc.List(NodeId),
+
+    pub fn init(a: alloc.Allocator) -> Builder {
+        return Builder {
+            nodes: alloc.List(Node).init(a),
+            children: alloc.List(NodeId).init(a),
+            stack: alloc.List(NodeId).init(a),
+        };
+    }
+
+    pub fn open(self: &Builder, first: u32) -> Mark {
+        return Mark { stack_len: self.stack.len() as u32, first: first };
+    }
+
+    /// Closes the node opened at m, covering tokens [m.first, end).
+    pub fn close(self: &mut Builder, m: Mark, kind: Kind, end: u32) -> NodeId {
+        let start = self.children.len() as u32;
+        let waiting = self.stack.items();
+        var i = m.stack_len as usize;
+        while i < waiting.len() : (i += 1) {
+            self.children.push(waiting[i]);
+        }
+        let count = self.children.len() as u32 - start;
+        var k: u32 = 0;
+        while k < count : (k += 1) {
+            _ = self.stack.pop();
+        }
+        // A node ends where its tokens end, and never before its children:
+        // an empty child sits where the parser stood, past trivia.
+        var last = end;
+        if last < m.first {
+            last = m.first;
+        }
+        if count > 0 {
+            let c = self.nodes[self.children[(start + count - 1) as usize].index as usize];
+            if c.end > last {
+                last = c.end;
+            }
+        }
+        let id = NodeId { index: self.nodes.len() as u32 };
+        self.nodes.push(Node { kind: kind, first: m.first, end: last, children_start: start, children_len: count });
+        self.stack.push(id);
+        return id;
+    }
+}
+
+/// The file again: every token in tree order.
+pub fn write_source(out: &mut std.Output, tree: &Tree, text: str) {
+    let end = write_node(out, tree, tree.root, text);
+    if end != tree.tokens.len() as u32 {
+        panic("internal error: the syntax tree does not cover every token");
+    }
+}
+
+fn write_tokens(out: &mut std.Output, tree: &Tree, text: str, from: u32, to: u32) {
+    var i = from;
+    while i < to : (i += 1) {
+        let t = tree.tokens[i as usize];
         out.write(text[t.start as usize..(t.start + t.len) as usize]);
     }
+}
+
+fn write_node(out: &mut std.Output, tree: &Tree, id: NodeId, text: str) -> u32 {
+    let n = tree.node(id);
+    var at = n.first;
+    var i: u32 = 0;
+    while i < n.children_len : (i += 1) {
+        let c = tree.node(tree.child(n, i));
+        if c.first < at or c.end > n.end {
+            panic("internal error: a syntax node is out of order");
+        }
+        write_tokens(out, tree, text, from: at, to: c.first);
+        _ = write_node(out, tree, tree.child(n, i), text);
+        at = c.end;
+    }
+    write_tokens(out, tree, text, from: at, to: n.end);
+    return n.end;
 }

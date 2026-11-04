@@ -227,8 +227,16 @@ fn hex_digit(c: u8) -> u64 {
     }
 }
 
-/// The escape at text[at] == '\\' (§2.2).
+/// The escape at text[at] == '\\' (§2.2), ending no later than the text.
 fn lex_escape(text: str, at: usize, in_string: bool, diags: &mut diag.Diagnostics) -> Escape {
+    var e = lex_escape_raw(text, at, in_string, diags);
+    if e.end > text.len() {
+        e.end = text.len();
+    }
+    return e;
+}
+
+fn lex_escape_raw(text: str, at: usize, in_string: bool, diags: &mut diag.Diagnostics) -> Escape {
     let c = byte_at(text, at + 1);
     match c {
         'n' => { return Escape { value: 10, end: at + 2 }; }

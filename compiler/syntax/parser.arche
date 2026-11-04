@@ -1,12 +1,1117 @@
-/// The parser: spec/arche-0.md §14.
+/// The parser: the grammar of spec/arche-0.md §14, building a lossless CST.
+///
+/// Recovery: when a token does not fit, the parser reports it (E0201 or a
+/// more specific code), wraps what it skips in an Error node, and goes on.
+/// Every loop makes progress, so the parser always reaches the end of the
+/// file, and one run reports every syntax error it can find.
 import alloc;
+import codes;
 import diag;
 import syntax.cst;
 import syntax.token as tk;
 
-pub fn parse(text: str, tokens: &alloc.List(tk.Token), diags: &mut diag.Diagnostics, a: alloc.Allocator) -> cst.Tree {
-    _ = text;
-    _ = diags;
-    _ = a;
-    return cst.Tree { tokens: tokens.len() as u32 };
+/// What parse returns: the tree, and the diagnostics given to it, with any
+/// it added.
+pub type Parsed = struct {
+    pub tree: cst.Tree,
+    pub diags: diag.Diagnostics,
+}
+
+type Parser = struct {
+    tokens: alloc.List(tk.Token),
+    /// A copy of the source, for messages that quote it.
+    text: alloc.String,
+    diags: diag.Diagnostics,
+    b: cst.Builder,
+    /// The next token that is not trivia.
+    pos: u32,
+    /// One past the last token consumed: where the node being built ends.
+    last_end: u32,
+    /// A struct literal cannot be an if/while condition or a match
+    /// scrutinee unless it is in parentheses (§7.4).
+    no_struct_lit: bool,
+}
+
+pub fn parse(tokens: alloc.List(tk.Token), text: str, diags: diag.Diagnostics, a: alloc.Allocator) -> Parsed {
+    var copy = alloc.String.init(a);
+    copy.push_str(text);
+    var p = Parser {
+        tokens: tokens,
+        text: copy,
+        diags: diags,
+        b: cst.Builder.init(a),
+        pos: 0,
+        last_end: 0,
+        no_struct_lit: false,
+    };
+    skip_trivia(&mut p);
+    let m = p.b.open(0);
+    parse_file(&mut p);
+    let root = p.b.close(m, cst.Kind.File, p.tokens.len() as u32);
+    return finish(p, root);
+}
+
+/// Moves the parts of the parser into the result. A struct's fields are
+/// moved out one by one: the parser is a local, so §5.5 allows it.
+fn finish(p: Parser, root: cst.NodeId) -> Parsed {
+    let tree = cst.Tree { tokens: p.tokens, nodes: p.b.nodes, children: p.b.children, root: root };
+    return Parsed { tree: tree, diags: p.diags };
+}
+
+// ---- tokens -----------------------------------------------------------------
+
+fn skip_trivia(p: &mut Parser) {
+    while p.tokens[p.pos as usize].kind.is_trivia() {
+        p.pos += 1;
+    }
+}
+
+fn peek(p: &Parser) -> tk.Kind {
+    return p.tokens[p.pos as usize].kind;
+}
+
+/// The kind of the significant token after the next one.
+fn peek_second(p: &Parser) -> tk.Kind {
+    var i = p.pos;
+    if p.tokens[i as usize].kind == tk.Kind.Eof {
+        return tk.Kind.Eof;
+    }
+    i += 1;
+    while p.tokens[i as usize].kind.is_trivia() : (i += 1) {
+    }
+    return p.tokens[i as usize].kind;
+}
+
+fn at(p: &Parser, k: tk.Kind) -> bool {
+    return peek(p) == k;
+}
+
+fn advance(p: &mut Parser) {
+    if at(p, tk.Kind.Eof) {
+        return;
+    }
+    p.pos += 1;
+    p.last_end = p.pos;
+    skip_trivia(p);
+}
+
+fn accept(p: &mut Parser, k: tk.Kind) -> bool {
+    if at(p, k) {
+        advance(p);
+        return true;
+    }
+    return false;
+}
+
+fn token_span(p: &Parser, i: u32) -> diag.Span {
+    let t = p.tokens[i as usize];
+    return diag.Span { start: t.start, len: t.len };
+}
+
+fn here(p: &Parser) -> diag.Span {
+    return token_span(p, p.pos);
+}
+
+fn open(p: &Parser) -> cst.Mark {
+    return p.b.open(p.pos);
+}
+
+fn close(p: &mut Parser, m: cst.Mark, kind: cst.Kind) -> cst.NodeId {
+    return p.b.close(m, kind, p.last_end);
+}
+
+/// How a message names the next token: "'fn'", or "identifier 'x'".
+fn describe_next(p: &Parser, m: &mut alloc.String) {
+    let t = p.tokens[p.pos as usize];
+    if t.kind == tk.Kind.Ident {
+        m.push_str("identifier '");
+        m.push_str(p.text.view()[t.start as usize..(t.start + t.len) as usize]);
+        m.push_str("'");
+    } else {
+        m.push_str(tk.describe(t.kind));
+    }
+}
+
+fn report_here(p: &mut Parser, code: u16, message: str) {
+    let s = here(p);
+    p.diags.report(code, s, message);
+}
+
+/// E0201: "expected <what>, found <the next token>".
+fn unexpected(p: &mut Parser, what: str) {
+    var m = p.diags.new_message();
+    m.push_str("expected ");
+    m.push_str(what);
+    m.push_str(", found ");
+    describe_next(p, &mut m);
+    let s = here(p);
+    p.diags.report_owned(codes.UNEXPECTED_TOKEN, s, m);
+}
+
+/// Consumes a k, or reports that one is missing and goes on as if it were
+/// there.
+fn expect(p: &mut Parser, k: tk.Kind, what: str) -> bool {
+    if accept(p, k) {
+        return true;
+    }
+    unexpected(p, what);
+    return false;
+}
+
+/// After an error: wraps the tokens up to one of the stop kinds (not
+/// included) in an Error node, so that parsing can go on from there.
+fn skip_to(p: &mut Parser, stop_a: tk.Kind, stop_b: tk.Kind) {
+    let m = open(p);
+    var depth: u32 = 0;
+    while not at(p, tk.Kind.Eof) {
+        let k = peek(p);
+        if depth == 0 and (k == stop_a or k == stop_b) {
+            break;
+        }
+        if k == tk.Kind.LBrace or k == tk.Kind.LParen or k == tk.Kind.LBracket {
+            depth += 1;
+        } else if k == tk.Kind.RBrace or k == tk.Kind.RParen or k == tk.Kind.RBracket {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        }
+        advance(p);
+    }
+    _ = close(p, m, cst.Kind.Error);
+}
+
+/// Consumes one token as an Error node, unless it closes something.
+fn skip_one(p: &mut Parser) {
+    let k = peek(p);
+    if k == tk.Kind.Eof or k == tk.Kind.RBrace or k == tk.Kind.RParen or k == tk.Kind.RBracket {
+        return;
+    }
+    let m = open(p);
+    advance(p);
+    _ = close(p, m, cst.Kind.Error);
+}
+
+// ---- items ------------------------------------------------------------------
+
+fn parse_file(p: &mut Parser) {
+    while at(p, tk.Kind.KwImport) {
+        parse_import(p);
+    }
+    while not at(p, tk.Kind.Eof) {
+        let before = p.pos;
+        parse_item(p);
+        if p.pos == before {
+            skip_one_or_brace(p);
+        }
+    }
+}
+
+/// Makes progress at top level, where a stray '}' cannot close anything.
+fn skip_one_or_brace(p: &mut Parser) {
+    let m = open(p);
+    advance(p);
+    _ = close(p, m, cst.Kind.Error);
+}
+
+fn parse_import(p: &mut Parser) {
+    let m = open(p);
+    advance(p);
+    if expect(p, tk.Kind.Ident, "a module path") {
+        while accept(p, tk.Kind.Dot) {
+            _ = expect(p, tk.Kind.Ident, "a module name");
+        }
+        if accept(p, tk.Kind.KwAs) {
+            _ = expect(p, tk.Kind.Ident, "a name after 'as'");
+        }
+    }
+    if not accept(p, tk.Kind.Semi) {
+        unexpected(p, "';'");
+        skip_to(p, tk.Kind.Semi, tk.Kind.KwImport);
+        _ = accept(p, tk.Kind.Semi);
+    }
+    _ = close(p, m, cst.Kind.Import);
+}
+
+fn parse_item(p: &mut Parser) {
+    let m = open(p);
+    let k = peek(p);
+    if k == tk.Kind.KwImport {
+        report_here(p, codes.LATE_IMPORT, "imports must come before every other item");
+        parse_import(p);
+        return;
+    }
+    if k == tk.Kind.KwTest {
+        advance(p);
+        _ = expect(p, tk.Kind.String, "a test name");
+        parse_block(p);
+        _ = close(p, m, cst.Kind.TestDecl);
+        return;
+    }
+    let is_pub = accept(p, tk.Kind.KwPub);
+    match peek(p) {
+        .KwFn => {
+            parse_fn(p, m);
+        }
+        .KwConst => {
+            parse_const(p, m);
+        }
+        .KwType => {
+            parse_type_decl(p, m);
+        }
+        .KwVar | .KwLet => {
+            report_here(p, codes.MODULE_BINDING, "a module has no 'var' or 'let' bindings; use 'const' for a module-level value");
+            skip_to(p, tk.Kind.Semi, tk.Kind.RBrace);
+            _ = accept(p, tk.Kind.Semi);
+            _ = close(p, m, cst.Kind.Error);
+        }
+        .KwTest | .KwImport => {
+            report_here(p, codes.PUB_NOT_ALLOWED, "'pub' goes only before 'fn', 'const' and 'type'");
+            _ = close(p, m, cst.Kind.Error);
+        }
+        _ => {
+            if is_pub {
+                unexpected(p, "'fn', 'const' or 'type' after 'pub'");
+            } else {
+                unexpected(p, "an item: 'fn', 'const', 'type' or 'test'");
+            }
+            skip_to_item(p);
+            _ = close(p, m, cst.Kind.Error);
+        }
+    }
+}
+
+/// After an error at top level: up to the start of the next item.
+fn skip_to_item(p: &mut Parser) {
+    while not at(p, tk.Kind.Eof) {
+        match peek(p) {
+            .KwFn | .KwConst | .KwType | .KwTest | .KwPub | .KwImport => { return; }
+            .LBrace => {
+                let m = open(p);
+                skip_braced(p);
+                _ = close(p, m, cst.Kind.Error);
+            }
+            _ => { advance(p); }
+        }
+    }
+}
+
+/// Consumes a balanced { ... }.
+fn skip_braced(p: &mut Parser) {
+    var depth: u32 = 0;
+    while not at(p, tk.Kind.Eof) {
+        let k = peek(p);
+        advance(p);
+        if k == tk.Kind.LBrace {
+            depth += 1;
+        } else if k == tk.Kind.RBrace {
+            depth -= 1;
+            if depth == 0 {
+                return;
+            }
+        }
+    }
+}
+
+fn parse_fn(p: &mut Parser, m: cst.Mark) {
+    advance(p);
+    if not expect(p, tk.Kind.Ident, "a function name") {
+        skip_to_item(p);
+        _ = close(p, m, cst.Kind.FnDecl);
+        return;
+    }
+    if expect(p, tk.Kind.LParen, "'('") {
+        while not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Eof) and not at(p, tk.Kind.LBrace) {
+            let pm = open(p);
+            if not expect(p, tk.Kind.Ident, "a parameter name") {
+                skip_to(p, tk.Kind.Comma, tk.Kind.RParen);
+            } else if expect(p, tk.Kind.Colon, "':' and the parameter's type") {
+                parse_type(p);
+            }
+            _ = close(p, pm, cst.Kind.Param);
+            if not accept(p, tk.Kind.Comma) {
+                break;
+            }
+        }
+        _ = expect(p, tk.Kind.RParen, "',' or ')'");
+    }
+    if accept(p, tk.Kind.Arrow) {
+        parse_type(p);
+    }
+    parse_block(p);
+    _ = close(p, m, cst.Kind.FnDecl);
+}
+
+fn parse_const(p: &mut Parser, m: cst.Mark) {
+    advance(p);
+    _ = expect(p, tk.Kind.Ident, "a constant name");
+    if expect(p, tk.Kind.Colon, "':' and the constant's type") {
+        parse_type(p);
+    }
+    if expect(p, tk.Kind.Assign, "'='") {
+        parse_expr(p);
+    }
+    end_statement(p);
+    _ = close(p, m, cst.Kind.ConstDecl);
+}
+
+fn parse_field(p: &mut Parser) {
+    let m = open(p);
+    _ = accept(p, tk.Kind.KwPub);
+    advance(p);
+    if expect(p, tk.Kind.Colon, "':' and the field's type") {
+        parse_type(p);
+    }
+    _ = close(p, m, cst.Kind.FieldDecl);
+}
+
+/// Fields and methods of a struct body, or the methods after an enum's
+/// variants (§4).
+fn parse_members(p: &mut Parser, is_struct: bool) {
+    var seen_method = false;
+    while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {
+        let before = p.pos;
+        let m = open(p);
+        let next = peek_second(p);
+        if at(p, tk.Kind.KwFn) or (at(p, tk.Kind.KwPub) and next == tk.Kind.KwFn) {
+            _ = accept(p, tk.Kind.KwPub);
+            parse_fn(p, m);
+            seen_method = true;
+        } else if at(p, tk.Kind.Ident) or (at(p, tk.Kind.KwPub) and next == tk.Kind.Ident) {
+            if not is_struct {
+                report_here(p, codes.ENUM_FIELD, "an enum lists its variants first, separated by ',', then its methods");
+            } else if seen_method {
+                report_here(p, codes.FIELD_AFTER_METHOD, "a struct lists its fields before its methods");
+            }
+            parse_field(p);
+            if not at(p, tk.Kind.RBrace) {
+                _ = expect(p, tk.Kind.Comma, "',' after the field");
+            }
+        } else {
+            unexpected(p, "a field or 'fn'");
+            skip_to(p, tk.Kind.Comma, tk.Kind.RBrace);
+            _ = accept(p, tk.Kind.Comma);
+        }
+        if p.pos == before {
+            skip_one(p);
+            if p.pos == before {
+                return; // a ')' or ']' that closes nothing: the caller's '}' check reports it
+            }
+        }
+    }
+}
+
+fn parse_type_decl(p: &mut Parser, m: cst.Mark) {
+    advance(p);
+    _ = expect(p, tk.Kind.Ident, "a type name");
+    if not expect(p, tk.Kind.Assign, "'='") {
+        skip_to_item(p);
+        _ = close(p, m, cst.Kind.TypeDecl);
+        return;
+    }
+    if accept(p, tk.Kind.KwStruct) {
+        if expect(p, tk.Kind.LBrace, "'{'") {
+            parse_members(p, true);
+            _ = expect(p, tk.Kind.RBrace, "'}'");
+        }
+    } else if accept(p, tk.Kind.KwEnum) {
+        if expect(p, tk.Kind.LBrace, "'{'") {
+            parse_variants(p);
+            parse_members(p, false);
+            _ = expect(p, tk.Kind.RBrace, "'}'");
+        }
+    } else if accept(p, tk.Kind.KwError) {
+        if expect(p, tk.Kind.LBrace, "'{'") {
+            if expect(p, tk.Kind.Ident, "an error name") {
+                while accept(p, tk.Kind.Comma) {
+                    if at(p, tk.Kind.RBrace) {
+                        break;
+                    }
+                    _ = expect(p, tk.Kind.Ident, "an error name");
+                }
+            }
+            if not accept(p, tk.Kind.RBrace) {
+                unexpected(p, "',' or '}'");
+                skip_to(p, tk.Kind.RBrace, tk.Kind.RBrace);
+                _ = accept(p, tk.Kind.RBrace);
+            }
+        }
+    } else {
+        parse_type(p);
+        end_statement(p);
+    }
+    _ = close(p, m, cst.Kind.TypeDecl);
+}
+
+fn parse_variants(p: &mut Parser) {
+    if not at(p, tk.Kind.Ident) {
+        unexpected(p, "a variant");
+        return;
+    }
+    while at(p, tk.Kind.Ident) {
+        let m = open(p);
+        advance(p);
+        if accept(p, tk.Kind.LBrace) {
+            if at(p, tk.Kind.RBrace) {
+                report_here(p, codes.EMPTY_VARIANT_FIELDS, "a variant written with '{ }' needs at least one field");
+            }
+            while at(p, tk.Kind.Ident) {
+                parse_field(p);
+                if not accept(p, tk.Kind.Comma) {
+                    break;
+                }
+            }
+            _ = expect(p, tk.Kind.RBrace, "',' or '}'");
+        }
+        _ = close(p, m, cst.Kind.Variant);
+        if not accept(p, tk.Kind.Comma) {
+            return;
+        }
+    }
+}
+
+/// The ';' that ends a statement or declaration; after an error, skips to it.
+fn end_statement(p: &mut Parser) {
+    if accept(p, tk.Kind.Semi) {
+        return;
+    }
+    unexpected(p, "';'");
+    skip_to(p, tk.Kind.Semi, tk.Kind.RBrace);
+    _ = accept(p, tk.Kind.Semi);
+}
+
+// ---- types ------------------------------------------------------------------
+
+fn parse_type(p: &mut Parser) {
+    let m = open(p);
+    match peek(p) {
+        .Question => {
+            advance(p);
+            parse_type(p);
+            _ = close(p, m, cst.Kind.TypeOptional);
+        }
+        .Bang => {
+            advance(p);
+            parse_type(p);
+            _ = close(p, m, cst.Kind.TypeErrorUnion);
+        }
+        .Amp => {
+            advance(p);
+            _ = accept(p, tk.Kind.KwMut);
+            parse_type(p);
+            _ = close(p, m, cst.Kind.TypeRef);
+        }
+        .LBracket => {
+            advance(p);
+            if accept(p, tk.Kind.RBracket) {
+                _ = accept(p, tk.Kind.KwMut);
+                parse_type(p);
+                _ = close(p, m, cst.Kind.TypeSlice);
+            } else {
+                parse_nested_expr(p);
+                _ = expect(p, tk.Kind.RBracket, "']'");
+                parse_type(p);
+                _ = close(p, m, cst.Kind.TypeArray);
+            }
+        }
+        .Ident => {
+            advance(p);
+            while accept(p, tk.Kind.Dot) {
+                _ = expect(p, tk.Kind.Ident, "a name");
+            }
+            if accept(p, tk.Kind.LParen) {
+                while not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Eof) {
+                    parse_type(p);
+                    if not accept(p, tk.Kind.Comma) {
+                        break;
+                    }
+                }
+                _ = expect(p, tk.Kind.RParen, "',' or ')'");
+            }
+            let path = close(p, m, cst.Kind.TypePath);
+            _ = path;
+            if accept(p, tk.Kind.Bang) {
+                parse_type(p);
+                _ = close(p, m, cst.Kind.TypeErrorUnion);
+            }
+        }
+        _ => {
+            unexpected(p, "a type");
+            _ = close(p, m, cst.Kind.Error);
+        }
+    }
+}
+
+// ---- statements -------------------------------------------------------------
+
+fn parse_block(p: &mut Parser) {
+    let m = open(p);
+    if not expect(p, tk.Kind.LBrace, "'{'") {
+        _ = close(p, m, cst.Kind.Block);
+        return;
+    }
+    let saved = p.no_struct_lit;
+    p.no_struct_lit = false;
+    while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {
+        let before = p.pos;
+        parse_stmt(p);
+        if p.pos == before {
+            skip_one(p);
+            if p.pos == before {
+                break; // a ')' or ']' that closes nothing: the '}' check reports it
+            }
+        }
+    }
+    p.no_struct_lit = saved;
+    _ = expect(p, tk.Kind.RBrace, "'}'");
+    _ = close(p, m, cst.Kind.Block);
+}
+
+fn is_assign_op(k: tk.Kind) -> bool {
+    match k {
+        .Assign | .PlusAssign | .MinusAssign | .StarAssign | .SlashAssign | .PercentAssign | .PlusWrapAssign
+        | .MinusWrapAssign | .StarWrapAssign | .AmpAssign | .PipeAssign | .CaretAssign | .ShlAssign | .ShrAssign => {
+            return true;
+        }
+        _ => { return false; }
+    }
+}
+
+/// simple = "_" "=" expr | expr [ assign_op expr ]. Returns false for a
+/// discard, which a while step cannot be.
+fn parse_simple(p: &mut Parser) -> bool {
+    let m = open(p);
+    if accept(p, tk.Kind.Underscore) {
+        _ = expect(p, tk.Kind.Assign, "'=' after '_'");
+        parse_expr(p);
+        _ = close(p, m, cst.Kind.DiscardStmt);
+        return false;
+    }
+    parse_expr(p);
+    if is_assign_op(peek(p)) {
+        advance(p);
+        parse_expr(p);
+        _ = close(p, m, cst.Kind.AssignStmt);
+    } else {
+        _ = close(p, m, cst.Kind.ExprStmt);
+    }
+    return true;
+}
+
+fn parse_condition(p: &mut Parser) {
+    let saved = p.no_struct_lit;
+    p.no_struct_lit = true;
+    parse_expr(p);
+    p.no_struct_lit = saved;
+}
+
+fn parse_if(p: &mut Parser, m: cst.Mark) {
+    advance(p);
+    parse_condition(p);
+    parse_block(p);
+    if accept(p, tk.Kind.KwElse) {
+        if at(p, tk.Kind.KwIf) {
+            let em = open(p);
+            parse_if(p, em);
+        } else {
+            parse_block(p);
+        }
+    }
+    _ = close(p, m, cst.Kind.IfStmt);
+}
+
+fn parse_stmt(p: &mut Parser) {
+    let m = open(p);
+    match peek(p) {
+        .KwLet | .KwVar => {
+            advance(p);
+            _ = expect(p, tk.Kind.Ident, "a name");
+            if accept(p, tk.Kind.Colon) {
+                parse_type(p);
+            }
+            if expect(p, tk.Kind.Assign, "'=': every binding is initialized") {
+                parse_expr(p);
+            }
+            end_statement(p);
+            _ = close(p, m, cst.Kind.LetStmt);
+        }
+        .KwIf => {
+            parse_if(p, m);
+        }
+        .KwWhile => {
+            advance(p);
+            parse_condition(p);
+            if accept(p, tk.Kind.Colon) {
+                if expect(p, tk.Kind.LParen, "'(' around the step") {
+                    let step = here(p);
+                    if not parse_simple(p) {
+                        p.diags.report(codes.DISCARD_STEP, step, "a while step is an assignment or an expression");
+                    }
+                    _ = expect(p, tk.Kind.RParen, "')'");
+                }
+            }
+            parse_block(p);
+            _ = close(p, m, cst.Kind.WhileStmt);
+        }
+        .KwMatch => {
+            advance(p);
+            parse_condition(p);
+            if expect(p, tk.Kind.LBrace, "'{'") {
+                while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {
+                    let before = p.pos;
+                    parse_arm(p);
+                    if p.pos == before {
+                        skip_one(p);
+                        if p.pos == before {
+                            break;
+                        }
+                    }
+                }
+                _ = expect(p, tk.Kind.RBrace, "'}'");
+            }
+            _ = close(p, m, cst.Kind.MatchStmt);
+        }
+        .KwReturn => {
+            advance(p);
+            if not at(p, tk.Kind.Semi) {
+                parse_expr(p);
+            }
+            end_statement(p);
+            _ = close(p, m, cst.Kind.ReturnStmt);
+        }
+        .KwBreak => {
+            advance(p);
+            end_statement(p);
+            _ = close(p, m, cst.Kind.BreakStmt);
+        }
+        .KwContinue => {
+            advance(p);
+            end_statement(p);
+            _ = close(p, m, cst.Kind.ContinueStmt);
+        }
+        .KwDefer => {
+            advance(p);
+            if at(p, tk.Kind.LBrace) {
+                parse_block(p);
+            } else {
+                _ = parse_simple(p);
+                end_statement(p);
+            }
+            _ = close(p, m, cst.Kind.DeferStmt);
+        }
+        .LBrace => {
+            parse_block(p);
+        }
+        _ => {
+            _ = parse_simple(p);
+            end_statement(p);
+        }
+    }
+}
+
+fn parse_arm(p: &mut Parser) {
+    let m = open(p);
+    parse_pattern(p);
+    while accept(p, tk.Kind.Pipe) {
+        parse_pattern(p);
+    }
+    if expect(p, tk.Kind.FatArrow, "'=>'") {
+        parse_block(p);
+    } else {
+        skip_to(p, tk.Kind.LBrace, tk.Kind.RBrace);
+        if at(p, tk.Kind.LBrace) {
+            parse_block(p);
+        }
+    }
+    _ = accept(p, tk.Kind.Comma);
+    _ = close(p, m, cst.Kind.MatchArm);
+}
+
+// ---- expressions ------------------------------------------------------------
+//
+// Each level parses its operands with the next level up and wraps them, from
+// the same mark, in a BinaryExpr: that is how a left-associative chain becomes
+// a tree without moving nodes.
+
+fn parse_nested_expr(p: &mut Parser) {
+    let saved = p.no_struct_lit;
+    p.no_struct_lit = false;
+    parse_expr(p);
+    p.no_struct_lit = saved;
+}
+
+fn parse_expr(p: &mut Parser) {
+    let m = open(p);
+    parse_or(p);
+    if at(p, tk.Kind.KwOrelse) or at(p, tk.Kind.KwCatch) {
+        let k = peek(p);
+        advance(p);
+        parse_expr(p); // right-associative
+        if k == tk.Kind.KwOrelse {
+            _ = close(p, m, cst.Kind.OrelseExpr);
+        } else {
+            _ = close(p, m, cst.Kind.CatchExpr);
+        }
+    }
+}
+
+/// Whether an operand of `or` is an unparenthesized `and` chain: they do not
+/// mix (§7.1).
+type Operand = struct {
+    is_and: bool,
+}
+
+fn parse_or(p: &mut Parser) {
+    let m = open(p);
+    var left = parse_and(p);
+    while at(p, tk.Kind.KwOr) {
+        let op = here(p);
+        advance(p);
+        let right = parse_and(p);
+        if left.is_and or right.is_and {
+            p.diags.report(codes.MIXED_LOGICAL, op, "'and' and 'or' cannot be mixed without parentheses");
+        }
+        _ = close(p, m, cst.Kind.BinaryExpr);
+        left = Operand { is_and: false };
+    }
+}
+
+fn parse_and(p: &mut Parser) -> Operand {
+    let m = open(p);
+    parse_cmp(p);
+    var any = false;
+    while accept(p, tk.Kind.KwAnd) {
+        parse_cmp(p);
+        _ = close(p, m, cst.Kind.BinaryExpr);
+        any = true;
+    }
+    return Operand { is_and: any };
+}
+
+fn is_comparison(k: tk.Kind) -> bool {
+    match k {
+        .EqEq | .NotEq | .Lt | .Le | .Gt | .Ge => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn parse_cmp(p: &mut Parser) {
+    let m = open(p);
+    parse_bit(p);
+    if is_comparison(peek(p)) {
+        advance(p);
+        parse_bit(p);
+        _ = close(p, m, cst.Kind.BinaryExpr);
+        if is_comparison(peek(p)) {
+            report_here(p, codes.CHAINED_COMPARISON, "comparisons do not chain; combine them with 'and'");
+            advance(p);
+            parse_bit(p);
+            _ = close(p, m, cst.Kind.BinaryExpr);
+        }
+    }
+}
+
+fn parse_bit(p: &mut Parser) {
+    let m = open(p);
+    parse_shift(p);
+    var first = tk.Kind.Eof;
+    while at(p, tk.Kind.Amp) or at(p, tk.Kind.Caret) or at(p, tk.Kind.Pipe) {
+        let k = peek(p);
+        if first != tk.Kind.Eof and k != first {
+            report_here(p, codes.MIXED_BITWISE, "'&', '^' and '|' cannot be mixed without parentheses");
+        }
+        first = k;
+        advance(p);
+        parse_shift(p);
+        _ = close(p, m, cst.Kind.BinaryExpr);
+    }
+}
+
+fn parse_shift(p: &mut Parser) {
+    let m = open(p);
+    parse_add(p);
+    while at(p, tk.Kind.Shl) or at(p, tk.Kind.Shr) {
+        advance(p);
+        parse_add(p);
+        _ = close(p, m, cst.Kind.BinaryExpr);
+    }
+}
+
+fn parse_add(p: &mut Parser) {
+    let m = open(p);
+    parse_mul(p);
+    while at(p, tk.Kind.Plus) or at(p, tk.Kind.Minus) or at(p, tk.Kind.PlusWrap) or at(p, tk.Kind.MinusWrap) {
+        advance(p);
+        parse_mul(p);
+        _ = close(p, m, cst.Kind.BinaryExpr);
+    }
+}
+
+fn parse_mul(p: &mut Parser) {
+    let m = open(p);
+    parse_cast(p);
+    while at(p, tk.Kind.Star) or at(p, tk.Kind.Slash) or at(p, tk.Kind.Percent) or at(p, tk.Kind.StarWrap) {
+        advance(p);
+        parse_cast(p);
+        _ = close(p, m, cst.Kind.BinaryExpr);
+    }
+}
+
+fn parse_cast(p: &mut Parser) {
+    let m = open(p);
+    parse_prefix(p);
+    while at(p, tk.Kind.KwAs) or at(p, tk.Kind.KwAsWrap) {
+        advance(p);
+        parse_type(p);
+        _ = close(p, m, cst.Kind.CastExpr);
+    }
+}
+
+fn parse_prefix(p: &mut Parser) {
+    let m = open(p);
+    match peek(p) {
+        .Minus | .Tilde | .KwNot => {
+            advance(p);
+            parse_prefix(p);
+            _ = close(p, m, cst.Kind.UnaryExpr);
+        }
+        .KwTry => {
+            advance(p);
+            parse_prefix(p);
+            _ = close(p, m, cst.Kind.TryExpr);
+        }
+        .Amp => {
+            advance(p);
+            _ = accept(p, tk.Kind.KwMut);
+            parse_prefix(p);
+            _ = close(p, m, cst.Kind.RefExpr);
+        }
+        _ => {
+            parse_postfix(p);
+        }
+    }
+}
+
+/// What parse_primary parsed: a path can take a struct literal (§7.4).
+fn parse_primary(p: &mut Parser) -> bool {
+    let m = open(p);
+    match peek(p) {
+        .Int => {
+            advance(p);
+            _ = close(p, m, cst.Kind.IntLit);
+        }
+        .Char => {
+            advance(p);
+            _ = close(p, m, cst.Kind.CharLit);
+        }
+        .String => {
+            advance(p);
+            _ = close(p, m, cst.Kind.StringLit);
+        }
+        .KwTrue | .KwFalse => {
+            advance(p);
+            _ = close(p, m, cst.Kind.BoolLit);
+        }
+        .KwNone => {
+            advance(p);
+            _ = close(p, m, cst.Kind.NoneLit);
+        }
+        .KwSome => {
+            advance(p);
+            if expect(p, tk.Kind.LParen, "'(' after 'some'") {
+                parse_nested_expr(p);
+                _ = expect(p, tk.Kind.RParen, "')'");
+            }
+            _ = close(p, m, cst.Kind.SomeExpr);
+        }
+        .Ident => {
+            advance(p);
+            _ = close(p, m, cst.Kind.NameExpr);
+            return true;
+        }
+        .LParen => {
+            advance(p);
+            parse_nested_expr(p);
+            _ = expect(p, tk.Kind.RParen, "')'");
+            _ = close(p, m, cst.Kind.ParenExpr);
+        }
+        .LBracket => {
+            advance(p);
+            while not at(p, tk.Kind.RBracket) and not at(p, tk.Kind.Eof) {
+                parse_nested_expr(p);
+                if not accept(p, tk.Kind.Comma) {
+                    break;
+                }
+            }
+            _ = expect(p, tk.Kind.RBracket, "',' or ']'");
+            _ = close(p, m, cst.Kind.ArrayLit);
+        }
+        _ => {
+            unexpected(p, "an expression");
+            _ = close(p, m, cst.Kind.Error);
+        }
+    }
+    return false;
+}
+
+fn parse_postfix(p: &mut Parser) {
+    let m = open(p);
+    var path = parse_primary(p);
+    while true {
+        match peek(p) {
+            .LParen => {
+                advance(p);
+                while not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Eof) {
+                    let am = open(p);
+                    if at(p, tk.Kind.Ident) and peek_second(p) == tk.Kind.Colon {
+                        advance(p);
+                        advance(p);
+                    }
+                    parse_nested_expr(p);
+                    _ = close(p, am, cst.Kind.Arg);
+                    if not accept(p, tk.Kind.Comma) {
+                        break;
+                    }
+                }
+                _ = expect(p, tk.Kind.RParen, "',' or ')'");
+                _ = close(p, m, cst.Kind.CallExpr);
+                path = false;
+            }
+            .Dot => {
+                advance(p);
+                _ = expect(p, tk.Kind.Ident, "a field or method name");
+                _ = close(p, m, cst.Kind.FieldExpr);
+            }
+            .DotStar => {
+                advance(p);
+                _ = close(p, m, cst.Kind.DerefExpr);
+                path = false;
+            }
+            .LBracket => {
+                advance(p);
+                parse_nested_expr(p);
+                if accept(p, tk.Kind.DotDot) {
+                    parse_nested_expr(p);
+                    _ = expect(p, tk.Kind.RBracket, "']'");
+                    _ = close(p, m, cst.Kind.SliceExpr);
+                } else {
+                    _ = expect(p, tk.Kind.RBracket, "']'");
+                    _ = close(p, m, cst.Kind.IndexExpr);
+                }
+                path = false;
+            }
+            .LBrace => {
+                if not path or p.no_struct_lit {
+                    return;
+                }
+                parse_struct_lit(p);
+                _ = close(p, m, cst.Kind.StructLit);
+                path = false;
+            }
+            _ => {
+                return;
+            }
+        }
+    }
+}
+
+fn parse_struct_lit(p: &mut Parser) {
+    advance(p);
+    while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {
+        let fm = open(p);
+        if not expect(p, tk.Kind.Ident, "a field name") {
+            skip_to(p, tk.Kind.Comma, tk.Kind.RBrace);
+        } else if expect(p, tk.Kind.Colon, "':'") {
+            parse_nested_expr(p);
+        }
+        _ = close(p, fm, cst.Kind.FieldInit);
+        if not accept(p, tk.Kind.Comma) {
+            break;
+        }
+    }
+    _ = expect(p, tk.Kind.RBrace, "',' or '}'");
+}
+
+// ---- patterns ---------------------------------------------------------------
+
+fn parse_pat_lit(p: &mut Parser) -> bool {
+    if accept(p, tk.Kind.Minus) {
+        return expect(p, tk.Kind.Int, "an integer after '-'");
+    }
+    return accept(p, tk.Kind.Int) or accept(p, tk.Kind.Char);
+}
+
+fn parse_pattern(p: &mut Parser) {
+    let m = open(p);
+    match peek(p) {
+        .Underscore => {
+            advance(p);
+            _ = close(p, m, cst.Kind.WildcardPat);
+        }
+        .Ident => {
+            advance(p);
+            _ = close(p, m, cst.Kind.BindPat);
+        }
+        .KwTrue | .KwFalse => {
+            advance(p);
+            _ = close(p, m, cst.Kind.BoolPat);
+        }
+        .KwNone => {
+            advance(p);
+            _ = close(p, m, cst.Kind.NonePat);
+        }
+        .KwSome | .KwOk | .KwErr => {
+            let k = peek(p);
+            advance(p);
+            if expect(p, tk.Kind.LParen, "'('") {
+                parse_pattern(p);
+                _ = expect(p, tk.Kind.RParen, "')'");
+            }
+            if k == tk.Kind.KwSome {
+                _ = close(p, m, cst.Kind.SomePat);
+            } else if k == tk.Kind.KwOk {
+                _ = close(p, m, cst.Kind.OkPat);
+            } else {
+                _ = close(p, m, cst.Kind.ErrPat);
+            }
+        }
+        .Dot => {
+            advance(p);
+            _ = expect(p, tk.Kind.Ident, "a variant or error name");
+            if accept(p, tk.Kind.LBrace) {
+                while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {
+                    if accept(p, tk.Kind.DotDot) {
+                        break;
+                    }
+                    let fm = open(p);
+                    if expect(p, tk.Kind.Ident, "a field name") and accept(p, tk.Kind.Colon) {
+                        if not accept(p, tk.Kind.Underscore) {
+                            _ = expect(p, tk.Kind.Ident, "a name or '_'");
+                        }
+                    }
+                    _ = close(p, fm, cst.Kind.FieldPat);
+                    if not accept(p, tk.Kind.Comma) {
+                        break;
+                    }
+                }
+                _ = expect(p, tk.Kind.RBrace, "',' or '}'");
+            }
+            _ = close(p, m, cst.Kind.VariantPat);
+        }
+        _ => {
+            if not parse_pat_lit(p) {
+                unexpected(p, "a pattern");
+                _ = close(p, m, cst.Kind.Error);
+                return;
+            }
+            if accept(p, tk.Kind.DotDotEq) {
+                if not parse_pat_lit(p) {
+                    unexpected(p, "the end of the range");
+                }
+                _ = close(p, m, cst.Kind.RangePat);
+            } else {
+                _ = close(p, m, cst.Kind.LitPat);
+            }
+        }
+    }
 }
