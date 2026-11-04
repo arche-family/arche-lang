@@ -61,8 +61,9 @@ fn lex_one(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &m
             return i;
         }
         '\r' => {
-            diags.report(codes.CARRIAGE_RETURN, span(start: start, end: start + 1),
-                "'\\r' is allowed only in string literals; lines end with '\\n'");
+            let at = span(start: start, end: start + 1);
+            diags.report_fix(codes.CARRIAGE_RETURN, at, "'\\r' is allowed only in string literals; lines end with '\\n'",
+                at: at, replacement: "");
             push(tokens, tk.Kind.Error, start: start, end: start + 1, value: 0);
             return start + 1;
         }
@@ -94,8 +95,9 @@ fn lex_comment(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags
     var i = start;
     while i < text.len() and text[i] != '\n' : (i += 1) {
         if text[i] == '\r' {
-            diags.report(codes.CARRIAGE_RETURN, span(start: i, end: i + 1),
-                "'\\r' is allowed only in string literals; lines end with '\\n'");
+            let at = span(start: i, end: i + 1);
+            diags.report_fix(codes.CARRIAGE_RETURN, at, "'\\r' is allowed only in string literals; lines end with '\\n'",
+                at: at, replacement: "");
         }
     }
     if byte_at(text, start + 2) == '/' {
@@ -182,8 +184,9 @@ fn lex_number(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags:
         let c = text[i];
         if c == '_' {
             if not after_digit or i + 1 == end or text[i + 1] == '_' {
-                diags.report(codes.BAD_SEPARATOR, span(start: i, end: i + 1),
-                    "'_' in an integer literal must separate two digits");
+                let at = span(start: i, end: i + 1);
+                diags.report_fix(codes.BAD_SEPARATOR, at, "'_' in an integer literal must separate two digits",
+                    at: at, replacement: "");
                 push(tokens, tk.Kind.Int, start: start, end: end, value: 0);
                 return end;
             }

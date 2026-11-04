@@ -1,7 +1,8 @@
 # The Arche compiler, written in Arche-0 and built by stage0.
 #
 #   make             build build/arche
-#   make check       lexical and syntax conformance tests, and CST round trips
+#   make check       lexical and syntax conformance tests, CST round trips,
+#                    and golden diagnostics (tests/)
 #   make clean       remove build/
 
 STAGE0 := ../stage0
@@ -21,6 +22,7 @@ check: $(BUILD)/arche
 	$(MAKE) -C ../conformance
 	../conformance/runner/build/runner --codes E01,E02 --compiler ./arche-check ../conformance/tests
 	sh ./roundtrip.sh $(BUILD)/arche ../conformance/tests .
+	sh ./tests/run.sh $(BUILD)/arche
 
 clean:
 	rm -rf $(BUILD)

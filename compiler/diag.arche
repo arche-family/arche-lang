@@ -13,10 +13,17 @@ pub type Span = struct {
     }
 }
 
+/// A machine-applicable fix: replace the text of span with replacement.
+pub type Fix = struct {
+    pub span: Span,
+    pub replacement: alloc.String,
+}
+
 pub type Diagnostic = struct {
     pub code: u16,
     pub span: Span,
     pub message: alloc.String,
+    pub fix: ?Fix,
 }
 
 pub type Diagnostics = struct {
@@ -31,12 +38,29 @@ pub type Diagnostics = struct {
     pub fn report(self: &mut Diagnostics, code: u16, span: Span, message: str) {
         var m = alloc.String.init(self.a);
         m.push_str(message);
-        self.items.push(Diagnostic { code: code, span: span, message: m });
+        self.items.push(Diagnostic { code: code, span: span, message: m, fix: none });
     }
 
     /// A diagnostic whose message was built by the caller.
     pub fn report_owned(self: &mut Diagnostics, code: u16, span: Span, message: alloc.String) {
-        self.items.push(Diagnostic { code: code, span: span, message: message });
+        self.items.push(Diagnostic { code: code, span: span, message: message, fix: none });
+    }
+
+    /// A diagnostic with a fix that replaces the text of `at` with `replacement`.
+    pub fn report_fix(self: &mut Diagnostics, code: u16, span: Span, message: str, at: Span, replacement: str) {
+        var m = alloc.String.init(self.a);
+        m.push_str(message);
+        var r = alloc.String.init(self.a);
+        r.push_str(replacement);
+        self.items.push(Diagnostic { code: code, span: span, message: m, fix: some(Fix { span: at, replacement: r }) });
+    }
+
+    /// Gives the last diagnostic a fix.
+    pub fn attach_fix(self: &mut Diagnostics, at: Span, replacement: str) {
+        var r = alloc.String.init(self.a);
+        r.push_str(replacement);
+        let last = self.items.len() - 1;
+        self.items[last].fix = some(Fix { span: at, replacement: r });
     }
 
     pub fn new_message(self: &Diagnostics) -> alloc.String {
@@ -68,6 +92,24 @@ pub fn position(text: str, offset: u32) -> Position {
     return Position { line: line, column: (end - line_start) as u32 + 1 };
 }
 
+/// The diagnostics in source order: lexing and parsing report in two
+/// passes, but a reader goes through the file once. Equal positions keep
+/// the order they were reported in.
+fn sorted(diags: &Diagnostics) -> alloc.List(u32) {
+    var order = alloc.List(u32).init(diags.a);
+    let items = diags.items.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        order.push(i as u32);
+        var j = order.len() - 1;
+        while j > 0 and items[order[j - 1] as usize].span.start > items[i].span.start : (j -= 1) {
+            order[j] = order[j - 1];
+            order[j - 1] = i as u32;
+        }
+    }
+    return order;
+}
+
 fn write_code(out: &mut std.Output, code: u16) {
     out.write_byte('E');
     var divisor: u16 = 1000;
@@ -79,9 +121,10 @@ fn write_code(out: &mut std.Output, code: u16) {
 /// path:line:column: error[E0112]: message
 pub fn write_text(out: &mut std.Output, diags: &Diagnostics, path: str, text: str) {
     let items = diags.items.items();
+    let order = sorted(diags);
     var i: usize = 0;
     while i < items.len() : (i += 1) {
-        let d = &items[i];
+        let d = &items[order[i] as usize];
         let pos = position(text, d.span.start);
         out.write(path);
         out.write(":");
@@ -125,13 +168,16 @@ fn write_hex_digit(out: &mut std.Output, d: u8) {
     }
 }
 
-/// A JSON array with one object per diagnostic.
+/// A JSON array with one object per diagnostic, in source order. A fix
+/// replaces the text from (line, column) up to, not including,
+/// (end_line, end_column) with its replacement.
 pub fn write_json(out: &mut std.Output, diags: &Diagnostics, path: str, text: str) {
     let items = diags.items.items();
+    let order = sorted(diags);
     out.write("[");
     var i: usize = 0;
     while i < items.len() : (i += 1) {
-        let d = &items[i];
+        let d = &items[order[i] as usize];
         let pos = position(text, d.span.start);
         if i > 0 {
             out.write(",");
@@ -146,6 +192,25 @@ pub fn write_json(out: &mut std.Output, diags: &Diagnostics, path: str, text: st
         write_code(out, d.code);
         out.write("\", \"message\": ");
         write_json_string(out, d.message.view());
+        out.write(", \"fix\": ");
+        match &d.fix {
+            some(f) => {
+                let from = position(text, f.span.start);
+                let to = position(text, f.span.end());
+                out.write("{\"line\": ");
+                out.write_u64(from.line as u64);
+                out.write(", \"column\": ");
+                out.write_u64(from.column as u64);
+                out.write(", \"end_line\": ");
+                out.write_u64(to.line as u64);
+                out.write(", \"end_column\": ");
+                out.write_u64(to.column as u64);
+                out.write(", \"replacement\": ");
+                write_json_string(out, f.replacement.view());
+                out.write("}");
+            }
+            none => { out.write("null"); }
+        }
         out.write("}");
     }
     if items.len() > 0 {

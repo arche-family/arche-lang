@@ -475,7 +475,27 @@ fn end_statement(p: &mut Parser) {
     if accept(p, tk.Kind.Semi) {
         return;
     }
-    unexpected(p, "';'");
+    // The fix puts the ';' right after the last token of the statement, when
+    // the next token starts a new line: then the ';' was surely forgotten.
+    var m = p.diags.new_message();
+    m.push_str("expected ';', found ");
+    describe_next(p, &mut m);
+    let s = here(p);
+    p.diags.report_owned(codes.UNEXPECTED_TOKEN, s, m);
+    if p.last_end > 0 {
+        let prev = p.tokens[(p.last_end - 1) as usize];
+        let after = prev.start + prev.len;
+        let next = p.tokens[p.pos as usize].start;
+        var newline = false;
+        var i = after as usize;
+        while i < next as usize : (i += 1) {
+            newline = newline or p.text.view()[i] == '\n';
+        }
+        if newline {
+            p.diags.attach_fix(diag.Span { start: after, len: 0 }, ";");
+            return; // go on as if the ';' were there: the next line is a statement of its own
+        }
+    }
     skip_to(p, tk.Kind.Semi, tk.Kind.RBrace);
     _ = accept(p, tk.Kind.Semi);
 }

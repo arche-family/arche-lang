@@ -15,13 +15,14 @@ import syntax.lexer;
 import syntax.parser;
 import syntax.cst;
 
-type ExitError = error { Failed }
+/// What `arche` exits with, besides success (§10: `error: <name>`, status 1).
+type Failure = error { ErrorsFound, BadUsage, CannotRead }
 
-fn usage(err_out: &mut std.Output) -> ExitError!void {
+fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("usage: arche check [--json] <file>\n");
     err_out.write("       arche tokens <file>\n");
     err_out.write("       arche cst <file>\n");
-    return ExitError.Failed;
+    return Failure.BadUsage;
 }
 
 /// The offset of the first byte that breaks UTF-8 (§2), if one does.
@@ -91,14 +92,14 @@ fn report_invalid_utf8(fs: &std.Fs, err_out: &mut std.Output, path: str, a: allo
     err_out.write(": error[E0101]: the file is not valid UTF-8\n");
 }
 
-fn read(fs: &std.Fs, err_out: &mut std.Output, path: str, a: alloc.Allocator) -> ExitError!alloc.String {
+fn read(fs: &std.Fs, err_out: &mut std.Output, path: str, a: alloc.Allocator) -> Failure!alloc.String {
     match fs.read_file(path, a) {
         ok(text) => {
             return text;
         }
         err(.InvalidUtf8) => {
             report_invalid_utf8(fs, err_out, path, a);
-            return ExitError.Failed;
+            return Failure.ErrorsFound;
         }
         err(e) => {
             err_out.write("arche: cannot read ");
@@ -112,7 +113,7 @@ fn read(fs: &std.Fs, err_out: &mut std.Output, path: str, a: alloc.Allocator) ->
                 .IoFailed => { err_out.write("input/output failed"); }
             }
             err_out.write("\n");
-            return ExitError.Failed;
+            return Failure.CannotRead;
         }
     }
 }
@@ -124,7 +125,7 @@ fn check(
     a: alloc.Allocator,
     path: str,
     json: bool,
-) -> ExitError!void {
+) -> Failure!void {
     let source = try read(fs, err_out, path, a);
     let text = source.view();
     var lexed = diag.Diagnostics.init(a);
@@ -137,11 +138,11 @@ fn check(
         diag.write_text(err_out, &diags, path: path, text: text);
     }
     if diags.count() > 0 {
-        return ExitError.Failed;
+        return Failure.ErrorsFound;
     }
 }
 
-fn dump_tokens(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> ExitError!void {
+fn dump_tokens(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> Failure!void {
     let source = try read(fs, err_out, path, a);
     let text = source.view();
     var diags = diag.Diagnostics.init(a);
@@ -150,7 +151,7 @@ fn dump_tokens(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: a
     diag.write_text(err_out, &diags, path: path, text: text);
 }
 
-fn print_cst(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> ExitError!void {
+fn print_cst(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> Failure!void {
     let source = try read(fs, err_out, path, a);
     let text = source.view();
     var lexed = diag.Diagnostics.init(a);
