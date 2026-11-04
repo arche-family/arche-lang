@@ -1,0 +1,40 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: slept after-2020 path unset random
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    let t0 = sys.clock.monotonic_ns();
+    sys.clock.sleep_ns(2000000);
+    let t1 = sys.clock.monotonic_ns();
+    if t1 - t0 >= 2000000 {
+        sys.stdout.write("slept ");
+    }
+    // 2020-01-01 is 1577836800 seconds after 1970.
+    if sys.clock.unix_ns() > 1577836800000000000 {
+        sys.stdout.write("after-2020 ");
+    }
+    match sys.env.get("PATH", sys.alloc) {
+        some(p) => {
+            if p.len() > 0 {
+                sys.stdout.write("path ");
+            }
+        }
+        none => { sys.stdout.write("no-path "); }
+    }
+    match sys.env.get("ARCHE_NO_SUCH_VARIABLE", sys.alloc) {
+        some(_) => { sys.stdout.write("found "); }
+        none => { sys.stdout.write("unset "); }
+    }
+    var buf: [16]u8 = [0; 16];
+    sys.rand.fill(buf[0..16]);
+    var nonzero = false;
+    for b in buf[0..16] {
+        nonzero = nonzero or b.* != 0;
+    }
+    if nonzero and sys.rand.next_u64() != sys.rand.next_u64() {
+        sys.stdout.write("random");
+    }
+    sys.stdout.write("\n");
+}

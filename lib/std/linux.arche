@@ -1,0 +1,87 @@
+/// Linux on x86-64, without the C library: system calls by number, through
+/// the syscall instruction (spec/arche.md §10.2). std is built on these; a
+/// result in -4095..-1 is an errno, negated.
+
+pub const READ: i64 = 0;
+pub const WRITE: i64 = 1;
+pub const CLOSE: i64 = 3;
+pub const NANOSLEEP: i64 = 35;
+pub const GETPID: i64 = 39;
+pub const SOCKET: i64 = 41;
+pub const CONNECT: i64 = 42;
+pub const ACCEPT: i64 = 43;
+pub const BIND: i64 = 49;
+pub const LISTEN: i64 = 50;
+pub const GETSOCKNAME: i64 = 51;
+pub const SETSOCKOPT: i64 = 54;
+pub const FORK: i64 = 57;
+pub const EXECVE: i64 = 59;
+pub const EXIT: i64 = 60;
+pub const WAIT4: i64 = 61;
+pub const GETDENTS64: i64 = 217;
+pub const CLOCK_GETTIME: i64 = 228;
+pub const OPENAT: i64 = 257;
+pub const MKDIRAT: i64 = 258;
+pub const NEWFSTATAT: i64 = 262;
+pub const UNLINKAT: i64 = 263;
+pub const RENAMEAT: i64 = 264;
+pub const GETRANDOM: i64 = 318;
+
+pub const AT_FDCWD: i64 = -100;
+
+pub const ENOENT: i64 = 2;
+pub const EINTR: i64 = 4;
+pub const EACCES: i64 = 13;
+pub const EEXIST: i64 = 17;
+pub const EISDIR: i64 = 21;
+pub const ENOTEMPTY: i64 = 39;
+pub const EADDRINUSE: i64 = 98;
+pub const ECONNREFUSED: i64 = 111;
+
+/// System call n with up to six arguments; the unused ones are 0.
+pub unsafe fn syscall(n: i64, args: [6]i64) -> i64 {
+    var r = n;
+    let a = args[0];
+    let b = args[1];
+    let c = args[2];
+    let d = args[3];
+    let e = args[4];
+    let f = args[5];
+    asm("syscall", inout("rax") r, in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d, in("r8") e, in("r9") f,
+        clobber("rcx"), clobber("r11"));
+    return r;
+}
+
+/// A raw pointer as a system call argument.
+pub fn arg(comptime T: type, p: *T) -> i64 {
+    unsafe {
+        // SAFETY: an address is a number; nothing is read here.
+        return p.addr() as% i64;
+    }
+}
+
+/// The errno of a failed call, or 0 when it succeeded.
+pub fn errno(r: i64) -> i64 {
+    if r < 0 and r > -4096 {
+        return -r;
+    }
+    return 0;
+}
+
+/// A path as the kernel wants it: NUL-terminated, in a buffer of the
+/// caller's. False when it does not fit or holds a NUL itself.
+pub fn c_path(path: str, buf: []mut u8) -> bool {
+    let b = path.bytes();
+    if b.len() + 1 > buf.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        if b[i] == 0 {
+            return false;
+        }
+        buf[i] = b[i];
+    }
+    buf[b.len()] = 0;
+    return true;
+}

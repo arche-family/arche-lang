@@ -7,6 +7,7 @@ import syntax.token as tk;
 import sema.check as ck;
 import sema.consts;
 import sema.floats;
+import sema.memory;
 import sema.stmt;
 import sema.types as ty;
 
@@ -382,6 +383,7 @@ fn check_kind(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Typ
         .RefExpr => { return check_ref(c, n); }
         .StructLit => { return check_struct_lit(c, n); }
         .ArrayLit => { return check_array_lit(c, n, expected); }
+        .ArrayRepeat => { return check_array_repeat(c, n, expected); }
         .UnaryExpr => { return check_unary(c, n, expected); }
         .BinaryExpr => { return check_binary(c, n, expected); }
         .CastExpr => { return check_cast(c, n); }
@@ -2137,6 +2139,39 @@ fn check_fields_loosely(c: &mut ck.Checker, n: cst.NodeId) {
     while i < ninits : (i += 1) {
         _ = check(c, ck.child(c, ck.child(c, n, i + 1), 0), none);
     }
+}
+
+/// [value; count]: count, a constant, copies of value, whose type comes
+/// from context or from value.
+fn check_array_repeat(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    let len = consts.array_length(c, ck.child(c, n, 1));
+    var elem = ty.invalid();
+    var from_context = false;
+    match expected {
+        some(e) => {
+            if c.t.kind(e) == ty.Kind.Array {
+                elem = c.t.elem(e);
+                from_context = true;
+            }
+        }
+        none => { }
+    }
+    if from_context {
+        check_value(c, ck.child(c, n, 0), elem);
+    } else {
+        elem = check(c, ck.child(c, n, 0), none);
+    }
+    if memory.is_move_only(c, elem) {
+        var m = ck.new_message(c);
+        ck.write_type(c, &mut m, elem);
+        m.push_str(" is moved, not copied, so an array cannot hold copies of one");
+        let s = ck.span_of(c, ck.child(c, n, 0));
+        ck.report_owned(c, codes.TYPE_MISMATCH, s, m);
+    }
+    if ck.is_invalid(c, elem) {
+        return elem;
+    }
+    return c.t.array(elem, len);
 }
 
 fn check_array_lit(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {

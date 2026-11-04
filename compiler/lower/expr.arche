@@ -664,6 +664,33 @@ fn value_of(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
         .RefExpr => { return scalar_val(address(l, child(l, e, 0))); }
         .CallExpr => { return call(l, e); }
         .StructLit => { return struct_lit(l, e); }
+        .ArrayRepeat => {
+            // The slot starts zeroed (alloca); other values are stored in a loop.
+            let tmp = lw.alloca(l, t);
+            let et = l.c.t.elem(t);
+            let size = size_of(l, et);
+            let n = l.c.t.get(t).len;
+            let x = child(l, e, 0);
+            let zero = kind(l, x) == cst.Kind.IntLit and ck.tok_value(&l.c, ck.tree(&l.c).first_token(x)) == 0;
+            let v = value(l, x);
+            if zero or n == 0 {
+                return fresh_val(tmp);
+            }
+            let index = lw.alloca(l, ty.int_type(ty.IntKind.Usize));
+            let head = lw.new_block(l);
+            let body = lw.new_block(l);
+            let done = lw.new_block(l);
+            lw.br(l, head);
+            lw.switch_to(l, head);
+            let i = lw.load(l, ir.Ty.I64, index);
+            lw.cond_br(l, cond: lw.cmp(l, ir.CmpKind.ULt, x: i, y: lw.konst(l, ir.Ty.I64, n)), yes: body, no: done);
+            lw.switch_to(l, body);
+            lw.store_val(l, et, v, lw.gep_index(l, addr: tmp, index: i, size));
+            lw.store(l, value: lw.bin(l, ir.BinKind.Add, x: i, y: lw.konst(l, ir.Ty.I64, 1)), addr: index);
+            lw.br(l, head);
+            lw.switch_to(l, done);
+            return fresh_val(tmp);
+        }
         .ArrayLit => {
             let tmp = lw.alloca(l, t);
             let et = l.c.t.elem(t);
@@ -1322,6 +1349,9 @@ fn intrinsic(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
     let a0 = value(l, runtime_arg(l, n, offset: info.ncomptime, i: 0));
     if nm.eq("str_from") {
         return lw.own_val(l, rt, a0);
+    }
+    if nm.eq("str_data") or nm.eq("slice_data") {
+        return scalar_val(lw.load(l, ir.Ty.Ptr, a0.v));
     }
     if nm.eq("bytes_of") {
         let tmp = lw.alloca(l, rt);

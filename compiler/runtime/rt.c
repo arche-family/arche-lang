@@ -808,6 +808,26 @@ static u16 read_into(const u8 *path, u64 path_len, u64 *out) {
 
 // IoError!alloc.String and IoError!alloc.List(u8): {error: u16} and the
 // value at offset 8.
+// lib/std.arche's Fs: reads a file into the String or List(u8) at out,
+// {data, len, cap, allocator}; checks UTF-8 when utf8 is set. 0 or the
+// IoError's number.
+u16 a0rt_fs_read(const u8 *path, u64 path_len, u64 *out, u8 utf8) {
+    u16 e = read_into(path, path_len, out);
+    if (e == 0 && utf8 && !valid_utf8((const u8 *)out[0], out[1])) {
+        e = 4; // InvalidUtf8
+    }
+    return e;
+}
+
+// lib/std.arche's Output and Proc: write out what is buffered, and leave.
+void a0rt_flush_all(void) {
+    flush_all();
+}
+
+_Noreturn void a0rt_exit(u8 status) {
+    exit_with(status);
+}
+
 void a0rt_read_file(const void *fs, const u8 *path, u64 path_len, u64 allocator, u8 *result) {
     (void)fs;
     u64 *value = (u64 *)(result + 8);
@@ -1040,7 +1060,8 @@ u32 a0rt_intern(Interner *in, const u8 *p, u64 n) {
 
 // ---- entry --------------------------------------------------------------------------
 
-// std.System: {fs, stdout, stderr, args {items, len}, allocator}.
+// std.System: {fs, stdout, stderr, args {items, len}, allocator}, and
+// for lib/std.arche the environment after them (docs/abi.md).
 typedef struct {
     i64 fs;
     i64 stdout_fd;
@@ -1048,6 +1069,7 @@ typedef struct {
     Str *args;
     u64 nargs;
     u64 allocator;
+    char **envp;
 } System;
 
 extern u16 a0_entry(System *sys);
@@ -1079,6 +1101,7 @@ _Noreturn void a0rt_start(i64 *sp) {
         sys.args[i].len = n;
     }
     sys.nargs = (u64)argc;
+    sys.envp = argv + argc + 1;
     u16 err = a0_entry(&sys);
     if (err) {
         flush_all();

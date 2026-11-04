@@ -28,7 +28,7 @@ Sizes and alignments are in bytes. A composite value is laid out in memory at it
 | `alloc.Interner` | 48 | 8 | runtime-defined |
 | `std.Output` | 8 | 8 | runtime-defined |
 | `std.Args`, `std.Fs` | 16, 8 | 8 | runtime-defined |
-| `std.System` | | 8 | `{fs, stdout, stderr, args, alloc}` in that order |
+| `std.System` | | 8 | `{fs, stdout, stderr, args, alloc}` in that order; `lib/std.arche`'s adds `{clock, env, proc, net, rand}` after them, where `env` is the address of the environment's array of pointers (`envp`) and the others are empty |
 
 ## Calling convention
 

@@ -1263,8 +1263,17 @@ fn parse_primary(p: &mut Parser) -> bool {
         }
         .LBracket => {
             advance(p);
+            var first = true;
             while not at(p, tk.Kind.RBracket) and not at(p, tk.Kind.Eof) {
                 parse_nested_expr(p);
+                // [value; count] (full Arche): count copies of one value.
+                if first and p.full and accept(p, tk.Kind.Semi) {
+                    parse_nested_expr(p);
+                    _ = expect(p, tk.Kind.RBracket, "']'");
+                    _ = close(p, m, cst.Kind.ArrayRepeat);
+                    return false;
+                }
+                first = false;
                 if not accept(p, tk.Kind.Comma) {
                     break;
                 }

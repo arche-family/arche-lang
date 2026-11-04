@@ -44,7 +44,7 @@ const PACKAGE: build.Package = build.Package {
 ```
 
 - A module path names a file of the package (A§3). A dependency's modules are reached through the dependency's name: `import http.server;`.
-- The roots `core`, `alloc` and `std` are the standard library; a package cannot use those names. The library is full Arche, in the repository's `lib/`: `core` (`lib/core.arche` and `lib/core/`) needs no operating system and no allocator, and imports neither `alloc` nor `std`; `alloc` (`lib/alloc.arche`) has Arche-0's containers, written over `core.mem`, whose functions the compiler provides. A full-Arche package gets this `alloc`; an Arche-0 package keeps the compiler's own, which has the same types and signatures, and `arche --lib-alloc` gives it the library's.
+- The roots `core`, `alloc` and `std` are the standard library; a package cannot use those names. The library is full Arche, in the repository's `lib/`: `core` (`lib/core.arche` and `lib/core/`) needs no operating system and no allocator, and imports neither `alloc` nor `std`; `alloc` (`lib/alloc.arche`) has Arche-0's containers, written over `core.mem`, whose functions the compiler provides. A full-Arche package gets this `alloc`; an Arche-0 package keeps the compiler's own, which has the same types and signatures, and `arche --lib-alloc` gives it the library's. `std` (`lib/std.arche`, `lib/std/`) is the same for Linux: Arche-0's `System`, `Fs`, `Output`, `Args` and `IoError` with their signatures, and the capabilities below; `arche --lib-std` gives it to an Arche-0 package.
 
 ### 1.2 Editions
 
@@ -55,6 +55,8 @@ Every package declares an `edition`, a year. An edition may change syntax or rul
 The capability types of `std` are `Fs`, `Net`, `Clock`, `Env`, `Proc` and `Rand`. A program reaches them only through `std.System` (A§10), and passes them on as parameters.
 
 - **`needs`** in the manifest lists the capability types the package uses. A module that names a capability type its package does not list is an error (E0801). A dependency therefore states, in one line its users can read, everything it can reach.
+- `std.System` holds one of each: `fs`, `stdout`, `stderr`, `args`, `alloc`, `clock`, `env`, `proc`, `net` and `rand`. A capability's fields are private, so no code outside `std` can make one, and each is move-only.
+- What they do on Linux: `Clock` reads the monotonic and the wall clock and sleeps; `Env` reads environment variables; `Proc` gives the process id, exits, and runs a program and waits for it; `Net` connects and listens over TCP and IPv4; `Rand` gives the kernel's random bytes. `Fs` adds `exists`, `make_dir`, `remove`, `rename` and `list` (sorted by byte order) to Arche-0's three; those return `FsError`, since `IoError` keeps Arche-0's five names.
 - A capability can be **narrowed**: `sys.fs.within("data/")` is an `Fs` that reaches only that directory; `sys.net.connect_only("db.local:5432")` is a `Net` that can open only that connection. Narrowing never widens.
 
 ## 2. Floating point
@@ -116,7 +118,11 @@ for entry in iterator { … }    // until iterator.next() gives none
 - The names a `for` binds cannot be assigned. A `for` loop over a range can run at compile time (§4.3).
 - An item that cannot be iterated is E0810; a range or destructuring that does not fit is E0811.
 
-### 3.3 Labeled loops
+### 3.3 Array repetition
+
+`[v; n]` is an array of `n` copies of `v`, `n` a constant: `var buf: [4096]u8 = [0; 4096];`. The element type comes from context, or from `v`; a move-only `v` cannot be copied (E0401).
+
+### 3.4 Labeled loops
 
 A loop may have a label, `outer: while … { … }` or `outer: for … { … }`, and `break outer;` or `continue outer;` then applies to it. Labels are not names: they cannot be passed or stored, and an inner label cannot repeat an outer one. A label that no enclosing loop has, or one that repeats, is E0511.
 
@@ -448,6 +454,7 @@ for_bind    = IDENT [ ":" type ] | "(" IDENT "," IDENT ")" ;
 
 expr        = or_expr [ ( "orelse" | "catch" ) expr ] ;
 primary     = INT | FLOAT | CHAR | STRING | "true" | "false" | "none"
+            | "[" expr ";" expr "]"
             | "some" "(" expr ")"
             | IDENT
             | "(" expr ")"

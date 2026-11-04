@@ -1,0 +1,56 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: a.txt b.txt first renamed not-empty exists
+import std;
+import alloc;
+import core.fmt;
+
+fn main(sys: &mut std.System) -> !void {
+    // A directory of this process's own, under /tmp.
+    var dir = alloc.String.init(sys.alloc);
+    dir.push_str("/tmp/arche-std-");
+    var digits: [20]u8 = [0; 20];
+    let n = fmt.decimal(sys.proc.pid() as u64, digits[0..20]);
+    for d in digits[0..n] {
+        dir.push_ascii(d.*);
+    }
+    try sys.fs.make_dir(dir.view());
+    var a = alloc.String.init(sys.alloc);
+    a.push_str(dir.view());
+    a.push_str("/b.txt");
+    var b = alloc.String.init(sys.alloc);
+    b.push_str(dir.view());
+    b.push_str("/a.txt");
+    try sys.fs.write_file(path: a.view(), data: "first");
+    try sys.fs.write_file(path: b.view(), data: "second");
+    let names = try sys.fs.list(dir.view(), sys.alloc);
+    for name in names.items() {
+        sys.stdout.write(name.view());
+        sys.stdout.write(" ");
+    }
+    var c = alloc.String.init(sys.alloc);
+    c.push_str(dir.view());
+    c.push_str("/c.txt");
+    try sys.fs.rename(from: a.view(), to: c.view());
+    let text = try sys.fs.read_file(c.view(), sys.alloc);
+    sys.stdout.write(text.view());
+    sys.stdout.write(" ");
+    if not sys.fs.exists(a.view()) and sys.fs.exists(c.view()) {
+        sys.stdout.write("renamed ");
+    }
+    match sys.fs.remove(dir.view()) {
+        ok(_) => { sys.stdout.write("removed "); }
+        err(.NotEmpty) => { sys.stdout.write("not-empty "); }
+        err(_) => { sys.stdout.write("failed "); }
+    }
+    try sys.fs.remove(b.view());
+    try sys.fs.remove(c.view());
+    try sys.fs.remove(dir.view());
+    match sys.fs.make_dir("/") {
+        ok(_) => { sys.stdout.write("made"); }
+        err(.AlreadyExists) => { sys.stdout.write("exists"); }
+        err(_) => { sys.stdout.write("other"); }
+    }
+    sys.stdout.write("\n");
+}

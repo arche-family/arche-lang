@@ -1,0 +1,41 @@
+// test: run
+// spec: std
+// stage0: skip
+// exit: 4
+// stdout: before child
+// stdout: status 3 not-found
+import std;
+import alloc;
+
+fn argv(a: alloc.Allocator, script: str) -> alloc.List(alloc.String) {
+    var list = alloc.List(alloc.String).init(a);
+    var sh = alloc.String.init(a);
+    sh.push_str("/bin/sh");
+    list.push(sh);
+    var c = alloc.String.init(a);
+    c.push_str("-c");
+    list.push(c);
+    var s = alloc.String.init(a);
+    s.push_str(script);
+    list.push(s);
+    return list;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write("before ");
+    let three = argv(sys.alloc, script: "echo child; exit 3");
+    let status = try sys.proc.run(&three, env: &sys.env, sys.alloc);
+    sys.stdout.write("status ");
+    sys.stdout.write_u64(status as u64);
+    var missing = alloc.List(alloc.String).init(sys.alloc);
+    var path = alloc.String.init(sys.alloc);
+    path.push_str("/no/such/program");
+    missing.push(path);
+    match sys.proc.run(&missing, env: &sys.env, sys.alloc) {
+        ok(_) => { sys.stdout.write(" ran"); }
+        err(.NotFound) => { sys.stdout.write(" not-found"); }
+        err(_) => { sys.stdout.write(" failed"); }
+    }
+    sys.stdout.write("\n");
+    sys.proc.exit(4);
+}

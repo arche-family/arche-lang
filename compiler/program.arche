@@ -28,6 +28,7 @@ pub type Options = struct {
     /// The library's directory, ending with '/'.
     pub lib: alloc.String,
     pub lib_alloc: bool,
+    pub lib_std: bool,
     pub target: Target,
     /// module.function: what a panic calls on a freestanding target.
     pub panic_handler: alloc.String,
@@ -83,6 +84,9 @@ pub type Program = struct {
     /// alloc is the library's (lib/alloc.arche), not the compiler's
     /// built-in one: in a full-Arche package, or when asked for.
     pub lib_alloc: bool,
+    /// std is the library's (lib/std.arche): in a full-Arche package on
+    /// Linux, or when asked for.
+    pub lib_std: bool,
     pub target: Target,
     pub panic_handler: alloc.String,
     root_dir: alloc.String,
@@ -198,7 +202,7 @@ fn import_path(m: &Module, node: cst.NodeId, a: alloc.Allocator) -> ImportPath {
 }
 
 /// The imports of a module that name package modules, not library roots.
-fn package_imports(m: &Module, a: alloc.Allocator, lib_alloc: bool) -> alloc.List(ImportPath) {
+fn package_imports(m: &Module, a: alloc.Allocator, lib_alloc: bool, lib_std: bool) -> alloc.List(ImportPath) {
     var out = alloc.List(ImportPath).init(a);
     let file_node = m.tree.node(m.tree.root);
     var c: u32 = 0;
@@ -206,7 +210,8 @@ fn package_imports(m: &Module, a: alloc.Allocator, lib_alloc: bool) -> alloc.Lis
         let item = m.tree.child(file_node, c);
         if m.tree.node(item).kind == cst.Kind.Import {
             let ip = import_path(m, item, a);
-            if not ip.library or (lib_alloc and ip.dotted.view().eq("alloc")) {
+            let d = ip.dotted.view();
+            if not ip.library or (lib_alloc and d.eq("alloc")) or (lib_std and (d.eq("std") or d.starts_with("std."))) {
                 out.push(ip);
             }
         }
@@ -229,7 +234,8 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         diags: diag.Diagnostics.init(a),
         a: a,
         full: false,
-        lib_alloc: opts.lib_alloc or opts.target != Target.LinuxX86_64,
+        lib_alloc: opts.lib_alloc or opts.lib_std or opts.target != Target.LinuxX86_64,
+        lib_std: opts.lib_std and opts.target == Target.LinuxX86_64,
         target: opts.target,
         panic_handler: handler,
         root_dir: alloc.String.init(a),
@@ -256,6 +262,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         ok(_) => {
             p.full = true;
             p.lib_alloc = true;
+            p.lib_std = p.target == Target.LinuxX86_64;
         }
         err(_) => { }
     }
@@ -274,7 +281,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
     while next < p.modules.len() : (next += 1) {
         // The imports are collected first: adding a module grows p.modules,
         // so no view of a module may be live then (§5.4).
-        let imports = package_imports(&p.modules[next], a, lib_alloc: p.lib_alloc);
+        let imports = package_imports(&p.modules[next], a, lib_alloc: p.lib_alloc, lib_std: p.lib_std);
         let ips = imports.items();
         var c: usize = 0;
         while c < ips.len() : (c += 1) {
@@ -285,8 +292,9 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
             }
             // core and its modules come from the library (spec/arche.md
             // §1.1): full Arche, whatever the package is.
-            let from_lib = ip.dotted.view().eq("core") or ip.dotted.view().starts_with("core.") or
-                (p.lib_alloc and ip.dotted.view().eq("alloc"));
+            let dotted = ip.dotted.view();
+            let from_lib = dotted.eq("core") or dotted.starts_with("core.") or (p.lib_alloc and dotted.eq("alloc")) or
+                (p.lib_std and (dotted.eq("std") or dotted.starts_with("std.")));
             var full = alloc.String.init(a);
             var shown = alloc.String.init(a);
             if from_lib {

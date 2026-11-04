@@ -29,7 +29,7 @@ fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("       arche tokens <file>\n");
     err_out.write("       arche cst <file>\n");
     err_out.write("       arche build <file> <out.ll>\n");
-    err_out.write("options, before the command: --lib-alloc, --target <linux-x86_64 | freestanding-x86_64 |\n");
+    err_out.write("options, before the command: --lib-alloc, --lib-std, --target <linux-x86_64 | freestanding-x86_64 |\n");
     err_out.write("       freestanding-riscv64>, --panic-handler <module.function>\n");
     return Failure.BadUsage;
 }
@@ -254,6 +254,7 @@ fn main(sys: &mut std.System) -> !void {
     var opts = program.Options {
         lib: find_lib(&sys.fs, sys.args.get(0), sys.alloc),
         lib_alloc: false,
+        lib_std: false,
         target: program.Target.LinuxX86_64,
         panic_handler: alloc.String.init(sys.alloc),
     };
@@ -262,6 +263,8 @@ fn main(sys: &mut std.System) -> !void {
         let o = sys.args.get(first);
         if o.eq("--lib-alloc") {
             opts.lib_alloc = true;
+        } else if o.eq("--lib-std") {
+            opts.lib_std = true;
         } else if o.eq("--target") {
             first += 1;
             match program.target_by_name(sys.args.get(first)) {

@@ -1,0 +1,39 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: ping pong 0 refused
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    let local = std.Address { ip: [127, 0, 0, 1], port: 0 };
+    var server = try sys.net.listen(local);
+    let port = server.port();
+    // The kernel finishes the handshake into the listen queue, so one
+    // thread can be both ends.
+    var client = try sys.net.connect(std.Address { ip: [127, 0, 0, 1], port: port });
+    var peer = try server.accept();
+    try client.write("ping".bytes());
+    var buf: [16]u8 = [0; 16];
+    let n = try peer.read(buf[0..16]);
+    for b in buf[0..n] {
+        sys.stdout.write_byte(b.*);
+    }
+    try peer.write("pong".bytes());
+    let m = try client.read(buf[0..16]);
+    sys.stdout.write(" ");
+    for b in buf[0..m] {
+        sys.stdout.write_byte(b.*);
+    }
+    peer.close();
+    let end = try client.read(buf[0..16]);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(end as u64);
+    client.close();
+    server.close();
+    match sys.net.connect(std.Address { ip: [127, 0, 0, 1], port: port }) {
+        ok(_) => { sys.stdout.write(" connected"); }
+        err(.Refused) => { sys.stdout.write(" refused"); }
+        err(_) => { sys.stdout.write(" failed"); }
+    }
+    sys.stdout.write("\n");
+}

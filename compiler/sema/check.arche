@@ -1942,8 +1942,12 @@ fn collect_import(c: &mut Checker, n: cst.NodeId) {
     if alias.library == Library.Alloc and c.p.lib_alloc {
         alias.library = Library.NotLibrary; // lib/alloc.arche, a module
     }
+    if alias.library == Library.Std and c.p.lib_std {
+        alias.library = Library.NotLibrary; // lib/std.arche
+    }
     let s = span_of(c, n);
-    if (first.eq("core") and not full(c)) or (alias.library != Library.NotLibrary and segments > 1) {
+    if (first.eq("core") and not full(c)) or (alias.library != Library.NotLibrary and segments > 1) or
+        (first.eq("std") and segments > 1 and not c.p.lib_std) {
         report(c, codes.BAD_IMPORT, s, "Arche-0 provides only the modules 'std' and 'alloc'");
         return;
     }
@@ -2858,7 +2862,19 @@ fn check_main(c: &mut Checker) {
     }
     c.module = 0;
     let main_sym = c.names.intern("main");
-    let system = c.t.builtin(ty.Builtin.System);
+    var system = c.t.builtin(ty.Builtin.System);
+    if c.p.lib_std {
+        match c.p.find("std") {
+            some(id) => {
+                let sys_sym = c.names.intern("System");
+                match find_item(c, id.index, sys_sym) {
+                    some(d) => { system = decl_type(c, d); }
+                    none => { }
+                }
+            }
+            none => { }
+        }
+    }
     let want_param = c.t.reference(true, system);
     let want_ret = c.t.error_union(NONE, ty.void_type());
     match find_item(c, 0, main_sym) {
