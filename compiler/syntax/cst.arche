@@ -101,6 +101,56 @@ pub type Tree = struct {
     pub fn child(self: &Tree, n: Node, i: u32) -> NodeId {
         return self.children[(n.children_start + i) as usize];
     }
+
+    pub fn token(self: &Tree, i: u32) -> tk.Token {
+        return self.tokens[i as usize];
+    }
+
+    /// The significant tokens of a node that no child covers, in order:
+    /// keywords, names and punctuation of the node itself.
+    pub fn own_tokens(self: &Tree, id: NodeId, a: alloc.Allocator) -> alloc.List(u32) {
+        var out = alloc.List(u32).init(a);
+        let n = self.node(id);
+        var at = n.first;
+        var c: u32 = 0;
+        while at < n.end {
+            if c < n.children_len {
+                let child = self.node(self.child(n, c));
+                if at >= child.first {
+                    at = child.end;
+                    c += 1;
+                    continue;
+                }
+            }
+            if not self.tokens[at as usize].kind.is_trivia() {
+                out.push(at);
+            }
+            at += 1;
+        }
+        return out;
+    }
+
+    /// The first own token of the kind, if there is one.
+    pub fn find_own(self: &Tree, id: NodeId, kind: tk.Kind, a: alloc.Allocator) -> ?u32 {
+        let own = self.own_tokens(id, a);
+        let items = own.items();
+        var i: usize = 0;
+        while i < items.len() : (i += 1) {
+            if self.tokens[items[i] as usize].kind == kind {
+                return items[i];
+            }
+        }
+        return none;
+    }
+
+    /// The first significant token of a node.
+    pub fn first_token(self: &Tree, id: NodeId) -> u32 {
+        let n = self.node(id);
+        var i = n.first;
+        while i < n.end and self.tokens[i as usize].kind.is_trivia() : (i += 1) {
+        }
+        return i;
+    }
 }
 
 /// Where a node began: what open() returned.

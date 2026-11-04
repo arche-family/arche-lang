@@ -1,0 +1,268 @@
+/// A program: the root module and every module it reaches through imports
+/// (spec/arche-0.md §3). The root's directory is the package root, and a
+/// module path a.b is the file a/b.arche there.
+import std;
+import alloc;
+import codes;
+import diag;
+import syntax.cst;
+import syntax.lexer;
+import syntax.parser;
+import syntax.token as tk;
+
+pub type ModuleId = struct { pub index: u32 }
+
+pub type Module = struct {
+    /// The dotted module path; empty for a root file whose name is not one.
+    pub name: alloc.String,
+    /// The file as it was opened, for diagnostics.
+    pub path: alloc.String,
+    pub text: alloc.String,
+    pub tree: cst.Tree,
+
+    /// The source text of a token.
+    pub fn token_text(self: &Module, t: u32) -> str {
+        let tok = self.tree.tokens[t as usize];
+        return self.text.view()[tok.start as usize..(tok.start + tok.len) as usize];
+    }
+
+    pub fn token_span(self: &Module, t: u32) -> diag.Span {
+        let tok = self.tree.tokens[t as usize];
+        return diag.Span { start: tok.start, len: tok.len };
+    }
+
+    /// The span of a node's significant tokens.
+    pub fn node_span(self: &Module, id: cst.NodeId) -> diag.Span {
+        let n = self.tree.node(id);
+        let first = self.tree.first_token(id);
+        if first >= n.end {
+            return self.token_span(first);
+        }
+        var last = n.end - 1;
+        while last > first and self.tree.tokens[last as usize].kind.is_trivia() : (last -= 1) {
+        }
+        let a = self.tree.tokens[first as usize];
+        let b = self.tree.tokens[last as usize];
+        return diag.Span { start: a.start, len: b.start + b.len - a.start };
+    }
+}
+
+pub type Program = struct {
+    pub modules: alloc.List(Module),
+    pub diags: diag.Diagnostics,
+    pub a: alloc.Allocator,
+    root_dir: alloc.String,
+
+    pub fn module(self: &Program, id: ModuleId) -> &Module {
+        return &self.modules[id.index as usize];
+    }
+
+    pub fn find(self: &Program, name: str) -> ?ModuleId {
+        let items = self.modules.items();
+        var i: usize = 0;
+        while i < items.len() : (i += 1) {
+            if items[i].name.view().eq(name) {
+                return ModuleId { index: i as u32 };
+            }
+        }
+        return none;
+    }
+}
+
+fn is_identifier(s: str) -> bool {
+    if s.len() == 0 or s.eq("_") {
+        return false;
+    }
+    var i: usize = 0;
+    while i < s.len() : (i += 1) {
+        let c = s[i];
+        match c {
+            'a'..='z' | 'A'..='Z' | '_' => { }
+            '0'..='9' => {
+                if i == 0 {
+                    return false;
+                }
+            }
+            _ => { return false; }
+        }
+    }
+    return true;
+}
+
+/// Lexes and parses one file into a module, reporting into p.diags.
+fn add_module(p: &mut Program, name: str, path: str, text: alloc.String) -> ModuleId {
+    let id = ModuleId { index: p.modules.len() as u32 };
+    p.diags.file = id.index;
+    var lexed = diag.Diagnostics.init(p.a);
+    lexed.file = id.index;
+    let tokens = lexer.lex(text.view(), &mut lexed, p.a);
+    let parsed = parser.parse(tokens, text.view(), lexed, p.a);
+    var n = alloc.String.init(p.a);
+    n.push_str(name);
+    var pa = alloc.String.init(p.a);
+    pa.push_str(path);
+    let found = parsed.diags.items.items();
+    var i: usize = 0;
+    while i < found.len() : (i += 1) {
+        p.diags.items.push(copy_diagnostic(&found[i], p.a));
+    }
+    p.modules.push(Module { name: n, path: pa, text: text, tree: parsed.tree });
+    return id;
+}
+
+fn copy_diagnostic(d: &diag.Diagnostic, a: alloc.Allocator) -> diag.Diagnostic {
+    var m = alloc.String.init(a);
+    m.push_str(d.message.view());
+    var fix: ?diag.Fix = none;
+    match &d.fix {
+        some(f) => {
+            var r = alloc.String.init(a);
+            r.push_str(f.replacement.view());
+            fix = some(diag.Fix { span: f.span, replacement: r });
+        }
+        none => { }
+    }
+    return diag.Diagnostic { file: d.file, code: d.code, span: d.span, message: m, fix: fix };
+}
+
+/// The path of an import, dotted ("a.b") and as a file ("a/b.arche").
+type ImportPath = struct {
+    dotted: alloc.String,
+    file: alloc.String,
+    library: bool,
+    span: diag.Span,
+}
+
+fn import_path(m: &Module, node: cst.NodeId, a: alloc.Allocator) -> ImportPath {
+    let own = m.tree.own_tokens(node, a);
+    let toks = own.items();
+    var dotted = alloc.String.init(a);
+    var file = alloc.String.init(a);
+    var i: usize = 1; // after 'import'
+    while i < toks.len() : (i += 1) {
+        let k = m.tree.token(toks[i]).kind;
+        if k == tk.Kind.Ident {
+            dotted.push_str(m.token_text(toks[i]));
+            file.push_str(m.token_text(toks[i]));
+        } else if k == tk.Kind.Dot {
+            dotted.push_str(".");
+            file.push_str("/");
+        } else {
+            break;
+        }
+    }
+    file.push_str(".arche");
+    let first = m.token_text(toks[1]);
+    let library = first.eq("std") or first.eq("alloc") or first.eq("core");
+    return ImportPath { dotted: dotted, file: file, library: library, span: m.node_span(node) };
+}
+
+/// The imports of a module that name package modules, not library roots.
+fn package_imports(m: &Module, a: alloc.Allocator) -> alloc.List(ImportPath) {
+    var out = alloc.List(ImportPath).init(a);
+    let file_node = m.tree.node(m.tree.root);
+    var c: u32 = 0;
+    while c < file_node.children_len : (c += 1) {
+        let item = m.tree.child(file_node, c);
+        if m.tree.node(item).kind == cst.Kind.Import {
+            let ip = import_path(m, item, a);
+            if not ip.library {
+                out.push(ip);
+            }
+        }
+    }
+    return out;
+}
+
+/// Starts from the root file, whose text the caller has read, and loads,
+/// breadth first, every module it imports.
+pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator) -> Program {
+    var p = Program {
+        modules: alloc.List(Module).init(a),
+        diags: diag.Diagnostics.init(a),
+        a: a,
+        root_dir: alloc.String.init(a),
+    };
+    var slash: ?usize = none;
+    var i: usize = 0;
+    while i < path.len() : (i += 1) {
+        if path[i] == '/' {
+            slash = some(i);
+        }
+    }
+    var base = path;
+    match slash {
+        some(s) => {
+            p.root_dir.push_str(path[0..s + 1]);
+            base = path[s + 1..path.len()];
+        }
+        none => { }
+    }
+    var stem = base;
+    if base.len() > 6 and base[base.len() - 6..base.len()].eq(".arche") {
+        stem = base[0..base.len() - 6];
+    }
+    var root_name = "";
+    if is_identifier(stem) {
+        root_name = stem;
+    }
+    _ = add_module(&mut p, root_name, path, text);
+
+    var next: usize = 0;
+    while next < p.modules.len() : (next += 1) {
+        // The imports are collected first: adding a module grows p.modules,
+        // so no view of a module may be live then (§5.4).
+        let imports = package_imports(&p.modules[next], a);
+        let ips = imports.items();
+        var c: usize = 0;
+        while c < ips.len() : (c += 1) {
+            let ip = &ips[c];
+            match p.find(ip.dotted.view()) {
+                some(_) => { continue; }
+                none => { }
+            }
+            var full = alloc.String.init(a);
+            full.push_str(p.root_dir.view());
+            full.push_str(ip.file.view());
+            match fs.read_file(full.view(), a) {
+                ok(source) => {
+                    _ = add_module(&mut p, ip.dotted.view(), full.view(), source);
+                }
+                err(_) => {
+                    p.diags.file = next as u32;
+                    var msg = p.diags.new_message();
+                    msg.push_str("cannot find module '");
+                    msg.push_str(ip.dotted.view());
+                    msg.push_str("': there is no readable file ");
+                    msg.push_str(full.view());
+                    p.diags.report_owned(codes.MODULE_NOT_FOUND, ip.span, msg);
+                }
+            }
+        }
+    }
+    return p;
+}
+
+/// Writes every diagnostic of the program, as text or JSON.
+pub fn write_diagnostics(out: &mut std.Output, p: &Program, json: bool) {
+    let mods = p.modules.items();
+    var first = true;
+    if json {
+        out.write("[");
+    }
+    var i: usize = 0;
+    while i < mods.len() : (i += 1) {
+        let m = &mods[i];
+        if json {
+            diag.write_json(out, &p.diags, i as u32, path: m.path.view(), text: m.text.view(), first: &mut first);
+        } else {
+            diag.write_text(out, &p.diags, i as u32, path: m.path.view(), text: m.text.view());
+        }
+    }
+    if json {
+        if not first {
+            out.write("\n");
+        }
+        out.write("]\n");
+    }
+}

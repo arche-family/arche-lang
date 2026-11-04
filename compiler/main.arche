@@ -11,6 +11,8 @@
 import std;
 import alloc;
 import diag;
+import program;
+import sema.check as sema;
 import syntax.lexer;
 import syntax.parser;
 import syntax.cst;
@@ -127,17 +129,16 @@ fn check(
     json: bool,
 ) -> Failure!void {
     let source = try read(fs, err_out, path, a);
-    let text = source.view();
-    var lexed = diag.Diagnostics.init(a);
-    let tokens = lexer.lex(text, &mut lexed, a);
-    let parsed = parser.parse(tokens, text, lexed, a);
-    let diags = parsed.diags;
-    if json {
-        diag.write_json(out, &diags, path: path, text: text);
-    } else {
-        diag.write_text(err_out, &diags, path: path, text: text);
+    var p = program.load(fs, path, source, a);
+    if p.diags.count() == 0 {
+        sema.check(&mut p);
     }
-    if diags.count() > 0 {
+    if json {
+        program.write_diagnostics(out, &p, true);
+    } else {
+        program.write_diagnostics(err_out, &p, false);
+    }
+    if p.diags.count() > 0 {
         return Failure.ErrorsFound;
     }
 }
@@ -148,7 +149,7 @@ fn dump_tokens(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: a
     var diags = diag.Diagnostics.init(a);
     let tokens = lexer.lex(text, &mut diags, a);
     lexer.write_tokens(out, &tokens, text);
-    diag.write_text(err_out, &diags, path: path, text: text);
+    diag.write_text(err_out, &diags, 0, path: path, text: text);
 }
 
 fn print_cst(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> Failure!void {
