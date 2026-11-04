@@ -1,0 +1,292 @@
+/// DER (ITU-T X.690) as X.509 uses it: one-byte tags and definite,
+/// minimal lengths. An element is offsets into the bytes it was read
+/// from, which the caller keeps: views cannot be fields.
+import alloc;
+
+pub type DerError = error { Malformed }
+
+pub const BOOLEAN: u8 = 0x01;
+pub const INTEGER: u8 = 0x02;
+pub const BIT_STRING: u8 = 0x03;
+pub const OCTET_STRING: u8 = 0x04;
+pub const NULL: u8 = 0x05;
+pub const OID: u8 = 0x06;
+pub const UTC_TIME: u8 = 0x17;
+pub const GENERALIZED_TIME: u8 = 0x18;
+pub const SEQUENCE: u8 = 0x30;
+pub const SET: u8 = 0x31;
+
+/// One element: its tag, where it starts (the tag), and where its
+/// contents start and end. The next element starts at end.
+pub type Element = struct {
+    pub tag: u8,
+    pub header: usize,
+    pub start: usize,
+    pub end: usize,
+
+    pub fn len(self: &Element) -> usize {
+        return self.end - self.start;
+    }
+}
+
+/// The element at b[at..], which must end by limit.
+pub fn read(b: []u8, at: usize, limit: usize) -> DerError!Element {
+    if limit > b.len() or at + 2 > limit {
+        return DerError.Malformed;
+    }
+    let tag = b[at];
+    if tag & 0x1f == 0x1f {
+        return DerError.Malformed;
+    }
+    let first = b[at + 1];
+    var start = at + 2;
+    var n: usize = 0;
+    if first < 0x80 {
+        n = first as usize;
+    } else {
+        let count = (first & 0x7f) as usize;
+        if count == 0 or count > 4 or start + count > limit {
+            return DerError.Malformed;
+        }
+        var i: usize = 0;
+        while i < count : (i += 1) {
+            n = (n << 8) | b[start + i] as usize;
+        }
+        start += count;
+        // Minimal: a long form only for 128 and up, without leading zeros.
+        if n < 0x80 or b[at + 2] == 0 {
+            return DerError.Malformed;
+        }
+    }
+    if n > limit - start {
+        return DerError.Malformed;
+    }
+    return Element { tag: tag, header: at, start: start, end: start + n };
+}
+
+/// The element at b[at..limit], which must have the tag.
+pub fn expect(b: []u8, at: usize, limit: usize, tag: u8) -> DerError!Element {
+    let e = try read(b, at: at, limit: limit);
+    if e.tag != tag {
+        return DerError.Malformed;
+    }
+    return e;
+}
+
+/// Whether the contents of e are the object identifier written as DER
+/// contents in oid.
+pub fn is_oid(b: []u8, e: &Element, oid: []u8) -> bool {
+    if e.tag != OID or e.len() != oid.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < oid.len() : (i += 1) {
+        if b[e.start + i] != oid[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A non-negative INTEGER's value as exactly out.len() big-endian bytes,
+/// or an error when it is negative or does not fit.
+pub fn unsigned(b: []u8, e: &Element, out: []mut u8) -> DerError!void {
+    if e.tag != INTEGER or e.len() == 0 or b[e.start] & 0x80 != 0 {
+        return DerError.Malformed;
+    }
+    var at = e.start;
+    // One leading zero keeps a high bit from reading as a sign; DER allows
+    // no more than that.
+    if b[at] == 0 and e.len() > 1 {
+        if b[at + 1] & 0x80 == 0 {
+            return DerError.Malformed;
+        }
+        at += 1;
+    }
+    let n = e.end - at;
+    if n > out.len() {
+        return DerError.Malformed;
+    }
+    var i: usize = 0;
+    while i < out.len() : (i += 1) {
+        out[i] = 0;
+    }
+    i = 0;
+    while i < n : (i += 1) {
+        out[out.len() - n + i] = b[at + i];
+    }
+}
+
+/// A small non-negative INTEGER (path lengths, versions).
+pub fn small(b: []u8, e: &Element) -> DerError!u32 {
+    var v: [4]u8 = [0; 4];
+    try unsigned(b, e: e, out: v[0..4]);
+    return ((v[0] as u32) << 24) | ((v[1] as u32) << 16) | ((v[2] as u32) << 8) | v[3] as u32;
+}
+
+fn digits(b: []u8, at: usize, n: usize) -> DerError!i64 {
+    var v: i64 = 0;
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        let c = b[at + i];
+        if c < '0' or c > '9' {
+            return DerError.Malformed;
+        }
+        v = v * 10 + (c - '0') as i64;
+    }
+    return v;
+}
+
+/// Days from 1970-01-01 to the date, for the proleptic Gregorian calendar
+/// (Howard Hinnant's days_from_civil).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    var y = year;
+    if month <= 2 {
+        y -= 1;
+    }
+    var era = y / 400;
+    if y < 0 {
+        era = (y - 399) / 400;
+    }
+    let yoe = y - era * 400;
+    var mp = month - 3;
+    if month <= 2 {
+        mp = month + 9;
+    }
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// A UTCTime (YYMMDDHHMMSSZ, years 1950 to 2049) or GeneralizedTime
+/// (YYYYMMDDHHMMSSZ) as seconds since 1970, UTC.
+pub fn time(b: []u8, e: &Element) -> DerError!i64 {
+    var at = e.start;
+    var year: i64 = 0;
+    if e.tag == UTC_TIME and e.len() == 13 {
+        year = try digits(b, at: at, n: 2);
+        if year < 50 {
+            year += 2000;
+        } else {
+            year += 1900;
+        }
+        at += 2;
+    } else if e.tag == GENERALIZED_TIME and e.len() == 15 {
+        year = try digits(b, at: at, n: 4);
+        at += 4;
+    } else {
+        return DerError.Malformed;
+    }
+    if b[e.end - 1] != 'Z' {
+        return DerError.Malformed;
+    }
+    let month = try digits(b, at: at, n: 2);
+    let day = try digits(b, at: at + 2, n: 2);
+    let hour = try digits(b, at: at + 4, n: 2);
+    let minute = try digits(b, at: at + 6, n: 2);
+    let second = try digits(b, at: at + 8, n: 2);
+    if month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60 {
+        return DerError.Malformed;
+    }
+    return days_from_civil(year: year, month: month, day: day) * 86400 + hour * 3600 + minute * 60 + second;
+}
+
+// ---- Writing ----------------------------------------------------------------------------------
+
+/// Appends an element: the tag, the minimal length, the contents.
+pub fn put(out: &mut alloc.List(u8), tag: u8, contents: []u8) {
+    out.push(tag);
+    let n = contents.len();
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        var count: u32 = 0;
+        var m = n;
+        while m > 0 : (m = m >> 8) {
+            count += 1;
+        }
+        out.push(0x80 | count as u8);
+        while count > 0 : (count -= 1) {
+            out.push(((n >> (8 * (count - 1))) & 0xff) as u8);
+        }
+    }
+    for x in contents {
+        out.push(x.*);
+    }
+}
+
+/// Appends a non-negative INTEGER from big-endian bytes.
+pub fn put_unsigned(out: &mut alloc.List(u8), value: []u8, a: alloc.Allocator) {
+    var skip: usize = 0;
+    while skip + 1 < value.len() and value[skip] == 0 : (skip += 1) {
+    }
+    var c = alloc.List(u8).init(a);
+    if value[skip] >= 0x80 {
+        c.push(0);
+    }
+    for x in value[skip..value.len()] {
+        c.push(x.*);
+    }
+    put(out, tag: INTEGER, contents: c.items());
+}
+
+/// The date of a day since 1970-01-01 (Howard Hinnant's civil_from_days).
+fn civil_from_days(z0: i64) -> [3]i64 {
+    let z = z0 + 719468;
+    var era = z / 146097;
+    if z < 0 {
+        era = (z - 146096) / 146097;
+    }
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    var m = mp + 3;
+    if mp >= 10 {
+        m = mp - 9;
+    }
+    var y = yoe + era * 400;
+    if m <= 2 {
+        y += 1;
+    }
+    return [y, m, d];
+}
+
+fn put_digits(out: &mut alloc.List(u8), v: i64, n: u32) {
+    var div: i64 = 1;
+    var i: u32 = 1;
+    while i < n : (i += 1) {
+        div *= 10;
+    }
+    while div > 0 : (div = div / 10) {
+        out.push('0' + ((v / div) % 10) as u8);
+    }
+}
+
+/// Appends a time, seconds since 1970: UTCTime before 2050, as RFC 5280
+/// wants, and GeneralizedTime from then on.
+pub fn put_time(out: &mut alloc.List(u8), t: i64, a: alloc.Allocator) {
+    var days = t / 86400;
+    var secs = t % 86400;
+    if secs < 0 {
+        secs += 86400;
+        days -= 1;
+    }
+    let date = civil_from_days(days);
+    var c = alloc.List(u8).init(a);
+    var tag = UTC_TIME;
+    if date[0] >= 2050 {
+        tag = GENERALIZED_TIME;
+        put_digits(&mut c, v: date[0], n: 4);
+    } else {
+        put_digits(&mut c, v: date[0] % 100, n: 2);
+    }
+    put_digits(&mut c, v: date[1], n: 2);
+    put_digits(&mut c, v: date[2], n: 2);
+    put_digits(&mut c, v: secs / 3600, n: 2);
+    put_digits(&mut c, v: (secs / 60) % 60, n: 2);
+    put_digits(&mut c, v: secs % 60, n: 2);
+    c.push('Z');
+    put(out, tag: tag, contents: c.items());
+}

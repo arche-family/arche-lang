@@ -1,0 +1,1646 @@
+/// TLS 1.3 (RFC 8446), client and server, over lib/crypto.
+///
+/// Engine is the protocol without I/O: bytes from the peer go in through
+/// feed, bytes for the peer come out of output, so the same code runs
+/// over a socket (Conn, below), in memory, or under a fuzzer.
+///
+/// Cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and
+/// TLS_CHACHA20_POLY1305_SHA256. Key exchange: X25519 and secp256r1.
+/// Signatures: ecdsa_secp256r1_sha256 and ed25519, so certificates have
+/// P-256 or Ed25519 keys. ALPN is supported; resumption, early data,
+/// HelloRetryRequest and client certificates are not.
+import alloc;
+import crypto.aes;
+import crypto.chacha20poly1305 as cc;
+import crypto.ct;
+import crypto.ed25519;
+import crypto.hmac;
+import crypto.p256;
+import crypto.random;
+import crypto.sha2;
+import crypto.x25519;
+import std;
+import tls.x509;
+
+/// Every way a connection fails. The names X.509 and the network use are
+/// among them, so their errors pass through as they are.
+pub type TlsError = error {
+    Malformed,
+    Unexpected,
+    BadRecord,
+    NoCommonSuite,
+    ProtocolVersion,
+    BadFinished,
+    BadSignature,
+    Expired,
+    UnknownIssuer,
+    NotCa,
+    NameMismatch,
+    Unsupported,
+    TooLarge,
+    PeerAlert,
+    Closed,
+    Refused,
+    AddressInUse,
+    NetFailed,
+}
+
+const CHANGE_CIPHER_SPEC: u8 = 20;
+const ALERT: u8 = 21;
+const HANDSHAKE: u8 = 22;
+const APPLICATION_DATA: u8 = 23;
+
+const CLIENT_HELLO: u8 = 1;
+const SERVER_HELLO: u8 = 2;
+const NEW_SESSION_TICKET: u8 = 4;
+const ENCRYPTED_EXTENSIONS: u8 = 8;
+const CERTIFICATE: u8 = 11;
+const CERTIFICATE_REQUEST: u8 = 13;
+const CERTIFICATE_VERIFY: u8 = 15;
+const FINISHED: u8 = 20;
+const KEY_UPDATE: u8 = 24;
+
+const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+
+const X25519: u16 = 0x001d;
+const SECP256R1: u16 = 0x0017;
+
+const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+const ED25519: u16 = 0x0807;
+
+const EXT_SERVER_NAME: u16 = 0;
+const EXT_SUPPORTED_GROUPS: u16 = 10;
+const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
+const EXT_ALPN: u16 = 16;
+const EXT_SUPPORTED_VERSIONS: u16 = 43;
+const EXT_KEY_SHARE: u16 = 51;
+
+const TLS13: u16 = 0x0304;
+
+/// The most plaintext a record carries.
+pub const MAX_PLAINTEXT: usize = 16384;
+
+// ---- Bytes in and out --------------------------------------------------------------------
+
+fn put8(out: &mut alloc.List(u8), v: u8) {
+    out.push(v);
+}
+
+fn put16(out: &mut alloc.List(u8), v: u16) {
+    out.push((v >> 8) as u8);
+    out.push((v & 0xff) as u8);
+}
+
+fn put(out: &mut alloc.List(u8), data: []u8) {
+    for x in data {
+        out.push(x.*);
+    }
+}
+
+/// Room for a length of size bytes, filled in by close_len.
+fn open_len(out: &mut alloc.List(u8), size: usize) -> usize {
+    let at = out.len();
+    var i: usize = 0;
+    while i < size : (i += 1) {
+        out.push(0);
+    }
+    return at;
+}
+
+fn close_len(out: &mut alloc.List(u8), at: usize, size: usize) {
+    let n = out.len() - at - size;
+    let b = out.items_mut();
+    var i: usize = 0;
+    while i < size : (i += 1) {
+        b[at + i] = ((n >> ((8 * (size - 1 - i)) as u32)) & 0xff) as u8;
+    }
+}
+
+fn copy(to: []mut u8, from: []u8) {
+    var i: usize = 0;
+    while i < from.len() : (i += 1) {
+        to[i] = from[i];
+    }
+}
+
+fn same(a: []u8, b: []u8) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len() : (i += 1) {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Where parsing is in a message, which each method takes as b; a vector
+/// is a reader of its own over its contents.
+type Reader = struct {
+    at: usize,
+    end: usize,
+
+    fn done(self: &Reader) -> bool {
+        return self.at == self.end;
+    }
+
+    fn byte(self: &mut Reader, b: []u8) -> TlsError!u8 {
+        if self.at >= self.end {
+            return TlsError.Malformed;
+        }
+        self.at += 1;
+        return b[self.at - 1];
+    }
+
+    fn short(self: &mut Reader, b: []u8) -> TlsError!u16 {
+        let hi = try self.byte(b);
+        let lo = try self.byte(b);
+        return ((hi as u16) << 8) | lo as u16;
+    }
+
+    /// n bytes, as a reader over them.
+    fn skip(self: &mut Reader, n: usize) -> TlsError!Reader {
+        if n > self.end - self.at {
+            return TlsError.Malformed;
+        }
+        let r = Reader { at: self.at, end: self.at + n };
+        self.at += n;
+        return r;
+    }
+
+    /// A vector with a length of size bytes in front.
+    fn vector(self: &mut Reader, b: []u8, size: u32) -> TlsError!Reader {
+        var n: usize = 0;
+        var i: u32 = 0;
+        while i < size : (i += 1) {
+            n = (n << 8) | (try self.byte(b)) as usize;
+        }
+        return self.skip(n);
+    }
+}
+
+/// Bytes that arrive at the back and leave from the front.
+type Queue = struct {
+    bytes: alloc.List(u8),
+    start: usize,
+
+    fn init(a: alloc.Allocator) -> Queue {
+        return Queue { bytes: alloc.List(u8).init(a), start: 0 };
+    }
+
+    fn push(self: &mut Queue, data: []u8) {
+        put(&mut self.bytes, data);
+    }
+
+    fn view(self: &Queue) -> []u8 {
+        return self.bytes.items()[self.start..self.bytes.len()];
+    }
+
+    fn len(self: &Queue) -> usize {
+        return self.bytes.len() - self.start;
+    }
+
+    fn take(self: &mut Queue, n: usize) {
+        self.start += n;
+        if self.start == self.bytes.len() {
+            self.bytes.clear();
+            self.start = 0;
+        } else if self.start >= 65536 {
+            let from = self.start;
+            let left = self.bytes.len() - from;
+            let b = self.bytes.items_mut();
+            var i: usize = 0;
+            while i < left : (i += 1) {
+                b[i] = b[from + i];
+            }
+            while self.bytes.len() > left {
+                _ = self.bytes.pop();
+            }
+            self.start = 0;
+        }
+    }
+}
+
+// ---- Hashes and the key schedule -----------------------------------------------------------
+
+type Hash = enum { Sha256, Sha384 }
+
+fn hash_len(h: Hash) -> usize {
+    match h {
+        .Sha256 => { return 32; }
+        .Sha384 => { return 48; }
+    }
+}
+
+fn suite_hash(suite: u16) -> Hash {
+    if suite == TLS_AES_256_GCM_SHA384 {
+        return Hash.Sha384;
+    }
+    return Hash.Sha256;
+}
+
+fn key_len(suite: u16) -> usize {
+    if suite == TLS_AES_128_GCM_SHA256 {
+        return 16;
+    }
+    return 32;
+}
+
+fn digest_of(h: Hash, data: []u8) -> [48]u8 {
+    var out: [48]u8 = [0; 48];
+    match h {
+        .Sha256 => {
+            let d = sha2.sha256(data);
+            copy(to: out[0..32], from: d[0..32]);
+        }
+        .Sha384 => {
+            out = sha2.sha384(data);
+        }
+    }
+    return out;
+}
+
+fn mac(h: Hash, key: []u8, data: []u8) -> [48]u8 {
+    var out: [48]u8 = [0; 48];
+    match h {
+        .Sha256 => {
+            let d = hmac.hmac_sha256(key: key, data: data);
+            copy(to: out[0..32], from: d[0..32]);
+        }
+        .Sha384 => {
+            out = hmac.hmac_sha384(key: key, data: data);
+        }
+    }
+    return out;
+}
+
+fn extract(h: Hash, salt: []u8, ikm: []u8) -> [48]u8 {
+    return mac(h, key: salt, data: ikm);
+}
+
+/// HKDF-Expand-Label: the label gets "tls13 " in front, and out says how
+/// much to make.
+fn expand_label(h: Hash, secret: []u8, label: str, context: []u8, out: []mut u8) {
+    var info: [520]u8 = [0; 520];
+    let lb = label.bytes();
+    let prefix = "tls13 ".bytes();
+    info[0] = (out.len() >> 8) as u8;
+    info[1] = (out.len() & 0xff) as u8;
+    info[2] = (prefix.len() + lb.len()) as u8;
+    var n: usize = 3;
+    for x in prefix {
+        info[n] = x.*;
+        n += 1;
+    }
+    for x in lb {
+        info[n] = x.*;
+        n += 1;
+    }
+    info[n] = context.len() as u8;
+    n += 1;
+    for x in context {
+        info[n] = x.*;
+        n += 1;
+    }
+    match h {
+        .Sha256 => { hmac.hkdf_expand_sha256(prk: secret, info: info[0..n], out: out); }
+        .Sha384 => { hmac.hkdf_expand_sha384(prk: secret, info: info[0..n], out: out); }
+    }
+}
+
+/// Derive-Secret: a secret of the hash's length from a transcript hash.
+fn derive(h: Hash, secret: []u8, label: str, digest: []u8) -> [48]u8 {
+    var out: [48]u8 = [0; 48];
+    expand_label(h, secret: secret, label: label, context: digest, out: out[0..hash_len(h)]);
+    return out;
+}
+
+/// The hash of the handshake so far, for both hashes until the suite is
+/// chosen.
+type Transcript = struct {
+    s256: sha2.Sha256,
+    s384: sha2.Sha512,
+
+    fn init() -> Transcript {
+        return Transcript { s256: sha2.Sha256.init(), s384: sha2.Sha512.init384() };
+    }
+
+    fn add(self: &mut Transcript, message: []u8) {
+        self.s256.update(message);
+        self.s384.update(message);
+    }
+
+    fn digest(self: &Transcript, h: Hash) -> [48]u8 {
+        var out: [48]u8 = [0; 48];
+        match h {
+            .Sha256 => {
+                var s = self.s256;
+                let d = s.finish();
+                copy(to: out[0..32], from: d[0..32]);
+            }
+            .Sha384 => {
+                var s = self.s384;
+                out = s.finish384();
+            }
+        }
+        return out;
+    }
+}
+
+/// One direction's record protection: its traffic secret, the key and IV
+/// made from it, and the sequence number.
+type Direction = struct {
+    on: bool,
+    secret: [48]u8,
+    key: [32]u8,
+    iv: [12]u8,
+    seq: u64,
+
+    fn off() -> Direction {
+        return Direction { on: false, secret: [0; 48], key: [0; 32], iv: [0; 12], seq: 0 };
+    }
+
+    fn from_secret(h: Hash, suite: u16, secret: [48]u8) -> Direction {
+        var d = Direction { on: true, secret: secret, key: [0; 32], iv: [0; 12], seq: 0 };
+        let n = hash_len(h);
+        let nothing: [1]u8 = [0];
+        expand_label(h, secret: secret[0..n], label: "key", context: nothing[0..0], out: d.key[0..key_len(suite)]);
+        expand_label(h, secret: secret[0..n], label: "iv", context: nothing[0..0], out: d.iv[0..12]);
+        return d;
+    }
+
+    /// The IV with the sequence number mixed into its last 8 bytes.
+    fn nonce(self: &Direction) -> [12]u8 {
+        var n = self.iv;
+        var i: usize = 0;
+        while i < 8 : (i += 1) {
+            n[4 + i] = n[4 + i] ^ ((self.seq >> ((8 * (7 - i)) as u32)) & 0xff) as u8;
+        }
+        return n;
+    }
+}
+
+/// Appends a record of the given type with data to out: in the clear
+/// before keys, then sealed, with the type inside.
+fn seal(d: &mut Direction, suite: u16, kind: u8, data: []u8, out: &mut alloc.List(u8), scratch: &mut alloc.List(u8)) {
+    if not d.on {
+        put8(out, kind);
+        put16(out, 0x0303);
+        put16(out, data.len() as u16);
+        put(out, data);
+        return;
+    }
+    scratch.clear();
+    put(scratch, data);
+    put8(scratch, kind);
+    let n = scratch.len() + 16;
+    let header: [5]u8 = [APPLICATION_DATA, 3, 3, (n >> 8) as u8, (n & 0xff) as u8];
+    put(out, header[0..5]);
+    let at = open_len(out, size: n);
+    let nonce = d.nonce();
+    let k = key_len(suite);
+    let sealed = out.items_mut()[at..at + n];
+    if suite == TLS_CHACHA20_POLY1305_SHA256 {
+        cc.seal(key: d.key[0..k], nonce: nonce[0..12], aad: header[0..5], plaintext: scratch.items(), out: sealed);
+    } else {
+        aes.gcm_seal(key: d.key[0..k], nonce: nonce[0..12], aad: header[0..5], plaintext: scratch.items(), out: sealed);
+    }
+    d.seq += 1;
+}
+
+/// Opens a sealed record into out and gives the type inside.
+fn open_record(d: &mut Direction, suite: u16, header: [5]u8, body: []u8, out: &mut alloc.List(u8)) -> TlsError!u8 {
+    if body.len() < 17 {
+        return TlsError.BadRecord;
+    }
+    out.clear();
+    let n = body.len() - 16;
+    _ = open_len(out, size: n);
+    let nonce = d.nonce();
+    let k = key_len(suite);
+    var opened = false;
+    if suite == TLS_CHACHA20_POLY1305_SHA256 {
+        opened = cc.open(key: d.key[0..k], nonce: nonce[0..12], aad: header[0..5], sealed: body, out: out.items_mut());
+    } else {
+        opened = aes.gcm_open(key: d.key[0..k], nonce: nonce[0..12], aad: header[0..5], sealed: body, out: out.items_mut());
+    }
+    if not opened {
+        return TlsError.BadRecord;
+    }
+    d.seq += 1;
+    // The type is the last byte that is not padding.
+    while out.len() > 0 {
+        let last = out.items()[out.len() - 1];
+        _ = out.pop();
+        if last != 0 {
+            if out.len() > MAX_PLAINTEXT {
+                return TlsError.TooLarge;
+            }
+            return last;
+        }
+    }
+    return TlsError.Unexpected;
+}
+
+/// The alert a failure sends.
+fn alert_for(e: TlsError) -> u8 {
+    if e == TlsError.Unexpected { return 10; }
+    if e == TlsError.BadRecord { return 20; }
+    if e == TlsError.TooLarge { return 22; }
+    if e == TlsError.NoCommonSuite { return 40; }
+    if e == TlsError.BadSignature or e == TlsError.NameMismatch or e == TlsError.NotCa { return 42; }
+    if e == TlsError.Unsupported { return 43; }
+    if e == TlsError.Expired { return 45; }
+    if e == TlsError.UnknownIssuer { return 48; }
+    if e == TlsError.BadFinished { return 51; }
+    if e == TlsError.ProtocolVersion { return 70; }
+    if e == TlsError.Malformed { return 50; }
+    return 80;
+}
+
+// ---- Configuration ---------------------------------------------------------------------------
+
+/// What a client knows before it connects.
+pub type ClientConfig = struct {
+    host: alloc.String,
+    anchors: x509.CertList,
+    alpn: alloc.List(u8),
+    now: i64,
+
+    /// host is the name the certificate must have, and the one sent in
+    /// server_name; now is the time to check validity at, in seconds since
+    /// 1970 (sys.clock.unix_ns() / 1000000000).
+    pub fn init(host: str, now: i64, a: alloc.Allocator) -> ClientConfig {
+        var h = alloc.String.init(a);
+        h.push_str(host);
+        return ClientConfig { host: h, anchors: x509.CertList.init(a), alpn: alloc.List(u8).init(a), now: now };
+    }
+
+    /// Trusts a certificate (DER) as an anchor.
+    pub fn trust(self: &mut ClientConfig, der: []u8) {
+        self.anchors.push(der);
+    }
+
+    /// Trusts every certificate in PEM text.
+    pub fn trust_pem(self: &mut ClientConfig, text: str, a: alloc.Allocator) -> TlsError!void {
+        _ = try x509.pem(text: text, label: "CERTIFICATE", out: &mut self.anchors, a);
+    }
+
+    /// Offers an application protocol (ALPN), in order of preference.
+    pub fn offer_protocol(self: &mut ClientConfig, name: str) {
+        put8(&mut self.alpn, name.len() as u8);
+        put(&mut self.alpn, name.bytes());
+    }
+}
+
+/// What a server presents: its certificate chain, leaf first, and the
+/// leaf's private key.
+pub type ServerConfig = struct {
+    chain: x509.CertList,
+    key: x509.PrivateKey,
+    alpn: alloc.List(u8),
+
+    pub fn init(a: alloc.Allocator) -> ServerConfig {
+        return ServerConfig {
+            chain: x509.CertList.init(a),
+            key: x509.PrivateKey { key: x509.Key.Other, secret: [0; 32] },
+            alpn: alloc.List(u8).init(a),
+        };
+    }
+
+    pub fn add_certificate(self: &mut ServerConfig, der: []u8) {
+        self.chain.push(der);
+    }
+
+    /// Adds every certificate in PEM text, leaf first.
+    pub fn certificates_pem(self: &mut ServerConfig, text: str, a: alloc.Allocator) -> TlsError!void {
+        _ = try x509.pem(text: text, label: "CERTIFICATE", out: &mut self.chain, a);
+    }
+
+    pub fn private_key(self: &mut ServerConfig, key: x509.PrivateKey) {
+        self.key = key;
+    }
+
+    /// The key from PEM text: "PRIVATE KEY" (PKCS #8) or "EC PRIVATE KEY".
+    pub fn private_key_pem(self: &mut ServerConfig, text: str, a: alloc.Allocator) -> TlsError!void {
+        var blocks = x509.CertList.init(a);
+        var n = try x509.pem(text: text, label: "PRIVATE KEY", out: &mut blocks, a);
+        if n == 0 {
+            n = try x509.pem(text: text, label: "EC PRIVATE KEY", out: &mut blocks, a);
+        }
+        if n != 1 {
+            return TlsError.Malformed;
+        }
+        self.key = try x509.private_key(blocks.get(0));
+    }
+
+    /// Accepts an application protocol (ALPN), in order of preference.
+    pub fn accept_protocol(self: &mut ServerConfig, name: str) {
+        put8(&mut self.alpn, name.len() as u8);
+        put(&mut self.alpn, name.bytes());
+    }
+}
+
+fn copy_certs(from: &x509.CertList, a: alloc.Allocator) -> x509.CertList {
+    var c = x509.CertList.init(a);
+    var i: usize = 0;
+    while i < from.len() : (i += 1) {
+        c.push(from.get(i));
+    }
+    return c;
+}
+
+fn copy_bytes(from: []u8, a: alloc.Allocator) -> alloc.List(u8) {
+    var c = alloc.List(u8).init(a);
+    put(&mut c, from);
+    return c;
+}
+
+// ---- The engine ------------------------------------------------------------------------------
+
+type State = enum {
+    ClientWaitServerHello,
+    ClientWaitEncryptedExtensions,
+    ClientWaitCertificate,
+    ClientWaitCertificateVerify,
+    ClientWaitFinished,
+    ServerWaitClientHello,
+    ServerWaitFinished,
+    Connected,
+    Failed,
+}
+
+pub type Engine = struct {
+    a: alloc.Allocator,
+    state: State,
+    rng: random.Csprng,
+    // A client's.
+    host: alloc.String,
+    anchors: x509.CertList,
+    now: i64,
+    // A server's.
+    chain: x509.CertList,
+    key: x509.PrivateKey,
+    /// ALPN: offered (a client) or accepted (a server), as on the wire.
+    protocols: alloc.List(u8),
+    /// The protocol both agreed on, if any.
+    chosen: alloc.List(u8),
+    suite: u16,
+    hash: Hash,
+    transcript: Transcript,
+    x_private: [32]u8,
+    p_private: [32]u8,
+    session_id: [32]u8,
+    session_id_len: usize,
+    handshake_secret: [48]u8,
+    client_hs: [48]u8,
+    server_hs: [48]u8,
+    client_ap: [48]u8,
+    server_ap: [48]u8,
+    rx: Direction,
+    tx: Direction,
+    incoming: Queue,
+    messages: Queue,
+    outgoing: alloc.List(u8),
+    app: Queue,
+    plain: alloc.List(u8),
+    scratch: alloc.List(u8),
+    peer: x509.CertList,
+    cert_requested: bool,
+    request_context: alloc.List(u8),
+    closed_by_peer: bool,
+    close_sent: bool,
+
+    fn blank(seed: [32]u8, a: alloc.Allocator) -> Engine {
+        return Engine {
+            a: a,
+            state: State.Failed,
+            rng: random.Csprng.from_seed(seed),
+            host: alloc.String.init(a),
+            anchors: x509.CertList.init(a),
+            now: 0,
+            chain: x509.CertList.init(a),
+            key: x509.PrivateKey { key: x509.Key.Other, secret: [0; 32] },
+            protocols: alloc.List(u8).init(a),
+            chosen: alloc.List(u8).init(a),
+            suite: 0,
+            hash: Hash.Sha256,
+            transcript: Transcript.init(),
+            x_private: [0; 32],
+            p_private: [0; 32],
+            session_id: [0; 32],
+            session_id_len: 0,
+            handshake_secret: [0; 48],
+            client_hs: [0; 48],
+            server_hs: [0; 48],
+            client_ap: [0; 48],
+            server_ap: [0; 48],
+            rx: Direction.off(),
+            tx: Direction.off(),
+            incoming: Queue.init(a),
+            messages: Queue.init(a),
+            outgoing: alloc.List(u8).init(a),
+            app: Queue.init(a),
+            plain: alloc.List(u8).init(a),
+            scratch: alloc.List(u8).init(a),
+            peer: x509.CertList.init(a),
+            cert_requested: false,
+            request_context: alloc.List(u8).init(a),
+            closed_by_peer: false,
+            close_sent: false,
+        };
+    }
+
+    /// A client, its ClientHello already in output. seed must be secret
+    /// and fresh for every connection (std.Rand.fill).
+    pub fn client(config: &ClientConfig, seed: [32]u8, a: alloc.Allocator) -> Engine {
+        var e = Engine.blank(seed, a);
+        e.host.push_str(config.host.view());
+        e.anchors = copy_certs(&config.anchors, a);
+        e.now = config.now;
+        e.protocols = copy_bytes(config.alpn.items(), a);
+        e.state = State.ClientWaitServerHello;
+        e.client_hello();
+        return e;
+    }
+
+    /// A server waiting for a ClientHello.
+    pub fn server(config: &ServerConfig, seed: [32]u8, a: alloc.Allocator) -> Engine {
+        var e = Engine.blank(seed, a);
+        e.chain = copy_certs(&config.chain, a);
+        e.key = config.key;
+        e.protocols = copy_bytes(config.alpn.items(), a);
+        e.state = State.ServerWaitClientHello;
+        return e;
+    }
+
+    /// Bytes to send to the peer; call sent once they are.
+    pub fn output(self: &Engine) -> []u8 {
+        return self.outgoing.items();
+    }
+
+    pub fn sent(self: &mut Engine) {
+        self.outgoing.clear();
+    }
+
+    /// Whether the handshake is done and application data can flow.
+    pub fn connected(self: &Engine) -> bool {
+        return self.state == State.Connected;
+    }
+
+    /// Whether the peer has said it will send no more (close_notify).
+    pub fn peer_closed(self: &Engine) -> bool {
+        return self.closed_by_peer;
+    }
+
+    /// How many bytes of application data are waiting for read.
+    pub fn available(self: &Engine) -> usize {
+        return self.app.len();
+    }
+
+    /// The application protocol agreed on by ALPN; empty when none was.
+    pub fn protocol(self: &Engine) -> []u8 {
+        return self.chosen.items();
+    }
+
+    /// The peer's certificates, leaf first (a server's, for a client).
+    pub fn peer_certificates(self: &Engine) -> &x509.CertList {
+        return &self.peer;
+    }
+
+    /// Up to into.len() bytes of application data received.
+    pub fn read(self: &mut Engine, into: []mut u8) -> usize {
+        var n = self.app.len();
+        if n > into.len() {
+            n = into.len();
+        }
+        copy(to: into, from: self.app.view()[0..n]);
+        self.app.take(n);
+        return n;
+    }
+
+    /// Application data for the peer, sealed into output.
+    pub fn write(self: &mut Engine, data: []u8) -> TlsError!void {
+        if self.state != State.Connected or self.close_sent {
+            return TlsError.Unexpected;
+        }
+        self.send(APPLICATION_DATA, data: data);
+    }
+
+    /// close_notify: no more data from this side.
+    pub fn close(self: &mut Engine) {
+        if not self.close_sent and self.state != State.Failed {
+            let alert: [2]u8 = [1, 0];
+            self.send(ALERT, data: alert[0..2]);
+            self.close_sent = true;
+        }
+    }
+
+    /// Bytes from the peer. A failure puts the alert it calls for in
+    /// output, and the engine stays failed.
+    pub fn feed(self: &mut Engine, data: []u8) -> TlsError!void {
+        if self.state == State.Failed {
+            return TlsError.Unexpected;
+        }
+        self.incoming.push(data);
+        match self.records() {
+            ok(_) => { }
+            err(e) => {
+                if e != TlsError.PeerAlert and e != TlsError.Closed {
+                    let alert: [2]u8 = [2, alert_for(e)];
+                    self.send(ALERT, data: alert[0..2]);
+                }
+                self.state = State.Failed;
+                return e;
+            }
+        }
+    }
+
+    /// data as records of the type, MAX_PLAINTEXT at most each.
+    fn send(self: &mut Engine, kind: u8, data: []u8) {
+        var at: usize = 0;
+        while true {
+            var n = data.len() - at;
+            if n > MAX_PLAINTEXT {
+                n = MAX_PLAINTEXT;
+            }
+            seal(&mut self.tx, suite: self.suite, kind: kind, data: data[at..at + n], out: &mut self.outgoing, scratch: &mut self.scratch);
+            at += n;
+            if at >= data.len() {
+                return;
+            }
+        }
+    }
+
+    fn send_handshake(self: &mut Engine, message: []u8) {
+        self.transcript.add(message);
+        self.send(HANDSHAKE, data: message);
+    }
+
+    fn change_cipher_spec(self: &mut Engine) {
+        let ccs: [6]u8 = [CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1];
+        put(&mut self.outgoing, ccs[0..6]);
+    }
+
+    fn records(self: &mut Engine) -> TlsError!void {
+        while self.incoming.len() >= 5 {
+            let v = self.incoming.view();
+            let kind = v[0];
+            let n = ((v[3] as usize) << 8) | v[4] as usize;
+            if n > MAX_PLAINTEXT + 256 {
+                return TlsError.TooLarge;
+            }
+            if v.len() < 5 + n {
+                return;
+            }
+            let header: [5]u8 = [v[0], v[1], v[2], v[3], v[4]];
+            var inner = kind;
+            if kind == CHANGE_CIPHER_SPEC {
+                // Sent for middleboxes during the handshake; it means nothing.
+                if n != 1 or v[5] != 1 or self.state == State.Connected {
+                    return TlsError.Unexpected;
+                }
+                self.incoming.take(5 + n);
+                continue;
+            }
+            if self.rx.on {
+                if kind != APPLICATION_DATA {
+                    return TlsError.Unexpected;
+                }
+                inner = try open_record(&mut self.rx, suite: self.suite, header: header, body: self.incoming.view()[5..5 + n], out: &mut self.plain);
+            } else {
+                if kind != HANDSHAKE and kind != ALERT {
+                    return TlsError.Unexpected;
+                }
+                if n > MAX_PLAINTEXT {
+                    return TlsError.TooLarge;
+                }
+                self.plain.clear();
+                put(&mut self.plain, self.incoming.view()[5..5 + n]);
+            }
+            self.incoming.take(5 + n);
+            try self.content(inner);
+        }
+    }
+
+    fn content(self: &mut Engine, kind: u8) -> TlsError!void {
+        if kind == ALERT {
+            let p = self.plain.items();
+            if p.len() != 2 {
+                return TlsError.Malformed;
+            }
+            if p[1] == 0 {
+                self.closed_by_peer = true;
+                return;
+            }
+            // user_canceled is a warning that a close follows.
+            if p[1] == 90 {
+                return;
+            }
+            return TlsError.PeerAlert;
+        }
+        if self.closed_by_peer {
+            return TlsError.Unexpected;
+        }
+        if kind == APPLICATION_DATA {
+            if self.state != State.Connected {
+                return TlsError.Unexpected;
+            }
+            self.app.push(self.plain.items());
+            return;
+        }
+        if kind != HANDSHAKE or self.plain.len() == 0 {
+            return TlsError.Unexpected;
+        }
+        self.messages.push(self.plain.items());
+        while self.messages.len() >= 4 {
+            let v = self.messages.view();
+            let n = ((v[1] as usize) << 16) | ((v[2] as usize) << 8) | v[3] as usize;
+            if n > 65536 {
+                return TlsError.TooLarge;
+            }
+            if v.len() < 4 + n {
+                return;
+            }
+            let m = copy_bytes(v[0..4 + n], self.a);
+            self.messages.take(4 + n);
+            try self.message(m.items());
+        }
+    }
+
+    /// Keys change only between records, so no message may be cut by one.
+    fn set_read(self: &mut Engine, secret: [48]u8) -> TlsError!void {
+        if self.messages.len() != 0 {
+            return TlsError.Unexpected;
+        }
+        self.rx = Direction.from_secret(self.hash, suite: self.suite, secret: secret);
+    }
+
+    fn set_write(self: &mut Engine, secret: [48]u8) {
+        self.tx = Direction.from_secret(self.hash, suite: self.suite, secret: secret);
+    }
+
+    fn message(self: &mut Engine, m: []u8) -> TlsError!void {
+        let kind = m[0];
+        var r = Reader { at: 4, end: m.len() };
+        match self.state {
+            .ClientWaitServerHello => {
+                if kind != SERVER_HELLO { return TlsError.Unexpected; }
+                try self.server_hello(m, r: &mut r);
+            }
+            .ClientWaitEncryptedExtensions => {
+                if kind != ENCRYPTED_EXTENSIONS { return TlsError.Unexpected; }
+                try self.encrypted_extensions(m, r: &mut r);
+            }
+            .ClientWaitCertificate => {
+                if kind == CERTIFICATE_REQUEST and not self.cert_requested {
+                    try self.certificate_request(m, r: &mut r);
+                } else if kind == CERTIFICATE {
+                    try self.certificate(m, r: &mut r);
+                } else {
+                    return TlsError.Unexpected;
+                }
+            }
+            .ClientWaitCertificateVerify => {
+                if kind != CERTIFICATE_VERIFY { return TlsError.Unexpected; }
+                try self.certificate_verify(m, r: &mut r);
+            }
+            .ClientWaitFinished => {
+                if kind != FINISHED { return TlsError.Unexpected; }
+                try self.server_finished(m, r: &mut r);
+            }
+            .ServerWaitClientHello => {
+                if kind != CLIENT_HELLO { return TlsError.Unexpected; }
+                try self.client_hello_received(m, r: &mut r);
+            }
+            .ServerWaitFinished => {
+                if kind != FINISHED { return TlsError.Unexpected; }
+                try self.client_finished(m, r: &mut r);
+            }
+            .Connected => {
+                try self.post_handshake(m, r: &mut r);
+            }
+            .Failed => {
+                return TlsError.Unexpected;
+            }
+        }
+    }
+
+    // ---- Client ----
+
+    fn client_hello(self: &mut Engine) {
+        var random_bytes: [32]u8 = [0; 32];
+        self.rng.fill(random_bytes[0..32]);
+        self.rng.fill(self.session_id[0..32]);
+        self.session_id_len = 32;
+        self.rng.fill(self.x_private[0..32]);
+        self.rng.fill(self.p_private[0..32]);
+        let xp = x25519.public_key(self.x_private[0..32]);
+        let pp = p256.public_key(self.p_private[0..32]);
+        var m = alloc.List(u8).init(self.a);
+        put8(&mut m, CLIENT_HELLO);
+        let body = open_len(&mut m, size: 3);
+        put16(&mut m, 0x0303);
+        put(&mut m, random_bytes[0..32]);
+        put8(&mut m, 32);
+        put(&mut m, self.session_id[0..32]);
+        put16(&mut m, 6);
+        put16(&mut m, TLS_AES_128_GCM_SHA256);
+        put16(&mut m, TLS_CHACHA20_POLY1305_SHA256);
+        put16(&mut m, TLS_AES_256_GCM_SHA384);
+        put8(&mut m, 1);
+        put8(&mut m, 0);
+        let exts = open_len(&mut m, size: 2);
+        // server_name, unless the host is an address (RFC 6066).
+        if not is_address(self.host.view()) and self.host.len() > 0 {
+            put16(&mut m, EXT_SERVER_NAME);
+            let e = open_len(&mut m, size: 2);
+            let list = open_len(&mut m, size: 2);
+            put8(&mut m, 0);
+            put16(&mut m, self.host.len() as u16);
+            put(&mut m, self.host.view().bytes());
+            close_len(&mut m, at: list, size: 2);
+            close_len(&mut m, at: e, size: 2);
+        }
+        put16(&mut m, EXT_SUPPORTED_VERSIONS);
+        put16(&mut m, 3);
+        put8(&mut m, 2);
+        put16(&mut m, TLS13);
+        put16(&mut m, EXT_SUPPORTED_GROUPS);
+        put16(&mut m, 6);
+        put16(&mut m, 4);
+        put16(&mut m, X25519);
+        put16(&mut m, SECP256R1);
+        put16(&mut m, EXT_SIGNATURE_ALGORITHMS);
+        put16(&mut m, 6);
+        put16(&mut m, 4);
+        put16(&mut m, ECDSA_SECP256R1_SHA256);
+        put16(&mut m, ED25519);
+        put16(&mut m, EXT_KEY_SHARE);
+        let ks = open_len(&mut m, size: 2);
+        let shares = open_len(&mut m, size: 2);
+        put16(&mut m, X25519);
+        put16(&mut m, 32);
+        put(&mut m, xp[0..32]);
+        put16(&mut m, SECP256R1);
+        put16(&mut m, 65);
+        put(&mut m, pp[0..65]);
+        close_len(&mut m, at: shares, size: 2);
+        close_len(&mut m, at: ks, size: 2);
+        if self.protocols.len() > 0 {
+            put16(&mut m, EXT_ALPN);
+            put16(&mut m, (self.protocols.len() + 2) as u16);
+            put16(&mut m, self.protocols.len() as u16);
+            put(&mut m, self.protocols.items());
+        }
+        close_len(&mut m, at: exts, size: 2);
+        close_len(&mut m, at: body, size: 3);
+        self.transcript.add(m.items());
+        // The first record says TLS 1.0, as most clients' do.
+        put8(&mut self.outgoing, HANDSHAKE);
+        put16(&mut self.outgoing, 0x0301);
+        put16(&mut self.outgoing, m.len() as u16);
+        put(&mut self.outgoing, m.items());
+    }
+
+    fn server_hello(self: &mut Engine, m: []u8, r: &mut Reader) -> TlsError!void {
+        if try r.short(m) != 0x0303 {
+            return TlsError.ProtocolVersion;
+        }
+        let rnd = try r.skip(32);
+        // A HelloRetryRequest is a ServerHello with this random.
+        let hrr: [32]u8 = [0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+            0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c];
+        if same(a: m[rnd.at..rnd.end], b: hrr[0..32]) {
+            return TlsError.Unsupported;
+        }
+        let sid = try r.vector(m, size: 1);
+        if not same(a: m[sid.at..sid.end], b: self.session_id[0..self.session_id_len]) {
+            return TlsError.Unexpected;
+        }
+        let suite = try r.short(m);
+        if suite != TLS_AES_128_GCM_SHA256 and suite != TLS_AES_256_GCM_SHA384 and suite != TLS_CHACHA20_POLY1305_SHA256 {
+            return TlsError.NoCommonSuite;
+        }
+        if try r.byte(m) != 0 {
+            return TlsError.Unexpected;
+        }
+        var exts = try r.vector(m, size: 2);
+        if not r.done() {
+            return TlsError.Malformed;
+        }
+        var version: u16 = 0;
+        var group: u16 = 0;
+        var share = Reader { at: 0, end: 0 };
+        while not exts.done() {
+            let t = try exts.short(m);
+            var e = try exts.vector(m, size: 2);
+            if t == EXT_SUPPORTED_VERSIONS {
+                version = try e.short(m);
+            } else if t == EXT_KEY_SHARE {
+                group = try e.short(m);
+                share = try e.vector(m, size: 2);
+            } else {
+                return TlsError.Unsupported;
+            }
+            if not e.done() {
+                return TlsError.Malformed;
+            }
+        }
+        if version != TLS13 {
+            return TlsError.ProtocolVersion;
+        }
+        self.suite = suite;
+        self.hash = suite_hash(suite);
+        self.transcript.add(m);
+        var shared: [32]u8 = [0; 32];
+        if group == X25519 and share.end - share.at == 32 {
+            shared = x25519.scalarmult(k: self.x_private[0..32], u: m[share.at..share.end]);
+            if all_zero(shared[0..32]) {
+                return TlsError.Unexpected;
+            }
+        } else if group == SECP256R1 {
+            match p256.shared_secret(private: self.p_private[0..32], peer: m[share.at..share.end]) {
+                some(z) => { shared = z; }
+                none => { return TlsError.Unexpected; }
+            }
+        } else {
+            return TlsError.NoCommonSuite;
+        }
+        self.handshake_secrets(shared[0..32]);
+        try self.set_read(self.server_hs);
+        self.set_write(self.client_hs);
+        self.state = State.ClientWaitEncryptedExtensions;
+    }
+
+    fn encrypted_extensions(self: &mut Engine, m: []u8, r: &mut Reader) -> TlsError!void {
+        var exts = try r.vector(m, size: 2);
+        if not r.done() {
+            return TlsError.Malformed;
+        }
+        while not exts.done() {
+            let t = try exts.short(m);
+            var e = try exts.vector(m, size: 2);
+            if t == EXT_ALPN {
+                var list = try e.vector(m, size: 2);
+                let name = try list.vector(m, size: 1);
+                if not list.done() or name.at == name.end or not offered(list: self.protocols.items(), name: m[name.at..name.end]) {
+                    return TlsError.Unexpected;
+                }
+                put(&mut self.chosen, m[name.at..name.end]);
+            }
+        }
+        self.transcript.add(m);
+        self.state = State.ClientWaitCertificate;
+    }
+
+    fn certificate_request(self: &mut Engine, m: []u8, r: &mut Reader) -> TlsError!void {
+        let context = try r.vector(m, size: 1);
+        _ = try r.vector(m, size: 2);
+        if not r.done() {
+            return TlsError.Malformed;
+        }
+        put(&mut self.request_context, m[context.at..context.end]);
+        self.cert_requested = true;
+        self.transcript.add(m);
+    }
+
+    fn certificate(self: &mut Engine, m: []u8, r: &mut Reader) -> TlsError!void {
+        let context = try r.vector(m, size: 1);
+        if not context.done() {
+            return TlsError.Unexpected;
+        }
+        var list = try r.vector(m, size: 3);
+        if not r.done() {
+            return TlsError.Malformed;
+        }
+        self.peer.clear();
+        while not list.done() {
+            let data = try list.vector(m, size: 3);
+            _ = try list.vector(m, size: 2);
+            if data.at == data.end {
+                return TlsError.Malformed;
+            }
+            self.peer.push(m[data.at..data.end]);
+        }
+        if self.peer.len() == 0 {
+            return TlsError.Malformed;
+        }
+        try x509.verify(chain: &self.peer, anchors: &self.anchors, host: self.host.view(), now: self.now);
+        self.transcript.add(m);
+        self.state = State.ClientWaitCertificateVerify;
+    }
+
+    fn certificate_verify(self: &mut Engine, m: []u8, r: &mut Reader) -> TlsError!void {
+        let scheme = try r.short(m);
+        let sig = try r.vector(m, size: 2);
+        if not r.done() {
+            return TlsError.Malformed;
+        }
+        let content = signed_content(self.transcript.digest(self.hash), n: hash_len(self.hash), server: true);
+        let leaf_der = self.peer.get(0);
+        let leaf = try x509.parse(leaf_der);
+        let key = leaf_der[leaf.key_bytes.start..leaf.key_bytes.end];
+        let total = 98 + hash_len(self.hash);
+        var good = false;
+        if scheme == ECDSA_SECP256R1_SHA256 and leaf.key == x509.Key.EcdsaP256 {
+            let rs = try x509.ecdsa_signature(m[sig.at..sig.end]);
+            let d = sha2.sha256(content[0..total]);
+            good = p256.verify(key: key, digest: d[0..32], sig: rs[0..64]);
+        } else if scheme == ED25519 and leaf.key == x509.Key.Ed25519 {
+            good = ed25519.verify(key: key, message: content[0..total], sig: m[sig.at..sig.end]);
+        } else {
+            return TlsError.Unsupported;
+        }
+        if not good {
+            return TlsError.BadSignature;
+        }
+        self.transcript.add(m);
+        self.state = State.ClientWaitFinished;
+    }
+
+    fn server_finished(self: &mut Engine, m: []u8, r: &mut Reader) -> TlsError!void {
+        let n = hash_len(self.hash);
+        let expected = finished_mac(self.hash, base: self.server_hs, digest: self.transcript.digest(self.hash));
+        if m.len() - r.at != n or not ct.eq(a: m[r.at..m.len()], b: expected[0..n]) {
+            return TlsError.BadFinished;
+        }
+        self.transcript.add(m);
+        self.application_secrets();
+        try self.set_read(self.server_ap);
+        self.change_cipher_spec();
+        if self.cert_requested {
+            var c = alloc.List(u8).init(self.a);
+            put8(&mut c, CERTIFICATE);
+            let body = open_len(&mut c, size: 3);
+            put8(&mut c, self.request_context.len() as u8);
+            put(&mut c, self.request_context.items());
+            _ = open_len(&mut c, size: 3);
+            close_len(&mut c, at: body, size: 3);
+            self.send_handshake(c.items());
+        }
+        let mine = finished_mac(self.hash, base: self.client_hs, digest: self.transcript.digest(self.hash));
+        let fin = finished_message(mine, n: n, a: self.a);
+        self.send_handshake(fin.items());
+        self.set_write(self.client_ap);
+        self.state = State.Connected;
+    }
+
+    // ---- Server ----
+
+    fn client_hello_received(self: &mut Engine, m: []u8, r: &mut Reader) -> TlsError!void {
+        _ = try r.short(m);
+        _ = try r.skip(32);
+        let sid = try r.vector(m, size: 1);
+        if sid.end - sid.at > 32 {
+            return TlsError.Malformed;
+        }
+        self.session_id_len = sid.end - sid.at;
+        copy(to: self.session_id[0..self.session_id_len], from: m[sid.at..sid.end]);
+        var suites = try r.vector(m, size: 2);
+        var suite: u16 = 0;
+        while not suites.done() {
+            let s = try suites.short(m);
+            if suite == 0 and (s == TLS_AES_128_GCM_SHA256 or s == TLS_AES_256_GCM_SHA384 or s == TLS_CHACHA20_POLY1305_SHA256) {
+                suite = s;
+            }
+        }
+        var compression = try r.vector(m, size: 1);
+        var null_compression = false;
+        while not compression.done() {
+            if try compression.byte(m) == 0 {
+                null_compression = true;
+            }
+        }
+        var exts = try r.vector(m, size: 2);
+        if not r.done() or not null_compression {
+            return TlsError.Malformed;
+        }
+        var tls13 = false;
+        var scheme_ok = false;
+        var group: u16 = 0;
+        var share = Reader { at: 0, end: 0 };
+        let wanted = scheme_for(self.key.key);
+        while not exts.done() {
+            let t = try exts.short(m);
+            var e = try exts.vector(m, size: 2);
+            if t == EXT_SUPPORTED_VERSIONS {
+                var list = try e.vector(m, size: 1);
+                while not list.done() {
+                    if try list.short(m) == TLS13 {
+                        tls13 = true;
+                    }
+                }
+            } else if t == EXT_SIGNATURE_ALGORITHMS {
+                var list = try e.vector(m, size: 2);
+                while not list.done() {
+                    if try list.short(m) == wanted {
+                        scheme_ok = true;
+                    }
+                }
+            } else if t == EXT_KEY_SHARE {
+                var list = try e.vector(m, size: 2);
+                while not list.done() {
+                    let g = try list.short(m);
+                    let k = try list.vector(m, size: 2);
+                    let n = k.end - k.at;
+                    if (g == X25519 and n == 32) or (g == SECP256R1 and n == 65 and group != X25519) {
+                        group = g;
+                        share = k;
+                    }
+                }
+            } else if t == EXT_ALPN and self.protocols.len() > 0 {
+                var list = try e.vector(m, size: 2);
+                try self.choose_protocol(m, list: &mut list);
+            }
+        }
+        if not tls13 {
+            return TlsError.ProtocolVersion;
+        }
+        if suite == 0 or group == 0 or not scheme_ok or self.chain.len() == 0 {
+            return TlsError.NoCommonSuite;
+        }
+        self.suite = suite;
+        self.hash = suite_hash(suite);
+        self.transcript.add(m);
+        // The key share and the shared secret.
+        var mine: [65]u8 = [0; 65];
+        var mine_len: usize = 0;
+        var shared: [32]u8 = [0; 32];
+        if group == X25519 {
+            self.rng.fill(self.x_private[0..32]);
+            let pub_key = x25519.public_key(self.x_private[0..32]);
+            copy(to: mine[0..32], from: pub_key[0..32]);
+            mine_len = 32;
+            shared = x25519.scalarmult(k: self.x_private[0..32], u: m[share.at..share.end]);
+            if all_zero(shared[0..32]) {
+                return TlsError.Unexpected;
+            }
+        } else {
+            self.rng.fill(self.p_private[0..32]);
+            mine = p256.public_key(self.p_private[0..32]);
+            mine_len = 65;
+            match p256.shared_secret(private: self.p_private[0..32], peer: m[share.at..share.end]) {
+                some(z) => { shared = z; }
+                none => { return TlsError.Unexpected; }
+            }
+        }
+        var sh = alloc.List(u8).init(self.a);
+        put8(&mut sh, SERVER_HELLO);
+        let body = open_len(&mut sh, size: 3);
+        put16(&mut sh, 0x0303);
+        var random_bytes: [32]u8 = [0; 32];
+        self.rng.fill(random_bytes[0..32]);
+        put(&mut sh, random_bytes[0..32]);
+        put8(&mut sh, self.session_id_len as u8);
+        put(&mut sh, self.session_id[0..self.session_id_len]);
+        put16(&mut sh, suite);
+        put8(&mut sh, 0);
+        let exts_at = open_len(&mut sh, size: 2);
+        put16(&mut sh, EXT_SUPPORTED_VERSIONS);
+        put16(&mut sh, 2);
+        put16(&mut sh, TLS13);
+        put16(&mut sh, EXT_KEY_SHARE);
+        put16(&mut sh, (mine_len + 4) as u16);
+        put16(&mut sh, group);
+        put16(&mut sh, mine_len as u16);
+        put(&mut sh, mine[0..mine_len]);
+        close_len(&mut sh, at: exts_at, size: 2);
+        close_len(&mut sh, at: body, size: 3);
+        self.send_handshake(sh.items());
+        self.handshake_secrets(shared[0..32]);
+        if self.session_id_len > 0 {
+            self.change_cipher_spec();
+        }
+        self.set_write(self.server_hs);
+        try self.set_read(self.client_hs);
+        // EncryptedExtensions.
+        var ee = alloc.List(u8).init(self.a);
+        put8(&mut ee, ENCRYPTED_EXTENSIONS);
+        let ee_body = open_len(&mut ee, size: 3);
+        let ee_exts = open_len(&mut ee, size: 2);
+        if self.chosen.len() > 0 {
+            put16(&mut ee, EXT_ALPN);
+            put16(&mut ee, (self.chosen.len() + 3) as u16);
+            put16(&mut ee, (self.chosen.len() + 1) as u16);
+            put8(&mut ee, self.chosen.len() as u8);
+            put(&mut ee, self.chosen.items());
+        }
+        close_len(&mut ee, at: ee_exts, size: 2);
+        close_len(&mut ee, at: ee_body, size: 3);
+        self.send_handshake(ee.items());
+        // Certificate.
+        var c = alloc.List(u8).init(self.a);
+        put8(&mut c, CERTIFICATE);
+        let c_body = open_len(&mut c, size: 3);
+        put8(&mut c, 0);
+        let list = open_len(&mut c, size: 3);
+        var i: usize = 0;
+        while i < self.chain.len() : (i += 1) {
+            let der = self.chain.get(i);
+            let one = open_len(&mut c, size: 3);
+            put(&mut c, der);
+            close_len(&mut c, at: one, size: 3);
+            put16(&mut c, 0);
+        }
+        close_len(&mut c, at: list, size: 3);
+        close_len(&mut c, at: c_body, size: 3);
+        self.send_handshake(c.items());
+        // CertificateVerify.
+        let content = signed_content(self.transcript.digest(self.hash), n: hash_len(self.hash), server: true);
+        let total = 98 + hash_len(self.hash);
+        var cv = alloc.List(u8).init(self.a);
+        put8(&mut cv, CERTIFICATE_VERIFY);
+        let cv_body = open_len(&mut cv, size: 3);
+        put16(&mut cv, wanted);
+        if wanted == ECDSA_SECP256R1_SHA256 {
+            let d = sha2.sha256(content[0..total]);
+            let rs = p256.sign(private: self.key.secret[0..32], digest: d[0..32]);
+            var sig: [72]u8 = [0; 72];
+            let n = x509.ecdsa_der(rs, out: &mut sig);
+            put16(&mut cv, n as u16);
+            put(&mut cv, sig[0..n]);
+        } else {
+            let sig = ed25519.sign(seed: self.key.secret[0..32], message: content[0..total]);
+            put16(&mut cv, 64);
+            put(&mut cv, sig[0..64]);
+        }
+        close_len(&mut cv, at: cv_body, size: 3);
+        self.send_handshake(cv.items());
+        // Finished, and the keys for what follows.
+        let n = hash_len(self.hash);
+        let verify_data = finished_mac(self.hash, base: self.server_hs, digest: self.transcript.digest(self.hash));
+        let fin = finished_message(verify_data, n: n, a: self.a);
+        self.send_handshake(fin.items());
+        self.application_secrets();
+        self.set_write(self.server_ap);
+        self.state = State.ServerWaitFinished;
+    }
+
+    /// The first protocol the server accepts that the client offered.
+    fn choose_protocol(self: &mut Engine, m: []u8, list: &mut Reader) -> TlsError!void {
+        var theirs = alloc.List(u8).init(self.a);
+        while not list.done() {
+            let name = try list.vector(m, size: 1);
+            if name.at == name.end {
+                return TlsError.Malformed;
+            }
+            put8(&mut theirs, (name.end - name.at) as u8);
+            put(&mut theirs, m[name.at..name.end]);
+        }
+        let ours = self.protocols.items();
+        var at: usize = 0;
+        while at < ours.len() {
+            let n = ours[at] as usize;
+            if offered(list: theirs.items(), name: ours[at + 1..at + 1 + n]) {
+                put(&mut self.chosen, ours[at + 1..at + 1 + n]);
+                return;
+            }
+            at += 1 + n;
+        }
+    }
+
+    fn client_finished(self: &mut Engine, m: []u8, r: &mut Reader) -> TlsError!void {
+        let n = hash_len(self.hash);
+        let expected = finished_mac(self.hash, base: self.client_hs, digest: self.transcript.digest(self.hash));
+        if m.len() - r.at != n or not ct.eq(a: m[r.at..m.len()], b: expected[0..n]) {
+            return TlsError.BadFinished;
+        }
+        self.transcript.add(m);
+        try self.set_read(self.client_ap);
+        self.state = State.Connected;
+    }
+
+    // ---- Both ----
+
+    fn post_handshake(self: &mut Engine, m: []u8, r: &mut Reader) -> TlsError!void {
+        let kind = m[0];
+        if kind == NEW_SESSION_TICKET and not self.chain_is_ours() {
+            // Resumption is not supported: a ticket is not kept.
+            return;
+        }
+        if kind != KEY_UPDATE {
+            return TlsError.Unexpected;
+        }
+        let request = try r.byte(m);
+        if not r.done() or request > 1 {
+            return TlsError.Malformed;
+        }
+        let n = hash_len(self.hash);
+        var next: [48]u8 = [0; 48];
+        let nothing: [1]u8 = [0];
+        expand_label(self.hash, secret: self.rx.secret[0..n], label: "traffic upd", context: nothing[0..0], out: next[0..n]);
+        try self.set_read(next);
+        if request == 1 and not self.close_sent {
+            let update: [5]u8 = [KEY_UPDATE, 0, 0, 1, 0];
+            self.send(HANDSHAKE, data: update[0..5]);
+            var mine: [48]u8 = [0; 48];
+            expand_label(self.hash, secret: self.tx.secret[0..n], label: "traffic upd", context: nothing[0..0], out: mine[0..n]);
+            self.set_write(mine);
+        }
+    }
+
+    /// Whether this side is the server: it has the certificates.
+    fn chain_is_ours(self: &Engine) -> bool {
+        return self.chain.len() > 0;
+    }
+
+    fn handshake_secrets(self: &mut Engine, shared: []u8) {
+        let h = self.hash;
+        let n = hash_len(h);
+        let zeros: [48]u8 = [0; 48];
+        let empty = digest_of(h, data: zeros[0..0]);
+        let early = extract(h, salt: zeros[0..n], ikm: zeros[0..n]);
+        let derived = derive(h, secret: early[0..n], label: "derived", digest: empty[0..n]);
+        self.handshake_secret = extract(h, salt: derived[0..n], ikm: shared);
+        let d = self.transcript.digest(h);
+        self.client_hs = derive(h, secret: self.handshake_secret[0..n], label: "c hs traffic", digest: d[0..n]);
+        self.server_hs = derive(h, secret: self.handshake_secret[0..n], label: "s hs traffic", digest: d[0..n]);
+    }
+
+    fn application_secrets(self: &mut Engine) {
+        let h = self.hash;
+        let n = hash_len(h);
+        let zeros: [48]u8 = [0; 48];
+        let empty = digest_of(h, data: zeros[0..0]);
+        let derived = derive(h, secret: self.handshake_secret[0..n], label: "derived", digest: empty[0..n]);
+        let master = extract(h, salt: derived[0..n], ikm: zeros[0..n]);
+        let d = self.transcript.digest(h);
+        self.client_ap = derive(h, secret: master[0..n], label: "c ap traffic", digest: d[0..n]);
+        self.server_ap = derive(h, secret: master[0..n], label: "s ap traffic", digest: d[0..n]);
+    }
+}
+
+fn all_zero(b: []u8) -> bool {
+    var acc: u8 = 0;
+    for x in b {
+        acc = acc | x.*;
+    }
+    return acc == 0;
+}
+
+/// Whether name is in a protocol list as ALPN writes it.
+fn offered(list: []u8, name: []u8) -> bool {
+    var at: usize = 0;
+    while at < list.len() {
+        let n = list[at] as usize;
+        if at + 1 + n > list.len() {
+            return false;
+        }
+        if same(a: list[at + 1..at + 1 + n], b: name) {
+            return true;
+        }
+        at += 1 + n;
+    }
+    return false;
+}
+
+fn is_address(host: str) -> bool {
+    for c in host.bytes() {
+        if (c.* < '0' or c.* > '9') and c.* != '.' {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn scheme_for(key: x509.Key) -> u16 {
+    if key == x509.Key.Ed25519 {
+        return ED25519;
+    }
+    return ECDSA_SECP256R1_SHA256;
+}
+
+/// What CertificateVerify signs: 64 spaces, the context string, a zero
+/// byte and the transcript hash; 98 + n bytes of it are used.
+fn signed_content(digest: [48]u8, n: usize, server: bool) -> [146]u8 {
+    var out: [146]u8 = [0x20; 146];
+    var context = "TLS 1.3, client CertificateVerify".bytes();
+    if server {
+        context = "TLS 1.3, server CertificateVerify".bytes();
+    }
+    copy(to: out[64..97], from: context);
+    out[97] = 0;
+    copy(to: out[98..98 + n], from: digest[0..n]);
+    return out;
+}
+
+fn finished_mac(h: Hash, base: [48]u8, digest: [48]u8) -> [48]u8 {
+    let n = hash_len(h);
+    var key: [48]u8 = [0; 48];
+    let nothing: [1]u8 = [0];
+    expand_label(h, secret: base[0..n], label: "finished", context: nothing[0..0], out: key[0..n]);
+    return mac(h, key: key[0..n], data: digest[0..n]);
+}
+
+fn finished_message(verify_data: [48]u8, n: usize, a: alloc.Allocator) -> alloc.List(u8) {
+    var f = alloc.List(u8).init(a);
+    put8(&mut f, FINISHED);
+    put8(&mut f, 0);
+    put8(&mut f, 0);
+    put8(&mut f, n as u8);
+    put(&mut f, verify_data[0..n]);
+    return f;
+}
+
+// ---- Over a socket -----------------------------------------------------------------------------
+
+/// A TLS connection over a TCP socket, which it owns.
+pub type Conn = struct {
+    sock: std.Socket,
+    engine: Engine,
+
+    /// Connects as a client over sock: the handshake is done when this
+    /// returns. On an error the socket is closed.
+    pub fn client(sock: std.Socket, config: &ClientConfig, rand: &mut std.Rand, a: alloc.Allocator) -> TlsError!Conn {
+        var seed: [32]u8 = [0; 32];
+        rand.fill(seed[0..32]);
+        var c = Conn { sock: sock, engine: Engine.client(config, seed: seed, a) };
+        match c.handshake() {
+            ok(_) => { return c; }
+            err(e) => {
+                c.sock.close();
+                return e;
+            }
+        }
+    }
+
+    /// Serves one client over sock: the handshake is done when this returns.
+    pub fn server(sock: std.Socket, config: &ServerConfig, rand: &mut std.Rand, a: alloc.Allocator) -> TlsError!Conn {
+        var seed: [32]u8 = [0; 32];
+        rand.fill(seed[0..32]);
+        var c = Conn { sock: sock, engine: Engine.server(config, seed: seed, a) };
+        match c.handshake() {
+            ok(_) => { return c; }
+            err(e) => {
+                c.sock.close();
+                return e;
+            }
+        }
+    }
+
+    fn handshake(self: &mut Conn) -> TlsError!void {
+        while not self.engine.connected() {
+            try self.pump();
+        }
+        try self.flush();
+    }
+
+    fn flush(self: &mut Conn) -> TlsError!void {
+        let out = self.engine.output();
+        if out.len() > 0 {
+            try self.sock.write(out);
+        }
+        self.engine.sent();
+    }
+
+    /// Sends what is due, then reads once from the socket.
+    fn pump(self: &mut Conn) -> TlsError!void {
+        try self.flush();
+        var buf: [8192]u8 = [0; 8192];
+        let n = try self.sock.read(buf[0..8192]);
+        if n == 0 {
+            return TlsError.Closed;
+        }
+        match self.engine.feed(buf[0..n]) {
+            ok(_) => { }
+            err(e) => {
+                _ = self.flush();
+                return e;
+            }
+        }
+    }
+
+    /// The application protocol agreed on by ALPN; empty when none was.
+    pub fn protocol(self: &Conn) -> []u8 {
+        return self.engine.protocol();
+    }
+
+    /// Up to into.len() bytes; 0 once the peer has closed.
+    pub fn read(self: &mut Conn, into: []mut u8) -> TlsError!usize {
+        while self.engine.available() == 0 {
+            if self.engine.peer_closed() {
+                return 0;
+            }
+            try self.pump();
+        }
+        return self.engine.read(into);
+    }
+
+    /// All of data.
+    pub fn write(self: &mut Conn, data: []u8) -> TlsError!void {
+        try self.engine.write(data);
+        try self.flush();
+    }
+
+    /// Sends close_notify and closes the socket.
+    pub fn close(self: &mut Conn) {
+        self.engine.close();
+        _ = self.flush();
+        self.sock.close();
+    }
+}

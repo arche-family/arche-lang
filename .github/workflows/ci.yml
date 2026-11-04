@@ -57,3 +57,16 @@ jobs:
         run: make -C stage0 && make -C compiler
       - name: Time lib/crypto on fixed and random secrets
         run: ./ctcheck/run.sh
+
+  # docs/sprints.md S21: lib/tls against OpenSSL and curl, both ways, and a
+  # minute of fuzzing the handshake and certificates.
+  tls:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Arche compiler
+        run: make -C stage0 && make -C compiler
+      - name: Interop with OpenSSL and curl
+        run: ./interop/tls.sh
+      - name: Fuzz TLS
+        run: ./fuzz/tls.sh 60

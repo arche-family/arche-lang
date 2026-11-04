@@ -1,0 +1,180 @@
+// test: run
+// spec: tls (RFC 8446)
+// stage0: skip
+// stdout: p256: connected, alpn http/1.1
+// stdout: hello server
+// stdout: hello client
+// stdout: closed
+// stdout: ed25519: connected, alpn http/1.1
+// stdout: hello server
+// stdout: hello client
+// stdout: closed
+// stdout: other name: NameMismatch, server told
+// stdout: untrusted: UnknownIssuer, server told
+// stdout: expired: Expired, server told
+// stdout: no common protocol: connected, alpn none
+import std;
+import alloc;
+import tls;
+import tls.x509;
+
+fn put(o: &mut std.Output, b: []u8) {
+    for x in b {
+        o.write_byte(x.*);
+    }
+}
+
+/// Passes bytes between the two until neither has any to send.
+fn shuttle(c: &mut tls.Engine, s: &mut tls.Engine) -> tls.TlsError!void {
+    var moved = true;
+    while moved {
+        moved = false;
+        if c.output().len() > 0 {
+            moved = true;
+            let r = s.feed(c.output());
+            c.sent();
+            try r;
+        }
+        if s.output().len() > 0 {
+            moved = true;
+            let r = c.feed(s.output());
+            s.sent();
+            try r;
+        }
+    }
+}
+
+fn certificate(subject: str, key: &x509.PrivateKey, ca_key: &x509.PrivateKey, ca_name: []u8, a: alloc.Allocator) -> alloc.List(u8) {
+    var t = x509.Template.init(subject, a);
+    t.add_name(subject, a);
+    t.serial = 2;
+    t.not_before = 1700000000;
+    t.not_after = 1900000000;
+    return x509.create(&t, key: key, issuer: ca_name, signer: ca_key, a);
+}
+
+fn error_name(e: tls.TlsError) -> str {
+    if e == tls.TlsError.NameMismatch { return "NameMismatch"; }
+    if e == tls.TlsError.UnknownIssuer { return "UnknownIssuer"; }
+    if e == tls.TlsError.Expired { return "Expired"; }
+    if e == tls.TlsError.PeerAlert { return "PeerAlert"; }
+    return "another error";
+}
+
+/// A handshake that the client must refuse with an alert to the server.
+fn refused(sys: &mut std.System, label: str, host: str, now: i64, trusted: []u8, leaf: []u8, key: x509.PrivateKey) {
+    let a = sys.alloc;
+    var sc = tls.ServerConfig.init(a);
+    sc.add_certificate(leaf);
+    sc.private_key(key);
+    var cc = tls.ClientConfig.init(host, now: now, a);
+    cc.trust(trusted);
+    var client = tls.Engine.client(&cc, seed: [3; 32], a);
+    var server = tls.Engine.server(&sc, seed: [4; 32], a);
+    sys.stdout.write(label);
+    sys.stdout.write(": ");
+    // The server's flight reaches the client, which refuses it.
+    _ = server.feed(client.output());
+    client.sent();
+    match client.feed(server.output()) {
+        ok(_) => { sys.stdout.write("accepted"); }
+        err(e) => { sys.stdout.write(error_name(e)); }
+    }
+    server.sent();
+    match server.feed(client.output()) {
+        ok(_) => { sys.stdout.write(", server not told\n"); }
+        err(e) => {
+            if e == tls.TlsError.PeerAlert {
+                sys.stdout.write(", server told\n");
+            } else {
+                sys.stdout.write(", server failed otherwise\n");
+            }
+        }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let ca_key = x509.PrivateKey { key: x509.Key.EcdsaP256, secret: [7; 32] };
+    var ca_t = x509.Template.init("Arche Test CA", a);
+    ca_t.ca = true;
+    ca_t.not_before = 1700000000;
+    ca_t.not_after = 1900000000;
+    let ca_name = x509.name_of("Arche Test CA", a);
+    let ca = x509.create(&ca_t, key: &ca_key, issuer: ca_name.items(), signer: &ca_key, a);
+    var round: u32 = 0;
+    while round < 2 : (round += 1) {
+        var leaf_key = x509.PrivateKey { key: x509.Key.EcdsaP256, secret: [9; 32] };
+        if round == 1 {
+            leaf_key = x509.PrivateKey { key: x509.Key.Ed25519, secret: [9; 32] };
+            sys.stdout.write("ed25519: ");
+        } else {
+            sys.stdout.write("p256: ");
+        }
+        let leaf = certificate("localhost", key: &leaf_key, ca_key: &ca_key, ca_name: ca_name.items(), a);
+        var sc = tls.ServerConfig.init(a);
+        sc.add_certificate(leaf.items());
+        sc.private_key(leaf_key);
+        sc.accept_protocol("http/1.1");
+        var cc = tls.ClientConfig.init("localhost", now: 1800000000, a);
+        cc.trust(ca.items());
+        cc.offer_protocol("h2");
+        cc.offer_protocol("http/1.1");
+        var client = tls.Engine.client(&cc, seed: [1; 32], a);
+        var server = tls.Engine.server(&sc, seed: [2; 32], a);
+        try shuttle(c: &mut client, s: &mut server);
+        if client.connected() and server.connected() {
+            sys.stdout.write("connected, alpn ");
+            put(&mut sys.stdout, client.protocol());
+            sys.stdout.write("\n");
+        }
+        try client.write("hello server".bytes());
+        try server.write("hello client".bytes());
+        try shuttle(c: &mut client, s: &mut server);
+        var buf: [64]u8 = [0; 64];
+        let n = server.read(buf[0..64]);
+        put(&mut sys.stdout, buf[0..n]);
+        sys.stdout.write("\n");
+        let m = client.read(buf[0..64]);
+        put(&mut sys.stdout, buf[0..m]);
+        sys.stdout.write("\n");
+        client.close();
+        try shuttle(c: &mut client, s: &mut server);
+        if server.peer_closed() {
+            sys.stdout.write("closed\n");
+        }
+    }
+
+    let key = x509.PrivateKey { key: x509.Key.EcdsaP256, secret: [9; 32] };
+    let leaf = certificate("localhost", key: &key, ca_key: &ca_key, ca_name: ca_name.items(), a);
+    refused(sys, label: "other name", host: "example.com", now: 1800000000, trusted: ca.items(), leaf: leaf.items(), key: key);
+    let other_key = x509.PrivateKey { key: x509.Key.EcdsaP256, secret: [8; 32] };
+    let other_name = x509.name_of("Another CA", a);
+    var other_t = x509.Template.init("Another CA", a);
+    other_t.ca = true;
+    other_t.not_before = 1700000000;
+    other_t.not_after = 1900000000;
+    let other_ca = x509.create(&other_t, key: &other_key, issuer: other_name.items(), signer: &other_key, a);
+    refused(sys, label: "untrusted", host: "localhost", now: 1800000000, trusted: other_ca.items(), leaf: leaf.items(), key: key);
+    refused(sys, label: "expired", host: "localhost", now: 1950000000, trusted: ca.items(), leaf: leaf.items(), key: key);
+
+    // ALPN with nothing in common: the handshake goes on without it.
+    var sc = tls.ServerConfig.init(a);
+    sc.add_certificate(leaf.items());
+    sc.private_key(key);
+    sc.accept_protocol("h2");
+    var cc = tls.ClientConfig.init("localhost", now: 1800000000, a);
+    cc.trust(ca.items());
+    cc.offer_protocol("http/1.1");
+    var client = tls.Engine.client(&cc, seed: [5; 32], a);
+    var server = tls.Engine.server(&sc, seed: [6; 32], a);
+    try shuttle(c: &mut client, s: &mut server);
+    sys.stdout.write("no common protocol: ");
+    if client.connected() and server.connected() {
+        sys.stdout.write("connected, alpn ");
+        if client.protocol().len() == 0 {
+            sys.stdout.write("none");
+        }
+        sys.stdout.write("\n");
+    }
+}

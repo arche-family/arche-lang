@@ -1,0 +1,165 @@
+// test: run
+// spec: tls (RFC 5280, X.690)
+// stage0: skip
+// stdout: chain: ok
+// stdout: by address: ok
+// stdout: wildcard: ok
+// stdout: wildcard two labels: NameMismatch
+// stdout: other name: NameMismatch
+// stdout: not yet valid: Expired
+// stdout: expired: Expired
+// stdout: untrusted: UnknownIssuer
+// stdout: same name, other key: BadSignature
+// stdout: issued by a leaf: NotCa
+// stdout: through an intermediate: ok
+// stdout: tampered: BadSignature
+// stdout: anchor itself: ok
+// stdout: pem: 2 certificates, same bytes
+// stdout: 1700000000 2524608000 -631152000
+// stdout: long form 127: Malformed
+// stdout: leading zero: Malformed
+import std;
+import alloc;
+import tls.der;
+import tls.x509;
+
+fn issue(subject: str, names: str, ca: bool, key: &x509.PrivateKey, issuer: []u8, signer: &x509.PrivateKey, a: alloc.Allocator) -> alloc.List(u8) {
+    var t = x509.Template.init(subject, a);
+    if names.len() > 0 {
+        t.add_name(names, a);
+    }
+    t.ca = ca;
+    t.serial = 5;
+    t.not_before = 1700000000;
+    t.not_after = 1900000000;
+    return x509.create(&t, key: key, issuer: issuer, signer: signer, a);
+}
+
+fn report(sys: &mut std.System, label: str, r: x509.X509Error!void) {
+    sys.stdout.write(label);
+    sys.stdout.write(": ");
+    match r {
+        ok(_) => { sys.stdout.write("ok"); }
+        err(e) => {
+            if e == x509.X509Error.NameMismatch { sys.stdout.write("NameMismatch"); }
+            if e == x509.X509Error.Expired { sys.stdout.write("Expired"); }
+            if e == x509.X509Error.UnknownIssuer { sys.stdout.write("UnknownIssuer"); }
+            if e == x509.X509Error.NotCa { sys.stdout.write("NotCa"); }
+            if e == x509.X509Error.BadSignature { sys.stdout.write("BadSignature"); }
+            if e == x509.X509Error.Malformed { sys.stdout.write("Malformed"); }
+            if e == x509.X509Error.Unsupported { sys.stdout.write("Unsupported"); }
+        }
+    }
+    sys.stdout.write("\n");
+}
+
+fn check(sys: &mut std.System, label: str, leaf: []u8, middle: []u8, anchor: []u8, host: str, now: i64) {
+    var chain = x509.CertList.init(sys.alloc);
+    chain.push(leaf);
+    if middle.len() > 0 {
+        chain.push(middle);
+    }
+    var anchors = x509.CertList.init(sys.alloc);
+    anchors.push(anchor);
+    report(sys, label: label, r: x509.verify(chain: &chain, anchors: &anchors, host: host, now: now));
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let ca_key = x509.PrivateKey { key: x509.Key.Ed25519, secret: [1; 32] };
+    let ca_name = x509.name_of("Root", a);
+    let root = issue(subject: "Root", names: "", ca: true, key: &ca_key, issuer: ca_name.items(), signer: &ca_key, a);
+    let leaf_key = x509.PrivateKey { key: x509.Key.EcdsaP256, secret: [2; 32] };
+    let leaf = issue(subject: "www.example.com", names: "www.example.com", ca: false, key: &leaf_key, issuer: ca_name.items(), signer: &ca_key, a);
+    let nothing: [1]u8 = [0];
+    let none_der = nothing[0..0];
+    check(sys, label: "chain", leaf: leaf.items(), middle: none_der, anchor: root.items(), host: "WWW.Example.com", now: 1800000000);
+    let ip_leaf = issue(subject: "server", names: "10.0.0.1", ca: false, key: &leaf_key, issuer: ca_name.items(), signer: &ca_key, a);
+    check(sys, label: "by address", leaf: ip_leaf.items(), middle: none_der, anchor: root.items(), host: "10.0.0.1", now: 1800000000);
+    let wild = issue(subject: "wild", names: "*.example.com", ca: false, key: &leaf_key, issuer: ca_name.items(), signer: &ca_key, a);
+    check(sys, label: "wildcard", leaf: wild.items(), middle: none_der, anchor: root.items(), host: "api.example.com", now: 1800000000);
+    check(sys, label: "wildcard two labels", leaf: wild.items(), middle: none_der, anchor: root.items(), host: "a.b.example.com", now: 1800000000);
+    check(sys, label: "other name", leaf: leaf.items(), middle: none_der, anchor: root.items(), host: "example.com", now: 1800000000);
+    check(sys, label: "not yet valid", leaf: leaf.items(), middle: none_der, anchor: root.items(), host: "www.example.com", now: 1600000000);
+    check(sys, label: "expired", leaf: leaf.items(), middle: none_der, anchor: root.items(), host: "www.example.com", now: 1900000001);
+    let other_key = x509.PrivateKey { key: x509.Key.Ed25519, secret: [3; 32] };
+    let other_name = x509.name_of("Other", a);
+    let other = issue(subject: "Other", names: "", ca: true, key: &other_key, issuer: other_name.items(), signer: &other_key, a);
+    check(sys, label: "untrusted", leaf: leaf.items(), middle: none_der, anchor: other.items(), host: "www.example.com", now: 1800000000);
+    let twin = issue(subject: "Root", names: "", ca: true, key: &other_key, issuer: ca_name.items(), signer: &other_key, a);
+    check(sys, label: "same name, other key", leaf: leaf.items(), middle: none_der, anchor: twin.items(), host: "www.example.com", now: 1800000000);
+    // Not a CA: a certificate issued under the leaf's name, by its key.
+    let leaf_name = try x509.subject_of(leaf.items(), a);
+    let below = issue(subject: "below", names: "below", ca: false, key: &other_key, issuer: leaf_name.items(), signer: &leaf_key, a);
+    check(sys, label: "issued by a leaf", leaf: below.items(), middle: leaf.items(), anchor: root.items(), host: "below", now: 1800000000);
+    // Root -> intermediate -> leaf.
+    let mid_key = x509.PrivateKey { key: x509.Key.EcdsaP256, secret: [4; 32] };
+    let mid = issue(subject: "Intermediate", names: "", ca: true, key: &mid_key, issuer: ca_name.items(), signer: &ca_key, a);
+    let mid_name = x509.name_of("Intermediate", a);
+    let deep = issue(subject: "deep", names: "deep.example", ca: false, key: &leaf_key, issuer: mid_name.items(), signer: &mid_key, a);
+    check(sys, label: "through an intermediate", leaf: deep.items(), middle: mid.items(), anchor: root.items(), host: "deep.example", now: 1800000000);
+    // One byte of the signed part changed.
+    var bad = alloc.List(u8).init(a);
+    for x in leaf.items() {
+        bad.push(x.*);
+    }
+    let c = try x509.parse(leaf.items());
+    let i = c.subject.end - 2;
+    bad.items_mut()[i] = bad.items()[i] ^ 1;
+    check(sys, label: "tampered", leaf: bad.items(), middle: none_der, anchor: root.items(), host: "www.example.com", now: 1800000000);
+    check(sys, label: "anchor itself", leaf: leaf.items(), middle: none_der, anchor: leaf.items(), host: "www.example.com", now: 1800000000);
+
+    var text = alloc.String.init(a);
+    x509.pem_encode(root.items(), label: "CERTIFICATE", out: &mut text);
+    text.push_str("junk between\n");
+    x509.pem_encode(leaf.items(), label: "CERTIFICATE", out: &mut text);
+    var back = x509.CertList.init(a);
+    let n = try x509.pem(text: text.view(), label: "CERTIFICATE", out: &mut back, a);
+    sys.stdout.write("pem: ");
+    sys.stdout.write_u64(n as u64);
+    sys.stdout.write(" certificates");
+    var same = back.len() == 2;
+    if same {
+        let r = back.get(0);
+        let l = back.get(1);
+        same = r.len() == root.len() and l.len() == leaf.len() and r[r.len() - 1] == root.items()[root.len() - 1];
+    }
+    if same {
+        sys.stdout.write(", same bytes");
+    }
+    sys.stdout.write("\n");
+
+    // Times: written and read back, across the UTCTime/GeneralizedTime line.
+    var times = alloc.List(u8).init(a);
+    der.put_time(&mut times, t: 1700000000, a);
+    der.put_time(&mut times, t: 2524608000, a);
+    der.put_time(&mut times, t: -631152000, a);
+    let tb = times.items();
+    var pos: usize = 0;
+    var k: u32 = 0;
+    while k < 3 : (k += 1) {
+        let e = try der.read(tb, at: pos, limit: tb.len());
+        let t = try der.time(tb, e: &e);
+        if k > 0 {
+            sys.stdout.write(" ");
+        }
+        sys.stdout.write_i64(t);
+        pos = e.end;
+    }
+    sys.stdout.write("\n");
+    // DER lengths must be minimal.
+    let long_form: [4]u8 = [0x04, 0x81, 0x7f, 0];
+    sys.stdout.write("long form 127: ");
+    match der.read(long_form[0..4], at: 0, limit: 4) {
+        ok(_) => { sys.stdout.write("accepted\n"); }
+        err(_) => { sys.stdout.write("Malformed\n"); }
+    }
+    let padded: [4]u8 = [0x02, 0x02, 0x00, 0x01];
+    let e = try der.read(padded[0..4], at: 0, limit: 4);
+    var v: [4]u8 = [0; 4];
+    sys.stdout.write("leading zero: ");
+    match der.unsigned(padded[0..4], e: &e, out: v[0..4]) {
+        ok(_) => { sys.stdout.write("accepted\n"); }
+        err(_) => { sys.stdout.write("Malformed\n"); }
+    }
+}

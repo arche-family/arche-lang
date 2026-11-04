@@ -2,7 +2,7 @@
 
 Arche (Greek *arkhē*: origin, first principle) is a systems programming language meant to carry a whole stack — bootstrap, compiler, kernel, network and web — under one memory model and one capability model.
 
-**Status:** self-hosting. stage0, a C11 translator, builds the Arche compiler; the compiler, written in [Arche-0](spec/arche-0.md), builds itself through LLVM into static binaries without the C library, and stage2 and stage3 of the bootstrap are bit-identical. The full language ([spec/arche.md](spec/arche.md)) is being implemented sprint by sprint ([docs/sprints.md](docs/sprints.md)): full-Arche packages already have generics, compile-time evaluation, interfaces with `impl`, `where` and `&dyn`, `for` loops, closures, regions, `unsafe`, floats, contracts, `nopanic` and structured concurrency; a constant-time crypto library; and a freestanding target whose programs boot in QEMU on x86-64 and RISC-V 64 ([freestanding/](freestanding/)).
+**Status:** self-hosting. stage0, a C11 translator, builds the Arche compiler; the compiler, written in [Arche-0](spec/arche-0.md), builds itself through LLVM into static binaries without the C library, and stage2 and stage3 of the bootstrap are bit-identical. The full language ([spec/arche.md](spec/arche.md)) is being implemented sprint by sprint ([docs/sprints.md](docs/sprints.md)): full-Arche packages already have generics, compile-time evaluation, interfaces with `impl`, `where` and `&dyn`, `for` loops, closures, regions, `unsafe`, floats, contracts, `nopanic` and structured concurrency; a constant-time crypto library; TLS 1.3; and a freestanding target whose programs boot in QEMU on x86-64 and RISC-V 64 ([freestanding/](freestanding/)).
 
 ## The criterion
 
@@ -46,15 +46,15 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | Path | Contents | Status |
 | --- | --- | --- |
 | [`docs/plan.md`](docs/plan.md) | the full plan (Uzbek) | snapshot, 2026-11-03 |
-| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S21 (S19 on Windows) |
+| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S22 (S19 on Windows) |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | [`spec/arche.md`](spec/arche.md) | the full language, built on Arche-0 | draft 0.1 |
-| [`conformance/`](conformance/README.md) | specification tests | 421 tests |
+| [`conformance/`](conformance/README.md) | specification tests | 424 tests |
 | `stage0/` | bootstrap compiler, C11 | complete: compiles all of Arche-0 |
 | [`compiler/`](compiler/) | the Arche compiler, Arche-0, through LLVM | self-hosting: stage2 == stage3 |
 | [`docs/abi.md`](docs/abi.md) | layouts, calling convention, runtime | version 0 |
 | [`docs/error-codes.md`](docs/error-codes.md) | every diagnostic code | living |
-| [`lib/`](lib/) | the library: `core` (no OS, no allocator), `alloc`, `std` for Linux, `crypto` (constant time, checked in CI by [`ctcheck/`](ctcheck/)) | the compiler bootstraps on `lib/alloc` and `lib/std` too |
+| [`lib/`](lib/) | the library: `core` (no OS, no allocator), `alloc`, `std` for Linux, `crypto` (constant time, checked in CI by [`ctcheck/`](ctcheck/)), `tls` (TLS 1.3 and X.509, interop-tested against OpenSSL and curl by [`interop/`](interop/)) | the compiler bootstraps on `lib/alloc` and `lib/std` too |
 
 ## Related
 

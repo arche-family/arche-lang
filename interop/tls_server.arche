@@ -1,0 +1,72 @@
+/// TLS interop server (docs/sprints.md S21): serves count connections on
+/// 127.0.0.1:port with the certificate chain and the private key from PEM
+/// files, and answers each request with a short HTTP reply.
+import alloc;
+import std;
+import tls;
+
+fn number(text: str) -> u16 {
+    var v: u32 = 0;
+    for c in text.bytes() {
+        v = v * 10 + (c.* - '0') as u32;
+    }
+    return v as u16;
+}
+
+/// Whether the request so far ends its head.
+fn complete(b: []u8) -> bool {
+    let n = b.len();
+    return (n >= 4 and b[n - 4] == '\r' and b[n - 3] == '\n' and b[n - 2] == '\r' and b[n - 1] == '\n') or
+        (n >= 2 and b[n - 2] == '\n' and b[n - 1] == '\n');
+}
+
+fn serve(conn: &mut tls.Conn, a: alloc.Allocator) -> tls.TlsError!void {
+    var request = alloc.List(u8).init(a);
+    var buf: [1024]u8 = [0; 1024];
+    while not complete(request.items()) {
+        let n = try conn.read(buf[0..1024]);
+        if n == 0 {
+            return;
+        }
+        for c in buf[0..n] {
+            request.push(c.*);
+        }
+    }
+    try conn.write("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nConnection: close\r\n\r\nhello from arche\n".bytes());
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() != 5 {
+        sys.stderr.write("usage: tls_server <port> <chain-file> <key-file> <count>\n");
+        sys.proc.exit(2);
+    }
+    let port = number(sys.args.get(1));
+    var config = tls.ServerConfig.init(sys.alloc);
+    let chain = try sys.fs.read_file(sys.args.get(2), sys.alloc);
+    try config.certificates_pem(chain.view(), sys.alloc);
+    let key = try sys.fs.read_file(sys.args.get(3), sys.alloc);
+    try config.private_key_pem(key.view(), sys.alloc);
+    config.accept_protocol("http/1.1");
+    let count = number(sys.args.get(4));
+    var listener = try sys.net.listen(std.Address { ip: [127, 0, 0, 1], port: port });
+    sys.stdout.write("ready\n");
+    sys.stdout.flush();
+    var served: u16 = 0;
+    while served < count : (served += 1) {
+        let sock = try listener.accept();
+        match tls.Conn.server(sock, config: &config, rand: &mut sys.rand, sys.alloc) {
+            ok(c) => {
+                var conn = c;
+                match serve(&mut conn, sys.alloc) {
+                    ok(_) => { }
+                    err(_) => { sys.stderr.write("tls_server: the connection failed after the handshake\n"); }
+                }
+                conn.close();
+            }
+            err(_) => {
+                sys.stderr.write("tls_server: the handshake failed\n");
+            }
+        }
+    }
+    listener.close();
+}

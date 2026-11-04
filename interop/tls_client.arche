@@ -1,0 +1,38 @@
+/// TLS interop client (docs/sprints.md S21): connects to 127.0.0.1:port,
+/// checks the server's certificate for host against the CA file (PEM),
+/// sends an HTTP request and prints the reply.
+import std;
+import tls;
+
+fn number(text: str) -> u16 {
+    var v: u32 = 0;
+    for c in text.bytes() {
+        v = v * 10 + (c.* - '0') as u32;
+    }
+    return v as u16;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() != 4 {
+        sys.stderr.write("usage: tls_client <port> <host> <ca-file>\n");
+        sys.proc.exit(2);
+    }
+    let port = number(sys.args.get(1));
+    let ca = try sys.fs.read_file(sys.args.get(3), sys.alloc);
+    let now = (sys.clock.unix_ns() / 1000000000) as i64;
+    var config = tls.ClientConfig.init(sys.args.get(2), now: now, sys.alloc);
+    try config.trust_pem(ca.view(), sys.alloc);
+    config.offer_protocol("http/1.1");
+    let sock = try sys.net.connect(std.Address { ip: [127, 0, 0, 1], port: port });
+    var conn = try tls.Conn.client(sock, config: &config, rand: &mut sys.rand, sys.alloc);
+    try conn.write("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n".bytes());
+    var buf: [4096]u8 = [0; 4096];
+    var n = try conn.read(buf[0..4096]);
+    while n > 0 {
+        for c in buf[0..n] {
+            sys.stdout.write_byte(c.*);
+        }
+        n = try conn.read(buf[0..4096]);
+    }
+    conn.close();
+}

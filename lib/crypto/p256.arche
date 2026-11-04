@@ -433,15 +433,16 @@ pub fn sign(private: []u8, digest: []u8) -> [64]u8 {
     return out;
 }
 
-/// Whether sig is the signature of digest by the key 0x04 || x || y.
-pub fn verify(key: []u8, digest: []u8, sig: []u8) -> bool {
-    if key.len() != 65 or key[0] != 4 or sig.len() != 64 or digest.len() != 32 {
-        return false;
+/// The point of an encoding 0x04 || x || y, or none when it is not one
+/// on the curve.
+fn decode(key: []u8) -> ?Point {
+    if key.len() != 65 or key[0] != 4 {
+        return none;
     }
     let qx = from_bytes(key[1..33]);
     let qy = from_bytes(key[33..65]);
     if not below(x: qx, m: modulus_p()) or not below(x: qy, m: modulus_p()) {
-        return false;
+        return none;
     }
     // y^2 = x^3 - 3x + b
     let x = Fp.of(qx);
@@ -449,7 +450,20 @@ pub fn verify(key: []u8, digest: []u8, sig: []u8) -> bool {
     let three = Fp.of([3, 0, 0, 0, 0, 0, 0, 0]);
     let rhs = x.mul(x).mul(x).sub(three.mul(x)).add(curve_b());
     if not y.mul(y).equals(rhs) {
+        return none;
+    }
+    return Point { x: x, y: y, z: Fp.of(one()) };
+}
+
+/// Whether sig is the signature of digest by the key 0x04 || x || y.
+pub fn verify(key: []u8, digest: []u8, sig: []u8) -> bool {
+    if sig.len() != 64 or digest.len() != 32 {
         return false;
+    }
+    var q = identity();
+    match decode(key) {
+        some(p) => { q = p; }
+        none => { return false; }
     }
     let r = from_bytes(sig[0..32]);
     let s = from_bytes(sig[32..64]);
@@ -460,7 +474,6 @@ pub fn verify(key: []u8, digest: []u8, sig: []u8) -> bool {
     let e = Scalar.of(reduce_n(from_bytes(digest)));
     let u1 = e.mul(w).value();
     let u2 = Scalar.of(r).mul(w).value();
-    let q = Point { x: x, y: y, z: Fp.of(one()) };
     let sum = scalarmult(p: generator(), k: u1).add(scalarmult(p: q, k: u2));
     if sum.is_identity() {
         return false;
@@ -472,4 +485,25 @@ pub fn verify(key: []u8, digest: []u8, sig: []u8) -> bool {
     to_bytes(v, vb[0..32]);
     to_bytes(r, rb[0..32]);
     return ct.eq(a: vb[0..32], b: rb[0..32]);
+}
+
+/// ECDH: the x coordinate of private times the peer's public key, or none
+/// when that key is not a point of the curve or the result is the identity.
+pub fn shared_secret(private: []u8, peer: []u8) -> ?[32]u8 {
+    var q = identity();
+    match decode(peer) {
+        some(p) => { q = p; }
+        none => { return none; }
+    }
+    let r = scalarmult(p: q, k: from_bytes(private));
+    if r.is_identity() {
+        return none;
+    }
+    let xy = r.affine();
+    var out: [32]u8 = [0; 32];
+    var i: usize = 0;
+    while i < 32 : (i += 1) {
+        out[i] = xy[i];
+    }
+    return out;
 }

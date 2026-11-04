@@ -1,0 +1,1030 @@
+/// X.509 certificates (RFC 5280), as far as TLS needs them: parsing, a
+/// chain up to a trusted anchor, validity at a given time, and the host
+/// name. Keys are ECDSA P-256 or Ed25519. A certificate is offsets into
+/// its DER bytes, which the caller keeps.
+import alloc;
+import crypto.ed25519;
+import crypto.p256;
+import crypto.sha2;
+import tls.der;
+
+pub type X509Error = error { Malformed, Unsupported, BadSignature, Expired, UnknownIssuer, NotCa, NameMismatch }
+
+/// How many certificates a chain may have above the leaf.
+pub const MAX_DEPTH: u32 = 8;
+
+pub type Key = enum { EcdsaP256, Ed25519, Other }
+
+pub type SigAlg = enum { EcdsaSha256, EcdsaSha384, Ed25519, Other }
+
+/// Where something is in the certificate's bytes.
+pub type Span = struct {
+    pub start: usize,
+    pub end: usize,
+}
+
+pub type Certificate = struct {
+    /// The signed part, tag and all.
+    pub tbs: Span,
+    pub sig_alg: SigAlg,
+    /// The signature, without the bit string's unused-bits byte.
+    pub sig: Span,
+    /// The issuer's and the subject's names, tag and all, to compare as bytes.
+    pub issuer: Span,
+    pub subject: Span,
+    /// Seconds since 1970, UTC.
+    pub not_before: i64,
+    pub not_after: i64,
+    pub key: Key,
+    /// 0x04 || x || y for P-256, 32 bytes for Ed25519.
+    pub key_bytes: Span,
+    pub ca: bool,
+    pub path_len: ?u32,
+    /// The first two bytes of the key usage bit string, when there is one.
+    pub key_usage: ?u16,
+    /// The contents of the subject alternative names, when there are some.
+    pub names: ?Span,
+}
+
+fn oid_ec_public_key() -> [7]u8 { return [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]; }
+fn oid_prime256v1() -> [8]u8 { return [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]; }
+fn oid_ed25519() -> [3]u8 { return [0x2b, 0x65, 0x70]; }
+fn oid_ecdsa_sha256() -> [8]u8 { return [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]; }
+fn oid_ecdsa_sha384() -> [8]u8 { return [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03]; }
+fn oid_subject_alt_name() -> [3]u8 { return [0x55, 0x1d, 0x11]; }
+fn oid_basic_constraints() -> [3]u8 { return [0x55, 0x1d, 0x13]; }
+fn oid_key_usage() -> [3]u8 { return [0x55, 0x1d, 0x0f]; }
+fn oid_ext_key_usage() -> [3]u8 { return [0x55, 0x1d, 0x25]; }
+
+/// keyCertSign, bit 5 of the key usage.
+const KEY_CERT_SIGN: u16 = 0x0400;
+/// digitalSignature, bit 0.
+pub const DIGITAL_SIGNATURE: u16 = 0x8000;
+
+fn span(e: &der.Element) -> Span {
+    return Span { start: e.start, end: e.end };
+}
+
+fn whole(e: &der.Element) -> Span {
+    return Span { start: e.header, end: e.end };
+}
+
+fn same(b: []u8, x: Span, c: []u8, y: Span) -> bool {
+    if x.end - x.start != y.end - y.start {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.end - x.start : (i += 1) {
+        if b[x.start + i] != c[y.start + i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn sig_alg(b: []u8, alg: &der.Element) -> X509Error!SigAlg {
+    let oid = try der.expect(b, at: alg.start, limit: alg.end, tag: der.OID);
+    let e256 = oid_ecdsa_sha256();
+    let e384 = oid_ecdsa_sha384();
+    let ed = oid_ed25519();
+    // ECDSA and Ed25519 identifiers take no parameters.
+    if oid.end != alg.end {
+        return SigAlg.Other;
+    }
+    if der.is_oid(b: b, e: &oid, oid: e256[0..8]) {
+        return SigAlg.EcdsaSha256;
+    }
+    if der.is_oid(b: b, e: &oid, oid: e384[0..8]) {
+        return SigAlg.EcdsaSha384;
+    }
+    if der.is_oid(b: b, e: &oid, oid: ed[0..3]) {
+        return SigAlg.Ed25519;
+    }
+    return SigAlg.Other;
+}
+
+/// The bits of a BIT STRING without unused bits.
+fn bit_string(b: []u8, e: &der.Element) -> X509Error!Span {
+    if e.tag != der.BIT_STRING or e.len() == 0 or b[e.start] != 0 {
+        return X509Error.Malformed;
+    }
+    return Span { start: e.start + 1, end: e.end };
+}
+
+/// Parses a DER certificate.
+pub fn parse(b: []u8) -> X509Error!Certificate {
+    let cert = try der.expect(b, at: 0, limit: b.len(), tag: der.SEQUENCE);
+    if cert.end != b.len() {
+        return X509Error.Malformed;
+    }
+    let tbs = try der.expect(b, at: cert.start, limit: cert.end, tag: der.SEQUENCE);
+    let alg = try der.expect(b, at: tbs.end, limit: cert.end, tag: der.SEQUENCE);
+    let sigv = try der.expect(b, at: alg.end, limit: cert.end, tag: der.BIT_STRING);
+    if sigv.end != cert.end {
+        return X509Error.Malformed;
+    }
+    var c = Certificate {
+        tbs: whole(&tbs),
+        sig_alg: try sig_alg(b, alg: &alg),
+        sig: try bit_string(b, e: &sigv),
+        issuer: Span { start: 0, end: 0 },
+        subject: Span { start: 0, end: 0 },
+        not_before: 0,
+        not_after: 0,
+        key: Key.Other,
+        key_bytes: Span { start: 0, end: 0 },
+        ca: false,
+        path_len: none,
+        key_usage: none,
+        names: none,
+    };
+    var e = try der.read(b, at: tbs.start, limit: tbs.end);
+    if e.tag == 0xa0 {
+        let version = try der.expect(b, at: e.start, limit: e.end, tag: der.INTEGER);
+        let v = try der.small(b, e: &version);
+        if v != 2 {
+            return X509Error.Unsupported;
+        }
+        e = try der.read(b, at: e.end, limit: tbs.end);
+    }
+    if e.tag != der.INTEGER {
+        return X509Error.Malformed;
+    }
+    let inner_alg = try der.expect(b, at: e.end, limit: tbs.end, tag: der.SEQUENCE);
+    // The algorithm inside the signed part must be the one outside it.
+    if not same(b: b, x: whole(&inner_alg), c: b, y: whole(&alg)) {
+        return X509Error.Malformed;
+    }
+    let issuer = try der.expect(b, at: inner_alg.end, limit: tbs.end, tag: der.SEQUENCE);
+    c.issuer = whole(&issuer);
+    let validity = try der.expect(b, at: issuer.end, limit: tbs.end, tag: der.SEQUENCE);
+    let nb = try der.read(b, at: validity.start, limit: validity.end);
+    let na = try der.read(b, at: nb.end, limit: validity.end);
+    if na.end != validity.end {
+        return X509Error.Malformed;
+    }
+    c.not_before = try der.time(b, e: &nb);
+    c.not_after = try der.time(b, e: &na);
+    let subject = try der.expect(b, at: validity.end, limit: tbs.end, tag: der.SEQUENCE);
+    c.subject = whole(&subject);
+    let spki = try der.expect(b, at: subject.end, limit: tbs.end, tag: der.SEQUENCE);
+    try public_key(b, spki: &spki, c: &mut c);
+    var at = spki.end;
+    while at < tbs.end {
+        let x = try der.read(b, at: at, limit: tbs.end);
+        if x.tag == 0xa3 {
+            try extensions(b, outer: &x, c: &mut c);
+        } else if x.tag != 0x81 and x.tag != 0x82 {
+            return X509Error.Malformed;
+        }
+        at = x.end;
+    }
+    return c;
+}
+
+fn public_key(b: []u8, spki: &der.Element, c: &mut Certificate) -> X509Error!void {
+    let alg = try der.expect(b, at: spki.start, limit: spki.end, tag: der.SEQUENCE);
+    let key = try der.expect(b, at: alg.end, limit: spki.end, tag: der.BIT_STRING);
+    if key.end != spki.end {
+        return X509Error.Malformed;
+    }
+    let oid = try der.expect(b, at: alg.start, limit: alg.end, tag: der.OID);
+    let ec = oid_ec_public_key();
+    let p256_oid = oid_prime256v1();
+    let ed = oid_ed25519();
+    let kb = try bit_string(b, e: &key);
+    if der.is_oid(b: b, e: &oid, oid: ec[0..7]) {
+        let curve = try der.read(b, at: oid.end, limit: alg.end);
+        if der.is_oid(b: b, e: &curve, oid: p256_oid[0..8]) and curve.end == alg.end and kb.end - kb.start == 65 and b[kb.start] == 4 {
+            c.key = Key.EcdsaP256;
+            c.key_bytes = kb;
+        }
+    } else if der.is_oid(b: b, e: &oid, oid: ed[0..3]) and oid.end == alg.end and kb.end - kb.start == 32 {
+        c.key = Key.Ed25519;
+        c.key_bytes = kb;
+    }
+}
+
+fn extensions(b: []u8, outer: &der.Element, c: &mut Certificate) -> X509Error!void {
+    let list = try der.expect(b, at: outer.start, limit: outer.end, tag: der.SEQUENCE);
+    if list.end != outer.end {
+        return X509Error.Malformed;
+    }
+    let san = oid_subject_alt_name();
+    let bc = oid_basic_constraints();
+    let ku = oid_key_usage();
+    let eku = oid_ext_key_usage();
+    var at = list.start;
+    while at < list.end {
+        let ext = try der.expect(b, at: at, limit: list.end, tag: der.SEQUENCE);
+        at = ext.end;
+        let oid = try der.expect(b, at: ext.start, limit: ext.end, tag: der.OID);
+        var v = try der.read(b, at: oid.end, limit: ext.end);
+        var critical = false;
+        if v.tag == der.BOOLEAN {
+            if v.len() != 1 {
+                return X509Error.Malformed;
+            }
+            critical = b[v.start] == 0xff;
+            v = try der.read(b, at: v.end, limit: ext.end);
+        }
+        if v.tag != der.OCTET_STRING or v.end != ext.end {
+            return X509Error.Malformed;
+        }
+        if der.is_oid(b: b, e: &oid, oid: san[0..3]) {
+            let names = try der.expect(b, at: v.start, limit: v.end, tag: der.SEQUENCE);
+            c.names = some(span(&names));
+        } else if der.is_oid(b: b, e: &oid, oid: bc[0..3]) {
+            let s = try der.expect(b, at: v.start, limit: v.end, tag: der.SEQUENCE);
+            var inner = s.start;
+            if inner < s.end and b[inner] == der.BOOLEAN {
+                let flag = try der.read(b, at: inner, limit: s.end);
+                if flag.len() != 1 {
+                    return X509Error.Malformed;
+                }
+                c.ca = b[flag.start] == 0xff;
+                inner = flag.end;
+            }
+            if inner < s.end {
+                let n = try der.expect(b, at: inner, limit: s.end, tag: der.INTEGER);
+                c.path_len = some(try der.small(b, e: &n));
+            }
+        } else if der.is_oid(b: b, e: &oid, oid: ku[0..3]) {
+            let s = try der.expect(b, at: v.start, limit: v.end, tag: der.BIT_STRING);
+            if s.len() < 2 {
+                return X509Error.Malformed;
+            }
+            var u = (b[s.start + 1] as u16) << 8;
+            if s.len() > 2 {
+                u = u | b[s.start + 2] as u16;
+            }
+            c.key_usage = some(u);
+        } else if der.is_oid(b: b, e: &oid, oid: eku[0..3]) {
+            // Extended key usage restricts what the key is for; a TLS
+            // server certificate may carry it, and it is not checked.
+        } else if critical {
+            return X509Error.Unsupported;
+        }
+    }
+}
+
+/// Whether issuer's key made sig over the signed part of the child.
+fn signed_by(child_der: []u8, child: &Certificate, issuer_der: []u8, issuer: &Certificate) -> X509Error!void {
+    let tbs = child_der[child.tbs.start..child.tbs.end];
+    let key = issuer_der[issuer.key_bytes.start..issuer.key_bytes.end];
+    let sig = child_der[child.sig.start..child.sig.end];
+    var ok_sig = false;
+    match child.sig_alg {
+        .EcdsaSha256 => {
+            if issuer.key == Key.EcdsaP256 {
+                let rs = try ecdsa_signature(sig);
+                let h = sha2.sha256(tbs);
+                ok_sig = p256.verify(key: key, digest: h[0..32], sig: rs[0..64]);
+            }
+        }
+        .EcdsaSha384 => {
+            if issuer.key == Key.EcdsaP256 {
+                let rs = try ecdsa_signature(sig);
+                let h = sha2.sha384(tbs);
+                // ECDSA takes the leftmost bits of a longer digest.
+                ok_sig = p256.verify(key: key, digest: h[0..32], sig: rs[0..64]);
+            }
+        }
+        .Ed25519 => {
+            if issuer.key == Key.Ed25519 {
+                ok_sig = ed25519.verify(key: key, message: tbs, sig: sig);
+            }
+        }
+        .Other => {
+            return X509Error.Unsupported;
+        }
+    }
+    if issuer.key == Key.Other {
+        return X509Error.Unsupported;
+    }
+    if not ok_sig {
+        return X509Error.BadSignature;
+    }
+}
+
+/// An ECDSA-Sig-Value, SEQUENCE { r INTEGER, s INTEGER }, as r || s.
+pub fn ecdsa_signature(sig: []u8) -> X509Error![64]u8 {
+    let seq = try der.expect(sig, at: 0, limit: sig.len(), tag: der.SEQUENCE);
+    if seq.end != sig.len() {
+        return X509Error.Malformed;
+    }
+    let r = try der.expect(sig, at: seq.start, limit: seq.end, tag: der.INTEGER);
+    let s = try der.expect(sig, at: r.end, limit: seq.end, tag: der.INTEGER);
+    if s.end != seq.end {
+        return X509Error.Malformed;
+    }
+    var out: [64]u8 = [0; 64];
+    try der.unsigned(sig, e: &r, out: out[0..32]);
+    try der.unsigned(sig, e: &s, out: out[32..64]);
+    return out;
+}
+
+/// r || s as an ECDSA-Sig-Value, written to out; its length.
+pub fn ecdsa_der(rs: [64]u8, out: &mut [72]u8) -> usize {
+    var n: usize = 2;
+    var half: usize = 0;
+    while half < 2 : (half += 1) {
+        let at = 32 * half;
+        var skip: usize = 0;
+        while skip < 31 and rs[at + skip] == 0 : (skip += 1) {
+        }
+        let pad = rs[at + skip] >= 0x80;
+        var len = 32 - skip;
+        if pad {
+            len += 1;
+        }
+        out.*[n] = der.INTEGER;
+        out.*[n + 1] = len as u8;
+        n += 2;
+        if pad {
+            out.*[n] = 0;
+            n += 1;
+        }
+        var i = skip;
+        while i < 32 : (i += 1) {
+            out.*[n] = rs[at + i];
+            n += 1;
+        }
+    }
+    out.*[0] = der.SEQUENCE;
+    out.*[1] = (n - 2) as u8;
+    return n;
+}
+
+/// DER certificates in order, in one buffer.
+pub type CertList = struct {
+    bytes: alloc.List(u8),
+    ends: alloc.List(usize),
+
+    pub fn init(a: alloc.Allocator) -> CertList {
+        return CertList { bytes: alloc.List(u8).init(a), ends: alloc.List(usize).init(a) };
+    }
+
+    pub fn push(self: &mut CertList, der_bytes: []u8) {
+        for x in der_bytes {
+            self.bytes.push(x.*);
+        }
+        self.ends.push(self.bytes.len());
+    }
+
+    pub fn len(self: &CertList) -> usize {
+        return self.ends.len();
+    }
+
+    pub fn get(self: &CertList, i: usize) -> []u8 {
+        var start: usize = 0;
+        if i > 0 {
+            start = self.ends.items()[i - 1];
+        }
+        return self.bytes.items()[start..self.ends.items()[i]];
+    }
+
+    pub fn clear(self: &mut CertList) {
+        self.bytes.clear();
+        self.ends.clear();
+    }
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 'A' and c <= 'Z' {
+        return c + 32;
+    }
+    return c;
+}
+
+/// Whether a dNSName matches the host: equal but for case, or "*." and a
+/// suffix that matches all of the host but its first label.
+fn dns_matches(name: []u8, host: []u8) -> bool {
+    var n = name;
+    var h = host;
+    if n.len() >= 2 and n[0] == '*' and n[1] == '.' {
+        var dot: usize = 0;
+        while dot < h.len() and h[dot] != '.' : (dot += 1) {
+        }
+        if dot == 0 or dot == h.len() {
+            return false;
+        }
+        n = name[1..name.len()];
+        h = host[dot..host.len()];
+    }
+    if n.len() != h.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n.len() : (i += 1) {
+        if lower(n[i]) != lower(h[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The host as four bytes, when it is a dotted IPv4 address.
+fn ipv4(host: []u8) -> ?[4]u8 {
+    var out: [4]u8 = [0; 4];
+    var part: usize = 0;
+    var value: u32 = 0;
+    var digits: u32 = 0;
+    for c in host {
+        if c.* == '.' {
+            if digits == 0 or part == 3 {
+                return none;
+            }
+            out[part] = value as u8;
+            part += 1;
+            value = 0;
+            digits = 0;
+        } else if c.* >= '0' and c.* <= '9' {
+            value = value * 10 + (c.* - '0') as u32;
+            digits += 1;
+            if value > 255 or digits > 3 {
+                return none;
+            }
+        } else {
+            return none;
+        }
+    }
+    if part != 3 or digits == 0 {
+        return none;
+    }
+    out[3] = value as u8;
+    return out;
+}
+
+/// Whether the certificate names the host, as a DNS name or an IPv4
+/// address in its subject alternative names.
+pub fn names_host(b: []u8, c: &Certificate, host: str) -> X509Error!bool {
+    let hb = host.bytes();
+    var names = Span { start: 0, end: 0 };
+    match c.names {
+        some(s) => { names = s; }
+        none => { return false; }
+    }
+    let ip = ipv4(hb);
+    var at = names.start;
+    while at < names.end {
+        let n = try der.read(b, at: at, limit: names.end);
+        at = n.end;
+        if n.tag == 0x82 and dns_matches(name: b[n.start..n.end], host: hb) {
+            return true;
+        }
+        if n.tag == 0x87 and n.len() == 4 {
+            match ip {
+                some(a) => {
+                    if a[0] == b[n.start] and a[1] == b[n.start + 1] and a[2] == b[n.start + 2] and a[3] == b[n.start + 3] {
+                        return true;
+                    }
+                }
+                none => { }
+            }
+        }
+    }
+    return false;
+}
+
+fn current(c: &Certificate, now: i64) -> X509Error!void {
+    if now < c.not_before or now > c.not_after {
+        return X509Error.Expired;
+    }
+}
+
+fn can_issue(c: &Certificate, below: u32) -> X509Error!void {
+    if not c.ca {
+        return X509Error.NotCa;
+    }
+    match c.key_usage {
+        some(u) => {
+            if u & KEY_CERT_SIGN == 0 {
+                return X509Error.NotCa;
+            }
+        }
+        none => { }
+    }
+    match c.path_len {
+        some(n) => {
+            if below > n {
+                return X509Error.NotCa;
+            }
+        }
+        none => { }
+    }
+}
+
+fn equal_bytes(a: []u8, b: []u8) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len() : (i += 1) {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Checks that chain[0] names host and is valid at now (seconds since
+/// 1970), and that it is signed by chain[1] or an anchor, chain[1] by
+/// the next, and so on, up to one of the anchors. Anchors are trusted as
+/// they are; an anchor that is chain[0] itself is enough.
+pub fn verify(chain: &CertList, anchors: &CertList, host: str, now: i64) -> X509Error!void {
+    if chain.len() == 0 {
+        return X509Error.Malformed;
+    }
+    let leaf_der = chain.get(0);
+    let leaf = try parse(leaf_der);
+    try current(&leaf, now: now);
+    if not (try names_host(leaf_der, c: &leaf, host: host)) {
+        return X509Error.NameMismatch;
+    }
+    var k: usize = 0;
+    while k < anchors.len() : (k += 1) {
+        if equal_bytes(a: anchors.get(k), b: leaf_der) {
+            return;
+        }
+    }
+    var child_index: usize = 0;
+    var depth: u32 = 0;
+    while depth <= MAX_DEPTH : (depth += 1) {
+        let child_der = chain.get(child_index);
+        let child = try parse(child_der);
+        // Every certificate with the issuer's name is tried, anchors
+        // first: names repeat when keys roll over or roots cross-sign.
+        var failure = X509Error.UnknownIssuer;
+        k = 0;
+        while k < anchors.len() : (k += 1) {
+            let a_der = anchors.get(k);
+            let a = try parse(a_der);
+            if same(b: child_der, x: child.issuer, c: a_der, y: a.subject) {
+                match issued(child_der: child_der, child: &child, issuer_der: a_der, issuer: &a, below: depth) {
+                    ok(_) => { return; }
+                    err(e) => { failure = e; }
+                }
+            }
+        }
+        // Otherwise one of the others the peer sent, which goes on.
+        var found = false;
+        var i: usize = 1;
+        while i < chain.len() and not found : (i += 1) {
+            if i == child_index {
+                continue;
+            }
+            let p_der = chain.get(i);
+            let p = try parse(p_der);
+            if same(b: child_der, x: child.issuer, c: p_der, y: p.subject) {
+                match issued(child_der: child_der, child: &child, issuer_der: p_der, issuer: &p, below: depth) {
+                    ok(_) => {
+                        match current(&p, now: now) {
+                            ok(_) => {
+                                child_index = i;
+                                found = true;
+                            }
+                            err(e) => { failure = e; }
+                        }
+                    }
+                    err(e) => { failure = e; }
+                }
+            }
+        }
+        if not found {
+            return failure;
+        }
+    }
+    return X509Error.UnknownIssuer;
+}
+
+/// Whether issuer may issue certificates, depth below it, and made
+/// child's signature.
+fn issued(child_der: []u8, child: &Certificate, issuer_der: []u8, issuer: &Certificate, below: u32) -> X509Error!void {
+    try can_issue(issuer, below: below);
+    try signed_by(child_der: child_der, child: child, issuer_der: issuer_der, issuer: issuer);
+}
+
+// ---- PEM and private keys -----------------------------------------------------------------
+
+fn sextet(c: u8) -> ?u8 {
+    if c >= 'A' and c <= 'Z' {
+        return c - 'A';
+    }
+    if c >= 'a' and c <= 'z' {
+        return c - 'a' + 26;
+    }
+    if c >= '0' and c <= '9' {
+        return c - '0' + 52;
+    }
+    if c == '+' {
+        return 62;
+    }
+    if c == '/' {
+        return 63;
+    }
+    return none;
+}
+
+fn starts_at(b: []u8, at: usize, word: []u8) -> bool {
+    if at + word.len() > b.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < word.len() : (i += 1) {
+        if b[at + i] != word[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Decodes every PEM block labelled label ("CERTIFICATE", "PRIVATE KEY")
+/// in text and adds its bytes to out; how many there were.
+pub fn pem(text: str, label: str, out: &mut CertList, a: alloc.Allocator) -> X509Error!usize {
+    let b = text.bytes();
+    let lb = label.bytes();
+    let begin = "-----BEGIN ".bytes();
+    let end_mark = "-----END ".bytes();
+    var count: usize = 0;
+    var at: usize = 0;
+    var data = alloc.List(u8).init(a);
+    while at < b.len() {
+        if not (starts_at(b: b, at: at, word: begin) and starts_at(b: b, at: at + begin.len(), word: lb) and starts_at(b: b, at: at + begin.len() + lb.len(), word: "-----".bytes())) {
+            at += 1;
+            continue;
+        }
+        at += begin.len() + lb.len() + 5;
+        data.clear();
+        var acc: u32 = 0;
+        var nbits: u32 = 0;
+        var closed = false;
+        while at < b.len() and not closed {
+            let c = b[at];
+            if c == '-' {
+                if not starts_at(b: b, at: at, word: end_mark) {
+                    return X509Error.Malformed;
+                }
+                closed = true;
+            } else if c == '=' or c == '\n' or c == '\r' or c == ' ' or c == '\t' {
+                at += 1;
+            } else {
+                match sextet(c) {
+                    some(v) => {
+                        acc = (acc << 6) | v as u32;
+                        nbits += 6;
+                        if nbits >= 8 {
+                            nbits -= 8;
+                            data.push(((acc >> nbits) & 0xff) as u8);
+                        }
+                    }
+                    none => { return X509Error.Malformed; }
+                }
+                at += 1;
+            }
+        }
+        if not closed {
+            return X509Error.Malformed;
+        }
+        out.push(data.items());
+        count += 1;
+    }
+    return count;
+}
+
+/// A private key: the P-256 scalar or the Ed25519 seed.
+pub type PrivateKey = struct {
+    pub key: Key,
+    pub secret: [32]u8,
+}
+
+/// A private key from DER: PKCS #8 ("PRIVATE KEY") with a P-256 or an
+/// Ed25519 key, or SEC 1 ("EC PRIVATE KEY") with a P-256 one.
+pub fn private_key(b: []u8) -> X509Error!PrivateKey {
+    let outer = try der.expect(b, at: 0, limit: b.len(), tag: der.SEQUENCE);
+    let version = try der.expect(b, at: outer.start, limit: outer.end, tag: der.INTEGER);
+    let v = try der.small(b, e: &version);
+    if v == 1 {
+        return sec1(b, seq: &outer);
+    }
+    if v != 0 {
+        return X509Error.Unsupported;
+    }
+    let alg = try der.expect(b, at: version.end, limit: outer.end, tag: der.SEQUENCE);
+    let wrapped = try der.expect(b, at: alg.end, limit: outer.end, tag: der.OCTET_STRING);
+    let oid = try der.expect(b, at: alg.start, limit: alg.end, tag: der.OID);
+    let ec = oid_ec_public_key();
+    let ed = oid_ed25519();
+    if der.is_oid(b: b, e: &oid, oid: ec[0..7]) {
+        let inner = try der.expect(b, at: wrapped.start, limit: wrapped.end, tag: der.SEQUENCE);
+        return sec1(b, seq: &inner);
+    }
+    if der.is_oid(b: b, e: &oid, oid: ed[0..3]) {
+        let seed = try der.expect(b, at: wrapped.start, limit: wrapped.end, tag: der.OCTET_STRING);
+        if seed.len() != 32 {
+            return X509Error.Malformed;
+        }
+        var k = PrivateKey { key: Key.Ed25519, secret: [0; 32] };
+        var i: usize = 0;
+        while i < 32 : (i += 1) {
+            k.secret[i] = b[seed.start + i];
+        }
+        return k;
+    }
+    return X509Error.Unsupported;
+}
+
+/// ECPrivateKey (RFC 5915): version 1, the scalar, and the curve, which
+/// when given must be P-256.
+fn sec1(b: []u8, seq: &der.Element) -> X509Error!PrivateKey {
+    let version = try der.expect(b, at: seq.start, limit: seq.end, tag: der.INTEGER);
+    let scalar = try der.expect(b, at: version.end, limit: seq.end, tag: der.OCTET_STRING);
+    if scalar.len() != 32 {
+        return X509Error.Unsupported;
+    }
+    if scalar.end < seq.end {
+        let next = try der.read(b, at: scalar.end, limit: seq.end);
+        if next.tag == 0xa0 {
+            let curve = try der.read(b, at: next.start, limit: next.end);
+            let p256_oid = oid_prime256v1();
+            if not der.is_oid(b: b, e: &curve, oid: p256_oid[0..8]) {
+                return X509Error.Unsupported;
+            }
+        }
+    }
+    var k = PrivateKey { key: Key.EcdsaP256, secret: [0; 32] };
+    var i: usize = 0;
+    while i < 32 : (i += 1) {
+        k.secret[i] = b[scalar.start + i];
+    }
+    return k;
+}
+
+// ---- Making certificates ----------------------------------------------------------------------
+
+/// What a new certificate says.
+pub type Template = struct {
+    /// The subject's common name.
+    pub subject: alloc.String,
+    /// DNS names, and dotted IPv4 addresses, for subject alternative names.
+    pub names: alloc.List(alloc.String),
+    pub serial: u64,
+    /// Seconds since 1970.
+    pub not_before: i64,
+    pub not_after: i64,
+    pub ca: bool,
+
+    pub fn init(subject: str, a: alloc.Allocator) -> Template {
+        var s = alloc.String.init(a);
+        s.push_str(subject);
+        return Template { subject: s, names: alloc.List(alloc.String).init(a), serial: 1, not_before: 0, not_after: 0, ca: false };
+    }
+
+    pub fn add_name(self: &mut Template, name: str, a: alloc.Allocator) {
+        var s = alloc.String.init(a);
+        s.push_str(name);
+        self.names.push(s);
+    }
+}
+
+/// A Name with only a common name, as DER.
+pub fn name_of(common_name: str, a: alloc.Allocator) -> alloc.List(u8) {
+    let cn_oid: [3]u8 = [0x55, 0x04, 0x03];
+    var atv = alloc.List(u8).init(a);
+    der.put(&mut atv, tag: der.OID, contents: cn_oid[0..3]);
+    der.put(&mut atv, tag: 0x0c, contents: common_name.bytes());
+    var seq = alloc.List(u8).init(a);
+    der.put(&mut seq, tag: der.SEQUENCE, contents: atv.items());
+    var set = alloc.List(u8).init(a);
+    der.put(&mut set, tag: der.SET, contents: seq.items());
+    var out = alloc.List(u8).init(a);
+    der.put(&mut out, tag: der.SEQUENCE, contents: set.items());
+    return out;
+}
+
+fn algorithm(key: &PrivateKey, a: alloc.Allocator) -> alloc.List(u8) {
+    var oid = alloc.List(u8).init(a);
+    if key.key == Key.Ed25519 {
+        let o = oid_ed25519();
+        der.put(&mut oid, tag: der.OID, contents: o[0..3]);
+    } else {
+        let o = oid_ecdsa_sha256();
+        der.put(&mut oid, tag: der.OID, contents: o[0..8]);
+    }
+    var out = alloc.List(u8).init(a);
+    der.put(&mut out, tag: der.SEQUENCE, contents: oid.items());
+    return out;
+}
+
+fn subject_public_key(key: &PrivateKey, a: alloc.Allocator) -> alloc.List(u8) {
+    var alg = alloc.List(u8).init(a);
+    var bits = alloc.List(u8).init(a);
+    bits.push(0);
+    if key.key == Key.Ed25519 {
+        let o = oid_ed25519();
+        der.put(&mut alg, tag: der.OID, contents: o[0..3]);
+        let pk = ed25519.public_key(key.secret[0..32]);
+        for x in pk[0..32] {
+            bits.push(x.*);
+        }
+    } else {
+        let o = oid_ec_public_key();
+        let c = oid_prime256v1();
+        der.put(&mut alg, tag: der.OID, contents: o[0..7]);
+        der.put(&mut alg, tag: der.OID, contents: c[0..8]);
+        let pk = p256.public_key(key.secret[0..32]);
+        for x in pk[0..65] {
+            bits.push(x.*);
+        }
+    }
+    var inner = alloc.List(u8).init(a);
+    der.put(&mut inner, tag: der.SEQUENCE, contents: alg.items());
+    der.put(&mut inner, tag: der.BIT_STRING, contents: bits.items());
+    var out = alloc.List(u8).init(a);
+    der.put(&mut out, tag: der.SEQUENCE, contents: inner.items());
+    return out;
+}
+
+fn extension(out: &mut alloc.List(u8), oid: []u8, critical: bool, value: []u8, a: alloc.Allocator) {
+    var e = alloc.List(u8).init(a);
+    der.put(&mut e, tag: der.OID, contents: oid);
+    if critical {
+        let t: [1]u8 = [0xff];
+        der.put(&mut e, tag: der.BOOLEAN, contents: t[0..1]);
+    }
+    der.put(&mut e, tag: der.OCTET_STRING, contents: value);
+    der.put(out, tag: der.SEQUENCE, contents: e.items());
+}
+
+/// The signature of data by key, as a certificate's BIT STRING holds it.
+fn signature_bits(key: &PrivateKey, data: []u8, a: alloc.Allocator) -> alloc.List(u8) {
+    var bits = alloc.List(u8).init(a);
+    bits.push(0);
+    if key.key == Key.Ed25519 {
+        let sig = ed25519.sign(seed: key.secret[0..32], message: data);
+        for x in sig[0..64] {
+            bits.push(x.*);
+        }
+    } else {
+        let h = sha2.sha256(data);
+        let rs = p256.sign(private: key.secret[0..32], digest: h[0..32]);
+        var sig: [72]u8 = [0; 72];
+        let n = ecdsa_der(rs, out: &mut sig);
+        for x in sig[0..n] {
+            bits.push(x.*);
+        }
+    }
+    return bits;
+}
+
+/// A certificate (DER) for key's public half as t describes, issued by
+/// the holder of signer under the name issuer (DER, from name_of or the
+/// issuer's certificate, subject_of). Self-signed when signer is key and issuer is
+/// the subject's own name (name_of).
+pub fn create(t: &Template, key: &PrivateKey, issuer: []u8, signer: &PrivateKey, a: alloc.Allocator) -> alloc.List(u8) {
+    var tbs = alloc.List(u8).init(a);
+    let v3: [3]u8 = [der.INTEGER, 1, 2];
+    der.put(&mut tbs, tag: 0xa0, contents: v3[0..3]);
+    var serial: [8]u8 = [0; 8];
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        serial[i] = ((t.serial >> ((56 - 8 * i) as u32)) & 0xff) as u8;
+    }
+    der.put_unsigned(&mut tbs, value: serial[0..8], a);
+    let alg = algorithm(signer, a);
+    for x in alg.items() {
+        tbs.push(x.*);
+    }
+    for x in issuer {
+        tbs.push(x.*);
+    }
+    var validity = alloc.List(u8).init(a);
+    der.put_time(&mut validity, t: t.not_before, a);
+    der.put_time(&mut validity, t: t.not_after, a);
+    der.put(&mut tbs, tag: der.SEQUENCE, contents: validity.items());
+    let subject = name_of(t.subject.view(), a);
+    for x in subject.items() {
+        tbs.push(x.*);
+    }
+    let spki = subject_public_key(key, a);
+    for x in spki.items() {
+        tbs.push(x.*);
+    }
+    // Extensions: basic constraints, key usage, and the names.
+    var exts = alloc.List(u8).init(a);
+    var bc = alloc.List(u8).init(a);
+    if t.ca {
+        let yes: [3]u8 = [der.BOOLEAN, 1, 0xff];
+        der.put(&mut bc, tag: der.SEQUENCE, contents: yes[0..3]);
+    } else {
+        let nothing: [1]u8 = [0];
+        der.put(&mut bc, tag: der.SEQUENCE, contents: nothing[0..0]);
+    }
+    let bc_oid = oid_basic_constraints();
+    extension(&mut exts, oid: bc_oid[0..3], critical: true, value: bc.items(), a);
+    var ku: [4]u8 = [der.BIT_STRING, 2, 7, 0x80];
+    if t.ca {
+        ku = [der.BIT_STRING, 2, 1, 0x06];
+    }
+    let ku_oid = oid_key_usage();
+    extension(&mut exts, oid: ku_oid[0..3], critical: true, value: ku[0..4], a);
+    if t.names.len() > 0 {
+        var gn = alloc.List(u8).init(a);
+        for n in t.names.items() {
+            let nb = n.view().bytes();
+            match ipv4(nb) {
+                some(ip) => { der.put(&mut gn, tag: 0x87, contents: ip[0..4]); }
+                none => { der.put(&mut gn, tag: 0x82, contents: nb); }
+            }
+        }
+        var seq = alloc.List(u8).init(a);
+        der.put(&mut seq, tag: der.SEQUENCE, contents: gn.items());
+        let san_oid = oid_subject_alt_name();
+        extension(&mut exts, oid: san_oid[0..3], critical: false, value: seq.items(), a);
+    }
+    var ext_seq = alloc.List(u8).init(a);
+    der.put(&mut ext_seq, tag: der.SEQUENCE, contents: exts.items());
+    der.put(&mut tbs, tag: 0xa3, contents: ext_seq.items());
+    var tbs_seq = alloc.List(u8).init(a);
+    der.put(&mut tbs_seq, tag: der.SEQUENCE, contents: tbs.items());
+    let sig = signature_bits(signer, data: tbs_seq.items(), a);
+    var body = alloc.List(u8).init(a);
+    for x in tbs_seq.items() {
+        body.push(x.*);
+    }
+    for x in alg.items() {
+        body.push(x.*);
+    }
+    der.put(&mut body, tag: der.BIT_STRING, contents: sig.items());
+    var out = alloc.List(u8).init(a);
+    der.put(&mut out, tag: der.SEQUENCE, contents: body.items());
+    return out;
+}
+
+/// The subject's name of a certificate, as DER, to issue others under.
+pub fn subject_of(b: []u8, a: alloc.Allocator) -> X509Error!alloc.List(u8) {
+    let c = try parse(b);
+    var out = alloc.List(u8).init(a);
+    for x in b[c.subject.start..c.subject.end] {
+        out.push(x.*);
+    }
+    return out;
+}
+
+fn base64_char(v: u32) -> u8 {
+    if v < 26 {
+        return 'A' + v as u8;
+    }
+    if v < 52 {
+        return 'a' + (v - 26) as u8;
+    }
+    if v < 62 {
+        return '0' + (v - 52) as u8;
+    }
+    if v == 62 {
+        return '+';
+    }
+    return '/';
+}
+
+/// der as a PEM block labelled label, appended to out.
+pub fn pem_encode(der_bytes: []u8, label: str, out: &mut alloc.String) {
+    out.push_str("-----BEGIN ");
+    out.push_str(label);
+    out.push_str("-----\n");
+    var i: usize = 0;
+    var line: usize = 0;
+    while i < der_bytes.len() : (i += 3) {
+        var v: u32 = (der_bytes[i] as u32) << 16;
+        let left = der_bytes.len() - i;
+        if left > 1 {
+            v = v | (der_bytes[i + 1] as u32) << 8;
+        }
+        if left > 2 {
+            v = v | der_bytes[i + 2] as u32;
+        }
+        out.push_ascii(base64_char((v >> 18) & 63));
+        out.push_ascii(base64_char((v >> 12) & 63));
+        if left > 1 {
+            out.push_ascii(base64_char((v >> 6) & 63));
+        } else {
+            out.push_ascii('=');
+        }
+        if left > 2 {
+            out.push_ascii(base64_char(v & 63));
+        } else {
+            out.push_ascii('=');
+        }
+        line += 4;
+        if line == 64 {
+            out.push_ascii('\n');
+            line = 0;
+        }
+    }
+    if line != 0 {
+        out.push_ascii('\n');
+    }
+    out.push_str("-----END ");
+    out.push_str(label);
+    out.push_str("-----\n");
+}

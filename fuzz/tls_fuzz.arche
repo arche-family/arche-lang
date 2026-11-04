@@ -1,0 +1,228 @@
+/// Fuzzes lib/tls (docs/sprints.md S21). Each case replays a handshake
+/// between a client and a server in memory and mangles one flight on its
+/// way: a flipped bit, a changed byte, a cut, bytes put in, the flight
+/// twice, or noise in its place. The engine must turn every one into an
+/// error or carry on; a panic (an index out of range, an overflow) is a
+/// bug. Certificates and DER get the same treatment.
+///
+/// usage: tls_fuzz <seconds> [seed]. Every case comes from the seed, so the
+/// seed printed first repeats a run.
+import alloc;
+import core.rand;
+import std;
+import tls;
+import tls.x509;
+
+type Setup = struct {
+    ca: alloc.List(u8),
+    leaf: alloc.List(u8),
+    key: x509.PrivateKey,
+}
+
+fn setup(ed: bool, a: alloc.Allocator) -> Setup {
+    let ca_key = x509.PrivateKey { key: x509.Key.EcdsaP256, secret: [7; 32] };
+    var ca_t = x509.Template.init("Fuzz CA", a);
+    ca_t.ca = true;
+    ca_t.not_before = 1700000000;
+    ca_t.not_after = 4102444800;
+    let ca_name = x509.name_of("Fuzz CA", a);
+    let ca = x509.create(&ca_t, key: &ca_key, issuer: ca_name.items(), signer: &ca_key, a);
+    var key = x509.PrivateKey { key: x509.Key.EcdsaP256, secret: [9; 32] };
+    if ed {
+        key = x509.PrivateKey { key: x509.Key.Ed25519, secret: [9; 32] };
+    }
+    var t = x509.Template.init("localhost", a);
+    t.add_name("localhost", a);
+    t.serial = 2;
+    t.not_before = 1700000000;
+    t.not_after = 4102444800;
+    let leaf = x509.create(&t, key: &key, issuer: ca_name.items(), signer: &ca_key, a);
+    return Setup { ca: ca, leaf: leaf, key: key };
+}
+
+/// The bytes of a flight, changed one way chosen by g.
+fn mangle(data: []u8, g: &mut rand.Seeded, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    for x in data {
+        out.push(x.*);
+    }
+    let how = g.below(6);
+    let n = out.len() as u64;
+    if how == 0 and n > 0 {
+        let at = g.below(n) as usize;
+        let bit = g.below(8) as u32;
+        let one: u8 = 1;
+        out.items_mut()[at] = out.items()[at] ^ (one << bit);
+    } else if how == 1 and n > 0 {
+        let at = g.below(n) as usize;
+        out.items_mut()[at] = (g.next_u64() & 0xff) as u8;
+    } else if how == 2 {
+        let keep = g.below(n + 1);
+        while out.len() as u64 > keep {
+            _ = out.pop();
+        }
+    } else if how == 3 {
+        let extra = g.below(16) + 1;
+        let at = g.below(n + 1) as usize;
+        var copy = alloc.List(u8).init(a);
+        var i: usize = 0;
+        while i < out.len() : (i += 1) {
+            if i == at {
+                var k: u64 = 0;
+                while k < extra : (k += 1) {
+                    copy.push((g.next_u64() & 0xff) as u8);
+                }
+            }
+            copy.push(out.items()[i]);
+        }
+        return copy;
+    } else if how == 4 {
+        for x in data {
+            out.push(x.*);
+        }
+    } else {
+        out.clear();
+        let len = g.below(300);
+        var k: u64 = 0;
+        while k < len : (k += 1) {
+            out.push((g.next_u64() & 0xff) as u8);
+        }
+    }
+    return out;
+}
+
+/// One case: the flight numbered target (counting both ways) is mangled.
+fn handshake_case(s: &Setup, g: &mut rand.Seeded, target: u64, a: alloc.Allocator) {
+    var sc = tls.ServerConfig.init(a);
+    sc.add_certificate(s.leaf.items());
+    sc.private_key(s.key);
+    sc.accept_protocol("http/1.1");
+    var cc = tls.ClientConfig.init("localhost", now: 1800000000, a);
+    cc.trust(s.ca.items());
+    cc.offer_protocol("http/1.1");
+    var client = tls.Engine.client(&cc, seed: [1; 32], a);
+    var server = tls.Engine.server(&sc, seed: [2; 32], a);
+    var flight: u64 = 0;
+    var moved = true;
+    var wrote = false;
+    while moved {
+        moved = false;
+        if client.output().len() > 0 {
+            moved = true;
+            var bytes = alloc.List(u8).init(a);
+            for x in client.output() {
+                bytes.push(x.*);
+            }
+            client.sent();
+            if flight == target {
+                bytes = mangle(bytes.items(), g: g, a);
+            }
+            flight += 1;
+            match server.feed(bytes.items()) {
+                ok(_) => { }
+                err(_) => { return; }
+            }
+        }
+        if server.output().len() > 0 {
+            moved = true;
+            var bytes = alloc.List(u8).init(a);
+            for x in server.output() {
+                bytes.push(x.*);
+            }
+            server.sent();
+            if flight == target {
+                bytes = mangle(bytes.items(), g: g, a);
+            }
+            flight += 1;
+            match client.feed(bytes.items()) {
+                ok(_) => { }
+                err(_) => { return; }
+            }
+        }
+        if not moved and not wrote and client.connected() and server.connected() {
+            // Application data and a close, so they are fuzzed too.
+            wrote = true;
+            moved = true;
+            _ = client.write("ping".bytes());
+            _ = server.write("pong".bytes());
+            client.close();
+        }
+    }
+    var buf: [16]u8 = [0; 16];
+    _ = server.read(buf[0..16]);
+    _ = client.read(buf[0..16]);
+}
+
+/// A mangled certificate, parsed and checked as a chain.
+fn certificate_case(s: &Setup, g: &mut rand.Seeded, a: alloc.Allocator) {
+    let bytes = mangle(s.leaf.items(), g: g, a);
+    match x509.parse(bytes.items()) {
+        ok(_) => { }
+        err(_) => { }
+    }
+    var chain = x509.CertList.init(a);
+    chain.push(bytes.items());
+    var anchors = x509.CertList.init(a);
+    anchors.push(s.ca.items());
+    match x509.verify(chain: &chain, anchors: &anchors, host: "localhost", now: 1800000000) {
+        ok(_) => { }
+        err(_) => { }
+    }
+    match x509.private_key(bytes.items()) {
+        ok(_) => { }
+        err(_) => { }
+    }
+    var text = alloc.String.init(a);
+    x509.pem_encode(bytes.items(), label: "CERTIFICATE", out: &mut text);
+    var back = x509.CertList.init(a);
+    match x509.pem(text: text.view(), label: "CERTIFICATE", out: &mut back, a) {
+        ok(_) => { }
+        err(_) => { }
+    }
+}
+
+fn number(text: str) -> u64 {
+    var v: u64 = 0;
+    for c in text.bytes() {
+        v = v * 10 + (c.* - '0') as u64;
+    }
+    return v;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() < 2 {
+        sys.stderr.write("usage: tls_fuzz <seconds> [seed]\n");
+        sys.proc.exit(2);
+    }
+    let seconds = number(sys.args.get(1));
+    var seed = sys.rand.next_u64() % 1000000000;
+    if sys.args.len() > 2 {
+        seed = number(sys.args.get(2));
+    }
+    sys.stdout.write("seed ");
+    sys.stdout.write_u64(seed);
+    sys.stdout.write("\n");
+    sys.stdout.flush();
+    let a = sys.alloc;
+    let p256_setup = setup(ed: false, a);
+    let ed_setup = setup(ed: true, a);
+    var g = rand.Seeded.init(seed);
+    let start = sys.clock.monotonic_ns();
+    var cases: u64 = 0;
+    while sys.clock.monotonic_ns() - start < seconds * 1000000000 : (cases += 1) {
+        let which = g.below(4);
+        let target = g.below(6);
+        // Each case in a region of its own: what it allocates goes with it.
+        region r {
+            if which == 0 {
+                certificate_case(&p256_setup, g: &mut g, r);
+            } else if which == 1 {
+                handshake_case(&ed_setup, g: &mut g, target: target, r);
+            } else {
+                handshake_case(&p256_setup, g: &mut g, target: target, r);
+            }
+        }
+    }
+    sys.stdout.write_u64(cases);
+    sys.stdout.write(" cases, no panic\n");
+}
