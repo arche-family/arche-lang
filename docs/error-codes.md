@@ -170,3 +170,4 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0910` | An operation that can panic or trap in a `nopanic` function, or a call of a function that is not `nopanic` (§8.2). |
 | `E0920` | An `unsafe` block without a `// SAFETY:` comment, in a package that sets `strict_unsafe` (§10.1). |
 | `E0921` | An operation that needs `unsafe` outside an `unsafe` block or `unsafe fn`: a raw pointer made, read, written, offset or turned into a view, or an `unsafe fn` called (§10.1). |
+| `E0922` | An `asm` operand that is not `in`, `out`, `inout` or `clobber`, whose value is not an integer, `bool` or pointer, that writes a place it cannot, or a `%N` without an operand (§10.2). |

@@ -58,6 +58,12 @@ pub type Op = enum {
     FConv,
     /// a, b, c: operands as the operation needs; flag: an FMathKind.
     FMath,
+    /// Inline assembly (spec/arche.md §10.2). imm: its entry in the
+    /// module's asms; args: the inputs; flag: how many outputs. With one,
+    /// the instruction's value is it; with more, AsmOut reads them.
+    Asm,
+    /// a: an Asm with outputs; imm: which output.
+    AsmOut,
     /// imm: the callee (a function, or an external when flag is 1); args:
     /// a range of the function's args list.
     Call,
@@ -175,6 +181,14 @@ pub type Global = struct {
     pub exported: bool,
 }
 
+/// The text and constraints of one asm, in LLVM's form, and the types of
+/// its outputs.
+pub type AsmText = struct {
+    pub template: alloc.String,
+    pub constraints: alloc.String,
+    pub outputs: alloc.List(Ty),
+}
+
 /// The methods of one impl, in its interface's order: the table a &dyn I
 /// view points to (spec/arche.md §5.3).
 pub type VTable = struct {
@@ -195,6 +209,7 @@ pub type Module = struct {
     pub globals: alloc.List(Global),
     pub tables: alloc.List(StrTable),
     pub vtables: alloc.List(VTable),
+    pub asms: alloc.List(AsmText),
     a: alloc.Allocator,
 
     pub fn init(a: alloc.Allocator) -> Module {
@@ -204,6 +219,7 @@ pub type Module = struct {
             globals: alloc.List(Global).init(a),
             tables: alloc.List(StrTable).init(a),
             vtables: alloc.List(VTable).init(a),
+            asms: alloc.List(AsmText).init(a),
             a: a,
         };
     }
@@ -304,6 +320,7 @@ pub fn has_value(i: Inst) -> bool {
     match i.op {
         .Store | .Memcpy | .Memzero | .Br | .CondBr | .Ret | .RetVoid | .Unreachable => { return false; }
         .Call | .CallIndirect => { return i.ty != Ty.Void; }
+        .Asm => { return i.flag > 0; }
         _ => { return true; }
     }
 }
@@ -446,7 +463,12 @@ pub fn verify(f: &Function) -> Problem {
                         return problem(id, ProblemKind.MissingReturn);
                     }
                 }
-                .Call | .CallIndirect => {
+                .AsmOut => {
+                    if i.a >= id {
+                        return problem(id, ProblemKind.Undefined);
+                    }
+                }
+                .Call | .CallIndirect | .Asm => {
                     if i.op == Op.CallIndirect and not operand_ok(f, user: id, v: i.a) {
                         return problem(id, ProblemKind.Undefined);
                     }

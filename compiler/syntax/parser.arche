@@ -395,11 +395,28 @@ fn parse_where(p: &mut Parser) {
     _ = close(p, m, cst.Kind.WhereClause);
 }
 
-/// nopanic fn, unsafe fn (spec/arche.md §8.2, §10.1): own tokens of the fn.
+fn is_fn_mod(k: tk.Kind) -> bool {
+    return k == tk.Kind.KwUnsafe or k == tk.Kind.KwNopanic or k == tk.Kind.KwNaked;
+}
+
+/// nopanic fn, unsafe fn, naked fn (spec/arche.md §8.2, §10): own tokens
+/// of the fn; export("name") and section("name") are Attribute children.
 fn fn_mods(p: &mut Parser) {
-    while p.full and (at(p, tk.Kind.KwUnsafe) or at(p, tk.Kind.KwNopanic)) and
-        (peek_second(p) == tk.Kind.KwFn or peek_second(p) == tk.Kind.KwUnsafe or peek_second(p) == tk.Kind.KwNopanic) {
-        advance(p);
+    while p.full {
+        if at(p, tk.Kind.Ident) and (token_is(p, "export") or token_is(p, "section")) and peek_second(p) == tk.Kind.LParen {
+            let am = open(p);
+            advance(p);
+            advance(p);
+            _ = expect(p, tk.Kind.String, "a name in quotes");
+            _ = expect(p, tk.Kind.RParen, "')'");
+            _ = close(p, am, cst.Kind.Attribute);
+            continue;
+        }
+        if is_fn_mod(peek(p)) and (peek_second(p) == tk.Kind.KwFn or is_fn_mod(peek_second(p)) or peek_second(p) == tk.Kind.Ident) {
+            advance(p);
+            continue;
+        }
+        break;
     }
 }
 
@@ -1244,6 +1261,36 @@ fn parse_primary(p: &mut Parser) -> bool {
                 return false;
             }
             parse_match(p, m, cst.Kind.MatchExpr);
+        }
+        .KwAsm => {
+            // asm("template", in(reg) x, out("eax") y, clobber("memory"))
+            advance(p);
+            if expect(p, tk.Kind.LParen, "'('") {
+                _ = expect(p, tk.Kind.String, "the assembly text");
+                while accept(p, tk.Kind.Comma) {
+                    if at(p, tk.Kind.RParen) {
+                        break;
+                    }
+                    let om = open(p);
+                    if at(p, tk.Kind.Ident) or at(p, tk.Kind.KwIn) {
+                        advance(p); // in, out, inout or clobber: contextual
+                    } else {
+                        unexpected(p, "'in', 'out', 'inout' or 'clobber'");
+                    }
+                    if expect(p, tk.Kind.LParen, "'('") {
+                        if not accept(p, tk.Kind.String) {
+                            _ = expect(p, tk.Kind.Ident, "a register or 'reg'");
+                        }
+                        _ = expect(p, tk.Kind.RParen, "')'");
+                    }
+                    if not at(p, tk.Kind.Comma) and not at(p, tk.Kind.RParen) {
+                        parse_nested_expr(p);
+                    }
+                    _ = close(p, om, cst.Kind.AsmOperand);
+                }
+                _ = expect(p, tk.Kind.RParen, "',' or ')'");
+            }
+            _ = close(p, m, cst.Kind.AsmExpr);
         }
         _ => {
             unexpected(p, "an expression");

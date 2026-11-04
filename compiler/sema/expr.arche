@@ -357,6 +357,7 @@ fn check_kind(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Typ
         .SliceExpr => { return check_slice(c, n); }
         .ClosureExpr => { return check_closure(c, n); }
         .IfExpr => { return stmt.check_if_value(c, n, expected); }
+        .AsmExpr => { return check_asm(c, n); }
         .MatchExpr => { return stmt.check_match_value(c, n, expected); }
         .DerefExpr => {
             let t = check(c, ck.child(c, n, 0), none);
@@ -583,6 +584,73 @@ fn check_name(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     let s = ck.span_of(c, n);
     ck.report_owned(c, codes.UNKNOWN_NAME, s, m);
     return ty.invalid();
+}
+
+// ---- asm (spec/arche.md §10.2) -----------------------------------------------------
+
+/// in(reg) x, out("rax") y, inout(reg) z, clobber("memory"): its word.
+pub fn asm_kind(c: &ck.Checker, op: cst.NodeId) -> str {
+    return ck.text(c, ck.first_own(c, op));
+}
+
+fn asm_scalar(c: &ck.Checker, t: ty.TypeId) -> bool {
+    let k = c.t.kind(t);
+    return k == ty.Kind.Int or k == ty.Kind.Bool or k == ty.Kind.Ptr or k == ty.Kind.Ref or k == ty.Kind.Invalid;
+}
+
+fn check_asm(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let s = ck.span_of(c, n);
+    ck.require_unsafe(c, s, "inline assembly");
+    let count = ck.child_count(c, n);
+    var operands: u32 = 0;
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let op = ck.child(c, n, i);
+        let word = asm_kind(c, op);
+        if word.eq("clobber") {
+            continue;
+        }
+        if not word.eq("in") and not word.eq("out") and not word.eq("inout") {
+            let ws = ck.token_span(c, ck.first_own(c, op));
+            ck.report(c, codes.BAD_ASM, ws, "an asm operand is in(...), out(...), inout(...) or clobber(...)");
+            continue;
+        }
+        operands += 1;
+        if ck.child_count(c, op) == 0 {
+            let os = ck.span_of(c, op);
+            ck.report(c, codes.BAD_ASM, os, "this asm operand needs a value after its register");
+            continue;
+        }
+        let e = ck.child(c, op, 0);
+        let t = check(c, e, none);
+        if not asm_scalar(c, t) {
+            var m = ck.new_message(c);
+            m.push_str("an asm operand is an integer, a bool or a pointer, not ");
+            ck.write_type(c, &mut m, t);
+            let es = ck.span_of(c, e);
+            ck.report_owned(c, codes.BAD_ASM, es, m);
+        }
+        if not word.eq("in") and not (is_place(c, e) and place_mutable(c, e)) {
+            let es = ck.span_of(c, e);
+            ck.report(c, codes.BAD_ASM, es, "an out or inout operand is a place the assembly can write: a 'var', or one reached through '&mut'");
+        }
+    }
+    // %N names the N-th operand.
+    let tmpl = ck.text(c, ck.find_own(c, n, tk.Kind.String) orelse ck.first_own(c, n));
+    var k: usize = 0;
+    while k + 1 < tmpl.len() : (k += 1) {
+        if tmpl[k] == '%' and tmpl[k + 1] == '%' {
+            k += 1;
+            continue;
+        }
+        if tmpl[k] == '%' and tmpl[k + 1] >= '0' and tmpl[k + 1] <= '9' {
+            if (tmpl[k + 1] - '0') as u32 >= operands {
+                ck.report(c, codes.BAD_ASM, s, "the assembly names an operand it is not given");
+                break;
+            }
+        }
+    }
+    return ty.void_type();
 }
 
 // ---- closures (spec/arche.md §6) ------------------------------------------------------

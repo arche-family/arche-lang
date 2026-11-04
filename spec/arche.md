@@ -332,7 +332,7 @@ These exist for the `freestanding` target (S16) and are all `unsafe`:
 
 | Feature | Form |
 | --- | --- |
-| Inline assembly | `asm("mov %0, cr3", in(reg) addr)` with typed operands and clobbers |
+| Inline assembly | `asm("mov %0, cr3", in(reg) addr)` with typed operands and clobbers: `in(r) e`, `out(r) p`, `inout(r) p` and `clobber("name")`, where `r` is `reg` (any register) or a register in quotes, `"rax"`; `%N` in the text is the N-th operand, `%%` a `%`. Operands are integers, `bool`s or pointers; `out` and `inout` ones are writable places (E0922). An `asm` also clobbers memory, so the compiler keeps loads and stores in order around it |
 | Naked functions | `naked fn`: no prologue or epilogue; the body is one `asm` block |
 | Volatile access | `ptr.read_volatile(p)`, `ptr.write_volatile(p, v)` |
 | Atomics | `core.atomic.U32` and friends, with an explicit `Ordering` on every operation: `Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst` |

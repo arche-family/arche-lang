@@ -361,9 +361,226 @@ fn float_to_int(l: &mut lw.Lower, e: cst.NodeId, x: u32, from: ty.TypeId, to: ty
     return fconv(l, ir.FConvKind.ToUI, x, s);
 }
 
+/// One operand's constraint: r for reg, else {name}.
+fn asm_register(l: &lw.Lower, op: cst.NodeId, out: &mut alloc.String) {
+    let toks = ck.own(&l.c, op);
+    var reg = "reg";
+    var i: usize = 0;
+    while i < toks.len() : (i += 1) {
+        let k = ck.tok_kind(&l.c, toks[i]);
+        if (k == tk.Kind.Ident or k == tk.Kind.String) and i > 0 {
+            reg = ck.text(&l.c, toks[i]);
+        }
+    }
+    if reg.len() >= 2 and reg[0] == '"' {
+        reg = reg[1..reg.len() - 1];
+    }
+    if reg.eq("reg") {
+        out.push_str("r");
+    } else {
+        out.push_str("{");
+        out.push_str(reg);
+        out.push_str("}");
+    }
+}
+
+/// asm(...) as LLVM inline assembly: outputs first in its constraints, then
+/// inputs (an inout one tied to its output), then clobbers; %N of the text
+/// becomes $ and the operand's place in that order.
+fn asm_value(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
+    let n = count(l, e);
+    var map = alloc.List(u32).init(l.a);
+    var nout: u32 = 0;
+    var i: u32 = 0;
+    while i < n : (i += 1) {
+        let w = sx.asm_kind(&l.c, child(l, e, i));
+        if w.eq("out") or w.eq("inout") {
+            nout += 1;
+        }
+    }
+    var cons = alloc.String.init(l.a);
+    var outputs = alloc.List(ir.Ty).init(l.a);
+    var out_places = alloc.List(u32).init(l.a);
+    var next_out: u32 = 0;
+    var next_in = nout;
+    var inputs = lw.args0(l);
+    var tied = alloc.String.init(l.a);
+    var plain = alloc.String.init(l.a);
+    var clobbers = alloc.String.init(l.a);
+    i = 0;
+    while i < n : (i += 1) {
+        let op = child(l, e, i);
+        let w = sx.asm_kind(&l.c, op);
+        if w.eq("clobber") {
+            clobbers.push_str(",~");
+            var reg = alloc.String.init(l.a);
+            asm_register(l, op, &mut reg);
+            clobbers.push_str(reg.view());
+            continue;
+        }
+        let x = child(l, op, 0);
+        if w.eq("in") {
+            map.push(next_in);
+            next_in += 1;
+            plain.push_str(",");
+            asm_register(l, op, &mut plain);
+            inputs.push(value(l, x).v);
+            continue;
+        }
+        map.push(next_out);
+        if cons.len() > 0 {
+            cons.push_str(",");
+        }
+        cons.push_str("=");
+        asm_register(l, op, &mut cons);
+        let addr = place(l, x);
+        out_places.push(addr);
+        outputs.push(layout.scalar(&l.c, type_of(l, x)));
+        if w.eq("inout") {
+            tied.push_str(",");
+            ir.write_number(&mut tied, next_out as u64);
+            inputs.push(lw.load(l, layout.scalar(&l.c, type_of(l, x)), addr));
+            next_in += 1;
+        }
+        next_out += 1;
+    }
+    // LLVM numbers outputs, then the tied inputs, then the others: renumber
+    // the plain inputs after the tied ones.
+    let ntied = next_in - nout - (map.len() as u32 - nout);
+    var constraints = alloc.String.init(l.a);
+    constraints.push_str(cons.view());
+    var rest = alloc.String.init(l.a);
+    rest.push_str(tied.view());
+    rest.push_str(plain.view());
+    rest.push_str(clobbers.view());
+    rest.push_str(",~{memory}");
+    if constraints.len() == 0 and rest.len() > 0 {
+        constraints.push_str(rest.view()[1..rest.len()]);
+    } else {
+        constraints.push_str(rest.view());
+    }
+    // Inputs: the tied ones were pushed in order with the plain ones; put
+    // tied first, as their constraints are.
+    var ordered = lw.args0(l);
+    var tied_vals = lw.args0(l);
+    var plain_vals = lw.args0(l);
+    var vi: usize = 0;
+    i = 0;
+    while i < n : (i += 1) {
+        let w = sx.asm_kind(&l.c, child(l, e, i));
+        if w.eq("inout") {
+            tied_vals.push(inputs[vi]);
+            vi += 1;
+        } else if w.eq("in") {
+            plain_vals.push(inputs[vi]);
+            vi += 1;
+        }
+    }
+    var q: usize = 0;
+    while q < tied_vals.len() : (q += 1) {
+        ordered.push(tied_vals[q]);
+    }
+    q = 0;
+    while q < plain_vals.len() : (q += 1) {
+        ordered.push(plain_vals[q]);
+    }
+    // A plain input's LLVM number comes after every output and tied input.
+    var remapped = alloc.List(u32).init(l.a);
+    var plain_seen: u32 = 0;
+    i = 0;
+    var oi: usize = 0;
+    while i < n : (i += 1) {
+        let w = sx.asm_kind(&l.c, child(l, e, i));
+        if w.eq("clobber") {
+            continue;
+        }
+        if w.eq("in") {
+            remapped.push(nout + ntied + plain_seen);
+            plain_seen += 1;
+        } else {
+            remapped.push(map[oi]);
+        }
+        oi += 1;
+    }
+    // The text: %N to $N in LLVM's numbering, %% to %, $ to $$.
+    let toks = ck.own(&l.c, e);
+    var raw_tok: u32 = toks[0];
+    var t: usize = 0;
+    while t < toks.len() : (t += 1) {
+        if ck.tok_kind(&l.c, toks[t]) == tk.Kind.String {
+            raw_tok = toks[t];
+            break;
+        }
+    }
+    let mod = &l.c.p.modules[l.c.module as usize];
+    let text = decode(mod.token_text(raw_tok).bytes(), l.a);
+    let tb = text.items();
+    var tmpl = alloc.String.init(l.a);
+    var k: usize = 0;
+    while k < tb.len() : (k += 1) {
+        let ch = tb[k];
+        if ch == '%' and k + 1 < tb.len() and tb[k + 1] == '%' {
+            tmpl.push_ascii('%');
+            k += 1;
+        } else if ch == '%' and k + 1 < tb.len() and tb[k + 1] >= '0' and tb[k + 1] <= '9' {
+            tmpl.push_ascii('$');
+            ir.write_number(&mut tmpl, remapped[(tb[k + 1] - '0') as usize] as u64);
+            k += 1;
+        } else if ch == '$' {
+            tmpl.push_str("$$");
+        } else if ch == '"' or ch == '\\' or ch < 32 {
+            tmpl.push_ascii('\\');
+            tmpl.push_ascii(hex_digit_char((ch >> 4) as u32));
+            tmpl.push_ascii(hex_digit_char((ch & 15) as u32));
+        } else {
+            tmpl.push_ascii(ch);
+        }
+    }
+    var outs_copy = alloc.List(ir.Ty).init(l.a);
+    q = 0;
+    while q < outputs.len() : (q += 1) {
+        outs_copy.push(outputs[q]);
+    }
+    let idx = l.m.asms.len() as u32;
+    l.m.asms.push(ir.AsmText { template: tmpl, constraints: constraints, outputs: outputs });
+    var ai = ir.inst(ir.Op.Asm, ir.Ty.Void);
+    ai.imm = idx as u64;
+    ai.flag = outs_copy.len() as u32;
+    if outs_copy.len() == 1 {
+        ai.ty = outs_copy[0];
+    }
+    ai.args_start = l.f.args.len() as u32;
+    q = 0;
+    while q < ordered.len() : (q += 1) {
+        l.f.args.push(ordered[q]);
+    }
+    ai.args_len = ordered.len() as u32;
+    let r = lw.emit(l, ai);
+    q = 0;
+    while q < out_places.len() : (q += 1) {
+        var v = r;
+        if outs_copy.len() > 1 {
+            var o = ir.inst(ir.Op.AsmOut, outs_copy[q]);
+            o.a = r;
+            o.imm = q as u64;
+            v = lw.emit(l, o);
+        }
+        lw.store(l, value: v, addr: out_places[q]);
+    }
+    return nothing();
+}
+
+fn hex_digit_char(d: u32) -> u8 {
+    if d < 10 {
+        return '0' + d as u8;
+    }
+    return 'A' + (d - 10) as u8;
+}
+
 fn value_of(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
     let t = type_of(l, e);
     match kind(l, e) {
+        .AsmExpr => { return asm_value(l, e); }
         .FloatLit => { return scalar_val(float_literal(l, e, t)); }
         .ClosureExpr => { return closure_value(l, t); }
         .IfExpr | .MatchExpr => { return stmt.branch_value(l, e); }

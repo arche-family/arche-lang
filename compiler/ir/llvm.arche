@@ -129,6 +129,23 @@ fn overflow_text(k: u32) -> str {
     }
 }
 
+/// An asm's result type: its one output's, or a struct of them.
+fn asm_result(out: &mut alloc.String, outs: []ir.Ty) {
+    if outs.len() == 1 {
+        out.push_str(ty_text(outs[0]));
+        return;
+    }
+    out.push_str("{");
+    var j: usize = 0;
+    while j < outs.len() : (j += 1) {
+        if j > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(ty_text(outs[j]));
+    }
+    out.push_str("}");
+}
+
 fn line_start(out: &mut alloc.String, v: u32) {
     out.push_str("  ");
     value_name(out, v);
@@ -140,6 +157,42 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
     let t = ty_text(i.ty);
     match i.op {
         .Const | .Param | .Alloca | .VTable => { }
+        .Asm => {
+            let at = &m.asms[i.imm as usize];
+            let outs = at.outputs.items();
+            if outs.len() == 0 {
+                out.push_str("  call void");
+            } else {
+                line_start(out, id);
+                out.push_str("call ");
+                asm_result(out, outs);
+            }
+            out.push_str(" asm sideeffect \"");
+            out.push_str(at.template.view());
+            out.push_str("\", \"");
+            out.push_str(at.constraints.view());
+            out.push_str("\"(");
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 1) {
+                if k > i.args_start {
+                    out.push_str(", ");
+                }
+                typed(out, m, f, f.args[k as usize]);
+            }
+            out.push_str(")\n");
+        }
+        .AsmOut => {
+            let ai = f.insts[i.a as usize];
+            let outs = m.asms[ai.imm as usize].outputs.items();
+            line_start(out, id);
+            out.push_str("extractvalue ");
+            asm_result(out, outs);
+            out.push_str(" ");
+            value_name(out, i.a);
+            out.push_str(", ");
+            ir.write_number(out, i.imm);
+            out.push_str("\n");
+        }
         .Global => {
             line_start(out, id);
             out.push_str("getelementptr i8, ptr @");
