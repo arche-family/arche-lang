@@ -2,7 +2,7 @@
 
 Arche (Greek *arkhē*: origin, first principle) is a systems programming language meant to carry a whole stack — bootstrap, compiler, kernel, network and web — under one memory model and one capability model.
 
-**Status:** design. The first piece of work is the [Arche-0 specification](spec/arche-0.md), the subset the compiler is written in. No code runs yet.
+**Status:** self-hosting. stage0, a C11 translator, builds the Arche compiler; the compiler, written in [Arche-0](spec/arche-0.md), builds itself through LLVM into static binaries without the C library, and stage2 and stage3 of the bootstrap are bit-identical. The full language (sprint S10 on, [docs/sprints.md](docs/sprints.md)) is next.
 
 ## The criterion
 
@@ -46,7 +46,7 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | Path | Contents | Status |
 | --- | --- | --- |
 | [`docs/plan.md`](docs/plan.md) | the full plan (Uzbek) | snapshot, 2026-11-03 |
-| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S0 |
+| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S10 |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | `spec/` | the full language specification | planned |
 | [`conformance/`](conformance/README.md) | specification tests | 237 tests |
