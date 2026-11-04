@@ -302,7 +302,7 @@ defer sys.stdout.write("done\n");
 - `if` and `while` take a `bool` condition without parentheses, and their bodies are always blocks.
 - `while c : (step) {…}` runs `step` after every iteration, including one ended by `continue`.
 - `break` and `continue` apply to the innermost `while`. There are no labels.
-- `defer stmt;` or `defer {…}` runs when the enclosing block exits, on every path: falling off the end, `return`, `break`, `continue`, or an error returned by `try`. Deferred code runs in reverse order of declaration and cannot itself `return`, `break`, `continue` or use `try`.
+- `defer stmt;` or `defer {…}` runs when the enclosing block exits, on every path: falling off the end, `return`, `break`, `continue`, or an error returned by `try`. Deferred code runs in reverse order of declaration and cannot itself `return`, `break`, `continue` or use `try`. On `return`, the returned value is computed before the deferred code runs.
 - A block introduces a scope.
 
 ## 9. Patterns and `match`
