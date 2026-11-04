@@ -1,0 +1,38 @@
+// test: run
+// spec: arche/3.3
+// stage0: skip
+// stdout: 607 5
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+
+    var found: u32 = 0;
+    outer: for i: u32 in 0..10 {
+        for j: u32 in 0..10 {
+            if i * j == 42 {
+                found = i * 100 + j;
+                break outer;
+            }
+            if j > i {
+                continue outer;
+            }
+        }
+    }
+    sys.stdout.write_u64(found as u64);
+    var n: u32 = 0;
+    rows: while n < 100 : (n += 1) {
+        var k: u32 = 0;
+        while true {
+            k += 1;
+            if k == 3 {
+                continue rows;
+            }
+            if n == 5 {
+                break rows;
+            }
+        }
+    }
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(n as u64);
+    sys.stdout.write("\n");
+}

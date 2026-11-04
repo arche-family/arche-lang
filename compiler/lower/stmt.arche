@@ -80,12 +80,13 @@ fn stmt(l: &mut lw.Lower, s: cst.NodeId) {
         .IfStmt => { if_stmt(l, s); }
         .WhileStmt => { while_stmt(l, s); }
         .ForStmt => { for_stmt(l, s); }
+        .IfExpr => { _ = expr.value(l, s); }
         .UnsafeStmt => { block(l, child(l, s, 0)); }
         .RegionStmt => { region_stmt(l, s); }
         .MatchStmt => { match_stmt(l, s); }
         .ReturnStmt => { return_stmt(l, s); }
         .BreakStmt | .ContinueStmt => {
-            let lp = l.loops[l.loops.len() - 1];
+            let lp = target_loop(l, s);
             run_defers(l, lp.defer_depth);
             if kind(l, s) == cst.Kind.BreakStmt {
                 lw.br(l, lp.break_block);
@@ -174,7 +175,8 @@ fn while_stmt(l: &mut lw.Lower, s: cst.NodeId) {
     let cond = expr.value(l, child(l, s, 0)).v;
     lw.cond_br(l, cond: cond, yes: body, no: done);
     lw.switch_to(l, body);
-    l.loops.push(lw.LoopCtx { break_block: done, continue_block: step, defer_depth: l.defers.len() as u32 });
+    let label = loop_label(l, s);
+    l.loops.push(lw.LoopCtx { break_block: done, continue_block: step, defer_depth: l.defers.len() as u32, label: label });
     block(l, child(l, s, count(l, s) - 1));
     _ = l.loops.pop();
     lw.br(l, step);
@@ -249,8 +251,9 @@ fn bind_scalar(l: &mut lw.Lower, p: cst.NodeId, v: u32) {
     lw.bind(l, sym, slot, type_of(l, p));
 }
 
-fn loop_body(l: &mut lw.Lower, body: cst.NodeId, done: u32, step: u32) {
-    l.loops.push(lw.LoopCtx { break_block: done, continue_block: step, defer_depth: l.defers.len() as u32 });
+fn loop_body(l: &mut lw.Lower, s: cst.NodeId, body: cst.NodeId, done: u32, step: u32) {
+    let label = loop_label(l, s);
+    l.loops.push(lw.LoopCtx { break_block: done, continue_block: step, defer_depth: l.defers.len() as u32, label: label });
     block(l, body);
     _ = l.loops.pop();
     lw.br(l, step);
@@ -291,7 +294,7 @@ fn for_stmt(l: &mut lw.Lower, s: cst.NodeId) {
         lw.cond_br(l, cond: lw.cmp(l, k, x: cur, y: to), yes: body_b, no: done);
         lw.switch_to(l, body_b);
         lw.bind(l, sym, slot, t);
-        loop_body(l, body, done: done, step: step);
+        loop_body(l, s: s, body: body, done: done, step: step);
         lw.switch_to(l, step);
         let now = lw.load(l, sc, slot);
         if inclusive {
@@ -322,7 +325,7 @@ fn for_stmt(l: &mut lw.Lower, s: cst.NodeId) {
         } else {
             bind_scalar(l, first, at);
         }
-        loop_body(l, body, done: done, step: step);
+        loop_body(l, s: s, body: body, done: done, step: step);
         lw.switch_to(l, step);
         let now = lw.load(l, ir.Ty.I64, index);
         lw.store(l, value: lw.bin(l, ir.BinKind.Add, x: now, y: lw.konst(l, ir.Ty.I64, 1)), addr: index);
@@ -361,7 +364,7 @@ fn for_stmt(l: &mut lw.Lower, s: cst.NodeId) {
         } else {
             bind_copy(l, first, item);
         }
-        loop_body(l, body, done: done, step: step);
+        loop_body(l, s: s, body: body, done: done, step: step);
         lw.switch_to(l, step);
         lw.br(l, head);
     }
@@ -617,7 +620,123 @@ fn bind_pattern(l: &mut lw.Lower, p: cst.NodeId, t: ty.TypeId, addr: u32, by_ref
     }
 }
 
+// ---- labels (spec/arche.md §3.3) --------------------------------------------------
+
+fn loop_label(l: &mut lw.Lower, s: cst.NodeId) -> alloc.Symbol {
+    match ck.find_own(&l.c, s, tk.Kind.Ident) {
+        some(t) => { return ck.symbol(&mut l.c, t); }
+        none => { return l.c.names.intern(""); }
+    }
+}
+
+/// The loop a break or continue leaves: the innermost, or the one its
+/// label names.
+fn target_loop(l: &mut lw.Lower, s: cst.NodeId) -> lw.LoopCtx {
+    match ck.find_own(&l.c, s, tk.Kind.Ident) {
+        some(t) => {
+            let sym = ck.symbol(&mut l.c, t);
+            var i = l.loops.len();
+            while i > 0 : (i -= 1) {
+                if l.loops[i - 1].label == sym {
+                    return l.loops[i - 1];
+                }
+            }
+        }
+        none => { }
+    }
+    return l.loops[l.loops.len() - 1];
+}
+
+// ---- if and match as values (spec/arche.md §3.1) -----------------------------------
+
+/// The value of an if or match expression, through a slot each branch fills.
+pub fn branch_value(l: &mut lw.Lower, s: cst.NodeId) -> lw.Val {
+    let t = type_of(l, s);
+    var slot = ck.NONE;
+    if not layout.is_nothing(&l.c, t) {
+        slot = lw.alloca(l, t);
+    }
+    if kind(l, s) == cst.Kind.IfExpr or kind(l, s) == cst.Kind.IfStmt {
+        if_into(l, s, t, slot);
+    } else {
+        match_into(l, s, t, slot);
+    }
+    if slot == ck.NONE {
+        return lw.Val { v: 0, scalar: true, fresh: true };
+    }
+    let v = lw.load_val(l, t, slot);
+    return lw.Val { v: v.v, scalar: v.scalar, fresh: true };
+}
+
+fn if_into(l: &mut lw.Lower, s: cst.NodeId, t: ty.TypeId, slot: u32) {
+    let cond = expr.value(l, child(l, s, 0)).v;
+    let yes = lw.new_block(l);
+    let no = lw.new_block(l);
+    let done = lw.new_block(l);
+    lw.cond_br(l, cond: cond, yes: yes, no: no);
+    lw.switch_to(l, yes);
+    value_block(l, child(l, s, 1), t, slot);
+    lw.br(l, done);
+    lw.switch_to(l, no);
+    let e = child(l, s, 2);
+    if kind(l, e) == cst.Kind.Block {
+        value_block(l, e, t, slot);
+    } else {
+        if_into(l, e, t, slot);
+    }
+    lw.br(l, done);
+    lw.switch_to(l, done);
+}
+
+/// A branch: its statements, then its value into the slot.
+fn value_block(l: &mut lw.Lower, b: cst.NodeId, t: ty.TypeId, slot: u32) {
+    let vars = l.vars.len();
+    let defers = l.defers.len() as u32;
+    let n = count(l, b);
+    var i: u32 = 0;
+    while i < n : (i += 1) {
+        let s = child(l, b, i);
+        let k = kind(l, s);
+        if i + 1 == n and k == cst.Kind.BlockValue {
+            if lw.terminated(l) {
+                lw.after_terminator(l);
+            }
+            let e = child(l, s, 0);
+            let v = expr.value(l, e);
+            if slot != ck.NONE and l.c.t.kind(type_of(l, e)) != ty.Kind.Noreturn and not lw.terminated(l) {
+                lw.store_val(l, t, v, slot);
+            }
+        } else if i + 1 == n and (k == cst.Kind.IfStmt or k == cst.Kind.MatchStmt) and not ck.is_invalid(&l.c, type_of(l, s)) {
+            if lw.terminated(l) {
+                lw.after_terminator(l);
+            }
+            if k == cst.Kind.IfStmt {
+                if_into(l, s, t, slot);
+            } else {
+                match_into(l, s, t, slot);
+            }
+        } else {
+            stmt(l, s);
+        }
+    }
+    if not lw.terminated(l) {
+        run_defers(l, defers);
+    }
+    while l.defers.len() as u32 > defers {
+        _ = l.defers.pop();
+    }
+    while l.vars.len() > vars {
+        _ = l.vars.pop();
+    }
+}
+
 fn match_stmt(l: &mut lw.Lower, s: cst.NodeId) {
+    match_into(l, s, ty.invalid(), ck.NONE - 1);
+}
+
+/// A match; slot NONE - 1 for a statement, else its value goes there (NONE
+/// for a value of nothing).
+fn match_into(l: &mut lw.Lower, s: cst.NodeId, rt: ty.TypeId, slot: u32) {
     let scrutinee = child(l, s, 0);
     let st = type_of(l, scrutinee);
     var t = st;
@@ -659,7 +778,11 @@ fn match_stmt(l: &mut lw.Lower, s: cst.NodeId) {
         if parts == 2 {
             bind_pattern(l, child(l, arm, 0), t, addr, by_ref);
         }
-        block(l, child(l, arm, parts - 1));
+        if slot == ck.NONE - 1 {
+            block(l, child(l, arm, parts - 1));
+        } else {
+            value_block(l, child(l, arm, parts - 1), rt, slot);
+        }
         while l.vars.len() > vars {
             _ = l.vars.pop();
         }

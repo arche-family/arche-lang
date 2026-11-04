@@ -232,6 +232,9 @@ pub type Checker = struct {
     /// Inside a closure: the bindings around it, which it may not use
     /// without capturing them.
     pub outer_scope: alloc.List(Binding),
+    /// The labels of the loops being checked, innermost last; the empty
+    /// name for a loop without one (spec/arche.md §3.3).
+    pub labels: alloc.List(alloc.Symbol),
     pub a: alloc.Allocator,
 }
 
@@ -2545,6 +2548,7 @@ pub fn analyze(p: program.Program) -> Checker {
         captures: alloc.List(Capture).init(a),
         fn_ifaces: alloc.List(u32).init(a),
         outer_scope: alloc.List(Binding).init(a),
+        labels: alloc.List(alloc.Symbol).init(a),
         a: a,
     };
     add_io_error(&mut c);

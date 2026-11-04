@@ -225,6 +225,37 @@ fn statement(c: &mut ck.Checker, r: &mut Run, s: cst.NodeId) -> Flow {
     return Flow.Normal;
 }
 
+/// An if expression at compile time: the branch's statements, then its value.
+fn if_value(c: &mut ck.Checker, r: &mut Run, e: cst.NodeId) -> u64 {
+    var b = ck.child(c, e, 1);
+    if value(c, r, ck.child(c, e, 0)) == 0 {
+        let other = ck.child(c, e, 2);
+        if ck.kind_of(c, other) != cst.Kind.Block {
+            return if_value(c, r, other);
+        }
+        b = other;
+    }
+    let base = r.locals.len();
+    let n = ck.child_count(c, b);
+    var v: u64 = 0;
+    var i: u32 = 0;
+    while i < n and not r.failed : (i += 1) {
+        let s = ck.child(c, b, i);
+        let k = ck.kind_of(c, s);
+        if i + 1 == n and k == cst.Kind.BlockValue {
+            v = value(c, r, ck.child(c, s, 0));
+        } else if i + 1 == n and k == cst.Kind.IfStmt and not ck.is_invalid(c, ck.type_of(c, s)) {
+            v = if_value(c, r, s);
+        } else if statement(c, r, s) != Flow.Normal {
+            _ = fail(c, r, s, "a branch of an if expression leaves it early, which compile-time code cannot do yet");
+        }
+    }
+    while r.locals.len() > base {
+        _ = r.locals.pop();
+    }
+    return v;
+}
+
 /// for i in a..b and a..=b (spec/arche.md §3.2); slices and iterators
 /// cannot run at compile time yet.
 fn for_range(c: &mut ck.Checker, r: &mut Run, s: cst.NodeId) -> Flow {
@@ -348,6 +379,7 @@ fn value(c: &mut ck.Checker, r: &mut Run, e: cst.NodeId) -> u64 {
     }
     match ck.kind_of(c, e) {
         .IntLit | .CharLit => { return ck.tok_value(c, ck.tree(c).first_token(e)); }
+        .IfExpr => { return if_value(c, r, e); }
         .BoolLit => {
             if ck.tok_kind(c, ck.tree(c).first_token(e)) == tk.Kind.KwTrue {
                 return 1;

@@ -32,6 +32,8 @@ type Parser = struct {
     no_struct_lit: bool,
     /// Full Arche (spec/arche.md), not Arche-0.
     full: bool,
+    /// The expression statement being parsed may be its block's value.
+    block_value_ok: bool,
 }
 
 pub fn parse(tokens: alloc.List(tk.Token), text: str, full: bool, diags: diag.Diagnostics, a: alloc.Allocator) -> Parsed {
@@ -46,6 +48,7 @@ pub fn parse(tokens: alloc.List(tk.Token), text: str, full: bool, diags: diag.Di
         last_end: 0,
         no_struct_lit: false,
         full: full,
+        block_value_ok: false,
     };
     skip_trivia(&mut p);
     let m = p.b.open(0);
@@ -74,6 +77,20 @@ fn peek(p: &Parser) -> tk.Kind {
 }
 
 /// The kind of the significant token after the next one.
+fn peek_third(p: &Parser) -> tk.Kind {
+    var i = p.pos;
+    var n: u32 = 0;
+    while n < 2 : (n += 1) {
+        if p.tokens[i as usize].kind == tk.Kind.Eof {
+            return tk.Kind.Eof;
+        }
+        i += 1;
+        while p.tokens[i as usize].kind.is_trivia() : (i += 1) {
+        }
+    }
+    return p.tokens[i as usize].kind;
+}
+
 fn peek_second(p: &Parser) -> tk.Kind {
     var i = p.pos;
     if p.tokens[i as usize].kind == tk.Kind.Eof {
@@ -758,6 +775,8 @@ fn is_assign_op(k: tk.Kind) -> bool {
 /// simple = "_" "=" expr | expr [ assign_op expr ]. Returns false for a
 /// discard, which a while step cannot be.
 fn parse_simple(p: &mut Parser) -> bool {
+    let value_ok = p.block_value_ok;
+    p.block_value_ok = false; // not for the statements nested inside
     let m = open(p);
     if accept(p, tk.Kind.Underscore) {
         _ = expect(p, tk.Kind.Assign, "'=' after '_'");
@@ -770,6 +789,10 @@ fn parse_simple(p: &mut Parser) -> bool {
         advance(p);
         parse_expr(p);
         _ = close(p, m, cst.Kind.AssignStmt);
+    } else if p.full and value_ok and at(p, tk.Kind.RBrace) {
+        // `{ ...; x }`: the block's value (spec/arche.md §3.1).
+        _ = close(p, m, cst.Kind.BlockValue);
+        return false;
     } else {
         _ = close(p, m, cst.Kind.ExprStmt);
     }
@@ -784,22 +807,32 @@ fn parse_condition(p: &mut Parser) {
 }
 
 fn parse_if(p: &mut Parser, m: cst.Mark) {
+    parse_if_as(p, m, cst.Kind.IfStmt);
+}
+
+fn parse_if_as(p: &mut Parser, m: cst.Mark, k: cst.Kind) {
     advance(p);
     parse_condition(p);
     parse_block(p);
     if accept(p, tk.Kind.KwElse) {
         if at(p, tk.Kind.KwIf) {
             let em = open(p);
-            parse_if(p, em);
+            parse_if_as(p, em, k);
         } else {
             parse_block(p);
         }
     }
-    _ = close(p, m, cst.Kind.IfStmt);
+    _ = close(p, m, k);
 }
 
 fn parse_stmt(p: &mut Parser) {
     let m = open(p);
+    // outer: while ... / outer: for ... (spec/arche.md §3.3)
+    if p.full and at(p, tk.Kind.Ident) and peek_second(p) == tk.Kind.Colon and
+        (peek_third(p) == tk.Kind.KwWhile or peek_third(p) == tk.Kind.KwFor) {
+        advance(p);
+        advance(p);
+    }
     match peek(p) {
         .KwLet | .KwVar => {
             advance(p);
@@ -864,22 +897,7 @@ fn parse_stmt(p: &mut Parser) {
             _ = close(p, m, cst.Kind.ForStmt);
         }
         .KwMatch => {
-            advance(p);
-            parse_condition(p);
-            if expect(p, tk.Kind.LBrace, "'{'") {
-                while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {
-                    let before = p.pos;
-                    parse_arm(p);
-                    if p.pos == before {
-                        skip_one(p);
-                        if p.pos == before {
-                            break;
-                        }
-                    }
-                }
-                _ = expect(p, tk.Kind.RBrace, "'}'");
-            }
-            _ = close(p, m, cst.Kind.MatchStmt);
+            parse_match(p, m, cst.Kind.MatchStmt);
         }
         .KwReturn => {
             advance(p);
@@ -891,11 +909,17 @@ fn parse_stmt(p: &mut Parser) {
         }
         .KwBreak => {
             advance(p);
+            if p.full {
+                _ = accept(p, tk.Kind.Ident);
+            }
             end_statement(p);
             _ = close(p, m, cst.Kind.BreakStmt);
         }
         .KwContinue => {
             advance(p);
+            if p.full {
+                _ = accept(p, tk.Kind.Ident);
+            }
             end_statement(p);
             _ = close(p, m, cst.Kind.ContinueStmt);
         }
@@ -913,10 +937,32 @@ fn parse_stmt(p: &mut Parser) {
             parse_block(p);
         }
         _ => {
-            _ = parse_simple(p);
-            end_statement(p);
+            p.block_value_ok = true;
+            let plain = parse_simple(p);
+            if plain or not at(p, tk.Kind.RBrace) or not p.full {
+                end_statement(p);
+            }
         }
     }
+}
+
+fn parse_match(p: &mut Parser, m: cst.Mark, k: cst.Kind) {
+    advance(p);
+    parse_condition(p);
+    if expect(p, tk.Kind.LBrace, "'{'") {
+        while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {
+            let before = p.pos;
+            parse_arm(p);
+            if p.pos == before {
+                skip_one(p);
+                if p.pos == before {
+                    break;
+                }
+            }
+        }
+        _ = expect(p, tk.Kind.RBrace, "'}'");
+    }
+    _ = close(p, m, k);
 }
 
 fn parse_arm(p: &mut Parser) {
@@ -1163,6 +1209,22 @@ fn parse_primary(p: &mut Parser) -> bool {
                 return false;
             }
             parse_closure(p, m);
+        }
+        .KwIf => {
+            if not p.full {
+                unexpected(p, "an expression");
+                _ = close(p, m, cst.Kind.Error);
+                return false;
+            }
+            parse_if_as(p, m, cst.Kind.IfExpr);
+        }
+        .KwMatch => {
+            if not p.full {
+                unexpected(p, "an expression");
+                _ = close(p, m, cst.Kind.Error);
+                return false;
+            }
+            parse_match(p, m, cst.Kind.MatchExpr);
         }
         _ => {
             unexpected(p, "an expression");

@@ -1,0 +1,24 @@
+// test: run
+// spec: arche/3.3
+// stage0: skip
+// stdout: 4
+import std;
+
+// The outer loop ends through a break of an inner one: its end is reached.
+fn first(limit: u32) -> u32 {
+    var i: u32 = 0;
+    outer: while true {
+        while true {
+            if i >= limit {
+                break outer;
+            }
+            i += 1;
+        }
+    }
+    return i;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(first(4) as u64);
+    sys.stdout.write("\n");
+}

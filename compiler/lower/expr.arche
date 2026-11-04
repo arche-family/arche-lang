@@ -283,6 +283,7 @@ fn value_of(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
     let t = type_of(l, e);
     match kind(l, e) {
         .ClosureExpr => { return closure_value(l, t); }
+        .IfExpr | .MatchExpr => { return stmt.branch_value(l, e); }
         .IntLit | .CharLit => {
             let v = ck.tok_value(&l.c, ck.tree(&l.c).first_token(e));
             return scalar_val(lw.konst(l, layout.scalar(&l.c, t), v));

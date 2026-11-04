@@ -465,6 +465,112 @@ fn first_closure(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) {
     }
 }
 
+// ---- views chosen by if and match (spec/arche.md §3.1) ---------------------------
+
+/// What a branch value views, read from the expression without evaluating
+/// it again: static memory, a binding's target, or a place viewed.
+fn value_target(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId, out: &mut alloc.List(View)) -> bool {
+    match ck.kind_of(c, e) {
+        .ParenExpr => { return value_target(c, f, ck.child(c, e, 0), out); }
+        .StringLit => {
+            out.push(static_view(c.a));
+            return true;
+        }
+        .NameExpr => {
+            let b = f.uses.get(e.index) orelse ck.NONE;
+            if b == ck.NONE {
+                out.push(static_view(c.a)); // a str constant
+            } else {
+                out.push(view_of_binding(c, f, b));
+            }
+            return true;
+        }
+        .RefExpr => {
+            var path = alloc.String.init(c.a);
+            if place_root(c, f, ck.child(c, e, 0), &mut path) {
+                let root = path_root(path.view());
+                out.push(View { target: canon(f, path.view(), c.a), root: root, is_static: false, mutable: ck.has_own(c, e, tk.Kind.KwMut) });
+                return true;
+            }
+            return false;
+        }
+        .IfExpr | .IfStmt | .MatchExpr | .MatchStmt => { return branch_targets(c, f, e, out); }
+        _ => { return false; }
+    }
+}
+
+fn block_target(c: &mut ck.Checker, f: &mut Fn, b: cst.NodeId, out: &mut alloc.List(View)) -> bool {
+    let n = ck.child_count(c, b);
+    if n == 0 {
+        return true;
+    }
+    let last = ck.child(c, b, n - 1);
+    match ck.kind_of(c, last) {
+        .BlockValue => { return value_target(c, f, ck.child(c, last, 0), out); }
+        .IfStmt | .MatchStmt => { return branch_targets(c, f, last, out); }
+        _ => { return true; } // a branch that does not end
+    }
+}
+
+fn branch_targets(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId, out: &mut alloc.List(View)) -> bool {
+    let k = ck.kind_of(c, n);
+    if k == cst.Kind.IfExpr or k == cst.Kind.IfStmt {
+        if not block_target(c, f, ck.child(c, n, 1), out) {
+            return false;
+        }
+        if ck.child_count(c, n) < 3 {
+            return true;
+        }
+        let e = ck.child(c, n, 2);
+        if ck.kind_of(c, e) == cst.Kind.Block {
+            return block_target(c, f, e, out);
+        }
+        return branch_targets(c, f, e, out);
+    }
+    let count = ck.child_count(c, n);
+    var i: u32 = 1;
+    while i < count : (i += 1) {
+        let arm = ck.child(c, n, i);
+        if not block_target(c, f, ck.child(c, arm, ck.child_count(c, arm) - 1), out) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The one place the branches of a view-valued if or match view: static
+/// memory, or one target they share (E0607 otherwise).
+fn branch_view(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> View {
+    var views = alloc.List(View).init(c.a);
+    let known = branch_targets(c, f, n, &mut views);
+    var chosen = static_view(c.a);
+    var fine = known;
+    let vs = views.items();
+    var i: usize = 0;
+    while i < vs.len() and fine : (i += 1) {
+        if vs[i].is_static {
+            continue;
+        }
+        if chosen.is_static {
+            chosen = View { target: copy_text(vs[i].target.view(), c.a), root: vs[i].root, is_static: false, mutable: vs[i].mutable };
+        } else if not vs[i].target.view().eq(chosen.target.view()) {
+            fine = false;
+        }
+    }
+    if not fine {
+        var m = ck.new_message(c);
+        m.push_str("the branches of this ");
+        if ck.kind_of(c, n) == cst.Kind.MatchExpr or ck.kind_of(c, n) == cst.Kind.MatchStmt {
+            m.push_str("match");
+        } else {
+            m.push_str("if");
+        }
+        m.push_str(" view different places; a view chosen at run time comes from one place, or from static memory");
+        report_once(c, f, codes.VIEW_BRANCHES, n, m);
+    }
+    return chosen;
+}
+
 /// The captures of a closure, where it is made: copies, moves and views.
 /// Returns the views, which live as long as the closure.
 fn closure_captures(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> alloc.List(View) {
@@ -874,6 +980,10 @@ fn view_of(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId) -> View {
             _ = closure_captures(c, f, e);
             return static_view(c.a);
         }
+        .IfExpr | .MatchExpr => {
+            stmt(c, f, e);
+            return branch_view(c, f, e);
+        }
         .ParenExpr => { return view_of(c, f, ck.child(c, e, 0)); }
         .NameExpr => {
             match f.uses.get(e.index) {
@@ -1100,6 +1210,7 @@ fn eval(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId, consume: bool) {
     match ck.kind_of(c, e) {
         .IntLit | .CharLit | .StringLit | .BoolLit | .NoneLit => { }
         .ClosureExpr => { _ = closure_captures(c, f, e); }
+        .IfExpr | .MatchExpr => { stmt(c, f, e); }
         .ParenExpr => { eval(c, f, ck.child(c, e, 0), consume); }
         .NameExpr | .FieldExpr | .IndexExpr | .DerefExpr => {
             if ck.kind_of(c, e) == cst.Kind.FieldExpr and ck.ref_of(c, e) != ck.VALUE_FIELD {
@@ -1694,7 +1805,7 @@ fn stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
         .ExprStmt => { eval(c, f, ck.child(c, s, 0), false); }
         .DiscardStmt => { eval(c, f, ck.child(c, s, 0), true); }
         .AssignStmt => { assign(c, f, s); }
-        .IfStmt => {
+        .IfStmt | .IfExpr => {
             eval(c, f, ck.child(c, s, 0), false);
             let entry = save(c, f);
             block(c, f, ck.child(c, s, 1));
@@ -1705,6 +1816,8 @@ fn stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
             }
             join(c, f, &then_end);
         }
+        .BlockValue => { eval(c, f, ck.child(c, s, 0), true); }
+        .MatchExpr => { match_stmt(c, f, s); }
         .WhileStmt => { loop_stmt(c, f, s); }
         .ForStmt => { for_stmt(c, f, s); }
         .UnsafeStmt => { block(c, f, ck.child(c, s, 0)); }

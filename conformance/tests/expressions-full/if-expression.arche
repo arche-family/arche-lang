@@ -1,0 +1,38 @@
+// test: run
+// spec: arche/3.1
+// stage0: skip
+// stdout: negative zero positive 99 42
+import std;
+
+fn kind(n: i32) -> str {
+    let k = if n < 0 { "negative" } else if n == 0 { "zero" } else { "positive" };
+    return k;
+}
+
+fn sign(n: i32) -> i32 {
+    return if n < 0 {
+        -1
+    } else {
+        let x = n;
+        if x == 0 { 0 } else { 1 }
+    };
+}
+
+fn fail_or(n: u32) -> u32 {
+    // A branch that never ends has no value to give.
+    let v: u32 = if n > 100 { panic("too big") } else { n * 2 };
+    return v;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write(kind(-5));
+    sys.stdout.write(" ");
+    sys.stdout.write(kind(0));
+    sys.stdout.write(" ");
+    sys.stdout.write(kind(3));
+    sys.stdout.write(" ");
+    sys.stdout.write_i64((sign(-9) + sign(0) * 10 + sign(7) * 100) as i64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(fail_or(21) as u64);
+    sys.stdout.write("\n");
+}

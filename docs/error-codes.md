@@ -114,6 +114,8 @@ Every diagnostic of the Arche compiler has a stable code. A code never changes m
 | `E0508` | A variant pattern that does not name every field and does not end with `..`. |
 | `E0509` | A `match` that is not exhaustive. Erasable: stage0 traps at run time instead. |
 | `E0510` | An empty range pattern. |
+| `E0511` | A label that no enclosing loop has, or one that repeats an enclosing loop's (spec/arche.md §3.3). |
+| `E0512` | An `if` expression without `else`, or a branch of an `if` or `match` expression that ends without a value (spec/arche.md §3.1). |
 
 ## Constants
 
@@ -135,6 +137,7 @@ Every diagnostic of the Arche compiler has a stable code. A code never changes m
 | `E0604` | A place used while a view of it is live, through another path: written or viewed `&mut` while viewed, or used at all while viewed `&mut` (§5.4). |
 | `E0605` | A move-only value used after it was moved (§5.5). |
 | `E0606` | A move out of a place reached through a view (§5.5). |
+| `E0607` | A view chosen by an `if` or `match` expression whose branches view different places (spec/arche.md §3.1). |
 
 ## Packages, generics and interfaces
 

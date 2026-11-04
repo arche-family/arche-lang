@@ -93,6 +93,13 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
     c.defer_loops = ck.NONE;
     let saved_unsafe = c.unsafe_depth;
     c.unsafe_depth = 0;
+    var outer_labels = alloc.List(alloc.Symbol).init(c.a);
+    let ol = c.labels.items();
+    var q: usize = 0;
+    while q < ol.len() : (q += 1) {
+        outer_labels.push(ol[q]);
+    }
+    c.labels = alloc.List(alloc.Symbol).init(c.a);
     if c.p.full and ck.is_unsafe_fn(c, info.decl) {
         c.unsafe_depth = 1;
     }
@@ -116,6 +123,7 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
     }
     c.fn_index = ck.NONE;
     c.unsafe_depth = saved_unsafe;
+    c.labels = outer_labels;
     ck.restore_context(c, saved);
 }
 
@@ -155,8 +163,16 @@ pub fn check_closure_body(c: &mut ck.Checker, f: u32, ci: u32, n: cst.NodeId) {
     c.fn_index = f;
     c.loops = 0;
     c.defer_loops = ck.NONE;
+    var saved_labels = alloc.List(alloc.Symbol).init(c.a);
+    let ls = c.labels.items();
+    var q: usize = 0;
+    while q < ls.len() : (q += 1) {
+        saved_labels.push(ls[q]);
+    }
+    c.labels = alloc.List(alloc.Symbol).init(c.a);
     let body = ck.child(c, n, ck.child_count(c, n) - 1);
     check_block(c, body);
+    c.labels = saved_labels;
     if not is_void_result(c, info.ret) and not block_ends(c, body) {
         var m = ck.new_message(c);
         m.push_str("this closure can reach its end without returning ");
@@ -248,11 +264,18 @@ fn check_stmt(c: &mut ck.Checker, s: cst.NodeId) {
             expr.check_value(c, ck.child(c, s, 0), ty.bool_type());
             let has_step = ck.child_count(c, s) == 3;
             c.loops += 1;
+            push_label(c, s);
             check_block(c, ck.child(c, s, ck.child_count(c, s) - 1));
+            _ = c.labels.pop();
             c.loops -= 1;
             if has_step {
                 check_stmt(c, ck.child(c, s, 1));
             }
+        }
+        .BlockValue => {
+            let sp = ck.span_of(c, ck.child(c, s, 0));
+            ck.report(c, codes.UNEXPECTED_TOKEN, sp, "expected ';' after this expression: a block ends with a value only as a branch of an if or match expression");
+            _ = expr.check(c, ck.child(c, s, 0), none);
         }
         .ForStmt => { check_for(c, s); }
         .UnsafeStmt => {
@@ -277,6 +300,19 @@ fn check_stmt(c: &mut ck.Checker, s: cst.NodeId) {
         .ReturnStmt => { check_return(c, s); }
         .BreakStmt | .ContinueStmt => {
             let sp = ck.span_of(c, s);
+            let lt = label_token(c, s);
+            if lt != ck.NONE and c.loops > 0 {
+                let sym = ck.symbol(c, lt);
+                var found = false;
+                var k: usize = 0;
+                while k < c.labels.len() : (k += 1) {
+                    found = found or c.labels[k] == sym;
+                }
+                if not found {
+                    let ls = ck.token_span(c, lt);
+                    ck.report(c, codes.BAD_LABEL, ls, "no loop around this one has this label");
+                }
+            }
             if c.loops == 0 {
                 ck.report(c, codes.OUTSIDE_LOOP, sp, "'break' and 'continue' are allowed only inside a loop");
             } else if c.defer_loops != ck.NONE and c.loops == c.defer_loops {
@@ -494,11 +530,162 @@ fn check_for(c: &mut ck.Checker, s: cst.NodeId) {
         declare(c, ck.ident_of(c, second_name), second, false);
     }
     c.loops += 1;
+    push_label(c, s);
     check_block(c, ck.child(c, s, n - 1));
+    _ = c.labels.pop();
     c.loops -= 1;
     while c.scope.len() > depth {
         _ = c.scope.pop();
     }
+}
+
+// ---- labels (spec/arche.md §3.3) --------------------------------------------------
+
+/// A loop's label, or a break's or continue's: its own Ident token, or NONE.
+pub fn label_token(c: &ck.Checker, s: cst.NodeId) -> u32 {
+    match ck.find_own(c, s, tk.Kind.Ident) {
+        some(t) => { return t; }
+        none => { return ck.NONE; }
+    }
+}
+
+fn push_label(c: &mut ck.Checker, s: cst.NodeId) {
+    let lt = label_token(c, s);
+    if lt == ck.NONE {
+        c.labels.push(c.names.intern(""));
+        return;
+    }
+    let sym = ck.symbol(c, lt);
+    var k: usize = 0;
+    var twice = false;
+    while k < c.labels.len() : (k += 1) {
+        twice = twice or c.labels[k] == sym;
+    }
+    if twice {
+        let ls = ck.token_span(c, lt);
+        ck.report(c, codes.BAD_LABEL, ls, "a loop inside this one has its label already; labels do not repeat");
+    }
+    c.labels.push(sym);
+}
+
+// ---- if and match as expressions (spec/arche.md §3.1) -----------------------------
+
+/// The block ends with a value: an expression without ';', or an if or
+/// match whose branches do.
+fn block_has_value(c: &ck.Checker, b: cst.NodeId) -> bool {
+    let n = ck.child_count(c, b);
+    if ck.kind_of(c, b) != cst.Kind.Block or n == 0 {
+        return false;
+    }
+    let last = ck.child(c, b, n - 1);
+    match ck.kind_of(c, last) {
+        .BlockValue => { return true; }
+        .IfStmt => { return ck.child_count(c, last) == 3 and block_has_value(c, ck.child(c, last, 1)); }
+        .MatchStmt => {
+            let count = ck.child_count(c, last);
+            var i: u32 = 1;
+            while i < count : (i += 1) {
+                let arm = ck.child(c, last, i);
+                if block_has_value(c, ck.child(c, arm, ck.child_count(c, arm) - 1)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+}
+
+/// Two branches' types: one type, or noreturn for a branch that never ends.
+fn unify(c: &mut ck.Checker, a: ty.TypeId, b: ty.TypeId, at: cst.NodeId) -> ty.TypeId {
+    let ka = c.t.kind(a);
+    let kb = c.t.kind(b);
+    if ka == ty.Kind.Noreturn or ka == ty.Kind.Invalid {
+        return b;
+    }
+    if kb == ty.Kind.Noreturn or kb == ty.Kind.Invalid {
+        return a;
+    }
+    if ck.assignable(c, got: b, want: a) {
+        return a;
+    }
+    if ck.assignable(c, got: a, want: b) {
+        return b;
+    }
+    ck.report_mismatch(c, at, want: a, got: b);
+    return ty.invalid();
+}
+
+/// A branch of an if or match expression: its statements, then its value.
+pub fn check_value_block(c: &mut ck.Checker, b: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    if ck.kind_of(c, b) != cst.Kind.Block {
+        return ty.invalid();
+    }
+    let depth = c.scope.len();
+    let n = ck.child_count(c, b);
+    var t = ty.invalid();
+    var has_value = false;
+    var i: u32 = 0;
+    while i < n : (i += 1) {
+        let s = ck.child(c, b, i);
+        let k = ck.kind_of(c, s);
+        if i + 1 == n and k == cst.Kind.BlockValue {
+            t = expr.check(c, ck.child(c, s, 0), expected);
+            has_value = true;
+        } else if i + 1 == n and k == cst.Kind.IfStmt and block_has_value(c, b) {
+            t = check_if_value(c, s, expected);
+            ck.set_type(c, s, t);
+            has_value = true;
+        } else if i + 1 == n and k == cst.Kind.MatchStmt and block_has_value(c, b) {
+            t = check_match_value(c, s, expected);
+            ck.set_type(c, s, t);
+            has_value = true;
+        } else {
+            check_stmt(c, s);
+        }
+    }
+    while c.scope.len() > depth {
+        _ = c.scope.pop();
+    }
+    if not has_value {
+        if block_ends(c, b) {
+            return ty.noreturn_type();
+        }
+        let sp = ck.span_of(c, b);
+        ck.report(c, codes.NO_BRANCH_VALUE, sp, "this branch of an if or match expression ends without a value: end it with an expression and no ';'");
+        return ty.invalid();
+    }
+    return t;
+}
+
+/// if c { a } else { b } as a value: IfExpr, or an IfStmt that ends a
+/// value block.
+pub fn check_if_value(c: &mut ck.Checker, s: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    expr.check_value(c, ck.child(c, s, 0), ty.bool_type());
+    let then_t = check_value_block(c, ck.child(c, s, 1), expected);
+    if ck.child_count(c, s) < 3 {
+        let sp = ck.span_of(c, s);
+        ck.report(c, codes.NO_BRANCH_VALUE, sp, "an if expression has an 'else': without it there is no value when the condition is false");
+        return ty.invalid();
+    }
+    var want = expected;
+    let then_kind = c.t.kind(then_t);
+    if then_kind != ty.Kind.Noreturn and then_kind != ty.Kind.Invalid {
+        want = some(then_t);
+    }
+    let e = ck.child(c, s, 2);
+    var else_t = ty.invalid();
+    if ck.kind_of(c, e) == cst.Kind.Block {
+        else_t = check_value_block(c, e, want);
+    } else {
+        else_t = check_if_value(c, e, want);
+        ck.set_type(c, e, else_t);
+    }
+    return unify(c, a: then_t, b: else_t, e);
+}
+
+pub fn check_match_value(c: &mut ck.Checker, s: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    return check_match_with(c, s, true, expected);
 }
 
 fn check_let(c: &mut ck.Checker, s: cst.NodeId) {
@@ -948,6 +1135,12 @@ fn check_variant_pattern(c: &mut ck.Checker, p: cst.NodeId, t: ty.TypeId, by_ref
 }
 
 fn check_match(c: &mut ck.Checker, s: cst.NodeId) {
+    _ = check_match_with(c, s, false, none);
+}
+
+fn check_match_with(c: &mut ck.Checker, s: cst.NodeId, value: bool, expected: ?ty.TypeId) -> ty.TypeId {
+    var result = ty.noreturn_type();
+    var want = expected;
     let st = expr.check(c, ck.child(c, s, 0), none);
     let info = c.t.get(st);
     var t = st;
@@ -971,7 +1164,17 @@ fn check_match(c: &mut ck.Checker, s: cst.NodeId) {
             patterns.push(p);
             check_pattern(c, p, t, by_ref: by_ref, ref_mut: ref_mut, alternatives: parts > 2);
         }
-        check_block(c, ck.child(c, arm, parts - 1));
+        if value {
+            let body = ck.child(c, arm, parts - 1);
+            let at = check_value_block(c, body, want);
+            result = unify(c, a: result, b: at, body);
+            let rk = c.t.kind(result);
+            if rk != ty.Kind.Noreturn and rk != ty.Kind.Invalid {
+                want = some(result);
+            }
+        } else {
+            check_block(c, ck.child(c, arm, parts - 1));
+        }
         while c.scope.len() > depth {
             _ = c.scope.pop();
         }
@@ -981,6 +1184,7 @@ fn check_match(c: &mut ck.Checker, s: cst.NodeId) {
         let sp = ck.span_of(c, ck.child(c, s, 0));
         ck.report(c, codes.NOT_EXHAUSTIVE, sp, "this match does not cover every value; add the missing cases or '_'");
     }
+    return result;
 }
 
 // ---- exhaustiveness (§9) ----------------------------------------------------------
@@ -1102,21 +1306,32 @@ fn covers(c: &mut ck.Checker, ps: &alloc.List(cst.NodeId), t: ty.TypeId) -> bool
 
 // ---- where paths end (§10) --------------------------------------------------------
 
-fn has_own_break(c: &ck.Checker, n: cst.NodeId) -> bool {
-    match ck.kind_of(c, n) {
-        .BreakStmt => { return true; }
-        .Block | .IfStmt | .MatchStmt | .MatchArm | .UnsafeStmt | .RegionStmt => {
-            let count = ck.child_count(c, n);
-            var i: u32 = 0;
-            while i < count : (i += 1) {
-                if has_own_break(c, ck.child(c, n, i)) {
-                    return true;
-                }
-            }
-            return false;
+/// A break in n leaves the loop labelled `label` (a token, or NONE), which
+/// n is the body of; nested counts the loops in between.
+fn breaks_out(c: &ck.Checker, n: cst.NodeId, label: u32, nested: u32) -> bool {
+    let k = ck.kind_of(c, n);
+    if k == cst.Kind.BreakStmt {
+        let lt = label_token(c, n);
+        if lt == ck.NONE {
+            return nested == 0;
         }
-        _ => { return false; } // a nested while owns its breaks
+        return label != ck.NONE and ck.text(c, lt).eq(ck.text(c, label));
     }
+    if k == cst.Kind.ClosureExpr {
+        return false; // a closure's breaks are its own
+    }
+    var inner = nested;
+    if k == cst.Kind.WhileStmt or k == cst.Kind.ForStmt {
+        inner = nested + 1;
+    }
+    let count = ck.child_count(c, n);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        if breaks_out(c, ck.child(c, n, i), label: label, nested: inner) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn stmt_ends(c: &ck.Checker, s: cst.NodeId) -> bool {
@@ -1132,7 +1347,7 @@ fn stmt_ends(c: &ck.Checker, s: cst.NodeId) -> bool {
             let cond = ck.child(c, s, 0);
             let is_true = ck.kind_of(c, cond) == cst.Kind.BoolLit and
                 ck.tok_kind(c, ck.tree(c).first_token(cond)) == tk.Kind.KwTrue;
-            return is_true and not has_own_break(c, ck.child(c, s, ck.child_count(c, s) - 1));
+            return is_true and not breaks_out(c, ck.child(c, s, ck.child_count(c, s) - 1), label: label_token(c, s), nested: 0);
         }
         .MatchStmt => {
             let count = ck.child_count(c, s);

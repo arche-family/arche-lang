@@ -92,8 +92,9 @@ let width: u32 = match shape {
 };
 ```
 
-- An `if` expression has an `else`; a `match` expression is exhaustive. All branches have one type, or are `noreturn`.
-- A block used as a statement ends without a value, as in Arche-0. A value-ending block appears only as a branch of an `if` or `match` expression.
+- An `if` expression has an `else`, and each branch ends with a value or never ends (E0512); a `match` expression is exhaustive (E0509). All branches have one type, or are `noreturn` (E0401). An `if` or `match` that ends a branch is that branch's value.
+- A block used as a statement ends without a value, as in Arche-0 (E0201). A value-ending block appears only as a branch of an `if` or `match` expression.
+- A view chosen by an `if` or `match` views static memory or one place in every branch (E0607): `if c { "a" } else { "b" }` is fine, `if c { &x } else { &y }` is not.
 
 ### 3.2 `for`
 
@@ -115,7 +116,7 @@ for entry in iterator { … }    // until iterator.next() gives none
 
 ### 3.3 Labeled loops
 
-A loop may have a label, `outer: while … { … }` or `outer: for … { … }`, and `break outer;` or `continue outer;` then applies to it. Labels are not names: they cannot be passed or stored, and an inner label cannot repeat an outer one.
+A loop may have a label, `outer: while … { … }` or `outer: for … { … }`, and `break outer;` or `continue outer;` then applies to it. Labels are not names: they cannot be passed or stored, and an inner label cannot repeat an outer one. A label that no enclosing loop has, or one that repeats, is E0511.
 
 ## 4. Generics
 
@@ -352,6 +353,7 @@ This chapter collects every rule of Arche's memory model in one place. Each has 
 | A function returns a view only with at most one view parameter; the result is a projection of it, or of static memory | E0602 |
 | A view never outlives what it views: it is not returned, stored in an outer binding, captured by a task, or bound to a longer-lived region, when what it views does not live that long | E0603 |
 | While a view of a place is live, the place is not written or viewed `&mut` through another path; while a `&mut` view is live, the place is not used through another path at all. The views given to one call are live during the call | E0604 |
+| A view chosen by an `if` or `match` views one place, or static memory, in every branch (§3.1) | E0607 |
 
 Liveness: a view is live from where it is made to its last use, and through the rest of any loop that uses it. Paths are compared by their fields and elements; elements of one array, list or slice are one path.
 
