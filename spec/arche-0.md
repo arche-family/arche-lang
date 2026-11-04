@@ -65,7 +65,7 @@ The primitive type names (§5.1) are predeclared names, not keywords. Like every
 
 ## 3. Modules
 
-- One file is one module. A package has a root directory, and a module's path is its file path relative to that root, without the extension, with `/` written as `.`: `syntax/lexer.arche` is `syntax.lexer`.
+- One file is one module. A package has a root directory, and a module's path is its file path relative to that root, without the extension, with `/` written as `.`: `syntax/lexer.arche` is `syntax.lexer`. The root module (§10) can be imported by its path like any other.
 - `import syntax.lexer;` binds the last segment, `lexer`, in the file. `import syntax.lexer as lex;` binds `lex`.
 - Imports come first in a file, one per line.
 - There are no glob imports and no selective imports. A name from another module is always written qualified: `lexer.Token`.
@@ -144,7 +144,7 @@ test "span end" {
 
 ### 5.3 Built-in generic types
 
-Arche-0 cannot declare generic types or functions. It can use these, which the library provides (§11):
+Arche-0 cannot declare generic types or functions. It can use these, which the library provides (§11). In expressions they are written with their arguments too: `alloc.List(u32).init(sys.alloc)`.
 
 | Type | Purpose |
 | --- | --- |
@@ -162,6 +162,8 @@ Arche-0 cannot declare generic types or functions. It can use these, which the l
 2. **Where it may not.** A view may not be a struct field, an enum payload, an array element, a `List` element, a `Map` key or value, or the payload of `?` or `!`.
 3. **Projection.** A function may return a view only if exactly one of its parameters is a view, counting `self`. The result is a projection of that argument and lives no longer than it. Slicing, `x[a..b]`, is a projection of `x`.
 4. **Exclusivity.** While a `&mut` view of a place is live, that place cannot be read, written or viewed through any other path. Places are tracked by path, so a view of `sys.args` and a `&mut` view of `sys.stdout` can be live together.
+
+A `&mut T` is accepted where a `&T` is expected, and a `[]mut T` where a `[]T` is: a view can give up the right to write, never gain it.
 
 Because a reference is never stored, there is nothing to annotate. Long-lived links between objects are handles (`NodeId`, `alloc.Symbol`) into lists. String literals are views of static memory and satisfy every rule.
 
@@ -259,7 +261,7 @@ A place is a local binding, a field of a place (`p.f`), an element of a place (`
 ### 7.7 Indexing and slicing
 
 - `x[i]` works on `[N]T`, `[]T`, `str` and `alloc.List(T)`. `i` is a `usize`; an index out of range traps. Indexing a `str` gives a byte, `u8`.
-- `x[a..b]` is a view of elements `a` up to but not including `b`; it traps unless `a <= b <= x.len()`. Slicing a `str` also traps unless both ends fall on UTF-8 character boundaries.
+- `x[a..b]` is a view of elements `a` up to but not including `b`; it traps unless `a <= b <= x.len()`. Slicing a `str` also traps unless both ends fall on UTF-8 character boundaries. Slicing a mutable place, or a `[]mut T`, gives a `[]mut T`; anything else gives a `[]T`.
 - `x.len()` gives the length as `usize`.
 
 ### 7.8 Optionals and errors
@@ -343,6 +345,7 @@ match lookup(name) {
 | `p1 \| p2` | either pattern; alternatives cannot bind names |
 
 - Arms are tried in order. An arm body is always a block; a comma after it is optional.
+- A variant pattern names every field of the variant, unless it ends with `..`.
 - `match` must be exhaustive.
 - **Bindings.** Matching a value binds copies of copyable fields and moves move-only fields out of the scrutinee, which must then be a local or a temporary. Matching `&x` or `&mut x` binds views of the fields instead and moves nothing.
 
