@@ -1,12 +1,12 @@
 // test: run
 // spec: 5.2
-// stdout: 0- 12- 12box 
+// stdout: 0- 12- 12b 
 import std;
 
 type Shape = enum {
     Dot,
     Circle { radius: u32 },
-    Rect { w: u32, h: u32, label: str },
+    Rect { w: u32, h: u32, label: u8 },
 }
 
 fn area(s: Shape) -> u32 {
@@ -17,19 +17,19 @@ fn area(s: Shape) -> u32 {
     }
 }
 
-fn label_of(s: Shape) -> str {
+fn label_of(s: Shape) -> u8 {
     match s {
         .Rect { label, .. } => { return label; }
-        _ => { return "-"; }
+        _ => { return '-'; }
     }
 }
 
 fn main(sys: &mut std.System) -> !void {
-    let shapes: [3]Shape = [Shape.Dot, Shape.Circle { radius: 2 }, Shape.Rect { w: 3, h: 4, label: "box" }];
+    let shapes: [3]Shape = [Shape.Dot, Shape.Circle { radius: 2 }, Shape.Rect { w: 3, h: 4, label: 'b' }];
     var i: usize = 0;
     while i < 3 : (i += 1) {
         sys.stdout.write_u64(area(shapes[i]) as u64);
-        sys.stdout.write(label_of(shapes[i]));
+        sys.stdout.write_byte(label_of(shapes[i]));
         sys.stdout.write(" ");
     }
     sys.stdout.write("\n");

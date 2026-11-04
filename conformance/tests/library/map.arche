@@ -1,6 +1,6 @@
 // test: run
 // spec: 11
-// stdout: 999 1 998001 7 7 20 green? 3
+// stdout: 999 1 998001 7 7 20 g? 3
 import std;
 import alloc;
 
@@ -28,16 +28,16 @@ fn main(sys: &mut std.System) -> !void {
     var keys = alloc.Map(Key, u32).init(sys.alloc);
     keys.put(Key { a: 1, b: true }, 10);
     keys.put(Key { a: 1, b: false }, 20);
-    var colors = alloc.Map(Color, str).init(sys.alloc);
-    colors.put(Color.Green, "green");
+    var colors = alloc.Map(Color, u8).init(sys.alloc);
+    colors.put(Color.Green, 'g');
     var names = alloc.Interner.init(sys.alloc);
     var counts = alloc.Map(alloc.Symbol, u32).init(sys.alloc);
     counts.put(names.intern("x"), 3);
     sys.stdout.write(" ");
     sys.stdout.write_u64((keys.get(Key { a: 1, b: false }) orelse 0) as u64);
     sys.stdout.write(" ");
-    sys.stdout.write(colors.get(Color.Green) orelse "?");
-    sys.stdout.write(colors.get(Color.Red) orelse "?");
+    sys.stdout.write_byte(colors.get(Color.Green) orelse '?');
+    sys.stdout.write_byte(colors.get(Color.Red) orelse '?');
     sys.stdout.write(" ");
     sys.stdout.write_u64((counts.get(names.intern("x")) orelse 0) as u64);
     sys.stdout.write("\n");
