@@ -1,7 +1,7 @@
 // Conformance test runner. The test format is described in conformance/README.md.
 //
-// Usage: runner --compiler <command> [--stage0] [--timeout <seconds>]
-//               [--filter <text>] <path>...
+// Usage: runner --compiler <command> [--stage0] [--codes <prefixes>]
+//               [--timeout <seconds>] [--filter <text>] <path>...
 //
 // Written in C11 + POSIX because it has to work before Arche does. `arche test`
 // replaces it in S23 (docs/sprints.md).
@@ -548,7 +548,29 @@ typedef struct {
     bool stage0;
     int timeout;
     const char *filter;
+    const char *codes; // comma-separated code prefixes, or NULL
 } Options;
+
+// With --codes, only compile-error tests whose code starts with one of the
+// prefixes run: for a compiler that checks programs but cannot build them yet.
+static bool code_selected(const Options *o, const Test *t) {
+    if (!o->codes) {
+        return true;
+    }
+    if (t->kind != KIND_COMPILE_ERROR || !t->code) {
+        return false;
+    }
+    const char *p = o->codes;
+    while (*p) {
+        const char *end = strchr(p, ',');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (n > 0 && strncmp(t->code, p, n) == 0) {
+            return true;
+        }
+        p += n + (end ? 1 : 0);
+    }
+    return false;
+}
 
 typedef enum { PASS, FAIL, SKIP } Result;
 
@@ -655,7 +677,7 @@ static Result run_test(const char *path, const Options *o, const char *tmp) {
         verdict("FAIL", path, "bad header: %s", err);
         goto done;
     }
-    if (o->stage0 && t.stage0_skip) {
+    if ((o->stage0 && t.stage0_skip) || !code_selected(o, &t)) {
         verdict("SKIP", path, NULL);
         result = SKIP;
         goto done;
@@ -744,7 +766,9 @@ static int compare_paths(const void *a, const void *b) {
 }
 
 static int usage(void) {
-    fputs("usage: runner --compiler <command> [--stage0] [--timeout <seconds>] [--filter <text>] <path>...\n", stderr);
+    fputs("usage: runner --compiler <command> [--stage0] [--codes <prefixes>] [--timeout <seconds>] [--filter <text>]"
+          " <path>...\n",
+          stderr);
     return 2;
 }
 
@@ -765,6 +789,8 @@ int main(int argc, char **argv) {
             o.timeout = (int)v;
         } else if (strcmp(a, "--filter") == 0 && has_value) {
             o.filter = argv[++i];
+        } else if (strcmp(a, "--codes") == 0 && has_value) {
+            o.codes = argv[++i];
         } else if (strcmp(a, "--stage0") == 0) {
             o.stage0 = true;
         } else if (a[0] == '-') {

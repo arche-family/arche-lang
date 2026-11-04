@@ -72,4 +72,5 @@ The runner calls the compiler as `<command> <source> <output>`:
 - stdin is `/dev/null`. stdout and stderr are captured separately.
 - Each step has a time limit (`--timeout`, default 10 s). On timeout, or when the step ends, its whole process group is killed.
 - `--stage0` skips tests marked `stage0: skip` and does not check `code`.
+- `--codes E01,E02` runs only the compile-error tests whose `code` starts with one of the prefixes and skips the rest: for a compiler that checks programs but cannot build them yet. Codes are listed in [`docs/error-codes.md`](../docs/error-codes.md).
 - Tests run in path order. The report has one `PASS`, `FAIL` or `SKIP` line per test, details under each failure, and a count line at the end. The runner exits with 1 if any test failed.
