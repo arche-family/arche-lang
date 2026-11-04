@@ -257,6 +257,10 @@ fn parse_item(p: &mut Parser) {
         return;
     }
     let is_pub = accept(p, tk.Kind.KwPub);
+    // unsafe fn (spec/arche.md §10.1)
+    if p.full and at(p, tk.Kind.KwUnsafe) and peek_second(p) == tk.Kind.KwFn {
+        advance(p);
+    }
     match peek(p) {
         .KwFn => {
             parse_fn(p, m);
@@ -626,6 +630,40 @@ fn parse_type(p: &mut Parser) {
             parse_type(p);
             _ = close(p, m, cst.Kind.TypeRef);
         }
+        .Star => {
+            if not p.full {
+                unexpected(p, "a type");
+                _ = close(p, m, cst.Kind.Error);
+                return;
+            }
+            // *T and *mut T (spec/arche.md §10.1)
+            advance(p);
+            _ = accept(p, tk.Kind.KwMut);
+            parse_type(p);
+            _ = close(p, m, cst.Kind.TypePtr);
+        }
+        .KwFn => {
+            if not p.full {
+                unexpected(p, "a type");
+                _ = close(p, m, cst.Kind.Error);
+                return;
+            }
+            // fn(P) -> R: the interface of closures (spec/arche.md §6)
+            advance(p);
+            if expect(p, tk.Kind.LParen, "'('") {
+                while not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Eof) {
+                    parse_type(p);
+                    if not accept(p, tk.Kind.Comma) {
+                        break;
+                    }
+                }
+                _ = expect(p, tk.Kind.RParen, "',' or ')'");
+            }
+            if accept(p, tk.Kind.Arrow) {
+                parse_type(p);
+            }
+            _ = close(p, m, cst.Kind.TypeFn);
+        }
         .LBracket => {
             advance(p);
             if accept(p, tk.Kind.RBracket) {
@@ -792,6 +830,18 @@ fn parse_stmt(p: &mut Parser) {
             }
             parse_block(p);
             _ = close(p, m, cst.Kind.WhileStmt);
+        }
+        .KwUnsafe => {
+            advance(p);
+            parse_block(p);
+            _ = close(p, m, cst.Kind.UnsafeStmt);
+        }
+        .KwRegion => {
+            // region r { ... } (spec/arche.md §7)
+            advance(p);
+            _ = expect(p, tk.Kind.Ident, "the region's name");
+            parse_block(p);
+            _ = close(p, m, cst.Kind.RegionStmt);
         }
         .KwFor => {
             // for x in e { }, for (i, x) in e { }, for i in a..b { } (§3.2)
@@ -1106,12 +1156,59 @@ fn parse_primary(p: &mut Parser) -> bool {
             _ = expect(p, tk.Kind.RBracket, "',' or ']'");
             _ = close(p, m, cst.Kind.ArrayLit);
         }
+        .KwFn => {
+            if not p.full {
+                unexpected(p, "an expression");
+                _ = close(p, m, cst.Kind.Error);
+                return false;
+            }
+            parse_closure(p, m);
+        }
         _ => {
             unexpected(p, "an expression");
             _ = close(p, m, cst.Kind.Error);
         }
     }
     return false;
+}
+
+/// fn [x, &y, &mut z](a: T) -> R { ... } (spec/arche.md §6): Capture
+/// children, then Param children, the result type, and the body.
+fn parse_closure(p: &mut Parser, m: cst.Mark) {
+    advance(p); // fn
+    if expect(p, tk.Kind.LBracket, "'[' and the captures") {
+        while at(p, tk.Kind.Ident) or at(p, tk.Kind.Amp) {
+            let cm = open(p);
+            if accept(p, tk.Kind.Amp) {
+                _ = accept(p, tk.Kind.KwMut);
+            }
+            _ = expect(p, tk.Kind.Ident, "a name");
+            _ = close(p, cm, cst.Kind.Capture);
+            if not accept(p, tk.Kind.Comma) {
+                break;
+            }
+        }
+        _ = expect(p, tk.Kind.RBracket, "',' or ']'");
+    }
+    if expect(p, tk.Kind.LParen, "'('") {
+        while at(p, tk.Kind.Ident) {
+            let pm = open(p);
+            advance(p);
+            if expect(p, tk.Kind.Colon, "':' and the parameter's type") {
+                parse_type(p);
+            }
+            _ = close(p, pm, cst.Kind.Param);
+            if not accept(p, tk.Kind.Comma) {
+                break;
+            }
+        }
+        _ = expect(p, tk.Kind.RParen, "',' or ')'");
+    }
+    if accept(p, tk.Kind.Arrow) {
+        parse_type(p);
+    }
+    parse_block(p);
+    _ = close(p, m, cst.Kind.ClosureExpr);
 }
 
 fn parse_postfix(p: &mut Parser) {
