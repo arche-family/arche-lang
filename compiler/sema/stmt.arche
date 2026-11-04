@@ -101,7 +101,7 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
         outer_labels.push(ol[q]);
     }
     c.labels = alloc.List(alloc.Symbol).init(c.a);
-    if c.p.full and ck.is_unsafe_fn(c, info.decl) {
+    if ck.full(c) and ck.is_unsafe_fn(c, info.decl) {
         c.unsafe_depth = 1;
     }
     while c.scope.len() > 0 {
@@ -116,7 +116,7 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
     check_contracts(c, n, info.ret);
     let body = ck.child(c, n, ck.child_count(c, n) - 1);
     check_block(c, body);
-    if c.p.full and ck.is_nopanic_fn(c, info.decl) {
+    if ck.full(c) and ck.is_nopanic_fn(c, info.decl) {
         no_panic.check(c, body);
     }
     if not is_void_result(c, info.ret) and not block_ends(c, body) {

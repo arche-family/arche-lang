@@ -56,6 +56,8 @@ pub type Op = enum {
     FCmp,
     /// a: the operand; flag: an FConvKind.
     FConv,
+    /// a, b, c: operands as the operation needs; flag: an FMathKind.
+    FMath,
     /// imm: the callee (a function, or an external when flag is 1); args:
     /// a range of the function's args list.
     Call,
@@ -83,6 +85,21 @@ pub type FCmpKind = enum { Eq, Ne, Lt, Le, Gt, Ge }
 
 /// SatToSI and SatToUI saturate, and give 0 for a NaN (spec/arche.md §2.3).
 pub type FConvKind = enum { FromSI, FromUI, ToSI, ToUI, Trunc, Ext, SatToSI, SatToUI }
+
+/// The correctly rounded operations of IEEE 754 beyond + - * /.
+pub type FMathKind = enum { Sqrt, Abs, Floor, Ceil, Trunc, Rem, Fma }
+
+pub fn fmath_flag(k: FMathKind) -> u32 {
+    match k {
+        .Sqrt => { return 0; }
+        .Abs => { return 1; }
+        .Floor => { return 2; }
+        .Ceil => { return 3; }
+        .Trunc => { return 4; }
+        .Rem => { return 5; }
+        .Fma => { return 6; }
+    }
+}
 
 pub fn fbin_flag(k: FBinKind) -> u32 {
     match k {
@@ -401,7 +418,7 @@ pub fn verify(f: &Function) -> Problem {
                         return problem(id, ProblemKind.CmpType);
                     }
                 }
-                .Ext | .Trunc | .OverflowBit | .FNeg | .FConv => {
+                .Ext | .Trunc | .OverflowBit | .FNeg | .FConv | .FMath => {
                     if not operand_ok(f, user: id, v: i.a) {
                         return problem(id, ProblemKind.Undefined);
                     }

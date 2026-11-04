@@ -1,0 +1,27 @@
+// test: run
+// spec: arche/2.4
+// stage0: skip
+// stdout: -1234 beef 18446744073709551615 0 0
+import std;
+import core.fmt;
+
+fn main(sys: &mut std.System) -> !void {
+    var out: [32]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var n = fmt.signed(-1234, out[0..32]);
+    out[n] = ' ';
+    n += 1;
+    n += fmt.hex(48879, out[n..32]);
+    out[n] = ' ';
+    n += 1;
+    n += fmt.decimal(18446744073709551615, out[n..32]);
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        sys.stdout.write_byte(out[i]);
+    }
+    sys.stdout.write(" ");
+    var small: [3]u8 = [0, 0, 0];
+    sys.stdout.write_u64(fmt.decimal(1000, small[0..3]) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(fmt.boolean(true, small[0..3]) as u64);
+    sys.stdout.write("\n");
+}

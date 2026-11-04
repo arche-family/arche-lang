@@ -344,6 +344,46 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
                 out.push_str("\n");
             }
         }
+        .FMath => {
+            line_start(out, id);
+            if i.flag == 5 {
+                out.push_str("frem ");
+                typed(out, m, f, i.a);
+                out.push_str(", ");
+                operand(out, m, f, i.b);
+                out.push_str("\n");
+            } else {
+                out.push_str("call ");
+                out.push_str(t);
+                out.push_str(" @llvm.");
+                if i.flag == 0 {
+                    out.push_str("sqrt");
+                } else if i.flag == 1 {
+                    out.push_str("fabs");
+                } else if i.flag == 2 {
+                    out.push_str("floor");
+                } else if i.flag == 3 {
+                    out.push_str("ceil");
+                } else if i.flag == 4 {
+                    out.push_str("trunc");
+                } else {
+                    out.push_str("fma");
+                }
+                if i.ty == ir.Ty.F32 {
+                    out.push_str(".f32(");
+                } else {
+                    out.push_str(".f64(");
+                }
+                typed(out, m, f, i.a);
+                if i.flag == 6 {
+                    out.push_str(", ");
+                    typed(out, m, f, i.b);
+                    out.push_str(", ");
+                    typed(out, m, f, i.c);
+                }
+                out.push_str(")\n");
+            }
+        }
         .Cmp => {
             line_start(out, id);
             out.push_str("icmp ");
@@ -576,6 +616,27 @@ pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
     }
     out.push_str("\ndeclare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
     out.push_str("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n");
+    // Float operations of IEEE 754 (spec/arche.md §2.2).
+    var fk: u32 = 0;
+    while fk < 6 : (fk += 1) {
+        var name = "sqrt";
+        if fk == 1 { name = "fabs"; }
+        if fk == 2 { name = "floor"; }
+        if fk == 3 { name = "ceil"; }
+        if fk == 4 { name = "trunc"; }
+        if fk == 5 { name = "fma"; }
+        out.push_str("declare float @llvm.");
+        out.push_str(name);
+        if fk == 5 {
+            out.push_str(".f32(float, float, float)\ndeclare double @llvm.");
+            out.push_str(name);
+            out.push_str(".f64(double, double, double)\n");
+        } else {
+            out.push_str(".f32(float)\ndeclare double @llvm.");
+            out.push_str(name);
+            out.push_str(".f64(double)\n");
+        }
+    }
     // Saturating float to integer conversions (spec/arche.md §2.3).
     var sw: u32 = 8;
     while sw <= 64 : (sw *= 2) {

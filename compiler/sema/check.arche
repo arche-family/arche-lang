@@ -283,6 +283,12 @@ pub fn is_unsafe_fn(c: &Checker, d: u32) -> bool {
     }
 }
 
+/// The module being checked is full Arche (spec/arche.md): its package has
+/// a manifest, or it is part of the library.
+pub fn full(c: &Checker) -> bool {
+    return c.p.modules[c.module as usize].full;
+}
+
 /// The kind of node n of module m.
 pub fn kind_of_in(c: &Checker, m: u32, n: cst.NodeId) -> cst.Kind {
     return c.p.modules[m as usize].tree.node(n).kind;
@@ -540,9 +546,11 @@ pub fn enter_decl(c: &mut Checker, d: u32) {
     c.env_start = decl.env_start;
     c.env_len = decl.env_len;
     c.self_type = ty.invalid();
-    if decl.owner != NONE {
+    if decl.impl_index != NONE {
+        c.self_type = c.impls[decl.impl_index as usize].target;
+    } else if decl.owner != NONE {
         let owner = c.decls[decl.owner as usize];
-        if owner.kind == DeclKind.Interface or decl.impl_index != NONE {
+        if owner.kind == DeclKind.Interface {
             c.self_type = owner.type_id;
         }
     } else if decl.kind == DeclKind.Interface {
@@ -1074,7 +1082,7 @@ pub fn resolve_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
 
 /// The type node is `Self`, in an interface or an impl.
 fn is_self_path(c: &Checker, n: cst.NodeId) -> bool {
-    if not c.p.full or is_invalid(c, c.self_type) or kind_of(c, n) != cst.Kind.TypePath or child_count(c, n) > 0 {
+    if not full(c) or is_invalid(c, c.self_type) or kind_of(c, n) != cst.Kind.TypePath or child_count(c, n) > 0 {
         return false;
     }
     let toks = own(c, n);
@@ -1204,7 +1212,7 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
         return ty.invalid();
     }
     let first = segments[0];
-    if segments.len() == 1 and nargs == 0 and c.p.full and not is_invalid(c, c.self_type) and text(c, first).eq("Self") {
+    if segments.len() == 1 and nargs == 0 and full(c) and not is_invalid(c, c.self_type) and text(c, first).eq("Self") {
         return c.self_type;
     }
     if segments.len() == 1 {
@@ -1225,7 +1233,7 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
                 some(t) => { return t; }
                 none => { }
             }
-            if c.p.full {
+            if full(c) {
                 match ty.float_by_name(text(c, first)) {
                     some(t) => { return t; }
                     none => { }
@@ -1723,8 +1731,14 @@ fn collect_import(c: &mut Checker, n: cst.NodeId) {
     let first = text(c, items[1]);
     var alias = Alias { library: library_of(first), module: 0 };
     let s = span_of(c, n);
-    if first.eq("core") or (alias.library != Library.NotLibrary and segments > 1) {
+    if (first.eq("core") and not full(c)) or (alias.library != Library.NotLibrary and segments > 1) {
         report(c, codes.BAD_IMPORT, s, "Arche-0 provides only the modules 'std' and 'alloc'");
+        return;
+    }
+    // core needs no operating system and no allocator (docs/sprints.md S15).
+    let here = c.p.modules[c.module as usize].name.view();
+    if (here.eq("core") or here.starts_with("core.")) and alias.library != Library.NotLibrary {
+        report(c, codes.BAD_IMPORT, s, "core imports neither std nor alloc: it runs without an operating system and without an allocator");
         return;
     }
     if alias.library == Library.NotLibrary {
@@ -2213,8 +2227,14 @@ fn check_signature_here(c: &mut Checker, d: u32) {
         c.tables.push(alloc.Map(u32, ty.TypeId).init(c.a));
         c.ref_tables.push(alloc.Map(u32, u32).init(c.a));
     }
-    if decl.owner != NONE and info.params_len > 0 and c.names.text(c.params[start as usize].name).eq("self") {
-        let owner_type = c.decls[decl.owner as usize].type_id;
+    let is_method = decl.owner != NONE or decl.impl_index != NONE;
+    if is_method and info.params_len > 0 and c.names.text(c.params[start as usize].name).eq("self") {
+        var owner_type = ty.invalid();
+        if decl.impl_index != NONE {
+            owner_type = c.impls[decl.impl_index as usize].target;
+        } else {
+            owner_type = c.decls[decl.owner as usize].type_id;
+        }
         let pt = c.params[start as usize].type_id;
         let pi = c.t.get(pt);
         info.has_self = true;
@@ -2260,17 +2280,23 @@ fn resolve_impls(c: &mut Checker) {
             continue;
         }
         let target_kind = c.t.kind(target);
-        if target_kind != ty.Kind.Struct and target_kind != ty.Kind.Enum {
+        let iface = c.t.get(it).decl;
+        let declared = target_kind == ty.Kind.Struct or target_kind == ty.Kind.Enum;
+        // A type without a declaration, u32 or str, implements an interface
+        // only in the interface's module (spec/arche.md §5.1).
+        if not declared and c.decls[iface as usize].module != im.module {
             var m = new_message(c);
             write_type(c, &mut m, target);
-            m.push_str(" cannot implement an interface here: only the package's own struct and enum types do, for now");
+            m.push_str(" has no declaration of its own: it implements an interface only in the module that declares the interface");
             let s = span_of(c, target_node);
             report_owned(c, codes.BAD_IMPL, s, m);
             continue;
         }
-        let iface = c.t.get(it).decl;
-        let td = c.t.get(target).decl;
-        if c.decls[td as usize].module != im.module and c.decls[iface as usize].module != im.module {
+        var td = NONE;
+        if declared {
+            td = c.t.get(target).decl;
+        }
+        if declared and c.decls[td as usize].module != im.module and c.decls[iface as usize].module != im.module {
             var m = new_message(c);
             m.push_str("impl ");
             write_type(c, &mut m, it);
@@ -2316,8 +2342,10 @@ fn resolve_impls(c: &mut Checker) {
             var md = new_decl(DeclKind.Fn, module: im.module, f, sym, name_token: nt, has_own(c, f, tk.Kind.KwPub));
             md.owner = td;
             md.impl_index = i as u32;
-            md.env_start = c.decls[td as usize].env_start;
-            md.env_len = c.decls[td as usize].env_len;
+            if declared {
+                md.env_start = c.decls[td as usize].env_start;
+                md.env_len = c.decls[td as usize].env_len;
+            }
             c.methods.push(c.decls.len() as u32);
             c.decls.push(md);
         }
@@ -2354,7 +2382,14 @@ fn check_impls(c: &mut Checker) {
             continue;
         }
         let iface = c.decls[im.iface as usize];
-        let owner = c.decls[c.t.get(im.target).decl as usize];
+        let tkind = c.t.kind(im.target);
+        let has_owner = tkind == ty.Kind.Struct or tkind == ty.Kind.Enum;
+        var owner_start: u32 = 0;
+        var owner_len: u32 = 0;
+        if has_owner {
+            owner_start = c.decls[c.t.get(im.target).decl as usize].methods_start;
+            owner_len = c.decls[c.t.get(im.target).decl as usize].methods_len;
+        }
         // The interface's own methods.
         var k = iface.methods_start;
         while k < iface.methods_start + iface.methods_len : (k += 1) {
@@ -2411,7 +2446,7 @@ fn check_impls(c: &mut Checker) {
                 m.push_str("; an impl has only the interface's methods");
                 let s = token_span(c, c.decls[md as usize].name_token);
                 report_impl(c, im.module, s, m);
-            } else if method_named(c, start: owner.methods_start, len: owner.methods_len, name) != NONE {
+            } else if method_named(c, start: owner_start, len: owner_len, name) != NONE {
                 var m = new_message(c);
                 write_type(c, &mut m, im.target);
                 m.push_str(" has a method '");

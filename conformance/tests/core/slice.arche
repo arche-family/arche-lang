@@ -1,0 +1,55 @@
+// test: run
+// spec: arche/5.2
+// stage0: skip
+// stdout: -8,-2,0,3,3,5,9, sorted 3 at 2 9 equal
+import std;
+import core;
+import core.slice;
+
+type Point = struct { x: i32, y: i32 }
+
+impl core.Ord for Point {
+    fn less(self: &Point, other: &Point) -> bool {
+        return self.x < other.x or (self.x == other.x and self.y < other.y);
+    }
+}
+
+impl core.Eq for Point {
+    fn eq(self: &Point, other: &Point) -> bool {
+        return self.x == other.x and self.y == other.y;
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var nums: [7]i32 = [5, -2, 9, 0, 3, 3, -8];
+    slice.sort(i32, nums[0..7]);
+    var i: usize = 0;
+    while i < 7 : (i += 1) {
+        sys.stdout.write_i64(nums[i] as i64);
+        sys.stdout.write(",");
+    }
+    if slice.is_sorted(i32, nums[0..7]) {
+        sys.stdout.write(" sorted");
+    }
+    var pts: [3]Point = [Point { x: 2, y: 1 }, Point { x: 1, y: 7 }, Point { x: 1, y: 3 }];
+    slice.sort(Point, pts[0..3]);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(pts[0].y as i64);
+    let p = Point { x: 2, y: 1 };
+    match slice.index_of(Point, pts[0..3], x: &p) {
+        some(k) => {
+            sys.stdout.write(" at ");
+            sys.stdout.write_u64(k as u64);
+        }
+        none => { sys.stdout.write(" missing"); }
+    }
+    slice.reverse(i32, nums[0..7]);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(nums[0] as i64);
+    let a: [3]u8 = [1, 2, 3];
+    let b: [3]u8 = [1, 2, 3];
+    if slice.eq(u8, a: a[0..3], b: b[0..3]) {
+        sys.stdout.write(" equal");
+    }
+    sys.stdout.write("\n");
+}

@@ -1,0 +1,84 @@
+/// Formatting without an allocator: numbers written into a buffer the
+/// caller owns. Each function returns how many bytes it wrote, or 0 when
+/// the buffer is too short.
+
+fn reverse_into(digits: []u8, n: usize, out: []mut u8) -> usize {
+    if out.len() < n {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        out[i] = digits[n - 1 - i];
+    }
+    return n;
+}
+
+/// n in base 10.
+pub fn decimal(n: u64, out: []mut u8) -> usize {
+    var digits: [20]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var len: usize = 0;
+    var v = n;
+    while true {
+        digits[len] = '0' + (v % 10) as u8;
+        len += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    return reverse_into(digits[0..len], n: len, out: out);
+}
+
+/// n in base 10, with '-' when it is negative.
+pub fn signed(n: i64, out: []mut u8) -> usize {
+    if n >= 0 {
+        return decimal(n as u64, out);
+    }
+    if out.len() < 2 {
+        return 0;
+    }
+    out[0] = '-';
+    let written = decimal((0 -% n) as% u64, out[1..out.len()]);
+    if written == 0 {
+        return 0;
+    }
+    return written + 1;
+}
+
+/// n in base 16, lowercase, without a prefix.
+pub fn hex(n: u64, out: []mut u8) -> usize {
+    var digits: [16]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var len: usize = 0;
+    var v = n;
+    while true {
+        let d = (v & 15) as u8;
+        if d < 10 {
+            digits[len] = '0' + d;
+        } else {
+            digits[len] = 'a' + (d - 10);
+        }
+        len += 1;
+        v = v >> 4;
+        if v == 0 {
+            break;
+        }
+    }
+    return reverse_into(digits[0..len], n: len, out: out);
+}
+
+/// "true" or "false".
+pub fn boolean(b: bool, out: []mut u8) -> usize {
+    var text = "false";
+    if b {
+        text = "true";
+    }
+    let bytes = text.bytes();
+    if out.len() < bytes.len() {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < bytes.len() : (i += 1) {
+        out[i] = bytes[i];
+    }
+    return bytes.len();
+}

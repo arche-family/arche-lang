@@ -423,7 +423,7 @@ pub fn location_args(l: &mut Lower, n: cst.NodeId, args: &mut alloc.List(u32), a
 /// Records n in the error return trace (spec/arche.md §8.3): `start` for
 /// where an error is made, else a `try` that passes it up.
 pub fn trace(l: &mut Lower, n: cst.NodeId, start: bool) {
-    if not l.c.p.full {
+    if not ck.full(&l.c) {
         return;
     }
     var args = args0(l);
@@ -573,6 +573,9 @@ pub fn mangle(c: &ck.Checker, d: u32, a: alloc.Allocator) -> alloc.String {
     }
     if decl.owner != ck.NONE {
         segment(&mut out, c.names.text(c.decls[decl.owner as usize].name));
+    } else if decl.impl_index != ck.NONE {
+        // A method of an impl for a type without a declaration: the interface.
+        segment(&mut out, c.names.text(c.decls[c.impls[decl.impl_index as usize].iface as usize].name));
     }
     segment(&mut out, c.names.text(decl.name));
     // A closure: one per expression, numbered by its function.

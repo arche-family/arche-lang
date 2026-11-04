@@ -132,9 +132,10 @@ fn check(
     a: alloc.Allocator,
     path: str,
     json: bool,
+    lib: str,
 ) -> Failure!void {
     let source = try read(fs, err_out, path, a);
-    var p = program.load(fs, path, source, a);
+    var p = program.load(fs, path: path, source, a, lib: lib);
     if p.diags.count() == 0 {
         p = sema.check(p);
     }
@@ -148,9 +149,9 @@ fn check(
     }
 }
 
-fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, out_path: str) -> Failure!void {
+fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, out_path: str, lib: str) -> Failure!void {
     let source = try read(fs, err_out, path, a);
-    let p = program.load(fs, path, source, a);
+    let p = program.load(fs, path: path, source, a, lib: lib);
     if p.diags.count() > 0 {
         program.write_diagnostics(err_out, &p, false);
         return Failure.ErrorsFound;
@@ -207,20 +208,55 @@ fn print_cst(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: all
     cst.write_source(out, &parsed.tree, text);
 }
 
+/// The library's directory (spec/arche.md §1.1): lib/ beside the
+/// compiler's directory, as the repository lays them out, from where the
+/// binary was started.
+fn find_lib(fs: &std.Fs, argv0: str, a: alloc.Allocator) -> alloc.String {
+    var cut: usize = 0;
+    var i: usize = 0;
+    while i < argv0.len() : (i += 1) {
+        if argv0[i] == '/' {
+            cut = i + 1;
+        }
+    }
+    var up: u32 = 2;
+    while up <= 4 : (up += 1) {
+        var dir = alloc.String.init(a);
+        dir.push_str(argv0[0..cut]);
+        var k: u32 = 0;
+        while k < up : (k += 1) {
+            dir.push_str("../");
+        }
+        dir.push_str("lib/");
+        var probe = alloc.String.init(a);
+        probe.push_str(dir.view());
+        probe.push_str("core.arche");
+        match fs.read_bytes(probe.view(), a) {
+            ok(_) => { return dir; }
+            err(_) => { }
+        }
+    }
+    var fallback = alloc.String.init(a);
+    fallback.push_str(argv0[0..cut]);
+    fallback.push_str("../../lib/");
+    return fallback;
+}
+
 fn main(sys: &mut std.System) -> !void {
     let n = sys.args.len();
     if n < 3 {
         try usage(&mut sys.stderr);
     }
+    let lib = find_lib(&sys.fs, sys.args.get(0), sys.alloc);
     let command = sys.args.get(1);
     if command.eq("check") and n == 4 and sys.args.get(2).eq("--json") {
-        try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3), json: true);
+        try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3), json: true, lib: lib.view());
     } else if command.eq("check") and n == 3 {
-        try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2), json: false);
+        try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2), json: false, lib: lib.view());
     } else if command.eq("tokens") and n == 3 {
         try dump_tokens(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2));
     } else if command.eq("build") and n == 4 {
-        try build(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2), out_path: sys.args.get(3));
+        try build(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2), out_path: sys.args.get(3), lib: lib.view());
     } else if command.eq("cst") and n == 3 {
         try print_cst(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2));
     } else {

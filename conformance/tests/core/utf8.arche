@@ -1,0 +1,29 @@
+// test: run
+// spec: arche-0/5.1
+// stage0: skip
+// stdout: 7 4 128512 checked 0
+import std;
+import core.utf8;
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(utf8.count("héllo €") as u64);
+    sys.stdout.write(" ");
+    var buf: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0];
+    let n = utf8.encode(0x1F600, buf[0..8]);
+    sys.stdout.write_u64(n as u64);
+    sys.stdout.write(" ");
+    match utf8.decode(buf[0..n], at: 0) {
+        some(d) => { sys.stdout.write_u64(d.code as u64); }
+        none => { sys.stdout.write("bad"); }
+    }
+    sys.stdout.write(" ");
+    let surrogate: [3]u8 = [0xED, 0xA0, 0x80];
+    let overlong: [2]u8 = [0xC0, 0x80];
+    let good = "ok €";
+    if not utf8.valid(surrogate[0..3]) and not utf8.valid(overlong[0..2]) and utf8.valid(good.bytes()) {
+        sys.stdout.write("checked");
+    }
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(utf8.encode(0xD800, buf[0..8]) as u64);
+    sys.stdout.write("\n");
+}

@@ -1,0 +1,138 @@
+/// Integer and float arithmetic beyond the operators (spec/arche.md §2.2).
+/// Nothing here allocates or needs an operating system.
+
+/// |x| as u64: defined for every i64, i64's smallest included.
+pub fn abs(x: i64) -> u64 {
+    if x < 0 {
+        return (0 -% x) as% u64;
+    }
+    return x as u64;
+}
+
+/// base^exp, or none when it overflows u64.
+pub fn pow(base: u64, exp: u32) -> ?u64 {
+    var result: u64 = 1;
+    var b = base;
+    var e = exp;
+    while e > 0 {
+        if e % 2 == 1 {
+            if b != 0 and result > 18446744073709551615 / b {
+                return none;
+            }
+            result *= b;
+        }
+        e /= 2;
+        if e > 0 {
+            if b != 0 and b > 18446744073709551615 / b {
+                return none;
+            }
+            b *= b;
+        }
+    }
+    return result;
+}
+
+/// The greatest common divisor; gcd(0, 0) is 0.
+pub fn gcd(a: u64, b: u64) -> u64 {
+    var x = a;
+    var y = b;
+    while y != 0 {
+        let r = x % y;
+        x = y;
+        y = r;
+    }
+    return x;
+}
+
+pub fn is_power_of_two(x: u64) -> bool {
+    return x != 0 and (x & (x - 1)) == 0;
+}
+
+/// x rounded up to a multiple of align, a power of two; none on overflow.
+pub fn align_up(x: u64, align: u64) -> ?u64 {
+    let mask = align - 1;
+    if x > 18446744073709551615 - mask {
+        return none;
+    }
+    return (x + mask) & ~mask;
+}
+
+/// floor(log2(x)) for x > 0; none for 0.
+pub fn log2(x: u64) -> ?u32 {
+    if x == 0 {
+        return none;
+    }
+    var n: u32 = 0;
+    var v = x;
+    while v > 1 : (v = v >> 1) {
+        n += 1;
+    }
+    return n;
+}
+
+/// x limited to lo..=hi.
+pub fn clamp(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo {
+        return lo;
+    }
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+/// |x| for floats: the sign cleared, NaN stays NaN.
+pub fn fabs(x: f64) -> f64 {
+    return x.abs();
+}
+
+/// The smaller float; NaN when either is NaN.
+pub fn fmin(a: f64, b: f64) -> f64 {
+    if a != a or b != b {
+        return a + b;
+    }
+    if b < a {
+        return b;
+    }
+    return a;
+}
+
+/// The larger float; NaN when either is NaN.
+pub fn fmax(a: f64, b: f64) -> f64 {
+    if a != a or b != b {
+        return a + b;
+    }
+    if a < b {
+        return b;
+    }
+    return a;
+}
+
+/// The square root, correctly rounded; NaN below zero.
+pub fn sqrt(x: f64) -> f64 {
+    return x.sqrt();
+}
+
+/// a - b * trunc(a / b), exactly, as IEEE 754's remainder for '%' would be
+/// (spec/arche.md §2.2).
+pub fn rem(a: f64, b: f64) -> f64 {
+    return a.rem(b);
+}
+
+/// a * b + c with one rounding: the only fused operation, written out
+/// (spec/arche.md §2.2).
+pub fn fma(a: f64, b: f64, c: f64) -> f64 {
+    return a.fma(factor: b, addend: c);
+}
+
+pub fn floor(x: f64) -> f64 {
+    return x.floor();
+}
+
+pub fn ceil(x: f64) -> f64 {
+    return x.ceil();
+}
+
+pub fn trunc(x: f64) -> f64 {
+    return x.trunc();
+}

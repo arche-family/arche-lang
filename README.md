@@ -54,7 +54,7 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | [`compiler/`](compiler/) | the Arche compiler, Arche-0, through LLVM | self-hosting: stage2 == stage3 |
 | [`docs/abi.md`](docs/abi.md) | layouts, calling convention, runtime | version 0 |
 | [`docs/error-codes.md`](docs/error-codes.md) | every diagnostic code | living |
-| `lib/` | `core`, `alloc`, `std` | planned |
+| [`lib/`](lib/) | the library: `core` (no OS, no allocator); `alloc` and `std` next | `core`: interfaces, math, UTF-8, fmt, slices |
 
 ## Related
 

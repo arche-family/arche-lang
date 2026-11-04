@@ -21,6 +21,9 @@ pub type Module = struct {
     pub display: alloc.String,
     pub text: alloc.String,
     pub tree: cst.Tree,
+    /// Full Arche (spec/arche.md), not Arche-0: the package has a manifest,
+    /// or the module is part of the library.
+    pub full: bool,
 
     /// The source text of a token.
     pub fn token_text(self: &Module, t: u32) -> str {
@@ -95,13 +98,13 @@ fn is_identifier(s: str) -> bool {
 }
 
 /// Lexes and parses one file into a module, reporting into p.diags.
-fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.String) -> ModuleId {
+fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.String, full: bool) -> ModuleId {
     let id = ModuleId { index: p.modules.len() as u32 };
     p.diags.file = id.index;
     var lexed = diag.Diagnostics.init(p.a);
     lexed.file = id.index;
-    let tokens = lexer.lex(text.view(), p.full, &mut lexed, p.a);
-    let parsed = parser.parse(tokens, text.view(), p.full, lexed, p.a);
+    let tokens = lexer.lex(text.view(), full, &mut lexed, p.a);
+    let parsed = parser.parse(tokens, text.view(), full, lexed, p.a);
     var n = alloc.String.init(p.a);
     n.push_str(name);
     var pa = alloc.String.init(p.a);
@@ -113,7 +116,7 @@ fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.S
     while i < found.len() : (i += 1) {
         p.diags.items.push(copy_diagnostic(&found[i], p.a));
     }
-    p.modules.push(Module { name: n, path: pa, display: di, text: text, tree: parsed.tree });
+    p.modules.push(Module { name: n, path: pa, display: di, text: text, tree: parsed.tree, full: full });
     return id;
 }
 
@@ -163,7 +166,7 @@ fn import_path(m: &Module, node: cst.NodeId, a: alloc.Allocator) -> ImportPath {
     var library = true;
     if toks.len() > 1 and m.tree.token(toks[1]).kind == tk.Kind.Ident {
         let first = m.token_text(toks[1]);
-        library = first.eq("std") or first.eq("alloc") or first.eq("core");
+        library = first.eq("std") or first.eq("alloc");
     }
     return ImportPath { dotted: dotted, file: file, library: library, span: m.node_span(node) };
 }
@@ -187,7 +190,8 @@ fn package_imports(m: &Module, a: alloc.Allocator) -> alloc.List(ImportPath) {
 
 /// Starts from the root file, whose text the caller has read, and loads,
 /// breadth first, every module it imports.
-pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator) -> Program {
+/// lib is the library's directory, ending with '/'.
+pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, lib: str) -> Program {
     var p = Program {
         modules: alloc.List(Module).init(a),
         diags: diag.Diagnostics.init(a),
@@ -225,7 +229,8 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator) -> P
     if is_identifier(stem) {
         root_name = stem;
     }
-    _ = add_module(&mut p, name: root_name, path: path, display: base, text);
+    let root_full = p.full;
+    _ = add_module(&mut p, name: root_name, path: path, display: base, text, root_full);
 
     var next: usize = 0;
     while next < p.modules.len() : (next += 1) {
@@ -240,12 +245,23 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator) -> P
                 some(_) => { continue; }
                 none => { }
             }
+            // core and its modules come from the library (spec/arche.md
+            // §1.1): full Arche, whatever the package is.
+            let from_lib = ip.dotted.view().eq("core") or ip.dotted.view().starts_with("core.");
             var full = alloc.String.init(a);
-            full.push_str(p.root_dir.view());
+            var shown = alloc.String.init(a);
+            if from_lib {
+                full.push_str(lib);
+                shown.push_str("lib/");
+            } else {
+                full.push_str(p.root_dir.view());
+            }
             full.push_str(ip.file.view());
+            shown.push_str(ip.file.view());
+            let module_full = from_lib or p.full;
             match fs.read_file(full.view(), a) {
                 ok(source) => {
-                    _ = add_module(&mut p, name: ip.dotted.view(), path: full.view(), display: ip.file.view(), source);
+                    _ = add_module(&mut p, name: ip.dotted.view(), path: full.view(), display: shown.view(), source, module_full);
                 }
                 err(_) => {
                     p.diags.file = next as u32;

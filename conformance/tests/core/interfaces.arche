@@ -1,0 +1,37 @@
+// test: run
+// spec: arche/5.1
+// stage0: skip
+// stdout: 3 -3 9 18165309246051714780 9929646806074584996 4 str
+import std;
+import core;
+
+type Point = struct { x: i32, y: i32 }
+
+impl core.Ord for Point {
+    fn less(self: &Point, other: &Point) -> bool {
+        return self.x < other.x or (self.x == other.x and self.y < other.y);
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(core.min(u32, a: 7, b: 3) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(core.max(i64, a: -7, b: -3));
+    sys.stdout.write(" ");
+    let p = core.max(Point, a: Point { x: 1, y: 5 }, b: Point { x: 1, y: 9 });
+    sys.stdout.write_i64(p.y as i64);
+    sys.stdout.write(" ");
+    let s: str = "abc";
+    sys.stdout.write_u64(core.hash_of(str, &s));
+    sys.stdout.write(" ");
+    let n: u64 = 1;
+    sys.stdout.write_u64(core.hash_of(u64, &n));
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(core.or_else(u32, none, fallback: 4) as u64);
+    sys.stdout.write(" ");
+    // str keeps its own eq where core implements Eq for it.
+    if s.eq("abc") {
+        sys.stdout.write("str");
+    }
+    sys.stdout.write("\n");
+}

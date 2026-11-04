@@ -322,7 +322,7 @@ fn check_kind(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Typ
             | .BinaryExpr | .CastExpr => { }
             // Full Arche runs calls at compile time (spec/arche.md §4.3).
             .CallExpr => {
-                if not c.p.full {
+                if not ck.full(c) {
                     return not_constant(c, n);
                 }
             }
@@ -807,15 +807,14 @@ pub fn find_error(c: &ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> ?u32 {
 
 pub fn find_method(c: &ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> ?u32 {
     let info = c.t.get(t);
-    if info.kind != ty.Kind.Struct and info.kind != ty.Kind.Enum and info.kind != ty.Kind.Interface {
-        return none;
-    }
-    let d = c.decls[info.decl as usize];
-    var i = d.methods_start;
-    while i < d.methods_start + d.methods_len : (i += 1) {
-        let m = c.methods[i as usize];
-        if c.decls[m as usize].name == name {
-            return m;
+    if info.kind == ty.Kind.Struct or info.kind == ty.Kind.Enum or info.kind == ty.Kind.Interface {
+        let d = c.decls[info.decl as usize];
+        var i = d.methods_start;
+        while i < d.methods_start + d.methods_len : (i += 1) {
+            let m = c.methods[i as usize];
+            if c.decls[m as usize].name == name {
+                return m;
+            }
         }
     }
     // The methods of its impls are its methods too (spec/arche.md §5.1).
@@ -1015,6 +1014,23 @@ pub fn builtin_method(c: &mut ck.Checker, t: ty.TypeId, name: str) -> ?Method {
     let shared = ck.SelfMode.Ref;
     let mutable = ck.SelfMode.MutRef;
     match info.kind {
+        .Float => {
+            // IEEE 754's correctly rounded operations (spec/arche.md §2.2).
+            if name.eq("sqrt") or name.eq("abs") or name.eq("floor") or name.eq("ceil") or name.eq("trunc") {
+                return method0(c, byval, t);
+            }
+            if name.eq("rem") {
+                let p = param(c, "divisor", t);
+                return method1(c, byval, p, t);
+            }
+            if name.eq("fma") {
+                let p0 = param(c, "factor", t);
+                let p1 = param(c, "addend", t);
+                var m = method2(c, byval, p0: p0, p1: p1, t);
+                m.labels = true;
+                return m;
+            }
+        }
         .Ptr => {
             // p.add(n), p.as_ref(), p.as_mut() (spec/arche.md §10.1)
             if name.eq("add") {
@@ -1112,10 +1128,10 @@ fn library_method(c: &mut ck.Checker, b: ty.Builtin, name: str) -> ?Method {
             } else if name.eq("write_i64") {
                 pt = ty.int_type(ty.IntKind.I64);
                 pn = "n";
-            } else if name.eq("write_f64") and c.p.full {
+            } else if name.eq("write_f64") and ck.full(c) {
                 pt = ty.f64_type();
                 pn = "x";
-            } else if name.eq("write_f32") and c.p.full {
+            } else if name.eq("write_f32") and ck.full(c) {
                 pt = ty.f32_type();
                 pn = "x";
             } else {
@@ -1301,7 +1317,7 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
     if c.decls[target as usize].fn_index == ck.NONE {
         ck.check_signature(c, target); // a constant reached it before the pass over signatures
     }
-    if c.p.full and ck.is_unsafe_fn(c, target) {
+    if ck.is_unsafe_fn(c, target) {
         let s = ck.span_of(c, ck.child(c, call, 0));
         ck.require_unsafe(c, s, "calling an unsafe fn");
     }
@@ -1578,6 +1594,28 @@ fn check_method_call(c: &mut ck.Checker, call: cst.NodeId, callee: cst.NodeId) -
     if c.t.kind(rt) == ty.Kind.Dyn {
         return dyn_call(c, call: call, callee: callee, rt, nt);
     }
+    // A built-in type's own methods come before its impls': str.eq is
+    // str's, even where core implements Eq for str.
+    let tk_ = c.t.kind(t);
+    if tk_ != ty.Kind.Struct and tk_ != ty.Kind.Enum {
+        var own_name = alloc.String.init(c.a);
+        own_name.push_str(ck.text(c, nt));
+        match builtin_method(c, t, own_name.view()) {
+            some(m) => {
+                if c.t.kind(t) == ty.Kind.Ptr {
+                    let s = ck.span_of(c, callee);
+                    ck.require_unsafe(c, s, "this raw pointer operation");
+                }
+                if m.self_mode == ck.SelfMode.MutRef {
+                    require_mutable_receiver(c, receiver, rt);
+                }
+                let ps = method_params(c, m);
+                check_args(c, call, &ps, m.labels);
+                return m.ret;
+            }
+            none => { }
+        }
+    }
     if ambiguous_method(c, t, sym) {
         var m = ck.new_message(c);
         m.push_str("two interfaces of ");
@@ -1606,7 +1644,10 @@ fn check_method_call(c: &mut ck.Checker, call: cst.NodeId, callee: cst.NodeId) -
                 return f.ret;
             }
             let s = ck.span_of(c, callee);
-            ck.require_visible(c, s, decl.module, decl.is_pub, "this method");
+            if decl.impl_index == ck.NONE {
+                // An impl's methods are visible wherever its interface is.
+                ck.require_visible(c, s, decl.module, decl.is_pub, "this method");
+            }
             if f.self_mode == ck.SelfMode.MutRef {
                 require_mutable_receiver(c, receiver, rt);
             }

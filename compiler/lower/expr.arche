@@ -1178,6 +1178,30 @@ fn builtin_method(l: &mut lw.Lower, n: cst.NodeId, callee: cst.NodeId) -> lw.Val
     name.push_str(ck.text(&l.c, sx.member_token(&l.c, callee)));
     let nm = name.view();
     let info = l.c.t.get(rt);
+    if info.kind == ty.Kind.Float {
+        let s = layout.scalar(&l.c, rt);
+        var i = ir.inst(ir.Op.FMath, s);
+        i.a = value(l, receiver).v;
+        if nm.eq("sqrt") {
+            i.flag = ir.fmath_flag(ir.FMathKind.Sqrt);
+        } else if nm.eq("abs") {
+            i.flag = ir.fmath_flag(ir.FMathKind.Abs);
+        } else if nm.eq("floor") {
+            i.flag = ir.fmath_flag(ir.FMathKind.Floor);
+        } else if nm.eq("ceil") {
+            i.flag = ir.fmath_flag(ir.FMathKind.Ceil);
+        } else if nm.eq("trunc") {
+            i.flag = ir.fmath_flag(ir.FMathKind.Trunc);
+        } else if nm.eq("rem") {
+            i.flag = ir.fmath_flag(ir.FMathKind.Rem);
+            i.b = value(l, arg_node(l, n, 0)).v;
+        } else {
+            i.flag = ir.fmath_flag(ir.FMathKind.Fma);
+            i.b = value(l, arg_node(l, n, 0)).v;
+            i.c = value(l, arg_node(l, n, 1)).v;
+        }
+        return scalar_val(lw.emit(l, i));
+    }
     if info.kind == ty.Kind.Ptr {
         let p = value(l, receiver).v;
         if nm.eq("add") {

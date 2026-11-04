@@ -1,0 +1,325 @@
+/// core: the library that needs no operating system and no allocator
+/// (spec/arche.md §1.1, docs/sprints.md S15). Its submodules are core.math,
+/// core.utf8, core.fmt and core.slice.
+
+/// Values that can be compared for equality (spec/arche.md §5.1).
+pub type Eq = interface {
+    fn eq(self: &Self, other: &Self) -> bool;
+}
+
+/// A total order: less is irreflexive and transitive, and of two different
+/// values one is less.
+pub type Ord = interface {
+    fn less(self: &Self, other: &Self) -> bool;
+}
+
+/// Values that feed what they are to a Hasher.
+pub type Hash = interface {
+    fn hash(self: &Self, h: &mut Hasher);
+}
+
+/// An iterator: a for loop calls next until it gives none (spec/arche.md
+/// §3.2).
+pub type Iter(comptime T: type) = interface {
+    fn next(self: &mut Self) -> ?T;
+}
+
+/// FNV-1a over 64 bits: the same input gives the same hash on every run and
+/// target, as maps need for their deterministic order (docs/plan.md).
+pub type Hasher = struct {
+    state: u64,
+
+    pub fn init() -> Hasher {
+        return Hasher { state: 0xcbf29ce484222325 };
+    }
+
+    pub fn write_u8(self: &mut Hasher, b: u8) {
+        self.state = (self.state ^ b as u64) *% 0x100000001b3;
+    }
+
+    /// Little-endian, byte by byte.
+    pub fn write_u64(self: &mut Hasher, v: u64) {
+        var i: u64 = 0;
+        while i < 8 : (i += 1) {
+            self.write_u8(((v >> (i * 8)) & 0xFF) as u8);
+        }
+    }
+
+    pub fn write_bytes(self: &mut Hasher, b: []u8) {
+        for x in b {
+            self.write_u8(x.*);
+        }
+    }
+
+    pub fn finish(self: &Hasher) -> u64 {
+        return self.state;
+    }
+}
+
+/// The smaller of a and b; a when they are equal.
+pub fn min(comptime T: type, a: T, b: T) -> T where T: Ord {
+    if b.less(&a) {
+        return b;
+    }
+    return a;
+}
+
+/// The larger of a and b; a when they are equal.
+pub fn max(comptime T: type, a: T, b: T) -> T where T: Ord {
+    if a.less(&b) {
+        return b;
+    }
+    return a;
+}
+
+/// The hash of a value, with a fresh Hasher.
+pub fn hash_of(comptime T: type, x: &T) -> u64 where T: Hash {
+    var h = Hasher.init();
+    x.hash(&mut h);
+    return h.finish();
+}
+
+/// x's value, or fallback when it has none.
+pub fn or_else(comptime T: type, x: ?T, fallback: T) -> T {
+    match x {
+        some(v) => { return v; }
+        none => { return fallback; }
+    }
+}
+
+pub fn is_some(comptime T: type, x: &?T) -> bool {
+    match x.* {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
+impl Eq for u8 {
+    fn eq(self: &u8, other: &u8) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Eq for u16 {
+    fn eq(self: &u16, other: &u16) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Eq for u32 {
+    fn eq(self: &u32, other: &u32) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Eq for u64 {
+    fn eq(self: &u64, other: &u64) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Eq for usize {
+    fn eq(self: &usize, other: &usize) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Eq for i8 {
+    fn eq(self: &i8, other: &i8) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Eq for i16 {
+    fn eq(self: &i16, other: &i16) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Eq for i32 {
+    fn eq(self: &i32, other: &i32) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Eq for i64 {
+    fn eq(self: &i64, other: &i64) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Eq for isize {
+    fn eq(self: &isize, other: &isize) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Eq for bool {
+    fn eq(self: &bool, other: &bool) -> bool {
+        return self.* == other.*;
+    }
+}
+
+impl Ord for u8 {
+    fn less(self: &u8, other: &u8) -> bool {
+        return self.* < other.*;
+    }
+}
+
+impl Hash for u8 {
+    fn hash(self: &u8, h: &mut Hasher) {
+        h.write_u64(self.* as% u64);
+    }
+}
+
+impl Ord for u16 {
+    fn less(self: &u16, other: &u16) -> bool {
+        return self.* < other.*;
+    }
+}
+
+impl Hash for u16 {
+    fn hash(self: &u16, h: &mut Hasher) {
+        h.write_u64(self.* as% u64);
+    }
+}
+
+impl Ord for u32 {
+    fn less(self: &u32, other: &u32) -> bool {
+        return self.* < other.*;
+    }
+}
+
+impl Hash for u32 {
+    fn hash(self: &u32, h: &mut Hasher) {
+        h.write_u64(self.* as% u64);
+    }
+}
+
+impl Ord for u64 {
+    fn less(self: &u64, other: &u64) -> bool {
+        return self.* < other.*;
+    }
+}
+
+impl Hash for u64 {
+    fn hash(self: &u64, h: &mut Hasher) {
+        h.write_u64(self.* as% u64);
+    }
+}
+
+impl Ord for usize {
+    fn less(self: &usize, other: &usize) -> bool {
+        return self.* < other.*;
+    }
+}
+
+impl Hash for usize {
+    fn hash(self: &usize, h: &mut Hasher) {
+        h.write_u64(self.* as% u64);
+    }
+}
+
+impl Ord for i8 {
+    fn less(self: &i8, other: &i8) -> bool {
+        return self.* < other.*;
+    }
+}
+
+impl Hash for i8 {
+    fn hash(self: &i8, h: &mut Hasher) {
+        h.write_u64(self.* as% u64);
+    }
+}
+
+impl Ord for i16 {
+    fn less(self: &i16, other: &i16) -> bool {
+        return self.* < other.*;
+    }
+}
+
+impl Hash for i16 {
+    fn hash(self: &i16, h: &mut Hasher) {
+        h.write_u64(self.* as% u64);
+    }
+}
+
+impl Ord for i32 {
+    fn less(self: &i32, other: &i32) -> bool {
+        return self.* < other.*;
+    }
+}
+
+impl Hash for i32 {
+    fn hash(self: &i32, h: &mut Hasher) {
+        h.write_u64(self.* as% u64);
+    }
+}
+
+impl Ord for i64 {
+    fn less(self: &i64, other: &i64) -> bool {
+        return self.* < other.*;
+    }
+}
+
+impl Hash for i64 {
+    fn hash(self: &i64, h: &mut Hasher) {
+        h.write_u64(self.* as% u64);
+    }
+}
+
+impl Ord for isize {
+    fn less(self: &isize, other: &isize) -> bool {
+        return self.* < other.*;
+    }
+}
+
+impl Hash for isize {
+    fn hash(self: &isize, h: &mut Hasher) {
+        h.write_u64(self.* as% u64);
+    }
+}
+
+impl Ord for bool {
+    fn less(self: &bool, other: &bool) -> bool {
+        return not self.* and other.*;
+    }
+}
+
+impl Hash for bool {
+    fn hash(self: &bool, h: &mut Hasher) {
+        if self.* {
+            h.write_u8(1);
+        } else {
+            h.write_u8(0);
+        }
+    }
+}
+
+impl Eq for str {
+    fn eq(self: &str, other: &str) -> bool {
+        return self.eq(other.*);
+    }
+}
+
+impl Ord for str {
+    /// Byte order, which for UTF-8 is code point order.
+    fn less(self: &str, other: &str) -> bool {
+        let a = self.bytes();
+        let b = other.bytes();
+        var i: usize = 0;
+        while i < a.len() and i < b.len() : (i += 1) {
+            if a[i] != b[i] {
+                return a[i] < b[i];
+            }
+        }
+        return a.len() < b.len();
+    }
+}
+
+impl Hash for str {
+    fn hash(self: &str, h: &mut Hasher) {
+        h.write_bytes(self.bytes());
+        h.write_u8(0xFF); // ends it, so "ab" + "c" and "a" + "bc" differ in a pair
+    }
+}

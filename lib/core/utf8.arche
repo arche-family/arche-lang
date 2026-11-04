@@ -1,0 +1,118 @@
+/// UTF-8 (spec/arche-0.md §5.1): decoding, encoding and checking bytes.
+
+/// A code point, and how many bytes it took.
+pub type Decoded = struct {
+    pub code: u32,
+    pub len: usize,
+}
+
+fn cont(b: []u8, i: usize) -> ?u32 {
+    if i >= b.len() or (b[i] & 0xC0) != 0x80 {
+        return none;
+    }
+    return (b[i] & 0x3F) as u32;
+}
+
+/// The code point that starts at b[at], or none when the bytes there are
+/// not well-formed UTF-8: no overlong forms, no surrogates, nothing above
+/// U+10FFFF.
+pub fn decode(b: []u8, at: usize) -> ?Decoded {
+    if at >= b.len() {
+        return none;
+    }
+    let c0 = b[at];
+    if c0 < 0x80 {
+        return Decoded { code: c0 as u32, len: 1 };
+    }
+    if c0 < 0xC2 or c0 >= 0xF5 {
+        return none;
+    }
+    var need: usize = 1;
+    var cp = (c0 & 0x1F) as u32;
+    if c0 >= 0xF0 {
+        need = 3;
+        cp = (c0 & 0x07) as u32;
+    } else if c0 >= 0xE0 {
+        need = 2;
+        cp = (c0 & 0x0F) as u32;
+    }
+    var k: usize = 1;
+    while k <= need : (k += 1) {
+        match cont(b, at + k) {
+            some(v) => { cp = (cp << 6) | v; }
+            none => { return none; }
+        }
+    }
+    if need == 2 and (cp < 0x800 or (cp >= 0xD800 and cp <= 0xDFFF)) {
+        return none;
+    }
+    if need == 3 and (cp < 0x10000 or cp > 0x10FFFF) {
+        return none;
+    }
+    return Decoded { code: cp, len: need + 1 };
+}
+
+/// Whether all of b is well-formed UTF-8.
+pub fn valid(b: []u8) -> bool {
+    var i: usize = 0;
+    while i < b.len() {
+        match decode(b, at: i) {
+            some(d) => { i += d.len; }
+            none => { return false; }
+        }
+    }
+    return true;
+}
+
+/// The number of code points in s.
+pub fn count(s: str) -> usize {
+    let b = s.bytes();
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        if (b[i] & 0xC0) != 0x80 {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// Writes code point cp to out and returns how many bytes it took; 0 when
+/// cp is not a scalar value or out is too short.
+pub fn encode(cp: u32, out: []mut u8) -> usize {
+    if cp < 0x80 {
+        if out.len() < 1 {
+            return 0;
+        }
+        out[0] = cp as u8;
+        return 1;
+    }
+    if cp < 0x800 {
+        if out.len() < 2 {
+            return 0;
+        }
+        out[0] = (0xC0 | (cp >> 6)) as u8;
+        out[1] = (0x80 | (cp & 0x3F)) as u8;
+        return 2;
+    }
+    if (cp >= 0xD800 and cp <= 0xDFFF) or cp > 0x10FFFF {
+        return 0;
+    }
+    if cp < 0x10000 {
+        if out.len() < 3 {
+            return 0;
+        }
+        out[0] = (0xE0 | (cp >> 12)) as u8;
+        out[1] = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+        out[2] = (0x80 | (cp & 0x3F)) as u8;
+        return 3;
+    }
+    if out.len() < 4 {
+        return 0;
+    }
+    out[0] = (0xF0 | (cp >> 18)) as u8;
+    out[1] = (0x80 | ((cp >> 12) & 0x3F)) as u8;
+    out[2] = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+    out[3] = (0x80 | (cp & 0x3F)) as u8;
+    return 4;
+}

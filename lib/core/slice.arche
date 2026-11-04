@@ -1,0 +1,97 @@
+import core;
+
+/// Slices of any element type: comparison, search and order.
+
+pub fn eq(comptime T: type, a: []T, b: []T) -> bool where T: core.Eq {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len() : (i += 1) {
+        if not a[i].eq(&b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The first index of x in items, or none.
+pub fn index_of(comptime T: type, items: []T, x: &T) -> ?usize where T: core.Eq {
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        if items[i].eq(x) {
+            return i;
+        }
+    }
+    return none;
+}
+
+pub fn contains(comptime T: type, items: []T, x: &T) -> bool where T: core.Eq {
+    match index_of(T, items, x: x) {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
+pub fn reverse(comptime T: type, items: []mut T) {
+    var i: usize = 0;
+    var j = items.len();
+    while i + 1 < j {
+        j -= 1;
+        let t = items[i];
+        items[i] = items[j];
+        items[j] = t;
+        i += 1;
+    }
+}
+
+/// Sorts items in place, in O(n log n) and without allocating: heapsort.
+/// Equal items may change order.
+pub fn sort(comptime T: type, items: []mut T) where T: core.Ord {
+    let n = items.len();
+    if n < 2 {
+        return;
+    }
+    var start = n / 2;
+    while start > 0 {
+        start -= 1;
+        sift_down(T, items, root: start, end: n);
+    }
+    var end = n;
+    while end > 1 {
+        end -= 1;
+        let t = items[0];
+        items[0] = items[end];
+        items[end] = t;
+        sift_down(T, items, root: 0, end: end);
+    }
+}
+
+fn sift_down(comptime T: type, items: []mut T, root: usize, end: usize) where T: core.Ord {
+    var r = root;
+    while 2 * r + 1 < end {
+        var child = 2 * r + 1;
+        if child + 1 < end and items[child].less(&items[child + 1]) {
+            child += 1;
+        }
+        if items[r].less(&items[child]) {
+            let t = items[r];
+            items[r] = items[child];
+            items[child] = t;
+            r = child;
+        } else {
+            return;
+        }
+    }
+}
+
+/// Whether items is in order.
+pub fn is_sorted(comptime T: type, items: []T) -> bool where T: core.Ord {
+    var i: usize = 1;
+    while i < items.len() : (i += 1) {
+        if items[i].less(&items[i - 1]) {
+            return false;
+        }
+    }
+    return true;
+}
