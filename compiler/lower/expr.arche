@@ -153,7 +153,10 @@ pub fn value(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
 
 /// A &T as a &dyn I: the address, and the table of T's impl of I.
 fn to_dyn(l: &mut lw.Lower, e: cst.NodeId, want: ty.TypeId, v: lw.Val) -> lw.Val {
-    let target = l.c.t.elem(type_of(l, e));
+    var target = l.c.t.elem(type_of(l, e));
+    if l.c.t.kind(type_of(l, e)) == ty.Kind.Closure {
+        target = type_of(l, e); // a closure written in place: v is its address
+    }
     var vt: u32 = 0;
     if l.c.t.kind(target) == ty.Kind.Closure {
         vt = lw.closure_vtable(l, l.c.t.get(target).decl);
@@ -1352,6 +1355,18 @@ fn intrinsic(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
     }
     if nm.eq("str_data") or nm.eq("slice_data") {
         return scalar_val(lw.load(l, ir.Ty.Ptr, a0.v));
+    }
+    // A &dyn fn is {captures, table}; a closure's table is {code, size + 1}.
+    if nm.eq("closure_env") {
+        return scalar_val(lw.load(l, ir.Ty.Ptr, a0.v));
+    }
+    if nm.eq("closure_code") or nm.eq("closure_size") {
+        let table = lw.load(l, ir.Ty.Ptr, lw.gep(l, a0.v, 8));
+        if nm.eq("closure_code") {
+            return scalar_val(lw.load(l, ir.Ty.Ptr, table));
+        }
+        let stored = lw.load(l, ir.Ty.I64, lw.gep(l, table, 8));
+        return scalar_val(lw.bin(l, ir.BinKind.Sub, x: stored, y: lw.konst(l, ir.Ty.I64, 1)));
     }
     if nm.eq("bytes_of") {
         let tmp = lw.alloca(l, rt);

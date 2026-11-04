@@ -1,0 +1,15 @@
+// test: compile-error
+// spec: arche/9
+// stage0: skip
+// line: 13
+// code: E0902
+import std;
+import std.task;
+
+fn main(sys: &mut std.System) -> !void {
+    var count: u32 = 0;
+    try task.scope(&sys.proc, fn [&mut count](s: &mut task.Scope) -> !void {
+        s.spawn(fn [&mut count]() -> !void { count += 1; });
+        count += 1;
+    });
+}

@@ -1,0 +1,16 @@
+// test: compile-error
+// spec: arche/9
+// stage0: skip
+// line: 12
+// code: E0603
+import std;
+import std.task;
+
+fn main(sys: &mut std.System) -> !void {
+    try task.scope(&sys.proc, fn [](s: &mut task.Scope) -> !void {
+        let local: u32 = 5;
+        s.spawn(fn [&local]() -> !void {
+            _ = local;
+        });
+    });
+}

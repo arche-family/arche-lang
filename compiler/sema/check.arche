@@ -283,6 +283,16 @@ pub fn require_unsafe(c: &mut Checker, s: diag.Span, what: str) {
     report_owned(c, codes.NEEDS_UNSAFE, s, m);
 }
 
+/// d is std.task.Scope.spawn: its closure becomes a task (spec/arche.md §9).
+pub fn is_task_spawn(c: &Checker, d: u32) -> bool {
+    let decl = c.decls[d as usize];
+    if decl.kind != DeclKind.Fn or decl.owner == NONE or not c.names.text(decl.name).eq("spawn") {
+        return false;
+    }
+    let owner = c.decls[decl.owner as usize];
+    return c.names.text(owner.name).eq("Scope") and c.p.modules[owner.module as usize].name.view().eq("std.task");
+}
+
 /// Declaration d is a nopanic fn (spec/arche.md §8.2).
 pub fn is_nopanic_fn(c: &Checker, d: u32) -> bool {
     let decl = c.decls[d as usize];

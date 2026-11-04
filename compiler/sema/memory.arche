@@ -229,6 +229,11 @@ type View = struct {
 
 type Access = enum { Read, Write, ViewShared, ViewMut, Move }
 
+type Lent = struct {
+    name: alloc.Symbol,
+    mutable: bool,
+}
+
 /// The analysis of one function.
 type Fn = struct {
     bindings: alloc.List(Binding),
@@ -248,6 +253,9 @@ type Fn = struct {
     break_moved: alloc.List(alloc.String),
     reported: alloc.Map(u64, bool),
     returns_view: bool,
+    /// What tasks of this function's scope captured: a name, and whether by
+    /// &mut, which no one else may then use (spec/arche.md §9).
+    lent: alloc.List(Lent),
     deferred: alloc.List(cst.NodeId),
     /// A closure's view of a capture and the binding that holds the
     /// closure, as view << 32 | holder: the view lives as long as it.
@@ -268,6 +276,7 @@ fn new_fn(a: alloc.Allocator) -> Fn {
         break_moved: alloc.List(alloc.String).init(a),
         reported: alloc.Map(u64, bool).init(a),
         returns_view: false,
+        lent: alloc.List(Lent).init(a),
         deferred: alloc.List(cst.NodeId).init(a),
         ties: alloc.List(u64).init(a),
     };
@@ -574,6 +583,75 @@ fn branch_view(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> View {
     return chosen;
 }
 
+// ---- tasks (spec/arche.md §9) -------------------------------------------------------
+
+/// A task's captures: a view only of what outlives the scope, a &mut view
+/// by one task alone, and nothing a task holds &mut used by anyone else.
+fn task_captures(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) {
+    if ck.kind_of(c, n) != cst.Kind.ClosureExpr {
+        return;
+    }
+    let count = ck.child_count(c, n);
+    var i: u32 = 0;
+    while i < count and ck.kind_of(c, ck.child(c, n, i)) == cst.Kind.Capture : (i += 1) {
+        let cn = ck.child(c, n, i);
+        let toks = ck.own(c, cn);
+        let nt = toks[toks.len() - 1];
+        let sym = ck.symbol(c, nt);
+        let by_ref = ck.has_own(c, cn, tk.Kind.Amp);
+        let mutable = by_ref and ck.has_own(c, cn, tk.Kind.KwMut);
+        let b = f.uses.get(cn.index) orelse ck.NONE;
+        var views = by_ref;
+        if b != ck.NONE and is_view(c, f.bindings[b as usize].type_id) {
+            views = true;
+        }
+        if views and b != ck.NONE {
+            var m = ck.new_message(c);
+            m.push_str("a task may run after ");
+            binding_name(c, f, b, &mut m);
+            m.push_str(" is gone: a task views only what is declared outside its scope, or captures by value");
+            report_once(c, f, codes.VIEW_ESCAPES, cn, m);
+        }
+        var k: usize = 0;
+        while k < f.lent.len() : (k += 1) {
+            let l = f.lent[k];
+            if l.name == sym and (l.mutable or mutable) {
+                var m = ck.new_message(c);
+                m.push_str("another task of this scope holds '");
+                m.push_str(c.names.text(sym));
+                m.push_str("'");
+                if l.mutable {
+                    m.push_str(" by &mut");
+                }
+                m.push_str("; a &mut view goes to one task, and no one else uses it while the tasks run");
+                report_once(c, f, codes.TASK_SHARE, cn, m);
+            }
+        }
+        if by_ref {
+            f.lent.push(Lent { name: sym, mutable: mutable });
+        }
+    }
+}
+
+/// A name a task holds by &mut, used by the scope's own code (E0902).
+fn check_lent(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId) {
+    if f.lent.len() == 0 or f.dead {
+        return;
+    }
+    let sym = ck.symbol(c, ck.ident_of(c, e));
+    var k: usize = 0;
+    while k < f.lent.len() : (k += 1) {
+        if f.lent[k].name == sym and f.lent[k].mutable {
+            var m = ck.new_message(c);
+            m.push_str("a task of this scope holds '");
+            m.push_str(c.names.text(sym));
+            m.push_str("' by &mut; it is not used here until the scope's tasks end");
+            report_once(c, f, codes.TASK_SHARE, e, m);
+            return;
+        }
+    }
+}
+
 /// The captures of a closure, where it is made: copies, moves and views.
 /// Returns the views, which live as long as the closure.
 fn closure_captures(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> alloc.List(View) {
@@ -582,6 +660,9 @@ fn closure_captures(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> alloc.List
     var i: u32 = 0;
     while i < count and ck.kind_of(c, ck.child(c, n, i)) == cst.Kind.Capture : (i += 1) {
         let cn = ck.child(c, n, i);
+        if f.lent.len() > 0 {
+            check_lent(c, f, cn);
+        }
         let b = f.uses.get(cn.index) orelse ck.NONE;
         if b == ck.NONE {
             continue;
@@ -742,7 +823,7 @@ fn first_node(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) {
             }
             return;
         }
-        .TypePath | .TypeRef | .TypeSlice | .TypeArray | .TypeOptional | .TypeErrorUnion => {
+        .TypePath | .TypeRef | .TypeSlice | .TypeArray | .TypeOptional | .TypeErrorUnion | .TypePtr => {
             return;
         }
         _ => { }
@@ -886,6 +967,7 @@ fn access(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId, path: str, kind: Access
 fn place(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId, out: &mut alloc.String) -> bool {
     match ck.kind_of(c, e) {
         .NameExpr => {
+            check_lent(c, f, e);
             match f.uses.get(e.index) {
                 some(b) => {
                     number_text(out, b);
@@ -989,6 +1071,7 @@ fn view_of(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId) -> View {
         }
         .ParenExpr => { return view_of(c, f, ck.child(c, e, 0)); }
         .NameExpr => {
+            check_lent(c, f, e);
             match f.uses.get(e.index) {
                 some(b) => {
                     var own_path = alloc.String.init(c.a);
@@ -1167,6 +1250,9 @@ fn call(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> View {
         argument(c, f, &mut cv, e, pt);
     }
     check_call_views(c, f, &cv);
+    if d != ck.NONE and ck.is_task_spawn(c, d) and nargs > 0 {
+        task_captures(c, f, ck.child(c, ck.child(c, n, 1), 0));
+    }
     check_region_args(c, f, n);
     let rt = ck.type_of(c, n);
     if c.t.kind(rt) == ty.Kind.Noreturn {

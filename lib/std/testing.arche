@@ -5,11 +5,21 @@ import core;
 import core.fmt;
 import core.mem;
 import core.rand;
+import std;
 
 /// The runner makes one for each test; its layout is the runtime's.
 pub type Test = struct {
     base_seed: u64,
+    sys: *mut std.System,
     unique: core.Unique,
+
+    /// The capabilities of the test binary, as main would have them.
+    pub fn system(self: &mut Test) -> &mut std.System {
+        unsafe {
+            // SAFETY: the runner's System, alive for the whole test.
+            return self.sys.as_mut();
+        }
+    }
 
     /// This test's seed: the same for the same run seed.
     pub fn seed(self: &Test) -> u64 {

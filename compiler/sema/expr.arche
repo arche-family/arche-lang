@@ -46,6 +46,11 @@ fn is_value_item(c: &ck.Checker, d: u32) -> bool {
 
 pub fn path(c: &mut ck.Checker, n: cst.NodeId) -> Path {
     let k = ck.kind_of(c, n);
+    if k == cst.Kind.TypeOptional or k == cst.Kind.TypePtr or k == cst.Kind.TypeSlice {
+        // A type argument written as a type: List(?T) (the parser's Arg).
+        let t = ck.resolve_type(c, n);
+        return Path { kind: PathKind.Type, type_id: t, alias: not_path().alias };
+    }
     if k == cst.Kind.NameExpr {
         let t = ck.ident_of(c, n);
         let sym = ck.symbol(c, t);
@@ -267,6 +272,21 @@ pub fn check_value(c: &mut ck.Checker, n: cst.NodeId, want: ty.TypeId) {
     let got = check(c, n, some(want));
     if c.t.kind(want) == ty.Kind.Dyn and c.t.kind(got) == ty.Kind.Ref {
         to_dyn(c, n, got: got, want: want);
+        return;
+    }
+    // A closure written where a &dyn fn(P) -> R is expected is a view of
+    // it, for as long as the call it is an argument of (spec/arche.md §6).
+    if c.t.kind(want) == ty.Kind.Dyn and c.t.kind(got) == ty.Kind.Closure and ck.kind_of(c, n) == cst.Kind.ClosureExpr {
+        let wi = c.t.get(want);
+        if not ck.implements(c, got, wi.decl) {
+            var m = ck.new_message(c);
+            m.push_str("this closure is not a ");
+            ck.write_decl_name(c, &mut m, wi.decl);
+            let s = ck.span_of(c, n);
+            ck.report_owned(c, codes.NOT_IMPLEMENTED, s, m);
+            return;
+        }
+        c.dyn_casts.put(ck.dyn_key(c, n), want);
         return;
     }
     if not ck.assignable(c, got: got, want: want) {
@@ -1476,6 +1496,14 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
     ck.set_ref(c, call, target);
     if is_atomic {
         check_atomic(c, call, target);
+    }
+    if ck.is_task_spawn(c, target) and ck.child_count(c, call) > 1 {
+        // The task copies the closure, so nothing else may still hold it.
+        let arg = ck.child(c, ck.child(c, call, 1), 0);
+        if ck.kind_of(c, arg) != cst.Kind.ClosureExpr {
+            let s = ck.span_of(c, arg);
+            ck.report(c, codes.SPAWN_CLOSURE, s, "spawn takes the task's closure written here, fn [...]() -> !void { ... }");
+        }
     }
     return f.ret;
 }

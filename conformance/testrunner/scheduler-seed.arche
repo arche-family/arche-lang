@@ -1,0 +1,67 @@
+// test: run
+// spec: arche/9
+// stage0: skip
+// args: --seed 3
+// stdout: seed: 3
+// stdout: test the same seed gives the same order ... ok
+// stdout: 1 passed, 0 failed, 0 filtered out
+import std;
+import std.task;
+import std.testing;
+import alloc;
+
+/// The order four tasks take turns in, as digits: each records itself, then
+/// yields, three times.
+fn order(sys: &mut std.System) -> u64 {
+    let log = task.Shared(u64).init(0, sys.alloc);
+    let r = task.scope(&sys.proc, fn [&log](s: &mut task.Scope) -> !void {
+        for id: u64 in 1..=4 {
+            s.spawn(fn [id, &log]() -> !void {
+                for round: u32 in 0..3 {
+                    log.lock(fn [id](v: &mut u64) { v.* = v.* *% 10 + id; });
+                    task.yield_now();
+                }
+            });
+        }
+    });
+    var v: u64 = 0;
+    log.lock(fn [&mut v](x: &mut u64) { v = x.*; });
+    _ = r;
+    return v;
+}
+
+test "the same seed gives the same order" (t: &mut testing.Test) {
+    let seed = t.seed();
+    let sys = t.system();
+    task.reseed(seed);
+    let a = order(sys);
+    task.reseed(seed);
+    let b = order(sys);
+    assert(a == b);
+    var differs = false;
+    var k: u64 = 1;
+    while k <= 20 and not differs : (k += 1) {
+        task.reseed(seed ^ (k * 1000003));
+        differs = order(sys) != a;
+    }
+    assert(differs);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var differs = false;
+    task.reseed(7);
+    let a = order(sys);
+    task.reseed(7);
+    let b = order(sys);
+    var k: u64 = 1;
+    while k <= 20 and not differs : (k += 1) {
+        task.reseed(k * 1000003);
+        differs = order(sys) != a;
+    }
+    if a == b {
+        sys.stdout.write("same seed, same order\n");
+    }
+    if differs {
+        sys.stdout.write("another seed, another order\n");
+    }
+}

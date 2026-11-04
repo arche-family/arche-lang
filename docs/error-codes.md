@@ -167,6 +167,7 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | --- | --- |
 | `E0901` | A value bound to a region that leaves the region's block (§7). |
 | `E0902` | A `&mut` view captured by a task while another task or its scope uses the place (§9). |
+| `E0903` | A `spawn` whose argument is not a closure written there (§9). |
 | `E0910` | An operation that can panic or trap in a `nopanic` function, or a call of a function that is not `nopanic` (§8.2). |
 | `E0920` | An `unsafe` block without a `// SAFETY:` comment, in a package that sets `strict_unsafe` (§10.1). |
 | `E0921` | An operation that needs `unsafe` outside an `unsafe` block or `unsafe fn`: a raw pointer made, read, written, offset or turned into a view, or an `unsafe fn` called (§10.1). |

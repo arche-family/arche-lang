@@ -1,0 +1,27 @@
+// test: run
+// spec: arche/9
+// stage0: skip
+// stdout: 10
+import std;
+import std.task;
+
+fn main(sys: &mut std.System) -> !void {
+    let total = task.Shared(u32).init(0, sys.alloc);
+    try task.scope(&sys.proc, fn [&total, &sys](s: &mut task.Scope) -> !void {
+        for i: u32 in 1..=3 {
+            s.spawn(fn [i, &total, &sys]() -> !void {
+                try task.scope(&sys.proc, fn [i, &total](inner: &mut task.Scope) -> !void {
+                    for k: u32 in 0..i {
+                        inner.spawn(fn [k, &total]() -> !void {
+                            total.lock(fn [k](n: &mut u32) { n.* += k + 1; });
+                        });
+                    }
+                });
+            });
+        }
+    });
+    var n: u32 = 0;
+    total.lock(fn [&mut n](v: &mut u32) { n = v.*; });
+    sys.stdout.write_u64(n as u64);
+    sys.stdout.write("\n");
+}

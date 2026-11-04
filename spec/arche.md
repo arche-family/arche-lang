@@ -220,7 +220,7 @@ Inside, a value of type `T` has exactly the methods of its constraints. A call c
 
 `&dyn I` and `&mut dyn I` are views of a value of any type that implements `I`: a pointer to the value and one to the table of `I`'s methods for its type. Calls through them are dynamic.
 
-- `&x` converts to `&dyn I` where a `&dyn I` is expected, when `x`'s type implements `I`; no other conversion is implicit.
+- `&x` converts to `&dyn I` where a `&dyn I` is expected, when `x`'s type implements `I`; so does a closure written as an argument where a `&dyn fn(P) -> R` is expected, as a view of it for the call (§6). No other conversion is implicit.
 - An interface is usable with `dyn` when its methods take `self` by reference and have no `comptime` parameters.
 - `dyn I` values are views (A§5.4): they are passed and held in locals, not stored (E0601). A `&dyn I` made from `&x` views `x`, so while it is live `x` obeys A§5.4 rule 4.
 - `&mut dyn I` converts to `&dyn I`, as `&mut T` to `&T`. A method that takes `&mut self` is called only through a `&mut dyn I`.
@@ -313,12 +313,13 @@ std.task.scope(sys.proc, fn [&files, &mut results](s: &mut task.Scope) {
 });   // returns when every task has finished
 ```
 
-- **Scopes.** `task.scope(proc, f)` runs `f` with a `Scope`; `s.spawn(g)` starts `g` as a task in it. `scope` returns when all of its tasks have finished. A task's panic is reported by `scope` as an error after the others finish.
-- **What tasks share.** A task's closure captures by value (moving), or by `&` view of data that outlives the scope. A `&mut` view can be captured by at most one task, and not used by the scope's own code until the tasks end (A§5.4, applied to tasks).
-- **`Shared(T)`** is the only way for tasks to change shared data: `let s = Shared(Counter).init(c, a);` and `s.lock(fn [](c: &mut Counter) { … })`. The view exists only inside the lock, so it is never held across another lock. `Shared(T)` is reference-counted; copying it with `.share()` is explicit.
-- **Channels.** `task.Channel(T)` with `send(value)` (moving it) and `recv() -> ?T`; `none` once every sender has been dropped and the channel is empty. Channels are bounded; a full channel blocks the sender.
-- **No async/await.** Tasks are scheduled by the runtime onto threads; blocking calls block only their task.
-- **Determinism in tests.** `arche test` runs tasks under a scheduler driven by a seed it prints, so a failure repeats with the same seed.
+- **Scopes.** `task.scope(&sys.proc, f)` runs `f` with a `Scope`; `s.spawn(g)` starts `g` as a task in it. `scope` returns when all of its tasks have finished. A task's panic ends that task, and `scope` reports it as `TaskError.Panicked` after the others finish; a task or `f` that returns an error makes it `TaskError.Failed`. Scopes nest: a task may open one of its own.
+- **Spawning.** The closure given to `spawn` is written there, as its argument (E0903): the task copies it and owns its captures, so nothing else may still hold it. It is a `fn() -> !void`.
+- **What tasks share.** A task's closure captures by value (moving), or by `&` view of data that outlives the scope: what the scope's closure itself captured, not its locals (E0603). A `&mut` view can be captured by at most one task, and is not used by the scope's own code until the tasks end (E0902; A§5.4, applied to tasks). Many tasks may capture one `&` view.
+- **`Shared(T)`** is the only way for tasks to change shared data: `let s = task.Shared(Counter).init(c, a);` and `s.lock(fn [](c: &mut Counter) { … })`. The view exists only inside the lock, so it is never held across another lock. Copying the handle with `.share()` is explicit; the data lives as long as its allocator.
+- **Channels.** `task.Channel(T)` with `init(capacity, a)`, `send(value)` (moving it) and `recv() -> ?T`, which gives `none` once the channel is closed, with `close()`, and empty. Channels are bounded: a full channel blocks the sender, an empty one the receiver. Sending on a closed channel panics.
+- **No async/await.** Tasks are scheduled by the runtime; a task that waits for a scope, a channel or a lock lets another run, and when every task waits for another the program panics: `deadlock: every task is waiting`. For now the runtime runs tasks as fibers on one thread, so a blocking system call blocks them all; parallel workers come with the HTTP server (sprint S22). `task.yield_now()` lets others run.
+- **Determinism.** Which ready task runs next comes from a generator with a seed: the same seed, the same order. `arche test` gives each test a seed of its own, derived from the one it prints, so a failure repeats with `--seed`; other programs start with a fixed seed, and `task.reseed(n)` sets one. A test reaches the capabilities, tasks included, through `t.system()`.
 
 ## 10. The low level
 
@@ -388,6 +389,7 @@ Liveness: a view is live from where it is made to its last use, and through the 
 | --- | --- |
 | A value bound to a region does not leave the region's block (§7) | E0901 |
 | A task captures a `&mut` view only if neither another task nor its scope uses that place while the task runs (§9) | E0902 |
+| A task views only what outlives its scope, and its closure is written where it is spawned (§9) | E0603, E0903 |
 | A closure that captures a view is a view; one that captures by value is a value, move-only when a capture is (§6) | E0601, E0605 |
 | Tasks share changeable data only through `Shared(T)`, whose view exists only inside `lock` | E0902 |
 

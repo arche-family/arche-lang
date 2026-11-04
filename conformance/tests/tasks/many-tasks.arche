@@ -1,0 +1,48 @@
+// test: run
+// spec: arche/9
+// stage0: skip
+// stdout: 1000 4549500
+import std;
+import std.task;
+import alloc;
+
+// Ten producers, one consumer, a channel of two: every value arrives once.
+fn main(sys: &mut std.System) -> !void {
+    let ch = task.Channel(u64).init(2, sys.alloc);
+    let done = task.Shared(u32).init(0, sys.alloc);
+    var sum: u64 = 0;
+    var count: u32 = 0;
+    try task.scope(&sys.proc, fn [&ch, &done, &mut sum, &mut count](s: &mut task.Scope) -> !void {
+        for p: u64 in 0..10 {
+            s.spawn(fn [p, &ch, &done]() -> !void {
+                for k: u64 in 0..100 {
+                    ch.send(p * 1000 + k);
+                    if k % 7 == 0 {
+                        task.yield_now();
+                    }
+                }
+                var last = false;
+                done.lock(fn [&mut last](n: &mut u32) {
+                    n.* += 1;
+                    last = n.* == 10;
+                });
+                if last {
+                    ch.close();
+                }
+            });
+        }
+        while true {
+            match ch.recv() {
+                some(v) => {
+                    sum += v;
+                    count += 1;
+                }
+                none => { break; }
+            }
+        }
+    });
+    sys.stdout.write_u64(count as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(sum);
+    sys.stdout.write("\n");
+}

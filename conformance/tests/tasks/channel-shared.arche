@@ -1,0 +1,36 @@
+// test: run
+// spec: arche/9
+// stage0: skip
+// stdout: 15 100
+import std;
+import std.task;
+import alloc;
+
+fn main(sys: &mut std.System) -> !void {
+    let ch = task.Channel(u32).init(2, sys.alloc);
+    var total: u32 = 0;
+    let counter = task.Shared(u32).init(0, sys.alloc);
+    try task.scope(&sys.proc, fn [&ch, &mut total, &counter](s: &mut task.Scope) -> !void {
+        s.spawn(fn [&ch]() -> !void {
+            for i: u32 in 1..=5 {
+                ch.send(i);
+            }
+            ch.close();
+        });
+        s.spawn(fn [&counter]() -> !void {
+            counter.lock(fn [](n: &mut u32) { n.* += 100; });
+        });
+        while true {
+            match ch.recv() {
+                some(v) => { total += v; }
+                none => { break; }
+            }
+        }
+    });
+    sys.stdout.write_u64(total as u64);
+    var seen: u32 = 0;
+    counter.lock(fn [&mut seen](n: &mut u32) { seen = n.*; });
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(seen as u64);
+    sys.stdout.write("\n");
+}

@@ -821,7 +821,11 @@ pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
         out.push_str("@");
         out.push_str(vts[v].name.view());
         out.push_str(" = private unnamed_addr constant [");
-        ir.write_number(&mut out, fs.len() as u64);
+        var slots = fs.len() as u64;
+        if vts[v].size > 0 {
+            slots += 1;
+        }
+        ir.write_number(&mut out, slots);
         out.push_str(" x ptr] [");
         var e: usize = 0;
         while e < fs.len() : (e += 1) {
@@ -830,6 +834,11 @@ pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
             }
             out.push_str("ptr @");
             out.push_str(m.functions[fs[e] as usize].name.view());
+        }
+        if vts[v].size > 0 {
+            out.push_str(", ptr inttoptr (i64 ");
+            ir.write_number(&mut out, vts[v].size);
+            out.push_str(" to ptr)");
         }
         out.push_str("]\n");
     }

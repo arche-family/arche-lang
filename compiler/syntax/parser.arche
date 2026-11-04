@@ -1408,7 +1408,14 @@ fn parse_postfix(p: &mut Parser) {
                         advance(p);
                         advance(p);
                     }
-                    parse_nested_expr(p);
+                    // ?T, *T and []T start no expression: a type argument,
+                    // List(?T) (spec/arche.md §4.2).
+                    if p.full and (at(p, tk.Kind.Question) or at(p, tk.Kind.Star) or
+                        (at(p, tk.Kind.LBracket) and peek_second(p) == tk.Kind.RBracket)) {
+                        parse_type(p);
+                    } else {
+                        parse_nested_expr(p);
+                    }
                     _ = close(p, am, cst.Kind.Arg);
                     if not accept(p, tk.Kind.Comma) {
                         break;

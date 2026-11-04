@@ -1,0 +1,213 @@
+/// Structured concurrency (spec/arche.md §9): tasks start in a scope and end
+/// before it returns, so they can borrow what lives outside it. Shared
+/// changeable data is a Shared(T); tasks pass values through a Channel(T).
+/// The runtime runs tasks as fibers on one thread (compiler/runtime/rt.c),
+/// switching where a task waits, in an order its seed decides.
+import alloc;
+import core;
+import core.mem;
+import std;
+
+pub type TaskError = error { Failed, Panicked }
+
+extern "c" fn a0rt_scope_new() -> *mut u8;
+extern "c" fn a0rt_scope_wait(scope: *mut u8) -> u32;
+extern "c" fn a0rt_spawn(scope: *mut u8, code: *u8, env: *mut u8);
+extern "c" fn a0rt_task_memory(n: u64) -> *mut u8;
+extern "c" fn a0rt_task_wait(key: *u8);
+extern "c" fn a0rt_task_wake(key: *u8);
+extern "c" fn a0rt_task_yield();
+extern "c" fn a0rt_sched_seed(seed: u64);
+
+/// Where tasks start; scope gives one to its body.
+pub type Scope = struct {
+    raw: *mut u8,
+    unique: core.Unique,
+
+    /// Starts a task in this scope. The closure is written here, as the
+    /// argument, and copied into the task, which owns its captures; the
+    /// scope waits for it to end.
+    pub fn spawn(self: &mut Scope, task: &dyn fn() -> !void) {
+        unsafe {
+            // SAFETY: the copy has the closure's size, and the closure is
+            // not used again (the compiler requires it written here).
+            let size = mem.closure_size(task);
+            let copy = a0rt_task_memory(size as u64 + 1);
+            if size > 0 {
+                mem.copy(copy, mem.closure_env(task), size);
+            }
+            a0rt_spawn(scope: self.raw, code: mem.closure_code(task), env: copy);
+        }
+    }
+}
+
+/// Runs body with a scope, and returns when every task it started has
+/// ended: Panicked when one panicked, Failed when one, or body, returned
+/// an error.
+pub fn scope(proc: &std.Proc, body: &dyn fn(&mut Scope) -> !void) -> TaskError!void {
+    var s = Scope { raw: mem.null(u8), unique: core.Unique { } };
+    unsafe {
+        // SAFETY: the runtime's scope, waited for below.
+        s.raw = a0rt_scope_new();
+    }
+    var body_failed = false;
+    match body(&mut s) {
+        ok(_) => { }
+        err(_) => { body_failed = true; }
+    }
+    var status: u32 = 0;
+    unsafe {
+        // SAFETY: waits for this scope's tasks only.
+        status = a0rt_scope_wait(s.raw);
+    }
+    if status == 2 {
+        return TaskError.Panicked;
+    }
+    if status == 1 or body_failed {
+        return TaskError.Failed;
+    }
+}
+
+/// Sets the seed that orders tasks from now on: the same seed, the same
+/// order. arche test sets one for each test; other programs start with a
+/// fixed one.
+pub fn reseed(seed: u64) {
+    unsafe {
+        // SAFETY: the scheduler's generator only.
+        a0rt_sched_seed(seed);
+    }
+}
+
+/// Lets other ready tasks run before this one goes on.
+pub fn yield_now() {
+    unsafe {
+        // SAFETY: a switch to another fiber and back.
+        a0rt_task_yield();
+    }
+}
+
+/// A bounded queue between tasks: send waits while it is full, recv while
+/// it is empty; after close, recv gives what is left, then none.
+pub type Channel(comptime T: type) = struct {
+    slots: alloc.List(?T),
+    head: usize,
+    count: usize,
+    closed: bool,
+
+    pub fn init(capacity: usize, a: alloc.Allocator) -> Channel(T) {
+        if capacity == 0 {
+            panic("a channel holds at least one value");
+        }
+        var slots = alloc.List(?T).init(a);
+        var i: usize = 0;
+        while i < capacity : (i += 1) {
+            slots.push(none);
+        }
+        return Channel(T) { slots: slots, head: 0, count: 0, closed: false };
+    }
+
+    /// Tasks share a channel through & views: its changes go through this.
+    fn inner(self: &Channel(T)) -> *mut Channel(T) {
+        unsafe {
+            // SAFETY: one thread runs the tasks, and none switches inside
+            // a send or recv except where it waits, so no change overlaps.
+            return self as *Channel(T) as *mut Channel(T);
+        }
+    }
+
+    fn key(self: &Channel(T), which: usize) -> *u8 {
+        unsafe {
+            // SAFETY: an address used as a name, never read.
+            return (self as *Channel(T) as *u8).add(which);
+        }
+    }
+
+    pub fn send(self: &Channel(T), value: T) {
+        let me = self.inner();
+        unsafe {
+            // SAFETY: see inner.
+            while me.*.count == me.*.slots.len() and not me.*.closed {
+                a0rt_task_wait(self.key(1));
+            }
+            if me.*.closed {
+                panic("send on a closed channel");
+            }
+            let at = (me.*.head + me.*.count) % me.*.slots.len();
+            let slot = &mut me.*.slots.items_mut()[at] as *mut ?T;
+            slot.* = some(value);
+            me.*.count += 1;
+            a0rt_task_wake(self.key(0));
+        }
+    }
+
+    pub fn recv(self: &Channel(T)) -> ?T {
+        let me = self.inner();
+        unsafe {
+            // SAFETY: see inner.
+            while me.*.count == 0 and not me.*.closed {
+                a0rt_task_wait(self.key(0));
+            }
+            if me.*.count == 0 {
+                return none;
+            }
+            let slot = &mut me.*.slots.items_mut()[me.*.head] as *mut ?T;
+            let value = slot.*;
+            slot.* = none;
+            me.*.head = (me.*.head + 1) % me.*.slots.len();
+            me.*.count -= 1;
+            a0rt_task_wake(self.key(1));
+            return value;
+        }
+    }
+
+    /// No more values: receivers get what is left, then none.
+    pub fn close(self: &Channel(T)) {
+        let me = self.inner();
+        unsafe {
+            // SAFETY: see inner.
+            me.*.closed = true;
+            a0rt_task_wake(self.key(0));
+            a0rt_task_wake(self.key(1));
+        }
+    }
+}
+
+type Cell(comptime T: type) = struct {
+    locked: bool,
+    value: T,
+}
+
+/// Data tasks change together: a view of it exists only inside lock, so it
+/// is never held across another lock. share() gives another handle to it.
+pub type Shared(comptime T: type) = struct {
+    cell: *mut Cell(T),
+    unique: core.Unique,
+
+    pub fn init(value: T, a: alloc.Allocator) -> Shared(T) {
+        unsafe {
+            // SAFETY: a new block the size of a Cell(T), written whole.
+            let raw = alloc.alloc_bytes(a, mem.size_of(Cell(T))) as *mut Cell(T);
+            raw.* = Cell(T) { locked: false, value: value };
+            return Shared(T) { cell: raw, unique: core.Unique { } };
+        }
+    }
+
+    pub fn share(self: &Shared(T)) -> Shared(T) {
+        return Shared(T) { cell: self.cell, unique: core.Unique { } };
+    }
+
+    /// Calls f with the data, while no other task has it.
+    pub fn lock(self: &Shared(T), f: &dyn fn(&mut T)) {
+        unsafe {
+            // SAFETY: the cell lives as long as the allocator; locked keeps
+            // a second view of the value from being made while one exists.
+            while self.cell.*.locked {
+                a0rt_task_wait(self.cell as *u8);
+            }
+            self.cell.*.locked = true;
+            f(&mut self.cell.*.value);
+            self.cell.*.locked = false;
+            a0rt_task_wake(self.cell as *u8);
+        }
+    }
+}

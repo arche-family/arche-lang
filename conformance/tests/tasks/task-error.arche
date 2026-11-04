@@ -1,0 +1,27 @@
+// test: run
+// spec: arche/9
+// stage0: skip
+// stdout: failed
+import std;
+import std.task;
+
+type Oops = error { Bad }
+
+fn work(fail: bool) -> Oops!void {
+    if fail {
+        return Oops.Bad;
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let r = task.scope(&sys.proc, fn [](s: &mut task.Scope) -> !void {
+        s.spawn(fn []() -> !void {
+            try work(true);
+        });
+    });
+    match r {
+        ok(_) => { sys.stdout.write("ok\n"); }
+        err(.Failed) => { sys.stdout.write("failed\n"); }
+        err(_) => { sys.stdout.write("panicked\n"); }
+    }
+}

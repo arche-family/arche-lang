@@ -43,7 +43,7 @@ static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     return r;
 }
 
-enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MUNMAP = 11, SYS_GETPID = 39, SYS_FORK = 57,
+enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MPROTECT = 10, SYS_MUNMAP = 11, SYS_GETPID = 39, SYS_FORK = 57,
        SYS_EXIT = 60, SYS_WAIT4 = 61, SYS_CLOCK_GETTIME = 228, SYS_EXIT_GROUP = 231, SYS_OPENAT = 257 };
 enum { AT_FDCWD = -100, O_RDONLY = 0, O_WRONLY = 1, O_CREAT = 0100, O_TRUNC = 01000, O_CLOEXEC = 02000000 };
 enum { ENOENT = 2, EACCES = 13, ENOTDIR = 20, EISDIR = 21, EPERM = 1 };
@@ -698,6 +698,223 @@ void a0rt_die(const char *message, u64 len) {
 }
 
 // panic and every trap: the message, then where it happened (§10).
+// ---- tasks (spec/arche.md §9, lib/std/task.arche) ---------------------------------
+//
+// Tasks are fibers: each has a stack of its own, and a0rt_ctx_switch moves
+// between them. They run on one thread, and switch only where a task waits:
+// for a scope's tasks, a channel, a lock, or by yielding. Which ready task
+// runs next comes from a generator with a seed, so a run repeats with the
+// same seed: arche test gives each test its own, and other programs a
+// fixed one.
+
+enum { READY, RUNNING, WAITING, DONE };
+enum { TASK_STACK = 256 * 1024, GUARD = 4096 };
+
+typedef struct Fiber {
+    u64 rsp;
+    u8 *stack;
+    u16 (*fn)(void *env);
+    void *env;
+    struct TaskScope *scope;
+    struct Fiber *next_in_scope;
+    const void *waiting_on;
+    int state;
+} Fiber;
+
+typedef struct TaskScope {
+    u32 pending;
+    u32 failed;      // 1: a task returned an error; 2: one panicked
+    Fiber *tasks;
+} TaskScope;
+
+static Fiber main_fiber = {0, 0, 0, 0, 0, 0, 0, RUNNING};
+static Fiber *current_fiber = &main_fiber;
+static Fiber **fibers;
+static u64 fiber_count, fiber_cap;
+static u64 sched_state = 0x853C49E6748FEA9BUL;
+
+void a0rt_ctx_switch(u64 *save_rsp, u64 load_rsp);
+__asm__(".text\n"
+        ".global a0rt_ctx_switch\n"
+        "a0rt_ctx_switch:\n"
+        "    push %rbp\n"
+        "    push %rbx\n"
+        "    push %r12\n"
+        "    push %r13\n"
+        "    push %r14\n"
+        "    push %r15\n"
+        "    mov %rsp, (%rdi)\n"
+        "    mov %rsi, %rsp\n"
+        "    pop %r15\n"
+        "    pop %r14\n"
+        "    pop %r13\n"
+        "    pop %r12\n"
+        "    pop %rbx\n"
+        "    pop %rbp\n"
+        "    ret\n");
+
+// The scheduler's seed: arche test sets it for each test.
+void a0rt_sched_seed(u64 seed) {
+    sched_state = seed ? seed : 0x853C49E6748FEA9BUL;
+}
+
+static u64 sched_next(void) {
+    u64 x = sched_state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    sched_state = x;
+    return x * 0x2545F4914F6CDD1DUL;
+}
+
+static void switch_to(Fiber *next) {
+    Fiber *prev = current_fiber;
+    if (next == prev) {
+        prev->state = RUNNING;
+        return;
+    }
+    current_fiber = next;
+    next->state = RUNNING;
+    a0rt_ctx_switch(&prev->rsp, next->rsp);
+}
+
+// The next fiber to run, chosen among the ready ones; when none is ready
+// and some wait, every task is waiting for another: a deadlock.
+static Fiber *pick(void) {
+    u64 ready = main_fiber.state == READY ? 1 : 0;
+    for (u64 i = 0; i < fiber_count; i++) {
+        ready += fibers[i]->state == READY;
+    }
+    if (ready == 0) {
+        a0rt_die("deadlock: every task is waiting", 31);
+    }
+    u64 k = sched_next() % ready;
+    if (main_fiber.state == READY) {
+        if (k == 0) {
+            return &main_fiber;
+        }
+        k--;
+    }
+    for (u64 i = 0; i < fiber_count; i++) {
+        if (fibers[i]->state == READY) {
+            if (k == 0) {
+                return fibers[i];
+            }
+            k--;
+        }
+    }
+    return &main_fiber;
+}
+
+// Lets other ready tasks run first.
+void a0rt_task_yield(void) {
+    current_fiber->state = READY;
+    switch_to(pick());
+}
+
+// Waits until a0rt_task_wake(key); the caller checks its condition again.
+void a0rt_task_wait(const void *key) {
+    current_fiber->state = WAITING;
+    current_fiber->waiting_on = key;
+    switch_to(pick());
+}
+
+void a0rt_task_wake(const void *key) {
+    if (main_fiber.state == WAITING && main_fiber.waiting_on == key) {
+        main_fiber.state = READY;
+    }
+    for (u64 i = 0; i < fiber_count; i++) {
+        if (fibers[i]->state == WAITING && fibers[i]->waiting_on == key) {
+            fibers[i]->state = READY;
+        }
+    }
+}
+
+// Memory for a task's closure: it lives as long as the program.
+void *a0rt_task_memory(u64 n) {
+    return a0rt_alloc(n);
+}
+
+void *a0rt_scope_new(void) {
+    TaskScope *s = a0rt_alloc(sizeof(TaskScope));
+    return s;
+}
+
+_Noreturn static void task_finish(u32 failure) {
+    Fiber *f = current_fiber;
+    f->state = DONE;
+    if (failure > f->scope->failed) {
+        f->scope->failed = failure;
+    }
+    f->scope->pending--;
+    if (f->scope->pending == 0) {
+        a0rt_task_wake(f->scope);
+    }
+    switch_to(pick());
+    __builtin_unreachable();
+}
+
+static void fiber_entry(void) {
+    Fiber *f = current_fiber;
+    u16 err = f->fn(f->env);
+    task_finish(err ? 1 : 0);
+}
+
+void a0rt_spawn(void *scope, void *fn, void *env) {
+    TaskScope *s = scope;
+    Fiber *f = a0rt_alloc(sizeof(Fiber));
+    i64 p = sys6(SYS_MMAP, 0, TASK_STACK + GUARD, 3, 0x22, -1, 0);
+    if (p < 0 && p > -4096) {
+        a0rt_die("out of memory", 13);
+    }
+    sys3(SYS_MPROTECT, p, GUARD, 0); // the stack's end faults, not overflows
+    f->stack = (u8 *)p;
+    u64 *top = (u64 *)(f->stack + TASK_STACK + GUARD);
+    top[-1] = 0;                  // fiber_entry's return address: none
+    top[-2] = (u64)fiber_entry;   // where a0rt_ctx_switch returns to
+    for (int i = 3; i <= 8; i++) {
+        top[-i] = 0;              // rbp, rbx, r12 to r15
+    }
+    f->rsp = (u64)(top - 8);
+    f->fn = (u16 (*)(void *))fn;
+    f->env = env;
+    f->scope = s;
+    f->state = READY;
+    f->next_in_scope = s->tasks;
+    s->tasks = f;
+    s->pending++;
+    if (fiber_count == fiber_cap) {
+        u64 cap = fiber_cap ? fiber_cap * 2 : 16;
+        Fiber **grown = a0rt_alloc(cap * sizeof(Fiber *));
+        for (u64 i = 0; i < fiber_count; i++) {
+            grown[i] = fibers[i];
+        }
+        fibers = grown;
+        fiber_cap = cap;
+    }
+    fibers[fiber_count++] = f;
+}
+
+// Waits for the scope's tasks, then frees their stacks: 0, or 1 when one
+// returned an error, 2 when one panicked.
+u32 a0rt_scope_wait(void *scope) {
+    TaskScope *s = scope;
+    while (s->pending > 0) {
+        a0rt_task_wait(s);
+    }
+    u64 kept = 0;
+    for (u64 i = 0; i < fiber_count; i++) {
+        Fiber *f = fibers[i];
+        if (f->scope == s) {
+            sys3(SYS_MUNMAP, (i64)f->stack, TASK_STACK + GUARD, 0);
+        } else {
+            fibers[kept++] = f;
+        }
+    }
+    fiber_count = kept;
+    return s->failed;
+}
+
 _Noreturn void a0rt_trap(const u8 *message, u64 len, const u8 *file, u64 file_len, u32 line, u32 col) {
     flush_all();
     a0rt_write(&err_fd, (const u8 *)"panic: ", 7);
@@ -709,6 +926,11 @@ _Noreturn void a0rt_trap(const u8 *message, u64 len, const u8 *file, u64 file_le
     a0rt_write_byte(&err_fd, ':');
     a0rt_write_u64(&err_fd, col);
     a0rt_write_byte(&err_fd, '\n');
+    if (current_fiber != &main_fiber) {
+        // A task's panic ends the task; its scope reports it (spec §9).
+        flush_all();
+        task_finish(2);
+    }
     exit_with(101);
 }
 
@@ -1181,7 +1403,7 @@ static void say(const char *text) {
     a0rt_write(&out_fd, (const u8 *)text, c_strlen(text));
 }
 
-u16 a0rt_run_tests(const System *sys) {
+u16 a0rt_run_tests(System *sys) {
     Str filter = {(const u8 *)"", 0};
     u64 seed = 0;
     int seeded = 0;
@@ -1219,9 +1441,11 @@ u16 a0rt_run_tests(const System *sys) {
         flush_all();
         i64 pid = sys1(SYS_FORK, 0);
         if (pid == 0) {
-            u64 test_seed = mix(seed ^ mix(i));
+            // std.testing.Test: {seed, system}.
+            u64 test[2] = {mix(seed ^ mix(i)), (u64)sys};
+            a0rt_sched_seed(mix(test[0]));
             if (t->takes_test) {
-                ((void (*)(u64 *))t->function)(&test_seed);
+                ((void (*)(u64 *))t->function)(test);
             } else {
                 ((void (*)(void))t->function)();
             }

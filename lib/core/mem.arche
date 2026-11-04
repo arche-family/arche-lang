@@ -36,3 +36,13 @@ pub unsafe fn str_data(s: str) -> *u8;
 
 /// Where a slice's elements are, even when it has none.
 pub unsafe fn slice_data(comptime T: type, s: []T) -> *T;
+
+/// The parts of a closure seen through a &dyn view (spec/arche.md §6):
+/// where its captures are, how many bytes they take, and its code, which
+/// takes the captures' address first. std.task copies a task's closure
+/// with them.
+pub unsafe fn closure_env(f: &dyn fn() -> !void) -> *u8;
+
+pub unsafe fn closure_size(f: &dyn fn() -> !void) -> usize;
+
+pub unsafe fn closure_code(f: &dyn fn() -> !void) -> *u8;

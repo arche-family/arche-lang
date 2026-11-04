@@ -1,0 +1,15 @@
+// test: compile-error
+// spec: arche/9
+// stage0: skip
+// line: 13
+// code: E0401
+import std;
+import std.task;
+
+fn main(sys: &mut std.System) -> !void {
+    let s = task.Shared(u32).init(0, sys.alloc);
+    var keep: u32 = 0;
+    s.lock(fn [&mut keep](n: &mut u32) {
+        keep = n;
+    });
+}

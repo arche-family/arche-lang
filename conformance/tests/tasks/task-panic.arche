@@ -1,0 +1,31 @@
+// test: run
+// spec: arche/9
+// stage0: skip
+// stdout: 1 panicked
+// stderr: panic: division by zero
+import std;
+import std.task;
+
+fn main(sys: &mut std.System) -> !void {
+    let finished = task.Shared(u32).init(0, sys.alloc);
+    let r = task.scope(&sys.proc, fn [&finished](s: &mut task.Scope) -> !void {
+        s.spawn(fn []() -> !void {
+            let zero: u32 = 0;
+            let x = 1 / zero;
+            _ = x;
+        });
+        s.spawn(fn [&finished]() -> !void {
+            task.yield_now();
+            finished.lock(fn [](n: &mut u32) { n.* += 1; });
+        });
+    });
+    // The other task still ran to its end; the scope reports the panic.
+    var n: u32 = 0;
+    finished.lock(fn [&mut n](v: &mut u32) { n = v.*; });
+    sys.stdout.write_u64(n as u64);
+    match r {
+        ok(_) => { sys.stdout.write(" ok\n"); }
+        err(.Panicked) => { sys.stdout.write(" panicked\n"); }
+        err(_) => { sys.stdout.write(" failed\n"); }
+    }
+}

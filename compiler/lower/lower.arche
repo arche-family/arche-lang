@@ -359,7 +359,10 @@ pub fn closure_vtable(l: &mut Lower, ci: u32) -> u32 {
     name.push_str("a0vc_");
     ir.write_number(&mut name, ci as u64);
     let id = l.m.vtables.len() as u32;
-    l.m.vtables.push(ir.VTable { name: name, functions: fns });
+    // The captures' size, so a task can copy the closure (lib/std/task.arche).
+    let closure_t = l.c.t.declared(ty.Kind.Closure, ci);
+    let size = layout.layout(&l.c, closure_t).size;
+    l.m.vtables.push(ir.VTable { name: name, functions: fns, size: size + 1 });
     l.vtables.put(key, id);
     return id;
 }
@@ -384,7 +387,7 @@ pub fn vtable(l: &mut Lower, i: u32) -> u32 {
     name.push_str("a0vt_");
     ir.write_number(&mut name, i as u64);
     let id = l.m.vtables.len() as u32;
-    l.m.vtables.push(ir.VTable { name: name, functions: fns });
+    l.m.vtables.push(ir.VTable { name: name, functions: fns, size: 0 });
     l.vtables.put(i, id);
     return id;
 }
