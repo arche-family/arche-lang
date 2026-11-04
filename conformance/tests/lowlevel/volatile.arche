@@ -1,0 +1,25 @@
+// test: run
+// spec: arche/10.2
+// stage0: skip
+// stdout: 42 41 5
+import std;
+import core.ptr;
+
+fn main(sys: &mut std.System) -> !void {
+    var x: u32 = 7;
+    unsafe {
+        // SAFETY: p is x's address, and x lives through the block.
+        let p = &mut x as *mut u32;
+        p.write_volatile(41);
+        sys.stdout.write_u64((p.read_volatile() + 1) as u64);
+        let q = ptr.from_addr(u32, p.addr());
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(q.read_volatile() as u64);
+        let ro = &x as *u32;
+        let rw = ro as *mut u32;
+        rw.* = 5;
+    }
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(x as u64);
+    sys.stdout.write("\n");
+}

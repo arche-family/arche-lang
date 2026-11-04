@@ -17,9 +17,9 @@ pub type Op = enum {
     Param,
     /// imm: the size in bytes; flag: the alignment.
     Alloca,
-    /// a: the address.
+    /// a: the address; flag: LOAD_VOLATILE and LOAD_UNALIGNED bits.
     Load,
-    /// a: the value; b: the address.
+    /// a: the value; b: the address; flag: as Load's.
     Store,
     /// a: the address; imm: the offset in bytes.
     Gep,
@@ -64,6 +64,10 @@ pub type Op = enum {
     Asm,
     /// a: an Asm with outputs; imm: which output.
     AsmOut,
+    /// a: an i64, as a pointer.
+    IntToPtr,
+    /// a: a pointer, as an i64.
+    PtrToInt,
     /// imm: the callee (a function, or an external when flag is 1); args:
     /// a range of the function's args list.
     Call,
@@ -76,6 +80,11 @@ pub type Op = enum {
     RetVoid,
     Unreachable,
 }
+
+/// A load or store the compiler must keep and not merge (spec/arche.md
+/// §10.2), and one whose address may not be aligned (a packed field).
+pub const LOAD_VOLATILE: u32 = 1;
+pub const LOAD_UNALIGNED: u32 = 2;
 
 pub type BinKind = enum { Add, Sub, Mul, SDiv, UDiv, SRem, URem, And, Or, Xor, Shl, LShr, AShr }
 
@@ -165,6 +174,10 @@ pub type Function = struct {
     pub args: alloc.List(u32),
     /// Internal functions are private to the module.
     pub internal: bool,
+    /// naked: no prologue or epilogue (spec/arche.md §10.2).
+    pub no_frame: bool,
+    /// The section the code goes in, or empty for the default.
+    pub section: alloc.String,
 }
 
 pub type External = struct {
@@ -302,6 +315,8 @@ pub fn new_function(name: str, ret: Ty, a: alloc.Allocator) -> Function {
         blocks: alloc.List(Block).init(a),
         args: alloc.List(u32).init(a),
         internal: true,
+        no_frame: false,
+        section: alloc.String.init(a),
     };
     f.blocks.push(Block { insts: alloc.List(u32).init(a) });
     return f;
@@ -435,7 +450,7 @@ pub fn verify(f: &Function) -> Problem {
                         return problem(id, ProblemKind.CmpType);
                     }
                 }
-                .Ext | .Trunc | .OverflowBit | .FNeg | .FConv | .FMath => {
+                .Ext | .Trunc | .OverflowBit | .FNeg | .FConv | .FMath | .IntToPtr | .PtrToInt => {
                     if not operand_ok(f, user: id, v: i.a) {
                         return problem(id, ProblemKind.Undefined);
                     }

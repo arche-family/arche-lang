@@ -129,6 +129,18 @@ fn overflow_text(k: u32) -> str {
     }
 }
 
+fn volatile_word(out: &mut alloc.String, flag: u32) {
+    if (flag & ir.LOAD_VOLATILE) != 0 {
+        out.push_str("volatile ");
+    }
+}
+
+fn align_suffix(out: &mut alloc.String, flag: u32) {
+    if (flag & ir.LOAD_UNALIGNED) != 0 {
+        out.push_str(", align 1");
+    }
+}
+
 /// An asm's result type: its one output's, or a struct of them.
 fn asm_result(out: &mut alloc.String, outs: []ir.Ty) {
     if outs.len() == 1 {
@@ -203,8 +215,11 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
             if i.ty == ir.Ty.I1 {
                 out.push_str("  %t");
                 ir.write_number(out, id as u64);
-                out.push_str(" = load i8, ptr ");
+                out.push_str(" = load ");
+                volatile_word(out, i.flag);
+                out.push_str("i8, ptr ");
                 operand(out, m, f, i.a);
+                align_suffix(out, i.flag);
                 out.push_str("\n");
                 line_start(out, id);
                 out.push_str("trunc i8 %t");
@@ -213,9 +228,11 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
             } else {
                 line_start(out, id);
                 out.push_str("load ");
+                volatile_word(out, i.flag);
                 out.push_str(t);
                 out.push_str(", ptr ");
                 operand(out, m, f, i.a);
+                align_suffix(out, i.flag);
                 out.push_str("\n");
             }
         }
@@ -225,15 +242,31 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
                 ir.write_number(out, id as u64);
                 out.push_str(" = zext i1 ");
                 operand(out, m, f, i.a);
-                out.push_str(" to i8\n  store i8 %t");
+                out.push_str(" to i8\n  store ");
+                volatile_word(out, i.flag);
+                out.push_str("i8 %t");
                 ir.write_number(out, id as u64);
             } else {
                 out.push_str("  store ");
+                volatile_word(out, i.flag);
                 typed(out, m, f, i.a);
             }
             out.push_str(", ptr ");
             operand(out, m, f, i.b);
+            align_suffix(out, i.flag);
             out.push_str("\n");
+        }
+        .IntToPtr => {
+            line_start(out, id);
+            out.push_str("inttoptr ");
+            typed(out, m, f, i.a);
+            out.push_str(" to ptr\n");
+        }
+        .PtrToInt => {
+            line_start(out, id);
+            out.push_str("ptrtoint ");
+            typed(out, m, f, i.a);
+            out.push_str(" to i64\n");
         }
         .Gep => {
             line_start(out, id);
@@ -557,7 +590,16 @@ fn emit_function(out: &mut alloc.String, m: &ir.Module, f: &ir.Function) {
             }
         }
     }
-    out.push_str(") {\n");
+    out.push_str(")");
+    if f.no_frame {
+        out.push_str(" naked noinline");
+    }
+    if f.section.len() > 0 {
+        out.push_str(" section \"");
+        out.push_str(f.section.view());
+        out.push_str("\"");
+    }
+    out.push_str(" {\n");
     let blocks = f.blocks.items();
     var b: usize = 0;
     while b < blocks.len() : (b += 1) {
@@ -738,6 +780,15 @@ pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
     let es = m.externals.items();
     var x: usize = 0;
     while x < es.len() : (x += 1) {
+        // An extern fn the program also defines, by export: no declaration.
+        var defined = false;
+        var fx: usize = 0;
+        while fx < m.functions.len() and not defined : (fx += 1) {
+            defined = m.functions[fx].name.view().eq(es[x].name.view());
+        }
+        if defined {
+            continue;
+        }
         out.push_str("declare ");
         out.push_str(ty_text(es[x].ret));
         out.push_str(" @");

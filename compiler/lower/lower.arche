@@ -102,6 +102,22 @@ pub fn load(l: &mut Lower, t: ir.Ty, addr: u32) -> u32 {
     return emit(l, i);
 }
 
+/// A load or store with ir.LOAD_VOLATILE or ir.LOAD_UNALIGNED.
+pub fn load_with(l: &mut Lower, t: ir.Ty, addr: u32, flags: u32) -> u32 {
+    var i = ir.inst(ir.Op.Load, t);
+    i.a = addr;
+    i.flag = flags;
+    return emit(l, i);
+}
+
+pub fn store_with(l: &mut Lower, value: u32, addr: u32, flags: u32) {
+    var i = ir.inst(ir.Op.Store, ir.Ty.Void);
+    i.a = value;
+    i.b = addr;
+    i.flag = flags;
+    _ = emit(l, i);
+}
+
 pub fn store(l: &mut Lower, value: u32, addr: u32) {
     var i = ir.inst(ir.Op.Store, ir.Ty.Void);
     i.a = value;
@@ -571,6 +587,12 @@ pub fn mangle(c: &ck.Checker, d: u32, a: alloc.Allocator) -> alloc.String {
             start = i + 1;
         }
     }
+    {
+        let exported = ck.fn_attribute(c, d, "export");
+        if decl.kind == ck.DeclKind.Fn and exported.len() > 0 {
+            return exported;
+        }
+    }
     if decl.owner != ck.NONE {
         segment(&mut out, c.names.text(c.decls[decl.owner as usize].name));
     } else if decl.impl_index != ck.NONE {
@@ -629,6 +651,11 @@ fn lower_fn(l: &mut Lower, f: u32) {
     ck.enter_decl(&mut l.c, info.decl);
     l.c.cur_table = info.table;
     l.c.fn_index = f;
+    if ck.fn_attribute(&l.c, info.decl, "export").len() > 0 {
+        l.f.internal = false; // others call it by its name
+    }
+    l.f.section = ck.fn_attribute(&l.c, info.decl, "section");
+    l.f.no_frame = ck.is_naked_fn(&l.c, info.decl);
     l.vars = alloc.List(Var).init(l.a);
     l.defers = alloc.List(cst.NodeId).init(l.a);
     l.loops = alloc.List(LoopCtx).init(l.a);
@@ -695,6 +722,11 @@ fn lower_fn(l: &mut Lower, f: u32) {
     stmt.block(l, body);
     if not terminated(l) {
         let k = l.c.t.kind(info.ret);
+        if l.f.no_frame {
+            // Its asm never falls through to an epilogue it does not have.
+            _ = emit(l, ir.inst(ir.Op.Unreachable, ir.Ty.Void));
+            return;
+        }
         if k == ty.Kind.Void or (l.f.ret == ir.Ty.I16 and k == ty.Kind.ErrorUnion) {
             stmt.check_ensures(l, false, Val { v: 0, scalar: true, fresh: true });
         }

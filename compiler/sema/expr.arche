@@ -1115,6 +1115,20 @@ pub fn builtin_method(c: &mut ck.Checker, t: ty.TypeId, name: str) -> ?Method {
             if name.eq("as_mut") and info.mutable {
                 return method0(c, byval, c.t.reference(true, info.elem));
             }
+            // Volatile access, of one scalar, and the address (spec/arche.md
+            // §10.2).
+            let ek = c.t.kind(info.elem);
+            let scalar = ek == ty.Kind.Int or ek == ty.Kind.Bool or ek == ty.Kind.Ptr or ek == ty.Kind.Float;
+            if name.eq("read_volatile") and scalar {
+                return method0(c, byval, info.elem);
+            }
+            if name.eq("write_volatile") and info.mutable and scalar {
+                let p = param(c, "value", info.elem);
+                return method1(c, byval, p, ty.void_type());
+            }
+            if name.eq("addr") {
+                return method0(c, byval, usize_t);
+            }
         }
         .Str => {
             if name.eq("len") { return method0(c, byval, usize_t); }
@@ -1436,6 +1450,10 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
     if ck.is_unsafe_fn(c, target) {
         let s = ck.span_of(c, ck.child(c, call, 0));
         ck.require_unsafe(c, s, "calling an unsafe fn");
+    }
+    if ck.is_extern_fn(c, target) {
+        let s = ck.span_of(c, ck.child(c, call, 0));
+        ck.require_unsafe(c, s, "calling a foreign function");
     }
     let f = c.fns[c.decls[target as usize].fn_index as usize];
     let ps = fn_params(c, f, skip);
@@ -2280,8 +2298,8 @@ fn check_cast(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     if ti.kind == ty.Kind.Ptr and (fi.kind == ty.Kind.Ref or fi.kind == ty.Kind.Ptr) {
         let s = ck.token_span(c, op_token(c, n));
         ck.require_unsafe(c, s, "making a raw pointer");
-        if ti.mutable and not fi.mutable {
-            ck.report(c, codes.BAD_CAST, s, "a *mut T comes from a &mut view or another *mut T");
+        if ti.mutable and not fi.mutable and fi.kind == ty.Kind.Ref {
+            ck.report(c, codes.BAD_CAST, s, "a *mut T comes from a &mut view or another raw pointer");
         } else if fi.kind == ty.Kind.Ref and fi.elem != ti.elem {
             var m = ck.new_message(c);
             m.push_str("a view of ");

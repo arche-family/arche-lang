@@ -1,0 +1,29 @@
+// test: run
+// spec: arche/10.2
+// stage0: skip
+// stdout: 42 5
+import std;
+
+extern "c" fn a0_double(x: u64) -> u64;
+
+export("a0_double") fn double(x: u64) -> u64 {
+    return x * 2;
+}
+
+section(".text.hot") fn hot(x: u32) -> u32 {
+    return x + 1;
+}
+
+naked fn spin() {
+    asm("1: pause\n jmp 1b");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    unsafe {
+        // SAFETY: a0_double is this program's own double.
+        sys.stdout.write_u64(a0_double(21));
+    }
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(hot(4) as u64);
+    sys.stdout.write("\n");
+}

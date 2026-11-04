@@ -273,6 +273,21 @@ fn parse_item(p: &mut Parser) {
         parse_impl(p, m);
         return;
     }
+    // extern "c" fn name(params) -> R; (spec/arche.md §12, extern_decl)
+    if p.full and at(p, tk.Kind.Ident) and token_is(p, "extern") and peek_second(p) == tk.Kind.String {
+        let am = open(p);
+        advance(p);
+        advance(p);
+        _ = close(p, am, cst.Kind.Attribute);
+        if at(p, tk.Kind.KwFn) {
+            parse_fn(p, m);
+        } else {
+            unexpected(p, "'fn' after extern \"c\"");
+            skip_to_item(p);
+            _ = close(p, m, cst.Kind.Error);
+        }
+        return;
+    }
     let is_pub = accept(p, tk.Kind.KwPub);
     fn_mods(p);
     match peek(p) {

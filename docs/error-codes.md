@@ -171,3 +171,5 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0920` | An `unsafe` block without a `// SAFETY:` comment, in a package that sets `strict_unsafe` (§10.1). |
 | `E0921` | An operation that needs `unsafe` outside an `unsafe` block or `unsafe fn`: a raw pointer made, read, written, offset or turned into a view, or an `unsafe fn` called (§10.1). |
 | `E0922` | An `asm` operand that is not `in`, `out`, `inout` or `clobber`, whose value is not an integer, `bool` or pointer, that writes a place it cannot, or a `%N` without an operand (§10.2). |
+| `E0923` | A `naked fn` with parameters or a result, or whose body is not one `asm` statement (§10.2). |
+| `E0924` | A foreign function with another calling convention than `"c"`, or one that takes or returns something other than integers, `bool`s, floats and raw pointers (§10.1). |

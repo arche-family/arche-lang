@@ -273,6 +273,12 @@ pub fn is_nopanic_fn(c: &Checker, d: u32) -> bool {
     }
 }
 
+/// The module being checked declares functions the compiler provides.
+fn intrinsic_module(c: &Checker) -> bool {
+    let m = c.p.modules[c.module as usize].name.view();
+    return m.eq("core.mem") or m.eq("core.ptr") or m.eq("core.atomic");
+}
+
 /// d is a function of core.mem, which the compiler provides (lib/core/mem.arche),
 /// or an instance of one.
 pub fn is_intrinsic(c: &Checker, d: u32) -> bool {
@@ -280,7 +286,8 @@ pub fn is_intrinsic(c: &Checker, d: u32) -> bool {
     if decl.template != NONE {
         decl = c.decls[decl.template as usize];
     }
-    return decl.kind == DeclKind.Fn and decl.owner == NONE and c.p.modules[decl.module as usize].name.view().eq("core.mem");
+    let m = c.p.modules[decl.module as usize].name.view();
+    return decl.kind == DeclKind.Fn and decl.owner == NONE and (m.eq("core.mem") or m.eq("core.ptr"));
 }
 
 /// t is core.Unique, the mark of move-only values (spec/arche.md §11.1).
@@ -291,6 +298,58 @@ pub fn is_unique(c: &Checker, t: ty.TypeId) -> bool {
     }
     let decl = c.decls[info.decl as usize];
     return c.names.text(decl.name).eq("Unique") and c.p.modules[decl.module as usize].name.view().eq("core");
+}
+
+/// Declaration d is `extern "c" fn`: a foreign function (spec/arche.md §10.1).
+pub fn is_extern_fn(c: &Checker, d: u32) -> bool {
+    let decl = c.decls[d as usize];
+    if decl.kind != DeclKind.Fn or decl.owner != NONE {
+        return false;
+    }
+    if c.p.modules[decl.module as usize].tree.node(decl.node).kind != cst.Kind.FnSig {
+        return false;
+    }
+    return fn_attribute(c, d, "extern").len() > 0;
+}
+
+/// Declaration d is a naked fn (spec/arche.md §10.2).
+pub fn is_naked_fn(c: &Checker, d: u32) -> bool {
+    let decl = c.decls[d as usize];
+    let t = &c.p.modules[decl.module as usize].tree;
+    match t.find_own(decl.node, tk.Kind.KwNaked, c.a) {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
+/// The text of a function's attribute, export("...") or section("..."),
+/// without its quotes; empty when it has none.
+pub fn fn_attribute(c: &Checker, d: u32, name: str) -> alloc.String {
+    var out = alloc.String.init(c.a);
+    let decl = c.decls[d as usize];
+    let m = &c.p.modules[decl.module as usize];
+    let t = &m.tree;
+    let n = t.node(decl.node);
+    var i: u32 = 0;
+    while i < n.children_len : (i += 1) {
+        let ch = t.child(n, i);
+        if t.node(ch).kind != cst.Kind.Attribute {
+            continue;
+        }
+        let first = t.first_token(ch);
+        if not m.token_text(first).eq(name) {
+            continue;
+        }
+        match t.find_own(ch, tk.Kind.String, c.a) {
+            some(s) => {
+                let quoted = m.token_text(s);
+                out.push_str(quoted[1..quoted.len() - 1]);
+                return out;
+            }
+            none => { }
+        }
+    }
+    return out;
 }
 
 /// Declaration d is an unsafe fn.
@@ -1981,7 +2040,7 @@ fn collect_items(c: &mut Checker) {
             c.impls.push(Impl { module: c.module, node: n, iface: NONE, target: ty.invalid(), methods_start: 0, methods_len: 0 });
             continue;
         }
-        if k == cst.Kind.FnSig and not c.p.modules[c.module as usize].name.view().eq("core.mem") {
+        if k == cst.Kind.FnSig and not intrinsic_module(c) and not (child_count(c, n) > 0 and kind_of(c, child(c, n, 0)) == cst.Kind.Attribute) {
             let s = span_of(c, n);
             report(c, codes.UNEXPECTED_TOKEN, s, "only the methods of an interface have no body");
             continue;
@@ -2391,8 +2450,38 @@ fn check_signature_here(c: &mut Checker, d: u32) {
             report_owned(c, codes.BAD_SELF, s, m);
         }
     }
+    if is_extern_fn(c, d) {
+        check_extern(c, d, info);
+    }
     c.decls[d as usize].fn_index = c.fns.len() as u32;
     c.fns.push(info);
+}
+
+/// extern "c": the C calling convention, which agrees with Arche's for
+/// scalars (docs/abi.md), so only scalars cross it.
+fn check_extern(c: &mut Checker, d: u32, info: FnInfo) {
+    let decl = c.decls[d as usize];
+    let s = token_span(c, decl.name_token);
+    let abi = fn_attribute(c, d, "extern");
+    if not abi.view().eq("c") {
+        let abi_span = span_of(c, child(c, decl.node, 0));
+        report(c, codes.BAD_EXTERN, abi_span, "the only foreign calling convention is \"c\"");
+    }
+    var fine = true;
+    var i = info.params_start;
+    while i < info.params_start + info.params_len : (i += 1) {
+        fine = fine and c_scalar(c, c.params[i as usize].type_id);
+    }
+    let rk = c.t.kind(info.ret);
+    fine = fine and (rk == ty.Kind.Void or rk == ty.Kind.Noreturn or c_scalar(c, info.ret));
+    if not fine {
+        report(c, codes.BAD_EXTERN, s, "a foreign function takes and returns only integers, bools, floats and raw pointers");
+    }
+}
+
+fn c_scalar(c: &Checker, t: ty.TypeId) -> bool {
+    let k = c.t.kind(t);
+    return k == ty.Kind.Int or k == ty.Kind.Bool or k == ty.Kind.Float or k == ty.Kind.Ptr or k == ty.Kind.Invalid;
 }
 
 // ---- impls (spec/arche.md §5.1) --------------------------------------------------

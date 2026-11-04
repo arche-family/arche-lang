@@ -94,6 +94,9 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
     c.defer_loops = ck.NONE;
     let saved_unsafe = c.unsafe_depth;
     c.unsafe_depth = 0;
+    if ck.full(c) and ck.is_naked_fn(c, info.decl) {
+        check_naked(c, info);
+    }
     var outer_labels = alloc.List(alloc.Symbol).init(c.a);
     let ol = c.labels.items();
     var q: usize = 0;
@@ -101,7 +104,7 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
         outer_labels.push(ol[q]);
     }
     c.labels = alloc.List(alloc.Symbol).init(c.a);
-    if ck.full(c) and ck.is_unsafe_fn(c, info.decl) {
+    if ck.full(c) and (ck.is_unsafe_fn(c, info.decl) or ck.is_naked_fn(c, info.decl)) {
         c.unsafe_depth = 1;
     }
     while c.scope.len() > 0 {
@@ -130,6 +133,28 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
     c.unsafe_depth = saved_unsafe;
     c.labels = outer_labels;
     ck.restore_context(c, saved);
+}
+
+/// A naked fn has no prologue, so no frame for parameters or locals: it
+/// takes nothing, returns nothing, and its body is one asm (spec/arche.md
+/// §10.2). Its body is unsafe code.
+fn check_naked(c: &mut ck.Checker, info: ck.FnInfo) {
+    let decl = c.decls[info.decl as usize];
+    let s = ck.token_span(c, decl.name_token);
+    let rk = c.t.kind(info.ret);
+    if info.params_len > 0 or (rk != ty.Kind.Void and rk != ty.Kind.Noreturn) {
+        ck.report(c, codes.BAD_NAKED, s, "a naked fn takes no parameters and returns nothing: its asm reads registers itself");
+        return;
+    }
+    let body = ck.child(c, decl.node, ck.child_count(c, decl.node) - 1);
+    var fine = ck.child_count(c, body) == 1;
+    if fine {
+        let st = ck.child(c, body, 0);
+        fine = ck.kind_of(c, st) == cst.Kind.ExprStmt and ck.kind_of(c, ck.child(c, st, 0)) == cst.Kind.AsmExpr;
+    }
+    if not fine {
+        ck.report(c, codes.BAD_NAKED, s, "a naked fn's body is one asm(...) statement");
+    }
 }
 
 /// requires e and ensures e (spec/arche.md §8.1): bool conditions over the

@@ -333,12 +333,13 @@ These exist for the `freestanding` target (S16) and are all `unsafe`:
 | Feature | Form |
 | --- | --- |
 | Inline assembly | `asm("mov %0, cr3", in(reg) addr)` with typed operands and clobbers: `in(r) e`, `out(r) p`, `inout(r) p` and `clobber("name")`, where `r` is `reg` (any register) or a register in quotes, `"rax"`; `%N` in the text is the N-th operand, `%%` a `%`. Operands are integers, `bool`s or pointers; `out` and `inout` ones are writable places (E0922). An `asm` also clobbers memory, so the compiler keeps loads and stores in order around it |
-| Naked functions | `naked fn`: no prologue or epilogue; the body is one `asm` block |
-| Volatile access | `ptr.read_volatile(p)`, `ptr.write_volatile(p, v)` |
+| Naked functions | `naked fn`: no prologue or epilogue; it takes no parameters, returns nothing, and its body is one `asm` statement (E0923) |
+| Volatile access | `p.read_volatile()`, `p.write_volatile(v)` on a raw pointer to a scalar; `p.addr()` is its address and `core.ptr.from_addr(T, n)` a pointer to address `n` |
+| Foreign functions | `extern "c" fn name(x: u64) -> u64;` declares a function of another object file, called by its own name; only integers, `bool`s, floats and raw pointers cross it (E0924). `export("name") fn …` gives an Arche function that name |
 | Atomics | `core.atomic.U32` and friends, with an explicit `Ordering` on every operation: `Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst` |
 | Barriers | `core.atomic.fence(ordering)` |
 | Layout | `packed struct`, `align(N)` on a type or field, `extern struct` for C's layout |
-| Sections | `section(".text.boot")` on a function or constant |
+| Sections | `section(".text.boot")` on a function (on a constant: not yet) |
 | Panic handler | `panic_handler: "kernel.panic.halt"` in the manifest names a `noreturn` function that a panic calls, for targets without `std` |
 | Target features | `target_features: ["-sse", "-avx"]` in the manifest |
 
@@ -404,7 +405,8 @@ align       = "align" "(" expr ")" ;
 impl_decl   = "impl" named "for" type "{" { [ "pub" ] fn_decl } "}" ;
 
 fn_decl     = fn_sig { contract } block ;
-fn_sig      = { fn_mod } "fn" IDENT "(" [ params ] ")" [ "->" type ] [ where ] ;
+fn_sig      = { fn_mod | fn_attr } "fn" IDENT "(" [ params ] ")" [ "->" type ] [ where ] ;
+fn_attr     = ( "export" | "section" ) "(" STRING ")" ;   (* contextual words *)
 fn_mod      = "nopanic" | "naked" | "unsafe" ;
 params      = param { "," param } [ "," ] ;
 param       = [ "comptime" ] IDENT ":" type ;

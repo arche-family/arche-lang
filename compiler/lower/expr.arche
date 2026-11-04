@@ -1294,6 +1294,11 @@ fn intrinsic(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
     if nm.eq("null") {
         return scalar_val(lw.konst(l, ir.Ty.Ptr, 0));
     }
+    if nm.eq("from_addr") {
+        var i = ir.inst(ir.Op.IntToPtr, ir.Ty.Ptr);
+        i.a = value(l, runtime_arg(l, n, offset: info.ncomptime, i: 0)).v;
+        return scalar_val(lw.emit(l, i));
+    }
     let a0 = value(l, runtime_arg(l, n, offset: info.ncomptime, i: 0));
     if nm.eq("str_from") {
         return lw.own_val(l, rt, a0);
@@ -1340,6 +1345,20 @@ fn call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
     let nargs = count(l, n) - 1;
     let is_method = kind(l, callee) == cst.Kind.FieldExpr and not ck.is_invalid(&l.c, type_of(l, callee));
     let d = ck.ref_of(&l.c, n);
+    if d != ck.NONE and ck.is_extern_fn(&l.c, d) {
+        // A foreign function, by its own name, with scalars only.
+        let info = l.c.fns[l.c.decls[d as usize].fn_index as usize];
+        var args = lw.args0(l);
+        var i: u32 = 0;
+        while i < nargs : (i += 1) {
+            args.push(value(l, arg_node(l, n, i)).v);
+        }
+        var name = alloc.String.init(l.a);
+        name.push_str(l.c.names.text(l.c.decls[d as usize].name));
+        let rt = lw.ret_ty(&l.c, info.ret);
+        let r = lw.call_runtime(l, name.view(), rt, &args);
+        return result_of(l, t, r: r, sret: ck.NONE);
+    }
     if is_method and d != ck.NONE and l.c.decls[d as usize].owner != ck.NONE and
         l.c.decls[l.c.decls[d as usize].owner as usize].kind == ck.DeclKind.Interface {
         return dyn_call(l, n, d);
@@ -1482,6 +1501,20 @@ fn builtin_method(l: &mut lw.Lower, n: cst.NodeId, callee: cst.NodeId) -> lw.Val
         if nm.eq("add") {
             let k = value(l, arg_node(l, n, 0)).v;
             return scalar_val(lw.gep_index(l, addr: p, index: k, size_of(l, info.elem)));
+        }
+        if nm.eq("read_volatile") {
+            let s = layout.scalar(&l.c, info.elem);
+            return scalar_val(lw.load_with(l, s, addr: p, flags: ir.LOAD_VOLATILE));
+        }
+        if nm.eq("write_volatile") {
+            let v = value(l, arg_node(l, n, 0));
+            lw.store_with(l, value: v.v, addr: p, flags: ir.LOAD_VOLATILE);
+            return nothing();
+        }
+        if nm.eq("addr") {
+            var i = ir.inst(ir.Op.PtrToInt, ir.Ty.I64);
+            i.a = p;
+            return scalar_val(lw.emit(l, i));
         }
         return scalar_val(p); // as_ref, as_mut: the same address
     }
