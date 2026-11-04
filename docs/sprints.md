@@ -2,7 +2,7 @@
 
 > 2026-11-03 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S10. S0–S4 va S6–S9 yopilgan: compiler o'zini build qiladi, stage2 == stage3. Ochiq qolganlar: S5'da parser'ni 24 soat fuzz qilish (CI har commit'da 60 soniya fuzz qiladi) va S9'da stage0'ni git tag bilan muzlatish.
+**Joriy sprint:** S10. S0–S4 va S6–S9 yopilgan: compiler o'zini build qiladi, stage2 == stage3, stage0 `stage0-frozen` tag'i bilan muzlatilgan. Ochiq qolgani: S5'da parser'ni 24 soat fuzz qilish (CI har commit'da 60 soniya fuzz qiladi).
 
 ## Qoidalar
 
