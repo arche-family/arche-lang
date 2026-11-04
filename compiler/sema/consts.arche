@@ -8,6 +8,7 @@ import syntax.cst;
 import syntax.token as tk;
 import sema.check as ck;
 import sema.expr;
+import sema.interp;
 import sema.types as ty;
 
 pub fn check_const(c: &mut ck.Checker, d: u32) {
@@ -191,6 +192,21 @@ pub fn eval(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
         .CastExpr => {
             return eval_cast(c, n);
         }
+        .CallExpr => {
+            // A call in a constant runs in the interpreter (spec/arche.md §4.3).
+            let d = ck.ref_of(c, n);
+            if d == ck.NONE or d >= ck.ENV_REF {
+                return 0;
+            }
+            let offset = c.fns[c.decls[d as usize].fn_index as usize].ncomptime;
+            var args = alloc.List(u64).init(c.a);
+            let nargs = ck.child_count(c, n) - 1;
+            var i = offset;
+            while i < nargs : (i += 1) {
+                args.push(eval(c, ck.child(c, ck.child(c, n, i + 1), 0)));
+            }
+            return interp.call(c, d, &args, at: n);
+        }
         _ => {
             return 0;
         }
@@ -198,8 +214,7 @@ pub fn eval(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
 }
 
 fn op_kind(c: &ck.Checker, n: cst.NodeId) -> tk.Kind {
-    let toks = ck.own(c, n);
-    return ck.tok_kind(c, toks[0]);
+    return ck.tok_kind(c, ck.first_own(c, n));
 }
 
 fn eval_unary(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
@@ -211,16 +226,29 @@ fn eval_unary(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
         }
         return 0;
     }
+    let x = eval(c, operand);
+    return apply_unary(c, n, x);
+}
+
+/// The value of a `-` or `~` node n on operand value bits.
+pub fn apply_unary(c: &mut ck.Checker, n: cst.NodeId, bits: u64) -> u64 {
+    let op = op_kind(c, n);
+    let operand = ck.child(c, n, 0);
+    if op == tk.Kind.KwNot {
+        if bits == 0 {
+            return 1;
+        }
+        return 0;
+    }
     let k = int_kind_of(c, n);
     if op == tk.Kind.Tilde {
-        return normalize(k, ~eval(c, operand));
+        return normalize(k, ~bits);
     }
     // '-' before a literal makes a negative literal: -128 is a valid i8.
     if ck.kind_of(c, operand) == cst.Kind.IntLit {
-        let mag = eval(c, operand);
-        return normalize(k, ~mag +% 1);
+        return normalize(k, ~bits +% 1);
     }
-    let x = bits_to_i64(eval(c, operand));
+    let x = bits_to_i64(bits);
     if is_min(k, x) {
         return overflow(c, n);
     }
@@ -245,13 +273,27 @@ fn eval_binary(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
     }
     let a = eval(c, lhs);
     let b = eval(c, rhs);
+    return apply_binary(c, n, a: a, b: b);
+}
+
+/// The value of binary operator node n on operand values a and b; and and
+/// or are not here, because they decide whether to evaluate b.
+pub fn apply_binary(c: &mut ck.Checker, n: cst.NodeId, a: u64, b: u64) -> u64 {
+    let op = op_kind(c, n);
+    let t = ck.type_of(c, ck.child(c, n, 0));
+    return apply_op(c, n, op, t, a: a, b: b);
+}
+
+/// op on operands of type t, with errors reported at node `at`.
+pub fn apply_op(c: &mut ck.Checker, at: cst.NodeId, op: tk.Kind, t: ty.TypeId, a: u64, b: u64) -> u64 {
+    let n = at;
     match op {
         .EqEq | .NotEq | .Lt | .Le | .Gt | .Ge => {
-            return compare(c, lhs, op, a: a, b: b);
+            return compare_typed(c, t, op, a: a, b: b);
         }
         _ => { }
     }
-    let k = int_kind_of(c, n);
+    let k = c.t.get(t).int_kind;
     let sig = ty.is_signed(k);
     let sa = bits_to_i64(a);
     let sb = bits_to_i64(b);
@@ -350,9 +392,9 @@ fn eval_binary(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
     }
 }
 
-fn compare(c: &ck.Checker, lhs: cst.NodeId, op: tk.Kind, a: u64, b: u64) -> u64 {
+fn compare_typed(c: &ck.Checker, t: ty.TypeId, op: tk.Kind, a: u64, b: u64) -> u64 {
     var cmp: i32 = 0;
-    let info = c.t.get(ck.type_of(c, lhs));
+    let info = c.t.get(t);
     if info.kind == ty.Kind.Int and ty.is_signed(info.int_kind) {
         let x = bits_to_i64(a);
         let y = bits_to_i64(b);
@@ -382,8 +424,13 @@ fn compare(c: &ck.Checker, lhs: cst.NodeId, op: tk.Kind, a: u64, b: u64) -> u64 
 }
 
 fn eval_cast(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
+    let x = eval(c, ck.child(c, n, 0));
+    return apply_cast(c, n, x);
+}
+
+/// The value of an `as` or `as%` node n on operand value x.
+pub fn apply_cast(c: &mut ck.Checker, n: cst.NodeId, x: u64) -> u64 {
     let operand = ck.child(c, n, 0);
-    let x = eval(c, operand);
     let from = int_kind_of(c, operand);
     let to = int_kind_of(c, n);
     if op_kind(c, n) == tk.Kind.KwAsWrap {

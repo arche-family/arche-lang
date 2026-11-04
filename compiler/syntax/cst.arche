@@ -130,15 +130,49 @@ pub type Tree = struct {
         return out;
     }
 
-    /// The first own token of the kind, if there is one.
-    pub fn find_own(self: &Tree, id: NodeId, kind: tk.Kind, a: alloc.Allocator) -> ?u32 {
-        let own = self.own_tokens(id, a);
-        let items = own.items();
-        var i: usize = 0;
-        while i < items.len() : (i += 1) {
-            if self.tokens[items[i] as usize].kind == kind {
-                return items[i];
+    /// The first significant token of a node that no child covers, without
+    /// allocating: the operator of an expression, the keyword of a statement.
+    pub fn first_own(self: &Tree, id: NodeId) -> u32 {
+        let n = self.node(id);
+        var at = n.first;
+        var c: u32 = 0;
+        while at < n.end {
+            if c < n.children_len {
+                let child = self.node(self.child(n, c));
+                if at >= child.first {
+                    at = child.end;
+                    c += 1;
+                    continue;
+                }
             }
+            if not self.tokens[at as usize].kind.is_trivia() {
+                return at;
+            }
+            at += 1;
+        }
+        return n.first;
+    }
+
+    /// The first own token of the kind, if there is one; without
+    /// allocating, since the checker and interpreter ask it often.
+    pub fn find_own(self: &Tree, id: NodeId, kind: tk.Kind, a: alloc.Allocator) -> ?u32 {
+        _ = a;
+        let n = self.node(id);
+        var at = n.first;
+        var c: u32 = 0;
+        while at < n.end {
+            if c < n.children_len {
+                let child = self.node(self.child(n, c));
+                if at >= child.first {
+                    at = child.end;
+                    c += 1;
+                    continue;
+                }
+            }
+            if self.tokens[at as usize].kind == kind {
+                return at;
+            }
+            at += 1;
         }
         return none;
     }

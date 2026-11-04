@@ -182,6 +182,9 @@ pub type Checker = struct {
     pub pending: alloc.List(u32),
     /// The next call checked has this many comptime arguments first.
     pub arg_offset: u32,
+    /// Function bodies already checked: a constant can call a function
+    /// before the pass over bodies reaches it.
+    pub checked: alloc.Map(u32, bool),
     pub a: alloc.Allocator,
 }
 
@@ -210,6 +213,11 @@ pub fn child_count(c: &Checker, n: cst.NodeId) -> u32 {
 
 pub fn own(c: &Checker, n: cst.NodeId) -> alloc.List(u32) {
     return c.p.modules[c.module as usize].tree.own_tokens(n, c.a);
+}
+
+/// The first own token of a node, without allocating.
+pub fn first_own(c: &Checker, n: cst.NodeId) -> u32 {
+    return c.p.modules[c.module as usize].tree.first_own(n);
 }
 
 pub fn has_own(c: &Checker, n: cst.NodeId, k: tk.Kind) -> bool {
@@ -1545,10 +1553,10 @@ fn check_contains(c: &mut Checker, t: ty.TypeId, path: &mut alloc.List(u32), don
     done.put(d, true);
 }
 
-fn check_signature(c: &mut Checker, d: u32) {
+pub fn check_signature(c: &mut Checker, d: u32) {
     let decl = c.decls[d as usize];
-    if decl.generic {
-        return; // a template: each instance has its own signature
+    if decl.generic or decl.fn_index != NONE {
+        return; // a template, or a signature checked already, on demand
     }
     let saved = save_context(c);
     enter_decl(c, d);
@@ -1747,6 +1755,7 @@ pub fn analyze(p: program.Program) -> Checker {
         instances: alloc.Map(InstKey, u32).init(a),
         pending: alloc.List(u32).init(a),
         arg_offset: 0,
+        checked: alloc.Map(u32, bool).init(a),
         a: a,
     };
     add_io_error(&mut c);

@@ -73,7 +73,10 @@ def main():
             sources.append(data)
         except UnicodeDecodeError:
             pass
-    path = "fuzz-input.arche"
+    # Half of the inputs are checked as full Arche, beside a manifest, so
+    # generics and the compile-time interpreter are fuzzed too.
+    os.makedirs("fuzz-full", exist_ok=True)
+    open(os.path.join("fuzz-full", "package.arche"), "w").write("// manifest\n")
     cases = failures = 0
     end = time.time() + seconds
     while time.time() < end:
@@ -83,6 +86,7 @@ def main():
         except UnicodeDecodeError:
             continue
         cases += 1
+        path = "fuzz-input.arche" if cases % 2 else os.path.join("fuzz-full", "input.arche")
         open(path, "wb").write(data)
         try:
             r = subprocess.run([arche, "cst", path], capture_output=True, timeout=5)
@@ -96,7 +100,10 @@ def main():
         if not ok:
             failures += 1
             open("fuzz-%d.arche" % failures, "wb").write(data)
-    os.remove(path)
+    for p in ("fuzz-input.arche", os.path.join("fuzz-full", "input.arche"), os.path.join("fuzz-full", "package.arche")):
+        if os.path.exists(p):
+            os.remove(p)
+    os.rmdir("fuzz-full")
     print("fuzz: %d cases, %d failures" % (cases, failures))
     sys.exit(1 if failures else 0)
 

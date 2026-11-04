@@ -1,0 +1,377 @@
+/// The compile-time interpreter (spec/arche.md §4.3): a constant's
+/// initializer may call functions in full Arche, and the call runs here,
+/// over the checked CST of the function.
+///
+/// This first version runs integer and bool code: parameters, locals,
+/// arithmetic with the traps of §7.2, if, while, match on integers and
+/// bools, calls and return. Anything else is reported as code that cannot
+/// run at compile time. A run is limited to 10^8 steps and 1000 nested
+/// calls (E0840).
+import alloc;
+import codes;
+import syntax.cst;
+import syntax.token as tk;
+import sema.check as ck;
+import sema.consts;
+import sema.stmt;
+import sema.types as ty;
+
+const MAX_STEPS: u64 = 100000000;
+const MAX_DEPTH: u32 = 1000;
+
+type Local = struct {
+    name: alloc.Symbol,
+    bits: u64,
+}
+
+type Flow = enum { Normal, Return, Break, Continue, Failed }
+
+type Run = struct {
+    locals: alloc.List(Local),
+    steps: u64,
+    depth: u32,
+    result: u64,
+    failed: bool,
+}
+
+/// Runs function decl d on argument values, from a constant at `at`.
+/// Returns its result; on failure a diagnostic is reported and 0 returned.
+pub fn call(c: &mut ck.Checker, d: u32, args: &alloc.List(u64), at: cst.NodeId) -> u64 {
+    var r = Run { locals: alloc.List(Local).init(c.a), steps: 0, depth: 0, result: 0, failed: false };
+    let v = run_fn(c, &mut r, d, args, at);
+    if r.failed {
+        return 0;
+    }
+    return v;
+}
+
+fn fail(c: &mut ck.Checker, r: &mut Run, n: cst.NodeId, message: str) -> Flow {
+    if not r.failed {
+        let s = ck.span_of(c, n);
+        ck.report(c, codes.NOT_CONSTANT, s, message);
+    }
+    r.failed = true;
+    return Flow.Failed;
+}
+
+fn step(c: &mut ck.Checker, r: &mut Run, n: cst.NodeId) -> bool {
+    r.steps += 1;
+    if r.steps > MAX_STEPS {
+        if not r.failed {
+            let s = ck.span_of(c, n);
+            ck.report(c, codes.COMPTIME_LIMIT, s, "compile-time evaluation ran more than 10^8 steps (spec/arche.md §4.3)");
+        }
+        r.failed = true;
+        return false;
+    }
+    return not r.failed;
+}
+
+fn run_fn(c: &mut ck.Checker, r: &mut Run, d: u32, args: &alloc.List(u64), at: cst.NodeId) -> u64 {
+    if r.depth >= MAX_DEPTH {
+        if not r.failed {
+            let s = ck.span_of(c, at);
+            ck.report(c, codes.COMPTIME_LIMIT, s, "compile-time evaluation nested more than 1000 calls (spec/arche.md §4.3)");
+        }
+        r.failed = true;
+        return 0;
+    }
+    let fi = c.decls[d as usize].fn_index;
+    let before = c.p.diags.count();
+    stmt.check_fn_nested(c, fi);
+    if c.p.diags.count() > before {
+        r.failed = true;
+        return 0;
+    }
+    let info = c.fns[fi as usize];
+    let saved = ck.save_context(c);
+    let saved_fn = c.fn_index;
+    ck.enter_decl(c, d);
+    c.cur_table = info.table;
+    c.fn_index = fi;
+    let base = r.locals.len();
+    let values = args.items();
+    var i: u32 = 0;
+    while i < info.params_len : (i += 1) {
+        let p = c.params[(info.params_start + i) as usize];
+        r.locals.push(Local { name: p.name, bits: values[i as usize] });
+    }
+    r.depth += 1;
+    let n = c.decls[d as usize].node;
+    let body = ck.child(c, n, ck.child_count(c, n) - 1);
+    let flow = block(c, r, body);
+    r.depth -= 1;
+    while r.locals.len() > base {
+        _ = r.locals.pop();
+    }
+    ck.restore_context(c, saved);
+    c.fn_index = saved_fn;
+    if flow == Flow.Return {
+        return r.result;
+    }
+    return 0;
+}
+
+fn find_local(r: &Run, name: alloc.Symbol) -> ?usize {
+    var i = r.locals.len();
+    while i > 0 : (i -= 1) {
+        if r.locals[i - 1].name == name {
+            return i - 1;
+        }
+    }
+    return none;
+}
+
+fn block(c: &mut ck.Checker, r: &mut Run, b: cst.NodeId) -> Flow {
+    let base = r.locals.len();
+    let count = ck.child_count(c, b);
+    var flow = Flow.Normal;
+    var i: u32 = 0;
+    while i < count and flow == Flow.Normal : (i += 1) {
+        flow = statement(c, r, ck.child(c, b, i));
+    }
+    while r.locals.len() > base {
+        _ = r.locals.pop();
+    }
+    return flow;
+}
+
+fn compound(op: tk.Kind) -> tk.Kind {
+    match op {
+        .PlusAssign => { return tk.Kind.Plus; }
+        .MinusAssign => { return tk.Kind.Minus; }
+        .StarAssign => { return tk.Kind.Star; }
+        .SlashAssign => { return tk.Kind.Slash; }
+        .PercentAssign => { return tk.Kind.Percent; }
+        .PlusWrapAssign => { return tk.Kind.PlusWrap; }
+        .MinusWrapAssign => { return tk.Kind.MinusWrap; }
+        .StarWrapAssign => { return tk.Kind.StarWrap; }
+        .AmpAssign => { return tk.Kind.Amp; }
+        .PipeAssign => { return tk.Kind.Pipe; }
+        .CaretAssign => { return tk.Kind.Caret; }
+        .ShlAssign => { return tk.Kind.Shl; }
+        _ => { return tk.Kind.Shr; }
+    }
+}
+
+fn statement(c: &mut ck.Checker, r: &mut Run, s: cst.NodeId) -> Flow {
+    if not step(c, r, s) {
+        return Flow.Failed;
+    }
+    match ck.kind_of(c, s) {
+        .Block => { return block(c, r, s); }
+        .LetStmt => {
+            let v = value(c, r, ck.child(c, s, ck.child_count(c, s) - 1));
+            let sym = ck.symbol(c, ck.ident_of(c, s));
+            r.locals.push(Local { name: sym, bits: v });
+        }
+        .AssignStmt => {
+            let target = ck.child(c, s, 0);
+            if ck.kind_of(c, target) != cst.Kind.NameExpr {
+                return fail(c, r, target, "only a local variable can be assigned at compile time");
+            }
+            let sym = ck.symbol(c, ck.ident_of(c, target));
+            let slot = find_local(r, sym) orelse 0;
+            let v = value(c, r, ck.child(c, s, 1));
+            let op = ck.tok_kind(c, ck.first_own(c, s));
+            if op == tk.Kind.Assign {
+                r.locals[slot].bits = v;
+            } else {
+                let old = r.locals[slot].bits;
+                let t = ck.type_of(c, target);
+                r.locals[slot].bits = consts.apply_op(c, s, compound(op), t, a: old, b: v);
+            }
+        }
+        .ExprStmt | .DiscardStmt => { _ = value(c, r, ck.child(c, s, 0)); }
+        .IfStmt => {
+            if value(c, r, ck.child(c, s, 0)) != 0 {
+                return block(c, r, ck.child(c, s, 1));
+            }
+            if ck.child_count(c, s) > 2 {
+                return statement(c, r, ck.child(c, s, 2));
+            }
+        }
+        .WhileStmt => {
+            let has_step = ck.child_count(c, s) == 3;
+            let body = ck.child(c, s, ck.child_count(c, s) - 1);
+            while value(c, r, ck.child(c, s, 0)) != 0 and not r.failed {
+                let flow = block(c, r, body);
+                if flow == Flow.Break {
+                    break;
+                }
+                if flow == Flow.Return or flow == Flow.Failed {
+                    return flow;
+                }
+                if has_step {
+                    _ = statement(c, r, ck.child(c, s, 1));
+                }
+            }
+        }
+        .MatchStmt => { return match_stmt(c, r, s); }
+        .ReturnStmt => {
+            if ck.child_count(c, s) > 0 {
+                r.result = value(c, r, ck.child(c, s, 0));
+            }
+            return Flow.Return;
+        }
+        .BreakStmt => { return Flow.Break; }
+        .ContinueStmt => { return Flow.Continue; }
+        _ => { return fail(c, r, s, "this statement cannot run at compile time yet"); }
+    }
+    if r.failed {
+        return Flow.Failed;
+    }
+    return Flow.Normal;
+}
+
+/// A pattern's literal, as bits of its type.
+fn literal(c: &ck.Checker, toks: []u32, from: &mut usize) -> u64 {
+    var negative = false;
+    if ck.tok_kind(c, toks[from.*]) == tk.Kind.Minus {
+        negative = true;
+        from.* += 1;
+    }
+    let v = ck.tok_value(c, toks[from.*]);
+    from.* += 1;
+    if negative {
+        return ~v +% 1;
+    }
+    return v;
+}
+
+fn matches(c: &mut ck.Checker, r: &mut Run, p: cst.NodeId, t: ty.TypeId, v: u64) -> bool {
+    match ck.kind_of(c, p) {
+        .WildcardPat => { return true; }
+        .BindPat => {
+            let sym = ck.symbol(c, ck.ident_of(c, p));
+            r.locals.push(Local { name: sym, bits: v });
+            return true;
+        }
+        .BoolPat => {
+            let is_true = ck.tok_kind(c, ck.tree(c).first_token(p)) == tk.Kind.KwTrue;
+            return (v != 0) == is_true;
+        }
+        .LitPat | .RangePat => {
+            let toks = ck.own(c, p);
+            var at: usize = 0;
+            let lo = literal(c, toks.items(), &mut at);
+            if ck.kind_of(c, p) == cst.Kind.LitPat {
+                return v == lo;
+            }
+            at += 1;
+            let hi = literal(c, toks.items(), &mut at);
+            let signed = ty.is_signed(c.t.get(t).int_kind);
+            if signed {
+                let x = consts.bits_to_i64(v);
+                return x >= consts.bits_to_i64(lo) and x <= consts.bits_to_i64(hi);
+            }
+            return v >= lo and v <= hi;
+        }
+        _ => {
+            _ = fail(c, r, p, "this pattern cannot be matched at compile time yet");
+            return false;
+        }
+    }
+}
+
+fn match_stmt(c: &mut ck.Checker, r: &mut Run, s: cst.NodeId) -> Flow {
+    let scrutinee = ck.child(c, s, 0);
+    let t = ck.type_of(c, scrutinee);
+    let v = value(c, r, scrutinee);
+    let count = ck.child_count(c, s);
+    var i: u32 = 1;
+    while i < count : (i += 1) {
+        let arm = ck.child(c, s, i);
+        let parts = ck.child_count(c, arm);
+        let base = r.locals.len();
+        var j: u32 = 0;
+        while j + 1 < parts : (j += 1) {
+            if matches(c, r, ck.child(c, arm, j), t, v) {
+                let flow = block(c, r, ck.child(c, arm, parts - 1));
+                while r.locals.len() > base {
+                    _ = r.locals.pop();
+                }
+                return flow;
+            }
+            if r.failed {
+                return Flow.Failed;
+            }
+        }
+    }
+    return fail(c, r, s, "no match arm matched at compile time");
+}
+
+fn value(c: &mut ck.Checker, r: &mut Run, e: cst.NodeId) -> u64 {
+    if not step(c, r, e) {
+        return 0;
+    }
+    match ck.kind_of(c, e) {
+        .IntLit | .CharLit => { return ck.tok_value(c, ck.tree(c).first_token(e)); }
+        .BoolLit => {
+            if ck.tok_kind(c, ck.tree(c).first_token(e)) == tk.Kind.KwTrue {
+                return 1;
+            }
+            return 0;
+        }
+        .ParenExpr => { return value(c, r, ck.child(c, e, 0)); }
+        .NameExpr => {
+            let sym = ck.symbol(c, ck.ident_of(c, e));
+            match find_local(r, sym) {
+                some(i) => { return r.locals[i].bits; }
+                none => { }
+            }
+            return consts.eval(c, e);
+        }
+        .FieldExpr => { return consts.eval(c, e); }
+        .UnaryExpr => {
+            let x = value(c, r, ck.child(c, e, 0));
+            return consts.apply_unary(c, e, x);
+        }
+        .BinaryExpr => {
+            let op = ck.tok_kind(c, ck.first_own(c, e));
+            let a = value(c, r, ck.child(c, e, 0));
+            if op == tk.Kind.KwAnd {
+                if a == 0 {
+                    return 0;
+                }
+                return value(c, r, ck.child(c, e, 1));
+            }
+            if op == tk.Kind.KwOr {
+                if a != 0 {
+                    return 1;
+                }
+                return value(c, r, ck.child(c, e, 1));
+            }
+            let b = value(c, r, ck.child(c, e, 1));
+            return consts.apply_binary(c, e, a: a, b: b);
+        }
+        .CastExpr => {
+            let x = value(c, r, ck.child(c, e, 0));
+            return consts.apply_cast(c, e, x);
+        }
+        .CallExpr => { return call_expr(c, r, e); }
+        _ => {
+            _ = fail(c, r, e, "this expression cannot be evaluated at compile time yet");
+            return 0;
+        }
+    }
+}
+
+fn call_expr(c: &mut ck.Checker, r: &mut Run, e: cst.NodeId) -> u64 {
+    let d = ck.ref_of(c, e);
+    if d == ck.NONE or d >= ck.ENV_REF or c.decls[d as usize].kind != ck.DeclKind.Fn {
+        _ = fail(c, r, e, "only functions of this program can be called at compile time");
+        return 0;
+    }
+    let offset = c.fns[c.decls[d as usize].fn_index as usize].ncomptime;
+    var args = alloc.List(u64).init(c.a);
+    let nargs = ck.child_count(c, e) - 1;
+    var i = offset;
+    while i < nargs : (i += 1) {
+        args.push(value(c, r, ck.child(c, ck.child(c, e, i + 1), 0)));
+    }
+    if r.failed {
+        return 0;
+    }
+    return run_fn(c, r, d, &args, e);
+}

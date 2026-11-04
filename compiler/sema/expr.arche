@@ -288,6 +288,12 @@ fn check_kind(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Typ
         match k {
             .IntLit | .CharLit | .StringLit | .BoolLit | .NameExpr | .FieldExpr | .ParenExpr | .UnaryExpr
             | .BinaryExpr | .CastExpr => { }
+            // Full Arche runs calls at compile time (spec/arche.md §4.3).
+            .CallExpr => {
+                if not c.p.full {
+                    return not_constant(c, n);
+                }
+            }
             _ => { return not_constant(c, n); }
         }
     }
@@ -986,6 +992,9 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
             check_args_loosely(c, call);
             return ty.invalid();
         }
+    }
+    if c.decls[target as usize].fn_index == ck.NONE {
+        ck.check_signature(c, target); // a constant reached it before the pass over signatures
     }
     let f = c.fns[c.decls[target as usize].fn_index as usize];
     let ps = fn_params(c, f, skip);

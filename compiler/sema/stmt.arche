@@ -50,7 +50,35 @@ fn is_void_result(c: &ck.Checker, t: ty.TypeId) -> bool {
 
 // ---- functions ----------------------------------------------------------------
 
+/// Checks a function's body once, from the middle of other code: a
+/// constant that calls it needs it checked (spec/arche.md §4.3).
+pub fn check_fn_nested(c: &mut ck.Checker, f: u32) {
+    match c.checked.get(f) {
+        some(_) => { return; }
+        none => { }
+    }
+    var saved_scope = alloc.List(ck.Binding).init(c.a);
+    let outer = c.scope.items();
+    var i: usize = 0;
+    while i < outer.len() : (i += 1) {
+        saved_scope.push(outer[i]);
+    }
+    let saved_fn = c.fn_index;
+    let saved_loops = c.loops;
+    let saved_defer = c.defer_loops;
+    check_fn(c, f);
+    c.scope = saved_scope;
+    c.fn_index = saved_fn;
+    c.loops = saved_loops;
+    c.defer_loops = saved_defer;
+}
+
 pub fn check_fn(c: &mut ck.Checker, f: u32) {
+    match c.checked.get(f) {
+        some(_) => { return; }
+        none => { }
+    }
+    c.checked.put(f, true);
     let info = c.fns[f as usize];
     let decl = c.decls[info.decl as usize];
     let saved = ck.save_context(c);

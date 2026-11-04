@@ -2,7 +2,7 @@
 
 > 2026-11-03 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S11. S0–S4 va S6–S10 yopilgan: compiler o'zini build qiladi, stage2 == stage3, stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da. Ochiq qolgani: S5'da parser'ni 24 soat fuzz qilish (CI har commit'da 60 soniya fuzz qiladi).
+**Joriy sprint:** S12. S0–S4 va S6–S11 yopilgan: compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da, generics monomorphization bilan ishlaydi. Ochiq qolganlar: S5'da parser'ni 24 soat fuzz qilish (CI har commit'da 60 soniya fuzz qiladi); S11'dagi comptime interpreter hozircha faqat integer va `bool` kodni bajaradi — struct, konteyner, `comptime { }` bloklari va `assert` keyingi bosqichda.
 
 ## Qoidalar
 
