@@ -53,6 +53,9 @@ pub type Program = struct {
     pub modules: alloc.List(Module),
     pub diags: diag.Diagnostics,
     pub a: alloc.Allocator,
+    /// The package has a manifest, package.arche, at its root: it is full
+    /// Arche (spec/arche.md §1). Without one it is Arche-0.
+    pub full: bool,
     root_dir: alloc.String,
 
     pub fn module(self: &Program, id: ModuleId) -> &Module {
@@ -97,8 +100,8 @@ fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.S
     p.diags.file = id.index;
     var lexed = diag.Diagnostics.init(p.a);
     lexed.file = id.index;
-    let tokens = lexer.lex(text.view(), &mut lexed, p.a);
-    let parsed = parser.parse(tokens, text.view(), lexed, p.a);
+    let tokens = lexer.lex(text.view(), p.full, &mut lexed, p.a);
+    let parsed = parser.parse(tokens, text.view(), p.full, lexed, p.a);
     var n = alloc.String.init(p.a);
     n.push_str(name);
     var pa = alloc.String.init(p.a);
@@ -189,6 +192,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator) -> P
         modules: alloc.List(Module).init(a),
         diags: diag.Diagnostics.init(a),
         a: a,
+        full: false,
         root_dir: alloc.String.init(a),
     };
     var slash: ?usize = none;
@@ -205,6 +209,13 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator) -> P
             base = path[s + 1..path.len()];
         }
         none => { }
+    }
+    var manifest = alloc.String.init(a);
+    manifest.push_str(p.root_dir.view());
+    manifest.push_str("package.arche");
+    match fs.read_bytes(manifest.view(), a) {
+        ok(_) => { p.full = true; }
+        err(_) => { }
     }
     var stem = base;
     if base.len() > 6 and base[base.len() - 6..base.len()].eq(".arche") {

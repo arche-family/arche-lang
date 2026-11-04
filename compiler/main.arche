@@ -193,7 +193,7 @@ fn dump_tokens(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: a
     let source = try read(fs, err_out, path, a);
     let text = source.view();
     var diags = diag.Diagnostics.init(a);
-    let tokens = lexer.lex(text, &mut diags, a);
+    let tokens = lexer.lex(text, true, &mut diags, a);
     lexer.write_tokens(out, &tokens, text);
     diag.write_text(err_out, &diags, 0, path: path, text: text);
 }
@@ -202,8 +202,8 @@ fn print_cst(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: all
     let source = try read(fs, err_out, path, a);
     let text = source.view();
     var lexed = diag.Diagnostics.init(a);
-    let tokens = lexer.lex(text, &mut lexed, a);
-    let parsed = parser.parse(tokens, text, lexed, a);
+    let tokens = lexer.lex(text, true, &mut lexed, a);
+    let parsed = parser.parse(tokens, text, true, lexed, a);
     cst.write_source(out, &parsed.tree, text);
 }
 

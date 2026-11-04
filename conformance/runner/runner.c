@@ -723,7 +723,8 @@ static bool ends_with(const char *s, const char *suffix) {
 }
 
 // Adds `path` if it is a file, or every *.arche file below it if it is a
-// directory, leaving out names that start with '_' or '.'.
+// directory, leaving out names that start with '_' or '.', and package
+// manifests (package.arche).
 static void collect(const char *path, List *files) {
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -752,7 +753,7 @@ static void collect(const char *path, List *files) {
         if (S_ISDIR(cs.st_mode)) {
             collect(child, files);
             free(child);
-        } else if (S_ISREG(cs.st_mode) && ends_with(e->d_name, ".arche")) {
+        } else if (S_ISREG(cs.st_mode) && ends_with(e->d_name, ".arche") && strcmp(e->d_name, "package.arche") != 0) {
             list_push(files, child);
         } else {
             free(child);

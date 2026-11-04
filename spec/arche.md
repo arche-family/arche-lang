@@ -130,7 +130,7 @@ fn max(comptime T: type, a: T, b: T) -> T where T: core.Ord {
 let m = max(u32, a: x, b: y);
 ```
 
-- A parameter marked `comptime` takes a value known at compile time: a type (`T: type`), an integer, a `bool` or a `str`. Its argument must be a constant expression (A§4) or another `comptime` parameter.
+- A parameter marked `comptime` takes a value known at compile time: a type (`T: type`), an integer, a `bool` or a `str`. Its argument must be a constant expression (A§4) or another `comptime` parameter. `comptime` parameters come before every other parameter, so a call's run-time arguments follow its compile-time ones.
 - A function with `comptime` parameters is instantiated once for each distinct list of `comptime` arguments; each instance is checked and compiled as an ordinary function.
 - The label rule (A§7.5) compares declared types as written, so `a: T, b: T` need labels and `key: K, value: V` do not.
 
@@ -395,7 +395,7 @@ type        = "?" type
             | "[" ( "]" [ "mut" ] type | expr "]" type )
             | named [ "!" type ] ;
 named       = path [ "(" targ { "," targ } [ "," ] ")" ] ;
-targ        = type | "comptime" expr ;
+targ        = type | expr ;   (* an INT, CHAR, STRING, '-', 'true' or 'false' starts an expr *)
 
 block       = "{" { stmt } "}" ;
 value_block = "{" { stmt } expr "}" ;

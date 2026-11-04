@@ -30,9 +30,11 @@ type Parser = struct {
     /// A struct literal cannot be an if/while condition or a match
     /// scrutinee unless it is in parentheses (§7.4).
     no_struct_lit: bool,
+    /// Full Arche (spec/arche.md), not Arche-0.
+    full: bool,
 }
 
-pub fn parse(tokens: alloc.List(tk.Token), text: str, diags: diag.Diagnostics, a: alloc.Allocator) -> Parsed {
+pub fn parse(tokens: alloc.List(tk.Token), text: str, full: bool, diags: diag.Diagnostics, a: alloc.Allocator) -> Parsed {
     var copy = alloc.String.init(a);
     copy.push_str(text);
     var p = Parser {
@@ -43,6 +45,7 @@ pub fn parse(tokens: alloc.List(tk.Token), text: str, diags: diag.Diagnostics, a
         pos: 0,
         last_end: 0,
         no_struct_lit: false,
+        full: full,
     };
     skip_trivia(&mut p);
     let m = p.b.open(0);
@@ -323,6 +326,7 @@ fn parse_fn(p: &mut Parser, m: cst.Mark) {
     if expect(p, tk.Kind.LParen, "'('") {
         while not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Eof) and not at(p, tk.Kind.LBrace) {
             let pm = open(p);
+            _ = accept(p, tk.Kind.KwComptime);
             if not expect(p, tk.Kind.Ident, "a parameter name") {
                 skip_to(p, stop_a: tk.Kind.Comma, stop_b: tk.Kind.RParen);
             } else if expect(p, tk.Kind.Colon, "':' and the parameter's type") {
@@ -404,6 +408,21 @@ fn parse_members(p: &mut Parser, is_struct: bool) {
 fn parse_type_decl(p: &mut Parser, m: cst.Mark) {
     advance(p);
     _ = expect(p, tk.Kind.Ident, "a type name");
+    // type Name(comptime T: type, ...) = ... (spec/arche.md §4.2)
+    if p.full and accept(p, tk.Kind.LParen) {
+        while not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Eof) {
+            let pm = open(p);
+            _ = expect(p, tk.Kind.KwComptime, "'comptime' before a type parameter");
+            if expect(p, tk.Kind.Ident, "a parameter name") and expect(p, tk.Kind.Colon, "':'") {
+                parse_type(p);
+            }
+            _ = close(p, pm, cst.Kind.Param);
+            if not accept(p, tk.Kind.Comma) {
+                break;
+            }
+        }
+        _ = expect(p, tk.Kind.RParen, "',' or ')'");
+    }
     if not expect(p, tk.Kind.Assign, "'='") {
         skip_to_item(p);
         _ = close(p, m, cst.Kind.TypeDecl);
@@ -541,7 +560,12 @@ fn parse_type(p: &mut Parser) {
             }
             if accept(p, tk.Kind.LParen) {
                 while not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Eof) {
-                    parse_type(p);
+                    // A comptime value argument, Grid(u8, 4, 4): a token that
+                    // cannot start a type starts an expression.
+                    match peek(p) {
+                        .Int | .Char | .Minus | .KwTrue | .KwFalse | .String => { parse_nested_expr(p); }
+                        _ => { parse_type(p); }
+                    }
                     if not accept(p, tk.Kind.Comma) {
                         break;
                     }
@@ -980,6 +1004,7 @@ fn parse_postfix(p: &mut Parser) {
     while true {
         match peek(p) {
             .LParen => {
+                let callee_is_path = path;
                 advance(p);
                 while not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Eof) {
                     let am = open(p);
@@ -995,7 +1020,9 @@ fn parse_postfix(p: &mut Parser) {
                 }
                 _ = expect(p, tk.Kind.RParen, "',' or ')'");
                 _ = close(p, m, cst.Kind.CallExpr);
-                path = false;
+                // Pair(u32, u8) { ... }: a generic type is a path called with
+                // its arguments (spec/arche.md §4.2).
+                path = p.full and callee_is_path;
             }
             .Dot => {
                 advance(p);

@@ -11,11 +11,13 @@ import codes;
 import diag;
 import syntax.token as tk;
 
-pub fn lex(text: str, diags: &mut diag.Diagnostics, a: alloc.Allocator) -> alloc.List(tk.Token) {
+/// full: the file is full Arche (spec/arche.md), where words Arche-0
+/// reserves can be keywords; otherwise it is Arche-0.
+pub fn lex(text: str, full: bool, diags: &mut diag.Diagnostics, a: alloc.Allocator) -> alloc.List(tk.Token) {
     var tokens = alloc.List(tk.Token).init(a);
     var i: usize = 0;
     while i < text.len() {
-        i = lex_one(text, i, &mut tokens, diags);
+        i = lex_one(text, i, full, &mut tokens, diags);
     }
     push(&mut tokens, tk.Kind.Eof, start: i, end: i, value: 0);
     return tokens;
@@ -50,7 +52,7 @@ fn is_ident_char(c: u8) -> bool {
     }
 }
 
-fn lex_one(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
+fn lex_one(text: str, start: usize, full: bool, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
     let c = text[start];
     match c {
         ' ' | '\t' | '\n' => {
@@ -68,7 +70,7 @@ fn lex_one(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &m
             return start + 1;
         }
         'a'..='z' | 'A'..='Z' | '_' => {
-            return lex_word(text, start, tokens, diags);
+            return lex_word(text, start, full, tokens, diags);
         }
         '0'..='9' => {
             return lex_number(text, start, tokens, diags);
@@ -108,13 +110,18 @@ fn lex_comment(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags
     return i;
 }
 
-fn lex_word(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
+fn lex_word(text: str, start: usize, full: bool, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
     var end = start;
     while end < text.len() and is_ident_char(text[end]) : (end += 1) {
     }
     let word = text[start..end];
     if word.eq("_") {
         push(tokens, tk.Kind.Underscore, start: start, end: end, value: 0);
+        return end;
+    }
+    // Full Arche has the keywords that Arche-0 reserves (spec/arche.md §12).
+    if full and word.eq("comptime") {
+        push(tokens, tk.Kind.KwComptime, start: start, end: end, value: 0);
         return end;
     }
     if tk.is_reserved(word) {
