@@ -46,6 +46,37 @@ typedef struct {
     char unused;
 } a0_alloc_Allocator;
 
+// ---- alloc ------------------------------------------------------------------
+
+typedef struct {
+    uint8_t *data;
+    uint64_t len;
+    uint64_t cap;
+    a0_alloc_Allocator alloc;
+} a0_alloc_String;
+
+typedef uint32_t a0_alloc_Symbol;
+
+// Interned texts, each copied once; a symbol is its text's index.
+typedef struct {
+    a0_str *texts;
+    uint64_t len;
+    uint64_t cap;
+    uint32_t *slots; // 0: empty, else a text's index + 1
+    uint64_t nslots;
+    a0_alloc_Allocator alloc;
+} a0_alloc_Interner;
+
+a0_alloc_String a0_alloc_String_init(a0_alloc_Allocator a);
+void a0_alloc_String_push_str(a0_alloc_String *self, a0_str text);
+void a0_alloc_String_push_ascii(a0_alloc_String *self, uint8_t byte, a0_loc loc);
+a0_str a0_alloc_String_view(a0_alloc_String *self);
+uint64_t a0_alloc_String_len(a0_alloc_String *self);
+
+a0_alloc_Interner a0_alloc_Interner_init(a0_alloc_Allocator a);
+a0_alloc_Symbol a0_alloc_Interner_intern(a0_alloc_Interner *self, a0_str text);
+a0_str a0_alloc_Interner_text(a0_alloc_Interner *self, a0_alloc_Symbol sym, a0_loc loc);
+
 typedef struct {
     a0_std_Fs fs;
     a0_std_Output out;
@@ -53,6 +84,22 @@ typedef struct {
     a0_std_Args args;
     a0_alloc_Allocator alloc;
 } a0_std_System;
+
+// std.IoError: its errors are numbered first (types.c).
+#define A0_ERR_NOT_FOUND 1
+#define A0_ERR_ACCESS_DENIED 2
+#define A0_ERR_IS_DIRECTORY 3
+#define A0_ERR_INVALID_UTF8 4
+#define A0_ERR_IO_FAILED 5
+
+// IoError!alloc.String; every E!alloc.String uses it.
+typedef struct {
+    a0_err err;
+    a0_alloc_String value;
+} a0_res_String;
+
+a0_res_String a0_std_Fs_read_file(a0_std_Fs *self, a0_str path, a0_alloc_Allocator a);
+a0_err a0_std_Fs_write_file(a0_std_Fs *self, a0_str path, a0_str data);
 
 void a0_std_Output_write(a0_std_Output *self, a0_str text);
 void a0_std_Output_write_byte(a0_std_Output *self, uint8_t byte);
@@ -89,6 +136,21 @@ static inline void a0_check_slice(uint64_t a, uint64_t b, uint64_t len, a0_loc l
 
 // Resizes p to count elements of size bytes; traps when memory runs out.
 void *a0_realloc(a0_alloc_Allocator a, void *p, uint64_t count, uint64_t size);
+
+// ---- hashing Map keys ---------------------------------------------------------
+
+static inline uint64_t a0_hash_word(uint64_t x) {
+    x ^= x >> 30;
+    x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x *= UINT64_C(0x94d049bb133111eb);
+    x ^= x >> 31;
+    return x;
+}
+
+static inline uint64_t a0_hash_mix(uint64_t h, uint64_t x) {
+    return a0_hash_word(h ^ (x + UINT64_C(0x9e3779b97f4a7c15) + (h << 6) + (h >> 2)));
+}
 
 // ---- integers (§7.2) ------------------------------------------------------------
 //
