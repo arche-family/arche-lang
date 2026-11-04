@@ -309,6 +309,44 @@ a0_res_String a0_std_Fs_read_file(a0_std_Fs *self, a0_str path, a0_alloc_Allocat
     return r;
 }
 
+a0_res_bytes a0_std_Fs_read_bytes(a0_std_Fs *self, a0_str path, a0_alloc_Allocator a) {
+    (void)self;
+    a0_res_bytes r = {0};
+    r.value.alloc = a;
+    char *p = c_path(path);
+    if (!p) {
+        r.err = A0_ERR_NOT_FOUND;
+        return r;
+    }
+    errno = 0;
+    FILE *f = fopen(p, "rb");
+    free(p);
+    if (!f) {
+        r.err = io_error(errno);
+        return r;
+    }
+    uint8_t chunk[65536];
+    size_t n;
+    errno = 0;
+    while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) {
+        if (r.value.len + n > r.value.cap) {
+            uint64_t cap = r.value.cap ? r.value.cap : 4096;
+            while (cap < r.value.len + n) {
+                cap *= 2;
+            }
+            r.value.data = a0_realloc(a, r.value.data, cap, 1);
+            r.value.cap = cap;
+        }
+        memcpy(r.value.data + r.value.len, chunk, n);
+        r.value.len += n;
+    }
+    if (ferror(f)) {
+        r.err = io_error(errno);
+    }
+    fclose(f);
+    return r;
+}
+
 a0_err a0_std_Fs_write_file(a0_std_Fs *self, a0_str path, a0_str data) {
     (void)self;
     char *p = c_path(path);

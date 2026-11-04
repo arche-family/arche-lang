@@ -1,0 +1,17 @@
+// test: run
+// spec: 11
+// stdout: 4 111 255 not found
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    let bytes = try sys.fs.read_bytes("_support/invalid.txt", sys.alloc);
+    sys.stdout.write_u64(bytes.len() as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(bytes[0] as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(bytes.items()[2] as u64);
+    match sys.fs.read_bytes("no-such-file", sys.alloc) {
+        err(.NotFound) => { sys.stdout.write(" not found\n"); }
+        _ => { sys.stdout.write(" ?\n"); }
+    }
+}

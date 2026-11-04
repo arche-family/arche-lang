@@ -104,6 +104,9 @@ Type *type_array(Type *elem, uint64_t len) {
 Type *type_list(Type *elem) {
     if (!elem->list_cache) {
         Type *t = new_composite(TY_LIST, "list");
+        if (elem == &int_types[U8]) {
+            t->c_name = "a0_bytes"; // the runtime's, for std.Fs.read_bytes
+        }
         t->elem = elem;
         elem->list_cache = t;
         type_slice(false, elem);
@@ -159,6 +162,10 @@ Type *type_error_union_of(TypeDecl *set, Type *elem) {
         t = NEW(Type);
         t->kind = TY_ERROR_UNION;
         t->c_name = "a0_res_String"; // the runtime's, for std.Fs.read_file
+    } else if (elem->kind == TY_LIST && elem->elem == &int_types[U8]) {
+        t = NEW(Type);
+        t->kind = TY_ERROR_UNION;
+        t->c_name = "a0_res_bytes"; // the runtime's, for std.Fs.read_bytes
     } else {
         t = new_composite(TY_ERROR_UNION, "res");
     }
@@ -406,7 +413,10 @@ void types_init(void) {
                     type_error_union_of(&io_error_decl, &string_type), "a0_std_Fs_read_file", false, M_RUNTIME};
     m[1] = (Method){"write_file", SELF_REF, 2, {{"path", &str_type}, {"data", &str_type}},
                     type_error_union_of(&io_error_decl, &void_type), "a0_std_Fs_write_file", false, M_RUNTIME};
-    fs_bt.nmethods = 2;
+    m[2] = (Method){"read_bytes", SELF_REF, 2, {{"path", &str_type}, {"a", &allocator_type}},
+                    type_error_union_of(&io_error_decl, type_list(&int_types[U8])), "a0_std_Fs_read_bytes", false,
+                    M_RUNTIME};
+    fs_bt.nmethods = 3;
 }
 
 Type *library_type(const char *library, const char *name) {

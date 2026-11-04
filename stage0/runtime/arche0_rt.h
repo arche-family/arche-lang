@@ -99,6 +99,22 @@ typedef struct {
 } a0_res_String;
 
 a0_res_String a0_std_Fs_read_file(a0_std_Fs *self, a0_str path, a0_alloc_Allocator a);
+
+// alloc.List(u8): the same fields as every list stage0 generates.
+typedef struct a0_bytes {
+    uint8_t *data;
+    uint64_t len;
+    uint64_t cap;
+    a0_alloc_Allocator alloc;
+} a0_bytes;
+
+// IoError!alloc.List(u8); every E!alloc.List(u8) uses it.
+typedef struct {
+    a0_err err;
+    a0_bytes value;
+} a0_res_bytes;
+
+a0_res_bytes a0_std_Fs_read_bytes(a0_std_Fs *self, a0_str path, a0_alloc_Allocator a);
 a0_err a0_std_Fs_write_file(a0_std_Fs *self, a0_str path, a0_str data);
 
 void a0_std_Output_write(a0_std_Output *self, a0_str text);

@@ -24,10 +24,81 @@ fn usage(err_out: &mut std.Output) -> ExitError!void {
     return ExitError.Failed;
 }
 
+/// The offset of the first byte that breaks UTF-8 (§2), if one does.
+fn first_invalid_utf8(b: []u8) -> ?usize {
+    var i: usize = 0;
+    while i < b.len() {
+        let c = b[i];
+        var n: usize = 0;
+        var min: u32 = 0;
+        var cp: u32 = 0;
+        if c < 0x80 {
+            i += 1;
+            continue;
+        } else if c >= 0xC2 and c <= 0xDF {
+            n = 2;
+            min = 0x80;
+            cp = (c & 0x1F) as u32;
+        } else if c >= 0xE0 and c <= 0xEF {
+            n = 3;
+            min = 0x800;
+            cp = (c & 0x0F) as u32;
+        } else if c >= 0xF0 and c <= 0xF4 {
+            n = 4;
+            min = 0x10000;
+            cp = (c & 0x07) as u32;
+        } else {
+            return i;
+        }
+        if i + n > b.len() {
+            return i;
+        }
+        var k: usize = 1;
+        while k < n : (k += 1) {
+            if b[i + k] & 0xC0 != 0x80 {
+                return i;
+            }
+            cp = (cp << 6) | (b[i + k] & 0x3F) as u32;
+        }
+        if cp < min or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) {
+            return i;
+        }
+        i += n;
+    }
+    return none;
+}
+
+/// A file that is not UTF-8 cannot become a str, so its one diagnostic is
+/// written from its bytes, here, rather than through diag.
+fn report_invalid_utf8(fs: &std.Fs, err_out: &mut std.Output, path: str, a: alloc.Allocator) {
+    let bytes = fs.read_bytes(path, a) catch alloc.List(u8).init(a);
+    let b = bytes.items();
+    let at = first_invalid_utf8(b) orelse 0;
+    var line: u64 = 1;
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while i < at : (i += 1) {
+        if b[i] == '\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    err_out.write(path);
+    err_out.write(":");
+    err_out.write_u64(line);
+    err_out.write(":");
+    err_out.write_u64((at - line_start + 1) as u64);
+    err_out.write(": error[E0101]: the file is not valid UTF-8\n");
+}
+
 fn read(fs: &std.Fs, err_out: &mut std.Output, path: str, a: alloc.Allocator) -> ExitError!alloc.String {
     match fs.read_file(path, a) {
         ok(text) => {
             return text;
+        }
+        err(.InvalidUtf8) => {
+            report_invalid_utf8(fs, err_out, path, a);
+            return ExitError.Failed;
         }
         err(e) => {
             err_out.write("arche: cannot read ");

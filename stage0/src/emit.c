@@ -1074,7 +1074,7 @@ static void define_deps(StrBuf *out, const Type *t, Vec *done) {
         define_type(out, t, done);
         return;
     case TY_ERROR_UNION:
-        if (t->elem->kind != TY_VOID && strcmp(t->c_name, "a0_res_String") != 0) {
+        if (t->elem->kind != TY_VOID && strcmp(t->c_name, "a0_res_String") != 0 && strcmp(t->c_name, "a0_res_bytes") != 0) {
             define_type(out, t, done);
         }
         return;
@@ -1083,7 +1083,15 @@ static void define_deps(StrBuf *out, const Type *t, Vec *done) {
     }
 }
 
+// Composite types whose C definition is in the runtime (arche0_rt.h).
+static bool runtime_defined(const Type *t) {
+    return strcmp(t->c_name, "a0_bytes") == 0;
+}
+
 static void define_type(StrBuf *out, const Type *t, Vec *done) {
+    if (runtime_defined(t)) {
+        return;
+    }
     for (size_t i = 0; i < done->len; i++) {
         if (done->items[i] == t || ((const Type *)done->items[i])->c_name == t->c_name) {
             return;
@@ -1439,7 +1447,9 @@ void emit_program(Program *p, StrBuf *out) {
     Vec *types = composite_types();
     for (size_t i = 0; i < types->len; i++) {
         const Type *t = types->items[i];
-        sb_printf(out, "typedef struct %s %s;\n", t->c_name, t->c_name);
+        if (!runtime_defined(t)) {
+            sb_printf(out, "typedef struct %s %s;\n", t->c_name, t->c_name);
+        }
     }
     sb_puts(out, "\n");
     Vec done = {0};
