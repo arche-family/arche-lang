@@ -2,7 +2,7 @@
 
 > 2026-11-03 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S4. S0–S3 yopilgan.
+**Joriy sprint:** S5. S0–S4 yopilgan: stage0 Arche-0'ni to'liq compile qiladi.
 
 ## Qoidalar
 
