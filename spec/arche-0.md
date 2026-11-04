@@ -159,9 +159,9 @@ Arche-0 cannot declare generic types or functions. It can use these, which the l
 `&T`, `&mut T`, `[]T`, `[]mut T` and `str` are **views**: they refer to memory owned by something else. Arche has no lifetime annotations. Views are second-class instead, and four rules make that sufficient:
 
 1. **Where a view may appear.** A view may be the type of a parameter or of a local `let`/`var`. A `const` may have type `str`.
-2. **Where it may not.** A view may not be a struct field, an enum payload, an array element, a `List` element, a `Map` key or value, or the payload of `?` or `!`.
-3. **Projection.** A function may return a view only if exactly one of its parameters is a view, counting `self`. The result is a projection of that argument and lives no longer than it. Slicing, `x[a..b]`, is a projection of `x`.
-4. **Exclusivity.** While a `&mut` view of a place is live, that place cannot be read, written or viewed through any other path. Places are tracked by path, so a view of `sys.args` and a `&mut` view of `sys.stdout` can be live together.
+2. **Where it may not.** A view may not be a struct field, an enum payload, an array or slice element, a `List` element, a `Map` key or value, or the payload of `?` or `!`.
+3. **Projection.** A function may return a view only if at most one of its parameters is a view, counting `self`. The result is a projection of that argument and lives no longer than it; with no view parameter, the result is a view of static memory, such as a string literal. Slicing, `x[a..b]`, is a projection of `x`. A view never outlives what it views: it is not returned from the function, or stored in a binding of an enclosing block, when what it views is a local of the function or of an inner block.
+4. **Exclusivity.** While a view of a place is live, that place cannot be written or viewed with `&mut` through any other path; while a `&mut` view is live, the place cannot be read either. A view is live from where it is made to its last use, and through the rest of a loop it is used in. The views given to one call are live during the call. Places are tracked by path, so a view of `sys.args` and a `&mut` view of `sys.stdout` can be live together.
 
 A `&mut T` is accepted where a `&T` is expected, and a `[]mut T` where a `[]T` is: a view can give up the right to write, never gain it.
 
@@ -171,7 +171,8 @@ Because a reference is never stored, there is nothing to annotate. Long-lived li
 
 A type is **copyable** if it is a primitive, a view, an error set, `alloc.Allocator`, `alloc.Symbol`, or a struct, enum, array or optional built only from copyable types. Every other type is **move-only**: containers, capabilities, and anything that contains one.
 
-- Assigning or passing a move-only value moves it. The source cannot be used again until it is reassigned.
+- Assigning or passing a move-only value moves it: as an initializer, an assigned value, an argument, a returned value, a field of a literal, an element, the operand of `some`, `try`, `catch`, `orelse` or `_ =`, or a receiver passed by value. The source cannot be used again, on any path that follows, until it is reassigned. Moving a field moves only that field.
+- A value cannot be moved out of a place reached through a view: copy it, or move the whole value the view comes from.
 - Views are copyable but stay bound by §5.4.
 - **Key types**, usable as `Map` keys: integers, `bool`, payload-free enums, `alloc.Symbol`, and structs made only of key types.
 - `==` and `!=` work on integers, `bool`, payload-free enums, error values, `alloc.Symbol`, and structs of these, compared field by field. They do not work on views, containers or enums with payloads. Text is compared with `a.eq(b)`, a visible O(n) call.

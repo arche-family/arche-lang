@@ -124,3 +124,14 @@ Every diagnostic of the Arche compiler has a stable code. A code never changes m
 | `E0703` | Division by zero in a constant expression. |
 | `E0704` | A constant that depends on itself. |
 | `E0705` | A constant whose type is not an integer type, `bool` or `str`. |
+
+## The memory model
+
+| Code | Meaning |
+| --- | --- |
+| `E0601` | A view where views cannot be: a field, a payload, an element, or the payload of `?` or `!` (§5.4). |
+| `E0602` | A function that returns a view with more than one view parameter (§5.4). |
+| `E0603` | A view that outlives what it views: a view of a local returned, or stored in a binding of an enclosing block (§5.4). |
+| `E0604` | A place used while a view of it is live, through another path: written or viewed `&mut` while viewed, or used at all while viewed `&mut` (§5.4). |
+| `E0605` | A move-only value used after it was moved (§5.5). |
+| `E0606` | A move out of a place reached through a view (§5.5). |
