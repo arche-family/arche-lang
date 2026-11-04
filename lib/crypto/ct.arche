@@ -1,0 +1,37 @@
+/// Constant time: what a secret is does not change which instructions run
+/// or which memory they reach, only the values they compute.
+
+/// a == b, after looking at every byte: a mismatch found early ends
+/// nothing early. Lengths are not secret.
+pub fn eq(a: []u8, b: []u8) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var diff: u8 = 0;
+    var i: usize = 0;
+    while i < a.len() : (i += 1) {
+        diff = diff | (a[i] ^ b[i]);
+    }
+    return is_zero(diff);
+}
+
+/// x == 0 as a bool, without a branch on x.
+pub fn is_zero(x: u8) -> bool {
+    let wide = x as u32;
+    return ((wide -% 1) >> 31) == 1;
+}
+
+/// All ones when bit is 1, zero when it is 0: for selecting without a branch.
+pub fn mask64(bit: u64) -> u64 {
+    return 0 -% (bit & 1);
+}
+
+pub fn mask32(bit: u32) -> u32 {
+    return 0 -% (bit & 1);
+}
+
+/// a when bit is 1, else b.
+pub fn select64(bit: u64, a: u64, b: u64) -> u64 {
+    let m = mask64(bit);
+    return (a & m) | (b & ~m);
+}

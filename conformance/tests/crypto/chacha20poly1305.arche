@@ -1,0 +1,56 @@
+// test: run
+// spec: crypto (RFC 8439)
+// stage0: skip
+// stdout: 6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d
+// stdout: a8061dc1305136c6c22b8baf0c0127a9
+// stdout: 1ae10b594f09e26a7e902ecbd0600691
+// stdout: d31a8d34648e60db7b86afbc53ef7ec2
+// stdout: Ladies and Gentlemen
+// stdout: tampered
+import std;
+import crypto.chacha20poly1305 as cc;
+import _hex;
+
+fn main(sys: &mut std.System) -> !void {
+    var key: [32]u8 = [0; 32];
+    var i: usize = 0;
+    while i < 32 : (i += 1) {
+        key[i] = i as u8;
+    }
+    // RFC 8439 2.4.2
+    let nonce1: [12]u8 = [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+    let text = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+    var out: [114]u8 = [0; 114];
+    cc.xor(key: key[0..32], counter: 1, nonce: nonce1[0..12], data: text.bytes(), out: out[0..114]);
+    _hex.hex(&mut sys.stdout, out[0..114]);
+    // RFC 8439 2.5.2
+    let pkey: [32]u8 = [0x85, 0xd6, 0xbe, 0x78, 0x57, 0x55, 0x6d, 0x33, 0x7f, 0x44, 0x52, 0xfe, 0x42, 0xd5, 0x06, 0xa8,
+        0x01, 0x03, 0x80, 0x8a, 0xfb, 0x0d, 0xb2, 0xfd, 0x4a, 0xbf, 0xf6, 0xaf, 0x41, 0x49, 0xf5, 0x1b];
+    var p = cc.Poly1305.init(pkey[0..32]);
+    p.update("Cryptographic Forum Research Group".bytes());
+    let t = p.finish();
+    _hex.hex(&mut sys.stdout, t[0..16]);
+    // RFC 8439 2.8.2
+    var akey: [32]u8 = [0; 32];
+    i = 0;
+    while i < 32 : (i += 1) {
+        akey[i] = (0x80 + i) as u8;
+    }
+    let nonce2: [12]u8 = [0x07, 0, 0, 0, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47];
+    let aad: [12]u8 = [0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7];
+    var sealed: [130]u8 = [0; 130];
+    cc.seal(key: akey[0..32], nonce: nonce2[0..12], aad: aad[0..12], plaintext: text.bytes(), out: sealed[0..130]);
+    _hex.hex(&mut sys.stdout, sealed[114..130]);
+    _hex.hex(&mut sys.stdout, sealed[0..16]);
+    var back: [114]u8 = [0; 114];
+    if cc.open(key: akey[0..32], nonce: nonce2[0..12], aad: aad[0..12], sealed: sealed[0..130], out: back[0..114]) {
+        for b in back[0..20] {
+            sys.stdout.write_byte(b.*);
+        }
+        sys.stdout.write("\n");
+    }
+    sealed[3] ^= 1;
+    if not cc.open(key: akey[0..32], nonce: nonce2[0..12], aad: aad[0..12], sealed: sealed[0..130], out: back[0..114]) {
+        sys.stdout.write("tampered\n");
+    }
+}

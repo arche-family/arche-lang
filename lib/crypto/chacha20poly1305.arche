@@ -1,0 +1,292 @@
+/// ChaCha20, Poly1305 and their AEAD (RFC 8439). Additions, rotations and
+/// xors only: no branch or memory index depends on the key or the data.
+import crypto.ct;
+
+fn load32(b: []u8, at: usize) -> u32 {
+    return (b[at] as u32) | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24);
+}
+
+fn store32(b: []mut u8, at: usize, v: u32) {
+    b[at] = (v & 0xFF) as u8;
+    b[at + 1] = ((v >> 8) & 0xFF) as u8;
+    b[at + 2] = ((v >> 16) & 0xFF) as u8;
+    b[at + 3] = (v >> 24) as u8;
+}
+
+fn rotl(x: u32, n: u32) -> u32 {
+    return (x << n) | (x >> (32 - n));
+}
+
+fn quarter(s: &mut [16]u32, a: usize, b: usize, c: usize, d: usize) {
+    s.*[a] = s.*[a] +% s.*[b];
+    s.*[d] = rotl(x: s.*[d] ^ s.*[a], n: 16);
+    s.*[c] = s.*[c] +% s.*[d];
+    s.*[b] = rotl(x: s.*[b] ^ s.*[c], n: 12);
+    s.*[a] = s.*[a] +% s.*[b];
+    s.*[d] = rotl(x: s.*[d] ^ s.*[a], n: 8);
+    s.*[c] = s.*[c] +% s.*[d];
+    s.*[b] = rotl(x: s.*[b] ^ s.*[c], n: 7);
+}
+
+/// The 64 bytes of key stream at counter.
+pub fn block(key: []u8, counter: u32, nonce: []u8) -> [64]u8 {
+    var s: [16]u32 = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        s[4 + i] = load32(key, at: 4 * i);
+    }
+    s[12] = counter;
+    s[13] = load32(nonce, at: 0);
+    s[14] = load32(nonce, at: 4);
+    s[15] = load32(nonce, at: 8);
+    var w = s;
+    var r: u32 = 0;
+    while r < 10 : (r += 1) {
+        quarter(&mut w, a: 0, b: 4, c: 8, d: 12);
+        quarter(&mut w, a: 1, b: 5, c: 9, d: 13);
+        quarter(&mut w, a: 2, b: 6, c: 10, d: 14);
+        quarter(&mut w, a: 3, b: 7, c: 11, d: 15);
+        quarter(&mut w, a: 0, b: 5, c: 10, d: 15);
+        quarter(&mut w, a: 1, b: 6, c: 11, d: 12);
+        quarter(&mut w, a: 2, b: 7, c: 8, d: 13);
+        quarter(&mut w, a: 3, b: 4, c: 9, d: 14);
+    }
+    var out: [64]u8 = [0; 64];
+    i = 0;
+    while i < 16 : (i += 1) {
+        store32(out[0..64], at: 4 * i, v: w[i] +% s[i]);
+    }
+    return out;
+}
+
+/// out = data xor the key stream from counter on; out may not be shorter.
+pub fn xor(key: []u8, counter: u32, nonce: []u8, data: []u8, out: []mut u8) {
+    var c = counter;
+    var done: usize = 0;
+    while done < data.len() {
+        let ks = block(key: key, counter: c, nonce: nonce);
+        var i: usize = 0;
+        while i < 64 and done < data.len() : (i += 1) {
+            out[done] = data[done] ^ ks[i];
+            done += 1;
+        }
+        c +%= 1;
+    }
+}
+
+/// Poly1305 with 26-bit limbs, so every product fits a u64.
+pub type Poly1305 = struct {
+    r: [5]u32,
+    h: [5]u32,
+    pad: [4]u32,
+    buf: [16]u8,
+    used: usize,
+
+    pub fn init(key: []u8) -> Poly1305 {
+        return Poly1305 {
+            r: [
+                load32(key, at: 0) & 0x3ffffff,
+                (load32(key, at: 3) >> 2) & 0x3ffff03,
+                (load32(key, at: 6) >> 4) & 0x3ffc0ff,
+                (load32(key, at: 9) >> 6) & 0x3f03fff,
+                (load32(key, at: 12) >> 8) & 0x00fffff,
+            ],
+            h: [0, 0, 0, 0, 0],
+            pad: [load32(key, at: 16), load32(key, at: 20), load32(key, at: 24), load32(key, at: 28)],
+            buf: [0; 16],
+            used: 0,
+        };
+    }
+
+    fn blocks(self: &mut Poly1305, m: []u8, hibit: u32) {
+        let r0 = self.r[0] as u64;
+        let r1 = self.r[1] as u64;
+        let r2 = self.r[2] as u64;
+        let r3 = self.r[3] as u64;
+        let r4 = self.r[4] as u64;
+        let s1 = r1 * 5;
+        let s2 = r2 * 5;
+        let s3 = r3 * 5;
+        let s4 = r4 * 5;
+        var h0 = self.h[0];
+        var h1 = self.h[1];
+        var h2 = self.h[2];
+        var h3 = self.h[3];
+        var h4 = self.h[4];
+        var at: usize = 0;
+        while at + 16 <= m.len() : (at += 16) {
+            h0 += load32(m, at: at) & 0x3ffffff;
+            h1 += (load32(m, at: at + 3) >> 2) & 0x3ffffff;
+            h2 += (load32(m, at: at + 6) >> 4) & 0x3ffffff;
+            h3 += (load32(m, at: at + 9) >> 6) & 0x3ffffff;
+            h4 += (load32(m, at: at + 12) >> 8) | hibit;
+            let d0 = (h0 as u64) * r0 + (h1 as u64) * s4 + (h2 as u64) * s3 + (h3 as u64) * s2 + (h4 as u64) * s1;
+            var d1 = (h0 as u64) * r1 + (h1 as u64) * r0 + (h2 as u64) * s4 + (h3 as u64) * s3 + (h4 as u64) * s2;
+            var d2 = (h0 as u64) * r2 + (h1 as u64) * r1 + (h2 as u64) * r0 + (h3 as u64) * s4 + (h4 as u64) * s3;
+            var d3 = (h0 as u64) * r3 + (h1 as u64) * r2 + (h2 as u64) * r1 + (h3 as u64) * r0 + (h4 as u64) * s4;
+            var d4 = (h0 as u64) * r4 + (h1 as u64) * r3 + (h2 as u64) * r2 + (h3 as u64) * r1 + (h4 as u64) * r0;
+            var c = d0 >> 26;
+            h0 = (d0 & 0x3ffffff) as u32;
+            d1 += c;
+            c = d1 >> 26;
+            h1 = (d1 & 0x3ffffff) as u32;
+            d2 += c;
+            c = d2 >> 26;
+            h2 = (d2 & 0x3ffffff) as u32;
+            d3 += c;
+            c = d3 >> 26;
+            h3 = (d3 & 0x3ffffff) as u32;
+            d4 += c;
+            c = d4 >> 26;
+            h4 = (d4 & 0x3ffffff) as u32;
+            h0 += (c * 5) as u32;
+            let c2 = h0 >> 26;
+            h0 = h0 & 0x3ffffff;
+            h1 += c2;
+        }
+        self.h = [h0, h1, h2, h3, h4];
+    }
+
+    pub fn update(self: &mut Poly1305, data: []u8) {
+        var i: usize = 0;
+        while i < data.len() {
+            if self.used == 0 and data.len() - i >= 16 {
+                let whole = (data.len() - i) / 16 * 16;
+                self.blocks(data[i..i + whole], hibit: 0x1000000);
+                i += whole;
+                continue;
+            }
+            self.buf[self.used] = data[i];
+            self.used += 1;
+            i += 1;
+            if self.used == 16 {
+                let b = self.buf;
+                self.blocks(b[0..16], hibit: 0x1000000);
+                self.used = 0;
+            }
+        }
+    }
+
+    pub fn finish(self: &mut Poly1305) -> [16]u8 {
+        if self.used > 0 {
+            var last: [16]u8 = [0; 16];
+            var i: usize = 0;
+            while i < self.used : (i += 1) {
+                last[i] = self.buf[i];
+            }
+            last[self.used] = 1;
+            self.blocks(last[0..16], hibit: 0);
+        }
+        var h0 = self.h[0];
+        var h1 = self.h[1];
+        var h2 = self.h[2];
+        var h3 = self.h[3];
+        var h4 = self.h[4];
+        var c = h1 >> 26;
+        h1 = h1 & 0x3ffffff;
+        h2 += c;
+        c = h2 >> 26;
+        h2 = h2 & 0x3ffffff;
+        h3 += c;
+        c = h3 >> 26;
+        h3 = h3 & 0x3ffffff;
+        h4 += c;
+        c = h4 >> 26;
+        h4 = h4 & 0x3ffffff;
+        h0 += c * 5;
+        c = h0 >> 26;
+        h0 = h0 & 0x3ffffff;
+        h1 += c;
+        // h - p, and h when that is negative: chosen by a mask.
+        var g0 = h0 + 5;
+        c = g0 >> 26;
+        g0 = g0 & 0x3ffffff;
+        var g1 = h1 + c;
+        c = g1 >> 26;
+        g1 = g1 & 0x3ffffff;
+        var g2 = h2 + c;
+        c = g2 >> 26;
+        g2 = g2 & 0x3ffffff;
+        var g3 = h3 + c;
+        c = g3 >> 26;
+        g3 = g3 & 0x3ffffff;
+        let g4 = (h4 + c) -% 0x4000000;
+        let keep_g = (g4 >> 31) -% 1;
+        h0 = (h0 & ~keep_g) | (g0 & keep_g);
+        h1 = (h1 & ~keep_g) | (g1 & keep_g);
+        h2 = (h2 & ~keep_g) | (g2 & keep_g);
+        h3 = (h3 & ~keep_g) | (g3 & keep_g);
+        h4 = (h4 & ~keep_g) | (g4 & keep_g);
+        let w0 = (h0 | (h1 << 26)) as u64;
+        let w1 = ((h1 >> 6) | (h2 << 20)) as u64;
+        let w2 = ((h2 >> 12) | (h3 << 14)) as u64;
+        let w3 = ((h3 >> 18) | (h4 << 8)) as u64;
+        var f = w0 + self.pad[0] as u64;
+        var out: [16]u8 = [0; 16];
+        store32(out[0..16], at: 0, v: (f & 0xffffffff) as u32);
+        f = w1 + self.pad[1] as u64 + (f >> 32);
+        store32(out[0..16], at: 4, v: (f & 0xffffffff) as u32);
+        f = w2 + self.pad[2] as u64 + (f >> 32);
+        store32(out[0..16], at: 8, v: (f & 0xffffffff) as u32);
+        f = w3 + self.pad[3] as u64 + (f >> 32);
+        store32(out[0..16], at: 12, v: (f & 0xffffffff) as u32);
+        return out;
+    }
+}
+
+fn zeros_to_16(p: &mut Poly1305, n: usize) {
+    let z: [16]u8 = [0; 16];
+    if n % 16 != 0 {
+        p.update(z[0..16 - n % 16]);
+    }
+}
+
+fn lengths(p: &mut Poly1305, aad: usize, text: usize) {
+    var l: [16]u8 = [0; 16];
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        l[i] = (((aad as u64) >> (8 * i) as u32) & 0xFF) as u8;
+        l[8 + i] = (((text as u64) >> (8 * i) as u32) & 0xFF) as u8;
+    }
+    p.update(l[0..16]);
+}
+
+fn tag(key: []u8, nonce: []u8, aad: []u8, ciphertext: []u8) -> [16]u8 {
+    let otk = block(key: key, counter: 0, nonce: nonce);
+    var p = Poly1305.init(otk[0..32]);
+    p.update(aad);
+    zeros_to_16(&mut p, aad.len());
+    p.update(ciphertext);
+    zeros_to_16(&mut p, ciphertext.len());
+    lengths(&mut p, aad: aad.len(), text: ciphertext.len());
+    return p.finish();
+}
+
+/// Encrypts plaintext into out, which is 16 bytes longer: the tag at the end.
+pub fn seal(key: []u8, nonce: []u8, aad: []u8, plaintext: []u8, out: []mut u8) {
+    let n = plaintext.len();
+    if out.len() != n + 16 or key.len() != 32 or nonce.len() != 12 {
+        panic("seal: a 32-byte key, a 12-byte nonce, and out 16 bytes longer than the plaintext");
+    }
+    xor(key: key, counter: 1, nonce: nonce, data: plaintext, out: out[0..n]);
+    let t = tag(key: key, nonce: nonce, aad: aad, ciphertext: out[0..n]);
+    var i: usize = 0;
+    while i < 16 : (i += 1) {
+        out[n + i] = t[i];
+    }
+}
+
+/// Checks the tag and decrypts into out, 16 bytes shorter; false, with
+/// out untouched, when the tag is wrong.
+pub fn open(key: []u8, nonce: []u8, aad: []u8, sealed: []u8, out: []mut u8) -> bool {
+    if sealed.len() < 16 or out.len() != sealed.len() - 16 or key.len() != 32 or nonce.len() != 12 {
+        return false;
+    }
+    let n = sealed.len() - 16;
+    let t = tag(key: key, nonce: nonce, aad: aad, ciphertext: sealed[0..n]);
+    if not ct.eq(a: t[0..16], b: sealed[n..n + 16]) {
+        return false;
+    }
+    xor(key: key, counter: 1, nonce: nonce, data: sealed[0..n], out: out);
+    return true;
+}

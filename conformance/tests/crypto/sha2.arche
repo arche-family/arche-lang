@@ -1,0 +1,40 @@
+// test: run
+// spec: crypto (FIPS 180-4)
+// stage0: skip
+// stdout: ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+// stdout: 248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
+// stdout: cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7
+// stdout: ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f
+// stdout: 8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909
+// stdout: 09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039
+// stdout: cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0
+import std;
+import crypto.sha2;
+import _hex;
+
+fn main(sys: &mut std.System) -> !void {
+    let abc = "abc".bytes();
+    let two = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".bytes();
+    let long = "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu".bytes();
+    let a = sha2.sha256(abc);
+    _hex.hex(&mut sys.stdout, a[0..32]);
+    let b = sha2.sha256(two);
+    _hex.hex(&mut sys.stdout, b[0..32]);
+    let c = sha2.sha384(abc);
+    _hex.hex(&mut sys.stdout, c[0..48]);
+    let d = sha2.sha512(abc);
+    _hex.hex(&mut sys.stdout, d[0..64]);
+    let e = sha2.sha512(long);
+    _hex.hex(&mut sys.stdout, e[0..64]);
+    let f = sha2.sha384(long);
+    _hex.hex(&mut sys.stdout, f[0..48]);
+    // A million 'a's, fed a thousand at a time.
+    var h = sha2.Sha256.init();
+    let chunk: [1000]u8 = [0x61; 1000];
+    var i: u32 = 0;
+    while i < 1000 : (i += 1) {
+        h.update(chunk[0..1000]);
+    }
+    let g = h.finish();
+    _hex.hex(&mut sys.stdout, g[0..32]);
+}

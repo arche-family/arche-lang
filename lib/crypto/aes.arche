@@ -1,0 +1,267 @@
+/// AES-128 and AES-256 (FIPS 197), and AES-GCM (NIST SP 800-38D). The
+/// S-box is computed, as the inverse in GF(2^8) and an affine map, not
+/// looked up: a table read at a secret index is not constant time. GHASH
+/// multiplies bit by bit with masks, for the same reason.
+import crypto.ct;
+
+/// a * b in GF(2^8) modulo x^8 + x^4 + x^3 + x + 1, without branches.
+fn gmul(a: u8, b: u8) -> u8 {
+    var p: u8 = 0;
+    var x = a;
+    var y = b;
+    var i: u32 = 0;
+    while i < 8 : (i += 1) {
+        p = p ^ (x & (0 -% (y & 1)));
+        let hi = x >> 7;
+        x = (x << 1) ^ (0x1b & (0 -% hi));
+        y = y >> 1;
+    }
+    return p;
+}
+
+fn rotl8(x: u8, n: u32) -> u8 {
+    return (x << n) | (x >> (8 - n));
+}
+
+/// S-box(x): x^254 (the inverse, and 0 for 0), then the affine map.
+fn sbox(x: u8) -> u8 {
+    var r = x;
+    var i: u32 = 0;
+    while i < 6 : (i += 1) {
+        r = gmul(a: gmul(a: r, b: r), b: x);
+    }
+    r = gmul(a: r, b: r);
+    return r ^ rotl8(x: r, n: 1) ^ rotl8(x: r, n: 2) ^ rotl8(x: r, n: 3) ^ rotl8(x: r, n: 4) ^ 0x63;
+}
+
+fn xtime(x: u8) -> u8 {
+    return (x << 1) ^ (0x1b & (0 -% (x >> 7)));
+}
+
+/// An AES key, expanded.
+pub type Aes = struct {
+    keys: [240]u8,
+    rounds: usize,
+
+    /// A 16-byte key (AES-128) or a 32-byte one (AES-256).
+    pub fn init(key: []u8) -> Aes {
+        let nk = key.len() / 4;
+        if key.len() != 16 and key.len() != 32 {
+            panic("AES takes a 16- or 32-byte key");
+        }
+        let rounds = nk + 6;
+        var w: [240]u8 = [0; 240];
+        var i: usize = 0;
+        while i < key.len() : (i += 1) {
+            w[i] = key[i];
+        }
+        var rcon: u8 = 1;
+        var word = nk;
+        while word < 4 * (rounds + 1) : (word += 1) {
+            var t: [4]u8 = [w[4 * word - 4], w[4 * word - 3], w[4 * word - 2], w[4 * word - 1]];
+            if word % nk == 0 {
+                let first = t[0];
+                t[0] = sbox(t[1]) ^ rcon;
+                t[1] = sbox(t[2]);
+                t[2] = sbox(t[3]);
+                t[3] = sbox(first);
+                rcon = xtime(rcon);
+            } else if nk > 6 and word % nk == 4 {
+                t[0] = sbox(t[0]);
+                t[1] = sbox(t[1]);
+                t[2] = sbox(t[2]);
+                t[3] = sbox(t[3]);
+            }
+            var k: usize = 0;
+            while k < 4 : (k += 1) {
+                w[4 * word + k] = w[4 * (word - nk) + k] ^ t[k];
+            }
+        }
+        return Aes { keys: w, rounds: rounds };
+    }
+
+    pub fn encrypt(self: &Aes, block: [16]u8) -> [16]u8 {
+        var s = block;
+        var i: usize = 0;
+        while i < 16 : (i += 1) {
+            s[i] = s[i] ^ self.keys[i];
+        }
+        var round: usize = 1;
+        while round <= self.rounds : (round += 1) {
+            i = 0;
+            while i < 16 : (i += 1) {
+                s[i] = sbox(s[i]);
+            }
+            // ShiftRows: row r moves left by r; the state is column by column.
+            let t = s;
+            var c: usize = 0;
+            while c < 4 : (c += 1) {
+                var r: usize = 0;
+                while r < 4 : (r += 1) {
+                    s[4 * c + r] = t[4 * ((c + r) % 4) + r];
+                }
+            }
+            if round != self.rounds {
+                c = 0;
+                while c < 4 : (c += 1) {
+                    let a0 = s[4 * c];
+                    let a1 = s[4 * c + 1];
+                    let a2 = s[4 * c + 2];
+                    let a3 = s[4 * c + 3];
+                    let all = a0 ^ a1 ^ a2 ^ a3;
+                    s[4 * c] = a0 ^ all ^ xtime(a0 ^ a1);
+                    s[4 * c + 1] = a1 ^ all ^ xtime(a1 ^ a2);
+                    s[4 * c + 2] = a2 ^ all ^ xtime(a2 ^ a3);
+                    s[4 * c + 3] = a3 ^ all ^ xtime(a3 ^ a0);
+                }
+            }
+            i = 0;
+            while i < 16 : (i += 1) {
+                s[i] = s[i] ^ self.keys[16 * round + i];
+            }
+        }
+        return s;
+    }
+}
+
+// ---- GCM ------------------------------------------------------------------------------
+
+/// x * y in GF(2^128) as GCM defines it, bit 0 the high bit of byte 0;
+/// a value is (hi, lo) in big-endian order.
+fn gf_mul(xh: u64, xl: u64, yh: u64, yl: u64) -> [2]u64 {
+    var zh: u64 = 0;
+    var zl: u64 = 0;
+    var vh = yh;
+    var vl = yl;
+    var i: u32 = 0;
+    while i < 128 : (i += 1) {
+        var bit: u64 = 0;
+        if i < 64 {
+            bit = (xh >> (63 - i)) & 1;
+        } else {
+            bit = (xl >> (127 - i)) & 1;
+        }
+        let m = ct.mask64(bit);
+        zh = zh ^ (vh & m);
+        zl = zl ^ (vl & m);
+        let low = ct.mask64(vl & 1);
+        vl = (vl >> 1) | (vh << 63);
+        vh = (vh >> 1) ^ (0xe100000000000000 & low);
+    }
+    return [zh, zl];
+}
+
+fn load64(b: []u8, at: usize) -> u64 {
+    var v: u64 = 0;
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        v = (v << 8) | b[at + i] as u64;
+    }
+    return v;
+}
+
+fn store64(b: []mut u8, at: usize, v: u64) {
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        b[at + i] = ((v >> ((7 - i) * 8) as u32) & 0xFF) as u8;
+    }
+}
+
+type Ghash = struct {
+    hh: u64,
+    hl: u64,
+    yh: u64,
+    yl: u64,
+
+    fn absorb(self: &mut Ghash, data: []u8) {
+        var at: usize = 0;
+        while at < data.len() : (at += 16) {
+            var block: [16]u8 = [0; 16];
+            var i: usize = 0;
+            while i < 16 and at + i < data.len() : (i += 1) {
+                block[i] = data[at + i];
+            }
+            let p = gf_mul(xh: self.yh ^ load64(block[0..16], at: 0), xl: self.yl ^ load64(block[0..16], at: 8), yh: self.hh, yl: self.hl);
+            self.yh = p[0];
+            self.yl = p[1];
+        }
+    }
+}
+
+fn counter_block(nonce: []u8, n: u32) -> [16]u8 {
+    var b: [16]u8 = [0; 16];
+    var i: usize = 0;
+    while i < 12 : (i += 1) {
+        b[i] = nonce[i];
+    }
+    b[12] = (n >> 24) as u8;
+    b[13] = ((n >> 16) & 0xFF) as u8;
+    b[14] = ((n >> 8) & 0xFF) as u8;
+    b[15] = (n & 0xFF) as u8;
+    return b;
+}
+
+fn ctr(aes: &Aes, nonce: []u8, data: []u8, out: []mut u8) {
+    var n: u32 = 2;
+    var at: usize = 0;
+    while at < data.len() : (at += 16) {
+        let ks = aes.encrypt(counter_block(nonce, n: n));
+        var i: usize = 0;
+        while i < 16 and at + i < data.len() : (i += 1) {
+            out[at + i] = data[at + i] ^ ks[i];
+        }
+        n +%= 1;
+    }
+}
+
+fn gcm_tag(aes: &Aes, nonce: []u8, aad: []u8, ciphertext: []u8) -> [16]u8 {
+    let zero: [16]u8 = [0; 16];
+    let h = aes.encrypt(zero);
+    var g = Ghash { hh: load64(h[0..16], at: 0), hl: load64(h[0..16], at: 8), yh: 0, yl: 0 };
+    g.absorb(aad);
+    g.absorb(ciphertext);
+    var lens: [16]u8 = [0; 16];
+    store64(lens[0..16], at: 0, v: (aad.len() as u64) * 8);
+    store64(lens[0..16], at: 8, v: (ciphertext.len() as u64) * 8);
+    g.absorb(lens[0..16]);
+    let ek = aes.encrypt(counter_block(nonce, n: 1));
+    var t: [16]u8 = [0; 16];
+    store64(t[0..16], at: 0, v: g.yh);
+    store64(t[0..16], at: 8, v: g.yl);
+    var i: usize = 0;
+    while i < 16 : (i += 1) {
+        t[i] = t[i] ^ ek[i];
+    }
+    return t;
+}
+
+/// AES-GCM with a 12-byte nonce: out is 16 bytes longer than plaintext,
+/// the tag at its end.
+pub fn gcm_seal(key: []u8, nonce: []u8, aad: []u8, plaintext: []u8, out: []mut u8) {
+    let n = plaintext.len();
+    if out.len() != n + 16 or nonce.len() != 12 {
+        panic("gcm_seal: a 12-byte nonce, and out 16 bytes longer than the plaintext");
+    }
+    let aes = Aes.init(key);
+    ctr(&aes, nonce: nonce, data: plaintext, out: out[0..n]);
+    let t = gcm_tag(&aes, nonce: nonce, aad: aad, ciphertext: out[0..n]);
+    var i: usize = 0;
+    while i < 16 : (i += 1) {
+        out[n + i] = t[i];
+    }
+}
+
+/// Checks the tag and decrypts; false, with out untouched, when it is wrong.
+pub fn gcm_open(key: []u8, nonce: []u8, aad: []u8, sealed: []u8, out: []mut u8) -> bool {
+    if sealed.len() < 16 or out.len() != sealed.len() - 16 or nonce.len() != 12 {
+        return false;
+    }
+    let n = sealed.len() - 16;
+    let aes = Aes.init(key);
+    let t = gcm_tag(&aes, nonce: nonce, aad: aad, ciphertext: sealed[0..n]);
+    if not ct.eq(a: t[0..16], b: sealed[n..n + 16]) {
+        return false;
+    }
+    ctr(&aes, nonce: nonce, data: sealed[0..n], out: out);
+    return true;
+}

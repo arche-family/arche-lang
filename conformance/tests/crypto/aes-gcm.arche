@@ -1,0 +1,78 @@
+// test: run
+// spec: crypto (FIPS 197, NIST GCM)
+// stage0: skip
+// stdout: 69c4e0d86a7b0430d8cdb78070b4c55a
+// stdout: 8ea2b7ca516745bfeafc49904b496089
+// stdout: 0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf
+// stdout: 42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e0915bc94fbc3221a5db94fae95ae7121a47
+// stdout: cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919
+// stdout: opened
+// stdout: tampered
+import std;
+import crypto.aes;
+import _hex;
+
+fn unhex(text: str, out: []mut u8) {
+    let b = text.bytes();
+    var i: usize = 0;
+    while i < out.len() : (i += 1) {
+        out[i] = nibble(b[2 * i]) * 16 + nibble(b[2 * i + 1]);
+    }
+}
+
+fn nibble(c: u8) -> u8 {
+    if c >= 'a' {
+        return c - 'a' + 10;
+    }
+    return c - '0';
+}
+
+fn main(sys: &mut std.System) -> !void {
+    // FIPS 197, C.1 and C.3.
+    var k128: [16]u8 = [0; 16];
+    var k256: [32]u8 = [0; 32];
+    var i: usize = 0;
+    while i < 32 : (i += 1) {
+        k256[i] = i as u8;
+        if i < 16 {
+            k128[i] = i as u8;
+        }
+    }
+    var pt: [16]u8 = [0; 16];
+    unhex("00112233445566778899aabbccddeeff", pt[0..16]);
+    let a = aes.Aes.init(k128[0..16]);
+    let c1 = a.encrypt(pt);
+    _hex.hex(&mut sys.stdout, c1[0..16]);
+    let b = aes.Aes.init(k256[0..32]);
+    let c2 = b.encrypt(pt);
+    _hex.hex(&mut sys.stdout, c2[0..16]);
+    // GCM test cases 2, 4 and 14 (McGrew and Viega).
+    let zero16: [16]u8 = [0; 16];
+    let zero12: [12]u8 = [0; 12];
+    var out2: [32]u8 = [0; 32];
+    aes.gcm_seal(key: zero16[0..16], nonce: zero12[0..12], aad: zero16[0..0], plaintext: zero16[0..16], out: out2[0..32]);
+    _hex.hex(&mut sys.stdout, out2[0..32]);
+    var key4: [16]u8 = [0; 16];
+    unhex("feffe9928665731c6d6a8f9467308308", key4[0..16]);
+    var iv4: [12]u8 = [0; 12];
+    unhex("cafebabefacedbaddecaf888", iv4[0..12]);
+    var p4: [60]u8 = [0; 60];
+    unhex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39", p4[0..60]);
+    var a4: [20]u8 = [0; 20];
+    unhex("feedfacedeadbeeffeedfacedeadbeefabaddad2", a4[0..20]);
+    var out4: [76]u8 = [0; 76];
+    aes.gcm_seal(key: key4[0..16], nonce: iv4[0..12], aad: a4[0..20], plaintext: p4[0..60], out: out4[0..76]);
+    _hex.hex(&mut sys.stdout, out4[0..76]);
+    let zero32: [32]u8 = [0; 32];
+    var out14: [32]u8 = [0; 32];
+    aes.gcm_seal(key: zero32[0..32], nonce: zero12[0..12], aad: zero16[0..0], plaintext: zero16[0..16], out: out14[0..32]);
+    _hex.hex(&mut sys.stdout, out14[0..32]);
+    var back: [60]u8 = [0; 60];
+    if aes.gcm_open(key: key4[0..16], nonce: iv4[0..12], aad: a4[0..20], sealed: out4[0..76], out: back[0..60]) and back[59] == p4[59] {
+        sys.stdout.write("opened\n");
+    }
+    out4[75] ^= 0x80;
+    if not aes.gcm_open(key: key4[0..16], nonce: iv4[0..12], aad: a4[0..20], sealed: out4[0..76], out: back[0..60]) {
+        sys.stdout.write("tampered\n");
+    }
+}

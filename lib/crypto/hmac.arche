@@ -1,0 +1,164 @@
+/// HMAC (RFC 2104) with SHA-256 and SHA-384, and HKDF (RFC 5869) on them.
+import crypto.sha2;
+
+/// HMAC-SHA-256, fed in pieces.
+pub type HmacSha256 = struct {
+    inner: sha2.Sha256,
+    outer_key: [64]u8,
+
+    pub fn init(key: []u8) -> HmacSha256 {
+        var k: [64]u8 = [0; 64];
+        if key.len() > 64 {
+            let h = sha2.sha256(key);
+            var i: usize = 0;
+            while i < 32 : (i += 1) {
+                k[i] = h[i];
+            }
+        } else {
+            var i: usize = 0;
+            while i < key.len() : (i += 1) {
+                k[i] = key[i];
+            }
+        }
+        var ipad: [64]u8 = [0; 64];
+        var opad: [64]u8 = [0; 64];
+        var i: usize = 0;
+        while i < 64 : (i += 1) {
+            ipad[i] = k[i] ^ 0x36;
+            opad[i] = k[i] ^ 0x5c;
+        }
+        var inner = sha2.Sha256.init();
+        inner.update(ipad[0..64]);
+        return HmacSha256 { inner: inner, outer_key: opad };
+    }
+
+    pub fn update(self: &mut HmacSha256, data: []u8) {
+        self.inner.update(data);
+    }
+
+    pub fn finish(self: &mut HmacSha256) -> [32]u8 {
+        let ih = self.inner.finish();
+        var outer = sha2.Sha256.init();
+        let opad = self.outer_key;
+        outer.update(opad[0..64]);
+        outer.update(ih[0..32]);
+        return outer.finish();
+    }
+}
+
+/// HMAC-SHA-384.
+pub type HmacSha384 = struct {
+    inner: sha2.Sha512,
+    outer_key: [128]u8,
+
+    pub fn init(key: []u8) -> HmacSha384 {
+        var k: [128]u8 = [0; 128];
+        if key.len() > 128 {
+            let h = sha2.sha384(key);
+            var i: usize = 0;
+            while i < 48 : (i += 1) {
+                k[i] = h[i];
+            }
+        } else {
+            var i: usize = 0;
+            while i < key.len() : (i += 1) {
+                k[i] = key[i];
+            }
+        }
+        var ipad: [128]u8 = [0; 128];
+        var opad: [128]u8 = [0; 128];
+        var i: usize = 0;
+        while i < 128 : (i += 1) {
+            ipad[i] = k[i] ^ 0x36;
+            opad[i] = k[i] ^ 0x5c;
+        }
+        var inner = sha2.Sha512.init384();
+        inner.update(ipad[0..128]);
+        return HmacSha384 { inner: inner, outer_key: opad };
+    }
+
+    pub fn update(self: &mut HmacSha384, data: []u8) {
+        self.inner.update(data);
+    }
+
+    pub fn finish(self: &mut HmacSha384) -> [48]u8 {
+        let ih = self.inner.finish384();
+        var outer = sha2.Sha512.init384();
+        let opad = self.outer_key;
+        outer.update(opad[0..128]);
+        outer.update(ih[0..48]);
+        return outer.finish384();
+    }
+}
+
+pub fn hmac_sha256(key: []u8, data: []u8) -> [32]u8 {
+    var h = HmacSha256.init(key);
+    h.update(data);
+    return h.finish();
+}
+
+pub fn hmac_sha384(key: []u8, data: []u8) -> [48]u8 {
+    var h = HmacSha384.init(key);
+    h.update(data);
+    return h.finish();
+}
+
+/// HKDF-Extract with SHA-256: the pseudorandom key.
+pub fn hkdf_extract_sha256(salt: []u8, ikm: []u8) -> [32]u8 {
+    return hmac_sha256(key: salt, data: ikm);
+}
+
+/// HKDF-Expand with SHA-256 into out, up to 255 * 32 bytes.
+pub fn hkdf_expand_sha256(prk: []u8, info: []u8, out: []mut u8) {
+    if out.len() > 255 * 32 {
+        panic("HKDF-Expand gives at most 255 blocks");
+    }
+    var t: [32]u8 = [0; 32];
+    var done: usize = 0;
+    var counter: u8 = 1;
+    while done < out.len() {
+        var h = HmacSha256.init(prk);
+        if counter > 1 {
+            h.update(t[0..32]);
+        }
+        h.update(info);
+        let c: [1]u8 = [counter];
+        h.update(c[0..1]);
+        t = h.finish();
+        var i: usize = 0;
+        while i < 32 and done < out.len() : (i += 1) {
+            out[done] = t[i];
+            done += 1;
+        }
+        counter +%= 1;
+    }
+}
+
+pub fn hkdf_extract_sha384(salt: []u8, ikm: []u8) -> [48]u8 {
+    return hmac_sha384(key: salt, data: ikm);
+}
+
+pub fn hkdf_expand_sha384(prk: []u8, info: []u8, out: []mut u8) {
+    if out.len() > 255 * 48 {
+        panic("HKDF-Expand gives at most 255 blocks");
+    }
+    var t: [48]u8 = [0; 48];
+    var done: usize = 0;
+    var counter: u8 = 1;
+    while done < out.len() {
+        var h = HmacSha384.init(prk);
+        if counter > 1 {
+            h.update(t[0..48]);
+        }
+        h.update(info);
+        let c: [1]u8 = [counter];
+        h.update(c[0..1]);
+        t = h.finish();
+        var i: usize = 0;
+        while i < 48 and done < out.len() : (i += 1) {
+            out[done] = t[i];
+            done += 1;
+        }
+        counter +%= 1;
+    }
+}

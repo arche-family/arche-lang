@@ -1,0 +1,38 @@
+// test: run
+// spec: crypto (RFC 4231, RFC 5869)
+// stage0: skip
+// stdout: 5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+// stdout: af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649
+// stdout: 60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54
+// stdout: 077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5
+// stdout: 3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865
+// stdout: ct
+import std;
+import alloc;
+import crypto.hmac;
+import crypto.ct;
+import _hex;
+
+fn main(sys: &mut std.System) -> !void {
+    // RFC 4231, test case 2.
+    let a = hmac.hmac_sha256(key: "Jefe".bytes(), data: "what do ya want for nothing?".bytes());
+    _hex.hex(&mut sys.stdout, a[0..32]);
+    let b = hmac.hmac_sha384(key: "Jefe".bytes(), data: "what do ya want for nothing?".bytes());
+    _hex.hex(&mut sys.stdout, b[0..48]);
+    // RFC 4231, test case 6: a key longer than the block.
+    let long_key: [131]u8 = [0xaa; 131];
+    let c = hmac.hmac_sha256(key: long_key[0..131], data: "Test Using Larger Than Block-Size Key - Hash Key First".bytes());
+    _hex.hex(&mut sys.stdout, c[0..32]);
+    // RFC 5869, test case 1.
+    let ikm: [22]u8 = [0x0b; 22];
+    let salt: [13]u8 = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
+    let info: [10]u8 = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
+    let prk = hmac.hkdf_extract_sha256(salt: salt[0..13], ikm: ikm[0..22]);
+    _hex.hex(&mut sys.stdout, prk[0..32]);
+    var okm: [42]u8 = [0; 42];
+    hmac.hkdf_expand_sha256(prk: prk[0..32], info: info[0..10], okm[0..42]);
+    _hex.hex(&mut sys.stdout, okm[0..42]);
+    if ct.eq(a: a[0..32], b: a[0..32]) and not ct.eq(a: a[0..32], b: c[0..32]) {
+        sys.stdout.write("ct\n");
+    }
+}
