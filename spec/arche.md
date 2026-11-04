@@ -44,7 +44,7 @@ const PACKAGE: build.Package = build.Package {
 ```
 
 - A module path names a file of the package (A§3). A dependency's modules are reached through the dependency's name: `import http.server;`.
-- The roots `core`, `alloc` and `std` are the standard library; a package cannot use those names.
+- The roots `core`, `alloc` and `std` are the standard library; a package cannot use those names. The library is full Arche, in the repository's `lib/`: `core` (`lib/core.arche` and `lib/core/`) needs no operating system and no allocator, and imports neither `alloc` nor `std`; `alloc` (`lib/alloc.arche`) has Arche-0's containers, written over `core.mem`, whose functions the compiler provides. A full-Arche package gets this `alloc`; an Arche-0 package keeps the compiler's own, which has the same types and signatures, and `arche --lib-alloc` gives it the library's.
 
 ### 1.2 Editions
 
@@ -354,7 +354,7 @@ This chapter collects every rule of Arche's memory model in one place. Each has 
 
 | Rule | Code |
 | --- | --- |
-| A move-only value (a container, a capability, a `Shared(T)`, a closure that captures a move-only value, or anything holding one) is moved when it is passed, assigned, returned, stored, captured by value or matched by value; the source is unusable on every path that follows until it is reassigned | E0605 |
+| A move-only value (a container, a capability, a `Shared(T)`, a `core.Unique`, a closure that captures a move-only value, or anything holding one) is moved when it is passed, assigned, returned, stored, captured by value or matched by value; the source is unusable on every path that follows until it is reassigned. A library type that owns memory holds a `core.Unique` | E0605 |
 | Nothing is moved out of a place reached through a view; copy it, or move the whole value the view comes from | E0606 |
 | Moving a field moves only that field; the rest of the struct stays usable, but the struct as a whole does not until the field is reassigned | E0605 |
 

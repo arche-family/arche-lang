@@ -966,6 +966,10 @@ fn bad_variant_use(c: &mut ck.Checker, n: cst.NodeId, what: str) -> ty.TypeId {
 pub type Param = struct {
     pub name: alloc.Symbol,
     pub type_id: ty.TypeId,
+    /// The type as the declaration writes it, interned, or the empty name
+    /// when it has no source: the label rule compares these (§7.5,
+    /// spec/arche.md §4.1).
+    pub written: alloc.Symbol,
 }
 
 /// A built-in method of §11.
@@ -982,11 +986,11 @@ pub type Method = struct {
 }
 
 fn param(c: &mut ck.Checker, name: str, t: ty.TypeId) -> Param {
-    return Param { name: c.names.intern(name), type_id: t };
+    return Param { name: c.names.intern(name), type_id: t, written: c.names.intern("") };
 }
 
 fn method0(c: &mut ck.Checker, mode: ck.SelfMode, ret: ty.TypeId) -> Method {
-    let empty = Param { name: c.names.intern(""), type_id: ty.invalid() };
+    let empty = Param { name: c.names.intern(""), type_id: ty.invalid(), written: c.names.intern("") };
     return Method { self_mode: mode, nparams: 0, p0: empty, p1: empty, ret: ret, labels: false };
 }
 
@@ -1246,8 +1250,16 @@ fn check_args(c: &mut ck.Checker, call: cst.NodeId, params: &alloc.List(Param), 
                 // Erasable (§7.5): two parameters of one type need labels.
                 var shared_type = false;
                 var j: usize = 0;
+                let empty = c.names.intern("");
                 while j < ps.len() and labels_by_type : (j += 1) {
-                    shared_type = shared_type or (j != i and ps[j].type_id == ps[i].type_id);
+                    if j == i {
+                        continue;
+                    }
+                    if ps[j].written != empty and ps[i].written != empty {
+                        shared_type = shared_type or ps[j].written == ps[i].written;
+                    } else {
+                        shared_type = shared_type or ps[j].type_id == ps[i].type_id;
+                    }
                 }
                 if shared_type {
                     var m = ck.new_message(c);
@@ -1270,12 +1282,48 @@ fn check_args(c: &mut ck.Checker, call: cst.NodeId, params: &alloc.List(Param), 
 }
 
 /// The parameters of a declared function, without self when skip is 1.
-fn fn_params(c: &ck.Checker, f: ck.FnInfo, skip: u32) -> alloc.List(Param) {
+/// The source text of run-time parameter k's type in f's declaration, as
+/// a name; the empty name when there is none to read.
+fn written_type(c: &mut ck.Checker, f: ck.FnInfo, k: u32) -> alloc.Symbol {
+    let empty = c.names.intern("");
+    if f.decl == ck.NONE {
+        return empty;
+    }
+    let decl = c.decls[f.decl as usize];
+    let m = &c.p.modules[decl.module as usize];
+    let t = &m.tree;
+    let n = t.node(decl.node);
+    var seen: u32 = 0;
+    var i: u32 = 0;
+    while i < n.children_len : (i += 1) {
+        let ch = t.child(n, i);
+        if t.node(ch).kind != cst.Kind.Param {
+            continue;
+        }
+        match t.find_own(ch, tk.Kind.KwComptime, c.a) {
+            some(_) => { continue; }
+            none => { }
+        }
+        if seen == k {
+            if t.node(ch).children_len == 0 {
+                return empty;
+            }
+            let sp = m.node_span(t.child(t.node(ch), 0));
+            var text = alloc.String.init(c.a);
+            text.push_str(m.text.view()[sp.start as usize..sp.end() as usize]);
+            return c.names.intern(text.view());
+        }
+        seen += 1;
+    }
+    return empty;
+}
+
+fn fn_params(c: &mut ck.Checker, f: ck.FnInfo, skip: u32) -> alloc.List(Param) {
     var out = alloc.List(Param).init(c.a);
     var i = f.params_start + skip;
     while i < f.params_start + f.params_len : (i += 1) {
         let pi = c.params[i as usize];
-        out.push(Param { name: pi.name, type_id: pi.type_id });
+        out.push(Param { name: pi.name, type_id: pi.type_id, written: written_type(c, f, i - f.params_start) });
     }
     return out;
 }

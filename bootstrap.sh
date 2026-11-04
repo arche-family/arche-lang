@@ -35,3 +35,22 @@ else
     echo "bootstrap: stage2 and stage3 differ"
     exit 1
 fi
+
+# The same with the library's alloc (lib/alloc.arche) instead of the
+# compiler's built-in one (docs/sprints.md S15): stage2 and stage3 are then
+# compilers whose containers are Arche code. The stages live three levels
+# below the repository, where they find lib/.
+mkdir -p "$work/lib/stage2" "$work/lib/stage3"
+echo "bootstrap: stage2 on lib/alloc, built by stage1"
+(cd "$root/compiler" && "$stage1" --lib-alloc build main.arche "$work/lib/stage2/arche.ll")
+(cd "$work/lib/stage2" && $link -o arche arche.ll "$rt")
+echo "bootstrap: stage3 on lib/alloc, built by stage2"
+(cd "$root/compiler" && "$work/lib/stage2/arche" --lib-alloc build main.arche "$work/lib/stage3/arche.ll")
+(cd "$work/lib/stage3" && $link -o arche arche.ll "$rt")
+if cmp -s "$work/lib/stage2/arche" "$work/lib/stage3/arche"; then
+    echo "bootstrap: on lib/alloc too, stage2 and stage3 are bit-identical"
+    sha256sum "$work/lib/stage3/arche"
+else
+    echo "bootstrap: on lib/alloc, stage2 and stage3 differ"
+    exit 1
+fi
