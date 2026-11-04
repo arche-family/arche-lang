@@ -55,6 +55,8 @@ fn f() {
 
 Values are taken verbatim after `key: `, without escapes. Codes are assigned when the compiler's diagnostics are built (S5); until then a test may leave `code` out.
 
+A test's directory is its package root (§3), so a test can import modules beside it. Files and directories whose names start with `_` are support modules, not tests: `tests/modules/two-modules.arche` imports `_support.shapes` from `tests/modules/_support/shapes.arche`.
+
 ## Compiler contract
 
 The runner calls the compiler as `<command> <source> <output>`:

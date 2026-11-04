@@ -700,7 +700,8 @@ static bool ends_with(const char *s, const char *suffix) {
     return n >= m && strcmp(s + n - m, suffix) == 0;
 }
 
-// Adds `path` if it is a file, or every *.arche file below it if it is a directory.
+// Adds `path` if it is a file, or every *.arche file below it if it is a
+// directory, leaving out names that start with '_' or '.'.
 static void collect(const char *path, List *files) {
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -717,7 +718,8 @@ static void collect(const char *path, List *files) {
     bool slash = ends_with(path, "/");
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+        // "." and "..", and support files: modules that tests import.
+        if (e->d_name[0] == '.' || e->d_name[0] == '_') {
             continue;
         }
         char *child = slash ? xformat("%s%s", path, e->d_name) : xformat("%s/%s", path, e->d_name);
