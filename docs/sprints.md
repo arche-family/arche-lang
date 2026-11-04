@@ -2,7 +2,7 @@
 
 > 2026-11-03 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S6. S0–S4 yopilgan. S5'da faqat parser'ni 24 soat fuzz qilish qoldi: CI har commit'da 60 soniya fuzz qiladi, uzun sinov hali o'tkazilmagan.
+**Joriy sprint:** S7. S0–S4 va S6 yopilgan. S5'da faqat parser'ni 24 soat fuzz qilish qoldi: CI har commit'da 60 soniya fuzz qiladi, uzun sinov hali o'tkazilmagan.
 
 ## Qoidalar
 
