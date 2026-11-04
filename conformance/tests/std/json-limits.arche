@@ -1,0 +1,48 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: too-deep bad bad bad bad bad bad -9223372036854775808 too-big
+import std;
+import std.json;
+import alloc;
+
+/// Texts that are not JSON: a leading zero, a dot without digits, an
+/// unknown escape, a trailing comma, a missing colon, a lone surrogate.
+fn bad(k: u32) -> str {
+    match k {
+        0 => { return "01"; }
+        1 => { return "1."; }
+        2 => { return "\"\\x\""; }
+        3 => { return "[1,]"; }
+        4 => { return "{\"a\" 1}"; }
+        _ => { return "\"\\udc00\""; }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var deep = alloc.String.init(sys.alloc);
+    var i: u32 = 0;
+    while i < 200 : (i += 1) {
+        deep.push_ascii('[');
+    }
+    match json.parse(deep.view(), sys.alloc) {
+        ok(_) => { sys.stdout.write("parsed"); }
+        err(.TooDeep) => { sys.stdout.write("too-deep"); }
+        err(.Syntax) => { sys.stdout.write("syntax"); }
+    }
+    for k: u32 in 0..6 {
+        match json.parse(bad(k), sys.alloc) {
+            ok(_) => { sys.stdout.write(" ok"); }
+            err(_) => { sys.stdout.write(" bad"); }
+        }
+    }
+    let n = try json.parse(" -9223372036854775808 ", sys.alloc);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(json.as_i64(&n) orelse 0);
+    let big = try json.parse("9223372036854775808", sys.alloc);
+    match json.as_i64(&big) {
+        some(_) => { sys.stdout.write(" fits"); }
+        none => { sys.stdout.write(" too-big"); }
+    }
+    sys.stdout.write("\n");
+}

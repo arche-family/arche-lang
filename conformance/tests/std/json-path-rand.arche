@@ -1,0 +1,57 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: {"name":"Arche","tags":[1,-20,3.5e2,true,null],"esc":"a\"bé😀\n"}
+// stdout: 1 -42 syntax
+// stdout: a/b c.txt gz a/b/c /c ..
+// stdout: 1546998764402558742 6990951692964543102 9 0
+import std;
+import std.json;
+import std.path;
+import alloc;
+import core.rand;
+
+fn main(sys: &mut std.System) -> !void {
+    let text = "{\"name\": \"Arche\", \"tags\": [1, -20, 3.5e2, true, null], \"esc\": \"a\\\"b\\u00e9\\ud83d\\ude00\\n\"}";
+    let v = try json.parse(text, sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+    match json.key_index(&v, "tags") {
+        some(i) => { sys.stdout.write_u64(i as u64); }
+        none => { sys.stdout.write("-"); }
+    }
+    let n = json.from_int(-42, sys.alloc);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(json.as_i64(&n) orelse 0);
+    match json.parse("[1, 2", sys.alloc) {
+        ok(_) => { sys.stdout.write(" parsed"); }
+        err(e) => { sys.stdout.write(" syntax"); }
+    }
+    sys.stdout.write("\n");
+    sys.stdout.write(path.parent("a/b/c.txt"));
+    sys.stdout.write(" ");
+    sys.stdout.write(path.file_name("a/b/c.txt"));
+    sys.stdout.write(" ");
+    sys.stdout.write(path.extension("a/b/c.tar.gz"));
+    sys.stdout.write(" ");
+    let j = path.join(base: "a/b", name: "c", sys.alloc);
+    sys.stdout.write(j.view());
+    sys.stdout.write(" ");
+    let m = path.normalize("/a/./b/../../c//d/..", sys.alloc);
+    sys.stdout.write(m.view());
+    sys.stdout.write(" ");
+    let r = path.normalize("../x/..", sys.alloc);
+    sys.stdout.write(r.view());
+    sys.stdout.write("\n");
+    var g = rand.Seeded.init(42);
+    sys.stdout.write_u64(g.next_u64());
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(g.next_u64());
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(g.below(10));
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(g.between(lo: -5, hi: 5));
+    sys.stdout.write("\n");
+}

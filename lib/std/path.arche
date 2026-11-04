@@ -1,0 +1,118 @@
+/// Paths as text, '/' between parts, as on Linux. Nothing here reads the
+/// file system.
+import alloc;
+
+pub fn is_absolute(p: str) -> bool {
+    return p.len() > 0 and p.bytes()[0] == '/';
+}
+
+fn last_slash(p: str) -> ?usize {
+    let b = p.bytes();
+    var i = b.len();
+    while i > 0 : (i -= 1) {
+        if b[i - 1] == '/' {
+            return i - 1;
+        }
+    }
+    return none;
+}
+
+/// The last part: "c.txt" of "a/b/c.txt"; the whole path without a '/'.
+pub fn file_name(p: str) -> str {
+    match last_slash(p) {
+        some(i) => { return p[i + 1..p.len()]; }
+        none => { return p; }
+    }
+}
+
+/// Everything before the last part: "a/b" of "a/b/c.txt", "/" of "/c",
+/// "" of "c.txt".
+pub fn parent(p: str) -> str {
+    match last_slash(p) {
+        some(i) => {
+            if i == 0 {
+                return p[0..1];
+            }
+            return p[0..i];
+        }
+        none => { return p[0..0]; }
+    }
+}
+
+/// "txt" of "a/b/c.txt"; "" when the last part has no '.' after its start.
+pub fn extension(p: str) -> str {
+    let name = file_name(p);
+    let b = name.bytes();
+    var i = b.len();
+    while i > 1 : (i -= 1) {
+        if b[i - 1] == '.' {
+            return name[i..name.len()];
+        }
+    }
+    return name[0..0];
+}
+
+/// base and name with one '/' between; name alone when it is absolute.
+pub fn join(base: str, name: str, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    if is_absolute(name) or base.len() == 0 {
+        out.push_str(name);
+        return out;
+    }
+    out.push_str(base);
+    if base.bytes()[base.len() - 1] != '/' {
+        out.push_ascii('/');
+    }
+    out.push_str(name);
+    return out;
+}
+
+/// Without "." parts, empty parts and the parts ".." takes back: "a/./b/../c"
+/// is "a/c". A relative path keeps the ".." it cannot take back; "" is ".".
+pub fn normalize(p: str, a: alloc.Allocator) -> alloc.String {
+    var parts = alloc.List(alloc.String).init(a);
+    let b = p.bytes();
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= b.len() : (i += 1) {
+        if i == b.len() or b[i] == '/' {
+            let part = p[start..i];
+            start = i + 1;
+            if part.len() == 0 or part.eq(".") {
+                continue;
+            }
+            if part.eq("..") {
+                var can_drop = false;
+                if parts.len() > 0 {
+                    can_drop = not parts.items()[parts.len() - 1].view().eq("..");
+                }
+                if can_drop {
+                    _ = parts.pop();
+                    continue;
+                }
+                if is_absolute(p) {
+                    continue; // nothing is above "/"
+                }
+            }
+            var s = alloc.String.init(a);
+            s.push_str(part);
+            parts.push(s);
+        }
+    }
+    var out = alloc.String.init(a);
+    if is_absolute(p) {
+        out.push_ascii('/');
+    }
+    var k: usize = 0;
+    for part in parts.items() {
+        if k > 0 {
+            out.push_ascii('/');
+        }
+        out.push_str(part.view());
+        k += 1;
+    }
+    if out.len() == 0 {
+        out.push_ascii('.');
+    }
+    return out;
+}

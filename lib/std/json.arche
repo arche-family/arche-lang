@@ -1,0 +1,444 @@
+/// JSON (RFC 8259): parsing text into a Value, and writing one back. An
+/// object keeps its keys in the order they came, so writing what was read
+/// gives the same order (docs/plan.md, determinism). A number keeps its text,
+/// as written; as_i64 reads the integers.
+import alloc;
+import core.fmt;
+import core.mem;
+import core.utf8;
+
+pub type Value = enum {
+    Null,
+    Bool { value: bool },
+    Number { text: alloc.String },
+    Text { value: alloc.String },
+    Array { items: alloc.List(Value) },
+    Object { keys: alloc.List(alloc.String), values: alloc.List(Value) },
+}
+
+pub type JsonError = error { Syntax, TooDeep }
+
+/// How deep arrays and objects may nest: deeper text is an error, not a
+/// stack overflow.
+pub const MAX_DEPTH: u32 = 128;
+
+pub fn parse(text: str, a: alloc.Allocator) -> JsonError!Value {
+    let b = text.bytes();
+    var p = Parser { at: 0, a: a };
+    p.space(b);
+    let v = try p.value(b, depth: 0);
+    p.space(b);
+    if p.at != b.len() {
+        return JsonError.Syntax;
+    }
+    return v;
+}
+
+/// Where parsing is in the text, which each function takes as b.
+type Parser = struct {
+    at: usize,
+    a: alloc.Allocator,
+
+    fn peek(self: &Parser, b: []u8) -> u8 {
+        if self.at < b.len() {
+            return b[self.at];
+        }
+        return 0;
+    }
+
+    fn space(self: &mut Parser, b: []u8) {
+        while self.at < b.len() {
+            let c = b[self.at];
+            if c != ' ' and c != '\t' and c != '\n' and c != '\r' {
+                return;
+            }
+            self.at += 1;
+        }
+    }
+
+    fn word(self: &mut Parser, b: []u8, w: str) -> bool {
+        let wb = w.bytes();
+        if self.at + wb.len() > b.len() {
+            return false;
+        }
+        var i: usize = 0;
+        while i < wb.len() : (i += 1) {
+            if b[self.at + i] != wb[i] {
+                return false;
+            }
+        }
+        self.at += wb.len();
+        return true;
+    }
+
+    fn value(self: &mut Parser, b: []u8, depth: u32) -> JsonError!Value {
+        if depth > MAX_DEPTH {
+            return JsonError.TooDeep;
+        }
+        let c = self.peek(b);
+        if c == 'n' and self.word(b, w: "null") {
+            return Value.Null;
+        }
+        if c == 't' and self.word(b, w: "true") {
+            return Value.Bool { value: true };
+        }
+        if c == 'f' and self.word(b, w: "false") {
+            return Value.Bool { value: false };
+        }
+        if c == '"' {
+            let s = try self.string(b);
+            return Value.Text { value: s };
+        }
+        if c == '[' {
+            self.at += 1;
+            var items = alloc.List(Value).init(self.a);
+            self.space(b);
+            if self.peek(b) == ']' {
+                self.at += 1;
+                return Value.Array { items: items };
+            }
+            while true {
+                self.space(b);
+                let v = try self.value(b, depth: depth + 1);
+                items.push(v);
+                self.space(b);
+                if self.peek(b) == ',' {
+                    self.at += 1;
+                } else if self.peek(b) == ']' {
+                    self.at += 1;
+                    return Value.Array { items: items };
+                } else {
+                    return JsonError.Syntax;
+                }
+            }
+        }
+        if c == '{' {
+            self.at += 1;
+            var keys = alloc.List(alloc.String).init(self.a);
+            var values = alloc.List(Value).init(self.a);
+            self.space(b);
+            if self.peek(b) == '}' {
+                self.at += 1;
+                return Value.Object { keys: keys, values: values };
+            }
+            while true {
+                self.space(b);
+                if self.peek(b) != '"' {
+                    return JsonError.Syntax;
+                }
+                let k = try self.string(b);
+                self.space(b);
+                if self.peek(b) != ':' {
+                    return JsonError.Syntax;
+                }
+                self.at += 1;
+                self.space(b);
+                let v = try self.value(b, depth: depth + 1);
+                keys.push(k);
+                values.push(v);
+                self.space(b);
+                if self.peek(b) == ',' {
+                    self.at += 1;
+                } else if self.peek(b) == '}' {
+                    self.at += 1;
+                    return Value.Object { keys: keys, values: values };
+                } else {
+                    return JsonError.Syntax;
+                }
+            }
+        }
+        if c == '-' or (c >= '0' and c <= '9') {
+            let n = try self.number(b);
+            return Value.Number { text: n };
+        }
+        return JsonError.Syntax;
+    }
+
+    fn digits(self: &mut Parser, b: []u8) -> usize {
+        let start = self.at;
+        while self.peek(b) >= '0' and self.peek(b) <= '9' {
+            self.at += 1;
+        }
+        return self.at - start;
+    }
+
+    /// -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?
+    fn number(self: &mut Parser, b: []u8) -> JsonError!alloc.String {
+        let start = self.at;
+        if self.peek(b) == '-' {
+            self.at += 1;
+        }
+        if self.peek(b) == '0' {
+            self.at += 1;
+        } else if self.digits(b) == 0 {
+            return JsonError.Syntax;
+        }
+        if self.peek(b) == '.' {
+            self.at += 1;
+            if self.digits(b) == 0 {
+                return JsonError.Syntax;
+            }
+        }
+        if self.peek(b) == 'e' or self.peek(b) == 'E' {
+            self.at += 1;
+            if self.peek(b) == '+' or self.peek(b) == '-' {
+                self.at += 1;
+            }
+            if self.digits(b) == 0 {
+                return JsonError.Syntax;
+            }
+        }
+        var out = alloc.String.init(self.a);
+        var i = start;
+        while i < self.at : (i += 1) {
+            out.push_ascii(b[i]);
+        }
+        return out;
+    }
+
+    fn hex4(self: &mut Parser, b: []u8) -> JsonError!u32 {
+        var v: u32 = 0;
+        var k: u32 = 0;
+        while k < 4 : (k += 1) {
+            let c = self.peek(b);
+            var d: u32 = 0;
+            if c >= '0' and c <= '9' {
+                d = (c - '0') as u32;
+            } else if c >= 'a' and c <= 'f' {
+                d = (c - 'a') as u32 + 10;
+            } else if c >= 'A' and c <= 'F' {
+                d = (c - 'A') as u32 + 10;
+            } else {
+                return JsonError.Syntax;
+            }
+            v = v * 16 + d;
+            self.at += 1;
+        }
+        return v;
+    }
+
+    /// A string, its escapes decoded; the text must be UTF-8.
+    fn string(self: &mut Parser, b: []u8) -> JsonError!alloc.String {
+        self.at += 1; // "
+        var bytes = alloc.List(u8).init(self.a);
+        while true {
+            if self.at >= b.len() {
+                return JsonError.Syntax;
+            }
+            let c = b[self.at];
+            self.at += 1;
+            if c == '"' {
+                break;
+            }
+            if c < 0x20 {
+                return JsonError.Syntax;
+            }
+            if c != '\\' {
+                bytes.push(c);
+                continue;
+            }
+            let e = self.peek(b);
+            self.at += 1;
+            if e == '"' or e == '\\' or e == '/' {
+                bytes.push(e);
+            } else if e == 'b' {
+                bytes.push(8);
+            } else if e == 'f' {
+                bytes.push(12);
+            } else if e == 'n' {
+                bytes.push('\n');
+            } else if e == 'r' {
+                bytes.push('\r');
+            } else if e == 't' {
+                bytes.push('\t');
+            } else if e == 'u' {
+                var cp = try self.hex4(b);
+                if cp >= 0xD800 and cp <= 0xDBFF {
+                    // A surrogate pair: 😀.
+                    if not self.word(b, w: "\\u") {
+                        return JsonError.Syntax;
+                    }
+                    let low = try self.hex4(b);
+                    if low < 0xDC00 or low > 0xDFFF {
+                        return JsonError.Syntax;
+                    }
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                } else if cp >= 0xDC00 and cp <= 0xDFFF {
+                    return JsonError.Syntax;
+                }
+                var enc: [4]u8 = [0; 4];
+                let n = utf8.encode(cp, enc[0..4]);
+                var k: usize = 0;
+                while k < n : (k += 1) {
+                    bytes.push(enc[k]);
+                }
+            } else {
+                return JsonError.Syntax;
+            }
+        }
+        if not utf8.valid(bytes.items()) {
+            return JsonError.Syntax;
+        }
+        var out = alloc.String.init(self.a);
+        unsafe {
+            // SAFETY: checked to be UTF-8 just now.
+            out.push_str(mem.str_from(bytes.items()));
+        }
+        return out;
+    }
+}
+
+// ---- writing ------------------------------------------------------------------------
+
+/// v as JSON text, without spaces, appended to out.
+pub fn write(v: &Value, out: &mut alloc.String) {
+    match v {
+        .Null => { out.push_str("null"); }
+        .Bool { value } => {
+            if value.* {
+                out.push_str("true");
+            } else {
+                out.push_str("false");
+            }
+        }
+        .Number { text } => { out.push_str(text.view()); }
+        .Text { value } => { write_string(value.view(), out); }
+        .Array { items } => {
+            out.push_ascii('[');
+            var i: usize = 0;
+            for item in items.items() {
+                if i > 0 {
+                    out.push_ascii(',');
+                }
+                write(item, out);
+                i += 1;
+            }
+            out.push_ascii(']');
+        }
+        .Object { keys, values } => {
+            out.push_ascii('{');
+            var i: usize = 0;
+            while i < keys.len() : (i += 1) {
+                if i > 0 {
+                    out.push_ascii(',');
+                }
+                write_string(keys.items()[i].view(), out);
+                out.push_ascii(':');
+                write(&values.items()[i], out);
+            }
+            out.push_ascii('}');
+        }
+    }
+}
+
+fn hex_digit(d: u8) -> u8 {
+    if d < 10 {
+        return '0' + d;
+    }
+    return 'a' + (d - 10);
+}
+
+/// A string with '"', '\\' and control characters escaped.
+pub fn write_string(s: str, out: &mut alloc.String) {
+    out.push_ascii('"');
+    let b = s.bytes();
+    var run: usize = 0;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        let c = b[i];
+        if c != '"' and c != '\\' and c >= 0x20 {
+            continue;
+        }
+        out.push_str(s[run..i]);
+        run = i + 1;
+        if c == '"' {
+            out.push_str("\\\"");
+        } else if c == '\\' {
+            out.push_str("\\\\");
+        } else if c == '\n' {
+            out.push_str("\\n");
+        } else if c == '\t' {
+            out.push_str("\\t");
+        } else if c == '\r' {
+            out.push_str("\\r");
+        } else {
+            out.push_str("\\u00");
+            out.push_ascii(hex_digit(c >> 4));
+            out.push_ascii(hex_digit(c & 15));
+        }
+    }
+    out.push_str(s[run..b.len()]);
+    out.push_ascii('"');
+}
+
+// ---- reading values -------------------------------------------------------------------
+
+/// A number that is an integer that fits i64: "-12" but not "1.5" or "1e3".
+pub fn as_i64(v: &Value) -> ?i64 {
+    match v {
+        .Number { text } => {
+            let b = text.view().bytes();
+            var neg = false;
+            var i: usize = 0;
+            if b[0] == '-' {
+                neg = true;
+                i = 1;
+            }
+            var mag: u64 = 0;
+            while i < b.len() : (i += 1) {
+                let c = b[i];
+                if c < '0' or c > '9' {
+                    return none;
+                }
+                if mag > (9223372036854775808 - (c - '0') as u64) / 10 {
+                    return none;
+                }
+                mag = mag * 10 + (c - '0') as u64;
+            }
+            if neg {
+                return (0 -% mag) as% i64;
+            }
+            if mag > 9223372036854775807 {
+                return none;
+            }
+            return mag as i64;
+        }
+        _ => { return none; }
+    }
+}
+
+/// The index of key in an object, the first one when it repeats.
+pub fn key_index(v: &Value, key: str) -> ?usize {
+    match v {
+        .Object { keys, .. } => {
+            var i: usize = 0;
+            for k in keys.items() {
+                if k.view().eq(key) {
+                    return i;
+                }
+                i += 1;
+            }
+            return none;
+        }
+        _ => { return none; }
+    }
+}
+
+/// A number value from an integer.
+pub fn from_int(n: i64, a: alloc.Allocator) -> Value {
+    var buf: [21]u8 = [0; 21];
+    let len = fmt.signed(n, buf[0..21]);
+    var text = alloc.String.init(a);
+    var i: usize = 0;
+    while i < len : (i += 1) {
+        text.push_ascii(buf[i]);
+    }
+    return Value.Number { text: text };
+}
+
+/// A text value.
+pub fn from_text(s: str, a: alloc.Allocator) -> Value {
+    var value = alloc.String.init(a);
+    value.push_str(s);
+    return Value.Text { value: value };
+}
