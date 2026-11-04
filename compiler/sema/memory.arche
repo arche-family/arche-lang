@@ -1907,4 +1907,14 @@ pub fn check(c: &mut ck.Checker) {
         check_body(c, i as u32, ck.child(c, n, ck.child_count(c, n) - 1));
         ck.restore_context(c, saved);
     }
+    var k: usize = 0;
+    while k < c.tests.len() : (k += 1) {
+        let t = c.tests[k];
+        let saved = ck.save_context(c);
+        c.module = t.module;
+        c.env_len = 0;
+        c.cur_table = ck.NONE;
+        check_body(c, t.fn_index, ck.child(c, t.node, ck.child_count(c, t.node) - 1));
+        ck.restore_context(c, saved);
+    }
 }

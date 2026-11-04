@@ -264,6 +264,15 @@ fn parse_item(p: &mut Parser) {
     if k == tk.Kind.KwTest {
         advance(p);
         _ = expect(p, tk.Kind.String, "a test name");
+        // test "name" (t: &mut std.testing.Test) { ... } in full Arche.
+        if p.full and accept(p, tk.Kind.LParen) {
+            let pm = open(p);
+            if expect(p, tk.Kind.Ident, "a parameter name") and expect(p, tk.Kind.Colon, "':'") {
+                parse_type(p);
+            }
+            _ = close(p, pm, cst.Kind.Param);
+            _ = expect(p, tk.Kind.RParen, "')'");
+        }
         parse_block(p);
         _ = close(p, m, cst.Kind.TestDecl);
         return;

@@ -1,0 +1,36 @@
+// test: run
+// spec: std.testing
+// stage0: skip
+// exit: 1
+// args: --seed 99
+// stdout: seed: 99
+// stdout: test plus one is larger ... FAILED
+// stdout: test same seed, same numbers ... ok
+// stdout: 1 passed, 1 failed, 0 filtered out
+// stdout: rerun with --seed 99
+// stderr: panic: property failed at case
+import std;
+import std.testing;
+import core.rand;
+
+// x + 1 > x does not hold for the largest u8, and the property finds a
+// case where it fails; which case depends on the seed, not on the run.
+test "plus one is larger" (t: &mut testing.Test) {
+    let larger = fn [](g: &mut rand.Seeded) -> bool {
+        let x = g.below(256) as u8;
+        return x == 255 or x +% 1 > x;
+    };
+    t.check(1000, property: &larger);
+    let wraps = fn [](g: &mut rand.Seeded) -> bool {
+        let x = g.below(4) as u8 + 253;
+        return x +% 1 > x;
+    };
+    t.check(1000, property: &wraps);
+}
+
+test "same seed, same numbers" (t: &mut testing.Test) {
+    var a = t.rand();
+    var b = t.rand();
+    assert(a.next_u64() == b.next_u64());
+    assert(t.seed() == t.seed());
+}

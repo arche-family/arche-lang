@@ -29,6 +29,7 @@ fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("       arche tokens <file>\n");
     err_out.write("       arche cst <file>\n");
     err_out.write("       arche build <file> <out.ll>\n");
+    err_out.write("       arche test <file> <out.ll>     the test blocks of <file>, run by std.testing\n");
     err_out.write("options, before the command: --lib-alloc, --lib-std, --target <linux-x86_64 | freestanding-x86_64 |\n");
     err_out.write("       freestanding-riscv64>, --panic-handler <module.function>\n");
     return Failure.BadUsage;
@@ -257,6 +258,7 @@ fn main(sys: &mut std.System) -> !void {
         lib_std: false,
         target: program.Target.LinuxX86_64,
         panic_handler: alloc.String.init(sys.alloc),
+        tests: false,
     };
     var first: usize = 1;
     while first + 1 < n and sys.args.get(first).starts_with("--") : (first += 1) {
@@ -291,6 +293,10 @@ fn main(sys: &mut std.System) -> !void {
     } else if command.eq("tokens") and count == 3 {
         try dump_tokens(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));
     } else if command.eq("build") and count == 4 {
+        try build(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), out_path: sys.args.get(3 + k), opts: &opts);
+    } else if command.eq("test") and count == 4 {
+        // The root module's test blocks and a runner (std.testing).
+        opts.tests = true;
         try build(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), out_path: sys.args.get(3 + k), opts: &opts);
     } else if command.eq("cst") and count == 3 {
         try print_cst(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));

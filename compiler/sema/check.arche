@@ -92,6 +92,15 @@ pub type Impl = struct {
     pub methods_len: u32,
 }
 
+/// A test block (§4): its function, and where it is written.
+pub type TestBlock = struct {
+    pub fn_index: u32,
+    pub module: u32,
+    pub node: cst.NodeId,
+    /// It takes a &mut std.testing.Test.
+    pub takes_test: bool,
+}
+
 /// What a closure captures: a copy or move of a binding, or a view of it
 /// (mode Ref or MutRef). type_id is the binding's type.
 pub type Capture = struct {
@@ -236,6 +245,8 @@ pub type Checker = struct {
     pub captures: alloc.List(Capture),
     /// The function a panic calls on a freestanding target, or NONE.
     pub panic_handler: u32,
+    /// The test blocks: their functions, modules and nodes.
+    pub tests: alloc.List(TestBlock),
     /// The interfaces fn(P) -> R made so far (spec/arche.md §6).
     pub fn_ifaces: alloc.List(u32),
     /// Inside a closure: the bindings around it, which it may not use
@@ -2851,6 +2862,9 @@ fn find_panic_handler(c: &mut Checker) {
 }
 
 fn check_main(c: &mut Checker) {
+    if c.p.tests {
+        return; // the test runner is the entry
+    }
     if program.freestanding(&c.p) {
         // No main: the program's own entry, exported, starts it.
         if not c.p.full {
@@ -2984,6 +2998,7 @@ pub fn analyze(p: program.Program) -> Checker {
         closures: alloc.List(Closure).init(a),
         captures: alloc.List(Capture).init(a),
         panic_handler: NONE,
+        tests: alloc.List(TestBlock).init(a),
         fn_ifaces: alloc.List(u32).init(a),
         outer_scope: alloc.List(Binding).init(a),
         labels: alloc.List(alloc.Symbol).init(a),

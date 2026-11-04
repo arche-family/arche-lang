@@ -24,6 +24,7 @@ $(BUILD):
 check: $(BUILD)/arche
 	$(MAKE) -C ../conformance
 	../conformance/runner/build/runner --timeout 30 --compiler ./arche-build ../conformance/tests
+	../conformance/runner/build/runner --timeout 30 --compiler ./arche-build-tests ../conformance/testrunner
 	sh ./check-valid.sh $(BUILD)/arche ../conformance/tests
 	sh ./roundtrip.sh $(BUILD)/arche ../conformance/tests .
 	sh ./tests/run.sh $(BUILD)/arche

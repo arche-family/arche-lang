@@ -257,22 +257,44 @@ pub fn check_closure_body(c: &mut ck.Checker, f: u32, ci: u32, n: cst.NodeId) {
 pub fn check_test(c: &mut ck.Checker, module: u32, n: cst.NodeId) {
     c.module = module;
     c.fn_index = c.fns.len() as u32;
+    c.loops = 0;
+    c.defer_loops = ck.NONE;
+    while c.scope.len() > 0 {
+        _ = c.scope.pop();
+    }
+    // test "name" (t: &mut std.testing.Test): the runner's seed and helpers.
+    let params_start = c.params.len() as u32;
+    var takes_test = false;
+    if ck.child_count(c, n) > 1 and ck.kind_of(c, ck.child(c, n, 0)) == cst.Kind.Param {
+        let pn = ck.child(c, n, 0);
+        let pt = ck.resolve_type(c, ck.child(c, pn, 0));
+        let pi = c.t.get(pt);
+        var fine = pi.kind == ty.Kind.Ref and pi.mutable and c.t.kind(pi.elem) == ty.Kind.Struct;
+        if fine {
+            let d = c.decls[c.t.get(pi.elem).decl as usize];
+            fine = c.names.text(d.name).eq("Test") and c.p.modules[d.module as usize].name.view().eq("std.testing");
+        }
+        if not fine and not ck.is_invalid(c, pt) {
+            let s = ck.span_of(c, pn);
+            ck.report(c, codes.BAD_TEST_PARAM, s, "a test takes nothing, or one '&mut std.testing.Test'");
+        }
+        let nt = ck.ident_of(c, pn);
+        c.params.push(ck.ParamInfo { name: ck.symbol(c, nt), name_token: nt, type_id: pt });
+        declare(c, nt, pt, false);
+        takes_test = true;
+    }
     c.fns.push(ck.FnInfo {
         decl: ck.NONE,
-        params_start: 0,
-        params_len: 0,
+        params_start: params_start,
+        params_len: c.params.len() as u32 - params_start,
         ret: ty.void_type(),
         has_self: false,
         self_mode: ck.SelfMode.Value,
         table: ck.NONE,
         ncomptime: 0,
     });
-    c.loops = 0;
-    c.defer_loops = ck.NONE;
-    while c.scope.len() > 0 {
-        _ = c.scope.pop();
-    }
-    check_block(c, ck.child(c, n, 0));
+    c.tests.push(ck.TestBlock { fn_index: c.fn_index, module: module, node: n, takes_test: takes_test });
+    check_block(c, ck.child(c, n, ck.child_count(c, n) - 1));
     c.fn_index = ck.NONE;
 }
 

@@ -1,0 +1,24 @@
+#!/bin/sh
+# Builds the test blocks of a file into a test binary and runs it: arche
+# test, linked with the runtime as arche-build links a program.
+# Usage: arche-test <source.arche> [--filter <text>] [--seed <number>]
+set -eu
+if [ $# -lt 1 ]; then
+    echo "usage: arche-test <source.arche> [--filter <text>] [--seed <number>]" >&2
+    exit 2
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+src=$1
+shift
+cc=${CLANG:-clang}
+rt="$here/build/rt.o"
+if [ ! -f "$rt" ] || [ "$here/runtime/rt.c" -nt "$rt" ]; then
+    $cc -c -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -fno-pie -Wall -Wextra -Werror \
+        -o "$rt.tmp.$$" "$here/runtime/rt.c"
+    mv "$rt.tmp.$$" "$rt"
+fi
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+"${ARCHE:-$here/build/arche}" test "$src" "$work/tests.ll"
+$cc -O1 -nostdlib -static -fno-pie -Wno-override-module -o "$work/tests" "$work/tests.ll" "$rt"
+"$work/tests" "$@"

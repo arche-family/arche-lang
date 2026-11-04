@@ -43,7 +43,8 @@ static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     return r;
 }
 
-enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MUNMAP = 11, SYS_EXIT_GROUP = 231, SYS_OPENAT = 257 };
+enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MUNMAP = 11, SYS_GETPID = 39, SYS_FORK = 57,
+       SYS_EXIT = 60, SYS_WAIT4 = 61, SYS_CLOCK_GETTIME = 228, SYS_EXIT_GROUP = 231, SYS_OPENAT = 257 };
 enum { AT_FDCWD = -100, O_RDONLY = 0, O_WRONLY = 1, O_CREAT = 0100, O_TRUNC = 01000, O_CLOEXEC = 02000000 };
 enum { ENOENT = 2, EACCES = 13, ENOTDIR = 20, EISDIR = 21, EPERM = 1 };
 
@@ -686,6 +687,7 @@ static _Noreturn void exit_with(int status) {
 }
 
 static const i64 err_fd = 2;
+static const i64 out_fd = 1;
 
 void a0rt_die(const char *message, u64 len) {
     flush_all();
@@ -1120,6 +1122,134 @@ _Noreturn void a0rt_start(i64 *sp) {
         exit_with(1);
     }
     exit_with(0);
+}
+
+// ---- the test runner (arche test, lib/std/testing.arche) ---------------------------
+//
+// A test build has a table of its tests. Each runs in a child process, so a
+// panic fails that test and the others still run. The seed is always
+// printed; --seed repeats a run, --filter runs the tests whose names
+// contain a text.
+
+typedef struct {
+    const u8 *name;
+    u64 name_len;
+    void *function;
+    u64 takes_test;
+} TestEntry;
+
+extern const TestEntry a0_tests[] __attribute__((weak));
+extern const u64 a0_test_count __attribute__((weak));
+
+static int contains(const u8 *hay, u64 n, const u8 *needle, u64 m) {
+    if (m == 0) {
+        return 1;
+    }
+    for (u64 i = 0; i + m <= n; i++) {
+        if (memcmp(hay + i, needle, m) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int parse_u64(const Str *s, u64 *out) {
+    u64 v = 0;
+    if (s->len == 0) {
+        return 0;
+    }
+    for (u64 i = 0; i < s->len; i++) {
+        u8 c = s->ptr[i];
+        if (c < '0' || c > '9' || v > (~(u64)0 - (c - '0')) / 10) {
+            return 0;
+        }
+        v = v * 10 + (u64)(c - '0');
+    }
+    *out = v;
+    return 1;
+}
+
+// splitmix64: each test's seed from the run's seed and the test's number.
+static u64 mix(u64 x) {
+    x += 0x9E3779B97F4A7C15UL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9UL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBUL;
+    return x ^ (x >> 31);
+}
+
+static void say(const char *text) {
+    a0rt_write(&out_fd, (const u8 *)text, c_strlen(text));
+}
+
+u16 a0rt_run_tests(const System *sys) {
+    Str filter = {(const u8 *)"", 0};
+    u64 seed = 0;
+    int seeded = 0;
+    for (u64 i = 1; i < sys->nargs; i++) {
+        Str a = sys->args[i];
+        if (i + 1 < sys->nargs && a.len == 8 && memcmp(a.ptr, "--filter", 8) == 0) {
+            filter = sys->args[++i];
+        } else if (i + 1 < sys->nargs && a.len == 6 && memcmp(a.ptr, "--seed", 6) == 0 && parse_u64(&sys->args[i + 1], &seed)) {
+            seeded = 1;
+            i++;
+        } else {
+            say("usage: <test binary> [--filter <text>] [--seed <number>]\n");
+            exit_with(2);
+        }
+    }
+    if (!seeded) {
+        i64 ts[2] = {0, 0};
+        sys3(SYS_CLOCK_GETTIME, 1, (i64)ts, 0);
+        seed = mix((u64)ts[0] * 1000000000UL + (u64)ts[1] + (u64)sys1(SYS_GETPID, 0));
+    }
+    say("seed: ");
+    a0rt_write_u64(&out_fd, seed);
+    say("\n");
+    u64 count = &a0_test_count ? a0_test_count : 0;
+    u64 passed = 0, failed = 0, skipped = 0;
+    for (u64 i = 0; i < count; i++) {
+        const TestEntry *t = &a0_tests[i];
+        if (!contains(t->name, t->name_len, filter.ptr, filter.len)) {
+            skipped++;
+            continue;
+        }
+        say("test ");
+        a0rt_write(&out_fd, t->name, t->name_len);
+        say(" ... ");
+        flush_all();
+        i64 pid = sys1(SYS_FORK, 0);
+        if (pid == 0) {
+            u64 test_seed = mix(seed ^ mix(i));
+            if (t->takes_test) {
+                ((void (*)(u64 *))t->function)(&test_seed);
+            } else {
+                ((void (*)(void))t->function)();
+            }
+            exit_with(0);
+        }
+        int status = 0;
+        sys4(SYS_WAIT4, pid, (i64)&status, 0, 0);
+        if (status == 0) {
+            say("ok\n");
+            passed++;
+        } else {
+            say("FAILED\n");
+            failed++;
+        }
+    }
+    a0rt_write_u64(&out_fd, passed);
+    say(" passed, ");
+    a0rt_write_u64(&out_fd, failed);
+    say(" failed, ");
+    a0rt_write_u64(&out_fd, skipped);
+    say(" filtered out\n");
+    if (failed) {
+        say("rerun with --seed ");
+        a0rt_write_u64(&out_fd, seed);
+        say("\n");
+        exit_with(1);
+    }
+    return 0;
 }
 
 // The kernel starts the program here, with argc at the top of the stack.

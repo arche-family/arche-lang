@@ -759,6 +759,39 @@ pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
         byte_array(&mut out, gs[g].bytes.items());
         out.push_str("\n");
     }
+    if m.test_mode {
+        // {name, length, function, takes a Test}: compiler/runtime/rt.c.
+        let ts = m.tests.items();
+        out.push_str("@a0_tests = constant [");
+        ir.write_number(&mut out, ts.len() as u64);
+        out.push_str(" x {ptr, i64, ptr, i64}] ");
+        if ts.len() == 0 {
+            out.push_str("zeroinitializer");
+        } else {
+            out.push_str("[");
+            var q: usize = 0;
+            while q < ts.len() : (q += 1) {
+                if q > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str("{ptr, i64, ptr, i64} {ptr @");
+                out.push_str(gs[ts[q].name as usize].name.view());
+                out.push_str(", i64 ");
+                ir.write_number(&mut out, gs[ts[q].name as usize].bytes.len() as u64);
+                out.push_str(", ptr @");
+                out.push_str(m.functions[ts[q].function as usize].name.view());
+                if ts[q].takes_test {
+                    out.push_str(", i64 1}");
+                } else {
+                    out.push_str(", i64 0}");
+                }
+            }
+            out.push_str("]");
+        }
+        out.push_str("\n@a0_test_count = constant i64 ");
+        ir.write_number(&mut out, ts.len() as u64);
+        out.push_str("\n");
+    }
     let tables = m.tables.items();
     var t: usize = 0;
     while t < tables.len() : (t += 1) {

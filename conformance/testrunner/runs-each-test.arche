@@ -1,0 +1,54 @@
+// test: run
+// spec: std.testing
+// stage0: skip
+// exit: 1
+// args: --seed 7
+// stdout: seed: 7
+// stdout: test adds ... ok
+// stdout: test sort keeps order ... ok
+// stdout: test fails on purpose ... FAILED
+// stdout: test overflow ... FAILED
+// stdout: 2 passed, 2 failed, 0 filtered out
+// stdout: rerun with --seed 7
+// stderr: panic: assertion failed
+// stderr: panic: integer overflow
+import std;
+import std.testing;
+import core.rand;
+import core.slice;
+
+fn add(a: u32, b: u32) -> u32 {
+    return a + b;
+}
+
+test "adds" {
+    assert(add(a: 2, b: 3) == 5);
+}
+
+test "sort keeps order" (t: &mut testing.Test) {
+    let sorted = fn [](g: &mut rand.Seeded) -> bool {
+        var xs: [8]i64 = [0; 8];
+        var i: usize = 0;
+        while i < 8 : (i += 1) {
+            xs[i] = g.between(lo: -50, hi: 50);
+        }
+        slice.sort(i64, xs[0..8]);
+        return slice.is_sorted(i64, xs[0..8]);
+    };
+    t.check(200, property: &sorted);
+}
+
+test "fails on purpose" (t: &mut testing.Test) {
+    var g = t.rand();
+    let x = g.below(10);
+    assert(x > 100);
+}
+
+test "overflow" {
+    let big: u8 = 200;
+    let y = big + add(a: 50, b: 10) as u8;
+    _ = y;
+}
+
+fn main(sys: &mut std.System) -> !void {
+}

@@ -220,6 +220,14 @@ pub type AsmText = struct {
     pub outputs: alloc.List(Ty),
 }
 
+/// A test for the runner: its name (a global), its function, and whether
+/// it takes a &mut std.testing.Test.
+pub type TestEntry = struct {
+    pub name: u32,
+    pub function: u32,
+    pub takes_test: bool,
+}
+
 /// The methods of one impl, in its interface's order: the table a &dyn I
 /// view points to (spec/arche.md §5.3).
 pub type VTable = struct {
@@ -243,6 +251,9 @@ pub type Module = struct {
     pub asms: alloc.List(AsmText),
     /// LLVM's target triple.
     pub triple: alloc.String,
+    /// A test build: the table a0_tests of the runner, one entry a test.
+    pub test_mode: bool,
+    pub tests: alloc.List(TestEntry),
     a: alloc.Allocator,
 
     pub fn init(a: alloc.Allocator) -> Module {
@@ -254,6 +265,8 @@ pub type Module = struct {
             vtables: alloc.List(VTable).init(a),
             asms: alloc.List(AsmText).init(a),
             triple: alloc.String.init(a),
+            test_mode: false,
+            tests: alloc.List(TestEntry).init(a),
             a: a,
         };
     }

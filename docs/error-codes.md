@@ -177,3 +177,4 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0926` | A view of a field of a packed struct, which may be unaligned (§10.2). |
 | `E0927` | An atomic operation whose ordering is not written as a constant, is one the operation cannot have, or whose type it does not work on (§10.2). |
 | `E0928` | A freestanding program without a panic handler, or one whose handler is not `fn(message: str, file: str, line: u32, column: u32) -> noreturn`, or that is not full Arche (§10.3). |
+| `E0929` | A test block's parameter that is not a `&mut std.testing.Test` (spec/arche.md §1.3, tests). |

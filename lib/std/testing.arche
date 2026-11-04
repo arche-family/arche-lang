@@ -1,0 +1,51 @@
+/// What a test block may take: test "name" (t: &mut testing.Test) { ... }.
+/// `arche test` gives each test a seed from the run's, which it prints, so
+/// a failing run repeats with --seed (docs/plan.md, determinism).
+import core;
+import core.fmt;
+import core.mem;
+import core.rand;
+
+/// The runner makes one for each test; its layout is the runtime's.
+pub type Test = struct {
+    base_seed: u64,
+    unique: core.Unique,
+
+    /// This test's seed: the same for the same run seed.
+    pub fn seed(self: &Test) -> u64 {
+        return self.base_seed;
+    }
+
+    /// A generator seeded with this test's seed.
+    pub fn rand(self: &Test) -> rand.Seeded {
+        return rand.Seeded.init(self.base_seed);
+    }
+
+    /// Property-based testing: calls property with a generator of its own
+    /// for each of `cases` cases, and panics, naming the case, when the
+    /// property is false for one.
+    pub fn check(self: &Test, cases: u32, property: &dyn fn(&mut rand.Seeded) -> bool) {
+        var c: u32 = 0;
+        while c < cases : (c += 1) {
+            var g = rand.Seeded.init(self.base_seed ^ ((c as u64 + 1) *% 0x9E3779B97F4A7C15));
+            if not property(&mut g) {
+                fail_case(c);
+            }
+        }
+    }
+}
+
+fn fail_case(c: u32) -> noreturn {
+    var text: [64]u8 = [0; 64];
+    let head = "property failed at case ";
+    var n: usize = 0;
+    for b in head.bytes() {
+        text[n] = b.*;
+        n += 1;
+    }
+    n += fmt.decimal(c as u64, text[n..64]);
+    unsafe {
+        // SAFETY: ASCII, written just now.
+        panic(mem.str_from(text[0..n]));
+    }
+}

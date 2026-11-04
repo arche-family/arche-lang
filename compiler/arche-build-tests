@@ -1,0 +1,19 @@
+#!/bin/sh
+# Builds the test blocks of a file into a test binary: the compiler command
+# the conformance runner calls for conformance/testrunner (arche test).
+# Usage: arche-build-tests <source.arche> <output>
+set -eu
+if [ $# -ne 2 ]; then
+    echo "usage: arche-build-tests <source.arche> <output>" >&2
+    exit 2
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+cc=${CLANG:-clang}
+rt="$here/build/rt.o"
+if [ ! -f "$rt" ] || [ "$here/runtime/rt.c" -nt "$rt" ]; then
+    $cc -c -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -fno-pie -Wall -Wextra -Werror \
+        -o "$rt.tmp.$$" "$here/runtime/rt.c"
+    mv "$rt.tmp.$$" "$rt"
+fi
+"${ARCHE:-$here/build/arche}" test "$1" "$2.ll"
+$cc -O1 -nostdlib -static -fno-pie -Wno-override-module -o "$2" "$2.ll" "$rt"

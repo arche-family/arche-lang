@@ -777,7 +777,89 @@ fn lower_fn(l: &mut Lower, f: u32) {
 }
 
 /// a0_entry: what the runtime calls; it calls the root module's main.
+/// In a test build, the test block of the root module whose function is f,
+/// or NONE.
+fn root_test(c: &ck.Checker, f: u32) -> u32 {
+    if not c.p.tests {
+        return ck.NONE;
+    }
+    var i: usize = 0;
+    while i < c.tests.len() : (i += 1) {
+        if c.tests[i].fn_index == f and c.tests[i].module == 0 {
+            return i as u32;
+        }
+    }
+    return ck.NONE;
+}
+
+/// A test block as a function of the runner: a0_test_<n>, taking the
+/// runner's Test when the block does (std.testing).
+fn lower_test(l: &mut Lower, i: u32) {
+    let t = l.c.tests[i as usize];
+    let info = l.c.fns[t.fn_index as usize];
+    var name = alloc.String.init(l.a);
+    name.push_str("a0_test_");
+    ir.write_number(&mut name, t.fn_index as u64);
+    l.f = ir.new_function(name.view(), ir.Ty.Void, l.a);
+    l.block = 0;
+    l.fn_index = t.fn_index;
+    l.ret = ty.void_type();
+    l.c.module = t.module;
+    l.c.env_len = 0;
+    l.c.cur_table = ck.NONE;
+    l.c.fn_index = t.fn_index;
+    l.vars = alloc.List(Var).init(l.a);
+    l.defers = alloc.List(cst.NodeId).init(l.a);
+    l.loops = alloc.List(LoopCtx).init(l.a);
+    l.post_conditions = alloc.List(cst.NodeId).init(l.a);
+    l.sret = ck.NONE;
+    if info.params_len > 0 {
+        l.f.params.push(ir.Ty.Ptr);
+        var p = ir.inst(ir.Op.Param, ir.Ty.Ptr);
+        p.imm = 0;
+        let v = emit(l, p);
+        let pi = l.c.params[info.params_start as usize];
+        let slot = alloca(l, pi.type_id);
+        store(l, value: v, addr: slot);
+        bind(l, pi.name, slot, pi.type_id);
+    }
+    stmt.block(l, ck.child(&l.c, t.node, ck.child_count(&l.c, t.node) - 1));
+    if not terminated(l) {
+        _ = emit(l, ir.inst(ir.Op.RetVoid, ir.Ty.Void));
+    }
+    // The runner's table: the name as written, without its quotes.
+    let m = &l.c.p.modules[t.module as usize];
+    let tok = ck.find_own(&l.c, t.node, tk.Kind.String) orelse 0;
+    let quoted = m.token_text(tok);
+    var text = alloc.String.init(l.a);
+    text.push_str(quoted[1..quoted.len() - 1]);
+    let g = l.m.global(text.view());
+    l.m.tests.push(ir.TestEntry { name: g, function: l.m.functions.len() as u32, takes_test: t.takes_test });
+}
+
+/// A test build's entry: the runner (compiler/runtime/rt.c).
+fn test_entry(l: &mut Lower) {
+    var e = ir.new_function("a0_entry", ir.Ty.I16, l.a);
+    e.internal = false;
+    e.params.push(ir.Ty.Ptr);
+    l.f = e;
+    l.block = 0;
+    var p = ir.inst(ir.Op.Param, ir.Ty.Ptr);
+    p.imm = 0;
+    let sys = emit(l, p);
+    var args = args0(l);
+    args.push(sys);
+    let r = call_runtime(l, "a0rt_run_tests", ir.Ty.I16, &args);
+    var ret = ir.inst(ir.Op.Ret, ir.Ty.Void);
+    ret.a = r;
+    _ = emit(l, ret);
+}
+
 fn entry(l: &mut Lower) {
+    if l.c.p.tests {
+        test_entry(l);
+        return;
+    }
     let main_sym = l.c.names.intern("main");
     let d = l.c.items[0].get(main_sym) orelse 0;
     let f = l.c.decls[d as usize].fn_index;
@@ -830,8 +912,17 @@ pub fn lower(c: ck.Checker) -> ir.Module {
         post_conditions: alloc.List(cst.NodeId).init(a),
         a: a,
     };
+    l.m.test_mode = l.c.p.tests;
     var f: usize = 0;
     while f < l.c.fns.len() : (f += 1) {
+        let test_block = root_test(&l.c, f as u32);
+        if test_block != ck.NONE {
+            lower_test(&mut l, test_block);
+            let done = l.f;
+            l.m.functions.push(done);
+            l.f = ir.new_function("", ir.Ty.Void, a);
+            continue;
+        }
         if l.c.fns[f].decl == ck.NONE or ck.is_signature(&l.c, f as u32) {
             // A test block, which a build leaves out, or an interface's
             // method, which has no body. A stub keeps the IR functions

@@ -32,6 +32,8 @@ pub type Options = struct {
     pub target: Target,
     /// module.function: what a panic calls on a freestanding target.
     pub panic_handler: alloc.String,
+    /// Build the root module's test blocks and a runner, not main.
+    pub tests: bool,
 }
 
 pub type Module = struct {
@@ -89,6 +91,7 @@ pub type Program = struct {
     pub lib_std: bool,
     pub target: Target,
     pub panic_handler: alloc.String,
+    pub tests: bool,
     root_dir: alloc.String,
 
     pub fn module(self: &Program, id: ModuleId) -> &Module {
@@ -238,6 +241,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         lib_std: opts.lib_std and opts.target == Target.LinuxX86_64,
         target: opts.target,
         panic_handler: handler,
+        tests: opts.tests,
         root_dir: alloc.String.init(a),
     };
     var slash: ?usize = none;
