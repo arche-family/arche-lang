@@ -1,0 +1,33 @@
+// test: run
+// spec: 5.5
+// stdout: 8
+import std;
+import alloc;
+
+type Pair = struct { a: alloc.String, b: alloc.String }
+
+fn length(s: alloc.String) -> usize {
+    return s.len();
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("abc");
+    let n = length(s);
+    s = alloc.String.init(sys.alloc);
+    s.push_str("de");
+    var p = Pair { a: alloc.String.init(sys.alloc), b: alloc.String.init(sys.alloc) };
+    p.b.push_str("xyz");
+    let a = p.a;
+    sys.stdout.write_u64((n + s.len() + p.b.len() + a.len()) as u64);
+    var i: u32 = 0;
+    while i < 3 : (i += 1) {
+        let fresh = alloc.String.init(sys.alloc);
+        _ = length(fresh);
+    }
+    let copy = sys.alloc;
+    let again = sys.alloc;
+    _ = copy;
+    _ = again;
+    sys.stdout.write("\n");
+}

@@ -1,0 +1,18 @@
+// test: compile-error
+// spec: 5.5
+// stage0: skip
+// line: 12
+// code: E0606
+import std;
+import alloc;
+
+type Holder = struct { text: alloc.String }
+
+fn take(h: &Holder) -> alloc.String {
+    return h.text;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let h = Holder { text: alloc.String.init(sys.alloc) };
+    sys.stdout.write(take(&h).view());
+}
