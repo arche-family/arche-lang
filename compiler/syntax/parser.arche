@@ -251,6 +251,11 @@ fn parse_item(p: &mut Parser) {
         _ = close(p, m, cst.Kind.TestDecl);
         return;
     }
+    // `impl I for T { ... }`: impl is contextual (spec/arche.md §12).
+    if p.full and at(p, tk.Kind.Ident) and token_is(p, "impl") and peek_second(p) == tk.Kind.Ident {
+        parse_impl(p, m);
+        return;
+    }
     let is_pub = accept(p, tk.Kind.KwPub);
     match peek(p) {
         .KwFn => {
@@ -316,6 +321,61 @@ fn skip_braced(p: &mut Parser) {
     }
 }
 
+fn token_is(p: &Parser, word: str) -> bool {
+    let t = p.tokens[p.pos as usize];
+    return p.text.view()[t.start as usize..(t.start + t.len) as usize].eq(word);
+}
+
+fn parse_impl(p: &mut Parser, m: cst.Mark) {
+    advance(p); // impl
+    parse_type(p);
+    _ = expect(p, tk.Kind.KwFor, "'for'");
+    parse_type(p);
+    if expect(p, tk.Kind.LBrace, "'{'") {
+        while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {
+            let before = p.pos;
+            let fm = open(p);
+            _ = accept(p, tk.Kind.KwPub);
+            if at(p, tk.Kind.KwFn) {
+                parse_fn(p, fm);
+            } else {
+                unexpected(p, "'fn'");
+                skip_to(p, stop_a: tk.Kind.KwFn, stop_b: tk.Kind.RBrace);
+                _ = close(p, fm, cst.Kind.Error);
+            }
+            if p.pos == before {
+                skip_one(p);
+                if p.pos == before {
+                    break;
+                }
+            }
+        }
+        _ = expect(p, tk.Kind.RBrace, "'}'");
+    }
+    _ = close(p, m, cst.Kind.ImplDecl);
+}
+
+/// where T: I + J, U: K (spec/arche.md §5.2)
+fn parse_where(p: &mut Parser) {
+    let m = open(p);
+    advance(p); // where
+    while at(p, tk.Kind.Ident) {
+        let bm = open(p);
+        advance(p);
+        if expect(p, tk.Kind.Colon, "':'") {
+            parse_type(p);
+            while accept(p, tk.Kind.Plus) {
+                parse_type(p);
+            }
+        }
+        _ = close(p, bm, cst.Kind.Bound);
+        if not accept(p, tk.Kind.Comma) {
+            break;
+        }
+    }
+    _ = close(p, m, cst.Kind.WhereClause);
+}
+
 fn parse_fn(p: &mut Parser, m: cst.Mark) {
     advance(p);
     if not expect(p, tk.Kind.Ident, "a function name") {
@@ -341,6 +401,14 @@ fn parse_fn(p: &mut Parser, m: cst.Mark) {
     }
     if accept(p, tk.Kind.Arrow) {
         parse_type(p);
+    }
+    if p.full and at(p, tk.Kind.KwWhere) {
+        parse_where(p);
+    }
+    // An interface lists signatures: no body, a ';' (spec/arche.md §5.1).
+    if p.full and accept(p, tk.Kind.Semi) {
+        _ = close(p, m, cst.Kind.FnSig);
+        return;
     }
     parse_block(p);
     _ = close(p, m, cst.Kind.FnDecl);
@@ -428,10 +496,21 @@ fn parse_type_decl(p: &mut Parser, m: cst.Mark) {
         _ = close(p, m, cst.Kind.TypeDecl);
         return;
     }
+    if p.full and at(p, tk.Kind.KwWhere) {
+        parse_where(p);
+    }
     if accept(p, tk.Kind.KwStruct) {
         if expect(p, tk.Kind.LBrace, "'{'") {
             parse_members(p, true);
             _ = expect(p, tk.Kind.RBrace, "'}'");
+        }
+    } else if p.full and accept(p, tk.Kind.KwInterface) {
+        if expect(p, tk.Kind.LBrace, "'{'") {
+            while at(p, tk.Kind.KwFn) {
+                let fm = open(p);
+                parse_fn(p, fm);
+            }
+            _ = expect(p, tk.Kind.RBrace, "'fn' or '}'");
         }
     } else if accept(p, tk.Kind.KwEnum) {
         if expect(p, tk.Kind.LBrace, "'{'") {
@@ -537,6 +616,9 @@ fn parse_type(p: &mut Parser) {
         .Amp => {
             advance(p);
             _ = accept(p, tk.Kind.KwMut);
+            if p.full {
+                _ = accept(p, tk.Kind.KwDyn); // &dyn I (spec/arche.md §5.3)
+            }
             parse_type(p);
             _ = close(p, m, cst.Kind.TypeRef);
         }
@@ -706,6 +788,25 @@ fn parse_stmt(p: &mut Parser) {
             }
             parse_block(p);
             _ = close(p, m, cst.Kind.WhileStmt);
+        }
+        .KwFor => {
+            // for x in e { }, for (i, x) in e { }, for i in a..b { } (§3.2)
+            advance(p);
+            if accept(p, tk.Kind.LParen) {
+                _ = expect(p, tk.Kind.Ident, "a name");
+                _ = expect(p, tk.Kind.Comma, "','");
+                _ = expect(p, tk.Kind.Ident, "a name");
+                _ = expect(p, tk.Kind.RParen, "')'");
+            } else {
+                _ = expect(p, tk.Kind.Ident, "a name");
+            }
+            _ = expect(p, tk.Kind.KwIn, "'in'");
+            parse_condition(p);
+            if accept(p, tk.Kind.DotDot) or accept(p, tk.Kind.DotDotEq) {
+                parse_condition(p);
+            }
+            parse_block(p);
+            _ = close(p, m, cst.Kind.ForStmt);
         }
         .KwMatch => {
             advance(p);

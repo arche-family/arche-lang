@@ -45,8 +45,13 @@ pub type Kind = enum {
     KwType,
     KwVar,
     KwWhile,
-    /// Full Arche only (spec/arche.md): Arche-0 reserves the word.
+    /// Full Arche only (spec/arche.md): Arche-0 reserves these words.
     KwComptime,
+    KwFor,
+    KwIn,
+    KwInterface,
+    KwWhere,
+    KwDyn,
     Plus,
     Minus,
     Star,
@@ -189,6 +194,18 @@ pub fn keyword(word: str) -> ?Kind {
     return none;
 }
 
+/// The keyword of full Arche spelled `word`, if it is one (spec/arche.md
+/// §12): a word Arche-0 reserves.
+pub fn full_keyword(word: str) -> ?Kind {
+    if word.eq("comptime") { return Kind.KwComptime; }
+    if word.eq("for") { return Kind.KwFor; }
+    if word.eq("in") { return Kind.KwIn; }
+    if word.eq("interface") { return Kind.KwInterface; }
+    if word.eq("where") { return Kind.KwWhere; }
+    if word.eq("dyn") { return Kind.KwDyn; }
+    return none;
+}
+
 /// A word reserved for full Arche (§2.1).
 pub fn is_reserved(word: str) -> bool {
     return word.eq("asm") or word.eq("comptime") or word.eq("dyn") or word.eq("ensures") or word.eq("for") or
@@ -243,6 +260,11 @@ pub fn describe(kind: Kind) -> str {
         .KwVar => { return "'var'"; }
         .KwWhile => { return "'while'"; }
         .KwComptime => { return "'comptime'"; }
+        .KwFor => { return "'for'"; }
+        .KwIn => { return "'in'"; }
+        .KwInterface => { return "'interface'"; }
+        .KwWhere => { return "'where'"; }
+        .KwDyn => { return "'dyn'"; }
         .Plus => { return "'+'"; }
         .Minus => { return "'-'"; }
         .Star => { return "'*'"; }

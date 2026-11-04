@@ -120,9 +120,14 @@ fn lex_word(text: str, start: usize, full: bool, tokens: &mut alloc.List(tk.Toke
         return end;
     }
     // Full Arche has the keywords that Arche-0 reserves (spec/arche.md §12).
-    if full and word.eq("comptime") {
-        push(tokens, tk.Kind.KwComptime, start: start, end: end, value: 0);
-        return end;
+    if full {
+        match tk.full_keyword(word) {
+            some(k) => {
+                push(tokens, k, start: start, end: end, value: 0);
+                return end;
+            }
+            none => { }
+        }
     }
     if tk.is_reserved(word) {
         var m = diags.new_message();
