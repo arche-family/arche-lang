@@ -16,11 +16,15 @@ import syntax.token as tk;
 import sema.types as ty;
 import sema.stmt;
 import sema.consts;
+import sema.expr;
 import sema.memory;
 
 pub const NONE: u32 = 4294967295;
 /// node_refs of a FieldExpr that reads a field of a value: it is a place.
 pub const VALUE_FIELD: u32 = 4294967294;
+/// node_refs from ENV_REF up name entry (ref - ENV_REF) of env: a comptime
+/// value parameter.
+pub const ENV_REF: u32 = 2147483648;
 
 pub type Library = enum { NotLibrary, Std, Alloc }
 
@@ -62,6 +66,33 @@ pub type Decl = struct {
     pub value: u64,
     pub value_module: u32,
     pub value_node: cst.NodeId,
+    /// A declaration with comptime parameters: a template, instantiated per
+    /// list of arguments (spec/arche.md §4).
+    pub generic: bool,
+    /// An instance: its template, and its arguments as a range of env.
+    pub template: u32,
+    pub env_start: u32,
+    pub env_len: u32,
+}
+
+/// A comptime argument, bound to its parameter's name.
+pub type EnvEntry = struct {
+    pub name: alloc.Symbol,
+    pub is_type: bool,
+    pub type_id: ty.TypeId,
+    /// A value argument: its bits, and type_id is its type.
+    pub value: u64,
+}
+
+/// What instances are made already: a template and its arguments.
+pub type InstKey = struct {
+    pub template: u32,
+    pub n: u32,
+    pub kinds: u32,
+    pub a0: u64,
+    pub a1: u64,
+    pub a2: u64,
+    pub a3: u64,
 }
 
 pub type Field = struct {
@@ -92,6 +123,11 @@ pub type FnInfo = struct {
     pub ret: ty.TypeId,
     pub has_self: bool,
     pub self_mode: SelfMode,
+    /// The table of node types and references of an instance's body, or
+    /// NONE for the module's own (generic bodies differ per instance).
+    pub table: u32,
+    /// Calls pass this many comptime arguments before the run-time ones.
+    pub ncomptime: u32,
 }
 
 pub type Binding = struct {
@@ -133,6 +169,19 @@ pub type Checker = struct {
     pub defer_loops: u32,
     /// The declaration of std.IoError.
     pub io_error: u32,
+    /// Comptime arguments of instances; the range that is in scope.
+    pub env: alloc.List(EnvEntry),
+    pub env_start: u32,
+    pub env_len: u32,
+    /// Node tables of instance bodies, and the one in use.
+    pub tables: alloc.List(alloc.Map(u32, ty.TypeId)),
+    pub ref_tables: alloc.List(alloc.Map(u32, u32)),
+    pub cur_table: u32,
+    pub instances: alloc.Map(InstKey, u32),
+    /// Instance functions whose bodies are still to be checked.
+    pub pending: alloc.List(u32),
+    /// The next call checked has this many comptime arguments first.
+    pub arg_offset: u32,
     pub a: alloc.Allocator,
 }
 
@@ -209,19 +258,71 @@ pub fn name_text(c: &Checker, sym: alloc.Symbol) -> str {
 
 /// The type checked for an expression node of the current module.
 pub fn type_of(c: &Checker, n: cst.NodeId) -> ty.TypeId {
+    if c.cur_table != NONE {
+        return c.tables[c.cur_table as usize].get(n.index) orelse ty.invalid();
+    }
     return c.node_types[c.module as usize][n.index as usize];
 }
 
 pub fn set_type(c: &mut Checker, n: cst.NodeId, t: ty.TypeId) {
+    if c.cur_table != NONE {
+        c.tables[c.cur_table as usize].put(n.index, t);
+        return;
+    }
     c.node_types[c.module as usize][n.index as usize] = t;
 }
 
 pub fn ref_of(c: &Checker, n: cst.NodeId) -> u32 {
+    if c.cur_table != NONE {
+        return c.ref_tables[c.cur_table as usize].get(n.index) orelse NONE;
+    }
     return c.node_refs[c.module as usize][n.index as usize];
 }
 
 pub fn set_ref(c: &mut Checker, n: cst.NodeId, d: u32) {
+    if c.cur_table != NONE {
+        c.ref_tables[c.cur_table as usize].put(n.index, d);
+        return;
+    }
     c.node_refs[c.module as usize][n.index as usize] = d;
+}
+
+/// The comptime argument in scope named `name`.
+pub fn find_env(c: &Checker, name: alloc.Symbol) -> ?u32 {
+    var i = c.env_start;
+    while i < c.env_start + c.env_len : (i += 1) {
+        if c.env[i as usize].name == name {
+            return i;
+        }
+    }
+    return none;
+}
+
+/// Brings the comptime arguments and node table of a declaration into
+/// scope; the caller restores the previous ones from the result.
+pub type Context = struct {
+    pub module: u32,
+    pub env_start: u32,
+    pub env_len: u32,
+    pub cur_table: u32,
+}
+
+pub fn save_context(c: &Checker) -> Context {
+    return Context { module: c.module, env_start: c.env_start, env_len: c.env_len, cur_table: c.cur_table };
+}
+
+pub fn restore_context(c: &mut Checker, x: Context) {
+    c.module = x.module;
+    c.env_start = x.env_start;
+    c.env_len = x.env_len;
+    c.cur_table = x.cur_table;
+}
+
+pub fn enter_decl(c: &mut Checker, d: u32) {
+    let decl = c.decls[d as usize];
+    c.module = decl.module;
+    c.env_start = decl.env_start;
+    c.env_len = decl.env_len;
 }
 
 // ---- diagnostics ------------------------------------------------------------------
@@ -329,6 +430,22 @@ pub fn write_decl_name(c: &Checker, m: &mut alloc.String, d: u32) {
         m.push_str(".");
     }
     m.push_str(c.names.text(decl.name));
+    if decl.template != NONE and decl.kind != DeclKind.Fn {
+        m.push_str("(");
+        var i = decl.env_start;
+        while i < decl.env_start + decl.env_len : (i += 1) {
+            if i > decl.env_start {
+                m.push_str(", ");
+            }
+            let e = c.env[i as usize];
+            if e.is_type {
+                write_type(c, m, e.type_id);
+            } else {
+                write_number(m, e.value);
+            }
+        }
+        m.push_str(")");
+    }
 }
 
 pub fn write_number(m: &mut alloc.String, n: u64) {
@@ -614,23 +731,44 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
         }
     }
     let nargs = child_count(c, n);
+    if segments.len() == 0 {
+        let s = span_of(c, n);
+        report(c, codes.UNKNOWN_TYPE, s, "'type' is only the type of a comptime parameter");
+        return ty.invalid();
+    }
     let first = segments[0];
     if segments.len() == 1 {
+        let sym = symbol(c, first);
+        match find_env(c, sym) {
+            some(e) => {
+                if c.env[e as usize].is_type and nargs == 0 {
+                    return c.env[e as usize].type_id;
+                }
+                let s = span_of(c, n);
+                report(c, codes.UNKNOWN_TYPE, s, "this comptime parameter is a value, not a type");
+                return ty.invalid();
+            }
+            none => { }
+        }
         if nargs == 0 {
             match primitive(text(c, first)) {
                 some(t) => { return t; }
                 none => { }
             }
-            let sym = symbol(c, first);
-            match find_item(c, c.module, sym) {
-                some(d) => {
-                    let k = c.decls[d as usize].kind;
-                    if k != DeclKind.Fn and k != DeclKind.Const {
+        }
+        match find_item(c, c.module, sym) {
+            some(d) => {
+                let k = c.decls[d as usize].kind;
+                if k != DeclKind.Fn and k != DeclKind.Const {
+                    if c.decls[d as usize].generic {
+                        return instance_from_type_args(c, d, n);
+                    }
+                    if nargs == 0 {
                         return decl_type(c, d);
                     }
                 }
-                none => { }
             }
+            none => { }
         }
         report_unknown_type(c, n);
         return ty.invalid();
@@ -646,7 +784,7 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
             if alias.library == Library.Alloc and (text(c, second).eq("List") or text(c, second).eq("Map")) {
                 return resolve_generic(c, n, text(c, second).eq("List"));
             }
-            if nargs > 0 {
+            if nargs > 0 and alias.library != Library.NotLibrary {
                 let s = span_of(c, n);
                 report(c, codes.BAD_GENERIC, s, "Arche-0 has no generic types besides alloc.List and alloc.Map");
                 return ty.invalid();
@@ -667,7 +805,12 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
                         if decl.kind != DeclKind.Fn and decl.kind != DeclKind.Const {
                             let s = span_of(c, n);
                             require_visible(c, s, decl.module, decl.is_pub, "this type");
-                            return decl_type(c, d);
+                            if decl.generic {
+                                return instance_from_type_args(c, d, n);
+                            }
+                            if nargs == 0 {
+                                return decl_type(c, d);
+                            }
                         }
                     }
                     none => { }
@@ -712,6 +855,250 @@ pub fn make_map(c: &mut Checker, n: cst.NodeId, key: ty.TypeId, value: ty.TypeId
     return c.t.map(key: key, value: value);
 }
 
+// ---- generics (spec/arche.md §4) --------------------------------------------------
+
+/// A comptime argument: a type, or a value's bits.
+pub type ArgVal = struct {
+    pub is_type: bool,
+    pub type_id: ty.TypeId,
+    pub value: u64,
+}
+
+/// The comptime parameters of a template: the leading Param children of a
+/// type declaration, or the comptime Param children of a function.
+pub fn template_params(c: &Checker, d: u32) -> alloc.List(cst.NodeId) {
+    let decl = c.decls[d as usize];
+    var out = alloc.List(cst.NodeId).init(c.a);
+    let t = &c.p.modules[decl.module as usize].tree;
+    let n = t.node(decl.node);
+    var i: u32 = 0;
+    while i < n.children_len : (i += 1) {
+        let ch = t.child(n, i);
+        if t.node(ch).kind != cst.Kind.Param {
+            if decl.kind == DeclKind.Fn {
+                continue;
+            }
+            break;
+        }
+        match t.find_own(ch, tk.Kind.KwComptime, c.a) {
+            some(_) => { out.push(ch); }
+            none => { }
+        }
+    }
+    return out;
+}
+
+/// The parameter's type is `type`: it takes a type.
+pub fn takes_type(c: &Checker, param: cst.NodeId) -> bool {
+    let tnode = child(c, param, 0);
+    return tok_kind(c, tree(c).first_token(tnode)) == tk.Kind.KwType;
+}
+
+fn arg_bits(a: ArgVal) -> u64 {
+    if a.is_type {
+        return a.type_id.index as u64;
+    }
+    return a.value;
+}
+
+/// The instance of template d for these arguments: made and checked the
+/// first time, then reused. NONE when the arguments do not fit.
+pub fn instantiate(c: &mut Checker, d: u32, args: &alloc.List(ArgVal), at: diag.Span) -> u32 {
+    let saved = save_context(c);
+    enter_decl(c, d);
+    c.env_len = 0;
+    let params = template_params(c, d);
+    let ps = params.items();
+    let given = args.items();
+    if ps.len() != given.len() or ps.len() > 4 {
+        restore_context(c, saved);
+        var m = new_message(c);
+        m.push_str("this takes ");
+        write_number(&mut m, ps.len() as u64);
+        m.push_str(" comptime argument");
+        if ps.len() != 1 {
+            m.push_str("s");
+        }
+        if ps.len() > 4 {
+            m.push_str(", and the compiler handles up to 4 for now");
+        }
+        report_owned(c, codes.BAD_GENERIC, at, m);
+        return NONE;
+    }
+    var key = InstKey { template: d, n: ps.len() as u32, kinds: 0, a0: 0, a1: 0, a2: 0, a3: 0 };
+    var i: usize = 0;
+    while i < ps.len() : (i += 1) {
+        let wants_type = takes_type(c, ps[i]);
+        if wants_type != given[i].is_type {
+            restore_context(c, saved);
+            if wants_type {
+                report(c, codes.BAD_GENERIC, at, "this comptime argument should be a type");
+            } else {
+                report(c, codes.BAD_GENERIC, at, "this comptime argument should be a value, not a type");
+            }
+            return NONE;
+        }
+        if given[i].is_type {
+            key.kinds = key.kinds | (1 << i as u32);
+        }
+        let bits = arg_bits(given[i]);
+        if i == 0 { key.a0 = bits; }
+        if i == 1 { key.a1 = bits; }
+        if i == 2 { key.a2 = bits; }
+        if i == 3 { key.a3 = bits; }
+    }
+    match c.instances.get(key) {
+        some(found) => {
+            restore_context(c, saved);
+            return found;
+        }
+        none => { }
+    }
+    let env_start = c.env.len() as u32;
+    i = 0;
+    while i < ps.len() : (i += 1) {
+        let sym = symbol(c, ident_of(c, ps[i]));
+        var t = given[i].type_id;
+        if not given[i].is_type {
+            t = resolve_type(c, child(c, ps[i], 0));
+        }
+        c.env.push(EnvEntry { name: sym, is_type: given[i].is_type, type_id: t, value: given[i].value });
+    }
+    var inst = c.decls[d as usize];
+    inst.generic = false;
+    inst.template = d;
+    inst.env_start = env_start;
+    inst.env_len = ps.len() as u32;
+    let id = c.decls.len() as u32;
+    c.decls.push(inst);
+    c.instances.put(key, id);
+    let k = inst.kind;
+    if k == DeclKind.Struct {
+        c.decls[id as usize].type_id = c.t.declared(ty.Kind.Struct, id);
+    } else if k == DeclKind.Enum {
+        c.decls[id as usize].type_id = c.t.declared(ty.Kind.Enum, id);
+    } else if k == DeclKind.ErrorSet {
+        c.decls[id as usize].type_id = c.t.declared(ty.Kind.ErrorSet, id);
+    }
+    if k == DeclKind.Fn {
+        check_signature(c, id);
+        c.pending.push(c.decls[id as usize].fn_index);
+    } else {
+        resolve_members(c, id);
+        let mstart = c.decls[id as usize].methods_start;
+        let mlen = c.decls[id as usize].methods_len;
+        var mi = mstart;
+        while mi < mstart + mlen : (mi += 1) {
+            let md = c.methods[mi as usize];
+            c.decls[md as usize].env_start = env_start;
+            c.decls[md as usize].env_len = ps.len() as u32;
+            check_signature(c, md);
+            c.pending.push(c.decls[md as usize].fn_index);
+        }
+    }
+    restore_context(c, saved);
+    return id;
+}
+
+/// A comptime value written where a type argument may be: a literal, a
+/// constant, or a comptime value parameter.
+pub fn comptime_value(c: &mut Checker, n: cst.NodeId, t: ty.TypeId) -> u64 {
+    if kind_of(c, n) == cst.Kind.TypePath {
+        let toks = own(c, n);
+        if toks.len() == 1 and tok_kind(c, toks[0]) == tk.Kind.Ident {
+            let sym = symbol(c, toks[0]);
+            match find_env(c, sym) {
+                some(e) => { return c.env[e as usize].value; }
+                none => { }
+            }
+            match find_item(c, c.module, sym) {
+                some(d) => {
+                    if c.decls[d as usize].kind == DeclKind.Const {
+                        consts.check_const(c, d);
+                        return c.decls[d as usize].value;
+                    }
+                }
+                none => { }
+            }
+        }
+        let s = span_of(c, n);
+        report(c, codes.NOT_CONSTANT, s, "a comptime argument must be a constant");
+        return 0;
+    }
+    let saved_fn = c.fn_index;
+    c.fn_index = NONE;
+    let before = c.p.diags.count();
+    expr.check_value(c, n, t);
+    var v: u64 = 0;
+    if c.p.diags.count() == before {
+        v = consts.eval(c, n);
+    }
+    c.fn_index = saved_fn;
+    return v;
+}
+
+/// The instance a written type such as Pair(u32, u8) or Grid(u8, 4, 4)
+/// names.
+fn instance_from_type_args(c: &mut Checker, d: u32, n: cst.NodeId) -> ty.TypeId {
+    let wants = comptime_kinds(c, d);
+    var args = alloc.List(ArgVal).init(c.a);
+    let nargs = child_count(c, n);
+    var k: u32 = 0;
+    while k < nargs : (k += 1) {
+        let an = child(c, n, k);
+        if (k as usize) < wants.len() and not ck_is_type(&wants, k) {
+            let vt = wants[k as usize].type_id;
+            let v = comptime_value(c, an, vt);
+            args.push(ArgVal { is_type: false, type_id: vt, value: v });
+        } else {
+            let t = resolve_type(c, an);
+            args.push(ArgVal { is_type: true, type_id: t, value: 0 });
+        }
+    }
+    let s = span_of(c, n);
+    let inst = instantiate(c, d, &args, at: s);
+    if inst == NONE {
+        return ty.invalid();
+    }
+    return c.decls[inst as usize].type_id;
+}
+
+fn ck_is_type(wants: &alloc.List(ArgVal), k: u32) -> bool {
+    return wants.items()[k as usize].is_type;
+}
+
+/// What each comptime parameter of template d takes: a type, or a value of
+/// the given type.
+pub fn comptime_kinds(c: &mut Checker, d: u32) -> alloc.List(ArgVal) {
+    let saved = save_context(c);
+    enter_decl(c, d);
+    c.env_len = 0;
+    let params = template_params(c, d);
+    var out = alloc.List(ArgVal).init(c.a);
+    let ps = params.items();
+    var i: usize = 0;
+    while i < ps.len() : (i += 1) {
+        if takes_type(c, ps[i]) {
+            out.push(ArgVal { is_type: true, type_id: ty.invalid(), value: 0 });
+        } else {
+            let vt = resolve_type(c, child(c, ps[i], 0));
+            out.push(ArgVal { is_type: false, type_id: vt, value: 0 });
+        }
+    }
+    restore_context(c, saved);
+    return out;
+}
+
+/// The number of leading Param children of a node: a generic type's comptime
+/// parameters come before its members.
+fn param_children(c: &Checker, n: cst.NodeId) -> u32 {
+    let count = child_count(c, n);
+    var i: u32 = 0;
+    while i < count and kind_of(c, child(c, n, i)) == cst.Kind.Param : (i += 1) {
+    }
+    return i;
+}
+
 // ---- declarations -------------------------------------------------------------
 
 fn new_decl(kind: DeclKind, module: u32, n: cst.NodeId, name: alloc.Symbol, name_token: u32, is_pub: bool) -> Decl {
@@ -733,6 +1120,10 @@ fn new_decl(kind: DeclKind, module: u32, n: cst.NodeId, name: alloc.Symbol, name
         value: 0,
         value_module: 0,
         value_node: cst.NodeId { index: 0 },
+        generic: false,
+        template: NONE,
+        env_start: 0,
+        env_len: 0,
     };
 }
 
@@ -838,6 +1229,31 @@ fn type_decl_kind(c: &Checker, n: cst.NodeId) -> DeclKind {
     return DeclKind.Alias;
 }
 
+/// A function with comptime parameters is a template; they come before
+/// the others (spec/arche.md §4.1).
+fn has_comptime_param(c: &mut Checker, n: cst.NodeId) -> bool {
+    let count = child_count(c, n);
+    var found = false;
+    var runtime_seen = false;
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let ch = child(c, n, i);
+        if kind_of(c, ch) != cst.Kind.Param {
+            continue;
+        }
+        if has_own(c, ch, tk.Kind.KwComptime) {
+            found = true;
+            if runtime_seen {
+                let s = span_of(c, ch);
+                report(c, codes.BAD_GENERIC, s, "comptime parameters come before the others (spec/arche.md §4.1)");
+            }
+        } else {
+            runtime_seen = true;
+        }
+    }
+    return found;
+}
+
 fn collect_items(c: &mut Checker) {
     let root = tree(c).root;
     let count = child_count(c, root);
@@ -856,13 +1272,16 @@ fn collect_items(c: &mut Checker) {
         let sym = symbol(c, nt);
         let is_pub = has_own(c, n, tk.Kind.KwPub);
         if k == cst.Kind.FnDecl {
-            _ = add_item(c, new_decl(DeclKind.Fn, module: c.module, n, sym, name_token: nt, is_pub));
+            let id = add_item(c, new_decl(DeclKind.Fn, module: c.module, n, sym, name_token: nt, is_pub));
+            c.decls[id as usize].generic = has_comptime_param(c, n);
         } else if k == cst.Kind.ConstDecl {
             _ = add_item(c, new_decl(DeclKind.Const, module: c.module, n, sym, name_token: nt, is_pub));
         } else {
             let dk = type_decl_kind(c, n);
             let id = add_item(c, new_decl(dk, module: c.module, n, sym, name_token: nt, is_pub));
-            if dk == DeclKind.Struct {
+            if param_children(c, n) > 0 {
+                c.decls[id as usize].generic = true; // a template has no type of its own
+            } else if dk == DeclKind.Struct {
                 c.decls[id as usize].type_id = c.t.declared(ty.Kind.Struct, id);
             } else if dk == DeclKind.Enum {
                 c.decls[id as usize].type_id = c.t.declared(ty.Kind.Enum, id);
@@ -895,8 +1314,17 @@ fn report_duplicate_member(c: &mut Checker, t: u32, what: str) {
 }
 
 /// Adds the FieldDecl children of n, from child `from` on, to c.fields.
-fn add_fields(c: &mut Checker, n: cst.NodeId, from: u32) -> u32 {
-    let start = c.fields.len() as u32;
+/// A run of the fields list.
+type Run = struct {
+    start: u32,
+    len: u32,
+}
+
+/// Adds the FieldDecl children of n, from child `from` on, to c.fields, as
+/// one run. Resolving a field's type may make instances, which add fields
+/// of their own: the run is pushed only once every type is known.
+fn add_fields(c: &mut Checker, n: cst.NodeId, from: u32) -> Run {
+    var local = alloc.List(Field).init(c.a);
     let count = child_count(c, n);
     var i = from;
     while i < count : (i += 1) {
@@ -906,16 +1334,25 @@ fn add_fields(c: &mut Checker, n: cst.NodeId, from: u32) -> u32 {
         }
         let nt = ident_of(c, f);
         let sym = symbol(c, nt);
-        var j = start;
-        while j < c.fields.len() as u32 : (j += 1) {
-            if c.fields[j as usize].name == sym {
-                report_duplicate_member(c, nt, "field");
-            }
+        let seen = local.items();
+        var j: usize = 0;
+        var twice = false;
+        while j < seen.len() : (j += 1) {
+            twice = twice or seen[j].name == sym;
+        }
+        if twice {
+            report_duplicate_member(c, nt, "field");
         }
         let ft = resolve_type(c, child(c, f, 0));
-        c.fields.push(Field { name: sym, name_token: nt, type_id: ft, is_pub: has_own(c, f, tk.Kind.KwPub) });
+        local.push(Field { name: sym, name_token: nt, type_id: ft, is_pub: has_own(c, f, tk.Kind.KwPub) });
     }
-    return c.fields.len() as u32 - start;
+    let start = c.fields.len() as u32;
+    let items = local.items();
+    var k: usize = 0;
+    while k < items.len() : (k += 1) {
+        c.fields.push(items[k]);
+    }
+    return Run { start: start, len: items.len() as u32 };
 }
 
 fn add_methods(c: &mut Checker, d: u32) {
@@ -965,18 +1402,26 @@ fn add_methods(c: &mut Checker, d: u32) {
 
 fn resolve_members(c: &mut Checker, d: u32) {
     let decl = c.decls[d as usize];
-    c.module = decl.module;
-    let n = decl.node;
+    if decl.generic {
+        return; // a template: its instances are resolved as they are made
+    }
+    let saved = save_context(c);
+    enter_decl(c, d);
+    resolve_members_here(c, d, decl.node);
+    restore_context(c, saved);
+}
+
+fn resolve_members_here(c: &mut Checker, d: u32, n: cst.NodeId) {
+    let decl = c.decls[d as usize];
     match decl.kind {
         .Struct => {
-            let start = c.fields.len() as u32;
-            let len = add_fields(c, n, 0);
-            c.decls[d as usize].members_start = start;
-            c.decls[d as usize].members_len = len;
+            let run = add_fields(c, n, param_children(c, n));
+            c.decls[d as usize].members_start = run.start;
+            c.decls[d as usize].members_len = run.len;
             add_methods(c, d);
         }
         .Enum => {
-            let start = c.variants.len() as u32;
+            var local = alloc.List(Variant).init(c.a);
             let count = child_count(c, n);
             var i: u32 = 0;
             while i < count : (i += 1) {
@@ -986,25 +1431,34 @@ fn resolve_members(c: &mut Checker, d: u32) {
                 }
                 let nt = ident_of(c, v);
                 let sym = symbol(c, nt);
-                var j = start;
-                while j < c.variants.len() as u32 : (j += 1) {
-                    if c.variants[j as usize].name == sym {
-                        report_duplicate_member(c, nt, "variant");
-                    }
+                let seen = local.items();
+                var j: usize = 0;
+                var twice = false;
+                while j < seen.len() : (j += 1) {
+                    twice = twice or seen[j].name == sym;
                 }
-                let fields_start = c.fields.len() as u32;
+                if twice {
+                    report_duplicate_member(c, nt, "variant");
+                }
                 let has_fields = has_own(c, v, tk.Kind.LBrace);
-                let fields_len = add_fields(c, v, 0);
-                c.variants.push(Variant {
+                let run = add_fields(c, v, 0);
+                local.push(Variant {
                     name: sym,
                     name_token: nt,
                     has_fields: has_fields,
-                    fields_start: fields_start,
-                    fields_len: fields_len,
+                    fields_start: run.start,
+                    fields_len: run.len,
                 });
             }
+            // Pushed as one run, after any instance the payloads made.
+            let start = c.variants.len() as u32;
+            let vs = local.items();
+            var k: usize = 0;
+            while k < vs.len() : (k += 1) {
+                c.variants.push(vs[k]);
+            }
             c.decls[d as usize].members_start = start;
-            c.decls[d as usize].members_len = c.variants.len() as u32 - start;
+            c.decls[d as usize].members_len = vs.len() as u32;
             add_methods(c, d);
         }
         .ErrorSet => {
@@ -1093,29 +1547,54 @@ fn check_contains(c: &mut Checker, t: ty.TypeId, path: &mut alloc.List(u32), don
 
 fn check_signature(c: &mut Checker, d: u32) {
     let decl = c.decls[d as usize];
-    c.module = decl.module;
+    if decl.generic {
+        return; // a template: each instance has its own signature
+    }
+    let saved = save_context(c);
+    enter_decl(c, d);
+    check_signature_here(c, d);
+    restore_context(c, saved);
+}
+
+fn check_signature_here(c: &mut Checker, d: u32) {
+    let decl = c.decls[d as usize];
     let n = decl.node;
-    let start = c.params.len() as u32;
+    var ncomptime: u32 = 0;
+    // Collected first: resolving a type may make instances with
+    // signatures of their own, which add parameters too.
+    var local = alloc.List(ParamInfo).init(c.a);
     let count = child_count(c, n);
     var ret = ty.void_type();
     var i: u32 = 0;
     while i < count : (i += 1) {
         let ch = child(c, n, i);
         let k = kind_of(c, ch);
-        if k == cst.Kind.Param {
+        if k == cst.Kind.Param and has_own(c, ch, tk.Kind.KwComptime) {
+            ncomptime += 1; // bound in env: not a run-time parameter
+
+        } else if k == cst.Kind.Param {
             let nt = ident_of(c, ch);
             let sym = symbol(c, nt);
-            var j = start;
-            while j < c.params.len() as u32 : (j += 1) {
-                if c.params[j as usize].name == sym {
-                    report_duplicate_member(c, nt, "parameter");
-                }
+            let seen = local.items();
+            var j: usize = 0;
+            var twice = false;
+            while j < seen.len() : (j += 1) {
+                twice = twice or seen[j].name == sym;
+            }
+            if twice {
+                report_duplicate_member(c, nt, "parameter");
             }
             let pt = resolve_type(c, child(c, ch, 0));
-            c.params.push(ParamInfo { name: sym, name_token: nt, type_id: pt });
+            local.push(ParamInfo { name: sym, name_token: nt, type_id: pt });
         } else if k != cst.Kind.Block {
             ret = resolve_type(c, ch);
         }
+    }
+    let start = c.params.len() as u32;
+    let ps = local.items();
+    var k2: usize = 0;
+    while k2 < ps.len() : (k2 += 1) {
+        c.params.push(ps[k2]);
     }
     var info = FnInfo {
         decl: d,
@@ -1124,7 +1603,16 @@ fn check_signature(c: &mut Checker, d: u32) {
         ret: ret,
         has_self: false,
         self_mode: SelfMode.Value,
+        table: NONE,
+        ncomptime: ncomptime,
     };
+    // An instance's body has types of its own (§4.1).
+    let is_instance = decl.template != NONE or (decl.owner != NONE and c.decls[decl.owner as usize].template != NONE);
+    if is_instance {
+        info.table = c.tables.len() as u32;
+        c.tables.push(alloc.Map(u32, ty.TypeId).init(c.a));
+        c.ref_tables.push(alloc.Map(u32, u32).init(c.a));
+    }
     if decl.owner != NONE and info.params_len > 0 and c.names.text(c.params[start as usize].name).eq("self") {
         let owner_type = c.decls[decl.owner as usize].type_id;
         let pt = c.params[start as usize].type_id;
@@ -1207,6 +1695,16 @@ fn add_io_error(c: &mut Checker) {
     }
 }
 
+/// The bodies of instances made while checking: each may make more.
+fn check_pending(c: &mut Checker) {
+    var i: usize = 0;
+    while i < c.pending.len() : (i += 1) {
+        let f = c.pending[i];
+        stmt.check_fn(c, f);
+    }
+    c.pending.clear();
+}
+
 /// Checks a program and returns its diagnostics.
 pub fn check(p: program.Program) -> program.Program {
     let c = analyze(p);
@@ -1240,6 +1738,15 @@ pub fn analyze(p: program.Program) -> Checker {
         loops: 0,
         defer_loops: NONE,
         io_error: NONE,
+        env: alloc.List(EnvEntry).init(a),
+        env_start: 0,
+        env_len: 0,
+        tables: alloc.List(alloc.Map(u32, ty.TypeId)).init(a),
+        ref_tables: alloc.List(alloc.Map(u32, u32)).init(a),
+        cur_table: NONE,
+        instances: alloc.Map(InstKey, u32).init(a),
+        pending: alloc.List(u32).init(a),
+        arg_offset: 0,
         a: a,
     };
     add_io_error(&mut c);
@@ -1297,6 +1804,7 @@ pub fn analyze(p: program.Program) -> Checker {
     while f < nfns : (f += 1) {
         stmt.check_fn(&mut c, f as u32);
     }
+    check_pending(&mut c);
     m = 0;
     while m < nmodules : (m += 1) {
         c.module = m as u32;
@@ -1310,6 +1818,7 @@ pub fn analyze(p: program.Program) -> Checker {
             }
         }
     }
+    check_pending(&mut c);
     // The memory model (§5.4, §5.5) is checked once the types are right.
     if c.p.diags.count() == 0 {
         memory.check(&mut c);

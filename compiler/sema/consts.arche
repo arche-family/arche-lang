@@ -173,6 +173,10 @@ pub fn eval(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
             return eval(c, ck.child(c, n, 0));
         }
         .NameExpr | .FieldExpr => {
+            let r = ck.ref_of(c, n);
+            if r >= ck.ENV_REF and r < ck.VALUE_FIELD {
+                return c.env[(r - ck.ENV_REF) as usize].value;
+            }
             match expr.constant_of(c, n) {
                 some(d) => { return c.decls[d as usize].value; }
                 none => { return 0; }

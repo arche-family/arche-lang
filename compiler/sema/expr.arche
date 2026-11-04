@@ -50,9 +50,18 @@ pub fn path(c: &mut ck.Checker, n: cst.NodeId) -> Path {
             some(_) => { return not_path(); }
             none => { }
         }
+        match ck.find_env(c, sym) {
+            some(e) => {
+                if c.env[e as usize].is_type {
+                    return Path { kind: PathKind.Type, type_id: c.env[e as usize].type_id, alias: not_path().alias };
+                }
+                return not_path();
+            }
+            none => { }
+        }
         match ck.find_item(c, c.module, sym) {
             some(d) => {
-                if is_value_item(c, d) {
+                if is_value_item(c, d) or c.decls[d as usize].generic {
                     return not_path();
                 }
                 let td = ck.decl_type(c, d);
@@ -106,6 +115,10 @@ pub fn path(c: &mut ck.Checker, n: cst.NodeId) -> Path {
     // alloc.List(T) and alloc.Map(K, V) in an expression (§5.3).
     if k == cst.Kind.CallExpr {
         let callee = ck.child(c, n, 0);
+        match generic_type_of(c, callee) {
+            some(d) => { return generic_instance(c, n, d); }
+            none => { }
+        }
         if ck.kind_of(c, callee) != cst.Kind.FieldExpr {
             return not_path();
         }
@@ -134,6 +147,70 @@ pub fn path(c: &mut ck.Checker, n: cst.NodeId) -> Path {
         return Path { kind: PathKind.Type, type_id: mt, alias: base.alias };
     }
     return not_path();
+}
+
+/// The generic type declaration a callee names, as in Pair(u32, u8).
+fn generic_type_of(c: &mut ck.Checker, callee: cst.NodeId) -> ?u32 {
+    let k = ck.kind_of(c, callee);
+    var module = c.module;
+    var name_token: u32 = 0;
+    if k == cst.Kind.NameExpr {
+        name_token = ck.ident_of(c, callee);
+    } else if k == cst.Kind.FieldExpr {
+        let base = path(c, ck.child(c, callee, 0));
+        if base.kind != PathKind.Module {
+            return none;
+        }
+        module = base.alias.module;
+        name_token = member_token(c, callee);
+    } else {
+        return none;
+    }
+    let sym = ck.symbol(c, name_token);
+    match ck.find_item(c, module, sym) {
+        some(d) => {
+            let decl = c.decls[d as usize];
+            if decl.generic and decl.kind != ck.DeclKind.Fn {
+                return d;
+            }
+        }
+        none => { }
+    }
+    return none;
+}
+
+/// The instance of generic type d that a call such as Grid(u8, 4, 4)
+/// names, as a type path.
+fn generic_instance(c: &mut ck.Checker, n: cst.NodeId, d: u32) -> Path {
+    let wants = ck.comptime_kinds(c, d);
+    let ws = wants.items();
+    var args = alloc.List(ck.ArgVal).init(c.a);
+    let nargs = ck.child_count(c, n) - 1;
+    var i: u32 = 0;
+    while i < nargs : (i += 1) {
+        let e = ck.child(c, ck.child(c, n, i + 1), 0);
+        if (i as usize) < ws.len() and not ws[i as usize].is_type {
+            let v = ck.comptime_value(c, e, ws[i as usize].type_id);
+            args.push(ck.ArgVal { is_type: false, type_id: ws[i as usize].type_id, value: v });
+        } else {
+            let p = path(c, e);
+            var t = ty.invalid();
+            if p.kind == PathKind.Type {
+                t = p.type_id;
+            } else {
+                let s = ck.span_of(c, e);
+                ck.report(c, codes.BAD_GENERIC, s, "this comptime argument should be a type");
+            }
+            args.push(ck.ArgVal { is_type: true, type_id: t, value: 0 });
+        }
+    }
+    let s = ck.span_of(c, n);
+    let inst = ck.instantiate(c, d, &args, at: s);
+    var t = ty.invalid();
+    if inst != ck.NONE {
+        t = c.decls[inst as usize].type_id;
+    }
+    return Path { kind: PathKind.Type, type_id: t, alias: not_path().alias };
 }
 
 fn prim(name: str) -> ?ty.TypeId {
@@ -347,7 +424,23 @@ fn check_name(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     let t = ck.ident_of(c, n);
     let sym = ck.symbol(c, t);
     match find_binding(c, sym) {
-        some(b) => { return b.type_id; }
+        some(b) => {
+            if in_constant(c) {
+                return not_constant(c, n); // a run-time binding, where a constant is needed
+            }
+            return b.type_id;
+        }
+        none => { }
+    }
+    match ck.find_env(c, sym) {
+        some(e) => {
+            if c.env[e as usize].is_type {
+                return not_a_value(c, n, "this comptime parameter is a type, not a value");
+            }
+            // A comptime value parameter: a constant of the instance (§4.1).
+            ck.set_ref(c, n, ck.ENV_REF + e);
+            return c.env[e as usize].type_id;
+        }
         none => { }
     }
     match ck.find_item(c, c.module, sym) {
@@ -786,7 +879,11 @@ fn library_method(c: &mut ck.Checker, b: ty.Builtin, name: str) -> ?Method {
 /// Checks the arguments of a call (children 1.. of the CallExpr) against
 /// params: their number, their types and their labels (§7.5).
 fn check_args(c: &mut ck.Checker, call: cst.NodeId, params: &alloc.List(Param), labels_by_type: bool) {
-    let nargs = ck.child_count(c, call) - 1;
+    // The comptime arguments of a generic call come first and are checked
+    // apart (§4.1).
+    let first = c.arg_offset;
+    c.arg_offset = 0;
+    let nargs = ck.child_count(c, call) - 1 - first;
     let ps = params.items();
     if nargs as usize != ps.len() {
         var m = ck.new_message(c);
@@ -802,13 +899,13 @@ fn check_args(c: &mut ck.Checker, call: cst.NodeId, params: &alloc.List(Param), 
         ck.report_owned(c, codes.ARGUMENT_COUNT, s, m);
         var k: u32 = 0;
         while k < nargs : (k += 1) {
-            _ = check(c, ck.child(c, ck.child(c, call, k + 1), 0), none);
+            _ = check(c, ck.child(c, ck.child(c, call, first + k + 1), 0), none);
         }
         return;
     }
     var i: usize = 0;
     while i < ps.len() : (i += 1) {
-        let arg = ck.child(c, call, i as u32 + 1);
+        let arg = ck.child(c, call, first + i as u32 + 1);
         match ck.find_own(c, arg, tk.Kind.Ident) {
             some(label) => {
                 let sym = ck.symbol(c, label);
@@ -882,11 +979,52 @@ fn check_args_loosely(c: &mut ck.Checker, call: cst.NodeId) {
 }
 
 fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId {
-    let f = c.fns[c.decls[d as usize].fn_index as usize];
+    var target = d;
+    if c.decls[d as usize].generic {
+        target = instantiate_call(c, call, d);
+        if target == ck.NONE {
+            check_args_loosely(c, call);
+            return ty.invalid();
+        }
+    }
+    let f = c.fns[c.decls[target as usize].fn_index as usize];
     let ps = fn_params(c, f, skip);
+    c.arg_offset = f.ncomptime;
     check_args(c, call, &ps, true);
-    ck.set_ref(c, call, d);
+    ck.set_ref(c, call, target);
     return f.ret;
+}
+
+/// The instance a call of a generic function names: its first arguments
+/// are the comptime ones (spec/arche.md §4.1).
+fn instantiate_call(c: &mut ck.Checker, call: cst.NodeId, d: u32) -> u32 {
+    let wants = ck.comptime_kinds(c, d);
+    let ws = wants.items();
+    let nargs = ck.child_count(c, call) - 1;
+    if (nargs as usize) < ws.len() {
+        let s = ck.span_of(c, call);
+        ck.report(c, codes.BAD_GENERIC, s, "this call is missing comptime arguments: they come first");
+        return ck.NONE;
+    }
+    var args = alloc.List(ck.ArgVal).init(c.a);
+    var i: usize = 0;
+    while i < ws.len() : (i += 1) {
+        let e = ck.child(c, ck.child(c, call, i as u32 + 1), 0);
+        if ws[i].is_type {
+            let p = path(c, e);
+            if p.kind != PathKind.Type {
+                let s = ck.span_of(c, e);
+                ck.report(c, codes.BAD_GENERIC, s, "this comptime argument should be a type");
+                return ck.NONE;
+            }
+            args.push(ck.ArgVal { is_type: true, type_id: p.type_id, value: 0 });
+        } else {
+            let v = ck.comptime_value(c, e, ws[i].type_id);
+            args.push(ck.ArgVal { is_type: false, type_id: ws[i].type_id, value: v });
+        }
+    }
+    let s = ck.span_of(c, call);
+    return ck.instantiate(c, d, &args, at: s);
 }
 
 fn check_builtin_fn(c: &mut ck.Checker, call: cst.NodeId, name: str) -> ?ty.TypeId {

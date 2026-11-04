@@ -29,6 +29,10 @@ fn declare(c: &mut ck.Checker, name_token: u32, t: ty.TypeId, mutable: bool) {
         some(_) => { visible = true; }
         none => { }
     }
+    match ck.find_env(c, sym) {
+        some(_) => { visible = true; }
+        none => { }
+    }
     if visible or ck.is_predeclared(ck.text(c, name_token)) {
         var m = ck.new_message(c);
         m.push_str("'");
@@ -49,7 +53,9 @@ fn is_void_result(c: &ck.Checker, t: ty.TypeId) -> bool {
 pub fn check_fn(c: &mut ck.Checker, f: u32) {
     let info = c.fns[f as usize];
     let decl = c.decls[info.decl as usize];
-    c.module = decl.module;
+    let saved = ck.save_context(c);
+    ck.enter_decl(c, info.decl);
+    c.cur_table = info.table;
     c.fn_index = f;
     c.loops = 0;
     c.defer_loops = ck.NONE;
@@ -72,6 +78,7 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
         ck.report_owned(c, codes.MISSING_RETURN, s, m);
     }
     c.fn_index = ck.NONE;
+    ck.restore_context(c, saved);
 }
 
 /// A test block (§4): a body like a function's that takes nothing and
@@ -86,6 +93,8 @@ pub fn check_test(c: &mut ck.Checker, module: u32, n: cst.NodeId) {
         ret: ty.void_type(),
         has_self: false,
         self_mode: ck.SelfMode.Value,
+        table: ck.NONE,
+        ncomptime: 0,
     });
     c.loops = 0;
     c.defer_loops = ck.NONE;

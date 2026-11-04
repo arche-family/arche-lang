@@ -102,8 +102,8 @@ fn check_declarations(c: &mut ck.Checker) {
     var d: usize = 0;
     while d < c.decls.len() : (d += 1) {
         let decl = c.decls[d];
-        if d as u32 == c.io_error {
-            continue;
+        if d as u32 == c.io_error or decl.generic {
+            continue; // a template: its instances are checked
         }
         c.module = decl.module;
         if decl.kind == ck.DeclKind.Struct {
@@ -128,7 +128,7 @@ fn check_declarations(c: &mut ck.Checker) {
                     }
                 }
             }
-        } else if decl.kind == ck.DeclKind.Fn {
+        } else if decl.kind == ck.DeclKind.Fn and decl.fn_index != ck.NONE {
             check_signature(c, decl.fn_index);
         }
     }
@@ -763,6 +763,11 @@ fn call(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> View {
     let d = ck.ref_of(c, n);
     var is_method = false;
     var mode = ck.SelfMode.Value;
+    // A generic call's comptime arguments come first; they are not values.
+    var offset: u32 = 0;
+    if d != ck.NONE and c.decls[d as usize].kind == ck.DeclKind.Fn {
+        offset = c.fns[c.decls[d as usize].fn_index as usize].ncomptime;
+    }
     if ck.kind_of(c, callee) == cst.Kind.FieldExpr and not ck.is_invalid(c, ck.type_of(c, callee)) {
         is_method = true;
     }
@@ -825,8 +830,8 @@ fn call(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> View {
         }
     }
     var i: u32 = 0;
-    while i < nargs : (i += 1) {
-        let e = ck.child(c, ck.child(c, n, i + 1), 0);
+    while i + offset < nargs : (i += 1) {
+        let e = ck.child(c, ck.child(c, n, offset + i + 1), 0);
         var pt = ck.type_of(c, e);
         if (i as usize) < params.len() {
             pt = params[i as usize];
@@ -1326,8 +1331,11 @@ pub fn check(c: &mut ck.Checker) {
             continue; // a test block: checked below with its module
         }
         let decl = c.decls[info.decl as usize];
-        c.module = decl.module;
+        let saved = ck.save_context(c);
+        ck.enter_decl(c, info.decl);
+        c.cur_table = info.table;
         let n = decl.node;
         check_body(c, i as u32, ck.child(c, n, ck.child_count(c, n) - 1));
+        ck.restore_context(c, saved);
     }
 }

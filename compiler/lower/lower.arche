@@ -488,6 +488,13 @@ pub fn mangle(c: &ck.Checker, d: u32, a: alloc.Allocator) -> alloc.String {
         segment(&mut out, c.names.text(c.decls[decl.owner as usize].name));
     }
     segment(&mut out, c.names.text(decl.name));
+    // An instance, or a method of one: its declaration number tells it
+    // from the template's other instances (spec/arche.md §4).
+    let is_instance = decl.template != ck.NONE or (decl.owner != ck.NONE and c.decls[decl.owner as usize].template != ck.NONE);
+    if is_instance {
+        out.push_str("_I");
+        ir.write_number(&mut out, d as u64);
+    }
     return out;
 }
 
@@ -516,7 +523,8 @@ fn lower_fn(l: &mut Lower, f: u32) {
     l.block = 0;
     l.fn_index = f;
     l.ret = info.ret;
-    l.c.module = decl.module;
+    ck.enter_decl(&mut l.c, info.decl);
+    l.c.cur_table = info.table;
     l.c.fn_index = f;
     l.vars = alloc.List(Var).init(l.a);
     l.defers = alloc.List(cst.NodeId).init(l.a);
@@ -618,13 +626,25 @@ pub fn lower(c: ck.Checker) -> ir.Module {
     var f: usize = 0;
     while f < l.c.fns.len() : (f += 1) {
         if l.c.fns[f].decl == ck.NONE {
-            break; // test blocks come last; a build leaves them out
+            // A test block: a build leaves it out. A stub keeps the IR
+            // functions numbered like the checker's.
+            var name = alloc.String.init(a);
+            name.push_str("a0_test_");
+            ir.write_number(&mut name, f as u64);
+            var stub = ir.new_function(name.view(), ir.Ty.Void, a);
+            var u = ir.inst(ir.Op.Unreachable, ir.Ty.Void);
+            u.a = 0;
+            stub.insts.push(u);
+            stub.blocks[0].insts.push(0);
+            l.m.functions.push(stub);
+            continue;
         }
         lower_fn(&mut l, f as u32);
         let done = l.f;
         l.m.functions.push(done);
         l.f = ir.new_function("", ir.Ty.Void, a);
     }
+    l.c.cur_table = ck.NONE;
     entry(&mut l);
     error_names(&mut l);
     let e = l.f;

@@ -553,6 +553,16 @@ fn parse_type(p: &mut Parser) {
                 _ = close(p, m, cst.Kind.TypeArray);
             }
         }
+        .KwType => {
+            // `comptime T: type`: the type of types (spec/arche.md §4.1).
+            if not p.full {
+                unexpected(p, "a type");
+                _ = close(p, m, cst.Kind.Error);
+                return;
+            }
+            advance(p);
+            _ = close(p, m, cst.Kind.TypePath);
+        }
         .Ident => {
             advance(p);
             while accept(p, tk.Kind.Dot) {

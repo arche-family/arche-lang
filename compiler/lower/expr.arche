@@ -168,6 +168,11 @@ pub fn value(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
         .ParenExpr => { return value(l, child(l, e, 0)); }
         .NameExpr => {
             let d = ck.ref_of(&l.c, e);
+            if d >= ck.ENV_REF and d < ck.VALUE_FIELD {
+                // A comptime value parameter of an instance.
+                let entry = l.c.env[(d - ck.ENV_REF) as usize];
+                return scalar_val(lw.konst(l, layout.scalar(&l.c, entry.type_id), entry.value));
+            }
             if d != ck.NONE {
                 return const_value(l, d);
             }
@@ -715,6 +720,11 @@ fn arg_node(l: &lw.Lower, call_node: cst.NodeId, i: u32) -> cst.NodeId {
     return child(l, child(l, call_node, i + 1), 0);
 }
 
+/// The i-th run-time argument of a call whose comptime ones come first.
+fn runtime_arg(l: &lw.Lower, call_node: cst.NodeId, offset: u32, i: u32) -> cst.NodeId {
+    return child(l, child(l, call_node, offset + i + 1), 0);
+}
+
 /// The receiver's address for a method taking self by reference.
 fn receiver_addr(l: &mut lw.Lower, receiver: cst.NodeId) -> u32 {
     if l.c.t.kind(type_of(l, receiver)) == ty.Kind.Ref {
@@ -769,9 +779,9 @@ fn call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
             }
         }
         var i: u32 = 0;
-        while i < nargs : (i += 1) {
+        while i + info.ncomptime < nargs : (i += 1) {
             let pt = l.c.params[(info.params_start + skip + i) as usize].type_id;
-            let v = value(l, arg_node(l, n, i));
+            let v = value(l, runtime_arg(l, n, offset: info.ncomptime, i: i));
             args.push(lw.as_arg(l, pt, v));
         }
         let r = lw.call_with(l, fi, false, lw.ret_ty(&l.c, info.ret), &args);

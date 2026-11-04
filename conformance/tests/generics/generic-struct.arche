@@ -1,0 +1,31 @@
+// test: run
+// spec: arche/4.2
+// stage0: skip
+// stdout: 42 5
+import std;
+
+type Pair(comptime A: type, comptime B: type) = struct {
+    first: A,
+    second: B,
+
+    fn swap(self: Pair(A, B)) -> Pair(B, A) {
+        return Pair(B, A) { first: self.second, second: self.first };
+    }
+
+    fn make(a: A, b: B) -> Pair(A, B) {
+        return Pair(A, B) { first: a, second: b };
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let p = Pair(u32, u8) { first: 40, second: 2 };
+    let q = p.swap();
+    let r: Pair(u8, u32) = q;
+    sys.stdout.write_u64(r.first as u64 + r.second as u64);
+    let m = Pair(u16, bool).make(5, true);
+    if m.second {
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(m.first as u64);
+    }
+    sys.stdout.write("\n");
+}

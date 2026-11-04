@@ -1,0 +1,58 @@
+// test: run
+// spec: arche/4.2
+// stage0: skip
+// stdout: 99 2 hi
+import std;
+import alloc;
+
+type Maybe(comptime T: type) = enum {
+    Nothing,
+    Just { value: T },
+
+    fn or_default(self: Maybe(T), d: T) -> T {
+        match self {
+            .Just { value } => { return value; }
+            .Nothing => { return d; }
+        }
+    }
+}
+
+type Stack(comptime T: type) = struct {
+    items: alloc.List(T),
+
+    fn init(a: alloc.Allocator) -> Stack(T) {
+        return Stack(T) { items: alloc.List(T).init(a) };
+    }
+
+    fn push(self: &mut Stack(T), x: T) {
+        self.items.push(x);
+    }
+
+    fn top(self: &Stack(T)) -> Maybe(T) {
+        let n = self.items.len();
+        if n == 0 {
+            return Maybe(T).Nothing;
+        }
+        return Maybe(T).Just { value: self.items[n - 1] };
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var s = Stack(u64).init(sys.alloc);
+    sys.stdout.write_u64(s.top().or_default(99));
+    s.push(1);
+    s.push(2);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(s.top().or_default(99));
+    var words = Stack(alloc.Symbol).init(sys.alloc);
+    var names = alloc.Interner.init(sys.alloc);
+    words.push(names.intern("hi"));
+    match words.top() {
+        .Just { value } => {
+            sys.stdout.write(" ");
+            sys.stdout.write(names.text(value));
+        }
+        .Nothing => { }
+    }
+    sys.stdout.write("\n");
+}

@@ -1,0 +1,32 @@
+// test: run
+// spec: arche/4.1
+// stage0: skip
+// stdout: 49 ababab
+import std;
+
+const SIZE: usize = 3;
+
+type Grid(comptime T: type, comptime W: usize, comptime H: usize) = struct {
+    cells: [W * H]T,
+
+    fn get(self: &Grid(T, W, H), x: usize, y: usize) -> T {
+        return self.cells[y * W + x];
+    }
+}
+
+fn repeat(comptime N: u32, out: &mut std.Output, text: str) {
+    var i: u32 = 0;
+    while i < N : (i += 1) {
+        out.write(text);
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let g = Grid(u8, 2, 2) { cells: [1, 2, 3, 4] };
+    sys.stdout.write_u64(g.get(x: 1, y: 1) as u64);
+    let h: Grid(u32, SIZE, 1) = Grid(u32, SIZE, 1) { cells: [7, 8, 9] };
+    sys.stdout.write_u64(h.get(x: 2, y: 0) as u64);
+    sys.stdout.write(" ");
+    repeat(3, &mut sys.stdout, "ab");
+    sys.stdout.write("\n");
+}
