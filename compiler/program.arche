@@ -17,6 +17,8 @@ pub type Module = struct {
     pub name: alloc.String,
     /// The file as it was opened, for diagnostics.
     pub path: alloc.String,
+    /// The file relative to the package root, for panics (§10).
+    pub display: alloc.String,
     pub text: alloc.String,
     pub tree: cst.Tree,
 
@@ -90,7 +92,7 @@ fn is_identifier(s: str) -> bool {
 }
 
 /// Lexes and parses one file into a module, reporting into p.diags.
-fn add_module(p: &mut Program, name: str, path: str, text: alloc.String) -> ModuleId {
+fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.String) -> ModuleId {
     let id = ModuleId { index: p.modules.len() as u32 };
     p.diags.file = id.index;
     var lexed = diag.Diagnostics.init(p.a);
@@ -101,12 +103,14 @@ fn add_module(p: &mut Program, name: str, path: str, text: alloc.String) -> Modu
     n.push_str(name);
     var pa = alloc.String.init(p.a);
     pa.push_str(path);
+    var di = alloc.String.init(p.a);
+    di.push_str(display);
     let found = parsed.diags.items.items();
     var i: usize = 0;
     while i < found.len() : (i += 1) {
         p.diags.items.push(copy_diagnostic(&found[i], p.a));
     }
-    p.modules.push(Module { name: n, path: pa, text: text, tree: parsed.tree });
+    p.modules.push(Module { name: n, path: pa, display: di, text: text, tree: parsed.tree });
     return id;
 }
 
@@ -210,7 +214,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator) -> P
     if is_identifier(stem) {
         root_name = stem;
     }
-    _ = add_module(&mut p, name: root_name, path: path, text);
+    _ = add_module(&mut p, name: root_name, path: path, display: base, text);
 
     var next: usize = 0;
     while next < p.modules.len() : (next += 1) {
@@ -230,7 +234,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator) -> P
             full.push_str(ip.file.view());
             match fs.read_file(full.view(), a) {
                 ok(source) => {
-                    _ = add_module(&mut p, name: ip.dotted.view(), path: full.view(), source);
+                    _ = add_module(&mut p, name: ip.dotted.view(), path: full.view(), display: ip.file.view(), source);
                 }
                 err(_) => {
                     p.diags.file = next as u32;

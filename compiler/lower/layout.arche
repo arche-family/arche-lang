@@ -1,0 +1,190 @@
+/// Layouts (docs/abi.md): where each value lives in memory, and which
+/// values are scalars that the IR holds in registers.
+import alloc;
+import ir.ir;
+import sema.check as ck;
+import sema.types as ty;
+
+pub type Layout = struct {
+    pub size: u64,
+    pub align: u64,
+}
+
+fn round(n: u64, align: u64) -> u64 {
+    return (n + align - 1) / align * align;
+}
+
+/// The IR type of a scalar value, or Void for a composite one.
+pub fn scalar(c: &ck.Checker, t: ty.TypeId) -> ir.Ty {
+    let info = c.t.get(t);
+    match info.kind {
+        .Bool => { return ir.Ty.I1; }
+        .Int => {
+            match ty.bits(info.int_kind) {
+                8 => { return ir.Ty.I8; }
+                16 => { return ir.Ty.I16; }
+                32 => { return ir.Ty.I32; }
+                _ => { return ir.Ty.I64; }
+            }
+        }
+        .Ref => { return ir.Ty.Ptr; }
+        .ErrorSet => { return ir.Ty.I16; }
+        .ErrorUnion => {
+            if c.t.kind(info.elem) == ty.Kind.Void {
+                return ir.Ty.I16;
+            }
+            return ir.Ty.Void;
+        }
+        .Builtin => {
+            if info.builtin == ty.Builtin.Allocator {
+                return ir.Ty.I64;
+            }
+            if info.builtin == ty.Builtin.Symbol {
+                return ir.Ty.I32;
+            }
+            return ir.Ty.Void;
+        }
+        _ => { return ir.Ty.Void; }
+    }
+}
+
+pub fn is_scalar(c: &ck.Checker, t: ty.TypeId) -> bool {
+    return scalar(c, t) != ir.Ty.Void;
+}
+
+/// Void and noreturn: no value at all.
+pub fn is_nothing(c: &ck.Checker, t: ty.TypeId) -> bool {
+    let k = c.t.kind(t);
+    return k == ty.Kind.Void or k == ty.Kind.Noreturn;
+}
+
+/// The layout of fields one after another, as in a struct.
+fn fields_layout(c: &ck.Checker, start: u32, len: u32) -> Layout {
+    var size: u64 = 0;
+    var align: u64 = 1;
+    var i = start;
+    while i < start + len : (i += 1) {
+        let l = layout(c, c.fields[i as usize].type_id);
+        size = round(n: size, align: l.align) + l.size;
+        if l.align > align {
+            align = l.align;
+        }
+    }
+    return Layout { size: round(n: size, align: align), align: align };
+}
+
+/// The offset of field i of a run that starts at `start`.
+pub fn field_offset(c: &ck.Checker, start: u32, i: u32) -> u64 {
+    var offset: u64 = 0;
+    var f = start;
+    while f <= i : (f += 1) {
+        let l = layout(c, c.fields[f as usize].type_id);
+        offset = round(n: offset, align: l.align);
+        if f == i {
+            return offset;
+        }
+        offset += l.size;
+    }
+    return offset;
+}
+
+/// Where an enum's payload starts: after the u32 tag, at the alignment of
+/// its most aligned payload.
+pub fn payload_offset(c: &ck.Checker, t: ty.TypeId) -> u64 {
+    let d = c.decls[c.t.get(t).decl as usize];
+    var align: u64 = 4;
+    var v = d.members_start;
+    while v < d.members_start + d.members_len : (v += 1) {
+        let variant = c.variants[v as usize];
+        let l = fields_layout(c, start: variant.fields_start, len: variant.fields_len);
+        if l.align > align {
+            align = l.align;
+        }
+    }
+    return round(n: 4, align: align);
+}
+
+/// Where the value of ?T or E!T starts.
+pub fn value_offset(c: &ck.Checker, t: ty.TypeId) -> u64 {
+    let info = c.t.get(t);
+    let inner = layout(c, info.elem);
+    if info.kind == ty.Kind.Optional {
+        return round(n: 1, align: inner.align);
+    }
+    return round(n: 2, align: inner.align);
+}
+
+pub fn layout(c: &ck.Checker, t: ty.TypeId) -> Layout {
+    let info = c.t.get(t);
+    match info.kind {
+        .Void | .Noreturn | .Invalid => { return Layout { size: 0, align: 1 }; }
+        .Bool => { return Layout { size: 1, align: 1 }; }
+        .Int => {
+            let n = (ty.bits(info.int_kind) / 8) as u64;
+            return Layout { size: n, align: n };
+        }
+        .Ref => { return Layout { size: 8, align: 8 }; }
+        .Str | .Slice => { return Layout { size: 16, align: 8 }; }
+        .Array => {
+            let e = layout(c, info.elem);
+            return Layout { size: e.size * info.len, align: e.align };
+        }
+        .List => { return Layout { size: 32, align: 8 }; }
+        .Map => { return Layout { size: 56, align: 8 }; }
+        .ErrorSet => { return Layout { size: 2, align: 2 }; }
+        .Optional => {
+            let e = layout(c, info.elem);
+            return Layout { size: round(n: round(n: 1, align: e.align) + e.size, align: e.align), align: e.align };
+        }
+        .ErrorUnion => {
+            let e = layout(c, info.elem);
+            var align: u64 = 2;
+            if e.align > align {
+                align = e.align;
+            }
+            return Layout { size: round(n: round(n: 2, align: e.align) + e.size, align: align), align: align };
+        }
+        .Struct => {
+            let d = c.decls[info.decl as usize];
+            return fields_layout(c, start: d.members_start, len: d.members_len);
+        }
+        .Enum => {
+            let d = c.decls[info.decl as usize];
+            var size: u64 = 4;
+            var align: u64 = 4;
+            let start = payload_offset(c, t);
+            var v = d.members_start;
+            while v < d.members_start + d.members_len : (v += 1) {
+                let variant = c.variants[v as usize];
+                let l = fields_layout(c, start: variant.fields_start, len: variant.fields_len);
+                if variant.fields_len > 0 and start + l.size > size {
+                    size = start + l.size;
+                }
+                if l.align > align {
+                    align = l.align;
+                }
+            }
+            return Layout { size: round(n: size, align: align), align: align };
+        }
+        .Builtin => {
+            match info.builtin {
+                .Allocator | .Output | .Fs => { return Layout { size: 8, align: 8 }; }
+                .Symbol => { return Layout { size: 4, align: 4 }; }
+                .Args => { return Layout { size: 16, align: 8 }; }
+                .String => { return Layout { size: 32, align: 8 }; }
+                .Interner => { return Layout { size: 48, align: 8 }; }
+                .System => { return Layout { size: 48, align: 8 }; }
+                .NotBuiltin => { return Layout { size: 0, align: 1 }; }
+            }
+        }
+    }
+}
+
+/// The offsets of std.System's fields.
+pub fn system_field(name: str) -> u64 {
+    if name.eq("fs") { return 0; }
+    if name.eq("stdout") { return 8; }
+    if name.eq("stderr") { return 16; }
+    if name.eq("args") { return 24; }
+    return 40;
+}

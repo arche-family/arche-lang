@@ -1207,7 +1207,14 @@ fn add_io_error(c: &mut Checker) {
     }
 }
 
+/// Checks a program and returns its diagnostics.
 pub fn check(p: program.Program) -> program.Program {
+    let c = analyze(p);
+    return c.p;
+}
+
+/// Checks a program and keeps what the checker learnt, for lowering.
+pub fn analyze(p: program.Program) -> Checker {
     let a = p.a;
     let nmodules = p.modules.len();
     var c = Checker {
@@ -1307,5 +1314,5 @@ pub fn check(p: program.Program) -> program.Program {
     if c.p.diags.count() == 0 {
         memory.check(&mut c);
     }
-    return c.p;
+    return c;
 }

@@ -1,0 +1,480 @@
+/// Lowering of statements and patterns (spec/arche-0.md §8, §9).
+import alloc;
+import syntax.cst;
+import syntax.token as tk;
+import ir.ir;
+import lower.layout;
+import lower.lower as lw;
+import lower.expr;
+import sema.check as ck;
+import sema.expr as sx;
+import sema.types as ty;
+
+fn kind(l: &lw.Lower, n: cst.NodeId) -> cst.Kind {
+    return ck.kind_of(&l.c, n);
+}
+
+fn child(l: &lw.Lower, n: cst.NodeId, i: u32) -> cst.NodeId {
+    return ck.child(&l.c, n, i);
+}
+
+fn count(l: &lw.Lower, n: cst.NodeId) -> u32 {
+    return ck.child_count(&l.c, n);
+}
+
+fn type_of(l: &lw.Lower, n: cst.NodeId) -> ty.TypeId {
+    return ck.type_of(&l.c, n);
+}
+
+// ---- blocks and defer ----------------------------------------------------------
+
+/// Runs the deferred statements registered after `depth`, last first, but
+/// keeps them registered: a return or break leaves the block on one path.
+pub fn run_defers(l: &mut lw.Lower, depth: u32) {
+    var i = l.defers.len() as u32;
+    while i > depth : (i -= 1) {
+        if lw.terminated(l) {
+            return;
+        }
+        let d = l.defers[(i - 1) as usize];
+        stmt(l, d);
+    }
+}
+
+pub fn block(l: &mut lw.Lower, b: cst.NodeId) {
+    let vars = l.vars.len();
+    let defers = l.defers.len() as u32;
+    let n = count(l, b);
+    var i: u32 = 0;
+    while i < n : (i += 1) {
+        stmt(l, child(l, b, i));
+    }
+    if not lw.terminated(l) {
+        run_defers(l, defers);
+    }
+    while l.defers.len() as u32 > defers {
+        _ = l.defers.pop();
+    }
+    while l.vars.len() > vars {
+        _ = l.vars.pop();
+    }
+}
+
+// ---- statements -------------------------------------------------------------------
+
+fn stmt(l: &mut lw.Lower, s: cst.NodeId) {
+    if lw.terminated(l) {
+        // Code after a return, break or noreturn call: nothing reaches it.
+        lw.after_terminator(l);
+    }
+    match kind(l, s) {
+        .Block => { block(l, s); }
+        .LetStmt => { let_stmt(l, s); }
+        .ExprStmt => { _ = expr.value(l, child(l, s, 0)); }
+        .DiscardStmt => { _ = expr.value(l, child(l, s, 0)); }
+        .AssignStmt => { assign(l, s); }
+        .IfStmt => { if_stmt(l, s); }
+        .WhileStmt => { while_stmt(l, s); }
+        .MatchStmt => { match_stmt(l, s); }
+        .ReturnStmt => { return_stmt(l, s); }
+        .BreakStmt | .ContinueStmt => {
+            let lp = l.loops[l.loops.len() - 1];
+            run_defers(l, lp.defer_depth);
+            if kind(l, s) == cst.Kind.BreakStmt {
+                lw.br(l, lp.break_block);
+            } else {
+                lw.br(l, lp.continue_block);
+            }
+        }
+        .DeferStmt => { l.defers.push(child(l, s, 0)); }
+        _ => { }
+    }
+}
+
+fn let_stmt(l: &mut lw.Lower, s: cst.NodeId) {
+    let t = type_of(l, s);
+    let init = child(l, s, count(l, s) - 1);
+    let v = expr.value(l, init);
+    let slot = lw.alloca(l, t);
+    lw.store_val(l, t, v, slot);
+    let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, s));
+    lw.bind(l, sym, slot, t);
+}
+
+fn assign(l: &mut lw.Lower, s: cst.NodeId) {
+    let target = child(l, s, 0);
+    let value = child(l, s, 1);
+    let toks = ck.own(&l.c, s);
+    let op = ck.tok_kind(&l.c, toks[0]);
+    let t = type_of(l, target);
+    // §7.3: the place first, then the value.
+    let addr = expr.place(l, target);
+    if op == tk.Kind.Assign {
+        let v = expr.value(l, value);
+        lw.store_val(l, t, v, addr);
+        return;
+    }
+    let s_ty = layout.scalar(&l.c, t);
+    let old = lw.load(l, s_ty, addr);
+    let rhs = expr.value(l, value).v;
+    let r = expr.int_op(l, compound_op(op), t, a: old, b: rhs, s);
+    lw.store(l, value: r, addr: addr);
+}
+
+fn compound_op(op: tk.Kind) -> tk.Kind {
+    match op {
+        .PlusAssign => { return tk.Kind.Plus; }
+        .MinusAssign => { return tk.Kind.Minus; }
+        .StarAssign => { return tk.Kind.Star; }
+        .SlashAssign => { return tk.Kind.Slash; }
+        .PercentAssign => { return tk.Kind.Percent; }
+        .PlusWrapAssign => { return tk.Kind.PlusWrap; }
+        .MinusWrapAssign => { return tk.Kind.MinusWrap; }
+        .StarWrapAssign => { return tk.Kind.StarWrap; }
+        .AmpAssign => { return tk.Kind.Amp; }
+        .PipeAssign => { return tk.Kind.Pipe; }
+        .CaretAssign => { return tk.Kind.Caret; }
+        .ShlAssign => { return tk.Kind.Shl; }
+        _ => { return tk.Kind.Shr; }
+    }
+}
+
+fn if_stmt(l: &mut lw.Lower, s: cst.NodeId) {
+    let cond = expr.value(l, child(l, s, 0)).v;
+    let yes = lw.new_block(l);
+    let no = lw.new_block(l);
+    let done = lw.new_block(l);
+    lw.cond_br(l, cond: cond, yes: yes, no: no);
+    lw.switch_to(l, yes);
+    block(l, child(l, s, 1));
+    lw.br(l, done);
+    lw.switch_to(l, no);
+    if count(l, s) > 2 {
+        stmt(l, child(l, s, 2));
+    }
+    lw.br(l, done);
+    lw.switch_to(l, done);
+}
+
+fn while_stmt(l: &mut lw.Lower, s: cst.NodeId) {
+    let has_step = count(l, s) == 3;
+    let head = lw.new_block(l);
+    let body = lw.new_block(l);
+    let step = lw.new_block(l);
+    let done = lw.new_block(l);
+    lw.br(l, head);
+    lw.switch_to(l, head);
+    let cond = expr.value(l, child(l, s, 0)).v;
+    lw.cond_br(l, cond: cond, yes: body, no: done);
+    lw.switch_to(l, body);
+    l.loops.push(lw.LoopCtx { break_block: done, continue_block: step, defer_depth: l.defers.len() as u32 });
+    block(l, child(l, s, count(l, s) - 1));
+    _ = l.loops.pop();
+    lw.br(l, step);
+    lw.switch_to(l, step);
+    if has_step {
+        stmt(l, child(l, s, 1));
+    }
+    lw.br(l, head);
+    lw.switch_to(l, done);
+}
+
+/// Return lifting (§7.8): a T returned from a ?T function is some(T); from
+/// an E!T function a T is the value and an error is the error.
+fn return_stmt(l: &mut lw.Lower, s: cst.NodeId) {
+    let rt = l.ret;
+    let info = l.c.t.get(rt);
+    var result = lw.Val { v: 0, scalar: true, fresh: true };
+    var has_result = false;
+    if count(l, s) > 0 {
+        let e = child(l, s, 0);
+        let et = type_of(l, e);
+        let v = expr.value(l, e);
+        has_result = not layout.is_nothing(&l.c, rt);
+        if et == rt or l.c.t.kind(et) == ty.Kind.Noreturn {
+            result = v;
+        } else if info.kind == ty.Kind.Optional {
+            result = expr.wrap_some(l, rt, v);
+        } else if info.kind == ty.Kind.ErrorUnion and l.c.t.kind(et) == ty.Kind.ErrorSet and
+            l.c.t.kind(info.elem) != ty.Kind.ErrorSet {
+            result = expr.wrap_error(l, rt, v.v);
+        } else if info.kind == ty.Kind.ErrorUnion {
+            result = expr.wrap_ok(l, rt, v);
+        } else {
+            result = v;
+        }
+        if has_result and not result.scalar {
+            result = lw.own_val(l, rt, result);
+        }
+    }
+    if lw.terminated(l) {
+        return;
+    }
+    run_defers(l, 0);
+    if lw.terminated(l) {
+        return;
+    }
+    emit_return(l, has_result, result);
+}
+
+pub fn emit_return(l: &mut lw.Lower, has_result: bool, result: lw.Val) {
+    let rt = l.ret;
+    if l.sret != ck.NONE {
+        lw.store_val(l, rt, result, l.sret);
+        _ = lw.emit(l, ir.inst(ir.Op.RetVoid, ir.Ty.Void));
+    } else if has_result {
+        var r = ir.inst(ir.Op.Ret, ir.Ty.Void);
+        r.a = result.v;
+        _ = lw.emit(l, r);
+    } else if l.f.ret == ir.Ty.I16 {
+        var r = ir.inst(ir.Op.Ret, ir.Ty.Void);
+        r.a = lw.konst(l, ir.Ty.I16, 0);
+        _ = lw.emit(l, r);
+    } else {
+        _ = lw.emit(l, ir.inst(ir.Op.RetVoid, ir.Ty.Void));
+    }
+}
+
+// ---- match (§9) -------------------------------------------------------------------
+
+/// A pattern's literal: its value as bits of the type.
+fn literal(l: &lw.Lower, toks: []u32, from: &mut usize) -> u64 {
+    var negative = false;
+    if ck.tok_kind(&l.c, toks[from.*]) == tk.Kind.Minus {
+        negative = true;
+        from.* += 1;
+    }
+    let v = ck.tok_value(&l.c, toks[from.*]);
+    from.* += 1;
+    if negative {
+        return ~v +% 1;
+    }
+    return v;
+}
+
+/// The i1 that says pattern p matches the value of type t at addr.
+fn matches(l: &mut lw.Lower, p: cst.NodeId, t: ty.TypeId, addr: u32) -> u32 {
+    let info = l.c.t.get(t);
+    match kind(l, p) {
+        .WildcardPat | .BindPat => { return lw.konst(l, ir.Ty.I1, 1); }
+        .LitPat | .RangePat => {
+            let s = layout.scalar(&l.c, t);
+            let v = lw.load(l, s, addr);
+            let signed = ty.is_signed(info.int_kind);
+            let toks = ck.own(&l.c, p);
+            var at: usize = 0;
+            let lo = lw.konst(l, s, literal(l, toks.items(), &mut at));
+            if kind(l, p) == cst.Kind.LitPat {
+                return lw.cmp(l, ir.CmpKind.Eq, x: v, y: lo);
+            }
+            at += 1;
+            let hi = lw.konst(l, s, literal(l, toks.items(), &mut at));
+            var ge = ir.CmpKind.UGe;
+            var le = ir.CmpKind.ULe;
+            if signed {
+                ge = ir.CmpKind.SGe;
+                le = ir.CmpKind.SLe;
+            }
+            let a = lw.cmp(l, ge, x: v, y: lo);
+            let b = lw.cmp(l, le, x: v, y: hi);
+            return lw.bin(l, ir.BinKind.And, x: a, y: b);
+        }
+        .BoolPat => {
+            let v = lw.load(l, ir.Ty.I1, addr);
+            let is_true = ck.tok_kind(&l.c, ck.tree(&l.c).first_token(p)) == tk.Kind.KwTrue;
+            if is_true {
+                return v;
+            }
+            return lw.bin(l, ir.BinKind.Xor, x: v, y: lw.konst(l, ir.Ty.I1, 1));
+        }
+        .NonePat => {
+            let has = lw.load(l, ir.Ty.I8, addr);
+            return lw.cmp(l, ir.CmpKind.Eq, x: has, y: lw.konst(l, ir.Ty.I8, 0));
+        }
+        .SomePat => {
+            let has = lw.load(l, ir.Ty.I8, addr);
+            let yes = lw.cmp(l, ir.CmpKind.Ne, x: has, y: lw.konst(l, ir.Ty.I8, 0));
+            let inner = lw.gep(l, addr, layout.value_offset(&l.c, t));
+            return and_then(l, yes: yes, child(l, p, 0), info.elem, addr: inner);
+        }
+        .OkPat | .ErrPat => {
+            let code = lw.load(l, ir.Ty.I16, addr);
+            let zero = lw.konst(l, ir.Ty.I16, 0);
+            if kind(l, p) == cst.Kind.OkPat {
+                let yes = lw.cmp(l, ir.CmpKind.Eq, x: code, y: zero);
+                if l.c.t.kind(info.elem) == ty.Kind.Void {
+                    return yes;
+                }
+                let inner = lw.gep(l, addr, layout.value_offset(&l.c, t));
+                return and_then(l, yes: yes, child(l, p, 0), info.elem, addr: inner);
+            }
+            let yes = lw.cmp(l, ir.CmpKind.Ne, x: code, y: zero);
+            var set = ty.any_error();
+            if info.decl != ck.NONE {
+                set = l.c.decls[info.decl as usize].type_id;
+            }
+            return and_then(l, yes: yes, child(l, p, 0), set, addr: addr);
+        }
+        .VariantPat => {
+            let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, p));
+            if info.kind == ty.Kind.ErrorSet {
+                let id = l.c.error_ids.get(sym) orelse 0;
+                let code = lw.load(l, ir.Ty.I16, addr);
+                return lw.cmp(l, ir.CmpKind.Eq, x: code, y: lw.konst(l, ir.Ty.I16, id as u64));
+            }
+            let v = sx.find_variant(&l.c, t, sym) orelse 0;
+            let tag = lw.load(l, ir.Ty.I32, addr);
+            let first = l.c.decls[info.decl as usize].members_start;
+            return lw.cmp(l, ir.CmpKind.Eq, x: tag, y: lw.konst(l, ir.Ty.I32, (v - first) as u64));
+        }
+        _ => { return lw.konst(l, ir.Ty.I1, 1); }
+    }
+}
+
+/// yes and, only when it holds, the inner pattern: the inner value may not
+/// be there to test otherwise.
+fn and_then(l: &mut lw.Lower, yes: u32, p: cst.NodeId, t: ty.TypeId, addr: u32) -> u32 {
+    let k = kind(l, p);
+    if k == cst.Kind.WildcardPat or k == cst.Kind.BindPat {
+        return yes;
+    }
+    let result = lw.alloca(l, ty.bool_type());
+    lw.store(l, value: yes, addr: result);
+    let inner = lw.new_block(l);
+    let done = lw.new_block(l);
+    lw.cond_br(l, cond: yes, yes: inner, no: done);
+    lw.switch_to(l, inner);
+    let r = matches(l, p, t, addr);
+    lw.store(l, value: r, addr: result);
+    lw.br(l, done);
+    lw.switch_to(l, done);
+    return lw.load(l, ir.Ty.I1, result);
+}
+
+/// Binds the names of pattern p, which matched the value of type t at
+/// addr: copies, or, when by_ref, addresses (§9).
+fn bind_pattern(l: &mut lw.Lower, p: cst.NodeId, t: ty.TypeId, addr: u32, by_ref: bool) {
+    let info = l.c.t.get(t);
+    match kind(l, p) {
+        .BindPat => {
+            let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, p));
+            let bt = type_of(l, p);
+            let slot = lw.alloca(l, bt);
+            if by_ref {
+                lw.store(l, value: addr, addr: slot);
+            } else {
+                let v = lw.load_val(l, t, addr);
+                lw.store_val(l, t, v, slot);
+            }
+            lw.bind(l, sym, slot, bt);
+        }
+        .SomePat => {
+            bind_pattern(l, child(l, p, 0), info.elem, lw.gep(l, addr, layout.value_offset(&l.c, t)), by_ref);
+        }
+        .OkPat => {
+            if l.c.t.kind(info.elem) != ty.Kind.Void {
+                bind_pattern(l, child(l, p, 0), info.elem, lw.gep(l, addr, layout.value_offset(&l.c, t)), by_ref);
+            }
+        }
+        .ErrPat => {
+            var set = ty.any_error();
+            if info.decl != ck.NONE {
+                set = l.c.decls[info.decl as usize].type_id;
+            }
+            bind_pattern(l, child(l, p, 0), set, addr, by_ref);
+        }
+        .VariantPat => {
+            if info.kind != ty.Kind.Enum {
+                return;
+            }
+            let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, p));
+            let v = sx.find_variant(&l.c, t, sym) orelse 0;
+            let variant = l.c.variants[v as usize];
+            let payload = lw.gep(l, addr, layout.payload_offset(&l.c, t));
+            let n = count(l, p);
+            var i: u32 = 0;
+            while i < n : (i += 1) {
+                let fp = child(l, p, i);
+                let toks = ck.own(&l.c, fp);
+                var bind_token = toks[0];
+                if toks.len() == 3 {
+                    bind_token = toks[2];
+                }
+                if ck.tok_kind(&l.c, bind_token) != tk.Kind.Ident {
+                    continue;
+                }
+                let fsym = ck.symbol(&mut l.c, toks[0]);
+                var f = variant.fields_start;
+                while f < variant.fields_start + variant.fields_len and l.c.fields[f as usize].name != fsym : (f += 1) {
+                }
+                let ft = l.c.fields[f as usize].type_id;
+                let faddr = lw.gep(l, payload, layout.field_offset(&l.c, start: variant.fields_start, i: f));
+                let bsym = ck.symbol(&mut l.c, bind_token);
+                let bt = type_of(l, fp);
+                let slot = lw.alloca(l, bt);
+                if by_ref {
+                    lw.store(l, value: faddr, addr: slot);
+                } else {
+                    let fv = lw.load_val(l, ft, faddr);
+                    lw.store_val(l, ft, fv, slot);
+                }
+                lw.bind(l, bsym, slot, bt);
+            }
+        }
+        _ => { }
+    }
+}
+
+fn match_stmt(l: &mut lw.Lower, s: cst.NodeId) {
+    let scrutinee = child(l, s, 0);
+    let st = type_of(l, scrutinee);
+    var t = st;
+    var by_ref = false;
+    var addr: u32 = 0;
+    let v = expr.value(l, scrutinee);
+    if l.c.t.kind(st) == ty.Kind.Ref {
+        t = l.c.t.elem(st);
+        by_ref = true;
+        addr = v.v;
+    } else {
+        let owned = lw.own_val(l, st, v);
+        if owned.scalar {
+            addr = lw.alloca(l, st);
+            lw.store(l, value: owned.v, addr: addr);
+        } else {
+            addr = owned.v;
+        }
+    }
+    let done = lw.new_block(l);
+    let n = count(l, s);
+    var i: u32 = 1;
+    while i < n : (i += 1) {
+        let arm = child(l, s, i);
+        let parts = count(l, arm);
+        let body = lw.new_block(l);
+        let next = lw.new_block(l);
+        // The alternatives of an arm: any one matching selects it.
+        var j: u32 = 0;
+        while j + 1 < parts : (j += 1) {
+            let fine = matches(l, child(l, arm, j), t, addr);
+            let other = lw.new_block(l);
+            lw.cond_br(l, cond: fine, yes: body, no: other);
+            lw.switch_to(l, other);
+        }
+        lw.br(l, next);
+        lw.switch_to(l, body);
+        let vars = l.vars.len();
+        if parts == 2 {
+            bind_pattern(l, child(l, arm, 0), t, addr, by_ref);
+        }
+        block(l, child(l, arm, parts - 1));
+        while l.vars.len() > vars {
+            _ = l.vars.pop();
+        }
+        lw.br(l, done);
+        lw.switch_to(l, next);
+    }
+    lw.trap(l, "no match arm matched", s);
+    lw.br(l, done);
+    lw.switch_to(l, done);
+}

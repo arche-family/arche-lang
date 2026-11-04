@@ -146,6 +146,11 @@ void a0rt_bytes_push(u64 *list, const u8 *p, u64 n) {
     list[1] += n;
 }
 
+// Whether offset i of a str falls on a character boundary (§7.7).
+u8 a0rt_str_boundary(const u8 *p, u64 n, u64 i) {
+    return i == 0 || i >= n || (p[i] & 0xC0) != 0x80;
+}
+
 u8 a0rt_str_eq(const u8 *a, u64 an, const u8 *b, u64 bn) {
     return an == bn && memcmp(a, b, an) == 0;
 }

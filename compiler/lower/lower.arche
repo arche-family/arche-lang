@@ -1,0 +1,633 @@
+/// Lowering: a checked program becomes an IR module (sprint S8).
+///
+/// Every binding has a stack slot, or for a composite parameter the address
+/// the caller passed; scalars are loaded from slots and stored back, and
+/// LLVM's mem2reg turns the slots into registers. A composite value is the
+/// address of memory holding it: a fresh temporary, or a place. Before a
+/// composite value from a place is passed on, it is copied, so that a later
+/// argument cannot change it (§7.3).
+import alloc;
+import diag;
+import syntax.cst;
+import syntax.token as tk;
+import ir.ir;
+import lower.layout;
+import lower.expr;
+import lower.stmt;
+import sema.check as ck;
+import sema.types as ty;
+
+pub type Var = struct {
+    pub name: alloc.Symbol,
+    /// The address of the binding's value.
+    pub addr: u32,
+    pub type_id: ty.TypeId,
+}
+
+pub type LoopCtx = struct {
+    pub break_block: u32,
+    pub continue_block: u32,
+    /// defers.len() when the loop began: break and continue run the ones after.
+    pub defer_depth: u32,
+}
+
+/// A value: a scalar in an IR value, or the address of a composite one.
+/// `fresh` says that the memory is a temporary nothing else refers to.
+pub type Val = struct {
+    pub v: u32,
+    pub scalar: bool,
+    pub fresh: bool,
+}
+
+pub type Lower = struct {
+    pub c: ck.Checker,
+    pub m: ir.Module,
+    pub f: ir.Function,
+    pub block: u32,
+    pub vars: alloc.List(Var),
+    pub defers: alloc.List(cst.NodeId),
+    pub loops: alloc.List(LoopCtx),
+    pub fn_index: u32,
+    /// The address the result is written to, for a composite result.
+    pub sret: u32,
+    pub ret: ty.TypeId,
+    pub a: alloc.Allocator,
+}
+
+// ---- building IR ---------------------------------------------------------------
+
+pub fn emit(l: &mut Lower, i: ir.Inst) -> u32 {
+    let id = l.f.insts.len() as u32;
+    l.f.insts.push(i);
+    l.f.blocks[l.block as usize].insts.push(id);
+    return id;
+}
+
+pub fn konst(l: &mut Lower, t: ir.Ty, v: u64) -> u32 {
+    var i = ir.inst(ir.Op.Const, t);
+    i.imm = v;
+    return emit(l, i);
+}
+
+pub fn alloca(l: &mut Lower, t: ty.TypeId) -> u32 {
+    let lay = layout.layout(&l.c, t);
+    return alloca_bytes(l, size: lay.size, align: lay.align);
+}
+
+pub fn alloca_bytes(l: &mut Lower, size: u64, align: u64) -> u32 {
+    var i = ir.inst(ir.Op.Alloca, ir.Ty.Ptr);
+    var n = size;
+    if n == 0 {
+        n = 1;
+    }
+    i.imm = n;
+    i.flag = align as u32;
+    let p = emit(l, i);
+    var z = ir.inst(ir.Op.Memzero, ir.Ty.Void);
+    z.a = p;
+    z.imm = n;
+    _ = emit(l, z);
+    return p;
+}
+
+pub fn load(l: &mut Lower, t: ir.Ty, addr: u32) -> u32 {
+    var i = ir.inst(ir.Op.Load, t);
+    i.a = addr;
+    return emit(l, i);
+}
+
+pub fn store(l: &mut Lower, value: u32, addr: u32) {
+    var i = ir.inst(ir.Op.Store, ir.Ty.Void);
+    i.a = value;
+    i.b = addr;
+    _ = emit(l, i);
+}
+
+pub fn gep(l: &mut Lower, addr: u32, offset: u64) -> u32 {
+    if offset == 0 {
+        return addr;
+    }
+    var i = ir.inst(ir.Op.Gep, ir.Ty.Ptr);
+    i.a = addr;
+    i.imm = offset;
+    return emit(l, i);
+}
+
+pub fn gep_index(l: &mut Lower, addr: u32, index: u32, size: u64) -> u32 {
+    var i = ir.inst(ir.Op.GepIndex, ir.Ty.Ptr);
+    i.a = addr;
+    i.b = index;
+    i.imm = size;
+    return emit(l, i);
+}
+
+pub fn memcpy(l: &mut Lower, dst: u32, src: u32, size: u64) {
+    if size == 0 {
+        return;
+    }
+    var i = ir.inst(ir.Op.Memcpy, ir.Ty.Void);
+    i.a = dst;
+    i.b = src;
+    i.imm = size;
+    _ = emit(l, i);
+}
+
+pub fn bin(l: &mut Lower, k: ir.BinKind, x: u32, y: u32) -> u32 {
+    var i = ir.inst(ir.Op.Bin, l.f.insts[x as usize].ty);
+    i.a = x;
+    i.b = y;
+    i.flag = bin_code(k);
+    return emit(l, i);
+}
+
+fn bin_code(k: ir.BinKind) -> u32 {
+    match k {
+        .Add => { return 0; }
+        .Sub => { return 1; }
+        .Mul => { return 2; }
+        .SDiv => { return 3; }
+        .UDiv => { return 4; }
+        .SRem => { return 5; }
+        .URem => { return 6; }
+        .And => { return 7; }
+        .Or => { return 8; }
+        .Xor => { return 9; }
+        .Shl => { return 10; }
+        .LShr => { return 11; }
+        .AShr => { return 12; }
+    }
+}
+
+pub fn cmp(l: &mut Lower, k: ir.CmpKind, x: u32, y: u32) -> u32 {
+    var i = ir.inst(ir.Op.Cmp, ir.Ty.I1);
+    i.a = x;
+    i.b = y;
+    match k {
+        .Eq => { i.flag = 0; }
+        .Ne => { i.flag = 1; }
+        .SLt => { i.flag = 2; }
+        .SLe => { i.flag = 3; }
+        .SGt => { i.flag = 4; }
+        .SGe => { i.flag = 5; }
+        .ULt => { i.flag = 6; }
+        .ULe => { i.flag = 7; }
+        .UGt => { i.flag = 8; }
+        .UGe => { i.flag = 9; }
+    }
+    return emit(l, i);
+}
+
+/// x op y with a check: the wrapped result, and an i1 that says whether it
+/// overflowed.
+pub fn overflow(l: &mut Lower, k: ir.OverflowKind, x: u32, y: u32) -> u32 {
+    var i = ir.inst(ir.Op.Overflow, l.f.insts[x as usize].ty);
+    i.a = x;
+    i.b = y;
+    match k {
+        .SAdd => { i.flag = 0; }
+        .UAdd => { i.flag = 1; }
+        .SSub => { i.flag = 2; }
+        .USub => { i.flag = 3; }
+        .SMul => { i.flag = 4; }
+        .UMul => { i.flag = 5; }
+    }
+    return emit(l, i);
+}
+
+pub fn overflow_bit(l: &mut Lower, o: u32) -> u32 {
+    var i = ir.inst(ir.Op.OverflowBit, ir.Ty.I1);
+    i.a = o;
+    return emit(l, i);
+}
+
+/// Converts an integer to type t: truncates, or extends with the sign
+/// when `signed`.
+pub fn convert(l: &mut Lower, x: u32, t: ir.Ty, signed: bool) -> u32 {
+    let from = l.f.insts[x as usize].ty;
+    if from == t {
+        return x;
+    }
+    if ir.bits(from) > ir.bits(t) {
+        var i = ir.inst(ir.Op.Trunc, t);
+        i.a = x;
+        return emit(l, i);
+    }
+    var i = ir.inst(ir.Op.Ext, t);
+    i.a = x;
+    if signed {
+        i.flag = 1;
+    }
+    return emit(l, i);
+}
+
+/// An i1 as 0 or 1 of type t.
+pub fn lconvert(l: &mut Lower, x: u32, t: ir.Ty) -> u32 {
+    return convert(l, x, t, false);
+}
+
+pub fn new_block(l: &mut Lower) -> u32 {
+    l.f.blocks.push(ir.Block { insts: alloc.List(u32).init(l.a) });
+    return l.f.blocks.len() as u32 - 1;
+}
+
+pub fn switch_to(l: &mut Lower, b: u32) {
+    l.block = b;
+}
+
+/// The current block already ends in a terminator.
+pub fn terminated(l: &Lower) -> bool {
+    let ids = l.f.blocks[l.block as usize].insts.items();
+    return ids.len() > 0 and ir.is_terminator(l.f.insts[ids[ids.len() - 1] as usize].op);
+}
+
+pub fn br(l: &mut Lower, target: u32) {
+    if terminated(l) {
+        return;
+    }
+    var i = ir.inst(ir.Op.Br, ir.Ty.Void);
+    i.a = target;
+    _ = emit(l, i);
+}
+
+pub fn cond_br(l: &mut Lower, cond: u32, yes: u32, no: u32) {
+    var i = ir.inst(ir.Op.CondBr, ir.Ty.Void);
+    i.a = cond;
+    i.b = yes;
+    i.c = no;
+    _ = emit(l, i);
+}
+
+/// After a terminator: code that follows goes to a new block, which nothing
+/// reaches.
+pub fn after_terminator(l: &mut Lower) {
+    let b = new_block(l);
+    switch_to(l, b);
+}
+
+fn record_params(l: &mut Lower, e: u32, args: &alloc.List(u32)) {
+    if l.m.externals[e as usize].params.len() > 0 or args.len() == 0 {
+        return;
+    }
+    let items = args.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        let t = l.f.insts[items[i] as usize].ty;
+        l.m.externals[e as usize].params.push(t);
+    }
+}
+
+/// Calls a runtime function; its parameter types are those of the first
+/// call.
+pub fn call_runtime(l: &mut Lower, name: str, ret: ir.Ty, args: &alloc.List(u32)) -> u32 {
+    let never = name.eq("a0rt_trap");
+    let e = l.m.external(name, ret, never);
+    record_params(l, e, args);
+    return call_with(l, e, true, ret, args);
+}
+
+pub fn call_with(l: &mut Lower, callee: u32, external: bool, ret: ir.Ty, args: &alloc.List(u32)) -> u32 {
+    var i = ir.inst(ir.Op.Call, ret);
+    i.imm = callee as u64;
+    if external {
+        i.flag = 1;
+    }
+    i.args_start = l.f.args.len() as u32;
+    let items = args.items();
+    var k: usize = 0;
+    while k < items.len() : (k += 1) {
+        l.f.args.push(items[k]);
+    }
+    i.args_len = items.len() as u32;
+    return emit(l, i);
+}
+
+pub fn args0(l: &Lower) -> alloc.List(u32) {
+    return alloc.List(u32).init(l.a);
+}
+
+// ---- traps -------------------------------------------------------------------
+
+/// A str value {ptr, len} of constant bytes, in a temporary.
+pub fn str_global(l: &mut Lower, bytes: str) -> Val {
+    let g = l.m.global(bytes);
+    var gi = ir.inst(ir.Op.Global, ir.Ty.Ptr);
+    gi.imm = g as u64;
+    let p = emit(l, gi);
+    let tmp = alloca(l, ty.str_type());
+    store(l, value: p, addr: tmp);
+    let n = konst(l, ir.Ty.I64, bytes.len() as u64);
+    store(l, value: n, addr: gep(l, tmp, 8));
+    return Val { v: tmp, scalar: false, fresh: true };
+}
+
+/// Where a trap points: the operator of an operation, `[` of an index,
+/// `as` of a conversion, `match` of a match; the start of a call.
+pub fn op_token(l: &Lower, n: cst.NodeId) -> u32 {
+    let k = ck.kind_of(&l.c, n);
+    if k == cst.Kind.CallExpr or k == cst.Kind.Arg {
+        return ck.tree(&l.c).first_token(n);
+    }
+    let toks = ck.own(&l.c, n);
+    if toks.len() == 0 {
+        return ck.tree(&l.c).first_token(n);
+    }
+    return toks[0];
+}
+
+/// Stops the program with "panic: <message>" and where the token is (§10).
+pub fn trap_with(l: &mut Lower, message_ptr: u32, message_len: u32, n: cst.NodeId) {
+    let tok = op_token(l, n);
+    let m = &l.c.p.modules[l.c.module as usize];
+    var file = alloc.String.init(l.a);
+    file.push_str(m.display.view());
+    let at = m.tree.token(tok).start;
+    let pos = diag.position(m.text.view(), at);
+    let fg = l.m.global(file.view());
+    var gi = ir.inst(ir.Op.Global, ir.Ty.Ptr);
+    gi.imm = fg as u64;
+    let fp = emit(l, gi);
+    var args = args0(l);
+    args.push(message_ptr);
+    args.push(message_len);
+    args.push(fp);
+    args.push(konst(l, ir.Ty.I64, file.len() as u64));
+    args.push(konst(l, ir.Ty.I32, pos.line as u64));
+    args.push(konst(l, ir.Ty.I32, pos.column as u64));
+    _ = call_runtime(l, "a0rt_trap", ir.Ty.Void, &args);
+    _ = emit(l, ir.inst(ir.Op.Unreachable, ir.Ty.Void));
+    after_terminator(l);
+}
+
+pub fn trap(l: &mut Lower, message: str, n: cst.NodeId) {
+    let g = l.m.global(message);
+    var gi = ir.inst(ir.Op.Global, ir.Ty.Ptr);
+    gi.imm = g as u64;
+    let p = emit(l, gi);
+    let len = konst(l, ir.Ty.I64, message.len() as u64);
+    trap_with(l, message_ptr: p, message_len: len, n);
+}
+
+/// Traps with the message unless fine holds.
+pub fn check(l: &mut Lower, fine: u32, message: str, n: cst.NodeId) {
+    let fail = new_block(l);
+    let cont = new_block(l);
+    cond_br(l, cond: fine, yes: cont, no: fail);
+    switch_to(l, fail);
+    trap(l, message, n);
+    br(l, cont);
+    switch_to(l, cont);
+}
+
+// ---- values ----------------------------------------------------------------------
+
+/// The value of type t stored at addr.
+pub fn load_val(l: &mut Lower, t: ty.TypeId, addr: u32) -> Val {
+    let s = layout.scalar(&l.c, t);
+    if s != ir.Ty.Void {
+        return Val { v: load(l, s, addr), scalar: true, fresh: true };
+    }
+    return Val { v: addr, scalar: false, fresh: false };
+}
+
+/// Stores value v of type t at addr.
+pub fn store_val(l: &mut Lower, t: ty.TypeId, v: Val, addr: u32) {
+    if layout.is_nothing(&l.c, t) {
+        return;
+    }
+    if v.scalar {
+        store(l, value: v.v, addr: addr);
+        return;
+    }
+    let size = layout.layout(&l.c, t).size;
+    memcpy(l, dst: addr, src: v.v, size);
+}
+
+/// A value nothing else refers to: a composite read from a place is copied.
+pub fn own_val(l: &mut Lower, t: ty.TypeId, v: Val) -> Val {
+    if v.scalar or v.fresh {
+        return v;
+    }
+    let tmp = alloca(l, t);
+    store_val(l, t, v, tmp);
+    return Val { v: tmp, scalar: false, fresh: true };
+}
+
+/// How a value of type t is passed to a call: a scalar, or the address of
+/// a composite (docs/abi.md).
+pub fn as_arg(l: &mut Lower, t: ty.TypeId, v: Val) -> u32 {
+    return own_val(l, t, v).v;
+}
+
+/// The IR type a function returns: composite results go through memory.
+pub fn ret_ty(c: &ck.Checker, t: ty.TypeId) -> ir.Ty {
+    if layout.is_nothing(c, t) {
+        return ir.Ty.Void;
+    }
+    let s = layout.scalar(c, t);
+    if s == ir.Ty.Void {
+        return ir.Ty.Void;
+    }
+    return s;
+}
+
+pub fn returns_in_memory(c: &ck.Checker, t: ty.TypeId) -> bool {
+    return not layout.is_nothing(c, t) and not layout.is_scalar(c, t);
+}
+
+pub fn param_ty(c: &ck.Checker, t: ty.TypeId) -> ir.Ty {
+    let s = layout.scalar(c, t);
+    if s == ir.Ty.Void {
+        return ir.Ty.Ptr;
+    }
+    return s;
+}
+
+pub fn find_var(l: &Lower, name: alloc.Symbol) -> ?Var {
+    var i = l.vars.len();
+    while i > 0 : (i -= 1) {
+        if l.vars[i - 1].name == name {
+            return l.vars[i - 1];
+        }
+    }
+    return none;
+}
+
+pub fn bind(l: &mut Lower, name: alloc.Symbol, addr: u32, t: ty.TypeId) {
+    l.vars.push(Var { name: name, addr: addr, type_id: t });
+}
+
+// ---- names -----------------------------------------------------------------------
+
+fn segment(out: &mut alloc.String, s: str) {
+    out.push_str("_");
+    ir.write_number(out, s.len() as u64);
+    out.push_str(s);
+}
+
+/// docs/abi.md: a0, then each segment of the module path, the type and the
+/// function, as _<length><text>.
+pub fn mangle(c: &ck.Checker, d: u32, a: alloc.Allocator) -> alloc.String {
+    let decl = c.decls[d as usize];
+    var out = alloc.String.init(a);
+    out.push_str("a0");
+    let mname = c.p.modules[decl.module as usize].name.view();
+    if mname.len() == 0 {
+        out.push_str("_0");
+    }
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= mname.len() : (i += 1) {
+        if i == mname.len() or mname[i] == '.' {
+            if i > start {
+                segment(&mut out, mname[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    if decl.owner != ck.NONE {
+        segment(&mut out, c.names.text(c.decls[decl.owner as usize].name));
+    }
+    segment(&mut out, c.names.text(decl.name));
+    return out;
+}
+
+// ---- functions -------------------------------------------------------------------
+
+/// The IR function for checker function f, with its signature only.
+fn declare_fn(l: &mut Lower, f: u32) -> ir.Function {
+    let info = l.c.fns[f as usize];
+    let name = mangle(&l.c, info.decl, l.a);
+    let rt = ret_ty(&l.c, info.ret);
+    var irf = ir.new_function(name.view(), rt, l.a);
+    if returns_in_memory(&l.c, info.ret) {
+        irf.params.push(ir.Ty.Ptr);
+    }
+    var i = info.params_start;
+    while i < info.params_start + info.params_len : (i += 1) {
+        irf.params.push(param_ty(&l.c, l.c.params[i as usize].type_id));
+    }
+    return irf;
+}
+
+fn lower_fn(l: &mut Lower, f: u32) {
+    let info = l.c.fns[f as usize];
+    let decl = l.c.decls[info.decl as usize];
+    l.f = declare_fn(l, f);
+    l.block = 0;
+    l.fn_index = f;
+    l.ret = info.ret;
+    l.c.module = decl.module;
+    l.c.fn_index = f;
+    l.vars = alloc.List(Var).init(l.a);
+    l.defers = alloc.List(cst.NodeId).init(l.a);
+    l.loops = alloc.List(LoopCtx).init(l.a);
+    l.sret = ck.NONE;
+    var position: u64 = 0;
+    if returns_in_memory(&l.c, info.ret) {
+        var p = ir.inst(ir.Op.Param, ir.Ty.Ptr);
+        p.imm = 0;
+        l.sret = emit(l, p);
+        position = 1;
+    }
+    var i = info.params_start;
+    while i < info.params_start + info.params_len : (i += 1) {
+        let pi = l.c.params[i as usize];
+        let pt = param_ty(&l.c, pi.type_id);
+        var p = ir.inst(ir.Op.Param, pt);
+        p.imm = position;
+        let v = emit(l, p);
+        position += 1;
+        if layout.is_scalar(&l.c, pi.type_id) {
+            let slot = alloca(l, pi.type_id);
+            store(l, value: v, addr: slot);
+            bind(l, pi.name, slot, pi.type_id);
+        } else {
+            bind(l, pi.name, v, pi.type_id);
+        }
+    }
+    let n = decl.node;
+    let body = ck.child(&l.c, n, ck.child_count(&l.c, n) - 1);
+    stmt.block(l, body);
+    if not terminated(l) {
+        let k = l.c.t.kind(info.ret);
+        if k == ty.Kind.Void {
+            _ = emit(l, ir.inst(ir.Op.RetVoid, ir.Ty.Void));
+        } else if l.f.ret == ir.Ty.I16 and k == ty.Kind.ErrorUnion {
+            // E!void falls off its end with success (§10).
+            var r = ir.inst(ir.Op.Ret, ir.Ty.Void);
+            r.a = konst(l, ir.Ty.I16, 0);
+            _ = emit(l, r);
+        } else {
+            _ = emit(l, ir.inst(ir.Op.Unreachable, ir.Ty.Void));
+        }
+    }
+}
+
+/// a0_entry: what the runtime calls; it calls the root module's main.
+fn entry(l: &mut Lower) {
+    let main_sym = l.c.names.intern("main");
+    let d = l.c.items[0].get(main_sym) orelse 0;
+    let f = l.c.decls[d as usize].fn_index;
+    var e = ir.new_function("a0_entry", ir.Ty.I16, l.a);
+    e.internal = false;
+    e.params.push(ir.Ty.Ptr);
+    l.f = e;
+    l.block = 0;
+    var p = ir.inst(ir.Op.Param, ir.Ty.Ptr);
+    p.imm = 0;
+    let sys = emit(l, p);
+    var args = args0(l);
+    args.push(sys);
+    let r = call_with(l, f, false, ir.Ty.I16, &args);
+    var ret = ir.inst(ir.Op.Ret, ir.Ty.Void);
+    ret.a = r;
+    _ = emit(l, ret);
+}
+
+/// The names of the program's errors, by number, for the runtime.
+fn error_names(l: &mut Lower) {
+    var entries = alloc.List(u32).init(l.a);
+    entries.push(l.m.global(""));
+    var i: usize = 0;
+    while i < l.c.error_names.len() : (i += 1) {
+        var name = alloc.String.init(l.a);
+        name.push_str(l.c.names.text(l.c.error_names[i]));
+        entries.push(l.m.global(name.view()));
+    }
+    var table = alloc.String.init(l.a);
+    table.push_str("a0_error_names");
+    l.m.tables.push(ir.StrTable { name: table, entries: entries });
+}
+
+/// Lowers the whole program. Every function is verified as it is made.
+pub fn lower(c: ck.Checker) -> ir.Module {
+    let a = c.a;
+    var l = Lower {
+        c: c,
+        m: ir.Module.init(a),
+        f: ir.new_function("", ir.Ty.Void, a),
+        block: 0,
+        vars: alloc.List(Var).init(a),
+        defers: alloc.List(cst.NodeId).init(a),
+        loops: alloc.List(LoopCtx).init(a),
+        fn_index: 0,
+        sret: ck.NONE,
+        ret: ty.void_type(),
+        a: a,
+    };
+    var f: usize = 0;
+    while f < l.c.fns.len() : (f += 1) {
+        if l.c.fns[f].decl == ck.NONE {
+            break; // test blocks come last; a build leaves them out
+        }
+        lower_fn(&mut l, f as u32);
+        let done = l.f;
+        l.m.functions.push(done);
+        l.f = ir.new_function("", ir.Ty.Void, a);
+    }
+    entry(&mut l);
+    error_names(&mut l);
+    let e = l.f;
+    l.m.functions.push(e);
+    return l.m;
+}

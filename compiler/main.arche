@@ -4,6 +4,7 @@
 ///     arche check [--json] <file>   report the file's errors
 ///     arche tokens <file>           list its tokens, trivia included
 ///     arche cst <file>              print it again from its syntax tree
+///     arche build <file> <out.ll>   compile it to LLVM IR (arche-build links it)
 ///
 /// Functions take the capabilities they use one by one, not the whole
 /// std.System: a path read from sys.args can then be passed beside
@@ -16,14 +17,18 @@ import sema.check as sema;
 import syntax.lexer;
 import syntax.parser;
 import syntax.cst;
+import ir.ir;
+import ir.llvm;
+import lower.lower;
 
 /// What `arche` exits with, besides success (§10: `error: <name>`, status 1).
-type Failure = error { ErrorsFound, BadUsage, CannotRead }
+type Failure = error { ErrorsFound, BadUsage, CannotRead, CannotWrite, BadIr }
 
 fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("usage: arche check [--json] <file>\n");
     err_out.write("       arche tokens <file>\n");
     err_out.write("       arche cst <file>\n");
+    err_out.write("       arche build <file> <out.ll>\n");
     return Failure.BadUsage;
 }
 
@@ -143,6 +148,47 @@ fn check(
     }
 }
 
+fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, out_path: str) -> Failure!void {
+    let source = try read(fs, err_out, path, a);
+    let p = program.load(fs, path, source, a);
+    if p.diags.count() > 0 {
+        program.write_diagnostics(err_out, &p, false);
+        return Failure.ErrorsFound;
+    }
+    let c = sema.analyze(p);
+    if c.p.diags.count() > 0 {
+        program.write_diagnostics(err_out, &c.p, false);
+        return Failure.ErrorsFound;
+    }
+    let m = lower.lower(c);
+    // The verifier checks every function the lowering made.
+    let fns = m.functions.items();
+    var i: usize = 0;
+    while i < fns.len() : (i += 1) {
+        let problem = ir.verify(&fns[i]);
+        if problem.found {
+            err_out.write("arche: internal error: the IR of ");
+            err_out.write(fns[i].name.view());
+            err_out.write(" is wrong at instruction ");
+            err_out.write_u64(problem.inst as u64);
+            err_out.write(": ");
+            err_out.write(ir.describe(problem.what));
+            err_out.write("\n");
+            return Failure.BadIr;
+        }
+    }
+    let text = llvm.emit(&m, a);
+    match fs.write_file(path: out_path, data: text.view()) {
+        ok(_) => { }
+        err(_) => {
+            err_out.write("arche: cannot write ");
+            err_out.write(out_path);
+            err_out.write("\n");
+            return Failure.CannotWrite;
+        }
+    }
+}
+
 fn dump_tokens(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> Failure!void {
     let source = try read(fs, err_out, path, a);
     let text = source.view();
@@ -173,6 +219,8 @@ fn main(sys: &mut std.System) -> !void {
         try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2), json: false);
     } else if command.eq("tokens") and n == 3 {
         try dump_tokens(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2));
+    } else if command.eq("build") and n == 4 {
+        try build(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2), out_path: sys.args.get(3));
     } else if command.eq("cst") and n == 3 {
         try print_cst(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2));
     } else {

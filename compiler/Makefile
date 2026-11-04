@@ -1,9 +1,11 @@
 # The Arche compiler, written in Arche-0 and built by stage0.
 #
 #   make             build build/arche
-#   make check       every conformance test that names an error code; every
-#                    valid program, the compiler's own source included, is
-#                    accepted; CST round trips; golden diagnostics (tests/)
+#   make check       every conformance test, built with the Arche compiler and
+#                    LLVM; every valid program, the compiler's own source
+#                    included, is accepted; CST round trips; golden
+#                    diagnostics (tests/)
+#   make differential  stage0 and the Arche compiler agree on every program
 #   make clean       remove build/
 
 STAGE0 := ../stage0
@@ -21,7 +23,7 @@ $(BUILD):
 
 check: $(BUILD)/arche
 	$(MAKE) -C ../conformance
-	../conformance/runner/build/runner --codes E01,E02,E03,E04,E05,E06,E07 --compiler ./arche-check ../conformance/tests
+	../conformance/runner/build/runner --timeout 30 --compiler ./arche-build ../conformance/tests
 	sh ./check-valid.sh $(BUILD)/arche ../conformance/tests
 	sh ./roundtrip.sh $(BUILD)/arche ../conformance/tests .
 	sh ./tests/run.sh $(BUILD)/arche
@@ -29,4 +31,7 @@ check: $(BUILD)/arche
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all check clean
+differential: $(BUILD)/arche
+	sh ./differential.sh ../conformance/tests
+
+.PHONY: all check differential clean

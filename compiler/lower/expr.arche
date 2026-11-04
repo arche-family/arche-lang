@@ -1,0 +1,1059 @@
+/// Lowering of expressions (spec/arche-0.md §7, §11).
+import alloc;
+import syntax.cst;
+import syntax.token as tk;
+import ir.ir;
+import lower.layout;
+import lower.lower as lw;
+import lower.stmt;
+import sema.check as ck;
+import sema.expr as sx;
+import sema.types as ty;
+
+fn kind(l: &lw.Lower, n: cst.NodeId) -> cst.Kind {
+    return ck.kind_of(&l.c, n);
+}
+
+fn child(l: &lw.Lower, n: cst.NodeId, i: u32) -> cst.NodeId {
+    return ck.child(&l.c, n, i);
+}
+
+fn count(l: &lw.Lower, n: cst.NodeId) -> u32 {
+    return ck.child_count(&l.c, n);
+}
+
+fn type_of(l: &lw.Lower, n: cst.NodeId) -> ty.TypeId {
+    return ck.type_of(&l.c, n);
+}
+
+fn nothing() -> lw.Val {
+    return lw.Val { v: 0, scalar: true, fresh: true };
+}
+
+fn scalar_val(v: u32) -> lw.Val {
+    return lw.Val { v: v, scalar: true, fresh: true };
+}
+
+fn fresh_val(v: u32) -> lw.Val {
+    return lw.Val { v: v, scalar: false, fresh: true };
+}
+
+fn size_of(l: &lw.Lower, t: ty.TypeId) -> u64 {
+    return layout.layout(&l.c, t).size;
+}
+
+fn int_kind(l: &lw.Lower, t: ty.TypeId) -> ty.IntKind {
+    return l.c.t.get(t).int_kind;
+}
+
+// ---- string literals ----------------------------------------------------------------
+
+fn hex(c: u8) -> u32 {
+    match c {
+        '0'..='9' => { return (c - '0') as u32; }
+        'a'..='f' => { return (c - 'a') as u32 + 10; }
+        _ => { return (c - 'A') as u32 + 10; }
+    }
+}
+
+fn push_utf8(out: &mut alloc.List(u8), cp: u32) {
+    if cp < 0x80 {
+        out.push(cp as u8);
+    } else if cp < 0x800 {
+        out.push((0xC0 | (cp >> 6)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else if cp < 0x10000 {
+        out.push((0xE0 | (cp >> 12)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else {
+        out.push((0xF0 | (cp >> 18)) as u8);
+        out.push((0x80 | ((cp >> 12) & 0x3F)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    }
+}
+
+/// The bytes of a string literal, its quotes included, with the escapes
+/// of §2.2 decoded. The lexer has checked it.
+fn decode(raw: []u8, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    var i: usize = 1;
+    while i + 1 < raw.len() {
+        let c = raw[i];
+        if c != '\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let e = raw[i + 1];
+        i += 2;
+        match e {
+            'n' => { out.push(10); }
+            'r' => { out.push(13); }
+            't' => { out.push(9); }
+            '0' => { out.push(0); }
+            'x' => {
+                out.push((hex(raw[i]) * 16 + hex(raw[i + 1])) as u8);
+                i += 2;
+            }
+            'u' => {
+                i += 1; // {
+                var cp: u32 = 0;
+                while raw[i] != '}' : (i += 1) {
+                    cp = cp * 16 + hex(raw[i]);
+                }
+                i += 1;
+                push_utf8(&mut out, cp);
+            }
+            _ => { out.push(e); }
+        }
+    }
+    return out;
+}
+
+/// The str value of the string literal node n of module m.
+fn string_literal(l: &mut lw.Lower, module: u32, n: cst.NodeId) -> lw.Val {
+    let mod = &l.c.p.modules[module as usize];
+    let t = mod.tree.first_token(n);
+    let bytes = decode(mod.token_text(t).bytes(), l.a);
+    let g = l.m.global_bytes(bytes.items());
+    var gi = ir.inst(ir.Op.Global, ir.Ty.Ptr);
+    gi.imm = g as u64;
+    let p = lw.emit(l, gi);
+    let tmp = lw.alloca(l, ty.str_type());
+    lw.store(l, value: p, addr: tmp);
+    let len = lw.konst(l, ir.Ty.I64, bytes.len() as u64);
+    lw.store(l, value: len, addr: lw.gep(l, tmp, 8));
+    return fresh_val(tmp);
+}
+
+fn const_value(l: &mut lw.Lower, d: u32) -> lw.Val {
+    let decl = l.c.decls[d as usize];
+    let t = decl.type_id;
+    if l.c.t.kind(t) == ty.Kind.Str {
+        return string_literal(l, decl.value_module, decl.value_node);
+    }
+    let s = layout.scalar(&l.c, t);
+    return scalar_val(lw.konst(l, s, decl.value));
+}
+
+// ---- values -----------------------------------------------------------------------
+
+/// The value of an expression.
+pub fn value(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
+    let t = type_of(l, e);
+    match kind(l, e) {
+        .IntLit | .CharLit => {
+            let v = ck.tok_value(&l.c, ck.tree(&l.c).first_token(e));
+            return scalar_val(lw.konst(l, layout.scalar(&l.c, t), v));
+        }
+        .BoolLit => {
+            let is_true = ck.tok_kind(&l.c, ck.tree(&l.c).first_token(e)) == tk.Kind.KwTrue;
+            var v: u64 = 0;
+            if is_true {
+                v = 1;
+            }
+            return scalar_val(lw.konst(l, ir.Ty.I1, v));
+        }
+        .StringLit => {
+            let m = l.c.module;
+            return string_literal(l, m, e);
+        }
+        .NoneLit => { return fresh_val(lw.alloca(l, t)); }
+        .SomeExpr => {
+            let v = value(l, child(l, e, 0));
+            return wrap_some(l, t, v);
+        }
+        .ParenExpr => { return value(l, child(l, e, 0)); }
+        .NameExpr => {
+            let d = ck.ref_of(&l.c, e);
+            if d != ck.NONE {
+                return const_value(l, d);
+            }
+            let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, e));
+            let var_ = lw.find_var(l, sym) orelse lw.Var { name: sym, addr: 0, type_id: t };
+            return lw.load_val(l, var_.type_id, var_.addr);
+        }
+        .FieldExpr => {
+            let r = ck.ref_of(&l.c, e);
+            if r == ck.VALUE_FIELD {
+                let addr = place(l, e);
+                return lw.load_val(l, t, addr);
+            }
+            if r != ck.NONE {
+                return const_value(l, r);
+            }
+            let sym = ck.symbol(&mut l.c, sx.member_token(&l.c, e));
+            if l.c.t.kind(t) == ty.Kind.ErrorSet {
+                let id = l.c.error_ids.get(sym) orelse 0;
+                return scalar_val(lw.konst(l, ir.Ty.I16, id as u64));
+            }
+            // A variant without fields.
+            let v = sx.find_variant(&l.c, t, sym) orelse 0;
+            let first = l.c.decls[l.c.t.get(t).decl as usize].members_start;
+            let tmp = lw.alloca(l, t);
+            lw.store(l, value: lw.konst(l, ir.Ty.I32, (v - first) as u64), addr: tmp);
+            return fresh_val(tmp);
+        }
+        .IndexExpr => {
+            if l.c.t.kind(type_of(l, child(l, e, 0))) == ty.Kind.Str {
+                let s = value(l, child(l, e, 0));
+                let i = value(l, child(l, e, 1)).v;
+                let data = lw.load(l, ir.Ty.Ptr, s.v);
+                let len = lw.load(l, ir.Ty.I64, lw.gep(l, s.v, 8));
+                lw.check(l, lw.cmp(l, ir.CmpKind.ULt, x: i, y: len), "index out of range", e);
+                return scalar_val(lw.load(l, ir.Ty.I8, lw.gep_index(l, addr: data, index: i, 1)));
+            }
+            let addr = place(l, e);
+            return lw.load_val(l, t, addr);
+        }
+        .SliceExpr => { return slice(l, e); }
+        .DerefExpr => {
+            let p = value(l, child(l, e, 0)).v;
+            return lw.load_val(l, t, p);
+        }
+        .RefExpr => { return scalar_val(address(l, child(l, e, 0))); }
+        .CallExpr => { return call(l, e); }
+        .StructLit => { return struct_lit(l, e); }
+        .ArrayLit => {
+            let tmp = lw.alloca(l, t);
+            let et = l.c.t.elem(t);
+            let size = size_of(l, et);
+            let n = count(l, e);
+            var i: u32 = 0;
+            while i < n : (i += 1) {
+                let v = value(l, child(l, e, i));
+                lw.store_val(l, et, v, lw.gep(l, tmp, size * i as u64));
+            }
+            return fresh_val(tmp);
+        }
+        .UnaryExpr => { return unary(l, e); }
+        .BinaryExpr => { return binary(l, e); }
+        .CastExpr => { return cast(l, e); }
+        .TryExpr => { return try_expr(l, e); }
+        .CatchExpr | .OrelseExpr => { return fallback(l, e); }
+        _ => { return nothing(); }
+    }
+}
+
+// ---- places (§7.6) ------------------------------------------------------------------
+
+fn is_place(l: &lw.Lower, e: cst.NodeId) -> bool {
+    match kind(l, e) {
+        .NameExpr => { return ck.ref_of(&l.c, e) == ck.NONE; }
+        .ParenExpr => { return is_place(l, child(l, e, 0)); }
+        .FieldExpr => { return ck.ref_of(&l.c, e) == ck.VALUE_FIELD; }
+        .IndexExpr => { return l.c.t.kind(type_of(l, child(l, e, 0))) != ty.Kind.Str; }
+        .DerefExpr => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// The address of the memory holding e's value: a place's own, or a
+/// temporary for any other expression.
+pub fn address(l: &mut lw.Lower, e: cst.NodeId) -> u32 {
+    if is_place(l, e) {
+        return place(l, e);
+    }
+    let t = type_of(l, e);
+    let v = value(l, e);
+    if v.scalar {
+        let tmp = lw.alloca(l, t);
+        lw.store(l, value: v.v, addr: tmp);
+        return tmp;
+    }
+    return v.v;
+}
+
+/// The offset of a field of a struct, or of std.System.
+fn field_offset(l: &mut lw.Lower, t: ty.TypeId, name: alloc.Symbol) -> u64 {
+    let info = l.c.t.get(t);
+    if info.kind == ty.Kind.Builtin {
+        return layout.system_field(l.c.names.text(name));
+    }
+    let d = l.c.decls[info.decl as usize];
+    var f = d.members_start;
+    while f < d.members_start + d.members_len and l.c.fields[f as usize].name != name : (f += 1) {
+    }
+    return layout.field_offset(&l.c, start: d.members_start, i: f);
+}
+
+pub fn place(l: &mut lw.Lower, e: cst.NodeId) -> u32 {
+    match kind(l, e) {
+        .NameExpr => {
+            let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, e));
+            let var_ = lw.find_var(l, sym) orelse lw.Var { name: sym, addr: 0, type_id: ty.invalid() };
+            return var_.addr;
+        }
+        .ParenExpr => { return place(l, child(l, e, 0)); }
+        .FieldExpr => {
+            let base = child(l, e, 0);
+            let bt = type_of(l, base);
+            var t = bt;
+            var base_addr: u32 = 0;
+            if l.c.t.kind(bt) == ty.Kind.Ref {
+                base_addr = value(l, base).v;
+                t = l.c.t.elem(bt);
+            } else {
+                base_addr = address(l, base);
+            }
+            let sym = ck.symbol(&mut l.c, sx.member_token(&l.c, e));
+            let off = field_offset(l, t, sym);
+            return lw.gep(l, base_addr, off);
+        }
+        .IndexExpr => { return element(l, e); }
+        .DerefExpr => { return value(l, child(l, e, 0)).v; }
+        _ => { return address(l, e); }
+    }
+}
+
+/// The data and length of an array, slice, str or list value at addr.
+type Run = struct {
+    data: u32,
+    len: u32,
+}
+
+fn run_of(l: &mut lw.Lower, t: ty.TypeId, addr: u32) -> Run {
+    let info = l.c.t.get(t);
+    if info.kind == ty.Kind.Array {
+        return Run { data: addr, len: lw.konst(l, ir.Ty.I64, info.len) };
+    }
+    let data = lw.load(l, ir.Ty.Ptr, addr);
+    let len = lw.load(l, ir.Ty.I64, lw.gep(l, addr, 8));
+    return Run { data: data, len: len };
+}
+
+fn element(l: &mut lw.Lower, e: cst.NodeId) -> u32 {
+    let base = child(l, e, 0);
+    let bt = type_of(l, base);
+    let addr = address(l, base);
+    let i = value(l, child(l, e, 1)).v;
+    let r = run_of(l, bt, addr);
+    lw.check(l, lw.cmp(l, ir.CmpKind.ULt, x: i, y: r.len), "index out of range", e);
+    let size = size_of(l, l.c.t.elem(bt));
+    return lw.gep_index(l, addr: r.data, index: i, size);
+}
+
+fn slice(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
+    let base = child(l, e, 0);
+    let bt = type_of(l, base);
+    let addr = address(l, base);
+    let a = value(l, child(l, e, 1)).v;
+    let b = value(l, child(l, e, 2)).v;
+    let r = run_of(l, bt, addr);
+    let fine = lw.bin(l, ir.BinKind.And, x: lw.cmp(l, ir.CmpKind.ULe, x: a, y: b), y: lw.cmp(l, ir.CmpKind.ULe, x: b, y: r.len));
+    lw.check(l, fine, "slice out of range", e);
+    var size: u64 = 1;
+    if l.c.t.kind(bt) == ty.Kind.Str {
+        var args = lw.args0(l);
+        args.push(r.data);
+        args.push(r.len);
+        args.push(a);
+        let at_a = lw.call_runtime(l, "a0rt_str_boundary", ir.Ty.I8, &args);
+        var args2 = lw.args0(l);
+        args2.push(r.data);
+        args2.push(r.len);
+        args2.push(b);
+        let at_b = lw.call_runtime(l, "a0rt_str_boundary", ir.Ty.I8, &args2);
+        let both = lw.bin(l, ir.BinKind.And, x: at_a, y: at_b);
+        lw.check(l, lw.cmp(l, ir.CmpKind.Ne, x: both, y: lw.konst(l, ir.Ty.I8, 0)), "slice is not on a character boundary", e);
+    } else {
+        size = size_of(l, l.c.t.elem(bt));
+    }
+    let tmp = lw.alloca(l, type_of(l, e));
+    lw.store(l, value: lw.gep_index(l, addr: r.data, index: a, size), addr: tmp);
+    lw.store(l, value: lw.bin(l, ir.BinKind.Sub, x: b, y: a), addr: lw.gep(l, tmp, 8));
+    return fresh_val(tmp);
+}
+
+fn struct_lit(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
+    let t = type_of(l, e);
+    let tmp = lw.alloca(l, t);
+    let info = l.c.t.get(t);
+    var start: u32 = 0;
+    var base = tmp;
+    if info.kind == ty.Kind.Enum {
+        let path = child(l, e, 0);
+        let sym = ck.symbol(&mut l.c, sx.member_token(&l.c, path));
+        let v = sx.find_variant(&l.c, t, sym) orelse 0;
+        let first = l.c.decls[info.decl as usize].members_start;
+        lw.store(l, value: lw.konst(l, ir.Ty.I32, (v - first) as u64), addr: tmp);
+        start = l.c.variants[v as usize].fields_start;
+        base = lw.gep(l, tmp, layout.payload_offset(&l.c, t));
+    } else {
+        start = l.c.decls[info.decl as usize].members_start;
+    }
+    let n = count(l, e) - 1;
+    var i: u32 = 0;
+    while i < n : (i += 1) {
+        let field_init = child(l, e, i + 1);
+        let ft = l.c.fields[(start + i) as usize].type_id;
+        let v = value(l, child(l, field_init, 0));
+        lw.store_val(l, ft, v, lw.gep(l, base, layout.field_offset(&l.c, start: start, i: start + i)));
+    }
+    return fresh_val(tmp);
+}
+
+// ---- optionals and error unions -----------------------------------------------------
+
+pub fn wrap_some(l: &mut lw.Lower, t: ty.TypeId, v: lw.Val) -> lw.Val {
+    let tmp = lw.alloca(l, t);
+    lw.store(l, value: lw.konst(l, ir.Ty.I8, 1), addr: tmp);
+    lw.store_val(l, l.c.t.elem(t), v, lw.gep(l, tmp, layout.value_offset(&l.c, t)));
+    return fresh_val(tmp);
+}
+
+pub fn wrap_ok(l: &mut lw.Lower, t: ty.TypeId, v: lw.Val) -> lw.Val {
+    if layout.is_scalar(&l.c, t) {
+        return scalar_val(lw.konst(l, ir.Ty.I16, 0));
+    }
+    let tmp = lw.alloca(l, t);
+    lw.store_val(l, l.c.t.elem(t), v, lw.gep(l, tmp, layout.value_offset(&l.c, t)));
+    return fresh_val(tmp);
+}
+
+pub fn wrap_error(l: &mut lw.Lower, t: ty.TypeId, code: u32) -> lw.Val {
+    if layout.is_scalar(&l.c, t) {
+        return scalar_val(code);
+    }
+    let tmp = lw.alloca(l, t);
+    lw.store(l, value: code, addr: tmp);
+    return fresh_val(tmp);
+}
+
+/// The error code of an error union value.
+fn error_code(l: &mut lw.Lower, t: ty.TypeId, v: lw.Val) -> u32 {
+    if layout.is_scalar(&l.c, t) {
+        return v.v;
+    }
+    return lw.load(l, ir.Ty.I16, v.v);
+}
+
+fn try_expr(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
+    let operand = child(l, e, 0);
+    let ut = type_of(l, operand);
+    let v = lw.own_val(l, ut, value(l, operand));
+    let code = error_code(l, ut, v);
+    let failed = lw.cmp(l, ir.CmpKind.Ne, x: code, y: lw.konst(l, ir.Ty.I16, 0));
+    let fail = lw.new_block(l);
+    let fine = lw.new_block(l);
+    lw.cond_br(l, cond: failed, yes: fail, no: fine);
+    lw.switch_to(l, fail);
+    // The error leaves the function, after its deferred code (§8).
+    let rt = l.ret;
+    let result = wrap_error(l, rt, code);
+    stmt.run_defers(l, 0);
+    stmt.emit_return(l, true, result);
+    lw.switch_to(l, fine);
+    let et = l.c.t.elem(ut);
+    if layout.is_nothing(&l.c, et) {
+        return nothing();
+    }
+    return lw.load_val(l, et, lw.gep(l, v.v, layout.value_offset(&l.c, ut)));
+}
+
+/// x orelse y, x catch y: y only when x has no value.
+fn fallback(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
+    let lhs = child(l, e, 0);
+    let rhs = child(l, e, 1);
+    let xt = type_of(l, lhs);
+    let et = l.c.t.elem(xt);
+    let x = lw.own_val(l, xt, value(l, lhs));
+    var has: u32 = 0;
+    if kind(l, e) == cst.Kind.OrelseExpr {
+        has = lw.cmp(l, ir.CmpKind.Ne, x: lw.load(l, ir.Ty.I8, x.v), y: lw.konst(l, ir.Ty.I8, 0));
+    } else {
+        has = lw.cmp(l, ir.CmpKind.Eq, x: error_code(l, xt, x), y: lw.konst(l, ir.Ty.I16, 0));
+    }
+    let nothing_left = layout.is_nothing(&l.c, et);
+    var result: u32 = 0;
+    if not nothing_left {
+        result = lw.alloca(l, et);
+    }
+    let yes = lw.new_block(l);
+    let no = lw.new_block(l);
+    let done = lw.new_block(l);
+    lw.cond_br(l, cond: has, yes: yes, no: no);
+    lw.switch_to(l, yes);
+    if not nothing_left {
+        let inner = lw.load_val(l, et, lw.gep(l, x.v, layout.value_offset(&l.c, xt)));
+        lw.store_val(l, et, inner, result);
+    }
+    lw.br(l, done);
+    lw.switch_to(l, no);
+    let y = value(l, rhs);
+    if not nothing_left and not lw.terminated(l) and l.c.t.kind(type_of(l, rhs)) != ty.Kind.Noreturn {
+        lw.store_val(l, et, y, result);
+    }
+    lw.br(l, done);
+    lw.switch_to(l, done);
+    if nothing_left {
+        return nothing();
+    }
+    let r = lw.load_val(l, et, result);
+    return lw.Val { v: r.v, scalar: r.scalar, fresh: true };
+}
+
+// ---- operators (§7.2) ----------------------------------------------------------------
+
+fn signed(l: &lw.Lower, t: ty.TypeId) -> bool {
+    return l.c.t.kind(t) == ty.Kind.Int and ty.is_signed(int_kind(l, t));
+}
+
+fn all_ones(l: &mut lw.Lower, s: ir.Ty) -> u32 {
+    return lw.konst(l, s, 18446744073709551615);
+}
+
+/// a op b on integers of type t, with the traps of §7.2.
+pub fn int_op(l: &mut lw.Lower, op: tk.Kind, t: ty.TypeId, a: u32, b: u32, n: cst.NodeId) -> u32 {
+    let sg = signed(l, t);
+    let s = layout.scalar(&l.c, t);
+    match op {
+        .Plus | .Minus | .Star => {
+            var k = ir.OverflowKind.UAdd;
+            if op == tk.Kind.Plus and sg {
+                k = ir.OverflowKind.SAdd;
+            } else if op == tk.Kind.Minus {
+                k = ir.OverflowKind.USub;
+                if sg {
+                    k = ir.OverflowKind.SSub;
+                }
+            } else if op == tk.Kind.Star {
+                k = ir.OverflowKind.UMul;
+                if sg {
+                    k = ir.OverflowKind.SMul;
+                }
+            }
+            let r = lw.overflow(l, k, x: a, y: b);
+            let over = lw.overflow_bit(l, r);
+            lw.check(l, lw.bin(l, ir.BinKind.Xor, x: over, y: lw.konst(l, ir.Ty.I1, 1)), "integer overflow", n);
+            return r;
+        }
+        .Slash | .Percent => {
+            lw.check(l, lw.cmp(l, ir.CmpKind.Ne, x: b, y: lw.konst(l, s, 0)), "division by zero", n);
+            if not sg {
+                if op == tk.Kind.Slash {
+                    return lw.bin(l, ir.BinKind.UDiv, x: a, y: b);
+                }
+                return lw.bin(l, ir.BinKind.URem, x: a, y: b);
+            }
+            let minus_one = lw.cmp(l, ir.CmpKind.Eq, x: b, y: all_ones(l, s));
+            if op == tk.Kind.Slash {
+                let min = lw.konst(l, s, 1 << (ty.bits(int_kind(l, t)) - 1) as u64);
+                let bad = lw.bin(l, ir.BinKind.And, x: minus_one, y: lw.cmp(l, ir.CmpKind.Eq, x: a, y: min));
+                lw.check(l, lw.bin(l, ir.BinKind.Xor, x: bad, y: lw.konst(l, ir.Ty.I1, 1)), "integer overflow", n);
+                return lw.bin(l, ir.BinKind.SDiv, x: a, y: b);
+            }
+            // x % -1 is 0, and LLVM leaves MIN % -1 undefined: divide by 1 instead.
+            let two = lw.bin(l, ir.BinKind.Shl, x: lw.lconvert(l, minus_one, s), y: lw.konst(l, s, 1));
+            return lw.bin(l, ir.BinKind.SRem, x: a, y: lw.bin(l, ir.BinKind.Add, x: b, y: two));
+        }
+        .PlusWrap => { return lw.bin(l, ir.BinKind.Add, x: a, y: b); }
+        .MinusWrap => { return lw.bin(l, ir.BinKind.Sub, x: a, y: b); }
+        .StarWrap => { return lw.bin(l, ir.BinKind.Mul, x: a, y: b); }
+        .Amp => { return lw.bin(l, ir.BinKind.And, x: a, y: b); }
+        .Pipe => { return lw.bin(l, ir.BinKind.Or, x: a, y: b); }
+        .Caret => { return lw.bin(l, ir.BinKind.Xor, x: a, y: b); }
+        .Shl | .Shr => {
+            let wide = lw.convert(l, b, ir.Ty.I64, false);
+            let width = lw.konst(l, ir.Ty.I64, ty.bits(int_kind(l, t)) as u64);
+            lw.check(l, lw.cmp(l, ir.CmpKind.ULt, x: wide, y: width), "shift amount too large", n);
+            let amount = lw.convert(l, b, s, false);
+            if op == tk.Kind.Shl {
+                return lw.bin(l, ir.BinKind.Shl, x: a, y: amount);
+            }
+            if sg {
+                return lw.bin(l, ir.BinKind.AShr, x: a, y: amount);
+            }
+            return lw.bin(l, ir.BinKind.LShr, x: a, y: amount);
+        }
+        _ => { return a; }
+    }
+}
+
+fn unary(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
+    let toks = ck.own(&l.c, e);
+    let op = ck.tok_kind(&l.c, toks[0]);
+    let operand = child(l, e, 0);
+    let t = type_of(l, e);
+    if op == tk.Kind.Minus and kind(l, operand) == cst.Kind.IntLit {
+        let v = ck.tok_value(&l.c, ck.tree(&l.c).first_token(operand));
+        return scalar_val(lw.konst(l, layout.scalar(&l.c, t), ~v +% 1));
+    }
+    let x = value(l, operand).v;
+    if op == tk.Kind.KwNot {
+        return scalar_val(lw.bin(l, ir.BinKind.Xor, x: x, y: lw.konst(l, ir.Ty.I1, 1)));
+    }
+    let s = layout.scalar(&l.c, t);
+    if op == tk.Kind.Tilde {
+        return scalar_val(lw.bin(l, ir.BinKind.Xor, x: x, y: all_ones(l, s)));
+    }
+    let r = lw.overflow(l, ir.OverflowKind.SSub, x: lw.konst(l, s, 0), y: x);
+    let over = lw.overflow_bit(l, r);
+    lw.check(l, lw.bin(l, ir.BinKind.Xor, x: over, y: lw.konst(l, ir.Ty.I1, 1)), "integer overflow", e);
+    return scalar_val(r);
+}
+
+/// a == b for values of type t at addresses (§5.5): field by field.
+fn equal_at(l: &mut lw.Lower, t: ty.TypeId, a: u32, b: u32) -> u32 {
+    let info = l.c.t.get(t);
+    if info.kind == ty.Kind.Enum {
+        return lw.cmp(l, ir.CmpKind.Eq, x: lw.load(l, ir.Ty.I32, a), y: lw.load(l, ir.Ty.I32, b));
+    }
+    if info.kind == ty.Kind.Struct {
+        let d = l.c.decls[info.decl as usize];
+        var r = lw.konst(l, ir.Ty.I1, 1);
+        var f = d.members_start;
+        while f < d.members_start + d.members_len : (f += 1) {
+            let off = layout.field_offset(&l.c, start: d.members_start, i: f);
+            let ft = l.c.fields[f as usize].type_id;
+            let fe = equal_at(l, ft, a: lw.gep(l, a, off), b: lw.gep(l, b, off));
+            r = lw.bin(l, ir.BinKind.And, x: r, y: fe);
+        }
+        return r;
+    }
+    let s = layout.scalar(&l.c, t);
+    return lw.cmp(l, ir.CmpKind.Eq, x: lw.load(l, s, a), y: lw.load(l, s, b));
+}
+
+fn equal(l: &mut lw.Lower, t: ty.TypeId, a: lw.Val, b: lw.Val) -> u32 {
+    if a.scalar {
+        return lw.cmp(l, ir.CmpKind.Eq, x: a.v, y: b.v);
+    }
+    return equal_at(l, t, a: a.v, b: b.v);
+}
+
+fn binary(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
+    let toks = ck.own(&l.c, e);
+    let op = ck.tok_kind(&l.c, toks[0]);
+    let lhs = child(l, e, 0);
+    let rhs = child(l, e, 1);
+    if op == tk.Kind.KwAnd or op == tk.Kind.KwOr {
+        let result = lw.alloca(l, ty.bool_type());
+        let x = value(l, lhs).v;
+        lw.store(l, value: x, addr: result);
+        let more = lw.new_block(l);
+        let done = lw.new_block(l);
+        if op == tk.Kind.KwAnd {
+            lw.cond_br(l, cond: x, yes: more, no: done);
+        } else {
+            lw.cond_br(l, cond: x, yes: done, no: more);
+        }
+        lw.switch_to(l, more);
+        let y = value(l, rhs).v;
+        lw.store(l, value: y, addr: result);
+        lw.br(l, done);
+        lw.switch_to(l, done);
+        return scalar_val(lw.load(l, ir.Ty.I1, result));
+    }
+    let t = type_of(l, lhs);
+    let a = lw.own_val(l, t, value(l, lhs));
+    let b = value(l, rhs);
+    match op {
+        .EqEq => { return scalar_val(equal(l, t, a: a, b: b)); }
+        .NotEq => {
+            let eq = equal(l, t, a: a, b: b);
+            return scalar_val(lw.bin(l, ir.BinKind.Xor, x: eq, y: lw.konst(l, ir.Ty.I1, 1)));
+        }
+        .Lt | .Le | .Gt | .Ge => {
+            let sg = signed(l, t);
+            var k = ir.CmpKind.ULt;
+            if op == tk.Kind.Lt and sg { k = ir.CmpKind.SLt; }
+            if op == tk.Kind.Le { k = ir.CmpKind.ULe; if sg { k = ir.CmpKind.SLe; } }
+            if op == tk.Kind.Gt { k = ir.CmpKind.UGt; if sg { k = ir.CmpKind.SGt; } }
+            if op == tk.Kind.Ge { k = ir.CmpKind.UGe; if sg { k = ir.CmpKind.SGe; } }
+            return scalar_val(lw.cmp(l, k, x: a.v, y: b.v));
+        }
+        _ => { return scalar_val(int_op(l, op, type_of(l, e), a: a.v, b: b.v, e)); }
+    }
+}
+
+/// `as` checks that the value fits; `as%` keeps the low bits (§5.6).
+fn cast(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
+    let operand = child(l, e, 0);
+    let from = type_of(l, operand);
+    let to = type_of(l, e);
+    let x = value(l, operand).v;
+    let fs = signed(l, from);
+    let ts = signed(l, to);
+    let fb = ty.bits(int_kind(l, from));
+    let tb = ty.bits(int_kind(l, to));
+    let s = layout.scalar(&l.c, to);
+    let wrapping = ck.tok_kind(&l.c, ck.own(&l.c, e)[0]) == tk.Kind.KwAsWrap;
+    if not wrapping {
+        let fsx = layout.scalar(&l.c, from);
+        var fine = lw.konst(l, ir.Ty.I1, 1);
+        if fs and not ts {
+            fine = lw.cmp(l, ir.CmpKind.SGe, x: x, y: lw.konst(l, fsx, 0));
+        }
+        // Too large: only when the target holds less of the positive range.
+        let to_max = ty.max_value(int_kind(l, to));
+        let from_max = ty.max_value(int_kind(l, from));
+        if to_max < from_max {
+            var k = ir.CmpKind.ULe;
+            if fs {
+                k = ir.CmpKind.SLe;
+            }
+            fine = lw.bin(l, ir.BinKind.And, x: fine, y: lw.cmp(l, k, x: x, y: lw.konst(l, fsx, to_max)));
+        }
+        if fs and ts and tb < fb {
+            let min = ~(ty.min_magnitude(int_kind(l, to))) +% 1;
+            fine = lw.bin(l, ir.BinKind.And, x: fine, y: lw.cmp(l, ir.CmpKind.SGe, x: x, y: lw.konst(l, fsx, min)));
+        }
+        var msg = alloc.String.init(l.a);
+        msg.push_str("value does not fit in ");
+        msg.push_str(ty.int_name(int_kind(l, to)));
+        lw.check(l, fine, msg.view(), e);
+    }
+    return scalar_val(lw.convert(l, x, s, fs));
+}
+
+// ---- calls ---------------------------------------------------------------------------
+
+fn arg_node(l: &lw.Lower, call_node: cst.NodeId, i: u32) -> cst.NodeId {
+    return child(l, child(l, call_node, i + 1), 0);
+}
+
+/// The receiver's address for a method taking self by reference.
+fn receiver_addr(l: &mut lw.Lower, receiver: cst.NodeId) -> u32 {
+    if l.c.t.kind(type_of(l, receiver)) == ty.Kind.Ref {
+        return value(l, receiver).v;
+    }
+    return address(l, receiver);
+}
+
+fn result_of(l: &mut lw.Lower, t: ty.TypeId, r: u32, sret: u32) -> lw.Val {
+    if l.c.t.kind(t) == ty.Kind.Noreturn {
+        _ = lw.emit(l, ir.inst(ir.Op.Unreachable, ir.Ty.Void));
+        lw.after_terminator(l);
+        return nothing();
+    }
+    if sret != ck.NONE {
+        return fresh_val(sret);
+    }
+    if layout.is_nothing(&l.c, t) {
+        return nothing();
+    }
+    return scalar_val(r);
+}
+
+fn call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
+    let callee = child(l, n, 0);
+    let t = type_of(l, n);
+    let nargs = count(l, n) - 1;
+    let is_method = kind(l, callee) == cst.Kind.FieldExpr and not ck.is_invalid(&l.c, type_of(l, callee));
+    let d = ck.ref_of(&l.c, n);
+    if d != ck.NONE and l.c.decls[d as usize].kind == ck.DeclKind.Fn {
+        let fi = l.c.decls[d as usize].fn_index;
+        let info = l.c.fns[fi as usize];
+        var args = lw.args0(l);
+        var sret = ck.NONE;
+        if lw.returns_in_memory(&l.c, info.ret) {
+            sret = lw.alloca(l, info.ret);
+            args.push(sret);
+        }
+        var skip: u32 = 0;
+        if is_method {
+            skip = 1;
+            let receiver = child(l, callee, 0);
+            if info.self_mode == ck.SelfMode.Value {
+                let st = l.c.params[info.params_start as usize].type_id;
+                var v = value(l, receiver);
+                if l.c.t.kind(type_of(l, receiver)) == ty.Kind.Ref {
+                    v = lw.load_val(l, st, v.v);
+                }
+                args.push(lw.as_arg(l, st, v));
+            } else {
+                args.push(receiver_addr(l, receiver));
+            }
+        }
+        var i: u32 = 0;
+        while i < nargs : (i += 1) {
+            let pt = l.c.params[(info.params_start + skip + i) as usize].type_id;
+            let v = value(l, arg_node(l, n, i));
+            args.push(lw.as_arg(l, pt, v));
+        }
+        let r = lw.call_with(l, fi, false, lw.ret_ty(&l.c, info.ret), &args);
+        return result_of(l, t, r: r, sret: sret);
+    }
+    if is_method {
+        return builtin_method(l, n: n, callee: callee);
+    }
+    if kind(l, callee) == cst.Kind.FieldExpr {
+        return init(l, n, t);
+    }
+    return builtin_fn(l, n);
+}
+
+/// T.init(a) of alloc.List, alloc.Map, alloc.String and alloc.Interner:
+/// zeroed memory and the allocator in its slot (docs/abi.md).
+fn init(l: &mut lw.Lower, n: cst.NodeId, t: ty.TypeId) -> lw.Val {
+    let a = value(l, arg_node(l, n, 0)).v;
+    let tmp = lw.alloca(l, t);
+    let info = l.c.t.get(t);
+    var at: u64 = 24;
+    if info.kind == ty.Kind.Map {
+        at = 48;
+    } else if info.kind == ty.Kind.Builtin and info.builtin == ty.Builtin.Interner {
+        at = 40;
+    }
+    lw.store(l, value: a, addr: lw.gep(l, tmp, at));
+    return fresh_val(tmp);
+}
+
+fn builtin_fn(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
+    let callee = child(l, n, 0);
+    let name = ck.text(&l.c, ck.ident_of(&l.c, callee));
+    if name.eq("panic") {
+        let m = value(l, arg_node(l, n, 0)).v;
+        let p = lw.load(l, ir.Ty.Ptr, m);
+        let len = lw.load(l, ir.Ty.I64, lw.gep(l, m, 8));
+        lw.trap_with(l, message_ptr: p, message_len: len, n);
+    } else if name.eq("assert") {
+        let c = value(l, arg_node(l, n, 0)).v;
+        lw.check(l, c, "assertion failed", n);
+    } else {
+        lw.trap(l, "reached unreachable code", n);
+    }
+    return nothing();
+}
+
+/// The data and length of a str argument, as two scalars.
+fn str_parts(l: &mut lw.Lower, s: lw.Val, args: &mut alloc.List(u32)) {
+    args.push(lw.load(l, ir.Ty.Ptr, s.v));
+    args.push(lw.load(l, ir.Ty.I64, lw.gep(l, s.v, 8)));
+}
+
+/// A value's address in memory: a scalar is stored in a temporary first.
+fn in_memory(l: &mut lw.Lower, t: ty.TypeId, v: lw.Val) -> u32 {
+    if v.scalar {
+        let tmp = lw.alloca(l, t);
+        lw.store(l, value: v.v, addr: tmp);
+        return tmp;
+    }
+    return lw.own_val(l, t, v).v;
+}
+
+/// A {data, len} view of the list or String at addr.
+fn view_of_run(l: &mut lw.Lower, t: ty.TypeId, addr: u32) -> lw.Val {
+    let tmp = lw.alloca(l, t);
+    lw.memcpy(l, dst: tmp, src: addr, 16);
+    return fresh_val(tmp);
+}
+
+fn builtin_method(l: &mut lw.Lower, n: cst.NodeId, callee: cst.NodeId) -> lw.Val {
+    let receiver = child(l, callee, 0);
+    var rt = type_of(l, receiver);
+    if l.c.t.kind(rt) == ty.Kind.Ref {
+        rt = l.c.t.elem(rt);
+    }
+    let result_t = type_of(l, n);
+    var name = alloc.String.init(l.a);
+    name.push_str(ck.text(&l.c, sx.member_token(&l.c, callee)));
+    let nm = name.view();
+    let info = l.c.t.get(rt);
+    let r = receiver_addr(l, receiver);
+    match info.kind {
+        .Str => {
+            if nm.eq("len") {
+                return scalar_val(lw.load(l, ir.Ty.I64, lw.gep(l, r, 8)));
+            }
+            if nm.eq("bytes") {
+                return view_of_run(l, result_t, r);
+            }
+            var args = lw.args0(l);
+            str_parts(l, lw.Val { v: r, scalar: false, fresh: false }, &mut args);
+            let other = value(l, arg_node(l, n, 0));
+            str_parts(l, other, &mut args);
+            var rtname = "a0rt_str_eq";
+            if nm.eq("starts_with") {
+                rtname = "a0rt_str_starts_with";
+            }
+            let b = lw.call_runtime(l, rtname, ir.Ty.I8, &args);
+            return scalar_val(lw.cmp(l, ir.CmpKind.Ne, x: b, y: lw.konst(l, ir.Ty.I8, 0)));
+        }
+        .Array => { return scalar_val(lw.konst(l, ir.Ty.I64, info.len)); }
+        .Slice => { return scalar_val(lw.load(l, ir.Ty.I64, lw.gep(l, r, 8))); }
+        .List => { return list_method(l, n, nm, rt, r); }
+        .Map => { return map_method(l, n, nm, rt, r); }
+        .Builtin => { return library_method(l, n, nm, info.builtin, r); }
+        _ => { return nothing(); }
+    }
+}
+
+fn list_method(l: &mut lw.Lower, n: cst.NodeId, nm: str, t: ty.TypeId, r: u32) -> lw.Val {
+    let et = l.c.t.elem(t);
+    let size = size_of(l, et);
+    let len_addr = lw.gep(l, r, 8);
+    if nm.eq("push") {
+        let item = lw.own_val(l, et, value(l, arg_node(l, n, 0)));
+        var args = lw.args0(l);
+        args.push(r);
+        args.push(lw.konst(l, ir.Ty.I64, size));
+        _ = lw.call_runtime(l, "a0rt_list_reserve", ir.Ty.Void, &args);
+        let data = lw.load(l, ir.Ty.Ptr, r);
+        let len = lw.load(l, ir.Ty.I64, len_addr);
+        lw.store_val(l, et, item, lw.gep_index(l, addr: data, index: len, size));
+        lw.store(l, value: lw.bin(l, ir.BinKind.Add, x: len, y: lw.konst(l, ir.Ty.I64, 1)), addr: len_addr);
+        return nothing();
+    }
+    if nm.eq("pop") {
+        let ot = type_of(l, n);
+        let tmp = lw.alloca(l, ot);
+        let len = lw.load(l, ir.Ty.I64, len_addr);
+        let some_left = lw.cmp(l, ir.CmpKind.Ne, x: len, y: lw.konst(l, ir.Ty.I64, 0));
+        let yes = lw.new_block(l);
+        let done = lw.new_block(l);
+        lw.cond_br(l, cond: some_left, yes: yes, no: done);
+        lw.switch_to(l, yes);
+        let last = lw.bin(l, ir.BinKind.Sub, x: len, y: lw.konst(l, ir.Ty.I64, 1));
+        lw.store(l, value: last, addr: len_addr);
+        let data = lw.load(l, ir.Ty.Ptr, r);
+        lw.memcpy(l, dst: lw.gep(l, tmp, layout.value_offset(&l.c, ot)), src: lw.gep_index(l, addr: data, index: last, size), size);
+        lw.store(l, value: lw.konst(l, ir.Ty.I8, 1), addr: tmp);
+        lw.br(l, done);
+        lw.switch_to(l, done);
+        return fresh_val(tmp);
+    }
+    if nm.eq("len") {
+        return scalar_val(lw.load(l, ir.Ty.I64, len_addr));
+    }
+    if nm.eq("clear") {
+        lw.store(l, value: lw.konst(l, ir.Ty.I64, 0), addr: len_addr);
+        return nothing();
+    }
+    return view_of_run(l, type_of(l, n), r); // items, items_mut
+}
+
+fn map_method(l: &mut lw.Lower, n: cst.NodeId, nm: str, t: ty.TypeId, r: u32) -> lw.Val {
+    let info = l.c.t.get(t);
+    let kt = info.key;
+    let vt = info.elem;
+    let ksize = lw.konst(l, ir.Ty.I64, size_of(l, kt));
+    let vsize = lw.konst(l, ir.Ty.I64, size_of(l, vt));
+    if nm.eq("len") {
+        return scalar_val(lw.load(l, ir.Ty.I64, lw.gep(l, r, 40)));
+    }
+    let key = in_memory(l, kt, value(l, arg_node(l, n, 0)));
+    var args = lw.args0(l);
+    args.push(r);
+    args.push(key);
+    args.push(ksize);
+    if nm.eq("put") {
+        let v = in_memory(l, vt, value(l, arg_node(l, n, 1)));
+        args.push(v);
+        args.push(vsize);
+        _ = lw.call_runtime(l, "a0rt_map_put", ir.Ty.Void, &args);
+        return nothing();
+    }
+    let ot = type_of(l, n);
+    let tmp = lw.alloca(l, ot);
+    let at = lw.gep(l, tmp, layout.value_offset(&l.c, ot));
+    args.push(vsize);
+    if nm.eq("remove") {
+        args.push(at);
+        let found = lw.call_runtime(l, "a0rt_map_remove", ir.Ty.I8, &args);
+        lw.store(l, value: found, addr: tmp);
+        return fresh_val(tmp);
+    }
+    let p = lw.call_runtime(l, "a0rt_map_get", ir.Ty.Ptr, &args);
+    let null = lw.konst(l, ir.Ty.Ptr, 0);
+    let yes = lw.new_block(l);
+    let done = lw.new_block(l);
+    lw.cond_br(l, cond: lw.cmp(l, ir.CmpKind.Ne, x: p, y: null), yes: yes, no: done);
+    lw.switch_to(l, yes);
+    lw.memcpy(l, dst: at, src: p, size_of(l, vt));
+    lw.store(l, value: lw.konst(l, ir.Ty.I8, 1), addr: tmp);
+    lw.br(l, done);
+    lw.switch_to(l, done);
+    return fresh_val(tmp);
+}
+
+fn library_method(l: &mut lw.Lower, n: cst.NodeId, nm: str, b: ty.Builtin, r: u32) -> lw.Val {
+    var args = lw.args0(l);
+    args.push(r);
+    match b {
+        .Output => {
+            let x = value(l, arg_node(l, n, 0));
+            if nm.eq("write") {
+                str_parts(l, x, &mut args);
+                _ = lw.call_runtime(l, "a0rt_write", ir.Ty.Void, &args);
+            } else {
+                args.push(x.v);
+                var rtname = "a0rt_write_byte";
+                if nm.eq("write_u64") {
+                    rtname = "a0rt_write_u64";
+                } else if nm.eq("write_i64") {
+                    rtname = "a0rt_write_i64";
+                }
+                _ = lw.call_runtime(l, rtname, ir.Ty.Void, &args);
+            }
+            return nothing();
+        }
+        .Args => {
+            let len = lw.load(l, ir.Ty.I64, lw.gep(l, r, 8));
+            if nm.eq("len") {
+                return scalar_val(len);
+            }
+            let i = value(l, arg_node(l, n, 0)).v;
+            lw.check(l, lw.cmp(l, ir.CmpKind.ULt, x: i, y: len), "argument index out of range", n);
+            let items = lw.load(l, ir.Ty.Ptr, r);
+            return view_of_run(l, ty.str_type(), lw.gep_index(l, addr: items, index: i, 16));
+        }
+        .Fs => {
+            let path = value(l, arg_node(l, n, 0));
+            str_parts(l, path, &mut args);
+            if nm.eq("write_file") {
+                let data = value(l, arg_node(l, n, 1));
+                str_parts(l, data, &mut args);
+                return scalar_val(lw.call_runtime(l, "a0rt_write_file", ir.Ty.I16, &args));
+            }
+            args.push(value(l, arg_node(l, n, 1)).v);
+            let tmp = lw.alloca(l, type_of(l, n));
+            args.push(tmp);
+            var rtname = "a0rt_read_file";
+            if nm.eq("read_bytes") {
+                rtname = "a0rt_read_bytes";
+            }
+            _ = lw.call_runtime(l, rtname, ir.Ty.Void, &args);
+            return fresh_val(tmp);
+        }
+        .String => {
+            if nm.eq("view") {
+                return view_of_run(l, ty.str_type(), r);
+            }
+            if nm.eq("len") {
+                return scalar_val(lw.load(l, ir.Ty.I64, lw.gep(l, r, 8)));
+            }
+            if nm.eq("push_str") {
+                let text = value(l, arg_node(l, n, 0));
+                str_parts(l, text, &mut args);
+            } else {
+                let byte = value(l, arg_node(l, n, 0)).v;
+                lw.check(l, lw.cmp(l, ir.CmpKind.ULe, x: byte, y: lw.konst(l, ir.Ty.I8, 127)),
+                    "push_ascii takes ASCII, a byte up to 0x7F", n);
+                let tmp = lw.alloca_bytes(l, size: 1, align: 1);
+                lw.store(l, value: byte, addr: tmp);
+                args.push(tmp);
+                args.push(lw.konst(l, ir.Ty.I64, 1));
+            }
+            _ = lw.call_runtime(l, "a0rt_bytes_push", ir.Ty.Void, &args);
+            return nothing();
+        }
+        .Interner => {
+            if nm.eq("intern") {
+                let text = value(l, arg_node(l, n, 0));
+                str_parts(l, text, &mut args);
+                return scalar_val(lw.call_runtime(l, "a0rt_intern", ir.Ty.I32, &args));
+            }
+            let sym = value(l, arg_node(l, n, 0)).v;
+            let wide = lw.convert(l, sym, ir.Ty.I64, false);
+            let len = lw.load(l, ir.Ty.I64, lw.gep(l, r, 8));
+            lw.check(l, lw.cmp(l, ir.CmpKind.ULt, x: wide, y: len), "this symbol is not from this interner", n);
+            let texts = lw.load(l, ir.Ty.Ptr, r);
+            return view_of_run(l, ty.str_type(), lw.gep_index(l, addr: texts, index: wide, 16));
+        }
+        _ => { return nothing(); }
+    }
+}
