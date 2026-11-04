@@ -2,7 +2,7 @@
 
 > 2026-11-03 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S3. S0–S2 yopilgan; S0'ning CI qabuli GitHub'da yashil.
+**Joriy sprint:** S4. S0–S3 yopilgan.
 
 ## Qoidalar
 
@@ -87,6 +87,7 @@ Bosqich natijasi: stage0 spec'dagi Arche-0'ni to'liq qabul qiladi va stage1 sour
 - View'lar: `&T`, `&mut T`, `[]T`, `str`. Indekslash va slicing bounds trap'i va UTF-8 chegarasi trap'i bilan.
 - `match` (§9): barcha pattern'lar, copy va move bilan binding, hech biri mos kelmasa trap.
 - Modullar (§3): ko'p fayl, `import … as`, import cycle'lar; dastur butunligicha compile qilinadi.
+- `alloc.List(T)`: `Ast` misoli uchun kerak, shuning uchun S4 dan shu yerga olindi (`pop` S4 da, chunki u `?T` qaytaradi).
 - `==` va `!=` (§5.5), struct'larda field bo'yicha.
 
 **Qabul:** §15'dagi `Ast` misoli va ko'p modulli dastur ishlaydi. §3, §5 va §9 conformance testlari o'tadi.
@@ -95,7 +96,7 @@ Bosqich natijasi: stage0 spec'dagi Arche-0'ni to'liq qabul qiladi va stage1 sour
 
 - `?T`, `E!T`, `try`, `catch`, `orelse`, return lifting, `some`/`none`/`ok`/`err` pattern'lari. `try` xato bilan chiqqanda ham `defer` ishlaydi.
 - `main` xato qaytarsa, `error: Name` chiqadi va status 1.
-- §11 runtime'i to'liq: `List`, `Map` (qo'shilish tartibida), `String`, `Interner`, `Fs.read_file`/`write_file`, `str` method'lari.
+- §11 runtime'i to'liq: `List.pop`, `Map` (qo'shilish tartibida), `String`, `Interner`, `Fs.read_file`/`write_file`.
 
 **Qabul:** §15'dagi `lines` dasturi ishlaydi. stage0 o'tkazib yuborishi mumkin deb belgilanmagan barcha conformance testlari o'tadi.
 
