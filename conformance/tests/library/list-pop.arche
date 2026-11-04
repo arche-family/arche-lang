@@ -1,0 +1,22 @@
+// test: run
+// spec: 11
+// stdout: 21 0
+import std;
+import alloc;
+
+fn main(sys: &mut std.System) -> !void {
+    var stack = alloc.List(u32).init(sys.alloc);
+    stack.push(1);
+    stack.push(2);
+    var total: u32 = 0;
+    while true {
+        match stack.pop() {
+            some(v) => { total = total * 10 + v; }
+            none => { break; }
+        }
+    }
+    sys.stdout.write_u64(total as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(stack.len() as u64);
+    sys.stdout.write("\n");
+}

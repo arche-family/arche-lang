@@ -1,0 +1,44 @@
+// test: run
+// spec: 11
+// stdout: 999 1 998001 7 7 20 green? 3
+import std;
+import alloc;
+
+type Key = struct { a: u32, b: bool }
+type Color = enum { Red, Green }
+
+fn main(sys: &mut std.System) -> !void {
+    var squares = alloc.Map(u64, u64).init(sys.alloc);
+    var i: u64 = 0;
+    while i < 1000 : (i += 1) {
+        squares.put(i, i * i);
+    }
+    squares.put(10, 1);
+    _ = squares.remove(11);
+    let gone = squares.remove(11);
+    sys.stdout.write_u64(squares.len() as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(squares.get(10) orelse 0);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(squares.get(999) orelse 0);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(squares.get(11) orelse 7);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(gone orelse 7);
+    var keys = alloc.Map(Key, u32).init(sys.alloc);
+    keys.put(Key { a: 1, b: true }, 10);
+    keys.put(Key { a: 1, b: false }, 20);
+    var colors = alloc.Map(Color, str).init(sys.alloc);
+    colors.put(Color.Green, "green");
+    var names = alloc.Interner.init(sys.alloc);
+    var counts = alloc.Map(alloc.Symbol, u32).init(sys.alloc);
+    counts.put(names.intern("x"), 3);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64((keys.get(Key { a: 1, b: false }) orelse 0) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write(colors.get(Color.Green) orelse "?");
+    sys.stdout.write(colors.get(Color.Red) orelse "?");
+    sys.stdout.write(" ");
+    sys.stdout.write_u64((counts.get(names.intern("x")) orelse 0) as u64);
+    sys.stdout.write("\n");
+}

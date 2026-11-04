@@ -1,0 +1,34 @@
+// test: run
+// spec: 5.2
+// stdout: first second 3 
+import std;
+
+type A = error { First }
+type B = error { Second }
+
+fn pick(n: u32) -> !u32 {
+    if n == 1 {
+        return A.First;
+    }
+    if n == 2 {
+        return B.Second;
+    }
+    return n;
+}
+
+fn name(out: &mut std.Output, n: u32) {
+    match pick(n) {
+        ok(v) => { out.write_u64(v as u64); }
+        err(.First) => { out.write("first"); }
+        err(.Second) => { out.write("second"); }
+        err(_) => { out.write("other"); }
+    }
+    out.write(" ");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    name(&mut sys.stdout, 1);
+    name(&mut sys.stdout, 2);
+    name(&mut sys.stdout, 3);
+    sys.stdout.write("\n");
+}

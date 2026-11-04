@@ -1,0 +1,44 @@
+// test: run
+// spec: 9
+// stdout: zero;17;empty;bad digit;
+import std;
+
+type ParseError = error { Empty, BadDigit }
+
+fn parse(text: str) -> ParseError!u32 {
+    if text.len() == 0 {
+        return ParseError.Empty;
+    }
+    var n: u32 = 0;
+    var i: usize = 0;
+    while i < text.len() : (i += 1) {
+        let c = text[i];
+        if c < '0' or c > '9' {
+            return ParseError.BadDigit;
+        }
+        n = n * 10 + (c - '0') as u32;
+    }
+    return n;
+}
+
+fn describe(out: &mut std.Output, r: ParseError!u32) {
+    match r {
+        ok(0) => { out.write("zero"); }
+        ok(n) => { out.write_u64(n as u64); }
+        err(.Empty) => { out.write("empty"); }
+        err(e) => {
+            if e == ParseError.BadDigit {
+                out.write("bad digit");
+            }
+        }
+    }
+    out.write(";");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    describe(&mut sys.stdout, parse("0"));
+    describe(&mut sys.stdout, parse("17"));
+    describe(&mut sys.stdout, parse(""));
+    describe(&mut sys.stdout, parse("x"));
+    sys.stdout.write("\n");
+}

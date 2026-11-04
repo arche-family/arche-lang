@@ -1,0 +1,23 @@
+// test: run
+// spec: 7.8
+// stdout: odd still odd
+import std;
+
+type CheckError = error { Odd }
+
+fn check(n: u32) -> CheckError!void {
+    if n % 2 == 1 {
+        return CheckError.Odd;
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    check(3) catch sys.stdout.write("odd ");
+    check(4) catch sys.stdout.write("never ");
+    match check(5) {
+        ok(_) => { sys.stdout.write("ok"); }
+        err(.Odd) => { sys.stdout.write("still odd"); }
+    }
+    try check(2);
+    sys.stdout.write("\n");
+}

@@ -1,0 +1,22 @@
+// test: run
+// spec: 11
+// stdout: alpha beta
+import std;
+import alloc;
+
+fn main(sys: &mut std.System) -> !void {
+    var names = alloc.Interner.init(sys.alloc);
+    let a = names.intern("alpha");
+    let b = names.intern("beta");
+    var i: u32 = 0;
+    while i < 500 : (i += 1) {
+        _ = names.intern("filler");
+    }
+    let a2 = names.intern("alpha");
+    if a == a2 and a != b {
+        sys.stdout.write(names.text(a));
+        sys.stdout.write(" ");
+        sys.stdout.write(names.text(b));
+    }
+    sys.stdout.write("\n");
+}

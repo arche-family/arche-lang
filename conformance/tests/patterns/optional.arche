@@ -1,0 +1,31 @@
+// test: run
+// spec: 9
+// stdout: circle 3;dot;nothing; 4
+import std;
+
+type Shape = enum { Dot, Circle { radius: u32 } }
+
+fn describe(out: &mut std.Output, s: ?Shape) {
+    match s {
+        some(.Circle { radius }) => {
+            out.write("circle ");
+            out.write_u64(radius as u64);
+        }
+        some(.Dot) => { out.write("dot"); }
+        none => { out.write("nothing"); }
+    }
+    out.write(";");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    describe(&mut sys.stdout, some(Shape.Circle { radius: 3 }));
+    describe(&mut sys.stdout, some(Shape.Dot));
+    describe(&mut sys.stdout, none);
+    let n: ?u32 = some(4);
+    match n {
+        some(1..=3) => { sys.stdout.write(" small"); }
+        some(v) => { sys.stdout.write(" "); sys.stdout.write_u64(v as u64); }
+        none => { }
+    }
+    sys.stdout.write("\n");
+}

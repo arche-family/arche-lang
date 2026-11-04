@@ -1,0 +1,30 @@
+// test: run
+// spec: 11
+// stdout: // tes ok; not found; is a directory; invalid UTF-8; not found; 
+import std;
+
+fn report(out: &mut std.Output, r: std.IoError!void) {
+    match r {
+        ok(_) => { out.write("ok"); }
+        err(.NotFound) => { out.write("not found"); }
+        err(.IsDirectory) => { out.write("is a directory"); }
+        err(.InvalidUtf8) => { out.write("invalid UTF-8"); }
+        err(_) => { out.write("other"); }
+    }
+    out.write("; ");
+}
+
+fn read(sys: &mut std.System, path: str) -> std.IoError!void {
+    let text = try sys.fs.read_file(path, sys.alloc);
+    sys.stdout.write(text.view()[0..6]);
+    sys.stdout.write(" ");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    report(&mut sys.stdout, read(sys, "fs.arche"));
+    report(&mut sys.stdout, read(sys, "no-such-file"));
+    report(&mut sys.stdout, read(sys, "_support"));
+    report(&mut sys.stdout, read(sys, "_support/invalid.txt"));
+    report(&mut sys.stdout, sys.fs.write_file(path: "no-such-dir/out.txt", data: "x"));
+    sys.stdout.write("\n");
+}

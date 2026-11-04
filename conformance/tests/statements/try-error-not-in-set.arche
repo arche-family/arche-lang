@@ -1,0 +1,33 @@
+// test: compile-error
+// spec: 7.8
+// line: 27
+import std;
+
+type ParseError = error { Empty, BadDigit }
+
+fn parse(text: str) -> ParseError!u32 {
+    if text.len() == 0 {
+        return ParseError.Empty;
+    }
+    var n: u32 = 0;
+    var i: usize = 0;
+    while i < text.len() : (i += 1) {
+        let c = text[i];
+        if c < '0' or c > '9' {
+            return ParseError.BadDigit;
+        }
+        n = n * 10 + (c - '0') as u32;
+    }
+    return n;
+}
+
+type SmallError = error { Empty }
+
+fn twice(text: str) -> SmallError!u32 {
+    let n = try parse(text);
+    return 2 * n;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    _ = twice("2");
+}

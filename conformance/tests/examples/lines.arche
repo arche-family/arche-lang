@@ -1,0 +1,27 @@
+// test: run
+// spec: 15
+// args: lines.arche
+// stdout: 27
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() != 2 {
+        sys.stderr.write("usage: lines <file>\n");
+        return;
+    }
+    let path = sys.args.get(1);
+    let text = try sys.fs.read_file(path, sys.alloc);
+    sys.stdout.write_u64(count_lines(text.view()));
+    sys.stdout.write("\n");
+}
+
+fn count_lines(text: str) -> u64 {
+    var n: u64 = 0;
+    var i: usize = 0;
+    while i < text.len() : (i += 1) {
+        if text[i] == '\n' {
+            n += 1;
+        }
+    }
+    return n;
+}

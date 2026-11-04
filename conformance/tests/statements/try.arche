@@ -1,0 +1,36 @@
+// test: run
+// spec: 7.8
+// stdout: [sum done]42 [sum done]1
+import std;
+
+type ParseError = error { Empty, BadDigit }
+
+fn parse(text: str) -> ParseError!u32 {
+    if text.len() == 0 {
+        return ParseError.Empty;
+    }
+    var n: u32 = 0;
+    var i: usize = 0;
+    while i < text.len() : (i += 1) {
+        let c = text[i];
+        if c < '0' or c > '9' {
+            return ParseError.BadDigit;
+        }
+        n = n * 10 + (c - '0') as u32;
+    }
+    return n;
+}
+
+fn sum(out: &mut std.Output, a: str, b: str) -> ParseError!u32 {
+    defer out.write("[sum done]");
+    let x = try parse(a);
+    let y = try parse(b);
+    return x + y;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64((sum(&mut sys.stdout, "40", "2") catch 0) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64((sum(&mut sys.stdout, "40", "") catch 1) as u64);
+    sys.stdout.write("\n");
+}
