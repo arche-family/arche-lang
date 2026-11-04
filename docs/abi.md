@@ -35,7 +35,7 @@ Sizes and alignments are in bytes. A composite value is laid out in memory at it
 
 ## Symbols
 
-A function's symbol is `a0` followed by each segment of its module path and then its name, each written as `_<length><text>`: `syntax.lexer.lex` is `a0_6syntax_5lexer_3lex`. A method adds its type's name before its own: `a0_4main_3Ast_4eval`. The root module whose file name is not a module path has the empty name, written `_0`. Runtime symbols start with `a0rt_`.
+A function's symbol is `a0` followed by each segment of its module path and then its name, each written as `_<length><text>`: `syntax.lexer.lex` is `a0_6syntax_5lexer_3lex`. A method adds its type's name before its own: `a0_4main_3Ast_4eval`. A method of an `impl` (spec/arche.md §5.1) adds `_X<n>` after its name, `n` the impl's number in the program, since two interfaces of a type may have methods of one name. The root module whose file name is not a module path has the empty name, written `_0`. Runtime symbols start with `a0rt_`.
 
 ## The runtime
 

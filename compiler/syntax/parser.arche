@@ -496,10 +496,11 @@ fn parse_type_decl(p: &mut Parser, m: cst.Mark) {
         _ = close(p, m, cst.Kind.TypeDecl);
         return;
     }
-    if p.full and at(p, tk.Kind.KwWhere) {
-        parse_where(p);
-    }
+    // struct where T: I { ... } (spec/arche.md §5.2)
     if accept(p, tk.Kind.KwStruct) {
+        if p.full and at(p, tk.Kind.KwWhere) {
+            parse_where(p);
+        }
         if expect(p, tk.Kind.LBrace, "'{'") {
             parse_members(p, true);
             _ = expect(p, tk.Kind.RBrace, "'}'");
@@ -513,6 +514,9 @@ fn parse_type_decl(p: &mut Parser, m: cst.Mark) {
             _ = expect(p, tk.Kind.RBrace, "'fn' or '}'");
         }
     } else if accept(p, tk.Kind.KwEnum) {
+        if p.full and at(p, tk.Kind.KwWhere) {
+            parse_where(p);
+        }
         if expect(p, tk.Kind.LBrace, "'{'") {
             parse_variants(p);
             parse_members(p, false);

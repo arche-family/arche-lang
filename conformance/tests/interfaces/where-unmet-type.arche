@@ -1,0 +1,20 @@
+// test: compile-error
+// spec: arche/5.2
+// stage0: skip
+// line: 19
+// code: E0830
+import std;
+
+type Weigh = interface {
+    fn weight(self: &Self) -> u64;
+}
+
+type Feather = struct { n: u64 }
+
+type Shelf(comptime T: type) = struct where T: Weigh {
+    item: T,
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let s = Shelf(Feather) { item: Feather { n: 1 } };
+}

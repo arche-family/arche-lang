@@ -28,6 +28,10 @@ pub type Kind = enum {
     Struct,
     Enum,
     Builtin,
+    /// Full Arche: an interface (decl), and &dyn I, a view of a value of
+    /// any type that implements it (spec/arche.md §5).
+    Interface,
+    Dyn,
 }
 
 /// No declaration: an error union with an inferred set, or the error set
@@ -149,6 +153,14 @@ pub type Types = struct {
     pub fn declared(self: &mut Types, kind: Kind, decl: u32) -> TypeId {
         var info = plain(kind);
         info.decl = decl;
+        return self.intern(info);
+    }
+
+    /// &dyn I and &mut dyn I; iface is the interface's declaration.
+    pub fn dyn_ref(self: &mut Types, mutable: bool, iface: u32) -> TypeId {
+        var info = plain(Kind.Dyn);
+        info.mutable = mutable;
+        info.decl = iface;
         return self.intern(info);
     }
 

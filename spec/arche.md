@@ -188,9 +188,11 @@ impl Hash for Point {
 }
 ```
 
-- `Self` is the implementing type.
+- `Self` is the implementing type. It means that only inside an interface and an `impl`; elsewhere it is an ordinary name (§12).
+- An interface's methods are signatures that end with `;`. Only they have no body. An interface is not a type of values: `fn f(s: Shape)` is an error (E0825), and a view of a value of any type that implements it is `&dyn Shape` (§5.3).
 - **`impl I for T`** declares that `T` implements `I`, with a body of the interface's methods. It may appear only in the module that declares `T` or the one that declares `I`, so the implementations of a type are found in two places at most, both named in its code. A type implements an interface only through an `impl`; having the methods is not enough.
-- The methods of an `impl` are methods of `T`: `p.hash(&mut h)`. If two interfaces a type implements have a method of one name, calls must name the interface: `Hash.hash(&p, &mut h)`.
+- An `impl` has each of the interface's methods, with the same parameters, parameter names and result, `Self` replaced by `T`, and no other methods (E0822). A type implements an interface once (E0823). `T` is a struct or enum type of the package (E0820); the module rule above is E0821.
+- The methods of an `impl` are methods of `T`: `p.hash(&mut h)`. A type's own method and an `impl`'s cannot share a name (E0822). If two interfaces a type implements have a method of one name, calls must name the interface (E0824): `Hash.hash(&p, &mut h)`. `I.name(x, …)` calls the method of the `impl` of `I` for the type of `x`, or of `x.*` when `x` is a view, and is an error when there is none (E0832).
 - The library declares `core.Eq`, `core.Ord`, `core.Hash`, `core.Iter(T)`, `core.Format` and `alloc.Allocator`; `==` on a struct is `Eq.eq` once the struct implements `Eq`, and A§5.5's field-by-field `==` remains for structs without it.
 
 ### 5.2 `where`
@@ -202,7 +204,7 @@ fn sort(comptime T: type, items: []mut T) where T: core.Ord { … }
 pub type Set(comptime T: type) = struct where T: core.Hash + core.Eq { … }
 ```
 
-Inside, a value of type `T` has exactly the methods of its constraints. A call checks the constraints against the arguments, and an error names the argument and the missing interface (E0830).
+Inside, a value of type `T` has exactly the methods of its constraints. A call checks the constraints against the arguments, and an error names the argument and the missing interface (E0830); a type with a `where` checks them where an instance is named. A `where` names comptime type parameters of its declaration only (E0830).
 
 ### 5.3 `dyn`
 

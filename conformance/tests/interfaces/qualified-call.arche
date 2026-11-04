@@ -1,0 +1,35 @@
+// test: run
+// spec: arche/5.1
+// stage0: skip
+// stdout: 24 8
+import std;
+
+type Area = interface {
+    fn size(self: &Self) -> u64;
+}
+
+type Volume = interface {
+    fn size(self: &Self) -> u64;
+}
+
+type Cube = struct { side: u64 }
+
+impl Area for Cube {
+    fn size(self: &Cube) -> u64 {
+        return 6 * self.side * self.side;
+    }
+}
+
+impl Volume for Cube {
+    fn size(self: &Cube) -> u64 {
+        return self.side * self.side * self.side;
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let c = Cube { side: 2 };
+    sys.stdout.write_u64(Area.size(&c));
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(Volume.size(&c));
+    sys.stdout.write("\n");
+}

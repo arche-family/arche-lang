@@ -145,7 +145,15 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0801` | A capability type that the package manifest does not list in `needs` (§1.3). |
 | `E0810` | A `for` loop over a value that is not a range, a slice or an iterator (§3.2). |
 | `E0811` | A `for` loop's range or names that do not fit: bounds of two types, a pair over a range or over items that are not a struct of two fields, a type on a name that is not a range's (§3.2). |
+| `E0820` | An `impl` of something that is not an interface, or for a type that cannot implement one here (§5.1). |
+| `E0821` | An `impl` outside both the module that declares the type and the one that declares the interface (§5.1). |
+| `E0822` | An `impl` whose methods are not the interface's: one missing, one more, one with other parameters, names or result, or one the type has already (§5.1). |
+| `E0823` | A second `impl` of one interface for one type (§5.1). |
+| `E0824` | A method call whose name two interfaces of the type have; name the interface: `I.name(&x, …)` (§5.1). |
+| `E0825` | An interface where a type of values is expected; a view of a value that implements it is `&dyn I` (§5.3). |
 | `E0830` | A `comptime` type argument that does not implement an interface its `where` bound requires (§5.2). |
+| `E0831` | `dyn I` of an interface whose methods do not all take `self` by reference and use `Self` nowhere else (§5.3). |
+| `E0832` | A value converted to `&dyn I`, or passed to `I.name(…)`, whose type does not implement `I` (§5.1, §5.3). |
 | `E0840` | Compile-time evaluation that runs too many steps or recurses too deep (§4.3). |
 
 ## Regions, contracts, concurrency and unsafe

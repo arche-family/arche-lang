@@ -117,7 +117,8 @@ pub fn value_offset(c: &ck.Checker, t: ty.TypeId) -> u64 {
 pub fn layout(c: &ck.Checker, t: ty.TypeId) -> Layout {
     let info = c.t.get(t);
     match info.kind {
-        .Void | .Noreturn | .Invalid => { return Layout { size: 0, align: 1 }; }
+        .Void | .Noreturn | .Invalid | .Interface => { return Layout { size: 0, align: 1 }; }
+        .Dyn => { return Layout { size: 16, align: 8 }; } // the value's address and its table
         .Bool => { return Layout { size: 1, align: 1 }; }
         .Int => {
             let n = (ty.bits(info.int_kind) / 8) as u64;

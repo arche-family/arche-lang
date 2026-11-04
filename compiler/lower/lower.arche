@@ -488,6 +488,11 @@ pub fn mangle(c: &ck.Checker, d: u32, a: alloc.Allocator) -> alloc.String {
         segment(&mut out, c.names.text(c.decls[decl.owner as usize].name));
     }
     segment(&mut out, c.names.text(decl.name));
+    // A method of an impl: two interfaces may both have one of its name.
+    if decl.impl_index != ck.NONE {
+        out.push_str("_X");
+        ir.write_number(&mut out, decl.impl_index as u64);
+    }
     // An instance, or a method of one: its declaration number tells it
     // from the template's other instances (spec/arche.md §4).
     let is_instance = decl.template != ck.NONE or (decl.owner != ck.NONE and c.decls[decl.owner as usize].template != ck.NONE);
@@ -625,9 +630,10 @@ pub fn lower(c: ck.Checker) -> ir.Module {
     };
     var f: usize = 0;
     while f < l.c.fns.len() : (f += 1) {
-        if l.c.fns[f].decl == ck.NONE {
-            // A test block: a build leaves it out. A stub keeps the IR
-            // functions numbered like the checker's.
+        if l.c.fns[f].decl == ck.NONE or ck.is_signature(&l.c, f as u32) {
+            // A test block, which a build leaves out, or an interface's
+            // method, which has no body. A stub keeps the IR functions
+            // numbered like the checker's.
             var name = alloc.String.init(a);
             name.push_str("a0_test_");
             ir.write_number(&mut name, f as u64);

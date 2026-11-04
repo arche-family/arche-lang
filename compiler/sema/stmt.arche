@@ -81,6 +81,9 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
     c.checked.put(f, true);
     let info = c.fns[f as usize];
     let decl = c.decls[info.decl as usize];
+    if ck.kind_of_in(c, decl.module, decl.node) == cst.Kind.FnSig {
+        return; // an interface's method: a signature, no body
+    }
     let saved = ck.save_context(c);
     ck.enter_decl(c, info.decl);
     c.cur_table = info.table;

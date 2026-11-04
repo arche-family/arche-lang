@@ -1,0 +1,33 @@
+// test: compile-error
+// spec: arche/5.1
+// stage0: skip
+// line: 32
+// code: E0824
+import std;
+
+type Area = interface {
+    fn size(self: &Self) -> u64;
+}
+
+type Volume = interface {
+    fn size(self: &Self) -> u64;
+}
+
+type Cube = struct { side: u64 }
+
+impl Area for Cube {
+    fn size(self: &Cube) -> u64 {
+        return 6;
+    }
+}
+
+impl Volume for Cube {
+    fn size(self: &Cube) -> u64 {
+        return 1;
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let c = Cube { side: 2 };
+    sys.stdout.write_u64(c.size());
+}

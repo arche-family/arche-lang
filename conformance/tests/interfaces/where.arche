@@ -1,0 +1,44 @@
+// test: run
+// spec: arche/5.2
+// stage0: skip
+// stdout: 5000 7000
+import std;
+
+type Weigh = interface {
+    fn weight(self: &Self) -> u64;
+}
+
+type Box = struct { kg: u64 }
+
+impl Weigh for Box {
+    fn weight(self: &Box) -> u64 {
+        return self.kg * 1000;
+    }
+}
+
+fn heavier(comptime T: type, a: &T, b: &T) -> u64 where T: Weigh {
+    let x = a.weight();
+    let y = b.weight();
+    if x > y {
+        return x;
+    }
+    return y;
+}
+
+type Shelf(comptime T: type) = struct where T: Weigh {
+    item: T,
+
+    fn load(self: &Shelf(T)) -> u64 {
+        return self.item.weight();
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = Box { kg: 2 };
+    let b = Box { kg: 5 };
+    sys.stdout.write_u64(heavier(Box, a: &a, b: &b));
+    let s = Shelf(Box) { item: Box { kg: 7 } };
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(s.load());
+    sys.stdout.write("\n");
+}

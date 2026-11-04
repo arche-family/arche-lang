@@ -1,0 +1,37 @@
+// test: run
+// spec: arche/5.1
+// stage0: skip
+// stdout: 12
+import std;
+
+type Source(comptime T: type) = interface {
+    fn take(self: &mut Self) -> ?T;
+}
+
+type Digits = struct {
+    n: u32,
+}
+
+impl Source(u8) for Digits {
+    fn take(self: &mut Digits) -> ?u8 {
+        if self.n == 0 {
+            return none;
+        }
+        let d = (self.n % 10) as u8;
+        self.n /= 10;
+        return d;
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var d = Digits { n: 4071 };
+    var sum: u32 = 0;
+    while true {
+        match d.take() {
+            some(x) => { sum += x as u32; }
+            none => { break; }
+        }
+    }
+    sys.stdout.write_u64(sum as u64);
+    sys.stdout.write("\n");
+}

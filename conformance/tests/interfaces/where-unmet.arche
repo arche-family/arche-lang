@@ -1,0 +1,21 @@
+// test: compile-error
+// spec: arche/5.2
+// stage0: skip
+// line: 20
+// code: E0830
+import std;
+
+type Weigh = interface {
+    fn weight(self: &Self) -> u64;
+}
+
+type Feather = struct { n: u64 }
+
+fn heaviest(comptime T: type, a: &T) -> u64 where T: Weigh {
+    return a.weight();
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let f = Feather { n: 1 };
+    sys.stdout.write_u64(heaviest(Feather, a: &f));
+}

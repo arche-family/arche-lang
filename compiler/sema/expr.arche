@@ -561,7 +561,7 @@ pub fn find_error(c: &ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> ?u32 {
 
 pub fn find_method(c: &ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> ?u32 {
     let info = c.t.get(t);
-    if info.kind != ty.Kind.Struct and info.kind != ty.Kind.Enum {
+    if info.kind != ty.Kind.Struct and info.kind != ty.Kind.Enum and info.kind != ty.Kind.Interface {
         return none;
     }
     let d = c.decls[info.decl as usize];
@@ -572,7 +572,42 @@ pub fn find_method(c: &ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> ?u32 {
             return m;
         }
     }
+    // The methods of its impls are its methods too (spec/arche.md §5.1).
+    var k: usize = 0;
+    while k < c.impls.len() : (k += 1) {
+        let im = c.impls[k];
+        if im.target != t {
+            continue;
+        }
+        var j = im.methods_start;
+        while j < im.methods_start + im.methods_len : (j += 1) {
+            let m = c.methods[j as usize];
+            if c.decls[m as usize].name == name {
+                return m;
+            }
+        }
+    }
     return none;
+}
+
+/// Two impls of t give it a method of this name: a call names the
+/// interface, I.name(&x, ...) (spec/arche.md §5.1).
+pub fn ambiguous_method(c: &ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> bool {
+    var found: u32 = 0;
+    var k: usize = 0;
+    while k < c.impls.len() : (k += 1) {
+        let im = c.impls[k];
+        if im.target != t {
+            continue;
+        }
+        var j = im.methods_start;
+        while j < im.methods_start + im.methods_len : (j += 1) {
+            if c.decls[c.methods[j as usize] as usize].name == name {
+                found += 1;
+            }
+        }
+    }
+    return found > 1;
 }
 
 fn report_no_member(c: &mut ck.Checker, n: cst.NodeId, t: ty.TypeId, what: str, name_token: u32) {
@@ -989,7 +1024,12 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
     if c.decls[d as usize].generic {
         target = instantiate_call(c, call, d);
         if target == ck.NONE {
-            check_args_loosely(c, call);
+            // The run-time arguments only: the comptime ones are types.
+            let nargs = ck.child_count(c, call) - 1;
+            var k = ck.comptime_kinds(c, d).len() as u32;
+            while k < nargs : (k += 1) {
+                _ = check(c, ck.child(c, ck.child(c, call, k + 1), 0), none);
+            }
             return ty.invalid();
         }
     }
@@ -1070,6 +1110,48 @@ fn has_init(c: &ck.Checker, t: ty.TypeId) -> bool {
     return info.kind == ty.Kind.Builtin and (info.builtin == ty.Builtin.String or info.builtin == ty.Builtin.Interner);
 }
 
+/// I.name(&x, ...): the method of x's impl of I (spec/arche.md §5.1).
+fn interface_call(c: &mut ck.Checker, n: cst.NodeId, t: ty.TypeId, nt: u32) -> ty.TypeId {
+    let sym = ck.symbol(c, nt);
+    let callee = ck.child(c, n, 0);
+    match find_method(c, t, sym) {
+        some(_) => { }
+        none => {
+            report_no_member(c, callee, t, "method", nt);
+            check_args_loosely(c, n);
+            return ty.invalid();
+        }
+    }
+    if ck.child_count(c, n) < 2 {
+        let s = ck.span_of(c, n);
+        ck.report(c, codes.ARGUMENT_COUNT, s, "the first argument is the value whose method this is: I.name(&x, ...)");
+        return ty.invalid();
+    }
+    let first = ck.child(c, ck.child(c, n, 1), 0);
+    let at = check(c, first, none);
+    if ck.is_invalid(c, at) {
+        check_args_loosely(c, n);
+        return ty.invalid();
+    }
+    var target = at;
+    if c.t.kind(at) == ty.Kind.Ref {
+        target = c.t.elem(at);
+    }
+    let iface = c.t.get(t).decl;
+    let d = ck.impl_method(c, target, iface, sym);
+    if d == ck.NONE {
+        var m = ck.new_message(c);
+        ck.write_type(c, &mut m, target);
+        m.push_str(" does not implement ");
+        ck.write_type(c, &mut m, t);
+        let s = ck.span_of(c, first);
+        ck.report_owned(c, codes.NOT_IMPLEMENTED, s, m);
+        check_args_loosely(c, n);
+        return ty.invalid();
+    }
+    return call_fn(c, n, d: d, skip: 0);
+}
+
 fn check_call(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     let callee = ck.child(c, n, 0);
     let ck_kind = ck.kind_of(c, callee);
@@ -1082,6 +1164,9 @@ fn check_call(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
             if ck.is_invalid(c, t) {
                 check_args_loosely(c, n);
                 return t;
+            }
+            if c.t.kind(t) == ty.Kind.Interface {
+                return interface_call(c, n, t, nt);
             }
             if has_init(c, t) and ck.text(c, nt).eq("init") {
                 var ps = alloc.List(Param).init(c.a);
@@ -1199,10 +1284,27 @@ fn check_method_call(c: &mut ck.Checker, call: cst.NodeId, callee: cst.NodeId) -
     }
     let nt = member_token(c, callee);
     let sym = ck.symbol(c, nt);
+    if ambiguous_method(c, t, sym) {
+        var m = ck.new_message(c);
+        m.push_str("two interfaces of ");
+        ck.write_type(c, &mut m, t);
+        m.push_str(" have a method '");
+        m.push_str(ck.text(c, nt));
+        m.push_str("'; name the one you mean: Interface.");
+        m.push_str(ck.text(c, nt));
+        m.push_str("(&x, ...)");
+        let s = ck.token_span(c, nt);
+        ck.report_owned(c, codes.AMBIGUOUS_METHOD, s, m);
+        check_args_loosely(c, call);
+        return ty.invalid();
+    }
     match find_method(c, t, sym) {
         some(d) => {
             let decl = c.decls[d as usize];
-            let f = c.fns[decl.fn_index as usize];
+            if decl.fn_index == ck.NONE {
+                ck.check_signature(c, d);
+            }
+            let f = c.fns[c.decls[d as usize].fn_index as usize];
             if not f.has_self {
                 let s = ck.span_of(c, callee);
                 ck.report(c, codes.BAD_SELF, s, "this function has no 'self' parameter; call it as Type.name(...)");

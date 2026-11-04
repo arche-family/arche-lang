@@ -34,7 +34,7 @@ pub type Alias = struct {
     pub module: u32,
 }
 
-pub type DeclKind = enum { Fn, Const, Struct, Enum, ErrorSet, Alias }
+pub type DeclKind = enum { Fn, Const, Struct, Enum, ErrorSet, Alias, Interface }
 
 pub type SelfMode = enum { Value, Ref, MutRef }
 
@@ -73,6 +73,20 @@ pub type Decl = struct {
     pub template: u32,
     pub env_start: u32,
     pub env_len: u32,
+    /// A method of an `impl`: its index in impls; NONE otherwise.
+    pub impl_index: u32,
+}
+
+/// impl I for T (spec/arche.md §5.1): its methods are methods of T.
+pub type Impl = struct {
+    pub module: u32,
+    pub node: cst.NodeId,
+    /// The interface's declaration, and the type; NONE and invalid until
+    /// resolved, or when they are wrong.
+    pub iface: u32,
+    pub target: ty.TypeId,
+    pub methods_start: u32,
+    pub methods_len: u32,
 }
 
 /// A comptime argument, bound to its parameter's name.
@@ -185,6 +199,10 @@ pub type Checker = struct {
     /// Function bodies already checked: a constant can call a function
     /// before the pass over bodies reaches it.
     pub checked: alloc.Map(u32, bool),
+    pub impls: alloc.List(Impl),
+    /// What `Self` names: inside an interface, the interface; inside an
+    /// impl, its type; invalid elsewhere.
+    pub self_type: ty.TypeId,
     pub a: alloc.Allocator,
 }
 
@@ -200,6 +218,20 @@ pub fn node(c: &Checker, n: cst.NodeId) -> cst.Node {
 
 pub fn kind_of(c: &Checker, n: cst.NodeId) -> cst.Kind {
     return c.p.modules[c.module as usize].tree.node(n).kind;
+}
+
+/// The kind of node n of module m.
+pub fn kind_of_in(c: &Checker, m: u32, n: cst.NodeId) -> cst.Kind {
+    return c.p.modules[m as usize].tree.node(n).kind;
+}
+
+/// A function's declaration is a signature only: a method of an interface.
+pub fn is_signature(c: &Checker, f: u32) -> bool {
+    let d = c.fns[f as usize].decl;
+    if d == NONE {
+        return false;
+    }
+    return kind_of_in(c, c.decls[d as usize].module, c.decls[d as usize].node) == cst.Kind.FnSig;
 }
 
 pub fn child(c: &Checker, n: cst.NodeId, i: u32) -> cst.NodeId {
@@ -313,10 +345,11 @@ pub type Context = struct {
     pub env_start: u32,
     pub env_len: u32,
     pub cur_table: u32,
+    pub self_type: ty.TypeId,
 }
 
 pub fn save_context(c: &Checker) -> Context {
-    return Context { module: c.module, env_start: c.env_start, env_len: c.env_len, cur_table: c.cur_table };
+    return Context { module: c.module, env_start: c.env_start, env_len: c.env_len, cur_table: c.cur_table, self_type: c.self_type };
 }
 
 pub fn restore_context(c: &mut Checker, x: Context) {
@@ -324,6 +357,7 @@ pub fn restore_context(c: &mut Checker, x: Context) {
     c.env_start = x.env_start;
     c.env_len = x.env_len;
     c.cur_table = x.cur_table;
+    c.self_type = x.self_type;
 }
 
 pub fn enter_decl(c: &mut Checker, d: u32) {
@@ -331,6 +365,15 @@ pub fn enter_decl(c: &mut Checker, d: u32) {
     c.module = decl.module;
     c.env_start = decl.env_start;
     c.env_len = decl.env_len;
+    c.self_type = ty.invalid();
+    if decl.owner != NONE {
+        let owner = c.decls[decl.owner as usize];
+        if owner.kind == DeclKind.Interface or decl.impl_index != NONE {
+            c.self_type = owner.type_id;
+        }
+    } else if decl.kind == DeclKind.Interface {
+        c.self_type = decl.type_id;
+    }
 }
 
 // ---- diagnostics ------------------------------------------------------------------
@@ -409,7 +452,15 @@ pub fn write_type(c: &Checker, m: &mut alloc.String, t: ty.TypeId) {
                 write_decl_name(c, m, info.decl);
             }
         }
-        .Struct | .Enum => { write_decl_name(c, m, info.decl); }
+        .Struct | .Enum | .Interface => { write_decl_name(c, m, info.decl); }
+        .Dyn => {
+            m.push_str("&");
+            if info.mutable {
+                m.push_str("mut ");
+            }
+            m.push_str("dyn ");
+            write_decl_name(c, m, info.decl);
+        }
         .Builtin => {
             match info.builtin {
                 .Output => { m.push_str("std.Output"); }
@@ -588,6 +639,45 @@ fn primitive(name: str) -> ?ty.TypeId {
     return none;
 }
 
+/// The type of a comptime value parameter: an integer type, bool or str
+/// (spec/arche.md §4.1); invalid otherwise. Only these names are looked
+/// at, so a parameter typed with its own template cannot recurse.
+fn comptime_param_type(c: &Checker, p: cst.NodeId) -> ty.TypeId {
+    let tn = child(c, p, 0);
+    if kind_of(c, tn) != cst.Kind.TypePath or child_count(c, tn) > 0 {
+        return ty.invalid();
+    }
+    let toks = own(c, tn);
+    if toks.len() != 1 {
+        return ty.invalid();
+    }
+    match primitive(text(c, toks[0])) {
+        some(t) => {
+            if t == ty.void_type() or t == ty.noreturn_type() {
+                return ty.invalid();
+            }
+            return t;
+        }
+        none => { return ty.invalid(); }
+    }
+}
+
+/// Reports comptime value parameters of other types than those.
+fn check_comptime_params(c: &mut Checker, n: cst.NodeId) {
+    let count = child_count(c, n);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let p = child(c, n, i);
+        if kind_of(c, p) != cst.Kind.Param or not has_own(c, p, tk.Kind.KwComptime) or child_count(c, p) == 0 {
+            continue;
+        }
+        if not takes_type(c, p) and is_invalid(c, comptime_param_type(c, p)) {
+            let s = span_of(c, child(c, p, 0));
+            report(c, codes.BAD_GENERIC, s, "a comptime parameter takes a type, an integer, a bool or a str");
+        }
+    }
+}
+
 pub fn is_predeclared(name: str) -> bool {
     match primitive(name) {
         some(_) => { return true; }
@@ -666,7 +756,21 @@ pub fn decl_type(c: &mut Checker, d: u32) -> ty.TypeId {
 pub fn resolve_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
     match kind_of(c, n) {
         .TypeRef => {
+            if has_own(c, n, tk.Kind.KwDyn) {
+                let it = resolve_interface(c, child(c, n, 0));
+                if is_invalid(c, it) {
+                    return ty.invalid();
+                }
+                let d = c.t.get(it).decl;
+                dyn_safe(c, d, span_of(c, n));
+                return c.t.dyn_ref(has_own(c, n, tk.Kind.KwMut), d);
+            }
             let elem = resolve_type(c, child(c, n, 0));
+            if c.t.kind(elem) == ty.Kind.Interface and not is_self_path(c, child(c, n, 0)) {
+                let s = span_of(c, n);
+                report(c, codes.INTERFACE_AS_TYPE, s, "a view of a value of any type that implements an interface is written '&dyn I'");
+                return ty.invalid();
+            }
             return c.t.reference(has_own(c, n, tk.Kind.KwMut), elem);
         }
         .TypeSlice => {
@@ -704,13 +808,122 @@ pub fn resolve_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
             return c.t.error_union(info.decl, elem);
         }
         .TypePath => {
-            return resolve_path_type(c, n);
+            let t = resolve_path_type(c, n);
+            if c.t.kind(t) == ty.Kind.Interface and not is_self_path(c, n) {
+                var m = new_message(c);
+                write_type(c, &mut m, t);
+                m.push_str(" is an interface, not a type of values; a view of a value that implements it is '&dyn ");
+                write_type(c, &mut m, t);
+                m.push_str("'");
+                let s = span_of(c, n);
+                report_owned(c, codes.INTERFACE_AS_TYPE, s, m);
+                return ty.invalid();
+            }
+            return t;
         }
         _ => {
             let s = span_of(c, n);
             report(c, codes.UNKNOWN_TYPE, s, "expected a type");
             return ty.invalid();
         }
+    }
+}
+
+/// The type node is `Self`, in an interface or an impl.
+fn is_self_path(c: &Checker, n: cst.NodeId) -> bool {
+    if not c.p.full or is_invalid(c, c.self_type) or kind_of(c, n) != cst.Kind.TypePath or child_count(c, n) > 0 {
+        return false;
+    }
+    let toks = own(c, n);
+    return toks.len() == 1 and text(c, toks[0]).eq("Self");
+}
+
+/// The interface a type node names, or invalid after reporting why not
+/// (spec/arche.md §5).
+pub fn resolve_interface(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
+    if kind_of(c, n) != cst.Kind.TypePath {
+        let s = span_of(c, n);
+        report(c, codes.BAD_IMPL, s, "expected an interface");
+        return ty.invalid();
+    }
+    let t = resolve_path_type(c, n);
+    if is_invalid(c, t) or c.t.kind(t) == ty.Kind.Interface {
+        return t;
+    }
+    var m = new_message(c);
+    write_type(c, &mut m, t);
+    m.push_str(" is not an interface");
+    let s = span_of(c, n);
+    report_owned(c, codes.BAD_IMPL, s, m);
+    return ty.invalid();
+}
+
+/// An interface is usable with dyn when its methods take self by
+/// reference, mention Self nowhere else and take no comptime arguments
+/// (spec/arche.md §5.3).
+fn dyn_safe(c: &mut Checker, d: u32, at: diag.Span) {
+    let decl = c.decls[d as usize];
+    var i = decl.methods_start;
+    while i < decl.methods_start + decl.methods_len : (i += 1) {
+        let md = c.methods[i as usize];
+        check_signature(c, md);
+        if c.decls[md as usize].fn_index == NONE {
+            continue;
+        }
+        let f = c.fns[c.decls[md as usize].fn_index as usize];
+        var fine = f.has_self and f.self_mode != SelfMode.Value and f.ncomptime == 0 and
+            not mentions(c, t: f.ret, x: decl.type_id, 0);
+        var k = f.params_start + 1;
+        while k < f.params_start + f.params_len : (k += 1) {
+            fine = fine and not mentions(c, t: c.params[k as usize].type_id, x: decl.type_id, 0);
+        }
+        if not fine {
+            var m = new_message(c);
+            write_decl_name(c, &mut m, d);
+            m.push_str(" cannot be used with dyn: its method '");
+            m.push_str(c.names.text(c.decls[md as usize].name));
+            m.push_str("' must take self as &Self or &mut Self and use Self nowhere else");
+            report_owned(c, codes.NOT_DYN_SAFE, at, m);
+            return;
+        }
+    }
+}
+
+/// Type t contains type x.
+fn mentions(c: &Checker, t: ty.TypeId, x: ty.TypeId, depth: u32) -> bool {
+    if t == x {
+        return true;
+    }
+    if depth > 32 {
+        return false;
+    }
+    let info = c.t.get(t);
+    match info.kind {
+        .Ref | .Slice | .Array | .List | .Optional | .ErrorUnion => { return mentions(c, t: info.elem, x: x, depth + 1); }
+        .Map => { return mentions(c, t: info.key, x: x, depth + 1) or mentions(c, t: info.elem, x: x, depth + 1); }
+        _ => { return false; }
+    }
+}
+
+/// Type t with x replaced by y: an interface's signature for one type.
+pub fn replace_type(c: &mut Checker, t: ty.TypeId, x: ty.TypeId, y: ty.TypeId) -> ty.TypeId {
+    if t == x {
+        return y;
+    }
+    let info = c.t.get(t);
+    match info.kind {
+        .Ref => { return c.t.reference(info.mutable, replace_type(c, t: info.elem, x: x, y: y)); }
+        .Slice => { return c.t.slice(info.mutable, replace_type(c, t: info.elem, x: x, y: y)); }
+        .Array => { return c.t.array(replace_type(c, t: info.elem, x: x, y: y), info.len); }
+        .List => { return c.t.list(replace_type(c, t: info.elem, x: x, y: y)); }
+        .Optional => { return c.t.optional(replace_type(c, t: info.elem, x: x, y: y)); }
+        .ErrorUnion => { return c.t.error_union(info.decl, replace_type(c, t: info.elem, x: x, y: y)); }
+        .Map => {
+            let k = replace_type(c, t: info.key, x: x, y: y);
+            let v = replace_type(c, t: info.elem, x: x, y: y);
+            return c.t.map(key: k, value: v);
+        }
+        _ => { return t; }
     }
 }
 
@@ -745,6 +958,9 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
         return ty.invalid();
     }
     let first = segments[0];
+    if segments.len() == 1 and nargs == 0 and c.p.full and not is_invalid(c, c.self_type) and text(c, first).eq("Self") {
+        return c.self_type;
+    }
     if segments.len() == 1 {
         let sym = symbol(c, first);
         match find_env(c, sym) {
@@ -968,9 +1184,20 @@ pub fn instantiate(c: &mut Checker, d: u32, args: &alloc.List(ArgVal), at: diag.
         let sym = symbol(c, ident_of(c, ps[i]));
         var t = given[i].type_id;
         if not given[i].is_type {
-            t = resolve_type(c, child(c, ps[i], 0));
+            t = comptime_param_type(c, ps[i]);
         }
         c.env.push(EnvEntry { name: sym, is_type: given[i].is_type, type_id: t, value: given[i].value });
+    }
+    // where T: I (spec/arche.md §5.2), with the arguments in scope.
+    c.env_start = env_start;
+    c.env_len = ps.len() as u32;
+    var unmet = new_message(c);
+    bounds_unmet(c, d, &mut unmet);
+    c.env_len = 0;
+    if unmet.len() > 0 {
+        restore_context(c, saved);
+        report_owned(c, codes.BOUND_UNMET, at, unmet);
+        return NONE;
     }
     var inst = c.decls[d as usize];
     inst.generic = false;
@@ -987,6 +1214,8 @@ pub fn instantiate(c: &mut Checker, d: u32, args: &alloc.List(ArgVal), at: diag.
         c.decls[id as usize].type_id = c.t.declared(ty.Kind.Enum, id);
     } else if k == DeclKind.ErrorSet {
         c.decls[id as usize].type_id = c.t.declared(ty.Kind.ErrorSet, id);
+    } else if k == DeclKind.Interface {
+        c.decls[id as usize].type_id = c.t.declared(ty.Kind.Interface, id);
     }
     if k == DeclKind.Fn {
         check_signature(c, id);
@@ -1006,6 +1235,69 @@ pub fn instantiate(c: &mut Checker, d: u32, args: &alloc.List(ArgVal), at: diag.
     }
     restore_context(c, saved);
     return id;
+}
+
+/// The where clause of a declaration, or NONE.
+fn where_clause(c: &Checker, n: cst.NodeId) -> cst.NodeId {
+    let count = child_count(c, n);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let ch = child(c, n, i);
+        if kind_of(c, ch) == cst.Kind.WhereClause {
+            return ch;
+        }
+    }
+    return cst.NodeId { index: NONE };
+}
+
+/// Says in m which bound of template d its arguments, in scope as env,
+/// do not meet; m stays empty when they meet every one.
+fn bounds_unmet(c: &mut Checker, d: u32, m: &mut alloc.String) {
+    let w = where_clause(c, c.decls[d as usize].node);
+    if w.index == NONE {
+        return;
+    }
+    let nb = child_count(c, w);
+    var i: u32 = 0;
+    while i < nb : (i += 1) {
+        let b = child(c, w, i);
+        let nt = first_own(c, b);
+        let sym = symbol(c, nt);
+        var arg = ty.invalid();
+        match find_env(c, sym) {
+            some(e) => {
+                if c.env[e as usize].is_type {
+                    arg = c.env[e as usize].type_id;
+                }
+            }
+            none => { }
+        }
+        if is_invalid(c, arg) {
+            let s = token_span(c, nt);
+            report(c, codes.BOUND_UNMET, s, "'where' constrains the comptime type parameters of its declaration");
+            continue;
+        }
+        let ni = child_count(c, b);
+        var k: u32 = 0;
+        while k < ni : (k += 1) {
+            let it = resolve_interface(c, child(c, b, k));
+            if is_invalid(c, it) or m.len() > 0 {
+                continue;
+            }
+            if not implements(c, arg, c.t.get(it).decl) {
+                m.push_str(text(c, nt));
+                m.push_str(" is ");
+                write_type(c, m, arg);
+                m.push_str(", which does not implement ");
+                write_type(c, m, it);
+                m.push_str(" (where ");
+                m.push_str(text(c, nt));
+                m.push_str(": ");
+                write_type(c, m, it);
+                m.push_str(")");
+            }
+        }
+    }
 }
 
 /// A comptime value written where a type argument may be: a literal, a
@@ -1089,7 +1381,7 @@ pub fn comptime_kinds(c: &mut Checker, d: u32) -> alloc.List(ArgVal) {
         if takes_type(c, ps[i]) {
             out.push(ArgVal { is_type: true, type_id: ty.invalid(), value: 0 });
         } else {
-            let vt = resolve_type(c, child(c, ps[i], 0));
+            let vt = comptime_param_type(c, ps[i]);
             out.push(ArgVal { is_type: false, type_id: vt, value: 0 });
         }
     }
@@ -1099,6 +1391,15 @@ pub fn comptime_kinds(c: &mut Checker, d: u32) -> alloc.List(ArgVal) {
 
 /// The number of leading Param children of a node: a generic type's comptime
 /// parameters come before its members.
+/// Where a type's fields start: after its parameters and where clause.
+fn members_from(c: &Checker, n: cst.NodeId) -> u32 {
+    let i = param_children(c, n);
+    if i < child_count(c, n) and kind_of(c, child(c, n, i)) == cst.Kind.WhereClause {
+        return i + 1;
+    }
+    return i;
+}
+
 fn param_children(c: &Checker, n: cst.NodeId) -> u32 {
     let count = child_count(c, n);
     var i: u32 = 0;
@@ -1132,6 +1433,7 @@ fn new_decl(kind: DeclKind, module: u32, n: cst.NodeId, name: alloc.Symbol, name
         template: NONE,
         env_start: 0,
         env_len: 0,
+        impl_index: NONE,
     };
 }
 
@@ -1234,6 +1536,9 @@ fn type_decl_kind(c: &Checker, n: cst.NodeId) -> DeclKind {
     if has_own(c, n, tk.Kind.KwError) {
         return DeclKind.ErrorSet;
     }
+    if has_own(c, n, tk.Kind.KwInterface) {
+        return DeclKind.Interface;
+    }
     return DeclKind.Alias;
 }
 
@@ -1273,6 +1578,15 @@ fn collect_items(c: &mut Checker) {
             collect_import(c, n);
             continue;
         }
+        if k == cst.Kind.ImplDecl {
+            c.impls.push(Impl { module: c.module, node: n, iface: NONE, target: ty.invalid(), methods_start: 0, methods_len: 0 });
+            continue;
+        }
+        if k == cst.Kind.FnSig {
+            let s = span_of(c, n);
+            report(c, codes.UNEXPECTED_TOKEN, s, "only the methods of an interface have no body");
+            continue;
+        }
         if k != cst.Kind.FnDecl and k != cst.Kind.ConstDecl and k != cst.Kind.TypeDecl {
             continue;
         }
@@ -1282,12 +1596,14 @@ fn collect_items(c: &mut Checker) {
         if k == cst.Kind.FnDecl {
             let id = add_item(c, new_decl(DeclKind.Fn, module: c.module, n, sym, name_token: nt, is_pub));
             c.decls[id as usize].generic = has_comptime_param(c, n);
+            check_comptime_params(c, n);
         } else if k == cst.Kind.ConstDecl {
             _ = add_item(c, new_decl(DeclKind.Const, module: c.module, n, sym, name_token: nt, is_pub));
         } else {
             let dk = type_decl_kind(c, n);
             let id = add_item(c, new_decl(dk, module: c.module, n, sym, name_token: nt, is_pub));
             if param_children(c, n) > 0 {
+                check_comptime_params(c, n);
                 c.decls[id as usize].generic = true; // a template has no type of its own
             } else if dk == DeclKind.Struct {
                 c.decls[id as usize].type_id = c.t.declared(ty.Kind.Struct, id);
@@ -1295,6 +1611,8 @@ fn collect_items(c: &mut Checker) {
                 c.decls[id as usize].type_id = c.t.declared(ty.Kind.Enum, id);
             } else if dk == DeclKind.ErrorSet {
                 c.decls[id as usize].type_id = c.t.declared(ty.Kind.ErrorSet, id);
+            } else if dk == DeclKind.Interface {
+                c.decls[id as usize].type_id = c.t.declared(ty.Kind.Interface, id);
             }
         }
     }
@@ -1370,7 +1688,19 @@ fn add_methods(c: &mut Checker, d: u32) {
     var i: u32 = 0;
     while i < count : (i += 1) {
         let f = child(c, n, i);
-        if kind_of(c, f) != cst.Kind.FnDecl {
+        let fk = kind_of(c, f);
+        let is_iface = c.decls[d as usize].kind == DeclKind.Interface;
+        if fk == cst.Kind.FnSig and not is_iface {
+            let s = span_of(c, f);
+            report(c, codes.UNEXPECTED_TOKEN, s, "only the methods of an interface have no body");
+            continue;
+        }
+        if fk == cst.Kind.FnDecl and is_iface {
+            let s = token_span(c, ident_of(c, f));
+            report(c, codes.UNEXPECTED_TOKEN, s, "an interface lists signatures: end this one with ';', and write the body in an impl");
+            continue;
+        }
+        if fk != cst.Kind.FnDecl and fk != cst.Kind.FnSig {
             continue;
         }
         let nt = ident_of(c, f);
@@ -1423,7 +1753,7 @@ fn resolve_members_here(c: &mut Checker, d: u32, n: cst.NodeId) {
     let decl = c.decls[d as usize];
     match decl.kind {
         .Struct => {
-            let run = add_fields(c, n, param_children(c, n));
+            let run = add_fields(c, n, members_from(c, n));
             c.decls[d as usize].members_start = run.start;
             c.decls[d as usize].members_len = run.len;
             add_methods(c, d);
@@ -1500,6 +1830,9 @@ fn resolve_members_here(c: &mut Checker, d: u32, n: cst.NodeId) {
         .Alias => {
             _ = decl_type(c, d);
         }
+        .Interface => {
+            add_methods(c, d);
+        }
         .Fn | .Const => { }
     }
 }
@@ -1567,6 +1900,13 @@ pub fn check_signature(c: &mut Checker, d: u32) {
 fn check_signature_here(c: &mut Checker, d: u32) {
     let decl = c.decls[d as usize];
     let n = decl.node;
+    if decl.template == NONE and decl.owner == NONE {
+        let w = where_clause(c, n);
+        if w.index != NONE {
+            let s = span_of(c, w);
+            report(c, codes.BOUND_UNMET, s, "'where' constrains comptime type parameters, and this function has none");
+        }
+    }
     var ncomptime: u32 = 0;
     // Collected first: resolving a type may make instances with
     // signatures of their own, which add parameters too.
@@ -1594,7 +1934,7 @@ fn check_signature_here(c: &mut Checker, d: u32) {
             }
             let pt = resolve_type(c, child(c, ch, 0));
             local.push(ParamInfo { name: sym, name_token: nt, type_id: pt });
-        } else if k != cst.Kind.Block {
+        } else if k != cst.Kind.Block and k != cst.Kind.WhereClause {
             ret = resolve_type(c, ch);
         }
     }
@@ -1648,6 +1988,211 @@ fn check_signature_here(c: &mut Checker, d: u32) {
     }
     c.decls[d as usize].fn_index = c.fns.len() as u32;
     c.fns.push(info);
+}
+
+// ---- impls (spec/arche.md §5.1) --------------------------------------------------
+
+/// Resolves each impl's interface and type, checks where it may be, and
+/// makes its functions methods of the type.
+fn resolve_impls(c: &mut Checker) {
+    var i: usize = 0;
+    while i < c.impls.len() : (i += 1) {
+        let im = c.impls[i];
+        c.module = im.module;
+        c.env_len = 0;
+        c.self_type = ty.invalid();
+        let it = resolve_interface(c, child(c, im.node, 0));
+        let target_node = child(c, im.node, 1);
+        let target = resolve_type(c, target_node);
+        if is_invalid(c, it) or is_invalid(c, target) {
+            continue;
+        }
+        let target_kind = c.t.kind(target);
+        if target_kind != ty.Kind.Struct and target_kind != ty.Kind.Enum {
+            var m = new_message(c);
+            write_type(c, &mut m, target);
+            m.push_str(" cannot implement an interface here: only the package's own struct and enum types do, for now");
+            let s = span_of(c, target_node);
+            report_owned(c, codes.BAD_IMPL, s, m);
+            continue;
+        }
+        let iface = c.t.get(it).decl;
+        let td = c.t.get(target).decl;
+        if c.decls[td as usize].module != im.module and c.decls[iface as usize].module != im.module {
+            var m = new_message(c);
+            m.push_str("impl ");
+            write_type(c, &mut m, it);
+            m.push_str(" for ");
+            write_type(c, &mut m, target);
+            m.push_str(" belongs in the module that declares one of them");
+            let s = span_of(c, im.node);
+            report_owned(c, codes.IMPL_PLACE, s, m);
+            continue;
+        }
+        var j: usize = 0;
+        var twice = false;
+        while j < i : (j += 1) {
+            twice = twice or (c.impls[j].iface == iface and c.impls[j].target == target);
+        }
+        if twice {
+            var m = new_message(c);
+            write_type(c, &mut m, target);
+            m.push_str(" already implements ");
+            write_type(c, &mut m, it);
+            let s = span_of(c, im.node);
+            report_owned(c, codes.IMPL_TWICE, s, m);
+            continue;
+        }
+        c.impls[i].iface = iface;
+        c.impls[i].target = target;
+        let start = c.methods.len() as u32;
+        let count = child_count(c, im.node);
+        var k: u32 = 2;
+        while k < count : (k += 1) {
+            let f = child(c, im.node, k);
+            if kind_of(c, f) != cst.Kind.FnDecl {
+                continue;
+            }
+            let nt = ident_of(c, f);
+            let sym = symbol(c, nt);
+            var q = start;
+            while q < c.methods.len() as u32 : (q += 1) {
+                if c.decls[c.methods[q as usize] as usize].name == sym {
+                    report_duplicate_member(c, nt, "function");
+                }
+            }
+            var md = new_decl(DeclKind.Fn, module: im.module, f, sym, name_token: nt, has_own(c, f, tk.Kind.KwPub));
+            md.owner = td;
+            md.impl_index = i as u32;
+            md.env_start = c.decls[td as usize].env_start;
+            md.env_len = c.decls[td as usize].env_len;
+            c.methods.push(c.decls.len() as u32);
+            c.decls.push(md);
+        }
+        c.impls[i].methods_start = start;
+        c.impls[i].methods_len = c.methods.len() as u32 - start;
+    }
+}
+
+fn method_named(c: &Checker, start: u32, len: u32, name: alloc.Symbol) -> u32 {
+    var i = start;
+    while i < start + len : (i += 1) {
+        let m = c.methods[i as usize];
+        if c.decls[m as usize].name == name {
+            return m;
+        }
+    }
+    return NONE;
+}
+
+fn report_impl(c: &mut Checker, module: u32, s: diag.Span, m: alloc.String) {
+    let saved = c.module;
+    c.module = module;
+    report_owned(c, codes.IMPL_MISMATCH, s, m);
+    c.module = saved;
+}
+
+/// Each impl has the interface's methods, with Self as its type, and no
+/// others (spec/arche.md §5.1).
+fn check_impls(c: &mut Checker) {
+    var i: usize = 0;
+    while i < c.impls.len() : (i += 1) {
+        let im = c.impls[i];
+        if im.iface == NONE {
+            continue;
+        }
+        let iface = c.decls[im.iface as usize];
+        let owner = c.decls[c.t.get(im.target).decl as usize];
+        // The interface's own methods.
+        var k = iface.methods_start;
+        while k < iface.methods_start + iface.methods_len : (k += 1) {
+            let want_d = c.methods[k as usize];
+            let found = method_named(c, start: im.methods_start, len: im.methods_len, c.decls[want_d as usize].name);
+            if found == NONE {
+                c.module = im.module;
+                var m = new_message(c);
+                m.push_str("this impl is missing the method '");
+                m.push_str(c.names.text(c.decls[want_d as usize].name));
+                m.push_str("' of ");
+                write_decl_name(c, &mut m, im.iface);
+                let s = token_span(c, first_own(c, im.node));
+                report_impl(c, im.module, s, m);
+                continue;
+            }
+            check_signature(c, want_d);
+            check_signature(c, found);
+            let want = c.fns[c.decls[want_d as usize].fn_index as usize];
+            let got = c.fns[c.decls[found as usize].fn_index as usize];
+            var same = want.params_len == got.params_len and want.ncomptime == got.ncomptime and
+                replace_type(c, t: want.ret, x: iface.type_id, y: im.target) == got.ret;
+            var p: u32 = 0;
+            while same and p < want.params_len : (p += 1) {
+                let wp = c.params[(want.params_start + p) as usize];
+                let gp = c.params[(got.params_start + p) as usize];
+                same = wp.name == gp.name and replace_type(c, t: wp.type_id, x: iface.type_id, y: im.target) == gp.type_id;
+            }
+            if not same {
+                c.module = im.module;
+                var m = new_message(c);
+                m.push_str("'");
+                m.push_str(c.names.text(c.decls[found as usize].name));
+                m.push_str("' differs from the interface's: its parameters, their names and the result are those of ");
+                write_decl_name(c, &mut m, im.iface);
+                m.push_str(", with Self as ");
+                write_type(c, &mut m, im.target);
+                let s = token_span(c, c.decls[found as usize].name_token);
+                report_impl(c, im.module, s, m);
+            }
+        }
+        // Methods the interface does not have, or the type has already.
+        var q = im.methods_start;
+        while q < im.methods_start + im.methods_len : (q += 1) {
+            let md = c.methods[q as usize];
+            let name = c.decls[md as usize].name;
+            c.module = im.module;
+            if method_named(c, start: iface.methods_start, len: iface.methods_len, name) == NONE {
+                var m = new_message(c);
+                m.push_str("'");
+                m.push_str(c.names.text(name));
+                m.push_str("' is not a method of ");
+                write_decl_name(c, &mut m, im.iface);
+                m.push_str("; an impl has only the interface's methods");
+                let s = token_span(c, c.decls[md as usize].name_token);
+                report_impl(c, im.module, s, m);
+            } else if method_named(c, start: owner.methods_start, len: owner.methods_len, name) != NONE {
+                var m = new_message(c);
+                write_type(c, &mut m, im.target);
+                m.push_str(" has a method '");
+                m.push_str(c.names.text(name));
+                m.push_str("' of its own already");
+                let s = token_span(c, c.decls[md as usize].name_token);
+                report_impl(c, im.module, s, m);
+            }
+        }
+    }
+}
+
+/// The method `name` of the impl of iface for t, or NONE.
+pub fn impl_method(c: &Checker, t: ty.TypeId, iface: u32, name: alloc.Symbol) -> u32 {
+    var i: usize = 0;
+    while i < c.impls.len() : (i += 1) {
+        let im = c.impls[i];
+        if im.iface == iface and im.target == t {
+            return method_named(c, start: im.methods_start, len: im.methods_len, name);
+        }
+    }
+    return NONE;
+}
+
+/// Type t implements the interface declared by iface.
+pub fn implements(c: &Checker, t: ty.TypeId, iface: u32) -> bool {
+    var i: usize = 0;
+    while i < c.impls.len() : (i += 1) {
+        if c.impls[i].iface == iface and c.impls[i].target == t {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn check_main(c: &mut Checker) {
@@ -1756,6 +2301,8 @@ pub fn analyze(p: program.Program) -> Checker {
         pending: alloc.List(u32).init(a),
         arg_offset: 0,
         checked: alloc.Map(u32, bool).init(a),
+        impls: alloc.List(Impl).init(a),
+        self_type: ty.invalid(),
         a: a,
     };
     add_io_error(&mut c);
@@ -1786,6 +2333,7 @@ pub fn analyze(p: program.Program) -> Checker {
             resolve_members(&mut c, d as u32);
         }
     }
+    resolve_impls(&mut c);
     var path = alloc.List(u32).init(a);
     var done = alloc.Map(u32, bool).init(a);
     d = 0;
@@ -1808,6 +2356,7 @@ pub fn analyze(p: program.Program) -> Checker {
         }
     }
     check_main(&mut c);
+    check_impls(&mut c);
     let nfns = c.fns.len();
     var f: usize = 0;
     while f < nfns : (f += 1) {
