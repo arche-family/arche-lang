@@ -559,7 +559,7 @@ fn element(l: &mut lw.Lower, e: cst.NodeId) -> u32 {
     let i = value(l, child(l, e, 1)).v;
     let r = run_of(l, bt, addr);
     lw.check(l, lw.cmp(l, ir.CmpKind.ULt, x: i, y: r.len), "index out of range", e);
-    let size = size_of(l, l.c.t.elem(bt));
+    let size = size_of(l, ck.indexed_elem(&l.c, bt));
     return lw.gep_index(l, addr: r.data, index: i, size);
 }
 
@@ -587,7 +587,7 @@ fn slice(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
         let both = lw.bin(l, ir.BinKind.And, x: at_a, y: at_b);
         lw.check(l, lw.cmp(l, ir.CmpKind.Ne, x: both, y: lw.konst(l, ir.Ty.I8, 0)), "slice is not on a character boundary", e);
     } else {
-        size = size_of(l, l.c.t.elem(bt));
+        size = size_of(l, ck.indexed_elem(&l.c, bt));
     }
     let tmp = lw.alloca(l, type_of(l, e));
     lw.store(l, value: lw.gep_index(l, addr: r.data, index: a, size), addr: tmp);
@@ -1056,8 +1056,66 @@ pub fn self_address(l: &mut lw.Lower, receiver: cst.NodeId) -> u32 {
     return in_memory(l, t, value(l, receiver));
 }
 
+/// A function of core.mem, which the compiler writes in place (lib/core/mem.arche).
+fn intrinsic(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
+    let decl = l.c.decls[d as usize];
+    var name = alloc.String.init(l.a);
+    name.push_str(l.c.names.text(decl.name));
+    let nm = name.view();
+    let info = l.c.fns[decl.fn_index as usize];
+    var t = ty.invalid();
+    if decl.env_len > 0 {
+        t = l.c.env[decl.env_start as usize].type_id;
+    }
+    let rt = type_of(l, n);
+    if nm.eq("size_of") {
+        return scalar_val(lw.konst(l, ir.Ty.I64, layout.layout(&l.c, t).size));
+    }
+    if nm.eq("align_of") {
+        return scalar_val(lw.konst(l, ir.Ty.I64, layout.layout(&l.c, t).align));
+    }
+    if nm.eq("null") {
+        return scalar_val(lw.konst(l, ir.Ty.Ptr, 0));
+    }
+    let a0 = value(l, runtime_arg(l, n, offset: info.ncomptime, i: 0));
+    if nm.eq("str_from") {
+        return lw.own_val(l, rt, a0);
+    }
+    if nm.eq("bytes_of") {
+        let tmp = lw.alloca(l, rt);
+        lw.store(l, value: a0.v, addr: tmp);
+        lw.store(l, value: lw.konst(l, ir.Ty.I64, layout.layout(&l.c, t).size), addr: lw.gep(l, tmp, 8));
+        return fresh_val(tmp);
+    }
+    let a1 = value(l, runtime_arg(l, n, offset: info.ncomptime, i: 1));
+    if nm.eq("alloc") {
+        var args = lw.args0(l);
+        args.push(a0.v);
+        args.push(a1.v);
+        return scalar_val(lw.call_runtime(l, "a0rt_alloc_in", ir.Ty.Ptr, &args));
+    }
+    if nm.eq("slice") or nm.eq("slice_mut") {
+        let tmp = lw.alloca(l, rt);
+        lw.store(l, value: a0.v, addr: tmp);
+        lw.store(l, value: a1.v, addr: lw.gep(l, tmp, 8));
+        return fresh_val(tmp);
+    }
+    // copy
+    let a2 = value(l, runtime_arg(l, n, offset: info.ncomptime, i: 2));
+    var args = lw.args0(l);
+    args.push(a0.v);
+    args.push(a1.v);
+    args.push(a2.v);
+    _ = lw.call_runtime(l, "a0rt_memmove", ir.Ty.Void, &args);
+    return nothing();
+}
+
 fn call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
     let callee = child(l, n, 0);
+    let intrinsic_d = ck.ref_of(&l.c, n);
+    if intrinsic_d != ck.NONE and ck.is_intrinsic(&l.c, intrinsic_d) {
+        return intrinsic(l, n, intrinsic_d);
+    }
     if kind(l, callee) == cst.Kind.NameExpr and not ck.is_invalid(&l.c, type_of(l, callee)) {
         return closure_call(l, n);
     }
@@ -1370,7 +1428,13 @@ fn library_method(l: &mut lw.Lower, n: cst.NodeId, nm: str, b: ty.Builtin, r: u3
                 str_parts(l, data, &mut args);
                 return scalar_val(lw.call_runtime(l, "a0rt_write_file", ir.Ty.I16, &args));
             }
-            args.push(value(l, arg_node(l, n, 1)).v);
+            // The allocator's handle: a u64, also inside lib/alloc's Allocator.
+            let av = value(l, arg_node(l, n, 1));
+            if av.scalar {
+                args.push(av.v);
+            } else {
+                args.push(lw.load(l, ir.Ty.I64, av.v));
+            }
             let tmp = lw.alloca(l, type_of(l, n));
             args.push(tmp);
             var rtname = "a0rt_read_file";

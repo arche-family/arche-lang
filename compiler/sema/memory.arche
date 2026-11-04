@@ -73,6 +73,9 @@ fn move_only_within(c: &ck.Checker, t: ty.TypeId, depth: u32) -> bool {
         .Array | .Optional => { return move_only_within(c, info.elem, depth + 1); }
         .ErrorUnion => { return move_only_within(c, info.elem, depth + 1); }
         .Struct => {
+            if ck.is_unique(c, t) {
+                return true;
+            }
             let d = c.decls[info.decl as usize];
             var i = d.members_start;
             while i < d.members_start + d.members_len : (i += 1) {
@@ -1011,7 +1014,7 @@ fn view_of(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId) -> View {
         }
         .SliceExpr => {
             let base = ck.child(c, e, 0);
-            let k = c.t.kind(ck.type_of(c, base));
+            let k = ck.indexed_kind(c, ck.type_of(c, base));
             if k == ty.Kind.Array or k == ty.Kind.List {
                 var out = alloc.String.init(c.a);
                 let found = place(c, f, base, &mut out);
@@ -1464,7 +1467,7 @@ fn assign(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
 /// A container or allocator carries the region it was made with.
 fn carries_region(c: &ck.Checker, t: ty.TypeId) -> bool {
     let info = c.t.get(t);
-    return is_move_only(c, t) or (info.kind == ty.Kind.Builtin and info.builtin == ty.Builtin.Allocator);
+    return is_move_only(c, t) or ck.is_allocator(c, t);
 }
 
 /// The inner of two regions: the one declared later; NONE is no region.

@@ -757,7 +757,7 @@ pub fn find_field(c: &mut ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> Field
         } else if n.eq("args") {
             r.type_id = c.t.builtin(ty.Builtin.Args);
         } else if n.eq("alloc") {
-            r.type_id = c.t.builtin(ty.Builtin.Allocator);
+            r.type_id = ck.alloc_type(c, "Allocator");
         } else {
             return r;
         }
@@ -1148,17 +1148,17 @@ fn library_method(c: &mut ck.Checker, b: ty.Builtin, name: str) -> ?Method {
             }
         }
         .Fs => {
-            let alloc_t = c.t.builtin(ty.Builtin.Allocator);
+            let alloc_t = ck.alloc_type(c, "Allocator");
             let path_p = param(c, "path", ty.str_type());
             if name.eq("read_file") {
                 let a = param(c, "a", alloc_t);
-                let string_t = c.t.builtin(ty.Builtin.String);
+                let string_t = ck.alloc_type(c, "String");
                 let r = c.t.error_union(c.io_error, string_t);
                 return method2(c, shared, p0: path_p, p1: a, r);
             }
             if name.eq("read_bytes") {
                 let a = param(c, "a", alloc_t);
-                let bytes = c.t.list(ty.int_type(ty.IntKind.U8));
+                let bytes = ck.alloc_list(c, ty.int_type(ty.IntKind.U8));
                 let r = c.t.error_union(c.io_error, bytes);
                 return method2(c, shared, p0: path_p, p1: a, r);
             }
@@ -1705,7 +1705,7 @@ pub fn is_place(c: &mut ck.Checker, e: cst.NodeId) -> bool {
             if k == ty.Kind.Slice {
                 return true;
             }
-            return (k == ty.Kind.Array or k == ty.Kind.List) and is_place(c, base);
+            return (k == ty.Kind.Array or k == ty.Kind.List or ck.indexed_kind(c, ck.type_of(c, base)) == ty.Kind.List) and is_place(c, base);
         }
         _ => { return false; }
     }
@@ -1770,8 +1770,8 @@ fn check_index(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     let bt = check(c, ck.child(c, n, 0), none);
     check_value(c, ck.child(c, n, 1), ty.int_type(ty.IntKind.Usize));
     let info = c.t.get(bt);
-    match info.kind {
-        .Array | .Slice | .List => { return info.elem; }
+    match ck.indexed_kind(c, bt) {
+        .Array | .Slice | .List => { return ck.indexed_elem(c, bt); }
         .Str => { return ty.int_type(ty.IntKind.U8); }
         .Invalid => { return bt; }
         _ => { return not_indexable(c, n, bt, " cannot be indexed"); }
@@ -1784,8 +1784,7 @@ fn check_slice(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     let usize_t = ty.int_type(ty.IntKind.Usize);
     check_value(c, ck.child(c, n, 1), usize_t);
     check_value(c, ck.child(c, n, 2), usize_t);
-    let info = c.t.get(bt);
-    match info.kind {
+    match ck.indexed_kind(c, bt) {
         .Str => { return bt; }
         .Slice => { return bt; }
         .Array | .List => {
@@ -1793,7 +1792,7 @@ fn check_slice(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
                 return not_indexable(c, n, bt, " can be sliced only as a place: store it in a variable first");
             }
             let mutable = place_mutable(c, base);
-            return c.t.slice(mutable, info.elem);
+            return c.t.slice(mutable, ck.indexed_elem(c, bt));
         }
         .Invalid => { return bt; }
         _ => { return not_indexable(c, n, bt, " cannot be sliced"); }

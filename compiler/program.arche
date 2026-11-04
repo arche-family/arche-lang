@@ -59,6 +59,9 @@ pub type Program = struct {
     /// The package has a manifest, package.arche, at its root: it is full
     /// Arche (spec/arche.md §1). Without one it is Arche-0.
     pub full: bool,
+    /// alloc is the library's (lib/alloc.arche), not the compiler's
+    /// built-in one: in a full-Arche package, or when asked for.
+    pub lib_alloc: bool,
     root_dir: alloc.String,
 
     pub fn module(self: &Program, id: ModuleId) -> &Module {
@@ -172,7 +175,7 @@ fn import_path(m: &Module, node: cst.NodeId, a: alloc.Allocator) -> ImportPath {
 }
 
 /// The imports of a module that name package modules, not library roots.
-fn package_imports(m: &Module, a: alloc.Allocator) -> alloc.List(ImportPath) {
+fn package_imports(m: &Module, a: alloc.Allocator, lib_alloc: bool) -> alloc.List(ImportPath) {
     var out = alloc.List(ImportPath).init(a);
     let file_node = m.tree.node(m.tree.root);
     var c: u32 = 0;
@@ -180,7 +183,7 @@ fn package_imports(m: &Module, a: alloc.Allocator) -> alloc.List(ImportPath) {
         let item = m.tree.child(file_node, c);
         if m.tree.node(item).kind == cst.Kind.Import {
             let ip = import_path(m, item, a);
-            if not ip.library {
+            if not ip.library or (lib_alloc and ip.dotted.view().eq("alloc")) {
                 out.push(ip);
             }
         }
@@ -191,12 +194,13 @@ fn package_imports(m: &Module, a: alloc.Allocator) -> alloc.List(ImportPath) {
 /// Starts from the root file, whose text the caller has read, and loads,
 /// breadth first, every module it imports.
 /// lib is the library's directory, ending with '/'.
-pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, lib: str) -> Program {
+pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, lib: str, lib_alloc: bool) -> Program {
     var p = Program {
         modules: alloc.List(Module).init(a),
         diags: diag.Diagnostics.init(a),
         a: a,
         full: false,
+        lib_alloc: lib_alloc,
         root_dir: alloc.String.init(a),
     };
     var slash: ?usize = none;
@@ -218,7 +222,10 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, lib:
     manifest.push_str(p.root_dir.view());
     manifest.push_str("package.arche");
     match fs.read_bytes(manifest.view(), a) {
-        ok(_) => { p.full = true; }
+        ok(_) => {
+            p.full = true;
+            p.lib_alloc = true;
+        }
         err(_) => { }
     }
     var stem = base;
@@ -236,7 +243,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, lib:
     while next < p.modules.len() : (next += 1) {
         // The imports are collected first: adding a module grows p.modules,
         // so no view of a module may be live then (§5.4).
-        let imports = package_imports(&p.modules[next], a);
+        let imports = package_imports(&p.modules[next], a, lib_alloc: p.lib_alloc);
         let ips = imports.items();
         var c: usize = 0;
         while c < ips.len() : (c += 1) {
@@ -247,7 +254,8 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, lib:
             }
             // core and its modules come from the library (spec/arche.md
             // §1.1): full Arche, whatever the package is.
-            let from_lib = ip.dotted.view().eq("core") or ip.dotted.view().starts_with("core.");
+            let from_lib = ip.dotted.view().eq("core") or ip.dotted.view().starts_with("core.") or
+                (p.lib_alloc and ip.dotted.view().eq("alloc"));
             var full = alloc.String.init(a);
             var shown = alloc.String.init(a);
             if from_lib {

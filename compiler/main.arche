@@ -133,9 +133,10 @@ fn check(
     path: str,
     json: bool,
     lib: str,
+    lib_alloc: bool,
 ) -> Failure!void {
     let source = try read(fs, err_out, path, a);
-    var p = program.load(fs, path: path, source, a, lib: lib);
+    var p = program.load(fs, path: path, source, a, lib: lib, lib_alloc: lib_alloc);
     if p.diags.count() == 0 {
         p = sema.check(p);
     }
@@ -149,9 +150,9 @@ fn check(
     }
 }
 
-fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, out_path: str, lib: str) -> Failure!void {
+fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, out_path: str, lib: str, lib_alloc: bool) -> Failure!void {
     let source = try read(fs, err_out, path, a);
-    let p = program.load(fs, path: path, source, a, lib: lib);
+    let p = program.load(fs, path: path, source, a, lib: lib, lib_alloc: lib_alloc);
     if p.diags.count() > 0 {
         program.write_diagnostics(err_out, &p, false);
         return Failure.ErrorsFound;
@@ -248,17 +249,27 @@ fn main(sys: &mut std.System) -> !void {
         try usage(&mut sys.stderr);
     }
     let lib = find_lib(&sys.fs, sys.args.get(0), sys.alloc);
-    let command = sys.args.get(1);
-    if command.eq("check") and n == 4 and sys.args.get(2).eq("--json") {
-        try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3), json: true, lib: lib.view());
-    } else if command.eq("check") and n == 3 {
-        try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2), json: false, lib: lib.view());
-    } else if command.eq("tokens") and n == 3 {
-        try dump_tokens(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2));
-    } else if command.eq("build") and n == 4 {
-        try build(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2), out_path: sys.args.get(3), lib: lib.view());
-    } else if command.eq("cst") and n == 3 {
-        try print_cst(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2));
+    // ARCHE_LIB_ALLOC is not read from the environment: Arche-0 has none.
+    // --lib-alloc as the first argument builds Arche-0 code on lib/alloc.
+    var lib_alloc = false;
+    var first: usize = 1;
+    if sys.args.get(1).eq("--lib-alloc") {
+        lib_alloc = true;
+        first = 2;
+    }
+    let k = first - 1;
+    let count = n - k;
+    let command = sys.args.get(first);
+    if command.eq("check") and count == 4 and sys.args.get(2 + k).eq("--json") {
+        try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3 + k), json: true, lib: lib.view(), lib_alloc: lib_alloc);
+    } else if command.eq("check") and count == 3 {
+        try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), json: false, lib: lib.view(), lib_alloc: lib_alloc);
+    } else if command.eq("tokens") and count == 3 {
+        try dump_tokens(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));
+    } else if command.eq("build") and count == 4 {
+        try build(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), out_path: sys.args.get(3 + k), lib: lib.view(), lib_alloc: lib_alloc);
+    } else if command.eq("cst") and count == 3 {
+        try print_cst(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));
     } else {
         try usage(&mut sys.stderr);
     }

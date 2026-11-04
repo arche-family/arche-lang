@@ -273,6 +273,26 @@ pub fn is_nopanic_fn(c: &Checker, d: u32) -> bool {
     }
 }
 
+/// d is a function of core.mem, which the compiler provides (lib/core/mem.arche),
+/// or an instance of one.
+pub fn is_intrinsic(c: &Checker, d: u32) -> bool {
+    var decl = c.decls[d as usize];
+    if decl.template != NONE {
+        decl = c.decls[decl.template as usize];
+    }
+    return decl.kind == DeclKind.Fn and decl.owner == NONE and c.p.modules[decl.module as usize].name.view().eq("core.mem");
+}
+
+/// t is core.Unique, the mark of move-only values (spec/arche.md §11.1).
+pub fn is_unique(c: &Checker, t: ty.TypeId) -> bool {
+    let info = c.t.get(t);
+    if info.kind != ty.Kind.Struct {
+        return false;
+    }
+    let decl = c.decls[info.decl as usize];
+    return c.names.text(decl.name).eq("Unique") and c.p.modules[decl.module as usize].name.view().eq("core");
+}
+
 /// Declaration d is an unsafe fn.
 pub fn is_unsafe_fn(c: &Checker, d: u32) -> bool {
     let decl = c.decls[d as usize];
@@ -928,6 +948,103 @@ pub fn is_predeclared(name: str) -> bool {
     return name.eq("panic") or name.eq("assert") or name.eq("unreachable");
 }
 
+// ---- alloc as a library (lib/alloc.arche) ----------------------------------------
+
+/// The module of lib/alloc.arche, when alloc is the library's.
+fn alloc_module(c: &Checker) -> ?u32 {
+    if not c.p.lib_alloc {
+        return none;
+    }
+    match c.p.find("alloc") {
+        some(id) => { return id.index; }
+        none => { return none; }
+    }
+}
+
+/// alloc's type `name`: the library's, or the compiler's built-in one.
+pub fn alloc_type(c: &mut Checker, name: str) -> ty.TypeId {
+    match alloc_module(c) {
+        some(m) => {
+            let sym = c.names.intern(name);
+            match find_item(c, m, sym) {
+                some(d) => { return decl_type(c, d); }
+                none => { }
+            }
+        }
+        none => { }
+    }
+    if name.eq("Allocator") { return c.t.builtin(ty.Builtin.Allocator); }
+    if name.eq("String") { return c.t.builtin(ty.Builtin.String); }
+    if name.eq("Interner") { return c.t.builtin(ty.Builtin.Interner); }
+    return c.t.builtin(ty.Builtin.Symbol);
+}
+
+/// alloc.List(elem).
+pub fn alloc_list(c: &mut Checker, elem: ty.TypeId) -> ty.TypeId {
+    match alloc_module(c) {
+        some(m) => {
+            let sym = c.names.intern("List");
+            match find_item(c, m, sym) {
+                some(d) => {
+                    var args = alloc.List(ArgVal).init(c.a);
+                    args.push(ArgVal { is_type: true, type_id: elem, value: 0 });
+                    let inst = instantiate(c, d, &args, at: diag.Span { start: 0, len: 0 });
+                    if inst != NONE {
+                        return c.decls[inst as usize].type_id;
+                    }
+                }
+                none => { }
+            }
+        }
+        none => { }
+    }
+    return c.t.list(elem);
+}
+
+/// t is an instance of the library's List: indexed and sliced like
+/// Arche-0's List (spec/arche-0.md §7.7).
+fn is_lib_list(c: &Checker, t: ty.TypeId) -> bool {
+    let info = c.t.get(t);
+    if info.kind != ty.Kind.Struct or not c.p.lib_alloc {
+        return false;
+    }
+    let d = c.decls[info.decl as usize];
+    if d.template == NONE {
+        return false;
+    }
+    let tmpl = c.decls[d.template as usize];
+    return c.names.text(tmpl.name).eq("List") and c.p.modules[tmpl.module as usize].name.view().eq("alloc");
+}
+
+/// The kind of a type as indexing sees it: List for the library's List.
+pub fn indexed_kind(c: &Checker, t: ty.TypeId) -> ty.Kind {
+    if is_lib_list(c, t) {
+        return ty.Kind.List;
+    }
+    return c.t.kind(t);
+}
+
+/// The element type of an array, slice or list.
+pub fn indexed_elem(c: &Checker, t: ty.TypeId) -> ty.TypeId {
+    if is_lib_list(c, t) {
+        return c.env[c.decls[c.t.get(t).decl as usize].env_start as usize].type_id;
+    }
+    return c.t.elem(t);
+}
+
+/// t is alloc.Allocator, built in or the library's.
+pub fn is_allocator(c: &Checker, t: ty.TypeId) -> bool {
+    let info = c.t.get(t);
+    if info.kind == ty.Kind.Builtin {
+        return info.builtin == ty.Builtin.Allocator;
+    }
+    if info.kind != ty.Kind.Struct {
+        return false;
+    }
+    let d = c.decls[info.decl as usize];
+    return c.names.text(d.name).eq("Allocator") and c.p.modules[d.module as usize].name.view().eq("alloc");
+}
+
 /// A type of §11 by its library and name.
 pub fn library_type(c: &mut Checker, lib: Library, name: str) -> ?ty.TypeId {
     if lib == Library.Std {
@@ -1388,6 +1505,19 @@ fn arg_bits(a: ArgVal) -> u64 {
 /// The instance of template d for these arguments: made and checked the
 /// first time, then reused. NONE when the arguments do not fit.
 pub fn instantiate(c: &mut Checker, d: u32, args: &alloc.List(ArgVal), at: diag.Span) -> u32 {
+    // lib/alloc's Map hashes and compares keys byte by byte, so its keys
+    // are key types, as Arche-0's Map's are (spec/arche-0.md §5.5).
+    let tmpl = c.decls[d as usize];
+    let key_args = args.items();
+    if c.p.lib_alloc and c.names.text(tmpl.name).eq("Map") and c.p.modules[tmpl.module as usize].name.view().eq("alloc") and
+        not c.p.modules[c.module as usize].name.view().eq("alloc") and
+        key_args.len() == 2 and key_args[0].is_type and not is_key(c, key_args[0].type_id) {
+        var m = new_message(c);
+        write_type(c, &mut m, key_args[0].type_id);
+        m.push_str(" cannot be a Map key (§5.5)");
+        report_owned(c, codes.BAD_KEY, at, m);
+        return NONE;
+    }
     let saved = save_context(c);
     enter_decl(c, d);
     c.env_len = 0;
@@ -1730,6 +1860,9 @@ fn collect_import(c: &mut Checker, n: cst.NodeId) {
     }
     let first = text(c, items[1]);
     var alias = Alias { library: library_of(first), module: 0 };
+    if alias.library == Library.Alloc and c.p.lib_alloc {
+        alias.library = Library.NotLibrary; // lib/alloc.arche, a module
+    }
     let s = span_of(c, n);
     if (first.eq("core") and not full(c)) or (alias.library != Library.NotLibrary and segments > 1) {
         report(c, codes.BAD_IMPORT, s, "Arche-0 provides only the modules 'std' and 'alloc'");
@@ -1848,18 +1981,18 @@ fn collect_items(c: &mut Checker) {
             c.impls.push(Impl { module: c.module, node: n, iface: NONE, target: ty.invalid(), methods_start: 0, methods_len: 0 });
             continue;
         }
-        if k == cst.Kind.FnSig {
+        if k == cst.Kind.FnSig and not c.p.modules[c.module as usize].name.view().eq("core.mem") {
             let s = span_of(c, n);
             report(c, codes.UNEXPECTED_TOKEN, s, "only the methods of an interface have no body");
             continue;
         }
-        if k != cst.Kind.FnDecl and k != cst.Kind.ConstDecl and k != cst.Kind.TypeDecl {
+        if k != cst.Kind.FnDecl and k != cst.Kind.FnSig and k != cst.Kind.ConstDecl and k != cst.Kind.TypeDecl {
             continue;
         }
         let nt = ident_of(c, n);
         let sym = symbol(c, nt);
         let is_pub = has_own(c, n, tk.Kind.KwPub);
-        if k == cst.Kind.FnDecl {
+        if k == cst.Kind.FnDecl or k == cst.Kind.FnSig {
             let id = add_item(c, new_decl(DeclKind.Fn, module: c.module, n, sym, name_token: nt, is_pub));
             c.decls[id as usize].generic = has_comptime_param(c, n);
             check_comptime_params(c, n);

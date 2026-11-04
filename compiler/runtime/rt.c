@@ -174,6 +174,24 @@ void *a0rt_alloc(u64 n) {
     return alloc_in(0, n);
 }
 
+// core.mem.alloc (lib/core/mem.arche): zeroed memory from an allocator.
+void *a0rt_alloc_in(u64 allocator, u64 n) {
+    return alloc_in(allocator, n);
+}
+
+// core.mem.copy: n bytes, which may overlap.
+void a0rt_memmove(u8 *dst, const u8 *src, u64 n) {
+    if (dst < src) {
+        for (u64 i = 0; i < n; i++) {
+            dst[i] = src[i];
+        }
+    } else {
+        for (u64 i = n; i > 0; i--) {
+            dst[i - 1] = src[i - 1];
+        }
+    }
+}
+
 static void *grow_in(u64 allocator, void *old, u64 old_bytes, u64 new_bytes) {
     void *p = alloc_in(allocator, new_bytes);
     if (old && old_bytes) {

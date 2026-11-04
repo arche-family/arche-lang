@@ -1,0 +1,32 @@
+/// Memory primitives: the compiler provides these functions itself, which
+/// is why they have no bodies. Everything that reads or writes raw memory
+/// is unsafe (spec/arche.md §10.1). alloc builds its containers on them.
+
+/// The size of a value of type T, in bytes (docs/abi.md).
+pub fn size_of(comptime T: type) -> usize;
+
+/// The alignment of a value of type T.
+pub fn align_of(comptime T: type) -> usize;
+
+/// A pointer to nothing: what an empty container holds.
+pub fn null(comptime T: type) -> *mut T;
+
+/// The bytes of a value: a view of it. Padding is zero (docs/abi.md), so
+/// equal plain values have equal bytes.
+pub fn bytes_of(comptime T: type, x: &T) -> []u8;
+
+/// size zeroed bytes from the allocator whose handle is given, aligned to
+/// 16. The program's allocator never frees them; a region's frees them
+/// when it ends.
+pub unsafe fn alloc(handle: u64, size: usize) -> *mut u8;
+
+/// Copies n bytes from src to dst; the two may overlap.
+pub unsafe fn copy(dst: *mut u8, src: *u8, n: usize);
+
+/// n elements at p, as a slice.
+pub unsafe fn slice(comptime T: type, p: *T, len: usize) -> []T;
+
+pub unsafe fn slice_mut(comptime T: type, p: *mut T, len: usize) -> []mut T;
+
+/// UTF-8 bytes as text, unchecked: the caller knows they are UTF-8.
+pub unsafe fn str_from(b: []u8) -> str;

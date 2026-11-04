@@ -1,0 +1,408 @@
+/// alloc: containers that own memory from an allocator (spec/arche-0.md
+/// §11, spec/arche.md §1.1). The types and signatures are Arche-0's; they
+/// are written here in Arche over core.mem instead of being built into
+/// the compiler. Every container holds a core.Unique, so it is move-only.
+import core;
+import core.mem;
+
+/// Where a container's memory comes from: the program's allocator
+/// (sys.alloc), or a region's (spec/arche.md §7). A handle, copied freely.
+pub type Allocator = struct {
+    handle: u64,
+}
+
+/// The bytes of a list's elements: a size the allocator can hand out.
+fn bytes_for(count: usize, size: usize) -> usize {
+    if size != 0 and count > 18446744073709551615 / size {
+        panic("container too large");
+    }
+    return count * size;
+}
+
+/// A growable array: data holds cap elements, of which the first len are
+/// in use (docs/abi.md: {data, len, cap, allocator}).
+pub type List(comptime T: type) = struct {
+    data: *mut T,
+    used: usize,
+    cap: usize,
+    allocator: Allocator,
+    unique: core.Unique,
+
+    pub fn init(a: Allocator) -> List(T) {
+        return List(T) { data: mem.null(T), used: 0, cap: 0, allocator: a, unique: core.Unique { } };
+    }
+
+    pub fn push(self: &mut List(T), item: T) {
+        if self.used == self.cap {
+            self.reserve();
+        }
+        unsafe {
+            // SAFETY: len < cap, so the slot is inside data.
+            self.data.add(self.used).* = item;
+        }
+        self.used += 1;
+    }
+
+    /// Room for one more element: twice the capacity, from 8.
+    fn reserve(self: &mut List(T)) {
+        var cap = self.cap * 2;
+        if cap == 0 {
+            cap = 8;
+        }
+        let size = mem.size_of(T);
+        unsafe {
+            // SAFETY: the new block holds cap elements and the old one len.
+            let fresh = mem.alloc(self.allocator.handle, bytes_for(count: cap, size: size)) as *mut T;
+            if self.used > 0 {
+                mem.copy(fresh as *mut u8, self.data as *u8, self.used * size);
+            }
+            self.data = fresh;
+        }
+        self.cap = cap;
+    }
+
+    /// The last element, moved out, or none.
+    pub fn pop(self: &mut List(T)) -> ?T {
+        if self.used == 0 {
+            return none;
+        }
+        self.used -= 1;
+        unsafe {
+            // SAFETY: the slot was in use; len no longer counts it.
+            return self.data.add(self.used).*;
+        }
+    }
+
+    pub fn len(self: &List(T)) -> usize {
+        return self.used;
+    }
+
+    pub fn clear(self: &mut List(T)) {
+        self.used = 0;
+    }
+
+    pub fn items(self: &List(T)) -> []T {
+        unsafe {
+            // SAFETY: the first len elements are in use.
+            return mem.slice(T, self.data as *T, self.used);
+        }
+    }
+
+    pub fn items_mut(self: &mut List(T)) -> []mut T {
+        unsafe {
+            // SAFETY: as items, and self is &mut.
+            return mem.slice_mut(T, self.data, self.used);
+        }
+    }
+}
+
+/// UTF-8 text that grows: a list of bytes that are always UTF-8.
+pub type String = struct {
+    data: *mut u8,
+    used: usize,
+    cap: usize,
+    allocator: Allocator,
+    unique: core.Unique,
+
+    pub fn init(a: Allocator) -> String {
+        return String { data: mem.null(u8), used: 0, cap: 0, allocator: a, unique: core.Unique { } };
+    }
+
+    fn room(self: &mut String, more: usize) {
+        if self.used + more <= self.cap {
+            return;
+        }
+        var cap = self.cap;
+        if cap == 0 {
+            cap = 16;
+        }
+        while cap < self.used + more {
+            cap *= 2;
+        }
+        unsafe {
+            // SAFETY: the new block holds cap bytes and the old one len.
+            let fresh = mem.alloc(self.allocator.handle, cap);
+            if self.used > 0 {
+                mem.copy(fresh, self.data as *u8, self.used);
+            }
+            self.data = fresh;
+        }
+        self.cap = cap;
+    }
+
+    pub fn push_str(self: &mut String, text: str) {
+        let b = text.bytes();
+        if b.len() == 0 {
+            return;
+        }
+        self.room(b.len());
+        unsafe {
+            // SAFETY: room made space for the bytes after len.
+            mem.copy(self.data.add(self.used), &b[0] as *u8, b.len());
+        }
+        self.used += b.len();
+    }
+
+    pub fn push_ascii(self: &mut String, byte: u8) {
+        if byte > 0x7F {
+            panic("push_ascii takes ASCII, a byte up to 0x7F");
+        }
+        self.room(1);
+        unsafe {
+            // SAFETY: room made space for one byte.
+            self.data.add(self.used).* = byte;
+        }
+        self.used += 1;
+    }
+
+    pub fn view(self: &String) -> str {
+        unsafe {
+            // SAFETY: only push_str and push_ascii write, and both keep the
+            // bytes UTF-8.
+            return mem.str_from(mem.slice(u8, self.data as *u8, self.used));
+        }
+    }
+
+    pub fn len(self: &String) -> usize {
+        return self.used;
+    }
+}
+
+/// FNV-1a of a value's bytes: map keys are plain values, compared and
+/// hashed byte by byte (spec/arche-0.md §5.5).
+fn hash_bytes(b: []u8) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        h = (h ^ b[i] as u64) *% 0x100000001b3;
+    }
+    return h;
+}
+
+fn same_bytes(a: []u8, b: []u8) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len() : (i += 1) {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Keys to values, in the order the keys were put: entries keep that
+/// order, and slots, a power of two of them, index the entries by hash
+/// (0 for an empty slot, i + 1 for entry i). A removed entry stays dead in
+/// place until the entries are rebuilt.
+pub type Map(comptime K: type, comptime V: type) = struct {
+    keys: List(K),
+    values: List(V),
+    live: List(bool),
+    slots: List(u32),
+    count: usize,
+    allocator: Allocator,
+
+    pub fn init(a: Allocator) -> Map(K, V) {
+        return Map(K, V) {
+            keys: List(K).init(a),
+            values: List(V).init(a),
+            live: List(bool).init(a),
+            slots: List(u32).init(a),
+            count: 0,
+            allocator: a,
+        };
+    }
+
+    /// The slot for key: its entry's, or the empty one where it would go.
+    fn find(self: &Map(K, V), key: &K) -> usize {
+        let mask = self.slots.len() - 1;
+        let kb = mem.bytes_of(K, key);
+        var i = (hash_bytes(kb) as usize) & mask;
+        let slots = self.slots.items();
+        let keys = self.keys.items();
+        while true {
+            let s = slots[i];
+            if s == 0 {
+                return i;
+            }
+            if same_bytes(a: mem.bytes_of(K, &keys[(s - 1) as usize]), b: kb) {
+                return i;
+            }
+            i = (i + 1) & mask;
+        }
+        return 0;
+    }
+
+    /// Slots for the live entries, at most half full, dead entries dropped.
+    fn rebuild(self: &mut Map(K, V), nslots: usize) {
+        var keys = List(K).init(self.allocator);
+        var values = List(V).init(self.allocator);
+        var live = List(bool).init(self.allocator);
+        var i: usize = 0;
+        while i < self.keys.len() : (i += 1) {
+            if self.live[i] {
+                keys.push(self.keys[i]);
+                values.push(self.values[i]);
+                live.push(true);
+            }
+        }
+        self.keys = keys;
+        self.values = values;
+        self.live = live;
+        var slots = List(u32).init(self.allocator);
+        var k: usize = 0;
+        while k < nslots : (k += 1) {
+            slots.push(0);
+        }
+        self.slots = slots;
+        var e: usize = 0;
+        while e < self.keys.len() : (e += 1) {
+            let key = self.keys[e];
+            let at = self.find(&key);
+            self.slots[at] = (e + 1) as u32;
+        }
+    }
+
+    pub fn put(self: &mut Map(K, V), key: K, value: V) {
+        if (self.keys.len() + 1) * 2 > self.slots.len() {
+            var nslots: usize = 16;
+            while nslots < (self.count + 1) * 4 {
+                nslots *= 2;
+            }
+            self.rebuild(nslots);
+        }
+        let at = self.find(&key);
+        let s = self.slots[at];
+        if s != 0 {
+            self.values[(s - 1) as usize] = value;
+            return;
+        }
+        self.keys.push(key);
+        self.values.push(value);
+        self.live.push(true);
+        self.slots[at] = self.keys.len() as u32;
+        self.count += 1;
+    }
+
+    pub fn get(self: &Map(K, V), key: K) -> ?V {
+        if self.slots.len() == 0 {
+            return none;
+        }
+        let s = self.slots[self.find(&key)];
+        if s == 0 {
+            return none;
+        }
+        return self.values[(s - 1) as usize];
+    }
+
+    pub fn remove(self: &mut Map(K, V), key: K) -> ?V {
+        if self.slots.len() == 0 {
+            return none;
+        }
+        // The slot stays, pointing at a dead entry, so probes still pass it.
+        let s = self.slots[self.find(&key)];
+        if s == 0 or not self.live[(s - 1) as usize] {
+            return none;
+        }
+        self.live[(s - 1) as usize] = false;
+        self.count -= 1;
+        return self.values[(s - 1) as usize];
+    }
+
+    pub fn len(self: &Map(K, V)) -> usize {
+        return self.count;
+    }
+}
+
+/// A name in an Interner: two are equal exactly when their texts are.
+pub type Symbol = struct {
+    id: u32,
+}
+
+/// Text copied once and named by a Symbol from then on.
+pub type Interner = struct {
+    texts: List(Text),
+    slots: List(u32),
+    allocator: Allocator,
+
+    pub fn init(a: Allocator) -> Interner {
+        return Interner { texts: List(Text).init(a), slots: List(u32).init(a), allocator: a };
+    }
+
+    fn slot(self: &Interner, b: []u8) -> usize {
+        let mask = self.slots.len() - 1;
+        var i = (hash_bytes(b) as usize) & mask;
+        while true {
+            let s = self.slots[i];
+            if s == 0 or same_bytes(a: self.texts[(s - 1) as usize].bytes(), b: b) {
+                return i;
+            }
+            i = (i + 1) & mask;
+        }
+        return 0;
+    }
+
+    pub fn intern(self: &mut Interner, text: str) -> Symbol {
+        if (self.texts.len() + 1) * 2 > self.slots.len() {
+            var n = self.slots.len() * 2;
+            if n == 0 {
+                n = 64;
+            }
+            var slots = List(u32).init(self.allocator);
+            var k: usize = 0;
+            while k < n : (k += 1) {
+                slots.push(0);
+            }
+            self.slots = slots;
+            var i: usize = 0;
+            while i < self.texts.len() : (i += 1) {
+                let b = self.texts[i].bytes();
+                let at = self.slot(b);
+                self.slots[at] = (i + 1) as u32;
+            }
+        }
+        let b = text.bytes();
+        let at = self.slot(b);
+        let s = self.slots[at];
+        if s != 0 {
+            return Symbol { id: s - 1 };
+        }
+        var copy = mem.null(u8);
+        unsafe {
+            // SAFETY: a new block of exactly the text's bytes.
+            copy = mem.alloc(self.allocator.handle, b.len());
+            if b.len() > 0 {
+                mem.copy(copy, &b[0] as *u8, b.len());
+            }
+        }
+        self.texts.push(Text { data: copy, len: b.len() });
+        self.slots[at] = self.texts.len() as u32;
+        return Symbol { id: (self.texts.len() - 1) as u32 };
+    }
+
+    pub fn text(self: &Interner, sym: Symbol) -> str {
+        return self.texts[sym.id as usize].view();
+    }
+}
+
+/// Interned bytes, never moved or freed while the interner lives.
+type Text = struct {
+    data: *mut u8,
+    len: usize,
+
+    fn bytes(self: &Text) -> []u8 {
+        unsafe {
+            // SAFETY: the interner copied len bytes there.
+            return mem.slice(u8, self.data as *u8, self.len);
+        }
+    }
+
+    fn view(self: &Text) -> str {
+        unsafe {
+            // SAFETY: the bytes were a str's.
+            return mem.str_from(self.bytes());
+        }
+    }
+}
