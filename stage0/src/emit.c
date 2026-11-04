@@ -535,6 +535,23 @@ static const char *equal(const Type *t, const char *a, const char *b) {
     }
 }
 
+// An expression as an if condition: without the parentheses that enclose it
+// whole, which clang warns about inside `if (...)`.
+static const char *condition(const char *e) {
+    size_t n = strlen(e);
+    if (n < 2 || e[0] != '(' || e[n - 1] != ')') {
+        return e;
+    }
+    int depth = 0;
+    for (size_t i = 0; i < n - 1; i++) {
+        depth += e[i] == '(' ? 1 : e[i] == ')' ? -1 : 0;
+        if (depth == 0) {
+            return e; // the first '(' closes before the end
+        }
+    }
+    return arena_strndup(e + 1, n - 2);
+}
+
 static const char *emit_slice(Emitter *em, const Expr *e) {
     const Type *bt = e->base->type;
     const char *base = bt->kind == TY_STR || bt->kind == TY_SLICE ? emit_expr(em, e->base) : emit_place(em, e->base);
@@ -1257,7 +1274,7 @@ static void define_map_ops(StrBuf *out, const Type *t) {
                   "        i = (i + 1) & mask;\n"
                   "    }\n"
                   "}\n\n",
-                  n, n, k, hash(t->key, "key"), equal(t->key, "self->entries[s - 1].key", "key"));
+                  n, n, k, hash(t->key, "key"), condition(equal(t->key, "self->entries[s - 1].key", "key")));
     }
     if (t->used & USE_MAP_PUT) {
         sb_printf(out,
