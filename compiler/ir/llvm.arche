@@ -1,0 +1,484 @@
+/// Writes an IR module as LLVM textual IR (.ll), for clang to build
+/// (sprint S8). Composite values are byte arrays reached by i8 offsets, so
+/// no LLVM struct types are needed.
+import alloc;
+import ir.ir;
+
+fn ty_text(t: ir.Ty) -> str {
+    match t {
+        .Void => { return "void"; }
+        .I1 => { return "i1"; }
+        .I8 => { return "i8"; }
+        .I16 => { return "i16"; }
+        .I32 => { return "i32"; }
+        .I64 => { return "i64"; }
+        .Ptr => { return "ptr"; }
+    }
+}
+
+fn value_name(out: &mut alloc.String, v: u32) {
+    out.push_str("%v");
+    ir.write_number(out, v as u64);
+}
+
+/// A constant of type t, from its bits: LLVM reads integers as signed.
+fn constant(out: &mut alloc.String, t: ir.Ty, bits: u64) {
+    if t == ir.Ty.I1 {
+        if bits & 1 == 1 {
+            out.push_str("true");
+        } else {
+            out.push_str("false");
+        }
+        return;
+    }
+    if t == ir.Ty.Ptr {
+        out.push_str("null");
+        return;
+    }
+    let n = ir.bits(t);
+    var v = bits;
+    if n < 64 {
+        v = bits & ((1 << n as u64) - 1);
+    }
+    let top: u64 = 1 << (n - 1) as u64;
+    if v >= top {
+        // Negative: -(2^n - v), written without overflowing a u64.
+        out.push_str("-");
+        let magnitude = (~v +% 1) & (((top - 1) << 1) | 1);
+        ir.write_number(out, magnitude);
+        return;
+    }
+    ir.write_number(out, v);
+}
+
+fn operand(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, v: u32) {
+    let i = f.insts[v as usize];
+    if i.op == ir.Op.Const {
+        constant(out, i.ty, i.imm);
+    } else if i.op == ir.Op.Global {
+        out.push_str("@");
+        out.push_str(m.globals[i.imm as usize].name.view());
+    } else {
+        value_name(out, v);
+    }
+}
+
+fn typed(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, v: u32) {
+    out.push_str(ty_text(f.insts[v as usize].ty));
+    out.push_str(" ");
+    operand(out, m, f, v);
+}
+
+fn bin_text(k: u32) -> str {
+    match k {
+        0 => { return "add"; }
+        1 => { return "sub"; }
+        2 => { return "mul"; }
+        3 => { return "sdiv"; }
+        4 => { return "udiv"; }
+        5 => { return "srem"; }
+        6 => { return "urem"; }
+        7 => { return "and"; }
+        8 => { return "or"; }
+        9 => { return "xor"; }
+        10 => { return "shl"; }
+        11 => { return "lshr"; }
+        _ => { return "ashr"; }
+    }
+}
+
+fn cmp_text(k: u32) -> str {
+    match k {
+        0 => { return "eq"; }
+        1 => { return "ne"; }
+        2 => { return "slt"; }
+        3 => { return "sle"; }
+        4 => { return "sgt"; }
+        5 => { return "sge"; }
+        6 => { return "ult"; }
+        7 => { return "ule"; }
+        8 => { return "ugt"; }
+        _ => { return "uge"; }
+    }
+}
+
+fn overflow_text(k: u32) -> str {
+    match k {
+        0 => { return "sadd"; }
+        1 => { return "uadd"; }
+        2 => { return "ssub"; }
+        3 => { return "usub"; }
+        4 => { return "smul"; }
+        _ => { return "umul"; }
+    }
+}
+
+fn line_start(out: &mut alloc.String, v: u32) {
+    out.push_str("  ");
+    value_name(out, v);
+    out.push_str(" = ");
+}
+
+fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
+    let i = f.insts[id as usize];
+    let t = ty_text(i.ty);
+    match i.op {
+        .Const | .Param | .Alloca => { }
+        .Global => {
+            line_start(out, id);
+            out.push_str("getelementptr i8, ptr @");
+            out.push_str(m.globals[i.imm as usize].name.view());
+            out.push_str(", i64 0\n");
+        }
+        .Load => {
+            if i.ty == ir.Ty.I1 {
+                out.push_str("  %t");
+                ir.write_number(out, id as u64);
+                out.push_str(" = load i8, ptr ");
+                operand(out, m, f, i.a);
+                out.push_str("\n");
+                line_start(out, id);
+                out.push_str("trunc i8 %t");
+                ir.write_number(out, id as u64);
+                out.push_str(" to i1\n");
+            } else {
+                line_start(out, id);
+                out.push_str("load ");
+                out.push_str(t);
+                out.push_str(", ptr ");
+                operand(out, m, f, i.a);
+                out.push_str("\n");
+            }
+        }
+        .Store => {
+            if f.insts[i.a as usize].ty == ir.Ty.I1 {
+                out.push_str("  %t");
+                ir.write_number(out, id as u64);
+                out.push_str(" = zext i1 ");
+                operand(out, m, f, i.a);
+                out.push_str(" to i8\n  store i8 %t");
+                ir.write_number(out, id as u64);
+            } else {
+                out.push_str("  store ");
+                typed(out, m, f, i.a);
+            }
+            out.push_str(", ptr ");
+            operand(out, m, f, i.b);
+            out.push_str("\n");
+        }
+        .Gep => {
+            line_start(out, id);
+            out.push_str("getelementptr i8, ptr ");
+            operand(out, m, f, i.a);
+            out.push_str(", i64 ");
+            ir.write_number(out, i.imm);
+            out.push_str("\n");
+        }
+        .GepIndex => {
+            out.push_str("  %t");
+            ir.write_number(out, id as u64);
+            out.push_str(" = mul i64 ");
+            operand(out, m, f, i.b);
+            out.push_str(", ");
+            ir.write_number(out, i.imm);
+            out.push_str("\n");
+            line_start(out, id);
+            out.push_str("getelementptr i8, ptr ");
+            operand(out, m, f, i.a);
+            out.push_str(", i64 %t");
+            ir.write_number(out, id as u64);
+            out.push_str("\n");
+        }
+        .Memcpy => {
+            out.push_str("  call void @llvm.memcpy.p0.p0.i64(ptr ");
+            operand(out, m, f, i.a);
+            out.push_str(", ptr ");
+            operand(out, m, f, i.b);
+            out.push_str(", i64 ");
+            ir.write_number(out, i.imm);
+            out.push_str(", i1 false)\n");
+        }
+        .Memzero => {
+            out.push_str("  call void @llvm.memset.p0.i64(ptr ");
+            operand(out, m, f, i.a);
+            out.push_str(", i8 0, i64 ");
+            ir.write_number(out, i.imm);
+            out.push_str(", i1 false)\n");
+        }
+        .Bin => {
+            line_start(out, id);
+            out.push_str(bin_text(i.flag));
+            out.push_str(" ");
+            typed(out, m, f, i.a);
+            out.push_str(", ");
+            operand(out, m, f, i.b);
+            out.push_str("\n");
+        }
+        .Overflow => {
+            out.push_str("  %s");
+            ir.write_number(out, id as u64);
+            out.push_str(" = call {");
+            out.push_str(t);
+            out.push_str(", i1} @llvm.");
+            out.push_str(overflow_text(i.flag));
+            out.push_str(".with.overflow.");
+            out.push_str(t);
+            out.push_str("(");
+            typed(out, m, f, i.a);
+            out.push_str(", ");
+            typed(out, m, f, i.b);
+            out.push_str(")\n");
+            line_start(out, id);
+            out.push_str("extractvalue {");
+            out.push_str(t);
+            out.push_str(", i1} %s");
+            ir.write_number(out, id as u64);
+            out.push_str(", 0\n");
+        }
+        .OverflowBit => {
+            let st = ty_text(f.insts[i.a as usize].ty);
+            line_start(out, id);
+            out.push_str("extractvalue {");
+            out.push_str(st);
+            out.push_str(", i1} %s");
+            ir.write_number(out, i.a as u64);
+            out.push_str(", 1\n");
+        }
+        .Cmp => {
+            line_start(out, id);
+            out.push_str("icmp ");
+            out.push_str(cmp_text(i.flag));
+            out.push_str(" ");
+            typed(out, m, f, i.a);
+            out.push_str(", ");
+            operand(out, m, f, i.b);
+            out.push_str("\n");
+        }
+        .Ext | .Trunc => {
+            let from = f.insts[i.a as usize].ty;
+            line_start(out, id);
+            if ir.bits(from) == ir.bits(i.ty) {
+                out.push_str("bitcast ");
+            } else if i.op == ir.Op.Trunc {
+                out.push_str("trunc ");
+            } else if i.flag == 1 {
+                out.push_str("sext ");
+            } else {
+                out.push_str("zext ");
+            }
+            typed(out, m, f, i.a);
+            out.push_str(" to ");
+            out.push_str(t);
+            out.push_str("\n");
+        }
+        .Call => {
+            if i.ty == ir.Ty.Void {
+                out.push_str("  ");
+            } else {
+                line_start(out, id);
+            }
+            out.push_str("call ");
+            out.push_str(t);
+            out.push_str(" @");
+            if i.flag == 1 {
+                out.push_str(m.externals[i.imm as usize].name.view());
+            } else {
+                out.push_str(m.functions[i.imm as usize].name.view());
+            }
+            out.push_str("(");
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 1) {
+                if k > i.args_start {
+                    out.push_str(", ");
+                }
+                typed(out, m, f, f.args[k as usize]);
+            }
+            out.push_str(")\n");
+        }
+        .Br => {
+            out.push_str("  br label %bb");
+            ir.write_number(out, i.a as u64);
+            out.push_str("\n");
+        }
+        .CondBr => {
+            out.push_str("  br i1 ");
+            operand(out, m, f, i.a);
+            out.push_str(", label %bb");
+            ir.write_number(out, i.b as u64);
+            out.push_str(", label %bb");
+            ir.write_number(out, i.c as u64);
+            out.push_str("\n");
+        }
+        .Ret => {
+            out.push_str("  ret ");
+            typed(out, m, f, i.a);
+            out.push_str("\n");
+        }
+        .RetVoid => { out.push_str("  ret void\n"); }
+        .Unreachable => { out.push_str("  unreachable\n"); }
+    }
+}
+
+fn emit_function(out: &mut alloc.String, m: &ir.Module, f: &ir.Function) {
+    out.push_str("\ndefine ");
+    if f.internal {
+        out.push_str("internal ");
+    }
+    out.push_str(ty_text(f.ret));
+    out.push_str(" @");
+    out.push_str(f.name.view());
+    out.push_str("(");
+    // A parameter is named by the Param instruction that reads it.
+    let insts = f.insts.items();
+    var p: usize = 0;
+    while p < f.params.len() : (p += 1) {
+        if p > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(ty_text(f.params[p]));
+        var k: usize = 0;
+        while k < insts.len() : (k += 1) {
+            if insts[k].op == ir.Op.Param and insts[k].imm == p as u64 {
+                out.push_str(" ");
+                value_name(out, k as u32);
+            }
+        }
+    }
+    out.push_str(") {\n");
+    let blocks = f.blocks.items();
+    var b: usize = 0;
+    while b < blocks.len() : (b += 1) {
+        out.push_str("bb");
+        ir.write_number(out, b as u64);
+        out.push_str(":\n");
+        if b == 0 {
+            // Every stack slot is made on entry, so loops do not grow the stack.
+            var k: usize = 0;
+            while k < insts.len() : (k += 1) {
+                if insts[k].op == ir.Op.Alloca {
+                    line_start(out, k as u32);
+                    out.push_str("alloca i8, i64 ");
+                    ir.write_number(out, insts[k].imm);
+                    out.push_str(", align ");
+                    ir.write_number(out, insts[k].flag as u64);
+                    out.push_str("\n");
+                }
+            }
+        }
+        let ids = blocks[b].insts.items();
+        var k: usize = 0;
+        while k < ids.len() : (k += 1) {
+            emit_inst(out, m, f, ids[k]);
+        }
+    }
+    out.push_str("}\n");
+}
+
+fn hex_digit(out: &mut alloc.String, d: u8) {
+    if d < 10 {
+        out.push_ascii('0' + d);
+    } else {
+        out.push_ascii('A' + d - 10);
+    }
+}
+
+fn byte_array(out: &mut alloc.String, b: []u8) {
+    out.push_str("[");
+    ir.write_number(out, b.len() as u64);
+    out.push_str(" x i8] c\"");
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        let c = b[i];
+        if c >= 0x20 and c < 0x7F and c != '"' and c != '\\' {
+            out.push_ascii(c);
+        } else {
+            out.push_str("\\");
+            hex_digit(out, c / 16);
+            hex_digit(out, c % 16);
+        }
+    }
+    out.push_str("\"");
+}
+
+pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    out.push_str("; Generated by the Arche compiler. Do not edit.\n");
+    out.push_str("target triple = \"x86_64-pc-linux-gnu\"\n\n");
+    let gs = m.globals.items();
+    var g: usize = 0;
+    while g < gs.len() : (g += 1) {
+        out.push_str("@");
+        out.push_str(gs[g].name.view());
+        out.push_str(" = private unnamed_addr constant ");
+        byte_array(&mut out, gs[g].bytes.items());
+        out.push_str("\n");
+    }
+    let tables = m.tables.items();
+    var t: usize = 0;
+    while t < tables.len() : (t += 1) {
+        let entries = tables[t].entries.items();
+        out.push_str("@");
+        out.push_str(tables[t].name.view());
+        out.push_str(" = constant [");
+        ir.write_number(&mut out, entries.len() as u64);
+        out.push_str(" x {ptr, i64}] [");
+        var e: usize = 0;
+        while e < entries.len() : (e += 1) {
+            if e > 0 {
+                out.push_str(", ");
+            }
+            out.push_str("{ptr, i64} {ptr @");
+            out.push_str(gs[entries[e] as usize].name.view());
+            out.push_str(", i64 ");
+            ir.write_number(&mut out, gs[entries[e] as usize].bytes.len() as u64);
+            out.push_str("}");
+        }
+        out.push_str("]\n");
+    }
+    out.push_str("\ndeclare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
+    out.push_str("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n");
+    var k: u32 = 0;
+    while k < 6 : (k += 1) {
+        var w: u32 = 8;
+        while w <= 64 : (w *= 2) {
+            out.push_str("declare {i");
+            ir.write_number(&mut out, w as u64);
+            out.push_str(", i1} @llvm.");
+            out.push_str(overflow_text(k));
+            out.push_str(".with.overflow.i");
+            ir.write_number(&mut out, w as u64);
+            out.push_str("(i");
+            ir.write_number(&mut out, w as u64);
+            out.push_str(", i");
+            ir.write_number(&mut out, w as u64);
+            out.push_str(")\n");
+        }
+    }
+    let es = m.externals.items();
+    var x: usize = 0;
+    while x < es.len() : (x += 1) {
+        out.push_str("declare ");
+        out.push_str(ty_text(es[x].ret));
+        out.push_str(" @");
+        out.push_str(es[x].name.view());
+        out.push_str("(");
+        var p: usize = 0;
+        while p < es[x].params.len() : (p += 1) {
+            if p > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(ty_text(es[x].params[p]));
+        }
+        out.push_str(")");
+        if es[x].noreturn {
+            out.push_str(" noreturn");
+        }
+        out.push_str("\n");
+    }
+    let fs = m.functions.items();
+    var i: usize = 0;
+    while i < fs.len() : (i += 1) {
+        emit_function(&mut out, m, &fs[i]);
+    }
+    return out;
+}

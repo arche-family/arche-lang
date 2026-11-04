@@ -1,0 +1,381 @@
+/// The intermediate representation: SSA values in basic blocks, with locals
+/// and composite values in stack memory, like LLVM before mem2reg.
+///
+/// A function's instructions are numbered in one list; an instruction's
+/// number is the value it produces. Blocks list the instructions they hold,
+/// in order, each ending in exactly one terminator. Composite values have
+/// no IR type: they live in memory, reached through a Ptr, and are moved
+/// with Memcpy (docs/abi.md).
+import alloc;
+
+pub type Ty = enum { Void, I1, I8, I16, I32, I64, Ptr }
+
+pub type Op = enum {
+    /// imm: the value.
+    Const,
+    /// imm: the parameter's position.
+    Param,
+    /// imm: the size in bytes; flag: the alignment.
+    Alloca,
+    /// a: the address.
+    Load,
+    /// a: the value; b: the address.
+    Store,
+    /// a: the address; imm: the offset in bytes.
+    Gep,
+    /// a: the address; b: an index; imm: the size of an element.
+    GepIndex,
+    /// a: destination; b: source; imm: size.
+    Memcpy,
+    /// a: destination; imm: size.
+    Memzero,
+    /// a, b: the operands; flag: a BinKind.
+    Bin,
+    /// a, b: the operands; flag: an OverflowKind. The value is the
+    /// wrapped result; an OverflowBit of it says whether it overflowed.
+    Overflow,
+    /// a: an Overflow instruction.
+    OverflowBit,
+    /// a, b: the operands; flag: a CmpKind.
+    Cmp,
+    /// a: the operand; flag: 1 to sign-extend.
+    Ext,
+    /// a: the operand.
+    Trunc,
+    /// imm: the global.
+    Global,
+    /// imm: the callee (a function, or an external when flag is 1); args:
+    /// a range of the function's args list.
+    Call,
+    /// a: the target block.
+    Br,
+    /// a: the condition; b, c: the blocks when true and when false.
+    CondBr,
+    /// a: the value.
+    Ret,
+    RetVoid,
+    Unreachable,
+}
+
+pub type BinKind = enum { Add, Sub, Mul, SDiv, UDiv, SRem, URem, And, Or, Xor, Shl, LShr, AShr }
+
+pub type CmpKind = enum { Eq, Ne, SLt, SLe, SGt, SGe, ULt, ULe, UGt, UGe }
+
+pub type OverflowKind = enum { SAdd, UAdd, SSub, USub, SMul, UMul }
+
+pub type Inst = struct {
+    pub op: Op,
+    pub ty: Ty,
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+    pub imm: u64,
+    pub flag: u32,
+    pub args_start: u32,
+    pub args_len: u32,
+}
+
+pub type Block = struct {
+    pub insts: alloc.List(u32),
+}
+
+pub type Function = struct {
+    pub name: alloc.String,
+    pub params: alloc.List(Ty),
+    pub ret: Ty,
+    pub insts: alloc.List(Inst),
+    pub blocks: alloc.List(Block),
+    pub args: alloc.List(u32),
+    /// Internal functions are private to the module.
+    pub internal: bool,
+}
+
+pub type External = struct {
+    pub name: alloc.String,
+    pub params: alloc.List(Ty),
+    pub ret: Ty,
+    pub noreturn: bool,
+}
+
+/// Constant bytes, such as string literals.
+pub type Global = struct {
+    pub name: alloc.String,
+    pub bytes: alloc.List(u8),
+    pub exported: bool,
+}
+
+/// A table of str values {ptr, len}, each pointing at a global: the error
+/// names the runtime prints.
+pub type StrTable = struct {
+    pub name: alloc.String,
+    pub entries: alloc.List(u32),
+}
+
+pub type Module = struct {
+    pub functions: alloc.List(Function),
+    pub externals: alloc.List(External),
+    pub globals: alloc.List(Global),
+    pub tables: alloc.List(StrTable),
+    a: alloc.Allocator,
+
+    pub fn init(a: alloc.Allocator) -> Module {
+        return Module {
+            functions: alloc.List(Function).init(a),
+            externals: alloc.List(External).init(a),
+            globals: alloc.List(Global).init(a),
+            tables: alloc.List(StrTable).init(a),
+            a: a,
+        };
+    }
+
+    /// A global holding the bytes of a str.
+    pub fn global(self: &mut Module, text: str) -> u32 {
+        return self.global_bytes(text.bytes());
+    }
+
+    /// A global holding these bytes; equal bytes share one.
+    pub fn global_bytes(self: &mut Module, bytes: []u8) -> u32 {
+        let gs = self.globals.items();
+        var i: usize = 0;
+        var found = false;
+        while i < gs.len() and not found {
+            if bytes_eq(x: gs[i].bytes.items(), y: bytes) {
+                found = true;
+            } else {
+                i += 1;
+            }
+        }
+        if found {
+            return i as u32;
+        }
+        var name = alloc.String.init(self.a);
+        name.push_str(".str.");
+        write_number(&mut name, self.globals.len() as u64);
+        var b = alloc.List(u8).init(self.a);
+        var k: usize = 0;
+        while k < bytes.len() : (k += 1) {
+            b.push(bytes[k]);
+        }
+        self.globals.push(Global { name: name, bytes: b, exported: false });
+        return self.globals.len() as u32 - 1;
+    }
+
+    pub fn external(self: &mut Module, name: str, ret: Ty, never_returns: bool) -> u32 {
+        let es = self.externals.items();
+        var i: usize = 0;
+        while i < es.len() : (i += 1) {
+            if es[i].name.view().eq(name) {
+                return i as u32;
+            }
+        }
+        var n = alloc.String.init(self.a);
+        n.push_str(name);
+        self.externals.push(External { name: n, params: alloc.List(Ty).init(self.a), ret: ret, noreturn: never_returns });
+        return self.externals.len() as u32 - 1;
+    }
+}
+
+fn bytes_eq(x: []u8, y: []u8) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.len() : (i += 1) {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn write_number(m: &mut alloc.String, n: u64) {
+    if n >= 10 {
+        write_number(m, n / 10);
+    }
+    m.push_ascii('0' + (n % 10) as u8);
+}
+
+pub fn new_function(name: str, ret: Ty, a: alloc.Allocator) -> Function {
+    var n = alloc.String.init(a);
+    n.push_str(name);
+    var f = Function {
+        name: n,
+        params: alloc.List(Ty).init(a),
+        ret: ret,
+        insts: alloc.List(Inst).init(a),
+        blocks: alloc.List(Block).init(a),
+        args: alloc.List(u32).init(a),
+        internal: true,
+    };
+    f.blocks.push(Block { insts: alloc.List(u32).init(a) });
+    return f;
+}
+
+pub fn inst(op: Op, ty: Ty) -> Inst {
+    return Inst { op: op, ty: ty, a: 0, b: 0, c: 0, imm: 0, flag: 0, args_start: 0, args_len: 0 };
+}
+
+pub fn is_terminator(op: Op) -> bool {
+    return op == Op.Br or op == Op.CondBr or op == Op.Ret or op == Op.RetVoid or op == Op.Unreachable;
+}
+
+/// The instruction produces a value that others can use.
+pub fn has_value(i: Inst) -> bool {
+    match i.op {
+        .Store | .Memcpy | .Memzero | .Br | .CondBr | .Ret | .RetVoid | .Unreachable => { return false; }
+        .Call => { return i.ty != Ty.Void; }
+        _ => { return true; }
+    }
+}
+
+pub fn bits(t: Ty) -> u32 {
+    match t {
+        .I1 => { return 1; }
+        .I8 => { return 8; }
+        .I16 => { return 16; }
+        .I32 => { return 32; }
+        .I64 | .Ptr => { return 64; }
+        .Void => { return 0; }
+    }
+}
+
+// ---- the verifier ---------------------------------------------------------------
+
+/// What is wrong with a function, if anything: the verifier runs after
+/// every pass, so a pass that breaks the IR is caught where it does.
+pub type Problem = struct {
+    pub found: bool,
+    pub inst: u32,
+    pub what: ProblemKind,
+}
+
+pub type ProblemKind = enum {
+    None,
+    EmptyBlock,
+    NoTerminator,
+    EarlyTerminator,
+    BadAddress,
+    BadStore,
+    Undefined,
+    MixedTypes,
+    CmpType,
+    BadCondition,
+    BadTarget,
+    BadReturn,
+    MissingReturn,
+}
+
+pub fn describe(k: ProblemKind) -> str {
+    match k {
+        .None => { return "no problem"; }
+        .EmptyBlock => { return "a block has no instructions"; }
+        .NoTerminator => { return "a block does not end in a terminator"; }
+        .EarlyTerminator => { return "a terminator is not the last instruction of its block"; }
+        .BadAddress => { return "the address operand is not a pointer value defined before"; }
+        .BadStore => { return "a store needs a value and a pointer defined before it"; }
+        .Undefined => { return "an operand is not defined before its use"; }
+        .MixedTypes => { return "the operands have different types"; }
+        .CmpType => { return "a comparison does not give an i1"; }
+        .BadCondition => { return "a branch condition is not an i1"; }
+        .BadTarget => { return "a branch goes to a block that does not exist"; }
+        .BadReturn => { return "the returned value does not have the function's type"; }
+        .MissingReturn => { return "a function that returns a value returns nothing"; }
+    }
+}
+
+fn problem(inst_index: u32, what: ProblemKind) -> Problem {
+    return Problem { found: true, inst: inst_index, what: what };
+}
+
+fn operand_ok(f: &Function, user: u32, v: u32) -> bool {
+    return v < user and has_value(f.insts[v as usize]);
+}
+
+pub fn verify(f: &Function) -> Problem {
+    let blocks = f.blocks.items();
+    var b: usize = 0;
+    while b < blocks.len() : (b += 1) {
+        let ids = blocks[b].insts.items();
+        if ids.len() == 0 {
+            return problem(0, ProblemKind.EmptyBlock);
+        }
+        var k: usize = 0;
+        while k < ids.len() : (k += 1) {
+            let id = ids[k];
+            let i = f.insts[id as usize];
+            let last = k + 1 == ids.len();
+            if is_terminator(i.op) != last {
+                if last {
+                    return problem(id, ProblemKind.NoTerminator);
+                }
+                return problem(id, ProblemKind.EarlyTerminator);
+            }
+            match i.op {
+                .Load | .Gep | .Memzero => {
+                    if not operand_ok(f, user: id, v: i.a) or f.insts[i.a as usize].ty != Ty.Ptr {
+                        return problem(id, ProblemKind.BadAddress);
+                    }
+                }
+                .Store => {
+                    if not operand_ok(f, user: id, v: i.a) or not operand_ok(f, user: id, v: i.b) or f.insts[i.b as usize].ty != Ty.Ptr {
+                        return problem(id, ProblemKind.BadStore);
+                    }
+                }
+                .Memcpy | .GepIndex => {
+                    if not operand_ok(f, user: id, v: i.a) or not operand_ok(f, user: id, v: i.b) {
+                        return problem(id, ProblemKind.Undefined);
+                    }
+                }
+                .Bin | .Cmp | .Overflow => {
+                    if not operand_ok(f, user: id, v: i.a) or not operand_ok(f, user: id, v: i.b) {
+                        return problem(id, ProblemKind.Undefined);
+                    }
+                    if f.insts[i.a as usize].ty != f.insts[i.b as usize].ty {
+                        return problem(id, ProblemKind.MixedTypes);
+                    }
+                    if i.op == Op.Cmp and i.ty != Ty.I1 {
+                        return problem(id, ProblemKind.CmpType);
+                    }
+                }
+                .Ext | .Trunc | .OverflowBit => {
+                    if not operand_ok(f, user: id, v: i.a) {
+                        return problem(id, ProblemKind.Undefined);
+                    }
+                }
+                .CondBr => {
+                    if not operand_ok(f, user: id, v: i.a) or f.insts[i.a as usize].ty != Ty.I1 {
+                        return problem(id, ProblemKind.BadCondition);
+                    }
+                    if i.b as usize >= blocks.len() or i.c as usize >= blocks.len() {
+                        return problem(id, ProblemKind.BadTarget);
+                    }
+                }
+                .Br => {
+                    if i.a as usize >= blocks.len() {
+                        return problem(id, ProblemKind.BadTarget);
+                    }
+                }
+                .Ret => {
+                    if not operand_ok(f, user: id, v: i.a) or f.insts[i.a as usize].ty != f.ret {
+                        return problem(id, ProblemKind.BadReturn);
+                    }
+                }
+                .RetVoid => {
+                    if f.ret != Ty.Void {
+                        return problem(id, ProblemKind.MissingReturn);
+                    }
+                }
+                .Call => {
+                    var j = i.args_start;
+                    while j < i.args_start + i.args_len : (j += 1) {
+                        if not operand_ok(f, user: id, v: f.args[j as usize]) {
+                            return problem(id, ProblemKind.Undefined);
+                        }
+                    }
+                }
+                _ => { }
+            }
+        }
+    }
+    return Problem { found: false, inst: 0, what: ProblemKind.None };
+}
