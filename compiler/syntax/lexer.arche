@@ -1,0 +1,506 @@
+/// The lexer: spec/arche-0.md §2.
+///
+/// Every byte of the file is in exactly one token, whitespace and comments
+/// included, so the tokens one after another are the file again. After an
+/// error the lexer reports it, keeps the bad text as an Error token (or as
+/// the literal it was meant to be) and goes on, so one run finds every
+/// lexical error.
+import std;
+import alloc;
+import codes;
+import diag;
+import syntax.token as tk;
+
+pub fn lex(text: str, diags: &mut diag.Diagnostics, a: alloc.Allocator) -> alloc.List(tk.Token) {
+    var tokens = alloc.List(tk.Token).init(a);
+    var i: usize = 0;
+    while i < text.len() {
+        i = lex_one(text, i, &mut tokens, diags);
+    }
+    push(&mut tokens, tk.Kind.Eof, start: i, end: i, value: 0);
+    return tokens;
+}
+
+fn push(tokens: &mut alloc.List(tk.Token), kind: tk.Kind, start: usize, end: usize, value: u64) {
+    tokens.push(tk.Token { kind: kind, start: start as u32, len: (end - start) as u32, value: value });
+}
+
+fn span(start: usize, end: usize) -> diag.Span {
+    return diag.Span { start: start as u32, len: (end - start) as u32 };
+}
+
+fn byte_at(text: str, i: usize) -> u8 {
+    if i < text.len() {
+        return text[i];
+    }
+    return 0;
+}
+
+fn is_ident_start(c: u8) -> bool {
+    match c {
+        'a'..='z' | 'A'..='Z' | '_' => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn is_ident_char(c: u8) -> bool {
+    match c {
+        'a'..='z' | 'A'..='Z' | '_' | '0'..='9' => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn lex_one(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
+    let c = text[start];
+    match c {
+        ' ' | '\t' | '\n' => {
+            var i = start;
+            while i < text.len() and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n') : (i += 1) {
+            }
+            push(tokens, tk.Kind.Whitespace, start: start, end: i, value: 0);
+            return i;
+        }
+        '\r' => {
+            diags.report(codes.CARRIAGE_RETURN, span(start: start, end: start + 1),
+                "'\\r' is allowed only in string literals; lines end with '\\n'");
+            push(tokens, tk.Kind.Error, start: start, end: start + 1, value: 0);
+            return start + 1;
+        }
+        'a'..='z' | 'A'..='Z' | '_' => {
+            return lex_word(text, start, tokens, diags);
+        }
+        '0'..='9' => {
+            return lex_number(text, start, tokens, diags);
+        }
+        '\'' => {
+            return lex_char(text, start, tokens, diags);
+        }
+        '"' => {
+            return lex_string(text, start, tokens, diags);
+        }
+        '/' => {
+            if byte_at(text, start + 1) == '/' {
+                return lex_comment(text, start, tokens, diags);
+            }
+            return lex_operator(text, start, tokens, diags);
+        }
+        _ => {
+            return lex_operator(text, start, tokens, diags);
+        }
+    }
+}
+
+fn lex_comment(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
+    var i = start;
+    while i < text.len() and text[i] != '\n' : (i += 1) {
+        if text[i] == '\r' {
+            diags.report(codes.CARRIAGE_RETURN, span(start: i, end: i + 1),
+                "'\\r' is allowed only in string literals; lines end with '\\n'");
+        }
+    }
+    if byte_at(text, start + 2) == '/' {
+        push(tokens, tk.Kind.DocComment, start: start, end: i, value: 0);
+    } else {
+        push(tokens, tk.Kind.Comment, start: start, end: i, value: 0);
+    }
+    return i;
+}
+
+fn lex_word(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
+    var end = start;
+    while end < text.len() and is_ident_char(text[end]) : (end += 1) {
+    }
+    let word = text[start..end];
+    if word.eq("_") {
+        push(tokens, tk.Kind.Underscore, start: start, end: end, value: 0);
+        return end;
+    }
+    if tk.is_reserved(word) {
+        var m = diags.new_message();
+        m.push_str("'");
+        m.push_str(word);
+        m.push_str("' is reserved for full Arche and cannot be used here");
+        diags.report_owned(codes.RESERVED_WORD, span(start: start, end: end), m);
+        push(tokens, tk.Kind.Ident, start: start, end: end, value: 0);
+        return end;
+    }
+    match tk.keyword(word) {
+        some(k) => {
+            if k == tk.Kind.KwAs and byte_at(text, end) == '%' {
+                push(tokens, tk.Kind.KwAsWrap, start: start, end: end + 1, value: 0);
+                return end + 1;
+            }
+            push(tokens, k, start: start, end: end, value: 0);
+        }
+        none => {
+            push(tokens, tk.Kind.Ident, start: start, end: end, value: 0);
+        }
+    }
+    return end;
+}
+
+fn digit_value(c: u8) -> u64 {
+    match c {
+        '0'..='9' => { return (c - '0') as u64; }
+        'a'..='f' => { return (c - 'a') as u64 + 10; }
+        'A'..='F' => { return (c - 'A') as u64 + 10; }
+        _ => { return 99; }
+    }
+}
+
+fn lex_number(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
+    var end = start;
+    while end < text.len() and is_ident_char(text[end]) : (end += 1) {
+    }
+    var base: u64 = 10;
+    var base_name = "decimal";
+    var i = start;
+    if text[start] == '0' and start + 1 < end {
+        let p = text[start + 1];
+        if p == 'x' {
+            base = 16;
+            base_name = "hexadecimal";
+            i += 2;
+        } else if p == 'o' {
+            base = 8;
+            base_name = "octal";
+            i += 2;
+        } else if p == 'b' {
+            base = 2;
+            base_name = "binary";
+            i += 2;
+        }
+    }
+    if i == end {
+        diags.report(codes.NO_DIGITS, span(start: start, end: end), "integer literal has no digits");
+        push(tokens, tk.Kind.Int, start: start, end: end, value: 0);
+        return end;
+    }
+    var value: u64 = 0;
+    var after_digit = false;
+    while i < end : (i += 1) {
+        let c = text[i];
+        if c == '_' {
+            if not after_digit or i + 1 == end or text[i + 1] == '_' {
+                diags.report(codes.BAD_SEPARATOR, span(start: i, end: i + 1),
+                    "'_' in an integer literal must separate two digits");
+                push(tokens, tk.Kind.Int, start: start, end: end, value: 0);
+                return end;
+            }
+            after_digit = false;
+            continue;
+        }
+        let d = digit_value(c);
+        if d >= base {
+            var m = diags.new_message();
+            m.push_str("invalid digit '");
+            m.push_ascii(c);
+            m.push_str("' in a ");
+            m.push_str(base_name);
+            m.push_str(" literal");
+            diags.report_owned(codes.BAD_DIGIT, span(start: i, end: i + 1), m);
+            push(tokens, tk.Kind.Int, start: start, end: end, value: 0);
+            return end;
+        }
+        if value > (18446744073709551615 - d) / base {
+            diags.report(codes.INT_TOO_LARGE, span(start: start, end: end), "integer literal does not fit in 64 bits");
+            push(tokens, tk.Kind.Int, start: start, end: end, value: 0);
+            return end;
+        }
+        value = value * base + d;
+        after_digit = true;
+    }
+    push(tokens, tk.Kind.Int, start: start, end: end, value: value);
+    return end;
+}
+
+/// An escape sequence: its value and where it ends.
+type Escape = struct {
+    value: u64,
+    end: usize,
+}
+
+fn hex_digit(c: u8) -> u64 {
+    match c {
+        '0'..='9' | 'a'..='f' | 'A'..='F' => { return digit_value(c); }
+        _ => { return 99; }
+    }
+}
+
+/// The escape at text[at] == '\\' (§2.2).
+fn lex_escape(text: str, at: usize, in_string: bool, diags: &mut diag.Diagnostics) -> Escape {
+    let c = byte_at(text, at + 1);
+    match c {
+        'n' => { return Escape { value: 10, end: at + 2 }; }
+        'r' => { return Escape { value: 13, end: at + 2 }; }
+        't' => { return Escape { value: 9, end: at + 2 }; }
+        '0' => { return Escape { value: 0, end: at + 2 }; }
+        '\\' | '"' | '\'' => { return Escape { value: c as u64, end: at + 2 }; }
+        'x' => {
+            let hi = hex_digit(byte_at(text, at + 2));
+            let lo = hex_digit(byte_at(text, at + 3));
+            if hi > 15 or lo > 15 {
+                diags.report(codes.UNKNOWN_ESCAPE, span(start: at, end: at + 2), "'\\x' needs two hexadecimal digits");
+                return Escape { value: 0, end: at + 2 };
+            }
+            let v = hi * 16 + lo;
+            if v > 0x7F {
+                diags.report(codes.HEX_ESCAPE_TOO_LARGE, span(start: at, end: at + 4),
+                    "'\\x' escapes go up to \\x7F; use \\u{...} for other characters");
+            }
+            return Escape { value: v, end: at + 4 };
+        }
+        'u' => {
+            if not in_string {
+                diags.report(codes.UNICODE_ESCAPE_IN_CHAR, span(start: at, end: at + 2),
+                    "'\\u{...}' is allowed only in string literals");
+            }
+            var j = at + 2;
+            if byte_at(text, j) != '{' {
+                diags.report(codes.BAD_UNICODE_ESCAPE, span(start: at, end: j), "expected '{' after '\\u'");
+                return Escape { value: 0, end: j };
+            }
+            j += 1;
+            var v: u64 = 0;
+            var digits: u32 = 0;
+            while hex_digit(byte_at(text, j)) <= 15 : (j += 1) {
+                digits += 1;
+                if digits <= 6 {
+                    v = v * 16 + hex_digit(byte_at(text, j));
+                }
+            }
+            if digits == 0 or digits > 6 or byte_at(text, j) != '}' {
+                diags.report(codes.BAD_UNICODE_ESCAPE, span(start: at, end: j),
+                    "'\\u{...}' needs one to six hexadecimal digits and a closing '}'");
+                return Escape { value: 0, end: j };
+            }
+            if v > 0x10FFFF or (v >= 0xD800 and v <= 0xDFFF) {
+                diags.report(codes.NOT_A_SCALAR_VALUE, span(start: at, end: j + 1), "this is not a Unicode scalar value");
+            }
+            return Escape { value: v, end: j + 1 };
+        }
+        _ => {
+            diags.report(codes.UNKNOWN_ESCAPE, span(start: at, end: at + 2), "unknown escape");
+            return Escape { value: 0, end: at + 2 };
+        }
+    }
+}
+
+/// The length of the UTF-8 sequence that starts with byte c.
+fn utf8_len(c: u8) -> usize {
+    if c < 0x80 {
+        return 1;
+    }
+    if c >= 0xF0 {
+        return 4;
+    }
+    if c >= 0xE0 {
+        return 3;
+    }
+    return 2;
+}
+
+fn lex_char(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
+    var i = start + 1;
+    let first = byte_at(text, i);
+    if i >= text.len() or first == '\n' {
+        diags.report(codes.UNCLOSED_CHAR, span(start: start, end: i), "character literal is not closed");
+        push(tokens, tk.Kind.Error, start: start, end: i, value: 0);
+        return i;
+    }
+    if first == '\'' {
+        diags.report(codes.EMPTY_CHAR, span(start: start, end: i + 1), "empty character literal");
+        push(tokens, tk.Kind.Error, start: start, end: i + 1, value: 0);
+        return i + 1;
+    }
+    var value: u64 = 0;
+    if first == '\\' {
+        let e = lex_escape(text, i, false, diags);
+        value = e.value;
+        i = e.end;
+    } else if first >= 0x80 {
+        diags.report(codes.NON_ASCII_CHAR, span(start: start, end: i + utf8_len(first)), "a character literal must be ASCII");
+        i += utf8_len(first);
+    } else {
+        if first == '\r' {
+            diags.report(codes.CARRIAGE_RETURN, span(start: i, end: i + 1), "'\\r' is allowed only in string literals");
+        }
+        value = first as u64;
+        i += 1;
+    }
+    if byte_at(text, i) == '\'' {
+        push(tokens, tk.Kind.Char, start: start, end: i + 1, value: value);
+        return i + 1;
+    }
+    // More than one character, or no closing quote on this line.
+    var j = i;
+    while j < text.len() and text[j] != '\'' and text[j] != '\n' : (j += 1) {
+    }
+    if byte_at(text, j) == '\'' {
+        diags.report(codes.LONG_CHAR, span(start: start, end: j + 1), "a character literal holds exactly one character");
+        push(tokens, tk.Kind.Error, start: start, end: j + 1, value: 0);
+        return j + 1;
+    }
+    diags.report(codes.UNCLOSED_CHAR, span(start: start, end: j), "character literal is not closed");
+    push(tokens, tk.Kind.Error, start: start, end: j, value: 0);
+    return j;
+}
+
+fn lex_string(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
+    var i = start + 1;
+    while true {
+        if i >= text.len() or text[i] == '\n' {
+            diags.report(codes.UNCLOSED_STRING, span(start: start, end: i),
+                "string literal is not closed (it cannot span lines)");
+            push(tokens, tk.Kind.String, start: start, end: i, value: 0);
+            return i;
+        }
+        let c = text[i];
+        if c == '"' {
+            push(tokens, tk.Kind.String, start: start, end: i + 1, value: 0);
+            return i + 1;
+        }
+        if c == '\\' {
+            i = lex_escape(text, i, true, diags).end;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+type Op = struct {
+    kind: tk.Kind,
+    len: usize,
+}
+
+/// The longest operator or punctuation at text[i] (§2.3).
+fn operator(text: str, i: usize) -> ?Op {
+    let a = byte_at(text, i + 1);
+    let b = byte_at(text, i + 2);
+    match text[i] {
+        '+' => {
+            if a == '%' and b == '=' { return Op { kind: tk.Kind.PlusWrapAssign, len: 3 }; }
+            if a == '%' { return Op { kind: tk.Kind.PlusWrap, len: 2 }; }
+            if a == '=' { return Op { kind: tk.Kind.PlusAssign, len: 2 }; }
+            return Op { kind: tk.Kind.Plus, len: 1 };
+        }
+        '-' => {
+            if a == '%' and b == '=' { return Op { kind: tk.Kind.MinusWrapAssign, len: 3 }; }
+            if a == '%' { return Op { kind: tk.Kind.MinusWrap, len: 2 }; }
+            if a == '=' { return Op { kind: tk.Kind.MinusAssign, len: 2 }; }
+            if a == '>' { return Op { kind: tk.Kind.Arrow, len: 2 }; }
+            return Op { kind: tk.Kind.Minus, len: 1 };
+        }
+        '*' => {
+            if a == '%' and b == '=' { return Op { kind: tk.Kind.StarWrapAssign, len: 3 }; }
+            if a == '%' { return Op { kind: tk.Kind.StarWrap, len: 2 }; }
+            if a == '=' { return Op { kind: tk.Kind.StarAssign, len: 2 }; }
+            return Op { kind: tk.Kind.Star, len: 1 };
+        }
+        '/' => {
+            if a == '=' { return Op { kind: tk.Kind.SlashAssign, len: 2 }; }
+            return Op { kind: tk.Kind.Slash, len: 1 };
+        }
+        '%' => {
+            if a == '=' { return Op { kind: tk.Kind.PercentAssign, len: 2 }; }
+            return Op { kind: tk.Kind.Percent, len: 1 };
+        }
+        '&' => {
+            if a == '=' { return Op { kind: tk.Kind.AmpAssign, len: 2 }; }
+            return Op { kind: tk.Kind.Amp, len: 1 };
+        }
+        '|' => {
+            if a == '=' { return Op { kind: tk.Kind.PipeAssign, len: 2 }; }
+            return Op { kind: tk.Kind.Pipe, len: 1 };
+        }
+        '^' => {
+            if a == '=' { return Op { kind: tk.Kind.CaretAssign, len: 2 }; }
+            return Op { kind: tk.Kind.Caret, len: 1 };
+        }
+        '~' => { return Op { kind: tk.Kind.Tilde, len: 1 }; }
+        '<' => {
+            if a == '<' and b == '=' { return Op { kind: tk.Kind.ShlAssign, len: 3 }; }
+            if a == '<' { return Op { kind: tk.Kind.Shl, len: 2 }; }
+            if a == '=' { return Op { kind: tk.Kind.Le, len: 2 }; }
+            return Op { kind: tk.Kind.Lt, len: 1 };
+        }
+        '>' => {
+            if a == '>' and b == '=' { return Op { kind: tk.Kind.ShrAssign, len: 3 }; }
+            if a == '>' { return Op { kind: tk.Kind.Shr, len: 2 }; }
+            if a == '=' { return Op { kind: tk.Kind.Ge, len: 2 }; }
+            return Op { kind: tk.Kind.Gt, len: 1 };
+        }
+        '=' => {
+            if a == '=' { return Op { kind: tk.Kind.EqEq, len: 2 }; }
+            if a == '>' { return Op { kind: tk.Kind.FatArrow, len: 2 }; }
+            return Op { kind: tk.Kind.Assign, len: 1 };
+        }
+        '!' => {
+            if a == '=' { return Op { kind: tk.Kind.NotEq, len: 2 }; }
+            return Op { kind: tk.Kind.Bang, len: 1 };
+        }
+        '.' => {
+            if a == '.' and b == '=' { return Op { kind: tk.Kind.DotDotEq, len: 3 }; }
+            if a == '.' { return Op { kind: tk.Kind.DotDot, len: 2 }; }
+            if a == '*' { return Op { kind: tk.Kind.DotStar, len: 2 }; }
+            return Op { kind: tk.Kind.Dot, len: 1 };
+        }
+        ',' => { return Op { kind: tk.Kind.Comma, len: 1 }; }
+        ':' => { return Op { kind: tk.Kind.Colon, len: 1 }; }
+        ';' => { return Op { kind: tk.Kind.Semi, len: 1 }; }
+        '?' => { return Op { kind: tk.Kind.Question, len: 1 }; }
+        '(' => { return Op { kind: tk.Kind.LParen, len: 1 }; }
+        ')' => { return Op { kind: tk.Kind.RParen, len: 1 }; }
+        '[' => { return Op { kind: tk.Kind.LBracket, len: 1 }; }
+        ']' => { return Op { kind: tk.Kind.RBracket, len: 1 }; }
+        '{' => { return Op { kind: tk.Kind.LBrace, len: 1 }; }
+        '}' => { return Op { kind: tk.Kind.RBrace, len: 1 }; }
+        _ => { return none; }
+    }
+}
+
+fn lex_operator(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {
+    match operator(text, start) {
+        some(op) => {
+            push(tokens, op.kind, start: start, end: start + op.len, value: 0);
+            return start + op.len;
+        }
+        none => { }
+    }
+    let c = text[start];
+    let n = utf8_len(c);
+    var m = diags.new_message();
+    if c >= 0x80 {
+        m.push_str("unexpected character '");
+        m.push_str(text[start..start + n]);
+        m.push_str("'; identifiers are ASCII");
+    } else if c < 0x20 or c == 0x7F {
+        m.push_str("unexpected control character");
+    } else {
+        m.push_str("unexpected character '");
+        m.push_ascii(c);
+        m.push_str("'");
+    }
+    diags.report_owned(codes.UNEXPECTED_CHARACTER, span(start: start, end: start + n), m);
+    push(tokens, tk.Kind.Error, start: start, end: start + n, value: 0);
+    return start + n;
+}
+
+/// One line per token: its kind, start and length (for `arche tokens`).
+pub fn write_tokens(out: &mut std.Output, tokens: &alloc.List(tk.Token), text: str) {
+    let items = tokens.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        let t = items[i];
+        out.write(tk.describe(t.kind));
+        out.write(" ");
+        out.write_u64(t.start as u64);
+        out.write(" ");
+        out.write_u64(t.len as u64);
+        if t.kind == tk.Kind.Ident or t.kind == tk.Kind.Int {
+            out.write(" ");
+            out.write(text[t.start as usize..(t.start + t.len) as usize]);
+        }
+        out.write("\n");
+    }
+}

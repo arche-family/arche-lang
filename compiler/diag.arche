@@ -1,0 +1,155 @@
+/// Diagnostics: errors with a stable code (docs/error-codes.md), a place in
+/// the source and a message, written as text or as JSON.
+import std;
+import alloc;
+
+/// A byte range of a source file.
+pub type Span = struct {
+    pub start: u32,
+    pub len: u32,
+
+    pub fn end(self: Span) -> u32 {
+        return self.start + self.len;
+    }
+}
+
+pub type Diagnostic = struct {
+    pub code: u16,
+    pub span: Span,
+    pub message: alloc.String,
+}
+
+pub type Diagnostics = struct {
+    pub items: alloc.List(Diagnostic),
+    a: alloc.Allocator,
+
+    pub fn init(a: alloc.Allocator) -> Diagnostics {
+        return Diagnostics { items: alloc.List(Diagnostic).init(a), a: a };
+    }
+
+    /// A diagnostic whose message is fixed text.
+    pub fn report(self: &mut Diagnostics, code: u16, span: Span, message: str) {
+        var m = alloc.String.init(self.a);
+        m.push_str(message);
+        self.items.push(Diagnostic { code: code, span: span, message: m });
+    }
+
+    /// A diagnostic whose message was built by the caller.
+    pub fn report_owned(self: &mut Diagnostics, code: u16, span: Span, message: alloc.String) {
+        self.items.push(Diagnostic { code: code, span: span, message: message });
+    }
+
+    pub fn new_message(self: &Diagnostics) -> alloc.String {
+        return alloc.String.init(self.a);
+    }
+
+    pub fn count(self: &Diagnostics) -> usize {
+        return self.items.len();
+    }
+}
+
+/// The line and column (both from 1, the column in bytes) of an offset.
+pub type Position = struct {
+    pub line: u32,
+    pub column: u32,
+}
+
+pub fn position(text: str, offset: u32) -> Position {
+    var line: u32 = 1;
+    var line_start: usize = 0;
+    var i: usize = 0;
+    let end = offset as usize;
+    while i < end and i < text.len() : (i += 1) {
+        if text[i] == '\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    return Position { line: line, column: (end - line_start) as u32 + 1 };
+}
+
+fn write_code(out: &mut std.Output, code: u16) {
+    out.write_byte('E');
+    var divisor: u16 = 1000;
+    while divisor > 0 : (divisor /= 10) {
+        out.write_byte('0' + ((code / divisor) % 10) as u8);
+    }
+}
+
+/// path:line:column: error[E0112]: message
+pub fn write_text(out: &mut std.Output, diags: &Diagnostics, path: str, text: str) {
+    let items = diags.items.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        let d = &items[i];
+        let pos = position(text, d.span.start);
+        out.write(path);
+        out.write(":");
+        out.write_u64(pos.line as u64);
+        out.write(":");
+        out.write_u64(pos.column as u64);
+        out.write(": error[");
+        write_code(out, d.code);
+        out.write("]: ");
+        out.write(d.message.view());
+        out.write("\n");
+    }
+}
+
+fn write_json_string(out: &mut std.Output, s: str) {
+    out.write_byte('"');
+    var i: usize = 0;
+    while i < s.len() : (i += 1) {
+        let c = s[i];
+        match c {
+            '"' => { out.write("\\\""); }
+            '\\' => { out.write("\\\\"); }
+            '\n' => { out.write("\\n"); }
+            '\t' => { out.write("\\t"); }
+            0..=0x1F => {
+                out.write("\\u00");
+                write_hex_digit(out, c / 16);
+                write_hex_digit(out, c % 16);
+            }
+            _ => { out.write_byte(c); }
+        }
+    }
+    out.write_byte('"');
+}
+
+fn write_hex_digit(out: &mut std.Output, d: u8) {
+    if d < 10 {
+        out.write_byte('0' + d);
+    } else {
+        out.write_byte('a' + d - 10);
+    }
+}
+
+/// A JSON array with one object per diagnostic.
+pub fn write_json(out: &mut std.Output, diags: &Diagnostics, path: str, text: str) {
+    let items = diags.items.items();
+    out.write("[");
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        let d = &items[i];
+        let pos = position(text, d.span.start);
+        if i > 0 {
+            out.write(",");
+        }
+        out.write("\n  {\"file\": ");
+        write_json_string(out, path);
+        out.write(", \"line\": ");
+        out.write_u64(pos.line as u64);
+        out.write(", \"column\": ");
+        out.write_u64(pos.column as u64);
+        out.write(", \"severity\": \"error\", \"code\": \"");
+        write_code(out, d.code);
+        out.write("\", \"message\": ");
+        write_json_string(out, d.message.view());
+        out.write("}");
+    }
+    if items.len() > 0 {
+        out.write("\n");
+    }
+    out.write("]\n");
+}

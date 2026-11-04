@@ -1,0 +1,28 @@
+# The Arche compiler, written in Arche-0 and built by stage0.
+#
+#   make             build build/arche
+#   make check       lexical and syntax conformance tests, and CST round trips
+#   make clean       remove build/
+
+STAGE0 := ../stage0
+BUILD := build
+SOURCES := $(shell find . -name '*.arche' -not -path './build/*')
+
+all: $(BUILD)/arche
+
+$(BUILD)/arche: $(SOURCES) | $(BUILD)
+	$(MAKE) -C $(STAGE0)
+	$(STAGE0)/arche0-build main.arche $@
+
+$(BUILD):
+	mkdir -p $@
+
+check: $(BUILD)/arche
+	$(MAKE) -C ../conformance
+	../conformance/runner/build/runner --codes E01,E02 --compiler ./arche-check ../conformance/tests
+	sh ./roundtrip.sh $(BUILD)/arche ../conformance/tests .
+
+clean:
+	rm -rf $(BUILD)
+
+.PHONY: all check clean

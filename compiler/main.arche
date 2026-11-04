@@ -1,0 +1,108 @@
+/// The Arche compiler, written in Arche-0 (spec/arche-0.md) and built by
+/// stage0.
+///
+///     arche check [--json] <file>   report the file's errors
+///     arche tokens <file>           list its tokens, trivia included
+///     arche cst <file>              print it again from its syntax tree
+///
+/// Functions take the capabilities they use one by one, not the whole
+/// std.System: a path read from sys.args can then be passed beside
+/// &mut sys.stdout without two views of one place (§5.4).
+import std;
+import alloc;
+import diag;
+import syntax.lexer;
+import syntax.parser;
+import syntax.cst;
+
+type ExitError = error { Failed }
+
+fn usage(err_out: &mut std.Output) -> ExitError!void {
+    err_out.write("usage: arche check [--json] <file>\n");
+    err_out.write("       arche tokens <file>\n");
+    err_out.write("       arche cst <file>\n");
+    return ExitError.Failed;
+}
+
+fn read(fs: &std.Fs, err_out: &mut std.Output, path: str, a: alloc.Allocator) -> ExitError!alloc.String {
+    match fs.read_file(path, a) {
+        ok(text) => {
+            return text;
+        }
+        err(e) => {
+            err_out.write("arche: cannot read ");
+            err_out.write(path);
+            err_out.write(": ");
+            match e {
+                .NotFound => { err_out.write("not found"); }
+                .AccessDenied => { err_out.write("access denied"); }
+                .IsDirectory => { err_out.write("it is a directory"); }
+                .InvalidUtf8 => { err_out.write("it is not UTF-8"); }
+                .IoFailed => { err_out.write("input/output failed"); }
+            }
+            err_out.write("\n");
+            return ExitError.Failed;
+        }
+    }
+}
+
+fn check(
+    out: &mut std.Output,
+    err_out: &mut std.Output,
+    fs: &std.Fs,
+    a: alloc.Allocator,
+    path: str,
+    json: bool,
+) -> ExitError!void {
+    let source = try read(fs, err_out, path, a);
+    let text = source.view();
+    var diags = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(text, &mut diags, a);
+    let tree = parser.parse(text, &tokens, &mut diags, a);
+    _ = tree;
+    if json {
+        diag.write_json(out, &diags, path: path, text: text);
+    } else {
+        diag.write_text(err_out, &diags, path: path, text: text);
+    }
+    if diags.count() > 0 {
+        return ExitError.Failed;
+    }
+}
+
+fn dump_tokens(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> ExitError!void {
+    let source = try read(fs, err_out, path, a);
+    let text = source.view();
+    var diags = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(text, &mut diags, a);
+    lexer.write_tokens(out, &tokens, text);
+    diag.write_text(err_out, &diags, path: path, text: text);
+}
+
+fn print_cst(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> ExitError!void {
+    let source = try read(fs, err_out, path, a);
+    let text = source.view();
+    var diags = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(text, &mut diags, a);
+    let tree = parser.parse(text, &tokens, &mut diags, a);
+    cst.write_source(out, &tree, &tokens, text);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let n = sys.args.len();
+    if n < 3 {
+        try usage(&mut sys.stderr);
+    }
+    let command = sys.args.get(1);
+    if command.eq("check") and n == 4 and sys.args.get(2).eq("--json") {
+        try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3), json: true);
+    } else if command.eq("check") and n == 3 {
+        try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2), json: false);
+    } else if command.eq("tokens") and n == 3 {
+        try dump_tokens(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2));
+    } else if command.eq("cst") and n == 3 {
+        try print_cst(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2));
+    } else {
+        try usage(&mut sys.stderr);
+    }
+}

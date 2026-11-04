@@ -1,0 +1,296 @@
+/// Tokens: spec/arche-0.md §2. Whitespace and comments are tokens too, so
+/// that the tokens of a file, one after another, are exactly the file.
+
+pub type Kind = enum {
+    Eof,
+    Whitespace,
+    Comment,
+    DocComment,
+    Error,
+    Ident,
+    Int,
+    Char,
+    String,
+    KwAnd,
+    KwAs,
+    KwAsWrap,
+    KwBreak,
+    KwCatch,
+    KwConst,
+    KwContinue,
+    KwDefer,
+    KwElse,
+    KwEnum,
+    KwErr,
+    KwError,
+    KwFalse,
+    KwFn,
+    KwIf,
+    KwImport,
+    KwLet,
+    KwMatch,
+    KwMut,
+    KwNone,
+    KwNot,
+    KwOk,
+    KwOr,
+    KwOrelse,
+    KwPub,
+    KwReturn,
+    KwSome,
+    KwStruct,
+    KwTest,
+    KwTrue,
+    KwTry,
+    KwType,
+    KwVar,
+    KwWhile,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    PlusWrap,
+    MinusWrap,
+    StarWrap,
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    Shl,
+    Shr,
+    EqEq,
+    NotEq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Assign,
+    PlusAssign,
+    MinusAssign,
+    StarAssign,
+    SlashAssign,
+    PercentAssign,
+    PlusWrapAssign,
+    MinusWrapAssign,
+    StarWrapAssign,
+    AmpAssign,
+    PipeAssign,
+    CaretAssign,
+    ShlAssign,
+    ShrAssign,
+    Dot,
+    Comma,
+    Colon,
+    Semi,
+    Arrow,
+    FatArrow,
+    DotDot,
+    DotDotEq,
+    DotStar,
+    Question,
+    Bang,
+    Underscore,
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    LBrace,
+    RBrace,
+
+    /// Whitespace and comments: the parser looks past them.
+    pub fn is_trivia(self: Kind) -> bool {
+        return self == Kind.Whitespace or self == Kind.Comment or self == Kind.DocComment;
+    }
+}
+
+pub type Token = struct {
+    pub kind: Kind,
+    pub start: u32,
+    pub len: u32,
+    /// The value of an integer or character literal.
+    pub value: u64,
+}
+
+/// The keyword spelled `word`, if it is one (§2.1).
+pub fn keyword(word: str) -> ?Kind {
+    match word[0] {
+        'a' => {
+            if word.eq("and") { return Kind.KwAnd; }
+            if word.eq("as") { return Kind.KwAs; }
+        }
+        'b' => {
+            if word.eq("break") { return Kind.KwBreak; }
+        }
+        'c' => {
+            if word.eq("catch") { return Kind.KwCatch; }
+            if word.eq("const") { return Kind.KwConst; }
+            if word.eq("continue") { return Kind.KwContinue; }
+        }
+        'd' => {
+            if word.eq("defer") { return Kind.KwDefer; }
+        }
+        'e' => {
+            if word.eq("else") { return Kind.KwElse; }
+            if word.eq("enum") { return Kind.KwEnum; }
+            if word.eq("err") { return Kind.KwErr; }
+            if word.eq("error") { return Kind.KwError; }
+        }
+        'f' => {
+            if word.eq("false") { return Kind.KwFalse; }
+            if word.eq("fn") { return Kind.KwFn; }
+        }
+        'i' => {
+            if word.eq("if") { return Kind.KwIf; }
+            if word.eq("import") { return Kind.KwImport; }
+        }
+        'l' => {
+            if word.eq("let") { return Kind.KwLet; }
+        }
+        'm' => {
+            if word.eq("match") { return Kind.KwMatch; }
+            if word.eq("mut") { return Kind.KwMut; }
+        }
+        'n' => {
+            if word.eq("none") { return Kind.KwNone; }
+            if word.eq("not") { return Kind.KwNot; }
+        }
+        'o' => {
+            if word.eq("ok") { return Kind.KwOk; }
+            if word.eq("or") { return Kind.KwOr; }
+            if word.eq("orelse") { return Kind.KwOrelse; }
+        }
+        'p' => {
+            if word.eq("pub") { return Kind.KwPub; }
+        }
+        'r' => {
+            if word.eq("return") { return Kind.KwReturn; }
+        }
+        's' => {
+            if word.eq("some") { return Kind.KwSome; }
+            if word.eq("struct") { return Kind.KwStruct; }
+        }
+        't' => {
+            if word.eq("test") { return Kind.KwTest; }
+            if word.eq("true") { return Kind.KwTrue; }
+            if word.eq("try") { return Kind.KwTry; }
+            if word.eq("type") { return Kind.KwType; }
+        }
+        'v' => {
+            if word.eq("var") { return Kind.KwVar; }
+        }
+        'w' => {
+            if word.eq("while") { return Kind.KwWhile; }
+        }
+        _ => { }
+    }
+    return none;
+}
+
+/// A word reserved for full Arche (§2.1).
+pub fn is_reserved(word: str) -> bool {
+    return word.eq("asm") or word.eq("comptime") or word.eq("dyn") or word.eq("ensures") or word.eq("for") or
+        word.eq("in") or word.eq("interface") or word.eq("naked") or word.eq("nopanic") or word.eq("region") or
+        word.eq("requires") or word.eq("unsafe") or word.eq("where");
+}
+
+/// How a message names a kind of token: "'fn'", "an identifier".
+pub fn describe(kind: Kind) -> str {
+    match kind {
+        .Eof => { return "end of file"; }
+        .Whitespace => { return "whitespace"; }
+        .Comment => { return "a comment"; }
+        .DocComment => { return "a doc comment"; }
+        .Error => { return "an invalid token"; }
+        .Ident => { return "an identifier"; }
+        .Int => { return "an integer literal"; }
+        .Char => { return "a character literal"; }
+        .String => { return "a string literal"; }
+        .KwAnd => { return "'and'"; }
+        .KwAs => { return "'as'"; }
+        .KwAsWrap => { return "'as%'"; }
+        .KwBreak => { return "'break'"; }
+        .KwCatch => { return "'catch'"; }
+        .KwConst => { return "'const'"; }
+        .KwContinue => { return "'continue'"; }
+        .KwDefer => { return "'defer'"; }
+        .KwElse => { return "'else'"; }
+        .KwEnum => { return "'enum'"; }
+        .KwErr => { return "'err'"; }
+        .KwError => { return "'error'"; }
+        .KwFalse => { return "'false'"; }
+        .KwFn => { return "'fn'"; }
+        .KwIf => { return "'if'"; }
+        .KwImport => { return "'import'"; }
+        .KwLet => { return "'let'"; }
+        .KwMatch => { return "'match'"; }
+        .KwMut => { return "'mut'"; }
+        .KwNone => { return "'none'"; }
+        .KwNot => { return "'not'"; }
+        .KwOk => { return "'ok'"; }
+        .KwOr => { return "'or'"; }
+        .KwOrelse => { return "'orelse'"; }
+        .KwPub => { return "'pub'"; }
+        .KwReturn => { return "'return'"; }
+        .KwSome => { return "'some'"; }
+        .KwStruct => { return "'struct'"; }
+        .KwTest => { return "'test'"; }
+        .KwTrue => { return "'true'"; }
+        .KwTry => { return "'try'"; }
+        .KwType => { return "'type'"; }
+        .KwVar => { return "'var'"; }
+        .KwWhile => { return "'while'"; }
+        .Plus => { return "'+'"; }
+        .Minus => { return "'-'"; }
+        .Star => { return "'*'"; }
+        .Slash => { return "'/'"; }
+        .Percent => { return "'%'"; }
+        .PlusWrap => { return "'+%'"; }
+        .MinusWrap => { return "'-%'"; }
+        .StarWrap => { return "'*%'"; }
+        .Amp => { return "'&'"; }
+        .Pipe => { return "'|'"; }
+        .Caret => { return "'^'"; }
+        .Tilde => { return "'~'"; }
+        .Shl => { return "'<<'"; }
+        .Shr => { return "'>>'"; }
+        .EqEq => { return "'=='"; }
+        .NotEq => { return "'!='"; }
+        .Lt => { return "'<'"; }
+        .Le => { return "'<='"; }
+        .Gt => { return "'>'"; }
+        .Ge => { return "'>='"; }
+        .Assign => { return "'='"; }
+        .PlusAssign => { return "'+='"; }
+        .MinusAssign => { return "'-='"; }
+        .StarAssign => { return "'*='"; }
+        .SlashAssign => { return "'/='"; }
+        .PercentAssign => { return "'%='"; }
+        .PlusWrapAssign => { return "'+%='"; }
+        .MinusWrapAssign => { return "'-%='"; }
+        .StarWrapAssign => { return "'*%='"; }
+        .AmpAssign => { return "'&='"; }
+        .PipeAssign => { return "'|='"; }
+        .CaretAssign => { return "'^='"; }
+        .ShlAssign => { return "'<<='"; }
+        .ShrAssign => { return "'>>='"; }
+        .Dot => { return "'.'"; }
+        .Comma => { return "','"; }
+        .Colon => { return "':'"; }
+        .Semi => { return "';'"; }
+        .Arrow => { return "'->'"; }
+        .FatArrow => { return "'=>'"; }
+        .DotDot => { return "'..'"; }
+        .DotDotEq => { return "'..='"; }
+        .DotStar => { return "'.*'"; }
+        .Question => { return "'?'"; }
+        .Bang => { return "'!'"; }
+        .Underscore => { return "'_'"; }
+        .LParen => { return "'('"; }
+        .RParen => { return "')'"; }
+        .LBracket => { return "'['"; }
+        .RBracket => { return "']'"; }
+        .LBrace => { return "'{'"; }
+        .RBrace => { return "'}'"; }
+    }
+}

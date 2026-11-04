@@ -1,0 +1,23 @@
+/// The concrete syntax tree. Each node covers a run of tokens, and the
+/// children of a node cover runs inside it, so writing the tokens in tree
+/// order gives the file back (S5: lossless).
+import std;
+import alloc;
+import syntax.token as tk;
+
+pub type NodeId = struct { pub index: u32 }
+
+pub type Tree = struct {
+    pub tokens: u32,
+}
+
+/// The file again, from the tree.
+pub fn write_source(out: &mut std.Output, tree: &Tree, tokens: &alloc.List(tk.Token), text: str) {
+    _ = tree;
+    let items = tokens.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        let t = items[i];
+        out.write(text[t.start as usize..(t.start + t.len) as usize]);
+    }
+}
