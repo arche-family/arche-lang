@@ -1,0 +1,46 @@
+// test: run
+// spec: arche/10.1
+// stage0: skip
+// stdout: 42 30 3 100 7
+import std;
+
+type Node = struct {
+    value: u32,
+    next: *Node,
+}
+
+unsafe fn bump(p: *mut u32) {
+    p.* = p.* + 1;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var x: u32 = 41;
+    var arr: [4]u32 = [10, 20, 30, 40];
+    var sum: u32 = 0;
+    unsafe {
+        // SAFETY: x and arr live for the whole block; indexes stay inside arr.
+        let p = &mut x as *mut u32;
+        bump(p);
+        sys.stdout.write_u64(p.* as u64);
+        let base = &arr[0] as *u32;
+        var i: usize = 0;
+        while i < 4 : (i += 1) {
+            sum += base.add(i).*;
+        }
+        let r = base.add(2).as_ref();
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(r.* as u64);
+        let tail = Node { value: 2, next: &arr[0] as *u32 as *Node };
+        let head = Node { value: 1, next: &tail as *Node };
+        sys.stdout.write(" ");
+        sys.stdout.write_u64((head.value + head.next.*.value) as u64);
+        let q = &mut x as *mut u32;
+        let m = q.as_mut();
+        m.* = 7;
+    }
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(sum as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(x as u64);
+    sys.stdout.write("\n");
+}

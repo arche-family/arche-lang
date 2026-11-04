@@ -1,0 +1,28 @@
+// test: run
+// spec: arche/7
+// stage0: skip
+// stdout: 7
+import std;
+import alloc;
+
+fn first(sys: &mut std.System) -> u64 {
+    region outer {
+        var a = alloc.List(u64).init(outer);
+        a.push(7);
+        region inner {
+            // An inner region's container may hold the outer region's values.
+            var lists = alloc.List(alloc.List(u64)).init(inner);
+            let b = alloc.List(u64).init(outer);
+            lists.push(b);
+            if lists.len() == 1 {
+                return a[0]; // returning a copy frees both regions
+            }
+        }
+    }
+    return 0;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(first(sys));
+    sys.stdout.write("\n");
+}

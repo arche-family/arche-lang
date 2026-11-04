@@ -1,0 +1,17 @@
+// test: compile-error
+// spec: arche/7
+// stage0: skip
+// line: 14
+// code: E0901
+import std;
+import alloc;
+
+fn main(sys: &mut std.System) -> !void {
+    region outer {
+        var lists = alloc.List(alloc.List(u32)).init(outer);
+        region inner {
+            let l = alloc.List(u32).init(inner);
+            lists.push(l);
+        }
+    }
+}

@@ -1,0 +1,18 @@
+// test: compile-error
+// spec: arche/7
+// stage0: skip
+// line: 16
+// code: E0901
+import std;
+import alloc;
+
+fn wrap(a: alloc.Allocator) -> alloc.String {
+    return alloc.String.init(a);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var keep = alloc.String.init(sys.alloc);
+    region r {
+        keep = wrap(r);
+    }
+}

@@ -155,6 +155,8 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0831` | `dyn I` of an interface whose methods do not all take `self` by reference and use `Self` nowhere else (§5.3). |
 | `E0832` | A value converted to `&dyn I`, or passed to `I.name(…)`, whose type does not implement `I` (§5.1, §5.3). |
 | `E0840` | Compile-time evaluation that runs too many steps or recurses too deep (§4.3). |
+| `E0850` | A closure body that uses a binding from outside without capturing it (§6). |
+| `E0851` | A capture that names no local binding, or one binding twice (§6). |
 
 ## Regions, contracts, concurrency and unsafe
 
@@ -164,3 +166,4 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0902` | A `&mut` view captured by a task while another task or its scope uses the place (§9). |
 | `E0910` | An operation that can panic or trap in a `nopanic` function (§8.2). |
 | `E0920` | An `unsafe` block without a `// SAFETY:` comment, in a package that sets `strict_unsafe` (§10.1). |
+| `E0921` | An operation that needs `unsafe` outside an `unsafe` block or `unsafe fn`: a raw pointer made, read, written, offset or turned into a view, or an `unsafe fn` called (§10.1). |

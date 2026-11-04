@@ -1,0 +1,19 @@
+// test: run
+// spec: arche/6
+// stage0: skip
+// stdout: 2 20
+import std;
+import alloc;
+
+fn main(sys: &mut std.System) -> !void {
+    var list = alloc.List(u32).init(sys.alloc);
+    list.push(4);
+    list.push(5);
+    // The closure owns the list now.
+    let count = fn [list]() -> usize { return list.len(); };
+    sys.stdout.write_u64(count() as u64);
+    let nested = fn [count](k: usize) -> usize { return count() * k; };
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(nested(10) as u64);
+    sys.stdout.write("\n");
+}

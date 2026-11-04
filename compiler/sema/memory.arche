@@ -25,7 +25,23 @@ import sema.types as ty;
 
 pub fn is_view(c: &ck.Checker, t: ty.TypeId) -> bool {
     let k = c.t.kind(t);
+    if k == ty.Kind.Closure {
+        return closure_views(c, c.t.get(t).decl);
+    }
     return k == ty.Kind.Ref or k == ty.Kind.Slice or k == ty.Kind.Str or k == ty.Kind.Dyn;
+}
+
+/// Closure ci captures a view, or a view by value: it is a view (§6).
+fn closure_views(c: &ck.Checker, ci: u32) -> bool {
+    let cl = c.closures[ci as usize];
+    var k = cl.captures_start;
+    while k < cl.captures_start + cl.captures_len : (k += 1) {
+        let cap = c.captures[k as usize];
+        if cap.mode != ck.SelfMode.Value or is_view(c, cap.type_id) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Containers, capabilities, and whatever holds one (§5.5).
@@ -42,6 +58,17 @@ fn move_only_within(c: &ck.Checker, t: ty.TypeId, depth: u32) -> bool {
         .List | .Map => { return true; }
         .Builtin => {
             return info.builtin != ty.Builtin.Allocator and info.builtin != ty.Builtin.Symbol;
+        }
+        .Closure => {
+            let cl = c.closures[info.decl as usize];
+            var k = cl.captures_start;
+            while k < cl.captures_start + cl.captures_len : (k += 1) {
+                let cap = c.captures[k as usize];
+                if cap.mode == ck.SelfMode.Value and move_only_within(c, cap.type_id, depth + 1) {
+                    return true;
+                }
+            }
+            return false;
         }
         .Array | .Optional => { return move_only_within(c, info.elem, depth + 1); }
         .ErrorUnion => { return move_only_within(c, info.elem, depth + 1); }
@@ -82,6 +109,7 @@ fn misplaced_view(c: &ck.Checker, t: ty.TypeId, top: bool) -> bool {
         .Ref => { return misplaced_view(c, info.elem, true) or not top; }
         .Slice => { return misplaced_view(c, info.elem, false) or not top; }
         .Str | .Dyn => { return not top; }
+        .Closure => { return closure_views(c, info.decl) and not top; }
         .Array | .List | .Optional | .ErrorUnion => { return misplaced_view(c, info.elem, false); }
         .Map => { return misplaced_view(c, info.key, false) or misplaced_view(c, info.elem, false); }
         _ => { return false; }
@@ -178,6 +206,8 @@ type Binding = struct {
     mutable_view: bool,
     static_target: bool,
     parent: u32,
+    /// The region binding the value is bound to, or NONE (§7).
+    bound_to: u32,
 }
 
 type Loop = struct {
@@ -216,6 +246,9 @@ type Fn = struct {
     reported: alloc.Map(u64, bool),
     returns_view: bool,
     deferred: alloc.List(cst.NodeId),
+    /// A closure's view of a capture and the binding that holds the
+    /// closure, as view << 32 | holder: the view lives as long as it.
+    ties: alloc.List(u64),
 }
 
 fn new_fn(a: alloc.Allocator) -> Fn {
@@ -233,6 +266,7 @@ fn new_fn(a: alloc.Allocator) -> Fn {
         reported: alloc.Map(u64, bool).init(a),
         returns_view: false,
         deferred: alloc.List(cst.NodeId).init(a),
+        ties: alloc.List(u64).init(a),
     };
 }
 
@@ -301,6 +335,7 @@ fn new_binding(c: &ck.Checker, f: &mut Fn, name: alloc.Symbol, t: ty.TypeId, pos
         mutable_view: c.t.get(t).mutable,
         static_target: false,
         parent: ck.NONE,
+        bound_to: ck.NONE,
     });
     var own_path = alloc.String.init(c.a);
     number_text(&mut own_path, id);
@@ -396,6 +431,85 @@ fn first_for(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) {
     }
 }
 
+/// A closure uses its captures where it is written; its body is checked as
+/// a function of its own. Each view it captures is a binding of its own,
+/// with no name, which lives as long as the closure (§6).
+fn first_closure(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) {
+    let count = ck.child_count(c, n);
+    var i: u32 = 0;
+    while i < count and ck.kind_of(c, ck.child(c, n, i)) == cst.Kind.Capture : (i += 1) {
+        let cn = ck.child(c, n, i);
+        let toks = ck.own(c, cn);
+        let nt = toks[toks.len() - 1];
+        if ck.tok_kind(c, nt) != tk.Kind.Ident {
+            continue;
+        }
+        let sym = ck.symbol(c, nt);
+        match resolve(f, sym) {
+            some(b) => {
+                f.uses.put(cn.index, b);
+                record_use(f, b: b, pos: nt);
+                let t = f.bindings[b as usize].type_id;
+                let by_view = ck.has_own(c, cn, tk.Kind.Amp);
+                if by_view or is_view(c, t) {
+                    var vt = t;
+                    if by_view {
+                        vt = c.t.reference(ck.has_own(c, cn, tk.Kind.KwMut), t);
+                    }
+                    let v = new_binding(c, f, c.names.intern(""), vt, nt);
+                    f.decls.put(cn.index, v);
+                }
+            }
+            none => { }
+        }
+    }
+}
+
+/// The captures of a closure, where it is made: copies, moves and views.
+/// Returns the views, which live as long as the closure.
+fn closure_captures(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> alloc.List(View) {
+    var views = alloc.List(View).init(c.a);
+    let count = ck.child_count(c, n);
+    var i: u32 = 0;
+    while i < count and ck.kind_of(c, ck.child(c, n, i)) == cst.Kind.Capture : (i += 1) {
+        let cn = ck.child(c, n, i);
+        let b = f.uses.get(cn.index) orelse ck.NONE;
+        if b == ck.NONE {
+            continue;
+        }
+        var path = alloc.String.init(c.a);
+        number_text(&mut path, b);
+        let t = f.bindings[b as usize].type_id;
+        var has_view = false;
+        var v = static_view(c.a);
+        if ck.has_own(c, cn, tk.Kind.Amp) {
+            v = view_of_place(c, f, cn, path.view(), ck.has_own(c, cn, tk.Kind.KwMut));
+            has_view = true;
+        } else if is_view(c, t) {
+            access(c, f, cn, path.view(), Access.Read);
+            v = view_of_binding(c, f, b);
+            has_view = true;
+        } else if is_move_only(c, t) {
+            access(c, f, cn, path.view(), Access.Move);
+        } else {
+            access(c, f, cn, path.view(), Access.Read);
+        }
+        if not has_view {
+            continue;
+        }
+        let sb = declared(f, cn);
+        if sb != ck.NONE {
+            fresh(c, f, sb);
+            f.bindings[sb as usize].depth = f.depth;
+            let copy = View { target: copy_text(v.target.view(), c.a), root: v.root, is_static: v.is_static, mutable: v.mutable };
+            set_target(f, sb, copy);
+            f.scope.push(sb);
+        }
+        views.push(v);
+    }
+    return views;
+}
+
 fn first_pattern(c: &mut ck.Checker, f: &mut Fn, p: cst.NodeId) {
     match ck.kind_of(c, p) {
         .BindPat => { declare_at(c, f, p, ck.ident_of(c, p)); }
@@ -427,8 +541,41 @@ fn first_node(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) {
             return;
         }
         .LetStmt => {
-            first_node(c, f, ck.child(c, n, count - 1));
+            let init = ck.child(c, n, count - 1);
+            first_node(c, f, init);
             declare_at(c, f, n, ck.ident_of(c, n));
+            var e = init;
+            while ck.kind_of(c, e) == cst.Kind.ParenExpr {
+                e = ck.child(c, e, 0);
+            }
+            if ck.kind_of(c, e) == cst.Kind.ClosureExpr {
+                let holder = declared(f, n);
+                let ce = ck.child_count(c, e);
+                var k: u32 = 0;
+                while k < ce : (k += 1) {
+                    let v = declared(f, ck.child(c, e, k));
+                    if v != ck.NONE {
+                        f.ties.push(((v as u64) << 32) | holder as u64);
+                    }
+                }
+            }
+            return;
+        }
+        .ClosureExpr => {
+            first_closure(c, f, n);
+            return;
+        }
+        .RegionStmt => {
+            let saved = f.scope.len();
+            f.depth += 1;
+            if ck.has_own(c, n, tk.Kind.Ident) {
+                declare_at(c, f, n, ck.ident_of(c, n));
+            }
+            first_block(c, f, ck.child(c, n, 0));
+            f.depth -= 1;
+            while f.scope.len() > saved {
+                _ = f.scope.pop();
+            }
             return;
         }
         .WhileStmt => {
@@ -660,6 +807,11 @@ fn place(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId, out: &mut alloc.String) 
             return found;
         }
         .DerefExpr => {
+            if c.t.kind(ck.type_of(c, ck.child(c, e, 0))) == ty.Kind.Ptr {
+                // A raw pointer's target is no path: §11.4.
+                eval(c, f, ck.child(c, e, 0), false);
+                return false;
+            }
             let found = place_or_view(c, f, ck.child(c, e, 0), out);
             if found {
                 out.push_str(".*");
@@ -717,6 +869,11 @@ fn view_of(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId) -> View {
     let mutable = c.t.get(t).mutable;
     match ck.kind_of(c, e) {
         .StringLit => { return static_view(c.a); }
+        .ClosureExpr => {
+            // Its views are bindings of their own (first_closure).
+            _ = closure_captures(c, f, e);
+            return static_view(c.a);
+        }
         .ParenExpr => { return view_of(c, f, ck.child(c, e, 0)); }
         .NameExpr => {
             match f.uses.get(e.index) {
@@ -787,6 +944,16 @@ fn add_view(cv: &mut CallViews, v: View, n: cst.NodeId) {
 
 /// Evaluates an argument passed as a parameter of type pt.
 fn argument(c: &mut ck.Checker, f: &mut Fn, cv: &mut CallViews, e: cst.NodeId, pt: ty.TypeId) {
+    if ck.kind_of(c, e) == cst.Kind.ClosureExpr {
+        // A closure made for the call: its views are live during it.
+        let vs = closure_captures(c, f, e);
+        var k: usize = 0;
+        while k < vs.len() : (k += 1) {
+            let v = &vs[k];
+            add_view(cv, View { target: copy_text(v.target.view(), c.a), root: v.root, is_static: v.is_static, mutable: v.mutable }, e);
+        }
+        return;
+    }
     if is_view(c, pt) {
         var v = view_of(c, f, e);
         v.mutable = c.t.get(pt).mutable;
@@ -815,6 +982,9 @@ fn call(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> View {
     }
     if ck.kind_of(c, callee) == cst.Kind.FieldExpr and not ck.is_invalid(c, ck.type_of(c, callee)) {
         is_method = true;
+    }
+    if ck.kind_of(c, callee) == cst.Kind.NameExpr and (f.uses.get(callee.index) orelse ck.NONE) != ck.NONE {
+        eval(c, f, callee, false); // calling a closure reads it
     }
     if d != ck.NONE and c.decls[d as usize].kind == ck.DeclKind.Fn {
         let info = c.fns[c.decls[d as usize].fn_index as usize];
@@ -884,6 +1054,7 @@ fn call(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) -> View {
         argument(c, f, &mut cv, e, pt);
     }
     check_call_views(c, f, &cv);
+    check_region_args(c, f, n);
     let rt = ck.type_of(c, n);
     if c.t.kind(rt) == ty.Kind.Noreturn {
         f.dead = true;
@@ -928,6 +1099,7 @@ fn eval(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId, consume: bool) {
     let t = ck.type_of(c, e);
     match ck.kind_of(c, e) {
         .IntLit | .CharLit | .StringLit | .BoolLit | .NoneLit => { }
+        .ClosureExpr => { _ = closure_captures(c, f, e); }
         .ParenExpr => { eval(c, f, ck.child(c, e, 0), consume); }
         .NameExpr | .FieldExpr | .IndexExpr | .DerefExpr => {
             if ck.kind_of(c, e) == cst.Kind.FieldExpr and ck.ref_of(c, e) != ck.VALUE_FIELD {
@@ -1116,6 +1288,7 @@ fn let_stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
     } else {
         eval(c, f, init, true);
     }
+    f.bindings[b as usize].bound_to = region_of(c, f, init);
     fresh(c, f, b);
     f.bindings[b as usize].depth = f.depth;
     f.scope.push(b);
@@ -1125,6 +1298,18 @@ fn assign(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
     let target = ck.child(c, s, 0);
     let value = ck.child(c, s, 1);
     let op = ck.tok_kind(c, ck.own(c, s)[0]);
+    let r = region_of(c, f, value);
+    if r != ck.NONE {
+        var root = alloc.String.init(c.a);
+        if place_root(c, f, target, &mut root) {
+            let tb = path_root(root.view());
+            if f.bindings[tb as usize].decl_pos < f.bindings[r as usize].decl_pos {
+                report_region(c, f, r, value, "be stored in a binding declared outside the region");
+            } else {
+                f.bindings[tb as usize].bound_to = inner_region(f, a: f.bindings[tb as usize].bound_to, b: r);
+            }
+        }
+    }
     var out = alloc.String.init(c.a);
     let is_place = place(c, f, target, &mut out);
     let t = ck.type_of(c, target);
@@ -1163,9 +1348,138 @@ fn assign(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
     }
 }
 
+// ---- regions (spec/arche.md §7) ---------------------------------------------------
+
+/// A container or allocator carries the region it was made with.
+fn carries_region(c: &ck.Checker, t: ty.TypeId) -> bool {
+    let info = c.t.get(t);
+    return is_move_only(c, t) or (info.kind == ty.Kind.Builtin and info.builtin == ty.Builtin.Allocator);
+}
+
+/// The inner of two regions: the one declared later; NONE is no region.
+fn inner_region(f: &Fn, a: u32, b: u32) -> u32 {
+    if a == ck.NONE {
+        return b;
+    }
+    if b == ck.NONE {
+        return a;
+    }
+    if f.bindings[b as usize].decl_pos > f.bindings[a as usize].decl_pos {
+        return b;
+    }
+    return a;
+}
+
+/// The region a value is bound to: made with its allocator, or holding a
+/// value bound to it. A call that takes an allocator or a bound value and
+/// returns a container binds the result to the innermost of them.
+fn region_of(c: &ck.Checker, f: &Fn, e: cst.NodeId) -> u32 {
+    if not carries_region(c, ck.type_of(c, e)) {
+        return ck.NONE;
+    }
+    match ck.kind_of(c, e) {
+        .ParenExpr | .SomeExpr | .TryExpr => { return region_of(c, f, ck.child(c, e, 0)); }
+        .NameExpr => {
+            let b = f.uses.get(e.index) orelse ck.NONE;
+            if b == ck.NONE {
+                return ck.NONE;
+            }
+            return f.bindings[b as usize].bound_to;
+        }
+        .FieldExpr => { return region_of(c, f, ck.child(c, e, 0)); }
+        .CallExpr | .StructLit | .ArrayLit => {
+            var r = ck.NONE;
+            let n = ck.child_count(c, e);
+            var i: u32 = 0;
+            if ck.kind_of(c, e) == cst.Kind.StructLit {
+                i = 1;
+            }
+            while i < n : (i += 1) {
+                var a = ck.child(c, e, i);
+                let k = ck.kind_of(c, a);
+                if k == cst.Kind.Arg or k == cst.Kind.FieldInit {
+                    a = ck.child(c, a, ck.child_count(c, a) - 1);
+                }
+                r = inner_region(f, a: r, b: region_of(c, f, a));
+            }
+            return r;
+        }
+        _ => { return ck.NONE; }
+    }
+}
+
+fn report_region(c: &mut ck.Checker, f: &mut Fn, r: u32, n: cst.NodeId, what: str) {
+    var m = ck.new_message(c);
+    m.push_str("this value is bound to region ");
+    binding_name(c, f, r, &mut m);
+    m.push_str(" and cannot ");
+    m.push_str(what);
+    m.push_str("; copy out what you need, or make it with an allocator that lives long enough (§7)");
+    report_once(c, f, codes.REGION_ESCAPE, n, m);
+}
+
+/// Moving a region's value into a container is fine when the container is
+/// bound to that region or to one inside it.
+fn check_region_args(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) {
+    let callee = ck.child(c, n, 0);
+    if ck.kind_of(c, callee) != cst.Kind.FieldExpr or ck.is_invalid(c, ck.type_of(c, callee)) {
+        return;
+    }
+    let receiver = ck.child(c, callee, 0);
+    var rt = ck.type_of(c, receiver);
+    if c.t.kind(rt) == ty.Kind.Ref {
+        rt = c.t.elem(rt);
+    }
+    if not is_move_only(c, rt) {
+        return;
+    }
+    var out = alloc.String.init(c.a);
+    var held = ck.NONE;
+    if place_root(c, f, receiver, &mut out) {
+        held = f.bindings[path_root(out.view()) as usize].bound_to;
+    }
+    let nargs = ck.child_count(c, n) - 1;
+    var i: u32 = 0;
+    while i < nargs : (i += 1) {
+        let a = ck.child(c, ck.child(c, n, i + 1), 0);
+        if not is_move_only(c, ck.type_of(c, a)) {
+            continue;
+        }
+        let r = region_of(c, f, a);
+        if r == ck.NONE {
+            continue;
+        }
+        if held == ck.NONE or f.bindings[held as usize].decl_pos < f.bindings[r as usize].decl_pos {
+            report_region(c, f, r, a, "be moved into a container that outlives it");
+        }
+    }
+}
+
+/// The binding a place expression starts from, without evaluating it.
+fn place_root(c: &ck.Checker, f: &Fn, e: cst.NodeId, out: &mut alloc.String) -> bool {
+    match ck.kind_of(c, e) {
+        .NameExpr => {
+            let b = f.uses.get(e.index) orelse ck.NONE;
+            if b == ck.NONE {
+                return false;
+            }
+            number_text(out, b);
+            return true;
+        }
+        .ParenExpr | .FieldExpr | .IndexExpr | .DerefExpr | .RefExpr => {
+            return place_root(c, f, ck.child(c, e, 0), out);
+        }
+        _ => { return false; }
+    }
+}
+
 fn return_stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
     if ck.child_count(c, s) > 0 {
         let e = ck.child(c, s, 0);
+        let r = region_of(c, f, e);
+        if r != ck.NONE {
+            report_region(c, f, r, e, "be returned");
+        }
         if f.returns_view {
             let v = view_of(c, f, e);
             if not v.is_static {
@@ -1393,6 +1707,22 @@ fn stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
         }
         .WhileStmt => { loop_stmt(c, f, s); }
         .ForStmt => { for_stmt(c, f, s); }
+        .UnsafeStmt => { block(c, f, ck.child(c, s, 0)); }
+        .RegionStmt => {
+            let saved = f.scope.len();
+            f.depth += 1;
+            let r = declared(f, s);
+            if r != ck.NONE {
+                f.bindings[r as usize].bound_to = r;
+                f.bindings[r as usize].depth = f.depth;
+                f.scope.push(r);
+            }
+            block(c, f, ck.child(c, s, 0));
+            f.depth -= 1;
+            while f.scope.len() > saved {
+                _ = f.scope.pop();
+            }
+        }
         .MatchStmt => { match_stmt(c, f, s); }
         .ReturnStmt => { return_stmt(c, f, s); }
         .BreakStmt => {
@@ -1428,6 +1758,16 @@ fn check_body(c: &mut ck.Checker, fn_index: u32, body: cst.NodeId) {
     }
     let params_end = f.scope.len();
     first_block(c, &mut f, body);
+    // A closure's views live as long as the binding that holds it.
+    let ties = f.ties.items();
+    var t: usize = 0;
+    while t < ties.len() : (t += 1) {
+        let v = (ties[t] >> 32) as u32;
+        let holder = (ties[t] & 0xFFFFFFFF) as u32;
+        if f.bindings[holder as usize].live_end > f.bindings[v as usize].live_end {
+            f.bindings[v as usize].live_end = f.bindings[holder as usize].live_end;
+        }
+    }
     while f.scope.len() > params_end {
         _ = f.scope.pop();
     }

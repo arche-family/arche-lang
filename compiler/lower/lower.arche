@@ -317,6 +317,24 @@ pub fn call_indirect(l: &mut Lower, callee: u32, ret: ir.Ty, args: &alloc.List(u
     return emit(l, i);
 }
 
+/// The table of a closure as a &dyn fn(P) -> R: its body alone.
+pub fn closure_vtable(l: &mut Lower, ci: u32) -> u32 {
+    let key = ci | 0x80000000;
+    match l.vtables.get(key) {
+        some(v) => { return v; }
+        none => { }
+    }
+    var fns = alloc.List(u32).init(l.a);
+    fns.push(l.c.closures[ci as usize].fn_index);
+    var name = alloc.String.init(l.a);
+    name.push_str("a0vc_");
+    ir.write_number(&mut name, ci as u64);
+    let id = l.m.vtables.len() as u32;
+    l.m.vtables.push(ir.VTable { name: name, functions: fns });
+    l.vtables.put(key, id);
+    return id;
+}
+
 /// The method table of impl i: its methods in the order of its interface's
 /// (spec/arche.md §5.3), made once.
 pub fn vtable(l: &mut Lower, i: u32) -> u32 {
@@ -529,6 +547,11 @@ pub fn mangle(c: &ck.Checker, d: u32, a: alloc.Allocator) -> alloc.String {
         segment(&mut out, c.names.text(c.decls[decl.owner as usize].name));
     }
     segment(&mut out, c.names.text(decl.name));
+    // A closure: one per expression, numbered by its function.
+    if ck.kind_of_in(c, decl.module, decl.node) == cst.Kind.ClosureExpr {
+        out.push_str("_C");
+        ir.write_number(&mut out, decl.fn_index as u64);
+    }
     // A method of an impl: two interfaces may both have one of its name.
     if decl.impl_index != ck.NONE {
         out.push_str("_X");
@@ -554,6 +577,9 @@ fn declare_fn(l: &mut Lower, f: u32) -> ir.Function {
     var irf = ir.new_function(name.view(), rt, l.a);
     if returns_in_memory(&l.c, info.ret) {
         irf.params.push(ir.Ty.Ptr);
+    }
+    if ck.is_closure_fn(&l.c, f) {
+        irf.params.push(ir.Ty.Ptr); // the closure: its captures
     }
     var i = info.params_start;
     while i < info.params_start + info.params_len : (i += 1) {
@@ -582,6 +608,25 @@ fn lower_fn(l: &mut Lower, f: u32) {
         p.imm = 0;
         l.sret = emit(l, p);
         position = 1;
+    }
+    if ck.is_closure_fn(&l.c, f) {
+        // A capture is a binding at its place in the closure, or, for a
+        // view, at the address the closure holds.
+        var p = ir.inst(ir.Op.Param, ir.Ty.Ptr);
+        p.imm = position;
+        let env = emit(l, p);
+        position += 1;
+        let ci = ck.closure_of_fn(&l.c, f);
+        let cl = l.c.closures[ci as usize];
+        var k: u32 = 0;
+        while k < cl.captures_len : (k += 1) {
+            let cap = l.c.captures[(cl.captures_start + k) as usize];
+            var addr = gep(l, env, layout.capture_offset(&l.c, ci: ci, k: k));
+            if cap.mode != ck.SelfMode.Value {
+                addr = load(l, ir.Ty.Ptr, addr);
+            }
+            bind(l, cap.name, addr, cap.type_id);
+        }
     }
     var i = info.params_start;
     while i < info.params_start + info.params_len : (i += 1) {

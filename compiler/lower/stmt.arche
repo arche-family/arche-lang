@@ -37,7 +37,11 @@ pub fn run_defers(l: &mut lw.Lower, depth: u32) {
             return;
         }
         let d = l.defers[(i - 1) as usize];
-        stmt(l, d);
+        if kind(l, d) == cst.Kind.RegionStmt {
+            region_end(l, d);
+        } else {
+            stmt(l, d);
+        }
     }
 }
 
@@ -76,6 +80,8 @@ fn stmt(l: &mut lw.Lower, s: cst.NodeId) {
         .IfStmt => { if_stmt(l, s); }
         .WhileStmt => { while_stmt(l, s); }
         .ForStmt => { for_stmt(l, s); }
+        .UnsafeStmt => { block(l, child(l, s, 0)); }
+        .RegionStmt => { region_stmt(l, s); }
         .MatchStmt => { match_stmt(l, s); }
         .ReturnStmt => { return_stmt(l, s); }
         .BreakStmt | .ContinueStmt => {
@@ -178,6 +184,42 @@ fn while_stmt(l: &mut lw.Lower, s: cst.NodeId) {
     }
     lw.br(l, head);
     lw.switch_to(l, done);
+}
+
+// ---- region (spec/arche.md §7) ---------------------------------------------------
+
+/// region r { ... }: an arena for the block, freed however it is left, as
+/// if by a defer registered at its start.
+fn region_stmt(l: &mut lw.Lower, s: cst.NodeId) {
+    let at = l.c.t.builtin(ty.Builtin.Allocator);
+    var none_ = lw.args0(l);
+    let h = lw.call_runtime(l, "a0rt_region_begin", ir.Ty.I64, &none_);
+    let slot = lw.alloca(l, at);
+    lw.store(l, value: h, addr: slot);
+    let vars = l.vars.len();
+    let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, s));
+    lw.bind(l, sym, slot, at);
+    let defers = l.defers.len() as u32;
+    l.defers.push(s);
+    block(l, child(l, s, 0));
+    if not lw.terminated(l) {
+        run_defers(l, defers);
+    }
+    while l.defers.len() as u32 > defers {
+        _ = l.defers.pop();
+    }
+    while l.vars.len() > vars {
+        _ = l.vars.pop();
+    }
+}
+
+fn region_end(l: &mut lw.Lower, s: cst.NodeId) {
+    let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, s));
+    let v = lw.find_var(l, sym) orelse lw.Var { name: sym, addr: 0, type_id: ty.invalid() };
+    let h = lw.load(l, ir.Ty.I64, v.addr);
+    var args = lw.args0(l);
+    args.push(h);
+    _ = lw.call_runtime(l, "a0rt_region_end", ir.Ty.Void, &args);
 }
 
 // ---- for (spec/arche.md §3.2) --------------------------------------------------

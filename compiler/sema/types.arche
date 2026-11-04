@@ -32,6 +32,11 @@ pub type Kind = enum {
     /// any type that implements it (spec/arche.md §5).
     Interface,
     Dyn,
+    /// *T and *mut T (spec/arche.md §10.1).
+    Ptr,
+    /// A closure's own type (spec/arche.md §6); decl is its number in the
+    /// checker's closures.
+    Closure,
 }
 
 /// No declaration: an error union with an inferred set, or the error set
@@ -153,6 +158,13 @@ pub type Types = struct {
     pub fn declared(self: &mut Types, kind: Kind, decl: u32) -> TypeId {
         var info = plain(kind);
         info.decl = decl;
+        return self.intern(info);
+    }
+
+    pub fn pointer(self: &mut Types, mutable: bool, elem: TypeId) -> TypeId {
+        var info = plain(Kind.Ptr);
+        info.mutable = mutable;
+        info.elem = elem;
         return self.intern(info);
     }
 

@@ -1,0 +1,43 @@
+// test: run
+// spec: arche/7
+// stage0: skip
+// stdout: hello, world 604200
+import std;
+import alloc;
+
+fn render(name: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str("hello, ");
+    s.push_str(name);
+    return s;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var total: usize = 0;
+    var i: u32 = 0;
+    while i < 200 : (i += 1) {
+        region r {
+            var body = alloc.String.init(r);
+            body.push_str("request ");
+            let reply = render("world", r);
+            var list = alloc.List(u64).init(r);
+            var k: u64 = 0;
+            while k < 3000 : (k += 1) {
+                list.push(k);
+            }
+            var seen = alloc.Map(u64, bool).init(r);
+            seen.put(k, true);
+            // Copying out what is copyable is fine.
+            total += body.len() + reply.len() + list.len() + seen.len();
+            if i == 199 {
+                sys.stdout.write(reply.view());
+            }
+            if i == 150 {
+                continue; // leaves the region: it is freed here too
+            }
+        }
+    }
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(total as u64);
+    sys.stdout.write("\n");
+}

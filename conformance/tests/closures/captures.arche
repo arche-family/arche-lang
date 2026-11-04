@@ -1,0 +1,39 @@
+// test: run
+// spec: arche/6
+// stage0: skip
+// stdout: 21 15 18 107
+import std;
+import alloc;
+
+fn apply(f: &dyn fn(u32) -> u32, x: u32) -> u32 {
+    return f(x);
+}
+
+fn each(items: []u32, f: &dyn fn(u32)) {
+    for x in items {
+        f(x.*);
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let factor: u32 = 3;
+    let scale = fn [factor](x: u32) -> u32 { return x * factor; };
+    sys.stdout.write_u64(scale(7) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(apply(&scale, x: 5) as u64);
+    var total: u32 = 0;
+    let add = fn [&mut total](x: u32) { total += x; };
+    add(10);
+    add(5);
+    var list = alloc.List(u32).init(sys.alloc);
+    list.push(1);
+    list.push(2);
+    each(list.items(), f: &add);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(total as u64);
+    let name = "arche";
+    let size = fn [name, &list](n: u32) -> usize { return name.len() + list.len() + n as usize; };
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(size(100) as u64);
+    sys.stdout.write("\n");
+}

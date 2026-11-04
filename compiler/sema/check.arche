@@ -89,6 +89,23 @@ pub type Impl = struct {
     pub methods_len: u32,
 }
 
+/// What a closure captures: a copy or move of a binding, or a view of it
+/// (mode Ref or MutRef). type_id is the binding's type.
+pub type Capture = struct {
+    pub name: alloc.Symbol,
+    pub name_token: u32,
+    pub type_id: ty.TypeId,
+    pub mode: SelfMode,
+}
+
+/// A closure (spec/arche.md §6): its body is function fn_index, which
+/// takes the closure's captures as its first, hidden parameter.
+pub type Closure = struct {
+    pub fn_index: u32,
+    pub captures_start: u32,
+    pub captures_len: u32,
+}
+
 /// A comptime argument, bound to its parameter's name.
 pub type EnvEntry = struct {
     pub name: alloc.Symbol,
@@ -206,6 +223,15 @@ pub type Checker = struct {
     /// What `Self` names: inside an interface, the interface; inside an
     /// impl, its type; invalid elsewhere.
     pub self_type: ty.TypeId,
+    /// Inside an unsafe block or an unsafe fn (spec/arche.md §10.1).
+    pub unsafe_depth: u32,
+    pub closures: alloc.List(Closure),
+    pub captures: alloc.List(Capture),
+    /// The interfaces fn(P) -> R made so far (spec/arche.md §6).
+    pub fn_ifaces: alloc.List(u32),
+    /// Inside a closure: the bindings around it, which it may not use
+    /// without capturing them.
+    pub outer_scope: alloc.List(Binding),
     pub a: alloc.Allocator,
 }
 
@@ -223,6 +249,27 @@ pub fn kind_of(c: &Checker, n: cst.NodeId) -> cst.Kind {
     return c.p.modules[c.module as usize].tree.node(n).kind;
 }
 
+/// Reports an operation that needs unsafe outside of it (spec/arche.md §10.1).
+pub fn require_unsafe(c: &mut Checker, s: diag.Span, what: str) {
+    if c.unsafe_depth > 0 {
+        return;
+    }
+    var m = new_message(c);
+    m.push_str(what);
+    m.push_str(" is allowed only inside 'unsafe { ... }' or an 'unsafe fn'");
+    report_owned(c, codes.NEEDS_UNSAFE, s, m);
+}
+
+/// Declaration d is an unsafe fn.
+pub fn is_unsafe_fn(c: &Checker, d: u32) -> bool {
+    let decl = c.decls[d as usize];
+    let t = &c.p.modules[decl.module as usize].tree;
+    match t.find_own(decl.node, tk.Kind.KwUnsafe, c.a) {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
 /// The kind of node n of module m.
 pub fn kind_of_in(c: &Checker, m: u32, n: cst.NodeId) -> cst.Kind {
     return c.p.modules[m as usize].tree.node(n).kind;
@@ -234,7 +281,118 @@ pub fn is_signature(c: &Checker, f: u32) -> bool {
     if d == NONE {
         return false;
     }
-    return kind_of_in(c, c.decls[d as usize].module, c.decls[d as usize].node) == cst.Kind.FnSig;
+    let k = kind_of_in(c, c.decls[d as usize].module, c.decls[d as usize].node);
+    return k == cst.Kind.FnSig or k == cst.Kind.TypeFn;
+}
+
+/// The function is a closure's body (spec/arche.md §6).
+pub fn is_closure_fn(c: &Checker, f: u32) -> bool {
+    let d = c.fns[f as usize].decl;
+    if d == NONE {
+        return false;
+    }
+    return kind_of_in(c, c.decls[d as usize].module, c.decls[d as usize].node) == cst.Kind.ClosureExpr;
+}
+
+/// The closure whose body is function f.
+pub fn closure_of_fn(c: &Checker, f: u32) -> u32 {
+    var i: usize = 0;
+    while i < c.closures.len() : (i += 1) {
+        if c.closures[i].fn_index == f {
+            return i as u32;
+        }
+    }
+    return NONE;
+}
+
+/// Declaration d is an interface fn(P) -> R.
+pub fn is_fn_iface(c: &Checker, d: u32) -> bool {
+    let decl = c.decls[d as usize];
+    return decl.kind == DeclKind.Interface and kind_of_in(c, decl.module, decl.node) == cst.Kind.TypeFn;
+}
+
+/// The interface fn(P) -> R, one per signature: its one method, `call`,
+/// takes the closure as self (spec/arche.md §6).
+pub fn fn_iface(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
+    var params = alloc.List(ty.TypeId).init(c.a);
+    var ret = ty.void_type();
+    let count = child_count(c, n);
+    let arrow = has_own(c, n, tk.Kind.Arrow);
+    var i: u32 = 0;
+    while i < count : (i += 1) {
+        let t = resolve_type(c, child(c, n, i));
+        if arrow and i == count - 1 {
+            ret = t;
+        } else {
+            params.push(t);
+        }
+    }
+    let ps = params.items();
+    var k: usize = 0;
+    while k < c.fn_ifaces.len() : (k += 1) {
+        let d = c.fn_ifaces[k];
+        let f = c.fns[c.decls[c.methods[c.decls[d as usize].methods_start as usize] as usize].fn_index as usize];
+        var same = f.ret == ret and f.params_len == ps.len() as u32 + 1;
+        var j: usize = 0;
+        while same and j < ps.len() : (j += 1) {
+            same = c.params[f.params_start as usize + 1 + j].type_id == ps[j];
+        }
+        if same {
+            return c.decls[d as usize].type_id;
+        }
+    }
+    let id = c.decls.len() as u32;
+    var d = new_decl(DeclKind.Interface, module: c.module, n, c.names.intern("fn"), name_token: first_own(c, n), true);
+    d.type_id = c.t.declared(ty.Kind.Interface, id);
+    let it = d.type_id;
+    c.decls.push(d);
+    var md = new_decl(DeclKind.Fn, module: c.module, n, c.names.intern("call"), name_token: first_own(c, n), true);
+    md.owner = id;
+    let mid = c.decls.len() as u32;
+    c.decls.push(md);
+    let start = c.params.len() as u32;
+    let self_sym = c.names.intern("self");
+    c.params.push(ParamInfo { name: self_sym, name_token: first_own(c, n), type_id: c.t.reference(false, it) });
+    var q: usize = 0;
+    while q < ps.len() : (q += 1) {
+        var pname = alloc.String.init(c.a);
+        pname.push_str("p");
+        write_number(&mut pname, q as u64);
+        let sym = c.names.intern(pname.view());
+        c.params.push(ParamInfo { name: sym, name_token: first_own(c, n), type_id: ps[q] });
+    }
+    c.decls[mid as usize].fn_index = c.fns.len() as u32;
+    c.fns.push(FnInfo {
+        decl: mid,
+        params_start: start,
+        params_len: c.params.len() as u32 - start,
+        ret: ret,
+        has_self: true,
+        self_mode: SelfMode.Ref,
+        table: NONE,
+        ncomptime: 0,
+    });
+    c.decls[id as usize].methods_start = c.methods.len() as u32;
+    c.decls[id as usize].methods_len = 1;
+    c.methods.push(mid);
+    c.fn_ifaces.push(id);
+    return it;
+}
+
+/// Closure ci has the signature of the interface fn(P) -> R declared by d.
+fn closure_fits(c: &Checker, ci: u32, d: u32) -> bool {
+    let cf = c.fns[c.closures[ci as usize].fn_index as usize];
+    let f = c.fns[c.decls[c.methods[c.decls[d as usize].methods_start as usize] as usize].fn_index as usize];
+    if cf.ret != f.ret or cf.params_len + 1 != f.params_len {
+        return false;
+    }
+    var j: u32 = 0;
+    while j < cf.params_len : (j += 1) {
+        if c.params[(cf.params_start + j) as usize].type_id != c.params[(f.params_start + 1 + j) as usize].type_id {
+            return false;
+        }
+    }
+    return true;
 }
 
 pub fn child(c: &Checker, n: cst.NodeId, i: u32) -> cst.NodeId {
@@ -464,6 +622,17 @@ pub fn write_type(c: &Checker, m: &mut alloc.String, t: ty.TypeId) {
             m.push_str("dyn ");
             write_decl_name(c, m, info.decl);
         }
+        .Ptr => {
+            m.push_str("*");
+            if info.mutable {
+                m.push_str("mut ");
+            }
+            write_type(c, m, info.elem);
+        }
+        .Closure => {
+            m.push_str("closure ");
+            write_signature(c, m, f: c.closures[info.decl as usize].fn_index, skip: 0);
+        }
         .Builtin => {
             match info.builtin {
                 .Output => { m.push_str("std.Output"); }
@@ -480,9 +649,32 @@ pub fn write_type(c: &Checker, m: &mut alloc.String, t: ty.TypeId) {
     }
 }
 
+/// fn(P) -> R of function f, leaving out its first `skip` parameters.
+pub fn write_signature(c: &Checker, m: &mut alloc.String, f: u32, skip: u32) {
+    let info = c.fns[f as usize];
+    m.push_str("fn(");
+    var i = info.params_start + skip;
+    while i < info.params_start + info.params_len : (i += 1) {
+        if i > info.params_start + skip {
+            m.push_str(", ");
+        }
+        write_type(c, m, c.params[i as usize].type_id);
+    }
+    m.push_str(")");
+    if c.t.kind(info.ret) != ty.Kind.Void {
+        m.push_str(" -> ");
+        write_type(c, m, info.ret);
+    }
+}
+
 pub fn write_decl_name(c: &Checker, m: &mut alloc.String, d: u32) {
     if d == c.io_error {
         m.push_str("std.IoError");
+        return;
+    }
+    if is_fn_iface(c, d) {
+        let md = c.methods[c.decls[d as usize].methods_start as usize];
+        write_signature(c, m, f: c.decls[md as usize].fn_index, skip: 1);
         return;
     }
     let decl = c.decls[d as usize];
@@ -585,7 +777,7 @@ fn comparable_within(c: &Checker, t: ty.TypeId, depth: u32) -> bool {
     }
     let info = c.t.get(t);
     match info.kind {
-        .Int | .Bool | .ErrorSet | .Invalid => { return true; }
+        .Int | .Bool | .ErrorSet | .Invalid | .Ptr => { return true; }
         .Builtin => { return info.builtin == ty.Builtin.Symbol; }
         .Enum => {
             let d = c.decls[info.decl as usize];
@@ -795,6 +987,15 @@ pub fn resolve_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
             let elem = resolve_type(c, child(c, n, 0));
             return c.t.slice(has_own(c, n, tk.Kind.KwMut), elem);
         }
+        .TypePtr => {
+            let elem = resolve_type(c, child(c, n, 0));
+            return c.t.pointer(has_own(c, n, tk.Kind.KwMut), elem);
+        }
+        .TypeFn => {
+            let s = span_of(c, n);
+            report(c, codes.INTERFACE_AS_TYPE, s, "fn(P) -> R is the interface of closures; a view of one is '&dyn fn(P) -> R'");
+            return ty.invalid();
+        }
         .TypeOptional => {
             let elem = resolve_type(c, child(c, n, 0));
             return c.t.optional(elem);
@@ -859,6 +1060,9 @@ fn is_self_path(c: &Checker, n: cst.NodeId) -> bool {
 /// The interface a type node names, or invalid after reporting why not
 /// (spec/arche.md §5).
 pub fn resolve_interface(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
+    if kind_of(c, n) == cst.Kind.TypeFn {
+        return fn_iface(c, n);
+    }
     if kind_of(c, n) != cst.Kind.TypePath {
         let s = span_of(c, n);
         report(c, codes.BAD_IMPL, s, "expected an interface");
@@ -2215,6 +2419,9 @@ pub fn impl_index(c: &Checker, t: ty.TypeId, iface: u32) -> u32 {
 
 /// Type t implements the interface declared by iface.
 pub fn implements(c: &Checker, t: ty.TypeId, iface: u32) -> bool {
+    if c.t.kind(t) == ty.Kind.Closure and is_fn_iface(c, iface) {
+        return closure_fits(c, ci: c.t.get(t).decl, d: iface);
+    }
     var i: usize = 0;
     while i < c.impls.len() : (i += 1) {
         if c.impls[i].iface == iface and c.impls[i].target == t {
@@ -2333,6 +2540,11 @@ pub fn analyze(p: program.Program) -> Checker {
         impls: alloc.List(Impl).init(a),
         dyn_casts: alloc.Map(u64, ty.TypeId).init(a),
         self_type: ty.invalid(),
+        unsafe_depth: 0,
+        closures: alloc.List(Closure).init(a),
+        captures: alloc.List(Capture).init(a),
+        fn_ifaces: alloc.List(u32).init(a),
+        outer_scope: alloc.List(Binding).init(a),
         a: a,
     };
     add_io_error(&mut c);

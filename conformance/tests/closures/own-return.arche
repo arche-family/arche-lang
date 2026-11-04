@@ -1,0 +1,22 @@
+// test: run
+// spec: arche/6
+// stage0: skip
+// stdout: 13
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    let limit: u32 = 10;
+    // return and break inside a closure belong to the closure.
+    let first_over = fn [limit](a: u32, b: u32) -> u32 {
+        var i = a;
+        while true {
+            if i > limit {
+                break;
+            }
+            i += b;
+        }
+        return i;
+    };
+    sys.stdout.write_u64(first_over(a: 1, b: 4) as u64);
+    sys.stdout.write("\n");
+}

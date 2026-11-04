@@ -43,7 +43,7 @@ static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     return r;
 }
 
-enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_EXIT_GROUP = 231, SYS_OPENAT = 257 };
+enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MUNMAP = 11, SYS_EXIT_GROUP = 231, SYS_OPENAT = 257 };
 enum { AT_FDCWD = -100, O_RDONLY = 0, O_WRONLY = 1, O_CREAT = 0100, O_TRUNC = 01000, O_CLOEXEC = 02000000 };
 enum { ENOENT = 2, EACCES = 13, ENOTDIR = 20, EISDIR = 21, EPERM = 1 };
 
@@ -97,20 +97,26 @@ int memcmp(const void *a, const void *b, u64 n) {
 _Noreturn void a0rt_die(const char *message, u64 len);
 
 // Memory comes in chunks mapped from the kernel and is handed out by
-// bumping a pointer. Nothing is freed: an Arche-0 program allocates for
-// its whole run (spec/arche-0.md §13).
+// bumping a pointer. The program's allocator, handle 0, frees nothing: an
+// Arche-0 program allocates for its whole run (spec/arche-0.md §13). A
+// region (spec/arche.md §7) is an arena with chunks of its own, its handle
+// the arena's address, and all of them are unmapped when it ends.
 static u8 *heap_next;
 static u64 heap_left;
+
+static void *map_pages(u64 n) {
+    i64 p = sys6(SYS_MMAP, 0, (i64)n, 3 /* read, write */, 0x22 /* private, anonymous */, -1, 0);
+    if (p < 0 && p > -4096) {
+        a0rt_die("out of memory", 13);
+    }
+    return (void *)p;
+}
 
 static void *alloc_bytes(u64 n) {
     n = (n + 15) & ~(u64)15;
     if (n > heap_left) {
         u64 chunk = n > ((u64)64 << 20) ? n : ((u64)64 << 20);
-        i64 p = sys6(SYS_MMAP, 0, (i64)chunk, 3 /* read, write */, 0x22 /* private, anonymous */, -1, 0);
-        if (p < 0 && p > -4096) {
-            a0rt_die("out of memory", 13);
-        }
-        heap_next = (u8 *)p;
+        heap_next = map_pages(chunk);
         heap_left = chunk;
     }
     void *r = heap_next;
@@ -119,17 +125,87 @@ static void *alloc_bytes(u64 n) {
     return r;
 }
 
-// Memory from mmap is zero, and stays so until handed out once.
-void *a0rt_alloc(u64 n) {
-    return alloc_bytes(n == 0 ? 1 : n);
+typedef struct Chunk {
+    struct Chunk *prev;
+    u64 size;
+} Chunk;
+
+typedef struct Arena {
+    u8 *next;
+    u64 left;
+    Chunk *last;
+    struct Arena *free_next;
+} Arena;
+
+static Arena *free_arenas;
+
+static void *arena_alloc(Arena *a, u64 n) {
+    n = (n + 15) & ~(u64)15;
+    if (n > a->left) {
+        u64 size = (n + sizeof(Chunk) + 4095) & ~(u64)4095;
+        if (size < 65536) {
+            size = 65536;
+        }
+        Chunk *c = map_pages(size);
+        c->prev = a->last;
+        c->size = size;
+        a->last = c;
+        a->next = (u8 *)c + sizeof(Chunk);
+        a->left = size - sizeof(Chunk);
+    }
+    void *r = a->next;
+    a->next += n;
+    a->left -= n;
+    return r;
 }
 
-void *a0rt_grow(void *old, u64 old_bytes, u64 new_bytes) {
-    void *p = a0rt_alloc(new_bytes);
+// Memory from mmap is zero, and stays so until handed out once.
+static void *alloc_in(u64 allocator, u64 n) {
+    if (n == 0) {
+        n = 1;
+    }
+    if (allocator == 0) {
+        return alloc_bytes(n);
+    }
+    return arena_alloc((Arena *)allocator, n);
+}
+
+void *a0rt_alloc(u64 n) {
+    return alloc_in(0, n);
+}
+
+static void *grow_in(u64 allocator, void *old, u64 old_bytes, u64 new_bytes) {
+    void *p = alloc_in(allocator, new_bytes);
     if (old && old_bytes) {
         memcpy(p, old, old_bytes);
     }
     return p;
+}
+
+u64 a0rt_region_begin(void) {
+    Arena *a = free_arenas;
+    if (a) {
+        free_arenas = a->free_next;
+    } else {
+        a = alloc_bytes(sizeof(Arena));
+    }
+    a->next = 0;
+    a->left = 0;
+    a->last = 0;
+    a->free_next = 0;
+    return (u64)a;
+}
+
+void a0rt_region_end(u64 handle) {
+    Arena *a = (Arena *)handle;
+    Chunk *c = a->last;
+    while (c) {
+        Chunk *prev = c->prev;
+        sys3(SYS_MUNMAP, (i64)c, (i64)c->size, 0);
+        c = prev;
+    }
+    a->free_next = free_arenas;
+    free_arenas = a;
 }
 
 // Appends n bytes to a String or List(u8): {data, len, cap}.
@@ -139,7 +215,7 @@ void a0rt_bytes_push(u64 *list, const u8 *p, u64 n) {
         while (cap < list[1] + n) {
             cap *= 2;
         }
-        list[0] = (u64)a0rt_grow((void *)list[0], list[1], cap);
+        list[0] = (u64)grow_in(list[3], (void *)list[0], list[1], cap);
         list[2] = cap;
     }
     memcpy((u8 *)list[0] + list[1], p, n);
@@ -165,7 +241,7 @@ void a0rt_list_reserve(u64 *list, u64 elem_size) {
         return;
     }
     u64 cap = list[2] ? list[2] * 2 : 8;
-    list[0] = (u64)a0rt_grow((void *)list[0], list[2] * elem_size, cap * elem_size);
+    list[0] = (u64)grow_in(list[3], (void *)list[0], list[2] * elem_size, cap * elem_size);
     list[2] = cap;
 }
 
@@ -346,7 +422,7 @@ static u16 read_into(const u8 *path, u64 path_len, u64 *out) {
     for (;;) {
         if (out[2] - out[1] < 65536) {
             u64 cap = out[2] ? out[2] * 2 : 65536;
-            out[0] = (u64)a0rt_grow((void *)out[0], out[1], cap);
+            out[0] = (u64)grow_in(out[3], (void *)out[0], out[1], cap);
             out[2] = cap;
         }
         i64 n = sys3(SYS_READ, fd, (i64)(out[0] + out[1]), (i64)(out[2] - out[1]));
@@ -471,7 +547,7 @@ static void rebuild(Map *m, u64 ksize, u64 esize, u64 nslots) {
         }
     }
     m->len = live;
-    m->slots = a0rt_alloc(nslots * 8);
+    m->slots = alloc_in(m->allocator, nslots * 8);
     m->nslots = nslots;
     for (u64 i = 0; i < live; i++) {
         int found;
@@ -496,7 +572,7 @@ void a0rt_map_put(Map *m, const u8 *key, u64 ksize, const u8 *value, u64 vsize) 
     }
     if (m->len == m->cap) {
         u64 cap = m->cap ? m->cap * 2 : 8;
-        m->entries = a0rt_grow(m->entries, m->cap * esize, cap * esize);
+        m->entries = grow_in(m->allocator, m->entries, m->cap * esize, cap * esize);
         m->cap = cap;
     }
     u8 *e = m->entries + m->len * esize;
@@ -572,7 +648,7 @@ static u64 interner_slot(Interner *in, const u8 *p, u64 n) {
 u32 a0rt_intern(Interner *in, const u8 *p, u64 n) {
     if ((in->len + 1) * 2 > in->nslots) {
         u64 nslots = in->nslots ? in->nslots * 2 : 64;
-        in->slots = a0rt_alloc(nslots * 4);
+        in->slots = alloc_in(in->allocator, nslots * 4);
         in->nslots = nslots;
         for (u64 i = 0; i < in->len; i++) {
             in->slots[interner_slot(in, in->texts[i].ptr, in->texts[i].len)] = (u32)(i + 1);
@@ -584,10 +660,10 @@ u32 a0rt_intern(Interner *in, const u8 *p, u64 n) {
     }
     if (in->len == in->cap) {
         u64 cap = in->cap ? in->cap * 2 : 64;
-        in->texts = a0rt_grow(in->texts, in->cap * sizeof(Str), cap * sizeof(Str));
+        in->texts = grow_in(in->allocator, in->texts, in->cap * sizeof(Str), cap * sizeof(Str));
         in->cap = cap;
     }
-    u8 *copy = a0rt_alloc(n);
+    u8 *copy = alloc_in(in->allocator, n);
     memcpy(copy, p, n);
     in->texts[in->len].ptr = copy;
     in->texts[in->len].len = n;

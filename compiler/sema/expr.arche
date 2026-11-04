@@ -6,6 +6,7 @@ import syntax.cst;
 import syntax.token as tk;
 import sema.check as ck;
 import sema.consts;
+import sema.stmt;
 import sema.types as ty;
 
 // ---- paths ------------------------------------------------------------------
@@ -348,10 +349,16 @@ fn check_kind(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Typ
         .CallExpr => { return check_call(c, n); }
         .IndexExpr => { return check_index(c, n); }
         .SliceExpr => { return check_slice(c, n); }
+        .ClosureExpr => { return check_closure(c, n); }
         .DerefExpr => {
             let t = check(c, ck.child(c, n, 0), none);
             let info = c.t.get(t);
             if info.kind == ty.Kind.Ref {
+                return info.elem;
+            }
+            if info.kind == ty.Kind.Ptr {
+                let s = ck.span_of(c, n);
+                ck.require_unsafe(c, s, "reading or writing through a raw pointer");
                 return info.elem;
             }
             if info.kind != ty.Kind.Invalid {
@@ -497,6 +504,25 @@ fn check_name(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     if ck.is_predeclared(ck.text(c, t)) {
         return not_a_value(c, n, "this is a predeclared type or function, not a value");
     }
+    let outer = c.outer_scope.items();
+    var k: usize = 0;
+    while k < outer.len() : (k += 1) {
+        if outer[k].name == sym {
+            var m = ck.new_message(c);
+            m.push_str("this closure does not capture '");
+            m.push_str(ck.text(c, t));
+            m.push_str("'; list it in the brackets after 'fn': [");
+            m.push_str(ck.text(c, t));
+            m.push_str("], [&");
+            m.push_str(ck.text(c, t));
+            m.push_str("] or [&mut ");
+            m.push_str(ck.text(c, t));
+            m.push_str("]");
+            let s = ck.span_of(c, n);
+            ck.report_owned(c, codes.NOT_CAPTURED, s, m);
+            return ty.invalid();
+        }
+    }
     var m = ck.new_message(c);
     m.push_str("unknown name '");
     m.push_str(ck.text(c, t));
@@ -504,6 +530,147 @@ fn check_name(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     let s = ck.span_of(c, n);
     ck.report_owned(c, codes.UNKNOWN_NAME, s, m);
     return ty.invalid();
+}
+
+// ---- closures (spec/arche.md §6) ------------------------------------------------------
+
+fn check_closure(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
+    let count = ck.child_count(c, n);
+    var local = alloc.List(ck.Capture).init(c.a);
+    var i: u32 = 0;
+    while i < count and ck.kind_of(c, ck.child(c, n, i)) == cst.Kind.Capture : (i += 1) {
+        let cn = ck.child(c, n, i);
+        let toks = ck.own(c, cn);
+        let nt = toks[toks.len() - 1];
+        if ck.tok_kind(c, nt) != tk.Kind.Ident {
+            continue;
+        }
+        let sym = ck.symbol(c, nt);
+        var mode = ck.SelfMode.Value;
+        if ck.has_own(c, cn, tk.Kind.Amp) {
+            mode = ck.SelfMode.Ref;
+            if ck.has_own(c, cn, tk.Kind.KwMut) {
+                mode = ck.SelfMode.MutRef;
+            }
+        }
+        let seen = local.items();
+        var twice = false;
+        var j: usize = 0;
+        while j < seen.len() : (j += 1) {
+            twice = twice or seen[j].name == sym;
+        }
+        if twice {
+            let s = ck.token_span(c, nt);
+            ck.report(c, codes.BAD_CAPTURE, s, "this name is captured twice");
+            continue;
+        }
+        match find_binding(c, sym) {
+            some(b) => {
+                if mode == ck.SelfMode.MutRef and not b.mutable {
+                    let s = ck.span_of(c, cn);
+                    ck.report(c, codes.NOT_MUTABLE, s, "'&mut' needs a mutable binding: a 'var'");
+                }
+                ck.set_type(c, cn, b.type_id);
+                local.push(ck.Capture { name: sym, name_token: nt, type_id: b.type_id, mode: mode });
+            }
+            none => {
+                let s = ck.token_span(c, nt);
+                ck.report(c, codes.BAD_CAPTURE, s, "a closure captures local bindings; constants and functions it uses without capturing");
+            }
+        }
+    }
+    let captures_start = c.captures.len() as u32;
+    let caps = local.items();
+    var k: usize = 0;
+    while k < caps.len() : (k += 1) {
+        c.captures.push(caps[k]);
+    }
+    // The signature: parameters, then the result type, then the body.
+    var params = alloc.List(ck.ParamInfo).init(c.a);
+    var ret = ty.void_type();
+    while i < count : (i += 1) {
+        let ch = ck.child(c, n, i);
+        let kd = ck.kind_of(c, ch);
+        if kd == cst.Kind.Param {
+            let pt = ck.resolve_type(c, ck.child(c, ch, 0));
+            let pnt = ck.ident_of(c, ch);
+            params.push(ck.ParamInfo { name: ck.symbol(c, pnt), name_token: pnt, type_id: pt });
+        } else if kd != cst.Kind.Block {
+            ret = ck.resolve_type(c, ch);
+        }
+    }
+    let did = c.decls.len() as u32;
+    let first = ck.first_own(c, n);
+    c.decls.push(ck.Decl {
+        kind: ck.DeclKind.Fn,
+        module: c.module,
+        node: n,
+        name: c.names.intern("closure"),
+        name_token: first,
+        is_pub: false,
+        type_id: ty.invalid(),
+        state: 0,
+        owner: ck.NONE,
+        members_start: 0,
+        members_len: 0,
+        methods_start: 0,
+        methods_len: 0,
+        fn_index: c.fns.len() as u32,
+        value: 0,
+        value_module: 0,
+        value_node: cst.NodeId { index: 0 },
+        generic: false,
+        template: ck.NONE,
+        env_start: c.env_start,
+        env_len: c.env_len,
+        impl_index: ck.NONE,
+    });
+    let pstart = c.params.len() as u32;
+    let ps = params.items();
+    k = 0;
+    while k < ps.len() : (k += 1) {
+        c.params.push(ps[k]);
+    }
+    let f = c.fns.len() as u32;
+    c.fns.push(ck.FnInfo {
+        decl: did,
+        params_start: pstart,
+        params_len: ps.len() as u32,
+        ret: ret,
+        has_self: false,
+        self_mode: ck.SelfMode.Value,
+        table: c.cur_table,
+        ncomptime: 0,
+    });
+    let ci = c.closures.len() as u32;
+    c.closures.push(ck.Closure { fn_index: f, captures_start: captures_start, captures_len: caps.len() as u32 });
+    stmt.check_closure_body(c, f: f, ci: ci, n);
+    return c.t.declared(ty.Kind.Closure, ci);
+}
+
+/// x(...) where x is a closure, a view of one, or a &dyn fn(P) -> R.
+fn call_value(c: &mut ck.Checker, call: cst.NodeId, b: ck.Binding) -> ty.TypeId {
+    let callee = ck.child(c, call, 0);
+    ck.set_type(c, callee, b.type_id);
+    var t = b.type_id;
+    if c.t.kind(t) == ty.Kind.Ref {
+        t = c.t.elem(t);
+    }
+    let info = c.t.get(t);
+    if info.kind == ty.Kind.Closure {
+        let f = c.fns[c.closures[info.decl as usize].fn_index as usize];
+        let ps = fn_params(c, f, 0);
+        check_args(c, call, &ps, true);
+        return f.ret;
+    }
+    if info.kind == ty.Kind.Dyn and ck.is_fn_iface(c, info.decl) {
+        let md = c.methods[c.decls[info.decl as usize].methods_start as usize];
+        let f = c.fns[c.decls[md as usize].fn_index as usize];
+        let ps = fn_params(c, f, 1);
+        check_args(c, call, &ps, true);
+        return f.ret;
+    }
+    return not_callable(c, call: call, n: callee, "this is a value, not a function");
 }
 
 /// The field of a struct or of std.System, by name.
@@ -795,6 +962,19 @@ pub fn builtin_method(c: &mut ck.Checker, t: ty.TypeId, name: str) -> ?Method {
     let shared = ck.SelfMode.Ref;
     let mutable = ck.SelfMode.MutRef;
     match info.kind {
+        .Ptr => {
+            // p.add(n), p.as_ref(), p.as_mut() (spec/arche.md §10.1)
+            if name.eq("add") {
+                let p = param(c, "n", usize_t);
+                return method1(c, byval, p, t);
+            }
+            if name.eq("as_ref") {
+                return method0(c, byval, c.t.reference(false, info.elem));
+            }
+            if name.eq("as_mut") and info.mutable {
+                return method0(c, byval, c.t.reference(true, info.elem));
+            }
+        }
         .Str => {
             if name.eq("len") { return method0(c, byval, usize_t); }
             if name.eq("eq") {
@@ -1062,6 +1242,10 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
     if c.decls[target as usize].fn_index == ck.NONE {
         ck.check_signature(c, target); // a constant reached it before the pass over signatures
     }
+    if c.p.full and ck.is_unsafe_fn(c, target) {
+        let s = ck.span_of(c, ck.child(c, call, 0));
+        ck.require_unsafe(c, s, "calling an unsafe fn");
+    }
     let f = c.fns[c.decls[target as usize].fn_index as usize];
     let ps = fn_params(c, f, skip);
     c.arg_offset = f.ncomptime;
@@ -1249,7 +1433,7 @@ fn check_call(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
         let t = ck.ident_of(c, callee);
         let sym = ck.symbol(c, t);
         match find_binding(c, sym) {
-            some(_) => { return not_callable(c, call: n, n: callee, "this is a value, not a function"); }
+            some(b) => { return call_value(c, n, b); }
             none => { }
         }
         match ck.find_item(c, c.module, sym) {
@@ -1375,6 +1559,10 @@ fn check_method_call(c: &mut ck.Checker, call: cst.NodeId, callee: cst.NodeId) -
     name.push_str(ck.text(c, nt));
     match builtin_method(c, t, name.view()) {
         some(m) => {
+            if c.t.kind(t) == ty.Kind.Ptr {
+                let s = ck.span_of(c, callee);
+                ck.require_unsafe(c, s, "this raw pointer operation");
+            }
             if m.self_mode == ck.SelfMode.MutRef {
                 require_mutable_receiver(c, receiver, rt);
             }
@@ -1860,6 +2048,23 @@ fn check_cast(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     }
     let from = check(c, operand, none);
     if ck.is_invalid(c, from) or ck.is_invalid(c, to) {
+        return to;
+    }
+    // &x as *T, &mut x as *mut T, and one raw pointer as another (§10.1).
+    let fi = c.t.get(from);
+    let ti = c.t.get(to);
+    if ti.kind == ty.Kind.Ptr and (fi.kind == ty.Kind.Ref or fi.kind == ty.Kind.Ptr) {
+        let s = ck.token_span(c, op_token(c, n));
+        ck.require_unsafe(c, s, "making a raw pointer");
+        if ti.mutable and not fi.mutable {
+            ck.report(c, codes.BAD_CAST, s, "a *mut T comes from a &mut view or another *mut T");
+        } else if fi.kind == ty.Kind.Ref and fi.elem != ti.elem {
+            var m = ck.new_message(c);
+            m.push_str("a view of ");
+            ck.write_type(c, &mut m, fi.elem);
+            m.push_str(" becomes a pointer to the same type; cast the pointer after");
+            ck.report_owned(c, codes.BAD_CAST, s, m);
+        }
         return to;
     }
     if not ck.is_int(c, from) or not ck.is_int(c, to) {

@@ -228,8 +228,9 @@ items.each(add);
 let scale = fn [factor](x: u32) -> u32 { return x * factor; };
 ```
 
-- The list in brackets after `fn` names every binding the body uses from outside: `x` captures a copy (a copyable value) or moves `x` (a move-only one); `&x` and `&mut x` capture views. The body can use no other outside binding; there is no implicit capture.
-- A closure's type is unnamed and unique. It implements `core.Fn(P, R)`, where `P` is its parameter list and `R` its result; a closure that captures by `&mut` implements `core.FnMut(P, R)`. They are taken as `comptime F: type where F: core.Fn(…)` or as `&dyn core.Fn(…)`.
+- The list in brackets after `fn` names every binding the body uses from outside: `x` captures a copy (a copyable value) or moves `x` (a move-only one); `&x` and `&mut x` capture views, and `&mut x` needs a `var`. The body can use no other outside binding (E0850); there is no implicit capture. A capture names a local binding once (E0851); constants and functions are used without capturing.
+- Inside the body a capture is used by its name, as the value or as the place it views: `total += x` changes the captured `total`. A copied or moved capture cannot be assigned.
+- A closure's type is unnamed and unique. It implements the interface `fn(P) -> R`, where `P` is its parameter types and `R` its result, written as a type: `&dyn fn(u32) -> u32` is a view of any closure of that signature, and `where F: fn(u32) -> u32` a bound. `fn(P) -> R` is not a type of values (E0825). A closure is called like a function, `scale(7)`, and so is a `&dyn fn` view. Taking one as `comptime F: type` needs a way to name its type, which comes with `core` (sprint S15).
 - A closure that captures a view is itself a view: it cannot be stored, returned, or outlive the bindings it views (A§5.4). A closure that captures only by value is an ordinary value and may be stored and moved.
 - Closures do not capture `return`, `break` or `continue`: those apply to the closure's own body.
 
@@ -246,9 +247,9 @@ region r {
 }   // everything allocated from r is freed here
 ```
 
-- `region r { … }` binds `r`, an `alloc.Allocator`, for the block.
+- `region r { … }` binds `r`, an `alloc.Allocator`, for the block. Containers made with `r` grow inside the region's arena; the arena is unmapped when the block ends.
 - **Region-bound values.** A value is bound to `r` when it was made with `r`, or holds a value bound to `r`. The compiler tracks this through bindings, fields, returns and calls: a function that takes an allocator and returns a container is assumed to bind the result to that allocator.
-- **Escape.** A value bound to `r` cannot leave the block: it cannot be assigned to a binding declared outside it, be returned from it, be moved into a container that is not bound to `r`, or be sent to another task (E0901). Copying out what is copyable is allowed: `let n = body.len();`.
+- **Escape.** A value bound to `r` cannot leave the block: it cannot be assigned to a binding declared outside it, be returned from it, be moved into a container that is not bound to `r` (a method call on a container that takes it by value), or be sent to another task (E0901). `r` itself is bound to `r`. Copying out what is copyable is allowed: `let n = body.len();`.
 - Regions nest. A value of an inner region may hold values of an outer one, never the other way around: the inner region ends first.
 - Leaving the block on any path, by `return`, `break`, `try` or a panic, frees the region.
 
@@ -304,8 +305,9 @@ std.task.scope(sys.proc, fn [&files, &mut results](s: &mut task.Scope) {
 
 `unsafe { … }` marks code whose correctness the compiler cannot check. Only inside it:
 
-- **Raw pointers** `*T` and `*mut T`: made from views with `&x as *T`, or from integers with `ptr.from_addr(T, n)`; read with `p.*`, offset with `p.add(n)`. Raw pointers are copyable values and may be stored anywhere; the rules of A§5.4 do not apply to them.
-- Calls to `unsafe fn`, foreign functions (`extern "c" fn`) and the operations below.
+- **Raw pointers** `*T` and `*mut T`: made from views with `&x as *T` (`*mut T` from `&mut x`), from another pointer with `p as *U`, or from integers with `ptr.from_addr(T, n)`; read and written with `p.*`, offset with `p.add(n)` (in elements), and turned back into views with `p.as_ref()` and, for `*mut T`, `p.as_mut()`. Raw pointers are copyable values and may be stored anywhere, outside `unsafe` too; the rules of A§5.4 do not apply to them, and `==` compares their addresses.
+- Calls to `unsafe fn`, foreign functions (`extern "c" fn`) and the operations below. An `unsafe fn`'s body is unsafe code.
+- Any of these outside `unsafe` is E0921.
 - Undefined behaviour is possible only inside `unsafe`: outside it, every program either does what the specification says or traps.
 
 Every `unsafe` block carries a comment that begins `// SAFETY:` and says why it is correct; a block without one is an error in a package that sets `strict_unsafe` (E0920).

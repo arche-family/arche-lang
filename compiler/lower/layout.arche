@@ -27,7 +27,7 @@ pub fn scalar(c: &ck.Checker, t: ty.TypeId) -> ir.Ty {
                 _ => { return ir.Ty.I64; }
             }
         }
-        .Ref => { return ir.Ty.Ptr; }
+        .Ref | .Ptr => { return ir.Ty.Ptr; }
         .ErrorSet => { return ir.Ty.I16; }
         .ErrorUnion => {
             if c.t.kind(info.elem) == ty.Kind.Void {
@@ -104,6 +104,46 @@ pub fn payload_offset(c: &ck.Checker, t: ty.TypeId) -> u64 {
     return round(n: 4, align: align);
 }
 
+/// A capture's layout: the value, or the address of what it views.
+fn capture_layout(c: &ck.Checker, cap: ck.Capture) -> Layout {
+    if cap.mode == ck.SelfMode.Value {
+        return layout(c, cap.type_id);
+    }
+    return Layout { size: 8, align: 8 };
+}
+
+/// A closure is its captures, laid out like a struct's fields.
+fn closure_layout(c: &ck.Checker, ci: u32) -> Layout {
+    let cl = c.closures[ci as usize];
+    var size: u64 = 0;
+    var align: u64 = 1;
+    var k = cl.captures_start;
+    while k < cl.captures_start + cl.captures_len : (k += 1) {
+        let l = capture_layout(c, c.captures[k as usize]);
+        size = round(n: size, align: l.align) + l.size;
+        if l.align > align {
+            align = l.align;
+        }
+    }
+    return Layout { size: round(n: size, align: align), align: align };
+}
+
+/// Where capture k of closure ci is.
+pub fn capture_offset(c: &ck.Checker, ci: u32, k: u32) -> u64 {
+    let cl = c.closures[ci as usize];
+    var offset: u64 = 0;
+    var i = cl.captures_start;
+    while i <= cl.captures_start + k : (i += 1) {
+        let l = capture_layout(c, c.captures[i as usize]);
+        offset = round(n: offset, align: l.align);
+        if i == cl.captures_start + k {
+            return offset;
+        }
+        offset += l.size;
+    }
+    return offset;
+}
+
 /// Where the value of ?T or E!T starts.
 pub fn value_offset(c: &ck.Checker, t: ty.TypeId) -> u64 {
     let info = c.t.get(t);
@@ -119,12 +159,13 @@ pub fn layout(c: &ck.Checker, t: ty.TypeId) -> Layout {
     match info.kind {
         .Void | .Noreturn | .Invalid | .Interface => { return Layout { size: 0, align: 1 }; }
         .Dyn => { return Layout { size: 16, align: 8 }; } // the value's address and its table
+        .Closure => { return closure_layout(c, info.decl); }
         .Bool => { return Layout { size: 1, align: 1 }; }
         .Int => {
             let n = (ty.bits(info.int_kind) / 8) as u64;
             return Layout { size: n, align: n };
         }
-        .Ref => { return Layout { size: 8, align: 8 }; }
+        .Ref | .Ptr => { return Layout { size: 8, align: 8 }; }
         .Str | .Slice => { return Layout { size: 16, align: 8 }; }
         .Array => {
             let e = layout(c, info.elem);

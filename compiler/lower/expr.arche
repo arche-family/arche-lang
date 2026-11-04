@@ -153,8 +153,13 @@ pub fn value(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
 /// A &T as a &dyn I: the address, and the table of T's impl of I.
 fn to_dyn(l: &mut lw.Lower, e: cst.NodeId, want: ty.TypeId, v: lw.Val) -> lw.Val {
     let target = l.c.t.elem(type_of(l, e));
-    let imp = ck.impl_index(&l.c, target, l.c.t.get(want).decl);
-    let vt = lw.vtable(l, imp);
+    var vt: u32 = 0;
+    if l.c.t.kind(target) == ty.Kind.Closure {
+        vt = lw.closure_vtable(l, l.c.t.get(target).decl);
+    } else {
+        let imp = ck.impl_index(&l.c, target, l.c.t.get(want).decl);
+        vt = lw.vtable(l, imp);
+    }
     let tmp = lw.alloca(l, want);
     lw.store(l, value: v.v, addr: tmp);
     var i = ir.inst(ir.Op.VTable, ir.Ty.Ptr);
@@ -198,9 +203,86 @@ fn dyn_call(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
     return result_of(l, t, r: r, sret: sret);
 }
 
+/// A closure's value: its captures, copied, moved or viewed (§6).
+fn closure_value(l: &mut lw.Lower, t: ty.TypeId) -> lw.Val {
+    let ci = l.c.t.get(t).decl;
+    let cl = l.c.closures[ci as usize];
+    let tmp = lw.alloca(l, t);
+    var k: u32 = 0;
+    while k < cl.captures_len : (k += 1) {
+        let cap = l.c.captures[(cl.captures_start + k) as usize];
+        let var_ = lw.find_var(l, cap.name) orelse lw.Var { name: cap.name, addr: 0, type_id: cap.type_id };
+        let at = lw.gep(l, tmp, layout.capture_offset(&l.c, ci: ci, k: k));
+        if cap.mode == ck.SelfMode.Value {
+            let v = lw.load_val(l, cap.type_id, var_.addr);
+            lw.store_val(l, cap.type_id, v, at);
+        } else {
+            lw.store(l, value: var_.addr, addr: at);
+        }
+    }
+    return fresh_val(tmp);
+}
+
+/// x(...) of a closure, a view of one, or a &dyn fn(P) -> R: the body
+/// with the closure as its hidden first parameter.
+fn closure_call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
+    let callee = child(l, n, 0);
+    let ct = type_of(l, callee);
+    let t = type_of(l, n);
+    var inner = ct;
+    if l.c.t.kind(ct) == ty.Kind.Ref {
+        inner = l.c.t.elem(ct);
+    }
+    var info = l.c.fns[0];
+    var fi = ck.NONE;
+    var env: u32 = 0;
+    var fp: u32 = 0;
+    var skip: u32 = 0;
+    if l.c.t.kind(inner) == ty.Kind.Closure {
+        fi = l.c.closures[l.c.t.get(inner).decl as usize].fn_index;
+        info = l.c.fns[fi as usize];
+        if l.c.t.kind(ct) == ty.Kind.Ref {
+            env = value(l, callee).v;
+        } else {
+            env = address(l, callee);
+        }
+    } else {
+        let iface = l.c.decls[l.c.t.get(inner).decl as usize];
+        let md = l.c.methods[iface.methods_start as usize];
+        info = l.c.fns[l.c.decls[md as usize].fn_index as usize];
+        let dv = in_memory(l, ct, value(l, callee));
+        env = lw.load(l, ir.Ty.Ptr, dv);
+        let table = lw.load(l, ir.Ty.Ptr, lw.gep(l, dv, 8));
+        fp = lw.load(l, ir.Ty.Ptr, table);
+        skip = 1;
+    }
+    var args = lw.args0(l);
+    var sret = ck.NONE;
+    if lw.returns_in_memory(&l.c, info.ret) {
+        sret = lw.alloca(l, info.ret);
+        args.push(sret);
+    }
+    args.push(env);
+    let nargs = count(l, n) - 1;
+    var i: u32 = 0;
+    while i < nargs : (i += 1) {
+        let pt = l.c.params[(info.params_start + skip + i) as usize].type_id;
+        let v = value(l, arg_node(l, n, i));
+        args.push(lw.as_arg(l, pt, v));
+    }
+    var r: u32 = 0;
+    if fi != ck.NONE {
+        r = lw.call_with(l, fi, false, lw.ret_ty(&l.c, info.ret), &args);
+    } else {
+        r = lw.call_indirect(l, fp, lw.ret_ty(&l.c, info.ret), &args);
+    }
+    return result_of(l, t, r: r, sret: sret);
+}
+
 fn value_of(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
     let t = type_of(l, e);
     match kind(l, e) {
+        .ClosureExpr => { return closure_value(l, t); }
         .IntLit | .CharLit => {
             let v = ck.tok_value(&l.c, ck.tree(&l.c).first_token(e));
             return scalar_val(lw.konst(l, layout.scalar(&l.c, t), v));
@@ -742,6 +824,9 @@ fn cast(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
     let fb = ty.bits(int_kind(l, from));
     let tb = ty.bits(int_kind(l, to));
     let s = layout.scalar(&l.c, to);
+    if l.c.t.kind(to) == ty.Kind.Ptr {
+        return scalar_val(x); // a view or pointer as a pointer: the same address
+    }
     let wrapping = ck.tok_kind(&l.c, ck.own(&l.c, e)[0]) == tk.Kind.KwAsWrap;
     if not wrapping {
         let fsx = layout.scalar(&l.c, from);
@@ -841,6 +926,9 @@ pub fn self_address(l: &mut lw.Lower, receiver: cst.NodeId) -> u32 {
 
 fn call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
     let callee = child(l, n, 0);
+    if kind(l, callee) == cst.Kind.NameExpr and not ck.is_invalid(&l.c, type_of(l, callee)) {
+        return closure_call(l, n);
+    }
     let t = type_of(l, n);
     let nargs = count(l, n) - 1;
     let is_method = kind(l, callee) == cst.Kind.FieldExpr and not ck.is_invalid(&l.c, type_of(l, callee));
@@ -958,6 +1046,14 @@ fn builtin_method(l: &mut lw.Lower, n: cst.NodeId, callee: cst.NodeId) -> lw.Val
     name.push_str(ck.text(&l.c, sx.member_token(&l.c, callee)));
     let nm = name.view();
     let info = l.c.t.get(rt);
+    if info.kind == ty.Kind.Ptr {
+        let p = value(l, receiver).v;
+        if nm.eq("add") {
+            let k = value(l, arg_node(l, n, 0)).v;
+            return scalar_val(lw.gep_index(l, addr: p, index: k, size_of(l, info.elem)));
+        }
+        return scalar_val(p); // as_ref, as_mut: the same address
+    }
     let r = receiver_addr(l, receiver);
     match info.kind {
         .Str => {

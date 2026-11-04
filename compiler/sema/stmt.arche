@@ -81,7 +81,8 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
     c.checked.put(f, true);
     let info = c.fns[f as usize];
     let decl = c.decls[info.decl as usize];
-    if ck.kind_of_in(c, decl.module, decl.node) == cst.Kind.FnSig {
+    let node_kind = ck.kind_of_in(c, decl.module, decl.node);
+    if node_kind == cst.Kind.FnSig or node_kind == cst.Kind.TypeFn {
         return; // an interface's method: a signature, no body
     }
     let saved = ck.save_context(c);
@@ -90,6 +91,11 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
     c.fn_index = f;
     c.loops = 0;
     c.defer_loops = ck.NONE;
+    let saved_unsafe = c.unsafe_depth;
+    c.unsafe_depth = 0;
+    if c.p.full and ck.is_unsafe_fn(c, info.decl) {
+        c.unsafe_depth = 1;
+    }
     while c.scope.len() > 0 {
         _ = c.scope.pop();
     }
@@ -109,7 +115,66 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
         ck.report_owned(c, codes.MISSING_RETURN, s, m);
     }
     c.fn_index = ck.NONE;
+    c.unsafe_depth = saved_unsafe;
     ck.restore_context(c, saved);
+}
+
+/// A closure's body, where it is written: its captures and parameters are
+/// its only bindings (spec/arche.md §6).
+pub fn check_closure_body(c: &mut ck.Checker, f: u32, ci: u32, n: cst.NodeId) {
+    c.checked.put(f, true);
+    var saved_scope = alloc.List(ck.Binding).init(c.a);
+    let outer = c.scope.items();
+    var i: usize = 0;
+    while i < outer.len() : (i += 1) {
+        saved_scope.push(outer[i]);
+    }
+    var saved_outer = alloc.List(ck.Binding).init(c.a);
+    let around = c.outer_scope.items();
+    i = 0;
+    while i < around.len() : (i += 1) {
+        saved_outer.push(around[i]);
+    }
+    let saved_fn = c.fn_index;
+    let saved_loops = c.loops;
+    let saved_defer = c.defer_loops;
+    c.outer_scope = saved_scope;
+    c.scope = alloc.List(ck.Binding).init(c.a);
+    let cl = c.closures[ci as usize];
+    var k = cl.captures_start;
+    while k < cl.captures_start + cl.captures_len : (k += 1) {
+        let cap = c.captures[k as usize];
+        c.scope.push(ck.Binding { name: cap.name, name_token: cap.name_token, type_id: cap.type_id, mutable: cap.mode == ck.SelfMode.MutRef });
+    }
+    let info = c.fns[f as usize];
+    var p = info.params_start;
+    while p < info.params_start + info.params_len : (p += 1) {
+        let pi = c.params[p as usize];
+        declare(c, pi.name_token, pi.type_id, false);
+    }
+    c.fn_index = f;
+    c.loops = 0;
+    c.defer_loops = ck.NONE;
+    let body = ck.child(c, n, ck.child_count(c, n) - 1);
+    check_block(c, body);
+    if not is_void_result(c, info.ret) and not block_ends(c, body) {
+        var m = ck.new_message(c);
+        m.push_str("this closure can reach its end without returning ");
+        ck.write_type(c, &mut m, info.ret);
+        let s = ck.token_span(c, ck.first_own(c, n));
+        ck.report_owned(c, codes.MISSING_RETURN, s, m);
+    }
+    var restored = alloc.List(ck.Binding).init(c.a);
+    let kept = c.outer_scope.items();
+    var r: usize = 0;
+    while r < kept.len() : (r += 1) {
+        restored.push(kept[r]);
+    }
+    c.scope = restored;
+    c.outer_scope = saved_outer;
+    c.fn_index = saved_fn;
+    c.loops = saved_loops;
+    c.defer_loops = saved_defer;
 }
 
 /// A test block (§4): a body like a function's that takes nothing and
@@ -190,6 +255,24 @@ fn check_stmt(c: &mut ck.Checker, s: cst.NodeId) {
             }
         }
         .ForStmt => { check_for(c, s); }
+        .UnsafeStmt => {
+            c.unsafe_depth += 1;
+            check_block(c, ck.child(c, s, 0));
+            c.unsafe_depth -= 1;
+        }
+        .RegionStmt => {
+            // region r { ... }: r is an allocator for the block (§7).
+            let at = c.t.builtin(ty.Builtin.Allocator);
+            let depth = c.scope.len();
+            ck.set_type(c, s, at);
+            if ck.has_own(c, s, tk.Kind.Ident) {
+                declare(c, ck.ident_of(c, s), at, false);
+            }
+            check_block(c, ck.child(c, s, 0));
+            while c.scope.len() > depth {
+                _ = c.scope.pop();
+            }
+        }
         .MatchStmt => { check_match(c, s); }
         .ReturnStmt => { check_return(c, s); }
         .BreakStmt | .ContinueStmt => {
@@ -1022,7 +1105,7 @@ fn covers(c: &mut ck.Checker, ps: &alloc.List(cst.NodeId), t: ty.TypeId) -> bool
 fn has_own_break(c: &ck.Checker, n: cst.NodeId) -> bool {
     match ck.kind_of(c, n) {
         .BreakStmt => { return true; }
-        .Block | .IfStmt | .MatchStmt | .MatchArm => {
+        .Block | .IfStmt | .MatchStmt | .MatchArm | .UnsafeStmt | .RegionStmt => {
             let count = ck.child_count(c, n);
             var i: u32 = 0;
             while i < count : (i += 1) {
@@ -1041,6 +1124,7 @@ fn stmt_ends(c: &ck.Checker, s: cst.NodeId) -> bool {
         .ReturnStmt => { return true; }
         .ExprStmt => { return c.t.kind(ck.type_of(c, ck.child(c, s, 0))) == ty.Kind.Noreturn; }
         .Block => { return block_ends(c, s); }
+        .UnsafeStmt | .RegionStmt => { return block_ends(c, ck.child(c, s, 0)); }
         .IfStmt => {
             return ck.child_count(c, s) == 3 and block_ends(c, ck.child(c, s, 1)) and stmt_ends(c, ck.child(c, s, 2));
         }
