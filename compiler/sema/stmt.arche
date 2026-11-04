@@ -186,12 +186,13 @@ fn check_stmt(c: &mut ck.Checker, s: cst.NodeId) {
                 check_stmt(c, ck.child(c, s, 1));
             }
         }
+        .ForStmt => { check_for(c, s); }
         .MatchStmt => { check_match(c, s); }
         .ReturnStmt => { check_return(c, s); }
         .BreakStmt | .ContinueStmt => {
             let sp = ck.span_of(c, s);
             if c.loops == 0 {
-                ck.report(c, codes.OUTSIDE_LOOP, sp, "'break' and 'continue' are allowed only inside a 'while' loop");
+                ck.report(c, codes.OUTSIDE_LOOP, sp, "'break' and 'continue' are allowed only inside a loop");
             } else if c.defer_loops != ck.NONE and c.loops == c.defer_loops {
                 ck.report(c, codes.IN_DEFER, sp, "deferred code cannot 'break' or 'continue' out of its block");
             }
@@ -203,6 +204,214 @@ fn check_stmt(c: &mut ck.Checker, s: cst.NodeId) {
             c.defer_loops = saved;
         }
         _ => { }
+    }
+}
+
+// ---- for (spec/arche.md §3.2) --------------------------------------------------
+
+/// The names a for statement binds: its leading BindPat children.
+pub fn for_names(c: &ck.Checker, s: cst.NodeId) -> u32 {
+    let n = ck.child_count(c, s);
+    var names: u32 = 0;
+    while names < n and ck.kind_of(c, ck.child(c, s, names)) == cst.Kind.BindPat : (names += 1) {
+    }
+    return names;
+}
+
+pub fn for_is_range(c: &ck.Checker, s: cst.NodeId) -> bool {
+    return ck.has_own(c, s, tk.Kind.DotDot) or ck.has_own(c, s, tk.Kind.DotDotEq);
+}
+
+fn check_range(c: &mut ck.Checker, from: cst.NodeId, to: cst.NodeId, want: ?ty.TypeId) -> ty.TypeId {
+    var at = ty.invalid();
+    var bt = ty.invalid();
+    match want {
+        some(t) => {
+            expr.check_value(c, from, t);
+            expr.check_value(c, to, t);
+            if ck.is_invalid(c, t) or ck.is_int(c, t) {
+                return t;
+            }
+            at = t;
+            bt = t;
+        }
+        none => { }
+    }
+    if not ck.is_invalid(c, at) {
+        // checked against the annotation above
+    } else if expr.untyped(c, from) and not expr.untyped(c, to) {
+        bt = expr.check(c, to, none);
+        at = expr.check(c, from, some(bt));
+    } else {
+        at = expr.check(c, from, none);
+        bt = expr.check(c, to, some(at));
+    }
+    if ck.is_invalid(c, at) or ck.is_invalid(c, bt) {
+        return ty.invalid();
+    }
+    if not ck.is_int(c, at) or at != bt {
+        var m = ck.new_message(c);
+        m.push_str("a range runs between two values of one integer type, not ");
+        ck.write_type(c, &mut m, at);
+        m.push_str(" and ");
+        ck.write_type(c, &mut m, bt);
+        let sp = ck.span_of(c, from);
+        ck.report_owned(c, codes.BAD_FOR, sp, m);
+        return ty.invalid();
+    }
+    return at;
+}
+
+/// The method `name` of t that takes only self, its signature checked.
+fn self_method(c: &mut ck.Checker, t: ty.TypeId, name: str) -> ?u32 {
+    let sym = c.names.intern(name);
+    var d = ck.NONE;
+    match expr.find_method(c, t, sym) {
+        some(m) => { d = m; }
+        none => { return none; }
+    }
+    if c.decls[d as usize].fn_index == ck.NONE {
+        ck.check_signature(c, d);
+    }
+    if c.decls[d as usize].fn_index == ck.NONE {
+        return none;
+    }
+    let f = c.fns[c.decls[d as usize].fn_index as usize];
+    if not f.has_self or f.params_len != 1 or f.ncomptime != 0 {
+        return none;
+    }
+    return d;
+}
+
+/// The item type of an iterator: the T of its `next(self: &mut Self) -> ?T`.
+/// Records `next` on the statement and `iter`, when used, on its body.
+fn iterator_item(c: &mut ck.Checker, s: cst.NodeId, e: cst.NodeId, t: ty.TypeId) -> ty.TypeId {
+    var it = t;
+    match self_method(c, t, "iter") {
+        some(d) => {
+            let f = c.fns[c.decls[d as usize].fn_index as usize];
+            if f.self_mode == ck.SelfMode.MutRef and not expr.place_mutable(c, e) {
+                let sp = ck.span_of(c, e);
+                ck.report(c, codes.NOT_MUTABLE, sp, "'iter' takes '&mut self', and this place cannot be changed");
+            }
+            it = f.ret;
+            ck.set_ref(c, ck.child(c, s, ck.child_count(c, s) - 1), d);
+        }
+        none => { }
+    }
+    match self_method(c, it, "next") {
+        some(d) => {
+            let f = c.fns[c.decls[d as usize].fn_index as usize];
+            if f.self_mode == ck.SelfMode.MutRef and c.t.kind(f.ret) == ty.Kind.Optional {
+                ck.set_ref(c, s, d);
+                return c.t.elem(f.ret);
+            }
+        }
+        none => { }
+    }
+    var m = ck.new_message(c);
+    m.push_str("a for loop goes over a range, a slice or an iterator; ");
+    ck.write_type(c, &mut m, it);
+    m.push_str(" has no method 'fn next(self: &mut Self) -> ?T'");
+    let sp = ck.span_of(c, e);
+    ck.report_owned(c, codes.NOT_ITERABLE, sp, m);
+    return ty.invalid();
+}
+
+fn check_for(c: &mut ck.Checker, s: cst.NodeId) {
+    let n = ck.child_count(c, s);
+    let names = for_names(c, s);
+    let is_range = for_is_range(c, s);
+    var needed = names + 2;
+    if is_range {
+        needed = names + 3;
+    }
+    if names == 0 or n != needed or ck.kind_of(c, ck.child(c, s, n - 1)) != cst.Kind.Block {
+        return; // the parser reported it
+    }
+    let first_name = ck.child(c, s, 0);
+    var item = ty.invalid();
+    var second = ty.invalid();
+    if is_range {
+        var want: ?ty.TypeId = none;
+        if ck.child_count(c, first_name) > 0 {
+            want = some(ck.resolve_type(c, ck.child(c, first_name, 0)));
+        }
+        item = check_range(c, from: ck.child(c, s, names), to: ck.child(c, s, names + 1), want);
+        if names == 2 {
+            let sp = ck.span_of(c, ck.child(c, s, 1));
+            ck.report(c, codes.BAD_FOR, sp, "a range gives one value per step: bind one name");
+        }
+    } else {
+        let e = ck.child(c, s, names);
+        let t = expr.check(c, e, none);
+        let info = c.t.get(t);
+        if info.kind == ty.Kind.Slice {
+            // A view of each element; (i, x) also binds its index.
+            item = c.t.reference(info.mutable, info.elem);
+            if names == 2 {
+                second = item;
+                item = ty.int_type(ty.IntKind.Usize);
+            }
+        } else if info.kind == ty.Kind.Struct or info.kind == ty.Kind.Enum {
+            item = iterator_item(c, s: s, e: e, t);
+            if names == 2 and not ck.is_invalid(c, item) {
+                let ii = c.t.get(item);
+                var fine = false;
+                if ii.kind == ty.Kind.Struct {
+                    let d = c.decls[ii.decl as usize];
+                    if d.members_len == 2 {
+                        fine = true;
+                        item = c.fields[d.members_start as usize].type_id;
+                        second = c.fields[(d.members_start + 1) as usize].type_id;
+                    }
+                }
+                if not fine {
+                    var m = ck.new_message(c);
+                    m.push_str("'for (a, b)' takes apart a struct of two fields, and the items are ");
+                    ck.write_type(c, &mut m, item);
+                    let sp = ck.span_of(c, first_name);
+                    ck.report_owned(c, codes.BAD_FOR, sp, m);
+                    item = ty.invalid();
+                }
+            }
+        } else if info.kind != ty.Kind.Invalid {
+            var m = ck.new_message(c);
+            m.push_str("a for loop goes over a range, a slice or an iterator, not ");
+            ck.write_type(c, &mut m, t);
+            if info.kind == ty.Kind.Array or info.kind == ty.Kind.List {
+                m.push_str("; iterate its elements with '.items()'");
+            }
+            let sp = ck.span_of(c, e);
+            ck.report_owned(c, codes.NOT_ITERABLE, sp, m);
+        }
+    }
+    if not is_range {
+        var k: u32 = 0;
+        while k < names : (k += 1) {
+            let p = ck.child(c, s, k);
+            if ck.child_count(c, p) > 0 {
+                let sp = ck.span_of(c, ck.child(c, p, 0));
+                ck.report(c, codes.BAD_FOR, sp, "only the name of a range loop takes a type: the items of a slice or an iterator have theirs");
+            }
+        }
+    }
+    let depth = c.scope.len();
+    ck.set_type(c, first_name, item);
+    declare(c, ck.ident_of(c, first_name), item, false);
+    if names == 2 {
+        let second_name = ck.child(c, s, 1);
+        if ck.is_invalid(c, second) {
+            second = item;
+        }
+        ck.set_type(c, second_name, second);
+        declare(c, ck.ident_of(c, second_name), second, false);
+    }
+    c.loops += 1;
+    check_block(c, ck.child(c, s, n - 1));
+    c.loops -= 1;
+    while c.scope.len() > depth {
+        _ = c.scope.pop();
     }
 }
 

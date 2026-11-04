@@ -75,6 +75,7 @@ fn stmt(l: &mut lw.Lower, s: cst.NodeId) {
         .AssignStmt => { assign(l, s); }
         .IfStmt => { if_stmt(l, s); }
         .WhileStmt => { while_stmt(l, s); }
+        .ForStmt => { for_stmt(l, s); }
         .MatchStmt => { match_stmt(l, s); }
         .ReturnStmt => { return_stmt(l, s); }
         .BreakStmt | .ContinueStmt => {
@@ -177,6 +178,155 @@ fn while_stmt(l: &mut lw.Lower, s: cst.NodeId) {
     }
     lw.br(l, head);
     lw.switch_to(l, done);
+}
+
+// ---- for (spec/arche.md §3.2) --------------------------------------------------
+
+fn for_names(l: &lw.Lower, s: cst.NodeId) -> u32 {
+    let n = count(l, s);
+    var names: u32 = 0;
+    while names < n and kind(l, child(l, s, names)) == cst.Kind.BindPat : (names += 1) {
+    }
+    return names;
+}
+
+/// Binds name node p to a new slot holding the value at addr.
+fn bind_copy(l: &mut lw.Lower, p: cst.NodeId, addr: u32) {
+    let t = type_of(l, p);
+    let slot = lw.alloca(l, t);
+    let v = lw.load_val(l, t, addr);
+    lw.store_val(l, t, v, slot);
+    let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, p));
+    lw.bind(l, sym, slot, t);
+}
+
+fn bind_scalar(l: &mut lw.Lower, p: cst.NodeId, v: u32) {
+    let slot = lw.alloca(l, type_of(l, p));
+    lw.store(l, value: v, addr: slot);
+    let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, p));
+    lw.bind(l, sym, slot, type_of(l, p));
+}
+
+fn loop_body(l: &mut lw.Lower, body: cst.NodeId, done: u32, step: u32) {
+    l.loops.push(lw.LoopCtx { break_block: done, continue_block: step, defer_depth: l.defers.len() as u32 });
+    block(l, body);
+    _ = l.loops.pop();
+    lw.br(l, step);
+}
+
+fn for_stmt(l: &mut lw.Lower, s: cst.NodeId) {
+    let n = count(l, s);
+    let names = for_names(l, s);
+    let body = child(l, s, n - 1);
+    let first = child(l, s, 0);
+    let vars = l.vars.len();
+    let head = lw.new_block(l);
+    let body_b = lw.new_block(l);
+    let step = lw.new_block(l);
+    let done = lw.new_block(l);
+    let inclusive = ck.has_own(&l.c, s, tk.Kind.DotDotEq);
+    if inclusive or ck.has_own(&l.c, s, tk.Kind.DotDot) {
+        // a..b counts up while < b; a..=b stops at b without passing it.
+        let t = type_of(l, first);
+        let sc = layout.scalar(&l.c, t);
+        let from = expr.value(l, child(l, s, names)).v;
+        let to = expr.value(l, child(l, s, names + 1)).v;
+        let slot = lw.alloca(l, t);
+        lw.store(l, value: from, addr: slot);
+        let sym = ck.symbol(&mut l.c, ck.ident_of(&l.c, first));
+        lw.br(l, head);
+        lw.switch_to(l, head);
+        let cur = lw.load(l, sc, slot);
+        let signed = ty.is_signed(l.c.t.get(t).int_kind);
+        var k = ir.CmpKind.ULt;
+        if signed and inclusive {
+            k = ir.CmpKind.SLe;
+        } else if signed {
+            k = ir.CmpKind.SLt;
+        } else if inclusive {
+            k = ir.CmpKind.ULe;
+        }
+        lw.cond_br(l, cond: lw.cmp(l, k, x: cur, y: to), yes: body_b, no: done);
+        lw.switch_to(l, body_b);
+        lw.bind(l, sym, slot, t);
+        loop_body(l, body, done: done, step: step);
+        lw.switch_to(l, step);
+        let now = lw.load(l, sc, slot);
+        if inclusive {
+            let more = lw.new_block(l);
+            lw.cond_br(l, cond: lw.cmp(l, ir.CmpKind.Eq, x: now, y: to), yes: done, no: more);
+            lw.switch_to(l, more);
+        }
+        lw.store(l, value: lw.bin(l, ir.BinKind.Add, x: now, y: lw.konst(l, sc, 1)), addr: slot);
+        lw.br(l, head);
+    } else if l.c.t.kind(type_of(l, child(l, s, names))) == ty.Kind.Slice {
+        let e = child(l, s, names);
+        let st = type_of(l, e);
+        let sv = expr.in_memory(l, st, expr.value(l, e));
+        let data = lw.load(l, ir.Ty.Ptr, sv);
+        let len = lw.load(l, ir.Ty.I64, lw.gep(l, sv, 8));
+        let size = layout.layout(&l.c, l.c.t.elem(st)).size;
+        let index = lw.alloca(l, ty.int_type(ty.IntKind.Usize));
+        lw.store(l, value: lw.konst(l, ir.Ty.I64, 0), addr: index);
+        lw.br(l, head);
+        lw.switch_to(l, head);
+        let i = lw.load(l, ir.Ty.I64, index);
+        lw.cond_br(l, cond: lw.cmp(l, ir.CmpKind.ULt, x: i, y: len), yes: body_b, no: done);
+        lw.switch_to(l, body_b);
+        let at = lw.gep_index(l, addr: data, index: i, size);
+        if names == 2 {
+            bind_scalar(l, first, i);
+            bind_scalar(l, child(l, s, 1), at);
+        } else {
+            bind_scalar(l, first, at);
+        }
+        loop_body(l, body, done: done, step: step);
+        lw.switch_to(l, step);
+        let now = lw.load(l, ir.Ty.I64, index);
+        lw.store(l, value: lw.bin(l, ir.BinKind.Add, x: now, y: lw.konst(l, ir.Ty.I64, 1)), addr: index);
+        lw.br(l, head);
+    } else {
+        // An iterator: e, or e.iter(), and its next until it gives none.
+        let e = child(l, s, names);
+        let next_d = ck.ref_of(&l.c, s);
+        let iter_d = ck.ref_of(&l.c, body);
+        var it_t = type_of(l, e);
+        var it = ck.NONE;
+        if iter_d != ck.NONE {
+            it_t = l.c.fns[l.c.decls[iter_d as usize].fn_index as usize].ret;
+            let r = expr.call_self(l, d: iter_d, self_addr: expr.self_address(l, e));
+            it = lw.alloca(l, it_t);
+            lw.store_val(l, it_t, r, it);
+        } else {
+            it = lw.alloca(l, it_t);
+            lw.store_val(l, it_t, expr.value(l, e), it);
+        }
+        let opt_t = l.c.fns[l.c.decls[next_d as usize].fn_index as usize].ret;
+        lw.br(l, head);
+        lw.switch_to(l, head);
+        let opt = expr.in_memory(l, opt_t, expr.call_self(l, d: next_d, self_addr: it));
+        let has = lw.load(l, ir.Ty.I8, opt);
+        lw.cond_br(l, cond: lw.cmp(l, ir.CmpKind.Ne, x: has, y: lw.konst(l, ir.Ty.I8, 0)), yes: body_b, no: done);
+        lw.switch_to(l, body_b);
+        let item = lw.gep(l, opt, layout.value_offset(&l.c, opt_t));
+        if names == 2 {
+            let item_t = l.c.t.elem(opt_t);
+            let d = l.c.decls[l.c.t.get(item_t).decl as usize];
+            let fa = lw.gep(l, item, layout.field_offset(&l.c, start: d.members_start, i: d.members_start));
+            let fb = lw.gep(l, item, layout.field_offset(&l.c, start: d.members_start, i: d.members_start + 1));
+            bind_copy(l, first, fa);
+            bind_copy(l, child(l, s, 1), fb);
+        } else {
+            bind_copy(l, first, item);
+        }
+        loop_body(l, body, done: done, step: step);
+        lw.switch_to(l, step);
+        lw.br(l, head);
+    }
+    lw.switch_to(l, done);
+    while l.vars.len() > vars {
+        _ = l.vars.pop();
+    }
 }
 
 /// Return lifting (§7.8): a T returned from a ?T function is some(T); from

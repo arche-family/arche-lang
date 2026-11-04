@@ -100,14 +100,18 @@ let width: u32 = match shape {
 ```arche
 for i in 0..n { … }            // 0, 1, …, n - 1
 for i in 0..=n { … }           // 0, …, n
+for i: u8 in 0..10 { … }       // two literals: the name gives the type
 for item in list.items() { … } // item: &T, a view of each element
-for (i, item) in list.items().enumerate() { … }
+for (i, item) in list.items() { … } // i: usize, the index
+for entry in iterator { … }    // until iterator.next() gives none
 ```
 
-- `for x in e` evaluates `e` once. If `e` has a method `iter`, the loop uses `e.iter()`; then the value must implement `core.Iter(T)` (§5.1): `fn next(self: &mut Self) -> ?T`. Each iteration binds `x` to the next item, until `next` gives `none`.
-- `for (a, b) in e` destructures an item of a struct type with two fields; it is the only destructuring in `for`.
-- Iterating a slice `[]T` gives views `&T`; iterating `[]mut T` gives `&mut T`. While the loop runs, the slice is live (A§5.4).
-- A range `a..b` is a value of `core.Range(T)` for an integer type `T`; `a..=b` of `core.RangeInclusive(T)`. Both are empty when `a > b`.
+- `for x in e` evaluates `e` once. If `e` has a method `iter`, the loop uses `e.iter()`; then the value must implement `core.Iter(T)` (§5.1): `fn next(self: &mut Self) -> ?T`. Each iteration binds `x` to the next item, until `next` gives `none`. Without `iter`, the loop owns `e`: it is moved, or copied, into the loop. Until the library declares `core.Iter` (sprint S15), a method `next` of that signature is enough.
+- `for (a, b) in e` destructures an item of a struct type with two fields; it is the only destructuring in `for`. Over a slice, `for (i, x) in s` binds the index `i: usize` and the view `x`.
+- Iterating a slice `[]T` gives views `&T`; iterating `[]mut T` gives `&mut T`. While the loop runs, the slice is live (A§5.4): the place it views cannot change through another path.
+- A range `a..b` runs over an integer type `T`; `a..=b` includes `b` and stops there, so `0..=255` over `u8` ends without overflow. Both are empty when `a > b`. Ranges appear only in `for`. The bounds take their type as operands of `+` do (A§7.3); when both are literals, the name takes a type, `for i: u32 in 0..10`, and only a range loop's name does.
+- The names a `for` binds cannot be assigned. A `for` loop over a range can run at compile time (§4.3).
+- An item that cannot be iterated is E0810; a range or destructuring that does not fit is E0811.
 
 ### 3.3 Labeled loops
 
@@ -412,8 +416,8 @@ stmt        = ( "let" | "var" ) IDENT [ ":" type ] "=" expr ";"
             | block
             | simple ";" ;
 loop        = "while" expr [ ":" "(" assign ")" ] block
-            | "for" for_bind "in" expr block ;
-for_bind    = IDENT | "(" IDENT "," IDENT ")" ;
+            | "for" for_bind "in" expr [ ( ".." | "..=" ) expr ] block ;
+for_bind    = IDENT [ ":" type ] | "(" IDENT "," IDENT ")" ;
 
 expr        = or_expr [ ( "orelse" | "catch" ) expr ] ;
 primary     = INT | FLOAT | CHAR | STRING | "true" | "false" | "none"

@@ -143,6 +143,8 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | Code | Meaning |
 | --- | --- |
 | `E0801` | A capability type that the package manifest does not list in `needs` (§1.3). |
+| `E0810` | A `for` loop over a value that is not a range, a slice or an iterator (§3.2). |
+| `E0811` | A `for` loop's range or names that do not fit: bounds of two types, a pair over a range or over items that are not a struct of two fields, a type on a name that is not a range's (§3.2). |
 | `E0830` | A `comptime` type argument that does not implement an interface its `where` bound requires (§5.2). |
 | `E0840` | Compile-time evaluation that runs too many steps or recurses too deep (§4.3). |
 

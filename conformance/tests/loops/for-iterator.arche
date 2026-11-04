@@ -1,0 +1,47 @@
+// test: run
+// spec: arche/3.2
+// stage0: skip
+// stdout: 14 2:4 1:1 0:0 3
+import std;
+
+type Entry = struct { key: u32, square: u32 }
+
+type Countdown = struct {
+    n: u32,
+
+    fn next(self: &mut Countdown) -> ?Entry {
+        if self.n == 0 {
+            return none;
+        }
+        self.n -= 1;
+        return Entry { key: self.n, square: self.n * self.n };
+    }
+}
+
+type Bag = struct {
+    size: u32,
+
+    fn iter(self: &Bag) -> Countdown {
+        return Countdown { n: self.size };
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let down = Countdown { n: 4 };
+    var squares: u32 = 0;
+    for e in down {
+        squares += e.square;
+    }
+    sys.stdout.write_u64(squares as u64);
+    let bag = Bag { size: 3 };
+    for (k, sq) in bag {
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(k as u64);
+        sys.stdout.write(":");
+        sys.stdout.write_u64(sq as u64);
+    }
+    // bag is still there: iter only viewed it.
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(bag.size as u64);
+    sys.stdout.write("\n");
+}

@@ -355,6 +355,47 @@ fn declare_at(c: &mut ck.Checker, f: &mut Fn, node: cst.NodeId, name_token: u32)
     f.decls.put(node.index, id);
 }
 
+fn for_names(c: &ck.Checker, s: cst.NodeId) -> u32 {
+    let n = ck.child_count(c, s);
+    var names: u32 = 0;
+    while names < n and ck.kind_of(c, ck.child(c, s, names)) == cst.Kind.BindPat : (names += 1) {
+    }
+    return names;
+}
+
+/// The iterated values come before the names; a view name is live for the
+/// whole loop, since the slice it comes from is (spec/arche.md §3.2).
+fn first_for(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) {
+    let count = ck.child_count(c, n);
+    let names = for_names(c, n);
+    var i = names;
+    while i + 1 < count : (i += 1) {
+        first_node(c, f, ck.child(c, n, i));
+    }
+    let body = ck.child(c, n, count - 1);
+    if names == 0 or ck.kind_of(c, body) != cst.Kind.Block {
+        return;
+    }
+    let saved = f.scope.len();
+    f.depth += 1;
+    var k: u32 = 0;
+    while k < names : (k += 1) {
+        let p = ck.child(c, n, k);
+        declare_at(c, f, p, ck.ident_of(c, p));
+        let b = declared(f, p);
+        if f.bindings[b as usize].is_view {
+            record_use(f, b: b, pos: end_of(c, n));
+        }
+    }
+    f.loops.push(Loop { start: pos_of(c, n), end: end_of(c, n) });
+    first_block(c, f, body);
+    _ = f.loops.pop();
+    f.depth -= 1;
+    while f.scope.len() > saved {
+        _ = f.scope.pop();
+    }
+}
+
 fn first_pattern(c: &mut ck.Checker, f: &mut Fn, p: cst.NodeId) {
     match ck.kind_of(c, p) {
         .BindPat => { declare_at(c, f, p, ck.ident_of(c, p)); }
@@ -397,6 +438,10 @@ fn first_node(c: &mut ck.Checker, f: &mut Fn, n: cst.NodeId) {
                 first_node(c, f, ck.child(c, n, i));
             }
             _ = f.loops.pop();
+            return;
+        }
+        .ForStmt => {
+            first_for(c, f, n);
             return;
         }
         .MatchStmt => {
@@ -1180,6 +1225,72 @@ fn loop_stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
     }
 }
 
+fn for_stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
+    let count = ck.child_count(c, s);
+    let names = for_names(c, s);
+    let body = ck.child(c, s, count - 1);
+    if names == 0 or ck.kind_of(c, body) != cst.Kind.Block {
+        return;
+    }
+    let is_range = ck.has_own(c, s, tk.Kind.DotDot) or ck.has_own(c, s, tk.Kind.DotDotEq);
+    var v = static_view(c.a);
+    if is_range {
+        eval(c, f, ck.child(c, s, names), false);
+        eval(c, f, ck.child(c, s, names + 1), false);
+    } else {
+        let e = ck.child(c, s, names);
+        if c.t.kind(ck.type_of(c, e)) == ty.Kind.Slice {
+            let sv = view_of(c, f, e);
+            var target = copy_text(sv.target.view(), c.a);
+            if target.len() > 0 {
+                target.push_str(".*");
+            }
+            v = View { target: target, root: sv.root, is_static: sv.is_static, mutable: sv.mutable };
+        } else if ck.ref_of(c, body) != ck.NONE {
+            eval(c, f, e, false); // e.iter() reads e
+        } else {
+            eval(c, f, e, true); // the loop owns the iterator
+        }
+    }
+    let saved_scope = f.scope.len();
+    f.depth += 1;
+    var k: u32 = 0;
+    while k < names : (k += 1) {
+        let b = declared(f, ck.child(c, s, k));
+        if b == ck.NONE {
+            continue;
+        }
+        fresh(c, f, b);
+        f.bindings[b as usize].depth = f.depth;
+        if f.bindings[b as usize].is_view {
+            let copy = View { target: copy_text(v.target.view(), c.a), root: v.root, is_static: v.is_static, mutable: v.mutable };
+            set_target(f, b, copy);
+        }
+        f.scope.push(b);
+    }
+    let saved_breaks = copy_paths(&f.break_moved, c.a);
+    f.break_moved = alloc.List(alloc.String).init(c.a);
+    let entry = save(c, f);
+    // Twice, as for while (loop_stmt).
+    var pass: u32 = 0;
+    while pass < 2 : (pass += 1) {
+        block(c, f, body);
+        let end = save(c, f);
+        restore(c, f, &entry);
+        join(c, f, &end);
+    }
+    let items = f.break_moved.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        add_path(&mut f.moved, items[i].view(), c.a);
+    }
+    f.break_moved = saved_breaks;
+    f.depth -= 1;
+    while f.scope.len() > saved_scope {
+        _ = f.scope.pop();
+    }
+}
+
 /// Whether a match binds a move-only value: then it moves the scrutinee.
 fn binds_move_only(c: &ck.Checker, f: &Fn, n: cst.NodeId) -> bool {
     let k = ck.kind_of(c, n);
@@ -1281,6 +1392,7 @@ fn stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
             join(c, f, &then_end);
         }
         .WhileStmt => { loop_stmt(c, f, s); }
+        .ForStmt => { for_stmt(c, f, s); }
         .MatchStmt => { match_stmt(c, f, s); }
         .ReturnStmt => { return_stmt(c, f, s); }
         .BreakStmt => {

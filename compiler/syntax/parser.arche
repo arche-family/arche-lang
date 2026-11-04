@@ -791,14 +791,15 @@ fn parse_stmt(p: &mut Parser) {
         }
         .KwFor => {
             // for x in e { }, for (i, x) in e { }, for i in a..b { } (§3.2)
+            // The names are BindPat nodes, so each has its own type.
             advance(p);
             if accept(p, tk.Kind.LParen) {
-                _ = expect(p, tk.Kind.Ident, "a name");
+                for_name(p);
                 _ = expect(p, tk.Kind.Comma, "','");
-                _ = expect(p, tk.Kind.Ident, "a name");
+                for_name(p);
                 _ = expect(p, tk.Kind.RParen, "')'");
             } else {
-                _ = expect(p, tk.Kind.Ident, "a name");
+                for_name(p);
             }
             _ = expect(p, tk.Kind.KwIn, "'in'");
             parse_condition(p);
@@ -1191,6 +1192,19 @@ fn parse_struct_lit(p: &mut Parser) {
 }
 
 // ---- patterns ---------------------------------------------------------------
+
+fn for_name(p: &mut Parser) {
+    if at(p, tk.Kind.Ident) {
+        let m = open(p);
+        advance(p);
+        if accept(p, tk.Kind.Colon) {
+            parse_type(p); // for i: u32 in 0..n
+        }
+        _ = close(p, m, cst.Kind.BindPat);
+    } else {
+        unexpected(p, "a name");
+    }
+}
 
 fn parse_pat_lit(p: &mut Parser) -> bool {
     if accept(p, tk.Kind.Minus) {

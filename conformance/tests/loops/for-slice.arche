@@ -1,0 +1,37 @@
+// test: run
+// spec: arche/3.2
+// stage0: skip
+// stdout: 12 0=3 1=4 2=5 40 50 LOOP
+import std;
+import alloc;
+
+fn main(sys: &mut std.System) -> !void {
+    var list = alloc.List(u32).init(sys.alloc);
+    list.push(3);
+    list.push(4);
+    list.push(5);
+    var total: u32 = 0;
+    for x in list.items() {
+        total += x.*;
+    }
+    sys.stdout.write_u64(total as u64);
+    sys.stdout.write(" ");
+    for (i, x) in list.items() {
+        sys.stdout.write_u64(i as u64);
+        sys.stdout.write("=");
+        sys.stdout.write_u64(x.* as u64);
+        sys.stdout.write(" ");
+    }
+    for x in list.items_mut() {
+        x.* = x.* * 10;
+    }
+    for x in list.items()[1..3] {
+        sys.stdout.write_u64(x.* as u64);
+        sys.stdout.write(" ");
+    }
+    let words = "loop";
+    for b in words.bytes() {
+        sys.stdout.write_byte(b.* - 32);
+    }
+    sys.stdout.write("\n");
+}

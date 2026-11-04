@@ -207,6 +207,7 @@ fn statement(c: &mut ck.Checker, r: &mut Run, s: cst.NodeId) -> Flow {
                 }
             }
         }
+        .ForStmt => { return for_range(c, r, s); }
         .MatchStmt => { return match_stmt(c, r, s); }
         .ReturnStmt => {
             if ck.child_count(c, s) > 0 {
@@ -217,6 +218,46 @@ fn statement(c: &mut ck.Checker, r: &mut Run, s: cst.NodeId) -> Flow {
         .BreakStmt => { return Flow.Break; }
         .ContinueStmt => { return Flow.Continue; }
         _ => { return fail(c, r, s, "this statement cannot run at compile time yet"); }
+    }
+    if r.failed {
+        return Flow.Failed;
+    }
+    return Flow.Normal;
+}
+
+/// for i in a..b and a..=b (spec/arche.md §3.2); slices and iterators
+/// cannot run at compile time yet.
+fn for_range(c: &mut ck.Checker, r: &mut Run, s: cst.NodeId) -> Flow {
+    let inclusive = ck.has_own(c, s, tk.Kind.DotDotEq);
+    if not inclusive and not ck.has_own(c, s, tk.Kind.DotDot) {
+        return fail(c, r, s, "only a for loop over a range can run at compile time yet");
+    }
+    let n = ck.child_count(c, s);
+    let first = ck.child(c, s, 0);
+    let t = ck.type_of(c, first);
+    let from = value(c, r, ck.child(c, s, 1));
+    let to = value(c, r, ck.child(c, s, 2));
+    let sym = ck.symbol(c, ck.ident_of(c, first));
+    let body = ck.child(c, s, n - 1);
+    var op = tk.Kind.Lt;
+    if inclusive {
+        op = tk.Kind.Le;
+    }
+    var cur = from;
+    while not r.failed and consts.apply_op(c, s, op, t, a: cur, b: to) != 0 {
+        r.locals.push(Local { name: sym, bits: cur });
+        let flow = block(c, r, body);
+        _ = r.locals.pop();
+        if flow == Flow.Break {
+            break;
+        }
+        if flow == Flow.Return or flow == Flow.Failed {
+            return flow;
+        }
+        if inclusive and cur == to {
+            break;
+        }
+        cur = consts.apply_op(c, s, tk.Kind.Plus, t, a: cur, b: 1);
     }
     if r.failed {
         return Flow.Failed;

@@ -748,6 +748,40 @@ fn result_of(l: &mut lw.Lower, t: ty.TypeId, r: u32, sret: u32) -> lw.Val {
     return scalar_val(r);
 }
 
+/// Calls method d, which takes only self, with self at self_addr: the iter
+/// and next of a for loop (spec/arche.md §3.2).
+pub fn call_self(l: &mut lw.Lower, d: u32, self_addr: u32) -> lw.Val {
+    let fi = l.c.decls[d as usize].fn_index;
+    let info = l.c.fns[fi as usize];
+    var args = lw.args0(l);
+    var sret = ck.NONE;
+    if lw.returns_in_memory(&l.c, info.ret) {
+        sret = lw.alloca(l, info.ret);
+        args.push(sret);
+    }
+    if info.self_mode == ck.SelfMode.Value {
+        let st = l.c.params[info.params_start as usize].type_id;
+        let v = lw.load_val(l, st, self_addr);
+        args.push(lw.as_arg(l, st, v));
+    } else {
+        args.push(self_addr);
+    }
+    let r = lw.call_with(l, fi, false, lw.ret_ty(&l.c, info.ret), &args);
+    return result_of(l, info.ret, r: r, sret: sret);
+}
+
+/// The address of a receiver's value: a place, or a temporary holding it.
+pub fn self_address(l: &mut lw.Lower, receiver: cst.NodeId) -> u32 {
+    let t = type_of(l, receiver);
+    if l.c.t.kind(t) == ty.Kind.Ref {
+        return value(l, receiver).v;
+    }
+    if is_place(l, receiver) {
+        return address(l, receiver);
+    }
+    return in_memory(l, t, value(l, receiver));
+}
+
 fn call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
     let callee = child(l, n, 0);
     let t = type_of(l, n);
@@ -836,7 +870,7 @@ fn str_parts(l: &mut lw.Lower, s: lw.Val, args: &mut alloc.List(u32)) {
 }
 
 /// A value's address in memory: a scalar is stored in a temporary first.
-fn in_memory(l: &mut lw.Lower, t: ty.TypeId, v: lw.Val) -> u32 {
+pub fn in_memory(l: &mut lw.Lower, t: ty.TypeId, v: lw.Val) -> u32 {
     if v.scalar {
         let tmp = lw.alloca(l, t);
         lw.store(l, value: v.v, addr: tmp);
