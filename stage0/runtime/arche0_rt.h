@@ -74,6 +74,21 @@ _Noreturn void a0_trap_fit(const char *type, a0_loc loc);
 uint64_t a0_str_len(a0_str s);
 bool a0_str_eq(a0_str s, a0_str other);
 bool a0_str_starts_with(a0_str s, a0_str prefix);
+uint8_t a0_str_at(a0_str s, uint64_t i, a0_loc loc);
+a0_str a0_str_slice(a0_str s, uint64_t a, uint64_t b, a0_loc loc); // traps off a character boundary
+
+// ---- indexing and memory (§7.7, §11) ------------------------------------------
+
+static inline void a0_check_index(uint64_t i, uint64_t len, a0_loc loc) {
+    if (i >= len) a0_trap("index out of range", loc);
+}
+
+static inline void a0_check_slice(uint64_t a, uint64_t b, uint64_t len, a0_loc loc) {
+    if (a > b || b > len) a0_trap("slice out of range", loc);
+}
+
+// Resizes p to count elements of size bytes; traps when memory runs out.
+void *a0_realloc(a0_alloc_Allocator a, void *p, uint64_t count, uint64_t size);
 
 // ---- integers (§7.2) ------------------------------------------------------------
 //

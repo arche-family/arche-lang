@@ -98,6 +98,41 @@ bool a0_str_starts_with(a0_str s, a0_str prefix) {
     return s.len >= prefix.len && (prefix.len == 0 || memcmp(s.ptr, prefix.ptr, (size_t)prefix.len) == 0);
 }
 
+uint8_t a0_str_at(a0_str s, uint64_t i, a0_loc loc) {
+    if (i >= s.len) {
+        a0_trap("index out of range", loc);
+    }
+    return s.ptr[i];
+}
+
+static bool char_boundary(a0_str s, uint64_t i) {
+    return i == 0 || i == s.len || (s.ptr[i] & 0xC0) != 0x80;
+}
+
+a0_str a0_str_slice(a0_str s, uint64_t a, uint64_t b, a0_loc loc) {
+    if (a > b || b > s.len) {
+        a0_trap("slice out of range", loc);
+    }
+    if (!char_boundary(s, a) || !char_boundary(s, b)) {
+        a0_trap("slice is not on a character boundary", loc);
+    }
+    return (a0_str){s.ptr + a, b - a};
+}
+
+// ---- memory -----------------------------------------------------------------
+
+void *a0_realloc(a0_alloc_Allocator a, void *p, uint64_t count, uint64_t size) {
+    (void)a;
+    if (size != 0 && count > SIZE_MAX / size) {
+        die("out of memory", 13, NULL);
+    }
+    void *q = realloc(p, (size_t)(count * size));
+    if (!q && count * size != 0) {
+        die("out of memory", 13, NULL);
+    }
+    return q;
+}
+
 // ---- std.Output -------------------------------------------------------------
 
 void a0_std_Output_write(a0_std_Output *self, a0_str text) {
