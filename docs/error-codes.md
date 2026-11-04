@@ -50,3 +50,77 @@ Every diagnostic of the Arche compiler has a stable code. A code never changes m
 | `E0209` | A `_ = ...` discard as a `while` step. |
 | `E0210` | A variant written with `{ }` and no fields. |
 | `E0211` | `pub` before `test` or `import`. |
+
+## Names, modules and visibility
+
+| Code | Meaning |
+| --- | --- |
+| `E0301` | An unknown name where a value is expected. |
+| `E0302` | An unknown type. |
+| `E0303` | An unknown function. |
+| `E0304` | An item, parameter, field, variant or error declared twice. |
+| `E0305` | A name declared while the same name is visible: Arche has no shadowing (§6.3). Erasable. |
+| `E0306` | A private item, field or method used from another module (§4). Erasable. |
+| `E0307` | An imported module that cannot be found. |
+| `E0308` | A name imported twice, or an import of a library module Arche-0 does not have. |
+| `E0309` | A name that is not a value: a function, type or module used as one. |
+| `E0310` | A field, method, variant or error that the type does not have. |
+| `E0311` | A module that has no item with this name. |
+| `E0312` | A method with the name of a field or variant of its type. |
+| `E0313` | No `main`, or `main` not declared as `fn main(sys: &mut std.System) -> !void`. |
+
+## Types and expressions
+
+| Code | Meaning |
+| --- | --- |
+| `E0401` | A value of the wrong type. |
+| `E0402` | The operands of a binary operator have different types. |
+| `E0403` | An operator that does not work on this type. |
+| `E0404` | An integer literal that does not fit in its type. |
+| `E0405` | An integer literal, `none` or array literal with no type from context (§5.6). Erasable for integers. |
+| `E0406` | An `as` conversion between types that are not both integers, or of a literal. |
+| `E0407` | A call with the wrong number of arguments. |
+| `E0408` | A label that does not match its parameter (§7.5). Erasable. |
+| `E0409` | A missing label where two parameters have the same type (§7.5). Erasable. |
+| `E0410` | An expression that cannot be called. |
+| `E0411` | An assignment or `&` of something that is not a place. |
+| `E0412` | A change through a place that is not mutable: a `let`, a parameter, or a `&` view. |
+| `E0413` | `.*` of something that is not a reference. |
+| `E0414` | Indexing or slicing a type that cannot be indexed, or slicing a value that is not a place. |
+| `E0415` | A struct literal whose fields are missing, unknown or out of order. |
+| `E0416` | A variant used without its fields, or with fields it does not have. |
+| `E0417` | An array literal with the wrong number of elements. |
+| `E0418` | `orelse` or `catch` on a value that is not an optional or error union. |
+| `E0419` | `try` in a function that does not return an error union, or on a value that is not one. |
+| `E0420` | An error that the function's error set does not contain. |
+| `E0421` | `let` of an expression that has no value. |
+| `E0422` | A method whose `self` is not the type, `&` or `&mut` of it; or an associated function called as a method. |
+| `E0423` | A struct or enum that contains itself. |
+| `E0424` | A type alias that refers to itself. |
+| `E0425` | A Map key type that is not a key type (§5.5). |
+| `E0426` | A generic type with the wrong number of arguments, or one Arche-0 does not have. |
+
+## Statements, patterns and paths
+
+| Code | Meaning |
+| --- | --- |
+| `E0501` | A result that is not used; write `_ = ...` to drop it (§7.8). Erasable. |
+| `E0502` | `return` without a value in a function that returns one, or with one in a function that does not. |
+| `E0503` | A function that can reach its end without returning its value (§10). |
+| `E0504` | `break` or `continue` outside a loop. |
+| `E0505` | `return`, `break`, `continue` or `try` in deferred code. |
+| `E0506` | A pattern that cannot match the type of the value. |
+| `E0507` | Alternatives joined with `|` that bind names. |
+| `E0508` | A variant pattern that does not name every field and does not end with `..`. |
+| `E0509` | A `match` that is not exhaustive. Erasable: stage0 traps at run time instead. |
+| `E0510` | An empty range pattern. |
+
+## Constants
+
+| Code | Meaning |
+| --- | --- |
+| `E0701` | An expression that is not a constant expression. |
+| `E0702` | A constant expression that overflows its type. |
+| `E0703` | Division by zero in a constant expression. |
+| `E0704` | A constant that depends on itself. |
+| `E0705` | A constant whose type is not an integer type, `bool` or `str`. |
