@@ -636,7 +636,16 @@ fn check_asm(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
         }
     }
     // %N names the N-th operand.
-    let tmpl = ck.text(c, ck.find_own(c, n, tk.Kind.String) orelse ck.first_own(c, n));
+    // The text: its strings, as written; escapes do not matter for %N.
+    var tmpl_text = alloc.String.init(c.a);
+    let own_toks = ck.own(c, n);
+    var q: usize = 0;
+    while q < own_toks.len() : (q += 1) {
+        if ck.tok_kind(c, own_toks[q]) == tk.Kind.String {
+            tmpl_text.push_str(ck.text(c, own_toks[q]));
+        }
+    }
+    let tmpl = tmpl_text.view();
     var k: usize = 0;
     while k + 1 < tmpl.len() : (k += 1) {
         if tmpl[k] == '%' and tmpl[k + 1] == '%' {

@@ -29,3 +29,19 @@ jobs:
         run: make -C compiler differential CC=${{ matrix.cc }}
       - name: Bootstrap, stage2 == stage3
         run: CC=${{ matrix.cc }} ./bootstrap.sh
+
+  # docs/sprints.md S16: freestanding binaries, built with core and alloc
+  # only, boot in QEMU on x86-64 and RISC-V 64 and write over serial.
+  freestanding:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and lld
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-system-misc lld
+          which qemu-system-riscv64 || sudo apt-get install -y qemu-system-riscv
+      - name: Build the Arche compiler
+        run: make -C stage0 && make -C compiler
+      - name: Boot the freestanding examples
+        run: ./freestanding/run.sh x86_64 riscv64

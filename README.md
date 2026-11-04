@@ -2,7 +2,7 @@
 
 Arche (Greek *arkhē*: origin, first principle) is a systems programming language meant to carry a whole stack — bootstrap, compiler, kernel, network and web — under one memory model and one capability model.
 
-**Status:** self-hosting. stage0, a C11 translator, builds the Arche compiler; the compiler, written in [Arche-0](spec/arche-0.md), builds itself through LLVM into static binaries without the C library, and stage2 and stage3 of the bootstrap are bit-identical. The full language ([spec/arche.md](spec/arche.md)) is being implemented sprint by sprint ([docs/sprints.md](docs/sprints.md)): full-Arche packages already have generics, compile-time evaluation, interfaces with `impl`, `where` and `&dyn`, `for` loops, closures, regions, `unsafe`, floats, contracts and `nopanic`.
+**Status:** self-hosting. stage0, a C11 translator, builds the Arche compiler; the compiler, written in [Arche-0](spec/arche-0.md), builds itself through LLVM into static binaries without the C library, and stage2 and stage3 of the bootstrap are bit-identical. The full language ([spec/arche.md](spec/arche.md)) is being implemented sprint by sprint ([docs/sprints.md](docs/sprints.md)): full-Arche packages already have generics, compile-time evaluation, interfaces with `impl`, `where` and `&dyn`, `for` loops, closures, regions, `unsafe`, floats, contracts and `nopanic`; and a freestanding target whose programs boot in QEMU on x86-64 and RISC-V 64 ([freestanding/](freestanding/)).
 
 ## The criterion
 
@@ -46,7 +46,7 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | Path | Contents | Status |
 | --- | --- | --- |
 | [`docs/plan.md`](docs/plan.md) | the full plan (Uzbek) | snapshot, 2026-11-03 |
-| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S16 |
+| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S17 |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | [`spec/arche.md`](spec/arche.md) | the full language, built on Arche-0 | draft 0.1 |
 | [`conformance/`](conformance/README.md) | specification tests | 365 tests |

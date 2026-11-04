@@ -12,6 +12,27 @@ import syntax.token as tk;
 
 pub type ModuleId = struct { pub index: u32 }
 
+/// What the program is built for (spec/arche.md §10.3): Linux with std, or
+/// a machine without an operating system, with core and alloc only.
+pub type Target = enum { LinuxX86_64, FreestandingX86_64, FreestandingRiscv64 }
+
+pub fn target_by_name(name: str) -> ?Target {
+    if name.eq("linux-x86_64") { return Target.LinuxX86_64; }
+    if name.eq("freestanding-x86_64") { return Target.FreestandingX86_64; }
+    if name.eq("freestanding-riscv64") { return Target.FreestandingRiscv64; }
+    return none;
+}
+
+/// The options of one compilation, from the command line.
+pub type Options = struct {
+    /// The library's directory, ending with '/'.
+    pub lib: alloc.String,
+    pub lib_alloc: bool,
+    pub target: Target,
+    /// module.function: what a panic calls on a freestanding target.
+    pub panic_handler: alloc.String,
+}
+
 pub type Module = struct {
     /// The dotted module path; empty for a root file whose name is not one.
     pub name: alloc.String,
@@ -62,6 +83,8 @@ pub type Program = struct {
     /// alloc is the library's (lib/alloc.arche), not the compiler's
     /// built-in one: in a full-Arche package, or when asked for.
     pub lib_alloc: bool,
+    pub target: Target,
+    pub panic_handler: alloc.String,
     root_dir: alloc.String,
 
     pub fn module(self: &Program, id: ModuleId) -> &Module {
@@ -193,14 +216,22 @@ fn package_imports(m: &Module, a: alloc.Allocator, lib_alloc: bool) -> alloc.Lis
 
 /// Starts from the root file, whose text the caller has read, and loads,
 /// breadth first, every module it imports.
-/// lib is the library's directory, ending with '/'.
-pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, lib: str, lib_alloc: bool) -> Program {
+pub fn freestanding(p: &Program) -> bool {
+    return p.target != Target.LinuxX86_64;
+}
+
+pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts: &Options) -> Program {
+    let lib = opts.lib.view();
+    var handler = alloc.String.init(a);
+    handler.push_str(opts.panic_handler.view());
     var p = Program {
         modules: alloc.List(Module).init(a),
         diags: diag.Diagnostics.init(a),
         a: a,
         full: false,
-        lib_alloc: lib_alloc,
+        lib_alloc: opts.lib_alloc or opts.target != Target.LinuxX86_64,
+        target: opts.target,
+        panic_handler: handler,
         root_dir: alloc.String.init(a),
     };
     var slash: ?usize = none;

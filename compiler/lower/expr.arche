@@ -504,16 +504,19 @@ fn asm_value(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
     }
     // The text: %N to $N in LLVM's numbering, %% to %, $ to $$.
     let toks = ck.own(&l.c, e);
-    var raw_tok: u32 = toks[0];
+    let mod = &l.c.p.modules[l.c.module as usize];
+    var text = alloc.List(u8).init(l.a);
     var t: usize = 0;
     while t < toks.len() : (t += 1) {
         if ck.tok_kind(&l.c, toks[t]) == tk.Kind.String {
-            raw_tok = toks[t];
-            break;
+            let piece = decode(mod.token_text(toks[t]).bytes(), l.a);
+            let pb = piece.items();
+            var b: usize = 0;
+            while b < pb.len() : (b += 1) {
+                text.push(pb[b]);
+            }
         }
     }
-    let mod = &l.c.p.modules[l.c.module as usize];
-    let text = decode(mod.token_text(raw_tok).bytes(), l.a);
     let tb = text.items();
     var tmpl = alloc.String.init(l.a);
     var k: usize = 0;

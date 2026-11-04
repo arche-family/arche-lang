@@ -332,7 +332,7 @@ These exist for the `freestanding` target (S16) and are all `unsafe`:
 
 | Feature | Form |
 | --- | --- |
-| Inline assembly | `asm("mov %0, cr3", in(reg) addr)` with typed operands and clobbers: `in(r) e`, `out(r) p`, `inout(r) p` and `clobber("name")`, where `r` is `reg` (any register) or a register in quotes, `"rax"`; `%N` in the text is the N-th operand, `%%` a `%`. Operands are integers, `bool`s or pointers; `out` and `inout` ones are writable places (E0922). An `asm` also clobbers memory, so the compiler keeps loads and stores in order around it |
+| Inline assembly | `asm("mov %0, cr3", in(reg) addr)` with typed operands and clobbers; adjacent strings are one text, so assembly can span lines: `in(r) e`, `out(r) p`, `inout(r) p` and `clobber("name")`, where `r` is `reg` (any register) or a register in quotes, `"rax"`; `%N` in the text is the N-th operand, `%%` a `%`. Operands are integers, `bool`s or pointers; `out` and `inout` ones are writable places (E0922). An `asm` also clobbers memory, so the compiler keeps loads and stores in order around it |
 | Naked functions | `naked fn`: no prologue or epilogue; it takes no parameters, returns nothing, and its body is one `asm` statement (E0923) |
 | Volatile access | `p.read_volatile()`, `p.write_volatile(v)` on a raw pointer to a scalar; `p.addr()` is its address and `core.ptr.from_addr(T, n)` a pointer to address `n` |
 | Foreign functions | `extern "c" fn name(x: u64) -> u64;` declares a function of another object file, called by its own name; only integers, `bool`s, floats and raw pointers cross it (E0924). `export("name") fn …` gives an Arche function that name |
@@ -340,12 +340,16 @@ These exist for the `freestanding` target (S16) and are all `unsafe`:
 | Barriers | `core.atomic.fence(o)`; a `Relaxed` one is E0927 |
 | Layout | `packed struct`: no padding, alignment 1, and a view of its fields is an error, since it may be unaligned (E0926); `align(N)` after `struct` or a field's type raises the alignment to `N`, a power of two up to 4096 (E0925); `extern struct` for C's layout, which for fields of the types Arche has is the layout it already uses (docs/abi.md) |
 | Sections | `section(".text.boot")` on a function (on a constant: not yet) |
-| Panic handler | `panic_handler: "kernel.panic.halt"` in the manifest names a `noreturn` function that a panic calls, for targets without `std` |
+| Panic handler | `panic_handler: "kernel.panic.halt"` in the manifest names a function `fn(message: str, file: str, line: u32, column: u32) -> noreturn` that a panic calls, for targets without `std` (E0928). Until the compiler reads the manifest (sprint S24), `arche --panic-handler kernel.panic.halt` names it |
 | Target features | `target_features: ["-sse", "-avx"]` in the manifest |
 
 ### 10.3 Targets
 
 `std` exists for hosted targets (Linux and Windows) and Arche OS. The `freestanding` target has `core` and `alloc` only: no capabilities, and a panic handler supplied by the program.
+
+- `arche --target freestanding-x86_64` and `--target freestanding-riscv64` build for a machine without an operating system. Such a program is full Arche, imports neither `std` (E0308) nor anything that does, and has no `main`: its entry is a function it exports, `export("_start")`, usually `naked`.
+- Its only allocators are its regions (§7): their arenas come from a static heap that the freestanding runtime (`compiler/runtime/freestanding.c`) treats as a stack, since regions nest. The runtime also gives the code `memcpy` and its relatives, and turns traps into calls of the panic handler.
+- The repository's `freestanding/` has a program for each of the two targets that boots in QEMU, writes over the serial port, allocates in a region and formats with `core`, and ends in a panic that its handler reports; `freestanding/run.sh` builds and runs them.
 
 ## 11. The memory model
 
@@ -451,7 +455,7 @@ primary     = INT | FLOAT | CHAR | STRING | "true" | "false" | "none"
             | "if" expr value_block "else" ( "if" if_expr_rest | value_block )
             | "match" expr "{" { pattern { "|" pattern } "=>" value_block [ "," ] } "}"
             | "fn" "[" [ capture { "," capture } [ "," ] ] "]" "(" [ params ] ")" [ "->" type ] block
-            | "asm" "(" STRING { "," asm_operand } ")" ;
+            | "asm" "(" STRING { STRING } { "," asm_operand } ")" ;
 if_expr_rest = expr value_block "else" ( "if" if_expr_rest | value_block ) ;
 capture     = [ "&" [ "mut" ] ] IDENT ;
 asm_operand = ( "in" | "out" | "inout" ) "(" IDENT ")" expr | "clobber" "(" STRING ")" ;
@@ -459,4 +463,4 @@ asm_operand = ( "in" | "out" | "inout" ) "(" IDENT ")" expr | "clobber" "(" STRI
 
 The other rules of A§14 (`if_rest`, `simple`, `assign`, `arm`, `pattern`, the operator levels and `postfix`) are unchanged. `FLOAT` is a decimal literal with a `.` or an exponent (§2.1). `for`, `in`, `interface`, `dyn`, `comptime`, `region`, `requires`, `ensures`, `where`, `nopanic`, `naked`, `unsafe` and `asm`, reserved in Arche-0 (A§2.1), are keywords here.
 
-`impl`, `extern`, `packed`, `align` and `Self` are **contextual**: they mean what this chapter says only where the grammar puts them (`impl` at the start of an item, `extern` before a string or `struct`, `packed` before `struct`, `align` after `struct` or in a field, `Self` inside an interface or an `impl`). Everywhere else they are ordinary identifiers, so no Arche-0 program that uses them as names changes meaning. Inside `asm(…)`, `in`, `out`, `inout` and `clobber` are contextual the same way.
+`impl`, `extern`, `packed`, `align`, `export`, `section` and `Self` are **contextual**: they mean what this chapter says only where the grammar puts them (`impl` at the start of an item, `extern` before a string or `struct`, `packed` before `struct`, `align` after `struct` or in a field, `Self` inside an interface or an `impl`). Everywhere else they are ordinary identifiers, so no Arche-0 program that uses them as names changes meaning. Inside `asm(…)`, `in`, `out`, `inout` and `clobber` are contextual the same way.

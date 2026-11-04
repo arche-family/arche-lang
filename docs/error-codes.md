@@ -176,3 +176,4 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0925` | An `align(N)` whose `N` is not a power of two from 1 to 4096, or one on a field of a packed struct (§10.2). |
 | `E0926` | A view of a field of a packed struct, which may be unaligned (§10.2). |
 | `E0927` | An atomic operation whose ordering is not written as a constant, is one the operation cannot have, or whose type it does not work on (§10.2). |
+| `E0928` | A freestanding program without a panic handler, or one whose handler is not `fn(message: str, file: str, line: u32, column: u32) -> noreturn`, or that is not full Arche (§10.3). |

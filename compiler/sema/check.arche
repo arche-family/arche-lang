@@ -234,6 +234,8 @@ pub type Checker = struct {
     pub unsafe_depth: u32,
     pub closures: alloc.List(Closure),
     pub captures: alloc.List(Capture),
+    /// The function a panic calls on a freestanding target, or NONE.
+    pub panic_handler: u32,
     /// The interfaces fn(P) -> R made so far (spec/arche.md §6).
     pub fn_ifaces: alloc.List(u32),
     /// Inside a closure: the bindings around it, which it may not use
@@ -1945,6 +1947,10 @@ fn collect_import(c: &mut Checker, n: cst.NodeId) {
         report(c, codes.BAD_IMPORT, s, "Arche-0 provides only the modules 'std' and 'alloc'");
         return;
     }
+    if alias.library == Library.Std and program.freestanding(&c.p) {
+        report(c, codes.BAD_IMPORT, s, "std needs an operating system; a freestanding program has core and alloc");
+        return;
+    }
     // core needs no operating system and no allocator (docs/sprints.md S15).
     let here = c.p.modules[c.module as usize].name.view();
     if (here.eq("core") or here.starts_with("core.")) and alias.library != Library.NotLibrary {
@@ -2781,7 +2787,75 @@ pub fn implements(c: &Checker, t: ty.TypeId, iface: u32) -> bool {
     return false;
 }
 
+/// --panic-handler module.function: a function a panic calls with what
+/// it says and where, which never returns (spec/arche.md §10.2).
+fn find_panic_handler(c: &mut Checker) {
+    c.module = 0;
+    let at = diag.Span { start: 0, len: 0 };
+    let full_name = c.p.panic_handler.view();
+    if full_name.len() == 0 {
+        report(c, codes.BAD_PANIC_HANDLER, at, "a freestanding program names its panic handler: --panic-handler module.function");
+        return;
+    }
+    var dot = full_name.len();
+    var i: usize = 0;
+    while i < full_name.len() : (i += 1) {
+        if full_name[i] == '.' {
+            dot = i;
+        }
+    }
+    if dot == full_name.len() {
+        report(c, codes.BAD_PANIC_HANDLER, at, "the panic handler is named module.function");
+        return;
+    }
+    var module_name = alloc.String.init(c.a);
+    module_name.push_str(full_name[0..dot]);
+    var fn_name = alloc.String.init(c.a);
+    fn_name.push_str(full_name[dot + 1..full_name.len()]);
+    var m: u32 = NONE;
+    match c.p.find(module_name.view()) {
+        some(id) => { m = id.index; }
+        none => {
+            report(c, codes.BAD_PANIC_HANDLER, at, "the panic handler's module is not part of the program");
+            return;
+        }
+    }
+    let sym = c.names.intern(fn_name.view());
+    var d: u32 = NONE;
+    match find_item(c, m, sym) {
+        some(x) => { d = x; }
+        none => { }
+    }
+    if d == NONE or c.decls[d as usize].kind != DeclKind.Fn or c.decls[d as usize].fn_index == NONE {
+        report(c, codes.BAD_PANIC_HANDLER, at, "the panic handler is not a function of its module");
+        return;
+    }
+    let f = c.fns[c.decls[d as usize].fn_index as usize];
+    let u32_t = ty.int_type(ty.IntKind.U32);
+    let fine = f.params_len == 4 and f.ret == ty.noreturn_type() and
+        c.params[f.params_start as usize].type_id == ty.str_type() and
+        c.params[(f.params_start + 1) as usize].type_id == ty.str_type() and
+        c.params[(f.params_start + 2) as usize].type_id == u32_t and
+        c.params[(f.params_start + 3) as usize].type_id == u32_t;
+    if not fine {
+        c.module = c.decls[d as usize].module;
+        let s = token_span(c, c.decls[d as usize].name_token);
+        report(c, codes.BAD_PANIC_HANDLER, s, "a panic handler is 'fn(message: str, file: str, line: u32, column: u32) -> noreturn'");
+        return;
+    }
+    c.panic_handler = d;
+}
+
 fn check_main(c: &mut Checker) {
+    if program.freestanding(&c.p) {
+        // No main: the program's own entry, exported, starts it.
+        if not c.p.full {
+            report(c, codes.BAD_PANIC_HANDLER, diag.Span { start: 0, len: 0 }, "a freestanding program is full Arche: its package has a package.arche");
+            return;
+        }
+        find_panic_handler(c);
+        return;
+    }
     c.module = 0;
     let main_sym = c.names.intern("main");
     let system = c.t.builtin(ty.Builtin.System);
@@ -2893,6 +2967,7 @@ pub fn analyze(p: program.Program) -> Checker {
         unsafe_depth: 0,
         closures: alloc.List(Closure).init(a),
         captures: alloc.List(Capture).init(a),
+        panic_handler: NONE,
         fn_ifaces: alloc.List(u32).init(a),
         outer_scope: alloc.List(Binding).init(a),
         labels: alloc.List(alloc.Symbol).init(a),

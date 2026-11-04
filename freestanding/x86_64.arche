@@ -1,0 +1,132 @@
+/// A PC under QEMU (qemu-system-x86_64): multiboot starts it in 32-bit
+/// protected mode, the boot code below enters 64-bit long mode, and COM1
+/// is the console. Build: freestanding/run.sh.
+import kernel;
+
+type Pc = struct {
+}
+
+impl kernel.Machine for Pc {
+    fn put(self: &Pc, byte: u8) {
+        unsafe {
+            // SAFETY: 0x3F8 is COM1's data register and 0x3FD its line
+            // status; port I/O touches no memory.
+            let status_port: u16 = 0x3FD;
+            var status: u8 = 0;
+            while (status & 0x20) == 0 {
+                asm("inb %1, %0", out("al") status, in("dx") status_port);
+            }
+            let data_port: u16 = 0x3F8;
+            asm("outb %0, %1", in("al") byte, in("dx") data_port);
+        }
+    }
+
+    /// QEMU's isa-debug-exit device: the exit status is code * 2 + 1.
+    fn off(self: &Pc, success: bool) -> noreturn {
+        var code: u8 = 1;
+        if success {
+            code = 0;
+        }
+        unsafe {
+            // SAFETY: 0xF4 is the isa-debug-exit device run.sh adds.
+            let port: u16 = 0xF4;
+            asm("outb %0, %1", in("al") code, in("dx") port);
+        }
+        while true {
+            unsafe {
+                // SAFETY: halts until an interrupt, and interrupts are off.
+                asm("hlt");
+            }
+        }
+    }
+}
+
+/// Multiboot's entry, in 32-bit protected mode with paging off: identity
+/// maps the first GiB with 2 MiB pages, enables SSE and long mode, and
+/// calls kernel_main on a stack of its own. The multiboot header uses the
+/// address fields (flag 16), so QEMU loads this 64-bit ELF file.
+export("_start") section(".text.boot") naked fn start() {
+    asm(
+        ".pushsection .multiboot, \"a\"\n"
+        ".align 4\n"
+        "multiboot_header:\n"
+        ".long 0x1BADB002\n"
+        ".long 0x00010000\n"
+        ".long -(0x1BADB002 + 0x00010000)\n"
+        ".long multiboot_header\n"
+        ".long __load_start\n"
+        ".long __load_end\n"
+        ".long __bss_end\n"
+        ".long _start\n"
+        ".popsection\n"
+        ".pushsection .bss\n"
+        ".align 4096\n"
+        "boot_pml4: .skip 4096\n"
+        "boot_pdpt: .skip 4096\n"
+        "boot_pd: .skip 4096\n"
+        "boot_stack: .skip 65536\n"
+        "boot_stack_top:\n"
+        ".popsection\n"
+        ".pushsection .rodata\n"
+        ".align 8\n"
+        "boot_gdt: .quad 0, 0x00AF9A000000FFFF, 0x00CF92000000FFFF\n"
+        "boot_gdt_ptr: .word 23\n"
+        ".long boot_gdt\n"
+        ".popsection\n"
+        ".code32\n"
+        "cli\n"
+        "movl $boot_stack_top, %esp\n"
+        "movl $boot_pdpt, %eax\n"
+        "orl $3, %eax\n"
+        "movl %eax, boot_pml4\n"
+        "movl $boot_pd, %eax\n"
+        "orl $3, %eax\n"
+        "movl %eax, boot_pdpt\n"
+        "movl $boot_pd, %edi\n"
+        "movl $0x83, %eax\n"
+        "movl $512, %ecx\n"
+        "1:\n"
+        "movl %eax, (%edi)\n"
+        "movl $0, 4(%edi)\n"
+        "addl $0x200000, %eax\n"
+        "addl $8, %edi\n"
+        "loop 1b\n"
+        "movl $boot_pml4, %eax\n"
+        "movl %eax, %cr3\n"
+        "movl %cr4, %eax\n"
+        "orl $0x620, %eax\n"
+        "movl %eax, %cr4\n"
+        "movl $0xC0000080, %ecx\n"
+        "rdmsr\n"
+        "orl $0x100, %eax\n"
+        "wrmsr\n"
+        "movl %cr0, %eax\n"
+        "andl $0xFFFFFFFB, %eax\n"
+        "orl $0x80000002, %eax\n"
+        "movl %eax, %cr0\n"
+        "lgdt boot_gdt_ptr\n"
+        "ljmp $0x08, $boot_long\n"
+        ".code64\n"
+        "boot_long:\n"
+        "movw $0x10, %ax\n"
+        "movw %ax, %ds\n"
+        "movw %ax, %es\n"
+        "movw %ax, %ss\n"
+        "movabsq $boot_stack_top, %rsp\n"
+        "call kernel_main\n"
+        "2:\n"
+        "hlt\n"
+        "jmp 2b\n"
+    );
+}
+
+export("kernel_main") fn kernel_main() -> noreturn {
+    let pc = Pc { };
+    kernel.run(&pc, "x86-64");
+}
+
+/// The panic handler: run.sh passes --panic-handler x86_64.halt.
+fn halt(message: str, file: str, line: u32, column: u32) -> noreturn {
+    let pc = Pc { };
+    kernel.report_panic(&pc, message: message, file: file, line: line, column: column);
+}

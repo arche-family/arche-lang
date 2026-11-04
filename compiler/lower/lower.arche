@@ -616,6 +616,11 @@ pub fn mangle(c: &ck.Checker, d: u32, a: alloc.Allocator) -> alloc.String {
         }
     }
     {
+        if d == c.panic_handler {
+            var name = alloc.String.init(a);
+            name.push_str("a0_panic"); // what the freestanding runtime calls
+            return name;
+        }
         let exported = ck.fn_attribute(c, d, "export");
         if decl.kind == ck.DeclKind.Fn and exported.len() > 0 {
             return exported;
@@ -679,7 +684,7 @@ fn lower_fn(l: &mut Lower, f: u32) {
     ck.enter_decl(&mut l.c, info.decl);
     l.c.cur_table = info.table;
     l.c.fn_index = f;
-    if ck.fn_attribute(&l.c, info.decl, "export").len() > 0 {
+    if ck.fn_attribute(&l.c, info.decl, "export").len() > 0 or info.decl == l.c.panic_handler {
         l.f.internal = false; // others call it by its name
     }
     l.f.section = ck.fn_attribute(&l.c, info.decl, "section");
@@ -848,9 +853,16 @@ pub fn lower(c: ck.Checker) -> ir.Module {
         l.f = ir.new_function("", ir.Ty.Void, a);
     }
     l.c.cur_table = ck.NONE;
-    entry(&mut l);
-    error_names(&mut l);
-    let e = l.f;
-    l.m.functions.push(e);
+    match l.c.p.target {
+        .LinuxX86_64 => {
+            l.m.triple.push_str("x86_64-pc-linux-gnu");
+            entry(&mut l);
+            error_names(&mut l);
+            let e = l.f;
+            l.m.functions.push(e);
+        }
+        .FreestandingX86_64 => { l.m.triple.push_str("x86_64-unknown-none-elf"); }
+        .FreestandingRiscv64 => { l.m.triple.push_str("riscv64-unknown-none-elf"); }
+    }
     return l.m;
 }

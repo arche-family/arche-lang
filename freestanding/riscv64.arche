@@ -1,0 +1,71 @@
+/// QEMU's RISC-V virt machine (qemu-system-riscv64 -machine virt -bios
+/// none): the hart starts at 0x80000000 in machine mode, an NS16550 UART is
+/// at 0x10000000, and the SiFive test device at 0x100000 powers off.
+/// Build: freestanding/run.sh.
+import core.ptr;
+import kernel;
+
+type Virt = struct {
+}
+
+impl kernel.Machine for Virt {
+    fn put(self: &Virt, byte: u8) {
+        unsafe {
+            // SAFETY: the UART's registers: data at 0, line status at 5.
+            let status = ptr.from_addr(u8, 0x10000005);
+            while (status.read_volatile() & 0x20) == 0 {
+            }
+            let data = ptr.from_addr(u8, 0x10000000);
+            data.write_volatile(byte);
+        }
+    }
+
+    /// 0x5555 ends QEMU with status 0; 0x3333 with code << 16 fails it.
+    fn off(self: &Virt, success: bool) -> noreturn {
+        var word: u32 = 0x13333;
+        if success {
+            word = 0x5555;
+        }
+        unsafe {
+            // SAFETY: the SiFive test device's register.
+            let device = ptr.from_addr(u32, 0x100000);
+            device.write_volatile(word);
+        }
+        while true {
+            unsafe {
+                // SAFETY: waits for an interrupt, and none are enabled.
+                asm("wfi");
+            }
+        }
+    }
+}
+
+/// The first code the hart runs: a stack, the floating-point unit on, and
+/// kernel_main.
+export("_start") section(".text.boot") naked fn start() {
+    asm(
+        ".pushsection .bss\n"
+        ".align 4\n"
+        "boot_stack: .skip 65536\n"
+        "boot_stack_top:\n"
+        ".popsection\n"
+        "la sp, boot_stack_top\n"
+        "li t0, 0x2000\n"
+        "csrs mstatus, t0\n"
+        "call kernel_main\n"
+        "1:\n"
+        "wfi\n"
+        "j 1b\n"
+    );
+}
+
+export("kernel_main") fn kernel_main() -> noreturn {
+    let virt = Virt { };
+    kernel.run(&virt, "RISC-V 64");
+}
+
+/// The panic handler: run.sh passes --panic-handler riscv64.halt.
+fn halt(message: str, file: str, line: u32, column: u32) -> noreturn {
+    let virt = Virt { };
+    kernel.report_panic(&virt, message: message, file: file, line: line, column: column);
+}

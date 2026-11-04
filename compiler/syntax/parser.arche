@@ -1300,7 +1300,10 @@ fn parse_primary(p: &mut Parser) -> bool {
             // asm("template", in(reg) x, out("eax") y, clobber("memory"))
             advance(p);
             if expect(p, tk.Kind.LParen, "'('") {
+                // Adjacent strings are one text, so assembly can span lines.
                 _ = expect(p, tk.Kind.String, "the assembly text");
+                while accept(p, tk.Kind.String) {
+                }
                 while accept(p, tk.Kind.Comma) {
                     if at(p, tk.Kind.RParen) {
                         break;

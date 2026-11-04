@@ -1,0 +1,73 @@
+/// What the freestanding examples do on every machine (docs/sprints.md
+/// S16): write over the serial port, allocate in a region with alloc,
+/// format with core, and end in a panic that the machine's handler reports.
+import alloc;
+import core.fmt;
+
+/// A machine's console and its way out: all the kernel needs of it.
+pub type Machine = interface {
+    fn put(self: &Self, byte: u8);
+    fn off(self: &Self, success: bool) -> noreturn;
+}
+
+pub fn say(m: &dyn Machine, text: str) {
+    for b in text.bytes() {
+        m.put(b.*);
+    }
+}
+
+pub fn number(m: &dyn Machine, n: u64) {
+    var buf: [20]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let len = fmt.decimal(n, buf[0..20]);
+    for b in buf[0..len] {
+        m.put(b.*);
+    }
+}
+
+fn square(x: u64) -> u64 {
+    return x * x;
+}
+
+pub fn run(m: &dyn Machine, arch: str) -> noreturn {
+    say(m, "Arche, freestanding on ");
+    say(m, arch);
+    say(m, "\n");
+    var total: u64 = 0;
+    region r {
+        var squares = alloc.List(u64).init(r);
+        for i: u64 in 1..=10 {
+            squares.push(square(i));
+        }
+        for s in squares.items() {
+            total += s.*;
+        }
+        var text = alloc.String.init(r);
+        text.push_str("core and alloc: ");
+        say(m, text.view());
+    }
+    say(m, "the squares of 1..10 add up to ");
+    number(m, total);
+    say(m, "\n");
+    // A trap, as any program can have one: the panic handler takes over.
+    let small: [3]u32 = [1, 2, 3];
+    var i: usize = 0;
+    while i <= 3 : (i += 1) {
+        total += small[i] as u64;
+    }
+    say(m, "not reached\n");
+    m.off(true);
+}
+
+/// What a panic handler says: the message and where it happened.
+pub fn report_panic(m: &dyn Machine, message: str, file: str, line: u32, column: u32) -> noreturn {
+    say(m, "panic: ");
+    say(m, message);
+    say(m, "\n  at ");
+    say(m, file);
+    say(m, ":");
+    number(m, line as u64);
+    say(m, ":");
+    number(m, column as u64);
+    say(m, "\n");
+    m.off(false);
+}
