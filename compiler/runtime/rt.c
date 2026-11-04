@@ -310,6 +310,324 @@ void a0rt_write_i64(const i64 *output, i64 v) {
     }
 }
 
+// ---- floats (spec/arche.md §2.4) ------------------------------------------------
+//
+// A float is written as the shortest decimal that reads back to the same
+// value (Burger and Dybvig's free-format algorithm), with exact integer
+// arithmetic, so the output is the same on every target.
+
+enum { BIG_LIMBS = 44 };
+
+typedef struct {
+    u32 limb[BIG_LIMBS];
+    int len;
+} Big;
+
+static void big_set(Big *x, u64 v) {
+    x->len = 0;
+    while (v) {
+        x->limb[x->len++] = (u32)v;
+        v >>= 32;
+    }
+}
+
+static void big_mul_small(Big *x, u32 m) {
+    u64 carry = 0;
+    for (int i = 0; i < x->len; i++) {
+        u64 v = (u64)x->limb[i] * m + carry;
+        x->limb[i] = (u32)v;
+        carry = v >> 32;
+    }
+    if (carry) {
+        x->limb[x->len++] = (u32)carry;
+    }
+}
+
+static void big_shl(Big *x, int k) {
+    int words = k / 32, bits = k % 32;
+    if (x->len == 0) {
+        return;
+    }
+    for (int i = x->len - 1; i >= 0; i--) {
+        x->limb[i + words] = x->limb[i];
+    }
+    for (int i = 0; i < words; i++) {
+        x->limb[i] = 0;
+    }
+    x->len += words;
+    if (bits) {
+        u32 carry = 0;
+        for (int i = words; i < x->len; i++) {
+            u32 v = x->limb[i];
+            x->limb[i] = (v << bits) | carry;
+            carry = v >> (32 - bits);
+        }
+        if (carry) {
+            x->limb[x->len++] = carry;
+        }
+    }
+}
+
+static int big_cmp(const Big *a, const Big *b) {
+    if (a->len != b->len) {
+        return a->len < b->len ? -1 : 1;
+    }
+    for (int i = a->len - 1; i >= 0; i--) {
+        if (a->limb[i] != b->limb[i]) {
+            return a->limb[i] < b->limb[i] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+static void big_add(Big *out, const Big *a, const Big *b) {
+    u64 carry = 0;
+    int n = a->len > b->len ? a->len : b->len;
+    for (int i = 0; i < n; i++) {
+        u64 v = carry;
+        if (i < a->len) {
+            v += a->limb[i];
+        }
+        if (i < b->len) {
+            v += b->limb[i];
+        }
+        out->limb[i] = (u32)v;
+        carry = v >> 32;
+    }
+    out->len = n;
+    if (carry) {
+        out->limb[out->len++] = (u32)carry;
+    }
+}
+
+// a -= b, for a >= b.
+static void big_sub(Big *a, const Big *b) {
+    u64 borrow = 0;
+    for (int i = 0; i < a->len; i++) {
+        u64 bv = (i < b->len ? b->limb[i] : 0) + borrow;
+        if ((u64)a->limb[i] >= bv) {
+            a->limb[i] = (u32)((u64)a->limb[i] - bv);
+            borrow = 0;
+        } else {
+            a->limb[i] = (u32)(((u64)1 << 32) + a->limb[i] - bv);
+            borrow = 1;
+        }
+    }
+    while (a->len > 0 && a->limb[a->len - 1] == 0) {
+        a->len--;
+    }
+}
+
+// The shortest digits of f * 2^e for a format of p bits whose smallest
+// exponent is min_e; returns their count, and *k with value 0.ddd * 10^k.
+static int shortest(u64 f, int e, int p, int min_e, u8 *digits, int *k_out) {
+    Big r, s, mp, mm, t;
+    int even = (f & 1) == 0;
+    u64 hidden = (u64)1 << (p - 1);
+    if (e >= 0) {
+        big_set(&r, f);
+        big_set(&mp, 1);
+        big_shl(&mp, e);
+        big_set(&mm, 1);
+        big_shl(&mm, e);
+        if (f != hidden) {
+            big_shl(&r, e + 1);
+            big_set(&s, 2);
+        } else {
+            big_shl(&r, e + 2);
+            big_set(&s, 4);
+            big_shl(&mp, 1);
+        }
+    } else {
+        big_set(&r, f);
+        big_set(&mp, 1);
+        big_set(&mm, 1);
+        big_set(&s, 1);
+        if (e == min_e || f != hidden) {
+            big_shl(&r, 1);
+            big_shl(&s, 1 - e);
+        } else {
+            big_shl(&r, 2);
+            big_shl(&s, 2 - e);
+            big_set(&mp, 2);
+        }
+    }
+    // k = ceil(log10 v), estimated low from the bit length, then fixed.
+    int bits = 0;
+    for (u64 x = f; x; x >>= 1) {
+        bits++;
+    }
+    int lg = e + bits - 1;
+    int k = lg >= 0 ? (lg * 1233) >> 12 : -((-lg * 1233 + 4095) >> 12);
+    if (k >= 0) {
+        for (int i = 0; i < k; i++) {
+            big_mul_small(&s, 10);
+        }
+    } else {
+        for (int i = 0; i < -k; i++) {
+            big_mul_small(&r, 10);
+            big_mul_small(&mp, 10);
+            big_mul_small(&mm, 10);
+        }
+    }
+    for (;;) {
+        big_add(&t, &r, &mp);
+        int c = big_cmp(&t, &s);
+        if (even ? c >= 0 : c > 0) {
+            big_mul_small(&s, 10);
+            k++;
+        } else {
+            break;
+        }
+    }
+    int n = 0;
+    for (;;) {
+        big_mul_small(&r, 10);
+        big_mul_small(&mp, 10);
+        big_mul_small(&mm, 10);
+        int d = 0;
+        while (big_cmp(&r, &s) >= 0) {
+            big_sub(&r, &s);
+            d++;
+        }
+        int c1 = big_cmp(&r, &mm);
+        int low = even ? c1 <= 0 : c1 < 0;
+        big_add(&t, &r, &mp);
+        int c2 = big_cmp(&t, &s);
+        int high = even ? c2 >= 0 : c2 > 0;
+        if (!low && !high) {
+            digits[n++] = (u8)d;
+            continue;
+        }
+        if (low && high) {
+            big_add(&t, &r, &r);
+            int c3 = big_cmp(&t, &s);
+            if (c3 > 0 || (c3 == 0 && (d & 1))) {
+                d++;
+            }
+        } else if (high) {
+            d++;
+        }
+        digits[n++] = (u8)d;
+        break;
+    }
+    *k_out = k;
+    return n;
+}
+
+static void write_float(const i64 *output, int negative, u64 f, int e, int p, int min_e, int special) {
+    u8 out[64];
+    int len = 0;
+    if (special == 2) {
+        a0rt_write(output, (const u8 *)"nan", 3);
+        return;
+    }
+    if (negative) {
+        out[len++] = '-';
+    }
+    if (special == 1) {
+        out[len++] = 'i';
+        out[len++] = 'n';
+        out[len++] = 'f';
+        a0rt_write(output, out, (u64)len);
+        return;
+    }
+    if (f == 0) {
+        out[len++] = '0';
+        out[len++] = '.';
+        out[len++] = '0';
+        a0rt_write(output, out, (u64)len);
+        return;
+    }
+    u8 d[32];
+    int k;
+    int n = shortest(f, e, p, min_e, d, &k);
+    if (k > 21 || k < -5) {
+        out[len++] = (u8)('0' + d[0]);
+        if (n > 1) {
+            out[len++] = '.';
+            for (int i = 1; i < n; i++) {
+                out[len++] = (u8)('0' + d[i]);
+            }
+        }
+        out[len++] = 'e';
+        int x = k - 1;
+        if (x < 0) {
+            out[len++] = '-';
+            x = -x;
+        }
+        u8 ex[8];
+        int m = 0;
+        do {
+            ex[m++] = (u8)('0' + x % 10);
+            x /= 10;
+        } while (x);
+        while (m) {
+            out[len++] = ex[--m];
+        }
+    } else if (k <= 0) {
+        out[len++] = '0';
+        out[len++] = '.';
+        for (int i = 0; i < -k; i++) {
+            out[len++] = '0';
+        }
+        for (int i = 0; i < n; i++) {
+            out[len++] = (u8)('0' + d[i]);
+        }
+    } else if (k >= n) {
+        for (int i = 0; i < n; i++) {
+            out[len++] = (u8)('0' + d[i]);
+        }
+        for (int i = n; i < k; i++) {
+            out[len++] = '0';
+        }
+        out[len++] = '.';
+        out[len++] = '0';
+    } else {
+        for (int i = 0; i < n; i++) {
+            if (i == k) {
+                out[len++] = '.';
+            }
+            out[len++] = (u8)('0' + d[i]);
+        }
+    }
+    a0rt_write(output, out, (u64)len);
+}
+
+void a0rt_write_f64(const i64 *output, double x) {
+    u64 b;
+    memcpy(&b, &x, 8);
+    int negative = (int)(b >> 63);
+    int be = (int)((b >> 52) & 0x7FF);
+    u64 m = b & (((u64)1 << 52) - 1);
+    if (be == 0x7FF) {
+        write_float(output, negative, 0, 0, 53, -1074, m ? 2 : 1);
+        return;
+    }
+    if (be == 0) {
+        write_float(output, negative, m, -1074, 53, -1074, 0);
+    } else {
+        write_float(output, negative, m | ((u64)1 << 52), be - 1075, 53, -1074, 0);
+    }
+}
+
+void a0rt_write_f32(const i64 *output, float x) {
+    u32 b;
+    memcpy(&b, &x, 4);
+    int negative = (int)(b >> 31);
+    int be = (int)((b >> 23) & 0xFF);
+    u64 m = b & 0x7FFFFF;
+    if (be == 0xFF) {
+        write_float(output, negative, 0, 0, 24, -149, m ? 2 : 1);
+        return;
+    }
+    if (be == 0) {
+        write_float(output, negative, m, -149, 24, -149, 0);
+    } else {
+        write_float(output, negative, m | ((u64)1 << 23), be - 150, 24, -149, 0);
+    }
+}
+
 // ---- exit -------------------------------------------------------------------------
 
 static _Noreturn void exit_with(int status) {

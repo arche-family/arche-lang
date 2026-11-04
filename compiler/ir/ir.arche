@@ -8,7 +8,7 @@
 /// with Memcpy (docs/abi.md).
 import alloc;
 
-pub type Ty = enum { Void, I1, I8, I16, I32, I64, Ptr }
+pub type Ty = enum { Void, I1, I8, I16, I32, I64, Ptr, F32, F64 }
 
 pub type Op = enum {
     /// imm: the value.
@@ -48,6 +48,14 @@ pub type Op = enum {
     VTable,
     /// a: the callee's address; args: as for Call.
     CallIndirect,
+    /// Floats (spec/arche.md §2). a, b: the operands; flag: an FBinKind.
+    FBin,
+    /// a: the operand.
+    FNeg,
+    /// a, b: the operands; flag: an FCmpKind. The value is an I1.
+    FCmp,
+    /// a: the operand; flag: an FConvKind.
+    FConv,
     /// imm: the callee (a function, or an external when flag is 1); args:
     /// a range of the function's args list.
     Call,
@@ -66,6 +74,48 @@ pub type BinKind = enum { Add, Sub, Mul, SDiv, UDiv, SRem, URem, And, Or, Xor, S
 pub type CmpKind = enum { Eq, Ne, SLt, SLe, SGt, SGe, ULt, ULe, UGt, UGe }
 
 pub type OverflowKind = enum { SAdd, UAdd, SSub, USub, SMul, UMul }
+
+pub type FBinKind = enum { Add, Sub, Mul, Div }
+
+/// Ordered comparisons, false with a NaN, and unordered not-equal, true
+/// with one (spec/arche.md §2.2).
+pub type FCmpKind = enum { Eq, Ne, Lt, Le, Gt, Ge }
+
+/// SatToSI and SatToUI saturate, and give 0 for a NaN (spec/arche.md §2.3).
+pub type FConvKind = enum { FromSI, FromUI, ToSI, ToUI, Trunc, Ext, SatToSI, SatToUI }
+
+pub fn fbin_flag(k: FBinKind) -> u32 {
+    match k {
+        .Add => { return 0; }
+        .Sub => { return 1; }
+        .Mul => { return 2; }
+        .Div => { return 3; }
+    }
+}
+
+pub fn fcmp_flag(k: FCmpKind) -> u32 {
+    match k {
+        .Eq => { return 0; }
+        .Ne => { return 1; }
+        .Lt => { return 2; }
+        .Le => { return 3; }
+        .Gt => { return 4; }
+        .Ge => { return 5; }
+    }
+}
+
+pub fn fconv_flag(k: FConvKind) -> u32 {
+    match k {
+        .FromSI => { return 0; }
+        .FromUI => { return 1; }
+        .ToSI => { return 2; }
+        .ToUI => { return 3; }
+        .Trunc => { return 4; }
+        .Ext => { return 5; }
+        .SatToSI => { return 6; }
+        .SatToUI => { return 7; }
+    }
+}
 
 pub type Inst = struct {
     pub op: Op,
@@ -247,7 +297,8 @@ pub fn bits(t: Ty) -> u32 {
         .I8 => { return 8; }
         .I16 => { return 16; }
         .I32 => { return 32; }
-        .I64 | .Ptr => { return 64; }
+        .I64 | .Ptr | .F64 => { return 64; }
+        .F32 => { return 32; }
         .Void => { return 0; }
     }
 }
@@ -339,7 +390,7 @@ pub fn verify(f: &Function) -> Problem {
                         return problem(id, ProblemKind.Undefined);
                     }
                 }
-                .Bin | .Cmp | .Overflow => {
+                .Bin | .Cmp | .Overflow | .FBin | .FCmp => {
                     if not operand_ok(f, user: id, v: i.a) or not operand_ok(f, user: id, v: i.b) {
                         return problem(id, ProblemKind.Undefined);
                     }
@@ -350,7 +401,7 @@ pub fn verify(f: &Function) -> Problem {
                         return problem(id, ProblemKind.CmpType);
                     }
                 }
-                .Ext | .Trunc | .OverflowBit => {
+                .Ext | .Trunc | .OverflowBit | .FNeg | .FConv => {
                     if not operand_ok(f, user: id, v: i.a) {
                         return problem(id, ProblemKind.Undefined);
                     }

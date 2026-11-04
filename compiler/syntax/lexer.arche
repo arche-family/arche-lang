@@ -73,6 +73,13 @@ fn lex_one(text: str, start: usize, full: bool, tokens: &mut alloc.List(tk.Token
             return lex_word(text, start, full, tokens, diags);
         }
         '0'..='9' => {
+            if full {
+                let f = float_end(text, start);
+                if f > start {
+                    push(tokens, tk.Kind.Float, start: start, end: f, value: 0);
+                    return f;
+                }
+            }
             return lex_number(text, start, tokens, diags);
         }
         '\'' => {
@@ -160,6 +167,41 @@ fn digit_value(c: u8) -> u64 {
         'A'..='F' => { return (c - 'A') as u64 + 10; }
         _ => { return 99; }
     }
+}
+
+fn digits_end(text: str, from: usize) -> usize {
+    var i = from;
+    while i < text.len() and ((text[i] >= '0' and text[i] <= '9') or text[i] == '_') : (i += 1) {
+    }
+    return i;
+}
+
+/// Where a decimal float literal starting at `start` ends: digits, then a
+/// '.' and digits or an exponent, or both; `start` when it is not one.
+fn float_end(text: str, start: usize) -> usize {
+    if text[start] == '0' and start + 1 < text.len() and (text[start + 1] == 'x' or text[start + 1] == 'o' or text[start + 1] == 'b') {
+        return start;
+    }
+    var i = digits_end(text, start);
+    var is_float = false;
+    if i + 1 < text.len() and text[i] == '.' and text[i + 1] >= '0' and text[i + 1] <= '9' {
+        i = digits_end(text, i + 1);
+        is_float = true;
+    }
+    if i < text.len() and (text[i] == 'e' or text[i] == 'E') {
+        var j = i + 1;
+        if j < text.len() and (text[j] == '+' or text[j] == '-') {
+            j += 1;
+        }
+        if j < text.len() and text[j] >= '0' and text[j] <= '9' {
+            i = digits_end(text, j);
+            is_float = true;
+        }
+    }
+    if not is_float or (i < text.len() and is_ident_char(text[i])) {
+        return start;
+    }
+    return i;
 }
 
 fn lex_number(text: str, start: usize, tokens: &mut alloc.List(tk.Token), diags: &mut diag.Diagnostics) -> usize {

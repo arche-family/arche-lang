@@ -13,8 +13,12 @@ fn ty_text(t: ir.Ty) -> str {
         .I32 => { return "i32"; }
         .I64 => { return "i64"; }
         .Ptr => { return "ptr"; }
+        .F32 => { return "float"; }
+        .F64 => { return "double"; }
     }
 }
+
+
 
 fn value_name(out: &mut alloc.String, v: u32) {
     out.push_str("%v");
@@ -33,6 +37,15 @@ fn constant(out: &mut alloc.String, t: ir.Ty, bits: u64) {
     }
     if t == ir.Ty.Ptr {
         out.push_str("null");
+        return;
+    }
+    if t == ir.Ty.F32 or t == ir.Ty.F64 {
+        // A double's bits in hex; an f32 constant is the double of its value.
+        out.push_str("0x");
+        var k: u64 = 16;
+        while k > 0 : (k -= 1) {
+            hex_digit(out, ((bits >> ((k - 1) * 4)) & 15) as u8);
+        }
         return;
     }
     let n = ir.bits(t);
@@ -246,6 +259,90 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
             out.push_str(", i1} %s");
             ir.write_number(out, i.a as u64);
             out.push_str(", 1\n");
+        }
+        .FBin => {
+            line_start(out, id);
+            if i.flag == 0 {
+                out.push_str("fadd ");
+            } else if i.flag == 1 {
+                out.push_str("fsub ");
+            } else if i.flag == 2 {
+                out.push_str("fmul ");
+            } else {
+                out.push_str("fdiv ");
+            }
+            typed(out, m, f, i.a);
+            out.push_str(", ");
+            operand(out, m, f, i.b);
+            out.push_str("\n");
+        }
+        .FNeg => {
+            line_start(out, id);
+            out.push_str("fneg ");
+            typed(out, m, f, i.a);
+            out.push_str("\n");
+        }
+        .FCmp => {
+            line_start(out, id);
+            out.push_str("fcmp ");
+            if i.flag == 0 {
+                out.push_str("oeq ");
+            } else if i.flag == 1 {
+                out.push_str("une ");
+            } else if i.flag == 2 {
+                out.push_str("olt ");
+            } else if i.flag == 3 {
+                out.push_str("ole ");
+            } else if i.flag == 4 {
+                out.push_str("ogt ");
+            } else {
+                out.push_str("oge ");
+            }
+            typed(out, m, f, i.a);
+            out.push_str(", ");
+            operand(out, m, f, i.b);
+            out.push_str("\n");
+        }
+        .FConv => {
+            let from = f.insts[i.a as usize].ty;
+            line_start(out, id);
+            if i.flag >= 6 {
+                out.push_str("call ");
+                out.push_str(t);
+                out.push_str(" @llvm.fpto");
+                if i.flag == 6 {
+                    out.push_str("si");
+                } else {
+                    out.push_str("ui");
+                }
+                out.push_str(".sat.");
+                out.push_str(t);
+                if from == ir.Ty.F32 {
+                    out.push_str(".f32(");
+                } else {
+                    out.push_str(".f64(");
+                }
+                typed(out, m, f, i.a);
+                out.push_str(")\n");
+            } else {
+                if i.flag == 0 {
+                    out.push_str("sitofp ");
+                } else if i.flag == 1 {
+                    out.push_str("uitofp ");
+                } else if i.flag == 2 {
+                    out.push_str("fptosi ");
+                } else if i.flag == 3 {
+                    out.push_str("fptoui ");
+                } else if i.flag == 4 {
+                    out.push_str("fptrunc ");
+                } else {
+                    out.push_str("fpext ");
+                }
+                typed(out, m, f, i.a);
+                out.push_str(" to ");
+                out.push_str(t);
+                out.push_str("\n");
+            }
         }
         .Cmp => {
             line_start(out, id);
@@ -479,6 +576,34 @@ pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
     }
     out.push_str("\ndeclare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
     out.push_str("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n");
+    // Saturating float to integer conversions (spec/arche.md §2.3).
+    var sw: u32 = 8;
+    while sw <= 64 : (sw *= 2) {
+        var sat: u32 = 0;
+        while sat < 4 : (sat += 1) {
+            var ft = "float";
+            var fs = "f32";
+            if sat % 2 == 1 {
+                ft = "double";
+                fs = "f64";
+            }
+            var sign = "si";
+            if sat >= 2 {
+                sign = "ui";
+            }
+            out.push_str("declare i");
+            ir.write_number(&mut out, sw as u64);
+            out.push_str(" @llvm.fpto");
+            out.push_str(sign);
+            out.push_str(".sat.i");
+            ir.write_number(&mut out, sw as u64);
+            out.push_str(".");
+            out.push_str(fs);
+            out.push_str("(");
+            out.push_str(ft);
+            out.push_str(")\n");
+        }
+    }
     var k: u32 = 0;
     while k < 6 : (k += 1) {
         var w: u32 = 8;

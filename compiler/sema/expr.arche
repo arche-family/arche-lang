@@ -6,6 +6,7 @@ import syntax.cst;
 import syntax.token as tk;
 import sema.check as ck;
 import sema.consts;
+import sema.floats;
 import sema.stmt;
 import sema.types as ty;
 
@@ -219,6 +220,10 @@ fn prim(name: str) -> ?ty.TypeId {
         some(k) => { return ty.int_type(k); }
         none => { }
     }
+    match ty.float_by_name(name) {
+        some(t) => { return t; }
+        none => { }
+    }
     if name.eq("bool") {
         return ty.bool_type();
     }
@@ -326,6 +331,7 @@ fn check_kind(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Typ
     }
     match k {
         .IntLit => { return check_int(c, n, expected); }
+        .FloatLit => { return check_float(c, n, expected); }
         .CharLit => { return ty.int_type(ty.IntKind.U8); }
         .StringLit => { return ty.str_type(); }
         .BoolLit => { return ty.bool_type(); }
@@ -389,6 +395,51 @@ fn check_kind(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Typ
 }
 
 // ---- literals -----------------------------------------------------------------
+
+/// The expected type, when it is an integer or float type: the type of an
+/// arithmetic operator's operands.
+fn expected_num(c: &ck.Checker, expected: ?ty.TypeId) -> ?ty.TypeId {
+    match expected {
+        some(e) => {
+            if ck.is_int(c, e) or ck.is_float(c, e) {
+                return e;
+            }
+        }
+        none => { }
+    }
+    return none;
+}
+
+/// 1.5 takes a float type from context (spec/arche.md §2.1).
+fn check_float(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.TypeId {
+    match expected {
+        some(t) => {
+            if ck.is_float(c, t) {
+                let tok = ck.tree(c).first_token(n);
+                var text = alloc.String.init(c.a);
+                text.push_str(ck.text(c, tok));
+                var inf = false;
+                if c.t.get(t).len == 32 {
+                    inf = floats.is_infinite_f32(floats.f32_bits(text.view(), c.a));
+                } else {
+                    inf = floats.is_infinite_f64(floats.f64_bits(text.view(), c.a));
+                }
+                if inf {
+                    var m = ck.new_message(c);
+                    m.push_str("this literal is too large for ");
+                    ck.write_type(c, &mut m, t);
+                    let s = ck.span_of(c, n);
+                    ck.report_owned(c, codes.LITERAL_RANGE, s, m);
+                }
+                return t;
+            }
+        }
+        none => { }
+    }
+    let s = ck.span_of(c, n);
+    ck.report(c, codes.NEEDS_CONTEXT, s, "a float literal takes its type from context, e.g. 'let x: f64 = 1.5;'");
+    return ty.invalid();
+}
 
 fn expected_int(c: &ck.Checker, expected: ?ty.TypeId) -> ?ty.TypeId {
     match expected {
@@ -1061,6 +1112,12 @@ fn library_method(c: &mut ck.Checker, b: ty.Builtin, name: str) -> ?Method {
             } else if name.eq("write_i64") {
                 pt = ty.int_type(ty.IntKind.I64);
                 pn = "n";
+            } else if name.eq("write_f64") and c.p.full {
+                pt = ty.f64_type();
+                pn = "x";
+            } else if name.eq("write_f32") and c.p.full {
+                pt = ty.f32_type();
+                pn = "x";
             } else {
                 return none;
             }
@@ -1849,7 +1906,7 @@ fn op_token(c: &ck.Checker, n: cst.NodeId) -> u32 {
 /// from context (§5.6).
 pub fn untyped(c: &ck.Checker, n: cst.NodeId) -> bool {
     match ck.kind_of(c, n) {
-        .IntLit => { return true; }
+        .IntLit | .FloatLit => { return true; }
         .ParenExpr => { return untyped(c, ck.child(c, n, 0)); }
         .UnaryExpr => {
             return ck.tok_kind(c, op_token(c, n)) != tk.Kind.KwNot and untyped(c, ck.child(c, n, 0));
@@ -1908,8 +1965,11 @@ fn check_unary(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Ty
             }
         }
     }
-    let t = check(c, operand, expected_int(c, expected));
+    let t = check(c, operand, expected_num(c, expected));
     if ck.is_invalid(c, t) {
+        return t;
+    }
+    if op == tk.Kind.Minus and ck.is_float(c, t) {
         return t;
     }
     if not ck.is_int(c, t) {
@@ -1986,21 +2046,21 @@ fn check_binary(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.T
                     ck.report_owned(c, codes.OPERAND_TYPES, s, m);
                     return ty.bool_type();
                 }
-                if not ck.comparable(c, lt) {
+                if not ck.comparable(c, lt) and not ck.is_float(c, lt) {
                     _ = report_operator(c, n, "works on integers, bools, errors, enums without payloads and structs of these (compare text with .eq())", lt);
                 }
                 return ty.bool_type();
             }
             let t = check_operands(c, n, none);
-            if not ck.is_invalid(c, t) and not ck.comparable(c, t) {
+            if not ck.is_invalid(c, t) and not ck.comparable(c, t) and not ck.is_float(c, t) {
                 _ = report_operator(c, n, "works on integers, bools, errors, enums without payloads and structs of these", t);
             }
             return ty.bool_type();
         }
         .Lt | .Le | .Gt | .Ge => {
             let t = check_operands(c, n, none);
-            if not ck.is_invalid(c, t) and not ck.is_int(c, t) {
-                _ = report_operator(c, n, "compares integers", t);
+            if not ck.is_invalid(c, t) and not ck.is_int(c, t) and not ck.is_float(c, t) {
+                _ = report_operator(c, n, "compares integers and floats", t);
             }
             return ty.bool_type();
         }
@@ -2028,9 +2088,15 @@ fn check_binary(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.T
             return t;
         }
         _ => {
-            let t = check_operands(c, n, expected_int(c, expected));
+            let t = check_operands(c, n, expected_num(c, expected));
             if ck.is_invalid(c, t) {
                 return t;
+            }
+            if ck.is_float(c, t) {
+                if op == tk.Kind.Plus or op == tk.Kind.Minus or op == tk.Kind.Star or op == tk.Kind.Slash {
+                    return t;
+                }
+                return report_operator(c, n, "works on integers; floats have + - * / (spec/arche.md §2.2)", t);
             }
             if not ck.is_int(c, t) {
                 return report_operator(c, n, "works on integers", t);
@@ -2068,6 +2134,11 @@ fn check_cast(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
             ck.report_owned(c, codes.BAD_CAST, s, m);
         }
         return to;
+    }
+    let from_num = ck.is_int(c, from) or ck.is_float(c, from);
+    let to_num = ck.is_int(c, to) or ck.is_float(c, to);
+    if (ck.is_float(c, from) or ck.is_float(c, to)) and from_num and to_num {
+        return to; // spec/arche.md §2.3
     }
     if not ck.is_int(c, from) or not ck.is_int(c, to) {
         var m = ck.new_message(c);

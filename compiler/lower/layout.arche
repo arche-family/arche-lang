@@ -28,6 +28,12 @@ pub fn scalar(c: &ck.Checker, t: ty.TypeId) -> ir.Ty {
             }
         }
         .Ref | .Ptr => { return ir.Ty.Ptr; }
+        .Float => {
+            if info.len == 32 {
+                return ir.Ty.F32;
+            }
+            return ir.Ty.F64;
+        }
         .ErrorSet => { return ir.Ty.I16; }
         .ErrorUnion => {
             if c.t.kind(info.elem) == ty.Kind.Void {
@@ -166,6 +172,7 @@ pub fn layout(c: &ck.Checker, t: ty.TypeId) -> Layout {
             return Layout { size: n, align: n };
         }
         .Ref | .Ptr => { return Layout { size: 8, align: 8 }; }
+        .Float => { return Layout { size: info.len / 8, align: info.len / 8 }; }
         .Str | .Slice => { return Layout { size: 16, align: 8 }; }
         .Array => {
             let e = layout(c, info.elem);

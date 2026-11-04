@@ -6,6 +6,7 @@ import ir.ir;
 import lower.layout;
 import lower.lower as lw;
 import lower.stmt;
+import sema.floats;
 import sema.check as ck;
 import sema.expr as sx;
 import sema.types as ty;
@@ -279,9 +280,91 @@ fn closure_call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
     return result_of(l, t, r: r, sret: sret);
 }
 
+/// A float literal's bits; an f32's as the double of its value, as LLVM
+/// writes f32 constants (spec/arche.md §2.1).
+fn float_literal(l: &mut lw.Lower, e: cst.NodeId, t: ty.TypeId) -> u32 {
+    var text = alloc.String.init(l.a);
+    text.push_str(ck.text(&l.c, ck.tree(&l.c).first_token(e)));
+    if l.c.t.get(t).len == 32 {
+        return lw.konst(l, ir.Ty.F32, floats.widen(floats.f32_bits(text.view(), l.a)));
+    }
+    return lw.konst(l, ir.Ty.F64, floats.f64_bits(text.view(), l.a));
+}
+
+fn fbin(l: &mut lw.Lower, k: ir.FBinKind, t: ir.Ty, x: u32, y: u32) -> u32 {
+    var i = ir.inst(ir.Op.FBin, t);
+    i.a = x;
+    i.b = y;
+    i.flag = ir.fbin_flag(k);
+    return lw.emit(l, i);
+}
+
+fn fcmp(l: &mut lw.Lower, k: ir.FCmpKind, x: u32, y: u32) -> u32 {
+    var i = ir.inst(ir.Op.FCmp, ir.Ty.I1);
+    i.a = x;
+    i.b = y;
+    i.flag = ir.fcmp_flag(k);
+    return lw.emit(l, i);
+}
+
+fn fconv(l: &mut lw.Lower, k: ir.FConvKind, x: u32, to: ir.Ty) -> u32 {
+    var i = ir.inst(ir.Op.FConv, to);
+    i.a = x;
+    i.flag = ir.fconv_flag(k);
+    return lw.emit(l, i);
+}
+
+const SIGN_BIT: u64 = 0x8000000000000000;
+
+/// The f64 bits of 2^k; with SIGN_BIT, of -2^k.
+fn pow2_f64(k: u64) -> u64 {
+    return (1023 + k) << 52;
+}
+
+/// A float as an integer (spec/arche.md §2.3): `as` truncates and traps
+/// when the result does not fit or the value is a NaN; `as%` saturates.
+fn float_to_int(l: &mut lw.Lower, e: cst.NodeId, x: u32, from: ty.TypeId, to: ty.TypeId, wrapping: bool) -> u32 {
+    let s = layout.scalar(&l.c, to);
+    let k = l.c.t.get(to).int_kind;
+    let sg = ty.is_signed(k);
+    if wrapping {
+        if sg {
+            return fconv(l, ir.FConvKind.SatToSI, x, s);
+        }
+        return fconv(l, ir.FConvKind.SatToUI, x, s);
+    }
+    // Checked in f64, which holds every bound exactly: lo < x < hi.
+    var d = x;
+    if l.c.t.get(from).len == 32 {
+        d = fconv(l, ir.FConvKind.Ext, x, ir.Ty.F64);
+    }
+    let bits = ty.bits(k) as u64;
+    var hi = pow2_f64(bits);
+    var lo: u64 = 0;
+    if sg {
+        hi = pow2_f64(bits - 1);
+        // -2^(n-1) fits; anything above -2^(n-1) - 1 truncates into range.
+        let below = lw.konst(l, ir.Ty.F64, pow2_f64(bits - 1) | SIGN_BIT);
+        let one = lw.konst(l, ir.Ty.F64, pow2_f64(0));
+        lo = 0;
+        let limit = fbin(l, ir.FBinKind.Sub, ir.Ty.F64, x: below, y: one);
+        let fine_lo = fcmp(l, ir.FCmpKind.Gt, x: d, y: limit);
+        let fine_hi = fcmp(l, ir.FCmpKind.Lt, x: d, y: lw.konst(l, ir.Ty.F64, hi));
+        lw.check(l, lw.bin(l, ir.BinKind.And, x: fine_lo, y: fine_hi), "value does not fit in the integer type", e);
+        return fconv(l, ir.FConvKind.ToSI, x, s);
+    }
+    let minus_one = lw.konst(l, ir.Ty.F64, pow2_f64(0) | SIGN_BIT);
+    let fine_lo = fcmp(l, ir.FCmpKind.Gt, x: d, y: minus_one);
+    let fine_hi = fcmp(l, ir.FCmpKind.Lt, x: d, y: lw.konst(l, ir.Ty.F64, hi));
+    lw.check(l, lw.bin(l, ir.BinKind.And, x: fine_lo, y: fine_hi), "value does not fit in the integer type", e);
+    _ = lo;
+    return fconv(l, ir.FConvKind.ToUI, x, s);
+}
+
 fn value_of(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
     let t = type_of(l, e);
     match kind(l, e) {
+        .FloatLit => { return scalar_val(float_literal(l, e, t)); }
         .ClosureExpr => { return closure_value(l, t); }
         .IfExpr | .MatchExpr => { return stmt.branch_value(l, e); }
         .IntLit | .CharLit => {
@@ -731,6 +814,11 @@ fn unary(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
         return scalar_val(lw.bin(l, ir.BinKind.Xor, x: x, y: lw.konst(l, ir.Ty.I1, 1)));
     }
     let s = layout.scalar(&l.c, t);
+    if l.c.t.kind(t) == ty.Kind.Float {
+        var i = ir.inst(ir.Op.FNeg, s);
+        i.a = x;
+        return scalar_val(lw.emit(l, i));
+    }
     if op == tk.Kind.Tilde {
         return scalar_val(lw.bin(l, ir.BinKind.Xor, x: x, y: all_ones(l, s)));
     }
@@ -759,6 +847,9 @@ fn equal_at(l: &mut lw.Lower, t: ty.TypeId, a: u32, b: u32) -> u32 {
         return r;
     }
     let s = layout.scalar(&l.c, t);
+    if info.kind == ty.Kind.Float {
+        return fcmp(l, ir.FCmpKind.Eq, x: lw.load(l, s, a), y: lw.load(l, s, b));
+    }
     return lw.cmp(l, ir.CmpKind.Eq, x: lw.load(l, s, a), y: lw.load(l, s, b));
 }
 
@@ -795,6 +886,22 @@ fn binary(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
     let t = type_of(l, lhs);
     let a = lw.own_val(l, t, value(l, lhs));
     let b = value(l, rhs);
+    if l.c.t.kind(t) == ty.Kind.Float {
+        // IEEE 754: no traps; every comparison with a NaN is false but !=.
+        let s = layout.scalar(&l.c, t);
+        match op {
+            .EqEq => { return scalar_val(fcmp(l, ir.FCmpKind.Eq, x: a.v, y: b.v)); }
+            .NotEq => { return scalar_val(fcmp(l, ir.FCmpKind.Ne, x: a.v, y: b.v)); }
+            .Lt => { return scalar_val(fcmp(l, ir.FCmpKind.Lt, x: a.v, y: b.v)); }
+            .Le => { return scalar_val(fcmp(l, ir.FCmpKind.Le, x: a.v, y: b.v)); }
+            .Gt => { return scalar_val(fcmp(l, ir.FCmpKind.Gt, x: a.v, y: b.v)); }
+            .Ge => { return scalar_val(fcmp(l, ir.FCmpKind.Ge, x: a.v, y: b.v)); }
+            .Plus => { return scalar_val(fbin(l, ir.FBinKind.Add, s, x: a.v, y: b.v)); }
+            .Minus => { return scalar_val(fbin(l, ir.FBinKind.Sub, s, x: a.v, y: b.v)); }
+            .Star => { return scalar_val(fbin(l, ir.FBinKind.Mul, s, x: a.v, y: b.v)); }
+            _ => { return scalar_val(fbin(l, ir.FBinKind.Div, s, x: a.v, y: b.v)); }
+        }
+    }
     match op {
         .EqEq => { return scalar_val(equal(l, t, a: a, b: b)); }
         .NotEq => {
@@ -820,6 +927,29 @@ fn cast(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
     let from = type_of(l, operand);
     let to = type_of(l, e);
     let x = value(l, operand).v;
+    let wrap = ck.tok_kind(&l.c, ck.own(&l.c, e)[0]) == tk.Kind.KwAsWrap;
+    let from_float = l.c.t.kind(from) == ty.Kind.Float;
+    let to_float = l.c.t.kind(to) == ty.Kind.Float;
+    if from_float and to_float {
+        let ts_ = layout.scalar(&l.c, to);
+        if l.c.t.get(from).len == l.c.t.get(to).len {
+            return scalar_val(x);
+        }
+        if l.c.t.get(to).len == 32 {
+            return scalar_val(fconv(l, ir.FConvKind.Trunc, x, ts_));
+        }
+        return scalar_val(fconv(l, ir.FConvKind.Ext, x, ts_));
+    }
+    if to_float {
+        // Rounds to nearest (spec/arche.md §2.3).
+        if signed(l, from) {
+            return scalar_val(fconv(l, ir.FConvKind.FromSI, x, layout.scalar(&l.c, to)));
+        }
+        return scalar_val(fconv(l, ir.FConvKind.FromUI, x, layout.scalar(&l.c, to)));
+    }
+    if from_float {
+        return scalar_val(float_to_int(l, e, x, from: from, to: to, wrapping: wrap));
+    }
     let fs = signed(l, from);
     let ts = signed(l, to);
     let fb = ty.bits(int_kind(l, from));
@@ -1188,6 +1318,10 @@ fn library_method(l: &mut lw.Lower, n: cst.NodeId, nm: str, b: ty.Builtin, r: u3
                     rtname = "a0rt_write_u64";
                 } else if nm.eq("write_i64") {
                     rtname = "a0rt_write_i64";
+                } else if nm.eq("write_f64") {
+                    rtname = "a0rt_write_f64";
+                } else if nm.eq("write_f32") {
+                    rtname = "a0rt_write_f32";
                 }
                 _ = lw.call_runtime(l, rtname, ir.Ty.Void, &args);
             }

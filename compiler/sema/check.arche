@@ -566,6 +566,13 @@ pub fn write_type(c: &Checker, m: &mut alloc.String, t: ty.TypeId) {
         .Bool => { m.push_str("bool"); }
         .Str => { m.push_str("str"); }
         .Int => { m.push_str(ty.int_name(info.int_kind)); }
+        .Float => {
+            if info.len == 32 {
+                m.push_str("f32");
+            } else {
+                m.push_str("f64");
+            }
+        }
         .Ref => {
             m.push_str("&");
             if info.mutable {
@@ -724,6 +731,10 @@ pub fn report_mismatch(c: &mut Checker, n: cst.NodeId, want: ty.TypeId, got: ty.
 }
 
 // ---- types ------------------------------------------------------------------
+
+pub fn is_float(c: &Checker, t: ty.TypeId) -> bool {
+    return c.t.kind(t) == ty.Kind.Float;
+}
 
 pub fn is_int(c: &Checker, t: ty.TypeId) -> bool {
     return c.t.kind(t) == ty.Kind.Int;
@@ -1203,6 +1214,12 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
             match primitive(text(c, first)) {
                 some(t) => { return t; }
                 none => { }
+            }
+            if c.p.full {
+                match ty.float_by_name(text(c, first)) {
+                    some(t) => { return t; }
+                    none => { }
+                }
             }
         }
         match find_item(c, c.module, sym) {

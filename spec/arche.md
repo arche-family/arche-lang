@@ -61,11 +61,11 @@ The capability types of `std` are `Fs`, `Net`, `Clock`, `Env`, `Proc` and `Rand`
 
 ### 2.1 Types and literals
 
-`f32` and `f64` are IEEE 754 binary32 and binary64. A float literal has a decimal point or an exponent, `1.5`, `2.0e-3`, `1e9`, and takes its type from context like an integer literal (A§5.6); without context it is an error.
+`f32` and `f64` are IEEE 754 binary32 and binary64. A float literal has a decimal point or an exponent, `1.5`, `2.0e-3`, `1e9`, and takes its type from context like an integer literal (A§5.6); without context it is an error (E0405), and so is `as` on it, as on an integer literal. Its value is the float nearest to the decimal, ties to even; one too large for its type is E0404. An integer literal is not a float literal: `let x: f64 = 1;` is E0405.
 
 ### 2.2 Arithmetic
 
-- `+ - * /` round to nearest, ties to even. They do not trap: overflow gives an infinity, an invalid operation a NaN. `%` is not defined on floats; `math.rem` is.
+- `+ - * /` and unary `-` round to nearest, ties to even; both operands have one float type (E0402), and other operators are E0403. They do not trap: overflow gives an infinity, an invalid operation a NaN. `%` is not defined on floats; `math.rem` is.
 - Comparisons follow IEEE 754: every comparison with a NaN is false, except `!=`, which is true. Floats are not key types (A§5.5) and do not implement `Eq`.
 - There is no fused multiply-add unless written: `math.fma(a, b, c)`. The compiler never contracts or reorders float operations, so results are the same on every target.
 
@@ -76,7 +76,9 @@ The capability types of `std` are `Fs`, `Net`, `Clock`, `Env`, `Proc` and `Rand`
 
 ### 2.4 Text
 
-`std.fmt` writes a float as the shortest decimal that reads back to the same value, so output is the same on every target.
+`std.fmt` writes a float as the shortest decimal that reads back to the same value, so output is the same on every target: plain digits when `1e-6 <= |x| < 1e21`, with `.0` when it is a whole number (`1.0`, `0.5`, `123456789.0`), and otherwise one digit, the rest after a `.`, and `e` with the exponent (`1e21`, `1.5e-7`, `5e-324`). Every output reads back as a float literal. NaN is `nan`, infinities `inf` and `-inf`, and zero keeps its sign, `-0.0`. Until `std.fmt` exists (sprint S18), `std.Output` has `write_f64` and `write_f32`.
+- Floats are full Arche: in an Arche-0 package `f32`, `f64` and float literals do not exist.
+- Constants are integers, `bool` or `str` (A§4); a float constant is E0705 for now, and float code does not run at compile time.
 
 ## 3. Expressions and loops
 

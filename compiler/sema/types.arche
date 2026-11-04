@@ -37,6 +37,8 @@ pub type Kind = enum {
     /// A closure's own type (spec/arche.md §6); decl is its number in the
     /// checker's closures.
     Closure,
+    /// f32 and f64 (spec/arche.md §2); len is 32 or 64.
+    Float,
 }
 
 /// No declaration: an error union with an inferred set, or the error set
@@ -81,6 +83,12 @@ pub type Types = struct {
         var any = plain(Kind.ErrorSet);
         any.decl = NO_DECL;
         _ = t.intern(any);
+        var f32 = plain(Kind.Float);
+        f32.len = 32;
+        _ = t.intern(f32);
+        var f64 = plain(Kind.Float);
+        f64.len = 64;
+        _ = t.intern(f64);
         return t;
     }
 
@@ -217,6 +225,18 @@ pub fn noreturn_type() -> TypeId { return TypeId { index: 2 }; }
 pub fn bool_type() -> TypeId { return TypeId { index: 3 }; }
 pub fn str_type() -> TypeId { return TypeId { index: 4 }; }
 pub fn any_error() -> TypeId { return TypeId { index: 15 }; }
+pub fn f32_type() -> TypeId { return TypeId { index: 16 }; }
+pub fn f64_type() -> TypeId { return TypeId { index: 17 }; }
+
+pub fn float_by_name(name: str) -> ?TypeId {
+    if name.eq("f32") {
+        return f32_type();
+    }
+    if name.eq("f64") {
+        return f64_type();
+    }
+    return none;
+}
 
 /// The integer type of the kind: i8 is 5, up to usize at 14.
 pub fn int_type(k: IntKind) -> TypeId {
