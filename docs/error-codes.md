@@ -145,7 +145,7 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 
 | Code | Meaning |
 | --- | --- |
-| `E0801` | A capability type that the package manifest does not list in `needs` (§1.3). |
+| `E0801` | A capability type that the package manifest does not list in `needs` (§1.3). Not reported yet: manifests are read from sprint S24. |
 | `E0810` | A `for` loop over a value that is not a range, a slice or an iterator (§3.2). |
 | `E0811` | A `for` loop's range or names that do not fit: bounds of two types, a pair over a range or over items that are not a struct of two fields, a type on a name that is not a range's (§3.2). |
 | `E0820` | An `impl` of something that is not an interface, or for a type that cannot implement one here (§5.1). |
@@ -169,7 +169,7 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0902` | A `&mut` view captured by a task while another task or its scope uses the place (§9). |
 | `E0903` | A `spawn` whose argument is not a closure written there (§9). |
 | `E0910` | An operation that can panic or trap in a `nopanic` function, or a call of a function that is not `nopanic` (§8.2). |
-| `E0920` | An `unsafe` block without a `// SAFETY:` comment, in a package that sets `strict_unsafe` (§10.1). |
+| `E0920` | An `unsafe` block without a `// SAFETY:` comment, in a package that sets `strict_unsafe` (§10.1). Not reported yet: manifests are read from sprint S24. |
 | `E0921` | An operation that needs `unsafe` outside an `unsafe` block or `unsafe fn`: a raw pointer made, read, written, offset or turned into a view, or an `unsafe fn` called (§10.1). |
 | `E0922` | An `asm` operand that is not `in`, `out`, `inout` or `clobber`, whose value is not an integer, `bool` or pointer, that writes a place it cannot, or a `%N` without an operand (§10.2). |
 | `E0923` | A `naked fn` with parameters or a result, or whose body is not one `asm` statement (§10.2). |

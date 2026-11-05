@@ -4,6 +4,8 @@
 ///     arche check [--json] <file>   report the file's errors
 ///     arche tokens <file>           list its tokens, trivia included
 ///     arche cst <file>              print it again from its syntax tree
+///     arche fix <file>              apply the fixes the checker suggests
+///     arche explain <code>          what an error code means, with an example
 ///     arche build <file> <out.ll>   compile it to LLVM IR (arche-build links it)
 ///
 /// Functions take the capabilities they use one by one, not the whole
@@ -12,6 +14,7 @@
 import std;
 import alloc;
 import diag;
+import explain;
 import program;
 import sema.check as sema;
 import syntax.lexer;
@@ -26,6 +29,8 @@ type Failure = error { ErrorsFound, BadUsage, CannotRead, CannotWrite, BadIr }
 
 fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("usage: arche check [--json] <file>\n");
+    err_out.write("       arche fix <file>                apply the checker's fixes to the files\n");
+    err_out.write("       arche explain [--example] <code>   what an error code means, or just its example\n");
     err_out.write("       arche tokens <file>\n");
     err_out.write("       arche cst <file>\n");
     err_out.write("       arche build <file> <out.ll>\n");
@@ -149,6 +154,210 @@ fn check(
     }
     if p.diags.count() > 0 {
         return Failure.ErrorsFound;
+    }
+}
+
+/// The number of a code written E0409 (or 0409, or 409), or none.
+fn code_number(text: str) -> ?u16 {
+    var start: usize = 0;
+    if text.len() > 0 and (text[0] == 'E' or text[0] == 'e') {
+        start = 1;
+    }
+    if text.len() == start or text.len() - start > 4 {
+        return none;
+    }
+    var n: u16 = 0;
+    var i = start;
+    while i < text.len() : (i += 1) {
+        let c = text[i];
+        if c < '0' or c > '9' {
+            return none;
+        }
+        n = n * 10 + (c - '0') as u16;
+    }
+    return n;
+}
+
+fn write_code(out: &mut std.Output, n: u16) {
+    out.write("E");
+    if n < 1000 {
+        out.write("0");
+    }
+    out.write_u64(n as u64);
+}
+
+/// `arche explain`: the meaning of a code and its example; with --example
+/// only the example, as a file to check (the byte E0101's needs included).
+fn explain_code(out: &mut std.Output, err_out: &mut std.Output, text: str, only_example: bool) -> Failure!void {
+    var n: u16 = 0;
+    match code_number(text) {
+        some(v) => { n = v; }
+        none => {
+            err_out.write("arche explain: a code is written like E0409\n");
+            return Failure.BadUsage;
+        }
+    }
+    let meaning = explain.meaning(n);
+    if meaning.len() == 0 {
+        err_out.write("arche explain: there is no code ");
+        write_code(err_out, n);
+        err_out.write(" (docs/error-codes.md lists them)\n");
+        return Failure.BadUsage;
+    }
+    let example = explain.example(n);
+    if only_example {
+        out.write(example);
+        if n == 101 {
+            out.write_byte(0xFF);
+            out.write("\n");
+        }
+        return;
+    }
+    write_code(out, n);
+    out.write(": ");
+    out.write(meaning);
+    out.write("\n");
+    if example.len() == 0 {
+        return;
+    }
+    out.write("\nFor example, ");
+    let options = explain.example_options(n);
+    if explain.example_is_full(n) {
+        out.write("in a package (a package.arche beside it, so full Arche), ");
+    }
+    out.write("`arche ");
+    if options.len() > 0 {
+        out.write(options);
+        out.write(" ");
+    }
+    out.write("check` reports ");
+    write_code(out, n);
+    out.write(" on this file:\n\n");
+    var line_start = true;
+    var i: usize = 0;
+    while i < example.len() : (i += 1) {
+        if line_start and example[i] != '\n' {
+            out.write("    ");
+        }
+        out.write_byte(example[i]);
+        line_start = example[i] == '\n';
+    }
+    if n == 101 {
+        out.write("    (the byte 0xFF)\n");
+    }
+}
+
+/// One edit of a fix: replace text[start..end] with replacement.
+type Edit = struct {
+    start: u32,
+    end: u32,
+    replacement: alloc.String,
+}
+
+/// Applies the checker's fixes to the files they are in, and checks again,
+/// until no fix is left (a fix can uncover another); then reports what is
+/// left as check does.
+fn fix(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, opts: &program.Options) -> Failure!void {
+    var applied: u64 = 0;
+    var round: u32 = 0;
+    while true {
+        let source = try read(fs, err_out, path, a);
+        var p = program.load(fs, path: path, source, a, opts);
+        if p.diags.count() == 0 {
+            p = sema.check(p);
+        }
+        var changed = false;
+        let mods = p.modules.items();
+        var m: usize = 0;
+        while m < mods.len() and round < 16 : (m += 1) {
+            // This module's edits, latest first, each once.
+            var edits = alloc.List(Edit).init(a);
+            let ds = p.diags.items.items();
+            var i: usize = 0;
+            while i < ds.len() : (i += 1) {
+                if ds[i].file as usize != m {
+                    continue;
+                }
+                match &ds[i].fix {
+                    some(f) => {
+                        var r = alloc.String.init(a);
+                        r.push_str(f.replacement.view());
+                        let e = Edit { start: f.span.start, end: f.span.end(), replacement: r };
+                        var dup = false;
+                        var k: usize = 0;
+                        while k < edits.len() : (k += 1) {
+                            if edits[k].start == e.start and edits[k].end == e.end and edits[k].replacement.view().eq(e.replacement.view()) {
+                                dup = true;
+                            }
+                        }
+                        if not dup {
+                            edits.push(e);
+                        }
+                    }
+                    none => { }
+                }
+            }
+            if edits.len() == 0 {
+                continue;
+            }
+            // Insertion sort by start, from the end of the file back.
+            let es = edits.items_mut();
+            var j: usize = 1;
+            while j < es.len() : (j += 1) {
+                var k = j;
+                while k > 0 and es[k - 1].start < es[k].start : (k -= 1) {
+                    let a_start = es[k - 1].start;
+                    let a_end = es[k - 1].end;
+                    var a_text = alloc.String.init(a);
+                    a_text.push_str(es[k - 1].replacement.view());
+                    es[k - 1].start = es[k].start;
+                    es[k - 1].end = es[k].end;
+                    var b_text = alloc.String.init(a);
+                    b_text.push_str(es[k].replacement.view());
+                    es[k - 1].replacement = b_text;
+                    es[k].start = a_start;
+                    es[k].end = a_end;
+                    es[k].replacement = a_text;
+                }
+            }
+            let text = mods[m].text.view();
+            var result = alloc.String.init(a);
+            // Built from the front: the edits in source order are es reversed.
+            var at: u32 = 0;
+            var e = es.len();
+            while e > 0 : (e -= 1) {
+                let ed = &es[e - 1];
+                if ed.start < at {
+                    continue;
+                }
+                result.push_str(text[at as usize..ed.start as usize]);
+                result.push_str(ed.replacement.view());
+                at = ed.end;
+                applied += 1;
+            }
+            result.push_str(text[at as usize..text.len()]);
+            match fs.write_file(path: mods[m].path.view(), data: result.view()) {
+                ok(_) => { }
+                err(_) => {
+                    err_out.write("arche: cannot write ");
+                    err_out.write(mods[m].path.view());
+                    err_out.write("\n");
+                    return Failure.CannotWrite;
+                }
+            }
+            changed = true;
+        }
+        if not changed {
+            out.write("arche fix: applied ");
+            out.write_u64(applied);
+            out.write(" fixes\n");
+            program.write_diagnostics(err_out, &p, false);
+            if p.diags.count() > 0 {
+                return Failure.ErrorsFound;
+            }
+            return;
+        }
+        round += 1;
     }
 }
 
@@ -290,6 +499,12 @@ fn main(sys: &mut std.System) -> !void {
         try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3 + k), json: true, opts: &opts);
     } else if command.eq("check") and count == 3 {
         try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), json: false, opts: &opts);
+    } else if command.eq("fix") and count == 3 {
+        try fix(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), opts: &opts);
+    } else if command.eq("explain") and count == 3 {
+        try explain_code(out: &mut sys.stdout, err_out: &mut sys.stderr, text: sys.args.get(2 + k), only_example: false);
+    } else if command.eq("explain") and count == 4 and sys.args.get(2 + k).eq("--example") {
+        try explain_code(out: &mut sys.stdout, err_out: &mut sys.stderr, text: sys.args.get(3 + k), only_example: true);
     } else if command.eq("tokens") and count == 3 {
         try dump_tokens(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));
     } else if command.eq("build") and count == 4 {

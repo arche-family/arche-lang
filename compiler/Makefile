@@ -28,6 +28,7 @@ check: $(BUILD)/arche
 	sh ./check-valid.sh $(BUILD)/arche ../conformance/tests
 	sh ./roundtrip.sh $(BUILD)/arche ../conformance/tests .
 	sh ./tests/run.sh $(BUILD)/arche
+	sh ./explain-check.sh $(BUILD)/arche
 
 clean:
 	rm -rf $(BUILD)
