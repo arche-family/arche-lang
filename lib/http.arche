@@ -162,9 +162,11 @@ pub type Response = struct {
     pub body: alloc.List(u8),
     /// HTTP/1.1 only: send the body in chunks rather than with its length.
     pub chunked: bool,
+    /// The request's memory: what a handler allocates goes with it.
+    pub alloc: alloc.Allocator,
 
     pub fn init(a: alloc.Allocator) -> Response {
-        return Response { status: 200, headers: Headers.init(a), body: alloc.List(u8).init(a), chunked: false };
+        return Response { status: 200, headers: Headers.init(a), body: alloc.List(u8).init(a), chunked: false, alloc: a };
     }
 
     /// Appends text to the body.

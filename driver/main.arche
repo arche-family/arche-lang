@@ -5,6 +5,13 @@
 ///     arche-driver build [dir]               every program build.arche lists
 ///     arche-driver run [dir] [name] [-- args] build, then run one
 ///     arche-driver clean [dir]               forget the cache
+///     arche-driver pkg add <name> [version] [--dir d]   depend on a package
+///     arche-driver pkg lock [--dir d]        resolve and check, write package.lock
+///     arche-driver pkg vendor [--dir d]      unpack the locked packages into vendor/
+///     arche-driver pkg publish <registry> <key> [--dir d]   publish to a registry directory
+///     arche-driver pkg keygen <key>          a new signing key; prints the public key
+///
+/// The pkg commands are in pkg.arche.
 ///
 /// A package's build.arche lists its programs:
 ///
@@ -23,6 +30,7 @@
 import alloc;
 import core.mem;
 import crypto.sha2;
+import pkg;
 import std;
 
 const COMPILE_FLAGS: str = "-c -O1 -fno-pie -ffunction-sections -fdata-sections -Wno-override-module";
@@ -361,10 +369,251 @@ fn plan(sys: &mut std.System, tools: &Tools, dir: str, work: str, a: alloc.Alloc
     return flat;
 }
 
+/// What arche manifest says of dir/package.arche.
+fn manifest_of(sys: &mut std.System, tools: &Tools, dir: str, work: str, a: alloc.Allocator) -> Failed!pkg.Manifest {
+    let out = join(dir: work, name: "manifest", a);
+    var argv = alloc.List(alloc.String).init(a);
+    argv.push(text_of(tools.arche.view().bytes(), a));
+    argv.push(text_of("manifest".bytes(), a));
+    argv.push(join(dir: dir, name: "package.arche", a));
+    let status = try run(sys, argv: &argv, out_path: out.view(), a: a);
+    let text = sys.fs.read_file(out.view(), a) catch alloc.String.init(a);
+    if status != 0 {
+        sys.stderr.write(text.view());
+        return Failed.Failed;
+    }
+    return pkg.parse_manifest(text.view(), a);
+}
+
+/// pkg lock: every dependency, and theirs, checked against the registry's
+/// signatures and hashes, into package.lock. Two versions of one package
+/// are an error.
+fn pkg_lock(sys: &mut std.System, tools: &Tools, dir: str, work: str, a: alloc.Allocator) -> Failed!void {
+    let m = try manifest_of(sys, tools: tools, dir: dir, work: work, a: a);
+    let r = match pkg.registry_of(sys, m: &m, dir: dir, a: a) {
+        ok(got5) => { got5 }
+        err(_) => { return Failed.Failed; }
+    };
+    let cache = join(dir: work, name: "pkg", a);
+    var queue = alloc.List(pkg.Dep).init(a);
+    for d in m.deps.items() {
+        queue.push(pkg.Dep { name: text_of(d.name.view().bytes(), a), version: text_of(d.version.view().bytes(), a), hash: text_of(d.hash.view().bytes(), a) });
+    }
+    var resolved = alloc.List(pkg.Dep).init(a);
+    var i: usize = 0;
+    while i < queue.len() : (i += 1) {
+        let name = text_of(queue[i].name.view().bytes(), a);
+        let version = text_of(queue[i].version.view().bytes(), a);
+        var pinned = text_of(queue[i].hash.view().bytes(), a);
+        var known = false;
+        for x in resolved.items() {
+            if x.name.view().eq(name.view()) {
+                known = true;
+                if not x.version.view().eq(version.view()) {
+                    sys.stderr.write("arche-driver pkg: two versions of ");
+                    sys.stderr.write(name.view());
+                    sys.stderr.write(" are needed, ");
+                    sys.stderr.write(x.version.view());
+                    sys.stderr.write(" and ");
+                    sys.stderr.write(version.view());
+                    sys.stderr.write("\n");
+                    return Failed.Failed;
+                }
+            }
+        }
+        if known {
+            continue;
+        }
+        let hash = match pkg.release_hash(sys, r: &r, name: name.view(), version: version.view(), a: a) {
+            ok(got6) => { got6 }
+            err(_) => { return Failed.Failed; }
+        };
+        if pinned.view().starts_with("sha256:") {
+            pinned = text_of(pinned.view().bytes()[7..pinned.len()], a);
+        }
+        if pinned.len() > 0 and not pinned.view().eq(hash.view()) {
+            say(&mut sys.stderr, a: "arche-driver pkg: the manifest pins another hash for ", b: name.view(), c: "");
+            return Failed.Failed;
+        }
+        let data = match pkg.archive(sys, r: &r, hash: hash.view(), cache: cache.view(), a: a) {
+            ok(got7) => { got7 }
+            err(_) => { return Failed.Failed; }
+        };
+        // Its own dependencies, from its manifest.
+        let unpacked = join(dir: join(dir: cache.view(), name: "unpacked", a).view(), name: name.view(), a);
+        pkg.remove_all(&sys.fs, path: unpacked.view(), a: a);
+        if not pkg.unpack(&sys.fs, data: data.items(), dir: unpacked.view(), to: &mut sys.stderr, a: a) {
+            return Failed.Failed;
+        }
+        let dm = try manifest_of(sys, tools: tools, dir: unpacked.view(), work: work, a: a);
+        if not dm.name.view().eq(name.view()) {
+            say(&mut sys.stderr, a: "arche-driver pkg: the registry's package is not ", b: name.view(), c: "");
+            return Failed.Failed;
+        }
+        for d in dm.deps.items() {
+            queue.push(pkg.Dep { name: text_of(d.name.view().bytes(), a), version: text_of(d.version.view().bytes(), a), hash: text_of(d.hash.view().bytes(), a) });
+        }
+        resolved.push(pkg.Dep { name: name, version: version, hash: hash });
+    }
+    let text = pkg.lock_text(&resolved, a);
+    match sys.fs.write_file(path: join(dir: dir, name: "package.lock", a).view(), data: text.view()) {
+        ok(_) => { }
+        err(_) => { return Failed.Failed; }
+    }
+    sys.stdout.write("locked ");
+    sys.stdout.write_u64(resolved.len() as u64);
+    sys.stdout.write(" packages\n");
+}
+
+/// pkg vendor: the locked packages, their hashes checked, in vendor/.
+fn pkg_vendor(sys: &mut std.System, tools: &Tools, dir: str, work: str, a: alloc.Allocator) -> Failed!void {
+    var lock_text = alloc.String.init(a);
+    match sys.fs.read_file(join(dir: dir, name: "package.lock", a).view(), a) {
+        ok(t) => { lock_text = t; }
+        err(_) => {
+            say(&mut sys.stderr, a: "arche-driver pkg: there is no package.lock; run arche-driver pkg lock", b: "", c: "");
+            return Failed.Failed;
+        }
+    }
+    let locked = pkg.read_lock(lock_text.view(), a);
+    let m = try manifest_of(sys, tools: tools, dir: dir, work: work, a: a);
+    let r = match pkg.registry_of(sys, m: &m, dir: dir, a: a) {
+        ok(got8) => { got8 }
+        err(_) => { return Failed.Failed; }
+    };
+    let cache = join(dir: work, name: "pkg", a);
+    let vendor = join(dir: dir, name: "vendor", a);
+    pkg.remove_all(&sys.fs, path: vendor.view(), a: a);
+    for d in locked.items() {
+        let data = match pkg.archive(sys, r: &r, hash: d.hash.view(), cache: cache.view(), a: a) {
+            ok(got9) => { got9 }
+            err(_) => { return Failed.Failed; }
+        };
+        if not pkg.unpack(&sys.fs, data: data.items(), dir: join(dir: vendor.view(), name: d.name.view(), a).view(), to: &mut sys.stderr, a: a) {
+            return Failed.Failed;
+        }
+    }
+    sys.stdout.write("vendored ");
+    sys.stdout.write_u64(locked.len() as u64);
+    sys.stdout.write(" packages\n");
+}
+
+/// pkg add: the dependency goes into the manifest, then lock and vendor.
+fn pkg_add(sys: &mut std.System, tools: &Tools, dir: str, work: str, name: str, version: str, a: alloc.Allocator) -> Failed!void {
+    let m = try manifest_of(sys, tools: tools, dir: dir, work: work, a: a);
+    for d in m.deps.items() {
+        if d.name.view().eq(name) {
+            say(&mut sys.stderr, a: "arche-driver pkg: the package depends on ", b: name, c: " already");
+            return Failed.Failed;
+        }
+    }
+    let r = match pkg.registry_of(sys, m: &m, dir: dir, a: a) {
+        ok(got10) => { got10 }
+        err(_) => { return Failed.Failed; }
+    };
+    var chosen = text_of(version.bytes(), a);
+    if chosen.len() == 0 {
+        var path = text_of(name.bytes(), a);
+        path.push_str("/versions");
+        match pkg.fetch(sys, r: &r, path: path.view(), a: a) {
+            ok(found) => {
+                match found {
+                    some(b) => { chosen = pkg.latest(text_of(b.items(), a).view(), a); }
+                    none => { }
+                }
+            }
+            err(_) => { return Failed.Failed; }
+        }
+        if chosen.len() == 0 {
+            say(&mut sys.stderr, a: "arche-driver pkg: the registry has no package ", b: name, c: "");
+            return Failed.Failed;
+        }
+    }
+    match pkg.release_hash(sys, r: &r, name: name, version: chosen.view(), a: a) {
+        ok(_) => { }
+        err(_) => { return Failed.Failed; }
+    }
+    let mpath = join(dir: dir, name: "package.arche", a);
+    let text = match sys.fs.read_file(mpath.view(), a) {
+        ok(got11) => { got11 }
+        err(_) => { return Failed.Failed; }
+    };
+    var entry = text_of("build.dep(\"".bytes(), a);
+    entry.push_str(name);
+    entry.push_str("\", \"");
+    entry.push_str(chosen.view());
+    entry.push_str("\")");
+    let updated = add_dependency(text: text.view(), entry: entry.view(), a: a);
+    match sys.fs.write_file(path: mpath.view(), data: updated.view()) {
+        ok(_) => { }
+        err(_) => { return Failed.Failed; }
+    }
+    say(&mut sys.stdout, a: "added ", b: entry.view(), c: "");
+    try pkg_lock(sys, tools: tools, dir: dir, work: work, a: a);
+    try pkg_vendor(sys, tools: tools, dir: dir, work: work, a: a);
+}
+
+/// The manifest's text with one more dependency: in its dependencies
+/// array, or in a new one before the end of PACKAGE.
+fn add_dependency(text: str, entry: str, a: alloc.Allocator) -> alloc.String {
+    let b = text.bytes();
+    let key = "dependencies:".bytes();
+    var at: usize = 0;
+    var found = b.len();
+    while at + key.len() <= b.len() and found == b.len() : (at += 1) {
+        var k: usize = 0;
+        while k < key.len() and b[at + k] == key[k] : (k += 1) {
+        }
+        if k == key.len() {
+            found = at;
+        }
+    }
+    var out = alloc.String.init(a);
+    if found < b.len() {
+        var lb = found;
+        while lb < b.len() and b[lb] != '[' : (lb += 1) {
+        }
+        var rb = lb;
+        while rb < b.len() and b[rb] != ']' : (rb += 1) {
+        }
+        // What is between the brackets, without the space around it.
+        var s = lb + 1;
+        while s < rb and (b[s] == ' ' or b[s] == '\n') : (s += 1) {
+        }
+        var e = rb;
+        while e > s and (b[e - 1] == ' ' or b[e - 1] == '\n') : (e -= 1) {
+        }
+        out.push_str(text[0..lb + 1]);
+        out.push_str(text[s..e]);
+        if e > s and b[e - 1] != ',' {
+            out.push_str(", ");
+        } else if e > s {
+            out.push_str(" ");
+        }
+        out.push_str(entry);
+        out.push_str(text[rb..text.len()]);
+        return out;
+    }
+    var close = b.len();
+    var i: usize = 0;
+    while i + 1 < b.len() : (i += 1) {
+        if b[i] == '}' and b[i + 1] == ';' {
+            close = i;
+        }
+    }
+    out.push_str(text[0..close]);
+    out.push_str("    dependencies: [");
+    out.push_str(entry);
+    out.push_str("],\n");
+    out.push_str(text[close..text.len()]);
+    return out;
+}
+
 fn usage(out: &mut std.Output) {
     out.write("usage: arche-driver build [dir]\n");
     out.write("       arche-driver run [dir] [program] [-- arguments]\n");
     out.write("       arche-driver clean [dir]\n");
+    out.write("       arche-driver pkg add <name> [version] | lock | vendor | publish <registry> <key> | keygen <key>  [--dir d]\n");
 }
 
 fn main(sys: &mut std.System) -> !void {
@@ -374,6 +623,10 @@ fn main(sys: &mut std.System) -> !void {
         sys.proc.exit(2);
     }
     let command = text_of(sys.args.get(1).bytes(), a);
+    if command.view().eq("pkg") {
+        package_command(sys, a: a);
+        return;
+    }
     var dir = alloc.String.init(a);
     dir.push_str(".");
     var program_name = alloc.String.init(a);
@@ -439,4 +692,48 @@ fn main(sys: &mut std.System) -> !void {
     }
     let status = run(sys, argv: &argv, out_path: "", a: a) catch sys.proc.exit(1);
     sys.proc.exit(status);
+}
+
+/// arche-driver pkg <command> [arguments] [--dir d].
+fn package_command(sys: &mut std.System, a: alloc.Allocator) {
+    var dir = text_of(".".bytes(), a);
+    var rest = alloc.List(alloc.String).init(a);
+    var i: usize = 2;
+    while i < sys.args.len() : (i += 1) {
+        if sys.args.get(i).eq("--dir") and i + 1 < sys.args.len() {
+            i += 1;
+            dir = text_of(sys.args.get(i).bytes(), a);
+        } else {
+            rest.push(text_of(sys.args.get(i).bytes(), a));
+        }
+    }
+    if rest.len() == 0 {
+        usage(&mut sys.stderr);
+        sys.proc.exit(2);
+    }
+    let what = text_of(rest[0].view().bytes(), a);
+    if what.view().eq("keygen") and rest.len() == 2 {
+        pkg.keygen(sys, file: rest[1].view(), a: a) catch sys.proc.exit(1);
+        return;
+    }
+    let work = join(dir: dir.view(), name: "build", a);
+    make_dirs(&sys.fs, dir: work.view(), a: a);
+    let tools = find_tools(sys, work: work.view(), a: a) catch sys.proc.exit(1);
+    if what.view().eq("lock") and rest.len() == 1 {
+        pkg_lock(sys, tools: &tools, dir: dir.view(), work: work.view(), a: a) catch sys.proc.exit(1);
+    } else if what.view().eq("vendor") and rest.len() == 1 {
+        pkg_vendor(sys, tools: &tools, dir: dir.view(), work: work.view(), a: a) catch sys.proc.exit(1);
+    } else if what.view().eq("add") and (rest.len() == 2 or rest.len() == 3) {
+        var version = alloc.String.init(a);
+        if rest.len() == 3 {
+            version.push_str(rest[2].view());
+        }
+        pkg_add(sys, tools: &tools, dir: dir.view(), work: work.view(), name: rest[1].view(), version: version.view(), a: a) catch sys.proc.exit(1);
+    } else if what.view().eq("publish") and rest.len() == 3 {
+        let m = manifest_of(sys, tools: &tools, dir: dir.view(), work: work.view(), a: a) catch sys.proc.exit(1);
+        pkg.publish(sys, dir: dir.view(), m: &m, registry_dir: rest[1].view(), key_file: rest[2].view(), a: a) catch sys.proc.exit(1);
+    } else {
+        usage(&mut sys.stderr);
+        sys.proc.exit(2);
+    }
 }

@@ -10,7 +10,9 @@
 ///         version: "0.3.1",
 ///         edition: 2027,
 ///         needs: [build.Capability.Net, build.Capability.Fs],
-///         dependencies: [build.dep("http", "1.2.0", "sha256:9f2c...")],
+///         dependencies: [build.dep("webkit", "1.2.0")],
+///         registry: "https://127.0.0.1:8443/",
+///         registry_key: "<the registry's Ed25519 public key, hex>",
 ///         strict_unsafe: true,
 ///         panic_handler: "kernel.panic",
 ///     };
@@ -75,6 +77,9 @@ pub type Manifest = struct {
     pub dependencies: alloc.List(Dependency),
     pub strict_unsafe: bool,
     pub panic_handler: alloc.String,
+    /// Where dependencies come from, and the key that signs them.
+    pub registry: alloc.String,
+    pub registry_key: alloc.String,
 }
 
 /// A program build.arche asks for: its name and its root file.
@@ -93,6 +98,8 @@ pub fn defaults(a: alloc.Allocator) -> Manifest {
         dependencies: alloc.List(Dependency).init(a),
         strict_unsafe: false,
         panic_handler: alloc.String.init(a),
+        registry: alloc.String.init(a),
+        registry_key: alloc.String.init(a),
     };
 }
 
@@ -284,15 +291,20 @@ pub fn read(tree: cst.Tree, text: str, diags: &mut diag.Diagnostics, a: alloc.Al
                 var k: u32 = 0;
                 while k < node(&r, v).children_len : (k += 1) {
                     let e = child(&r, v, k);
-                    let ok_call = node(&r, e).kind == cst.Kind.CallExpr and node(&r, e).children_len == 4 and
+                    let args = node(&r, e).children_len;
+                    let ok_call = node(&r, e).kind == cst.Kind.CallExpr and (args == 3 or args == 4) and
                         joined(&r, child(&r, e, 0), a).view().eq("build.dep");
                     if not ok_call {
-                        diags.report(codes.BAD_MANIFEST, span_of(&r, e), "a dependency is build.dep(name, version, hash)");
+                        diags.report(codes.BAD_MANIFEST, span_of(&r, e), "a dependency is build.dep(name, version), or build.dep(name, version, hash)");
                     } else {
+                        var hash = alloc.String.init(a);
+                        if args == 4 {
+                            hash = string_value(&r, child(&r, child(&r, e, 3), 0), diags: diags, a: a);
+                        }
                         m.dependencies.push(Dependency {
                             name: string_value(&r, child(&r, child(&r, e, 1), 0), diags: diags, a: a),
                             version: string_value(&r, child(&r, child(&r, e, 2), 0), diags: diags, a: a),
-                            hash: string_value(&r, child(&r, child(&r, e, 3), 0), diags: diags, a: a),
+                            hash: hash,
                         });
                     }
                 }
@@ -306,11 +318,15 @@ pub fn read(tree: cst.Tree, text: str, diags: &mut diag.Diagnostics, a: alloc.Al
             }
         } else if name.eq("panic_handler") {
             m.panic_handler = string_value(&r, v, diags: diags, a: a);
+        } else if name.eq("registry") {
+            m.registry = string_value(&r, v, diags: diags, a: a);
+        } else if name.eq("registry_key") {
+            m.registry_key = string_value(&r, v, diags: diags, a: a);
         } else {
             var msg = diags.new_message();
             msg.push_str("a manifest has no field '");
             msg.push_str(name);
-            msg.push_str("'; its fields are name, version, edition, needs, dependencies, strict_unsafe and panic_handler");
+            msg.push_str("'; its fields are name, version, edition, needs, dependencies, registry, registry_key, strict_unsafe and panic_handler");
             diags.report_owned(codes.BAD_MANIFEST, span_of(&r, f), msg);
         }
     }

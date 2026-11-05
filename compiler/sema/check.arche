@@ -632,7 +632,7 @@ pub fn ref_of(c: &Checker, n: cst.NodeId) -> u32 {
 /// A capability the module names (§1.3): an error unless its package's
 /// manifest lists it in needs. The library's modules are not checked.
 pub fn require_capability(c: &mut Checker, bit: u32, s: diag.Span) {
-    if not c.p.modules[c.module as usize].in_package or c.p.manifest.needs & bit != 0 {
+    if not c.p.modules[c.module as usize].in_package or c.p.manifest_of(c.module).needs & bit != 0 {
         return;
     }
     var m = new_message(c);
@@ -2053,6 +2053,11 @@ fn collect_import(c: &mut Checker, n: cst.NodeId) {
         return;
     }
     if alias.library == Library.NotLibrary {
+        let lib_root = first.eq("core") or first.eq("alloc") or first.eq("std") or first.eq("crypto") or first.eq("tls") or first.eq("http");
+        if not lib_root {
+            let r = program.resolve_import(&c.p, module: c.module, dotted: path.view(), a: c.a);
+            path = r.dotted;
+        }
         match c.p.find(path.view()) {
             some(id) => { alias.module = id.index; }
             none => { return; } // reported by program.load

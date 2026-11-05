@@ -1,0 +1,794 @@
+/// arche-driver pkg (docs/sprints.md S25): dependencies from a registry.
+///
+/// A registry is a directory, read from the disk or over HTTPS
+/// (arche-registry serves one). It is content-addressed: a package
+/// version is an archive kept as objects/<sha256 of it>, never changed,
+/// and a release record that names the hash,
+///
+///     arche-release 1
+///     name <name>
+///     version <version>
+///     sha256 <hex>
+///
+/// kept as <name>/<version>.release beside its Ed25519 signature,
+/// <name>/<version>.sig, by the registry's key; <name>/versions lists the
+/// versions. A package trusts the registry and the key its manifest names
+/// (registry, registry_key). pkg lock checks every record's signature and
+/// every archive's hash, and writes package.lock: a line for each
+/// dependency, transitive ones too, with the hash; pkg vendor unpacks the
+/// locked archives into vendor/<name>/ after checking their hashes again,
+/// so the same lockfile always gives the same sources.
+import alloc;
+import core.mem;
+import crypto.ed25519;
+import crypto.random;
+import crypto.sha2;
+import http;
+import http.server;
+import std;
+import tls;
+
+pub type PkgError = error { Failed }
+
+fn text_of(b: []u8, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    unsafe {
+        // SAFETY: every caller passes bytes it checked to be text, or a
+        // part of a str cut at ASCII bytes.
+        s.push_str(mem.str_from(b));
+    }
+    return s;
+}
+
+fn copy(text: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str(text);
+    return s;
+}
+
+pub fn join(dir: str, name: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str(dir);
+    if dir.len() > 0 and dir.bytes()[dir.len() - 1] != '/' {
+        s.push_str("/");
+    }
+    s.push_str(name);
+    return s;
+}
+
+fn fail(to: &mut std.Output, a: str, b: str) -> PkgError {
+    to.write("arche-driver pkg: ");
+    to.write(a);
+    to.write(b);
+    to.write("\n");
+    return PkgError.Failed;
+}
+
+pub fn hex(b: []u8, a: alloc.Allocator) -> alloc.String {
+    let digits = "0123456789abcdef".bytes();
+    var s = alloc.String.init(a);
+    for x in b {
+        s.push_ascii(digits[(x.* >> 4) as usize]);
+        s.push_ascii(digits[(x.* & 15) as usize]);
+    }
+    return s;
+}
+
+fn unhex(text: str, out: []mut u8) -> bool {
+    let b = text.bytes();
+    if b.len() != 2 * out.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < out.len() : (i += 1) {
+        var v: u8 = 0;
+        var k: usize = 0;
+        while k < 2 : (k += 1) {
+            let c = b[2 * i + k];
+            var d: u8 = 0;
+            if c >= '0' and c <= '9' {
+                d = c - '0';
+            } else if c >= 'a' and c <= 'f' {
+                d = c - 'a' + 10;
+            } else {
+                return false;
+            }
+            v = v * 16 + d;
+        }
+        out[i] = v;
+    }
+    return true;
+}
+
+fn sha256_hex(b: []u8, a: alloc.Allocator) -> alloc.String {
+    let d = sha2.sha256(b);
+    return hex(d[0..32], a);
+}
+
+/// The lines of a text, without empty ones.
+pub fn lines(text: str, a: alloc.Allocator) -> alloc.List(alloc.String) {
+    var out = alloc.List(alloc.String).init(a);
+    let b = text.bytes();
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= b.len() : (i += 1) {
+        if i == b.len() or b[i] == '\n' {
+            if i > start {
+                out.push(text_of(b[start..i], a));
+            }
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+/// The words of a line, split at spaces.
+fn words(line: str, a: alloc.Allocator) -> alloc.List(alloc.String) {
+    var out = alloc.List(alloc.String).init(a);
+    let b = line.bytes();
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= b.len() : (i += 1) {
+        if i == b.len() or b[i] == ' ' {
+            if i > start {
+                out.push(text_of(b[start..i], a));
+            }
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+// ---- Archives ---------------------------------------------------------------------------
+
+/// Whether a file or directory of a package goes into its archive: not
+/// what is built or fetched, nor hidden files.
+fn packed(name: str) -> bool {
+    return not name.starts_with(".") and not name.eq("build") and not name.eq("vendor") and not name.eq("package.lock");
+}
+
+fn collect(fs: &std.Fs, root: str, rel: str, out: &mut alloc.List(alloc.String), a: alloc.Allocator) {
+    let here = join(dir: root, name: rel, a);
+    let names = fs.list(here.view(), a) catch alloc.List(alloc.String).init(a);
+    for n in names.items() {
+        if not packed(n.view()) {
+            continue;
+        }
+        var path = alloc.String.init(a);
+        if rel.len() > 0 {
+            path.push_str(rel);
+            path.push_str("/");
+        }
+        path.push_str(n.view());
+        let full = join(dir: root, name: path.view(), a);
+        match fs.list(full.view(), a) {
+            ok(_) => { collect(fs, root: root, rel: path.view(), out: out, a: a); }
+            err(_) => { out.push(path); }
+        }
+    }
+}
+
+fn put_number(out: &mut alloc.List(u8), n: u64) {
+    var digits: [20]u8 = [0; 20];
+    var k: usize = 0;
+    var v = n;
+    while true {
+        digits[k] = '0' + (v % 10) as u8;
+        k += 1;
+        v = v / 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while k > 0 : (k -= 1) {
+        out.push(digits[k - 1]);
+    }
+}
+
+/// The package in dir as one archive: "arche-pack 1", then for each file,
+/// in byte order of its path, the path, its size and its bytes, each on a
+/// line. The same files always give the same bytes.
+pub fn pack(fs: &std.Fs, dir: str, a: alloc.Allocator) -> alloc.List(u8) {
+    var files = alloc.List(alloc.String).init(a);
+    collect(fs, root: dir, rel: "", out: &mut files, a: a);
+    // fs.list sorts each directory; the full paths are sorted again, since
+    // "a/b" and "a.c" compare differently from their parts.
+    let fl = files.items_mut();
+    var i: usize = 1;
+    while i < fl.len() : (i += 1) {
+        var k = i;
+        while k > 0 and less(x: fl[k].view().bytes(), than: fl[k - 1].view().bytes()) : (k -= 1) {
+            let hold = copy(fl[k].view(), a);
+            fl[k] = copy(fl[k - 1].view(), a);
+            fl[k - 1] = hold;
+        }
+    }
+    var out = alloc.List(u8).init(a);
+    for c in "arche-pack 1\n".bytes() {
+        out.push(c.*);
+    }
+    for f in files.items() {
+        let data = fs.read_bytes(join(dir: dir, name: f.view(), a).view(), a) catch alloc.List(u8).init(a);
+        for c in f.view().bytes() {
+            out.push(c.*);
+        }
+        out.push('\n');
+        put_number(&mut out, n: data.len() as u64);
+        out.push('\n');
+        for c in data.items() {
+            out.push(c.*);
+        }
+        out.push('\n');
+    }
+    return out;
+}
+
+fn less(x: []u8, than: []u8) -> bool {
+    var i: usize = 0;
+    while i < x.len() and i < than.len() : (i += 1) {
+        if x[i] != than[i] {
+            return x[i] < than[i];
+        }
+    }
+    return x.len() < than.len();
+}
+
+/// Whether a path from an archive stays inside the directory it is
+/// unpacked into: relative, without empty, "." or ".." parts.
+fn safe_path(p: []u8) -> bool {
+    if p.len() == 0 or p[0] == '/' {
+        return false;
+    }
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= p.len() : (i += 1) {
+        if i == p.len() or p[i] == '/' {
+            let part = p[start..i];
+            if part.len() == 0 or (part.len() == 1 and part[0] == '.') or (part.len() == 2 and part[0] == '.' and part[1] == '.') or part[0] == '\\' {
+                return false;
+            }
+            start = i + 1;
+        }
+    }
+    return true;
+}
+
+fn make_dirs(fs: &std.Fs, dir: str, a: alloc.Allocator) {
+    if dir.len() == 0 or fs.exists(dir) {
+        return;
+    }
+    let b = dir.bytes();
+    var cut: usize = 0;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        if b[i] == '/' and i + 1 < b.len() {
+            cut = i;
+        }
+    }
+    if cut > 0 {
+        make_dirs(fs, dir: dir[0..cut], a: a);
+    }
+    _ = fs.make_dir(dir);
+}
+
+/// Removes a directory and all it holds.
+pub fn remove_all(fs: &std.Fs, path: str, a: alloc.Allocator) {
+    match fs.list(path, a) {
+        ok(names) => {
+            for n in names.items() {
+                remove_all(fs, path: join(dir: path, name: n.view(), a).view(), a: a);
+            }
+        }
+        err(_) => { }
+    }
+    _ = fs.remove(path);
+}
+
+/// Unpacks an archive into dir; false, with a reason, when it is not one.
+pub fn unpack(fs: &std.Fs, data: []u8, dir: str, to: &mut std.Output, a: alloc.Allocator) -> bool {
+    let magic = "arche-pack 1\n".bytes();
+    if data.len() < magic.len() or not same(a: data[0..magic.len()], b: magic) {
+        to.write("arche-driver pkg: not an archive\n");
+        return false;
+    }
+    var at = magic.len();
+    while at < data.len() {
+        var nl = at;
+        while nl < data.len() and data[nl] != '\n' : (nl += 1) {
+        }
+        let path = data[at..nl];
+        if nl >= data.len() or not safe_path(path) {
+            to.write("arche-driver pkg: an archive's path leaves its directory\n");
+            return false;
+        }
+        at = nl + 1;
+        var size: u64 = 0;
+        while at < data.len() and data[at] != '\n' : (at += 1) {
+            if data[at] < '0' or data[at] > '9' or size > 1000000000 {
+                to.write("arche-driver pkg: an archive's size is not a number\n");
+                return false;
+            }
+            size = size * 10 + (data[at] - '0') as u64;
+        }
+        at += 1;
+        if at + size as usize >= data.len() + 1 or at + size as usize > data.len() {
+            to.write("arche-driver pkg: an archive ends early\n");
+            return false;
+        }
+        let file = text_of(path, a);
+        let full = join(dir: dir, name: file.view(), a);
+        let fb = full.view().bytes();
+        var cut: usize = 0;
+        var i: usize = 0;
+        while i < fb.len() : (i += 1) {
+            if fb[i] == '/' {
+                cut = i;
+            }
+        }
+        make_dirs(fs, dir: full.view()[0..cut], a: a);
+        match fs.write_bytes(full.view(), data[at..at + size as usize]) {
+            ok(_) => { }
+            err(_) => {
+                to.write("arche-driver pkg: cannot write ");
+                to.write(full.view());
+                to.write("\n");
+                return false;
+            }
+        }
+        at += size as usize + 1;
+    }
+    return true;
+}
+
+fn same(a: []u8, b: []u8) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len() : (i += 1) {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---- The registry ---------------------------------------------------------------------------
+
+/// Where packages come from: a directory, or https://host:port/path/.
+pub type Registry = struct {
+    base: alloc.String,
+    key: [32]u8,
+    /// PEM text of the anchors that HTTPS trusts (ARCHE_CA).
+    anchors: alloc.String,
+}
+
+fn number(text: []u8) -> u32 {
+    var v: u32 = 0;
+    for c in text {
+        if c.* >= '0' and c.* <= '9' and v < 100000 {
+            v = v * 10 + (c.* - '0') as u32;
+        }
+    }
+    return v;
+}
+
+/// The bytes at path in the registry; none when it has nothing there.
+pub fn fetch(sys: &mut std.System, r: &Registry, path: str, a: alloc.Allocator) -> PkgError!?alloc.List(u8) {
+    let base = r.base.view();
+    if not base.starts_with("https://") {
+        match sys.fs.read_bytes(join(dir: base, name: path, a).view(), a) {
+            ok(b) => { return some(b); }
+            err(_) => { return none; }
+        }
+    }
+    // https://host[:port]/prefix/
+    let b = base.bytes();
+    var at: usize = 8;
+    var host_end = at;
+    while host_end < b.len() and b[host_end] != ':' and b[host_end] != '/' : (host_end += 1) {
+    }
+    let host = text_of(b[at..host_end], a);
+    var port: u32 = 443;
+    at = host_end;
+    if at < b.len() and b[at] == ':' {
+        var e = at + 1;
+        while e < b.len() and b[e] != '/' : (e += 1) {
+        }
+        port = number(b[at + 1..e]);
+        at = e;
+    }
+    var target = alloc.String.init(a);
+    if at < b.len() {
+        target.push_str(base[at..base.len()]);
+    } else {
+        target.push_str("/");
+    }
+    if target.view().bytes()[target.len() - 1] != '/' {
+        target.push_str("/");
+    }
+    target.push_str(path);
+    var ip: [4]u8 = [127, 0, 0, 1];
+    let hb = host.view().bytes();
+    if not host.view().eq("localhost") {
+        var part: usize = 0;
+        var v: u32 = 0;
+        for c in hb {
+            if c.* == '.' {
+                if part < 4 {
+                    ip[part] = v as u8;
+                }
+                part += 1;
+                v = 0;
+            } else if c.* >= '0' and c.* <= '9' {
+                v = v * 10 + (c.* - '0') as u32;
+            } else {
+                return fail(&mut sys.stderr, a: "a registry's host is an IPv4 address or localhost, not ", b: host.view());
+            }
+        }
+        if part != 3 or v > 255 {
+            return fail(&mut sys.stderr, a: "a registry's host is an IPv4 address or localhost, not ", b: host.view());
+        }
+        ip[3] = v as u8;
+    }
+    let now = (sys.clock.unix_ns() / 1000000000) as i64;
+    var config = tls.ClientConfig.init(host.view(), now: now, a);
+    match config.trust_pem(r.anchors.view(), a) {
+        ok(_) => { }
+        err(_) => { return fail(&mut sys.stderr, a: "ARCHE_CA is not PEM", b: ""); }
+    }
+    config.offer_protocol("http/1.1");
+    let sock = match sys.net.connect(std.Address { ip: ip, port: port as u16 }) {
+        ok(got1) => { got1 }
+        err(_) => { return fail(&mut sys.stderr, a: "cannot connect to ", b: base); }
+    };
+    let conn = match tls.Conn.client(sock, config: &config, rand: &mut sys.rand, a) {
+        ok(got2) => { got2 }
+        err(_) => { return fail(&mut sys.stderr, a: "the registry's TLS failed: ", b: base); }
+    };
+    var t = server.Transport.Secure { conn: conn };
+    var req = http.Request.init(a);
+    req.method.push_str("GET");
+    req.target.push_str(target.view());
+    req.authority.push_str(host.view());
+    req.headers.add(name: "connection", value: "close");
+    var resp = http.Response.init(a);
+    match server.fetch(&mut t, req: &req, resp: &mut resp, a) {
+        ok(_) => { }
+        err(_) => {
+            t.close();
+            return fail(&mut sys.stderr, a: "the registry did not answer: ", b: base);
+        }
+    }
+    t.close();
+    if resp.status == 404 {
+        return none;
+    }
+    if resp.status != 200 {
+        return fail(&mut sys.stderr, a: "the registry answered with an error for ", b: path);
+    }
+    return some(resp.body);
+}
+
+fn release_text(name: str, version: str, hash: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str("arche-release 1\nname ");
+    s.push_str(name);
+    s.push_str("\nversion ");
+    s.push_str(version);
+    s.push_str("\nsha256 ");
+    s.push_str(hash);
+    s.push_str("\n");
+    return s;
+}
+
+/// The hash a version's signed release record names, after checking the
+/// signature with the registry's key.
+pub fn release_hash(sys: &mut std.System, r: &Registry, name: str, version: str, a: alloc.Allocator) -> PkgError!alloc.String {
+    var base_name = alloc.String.init(a);
+    base_name.push_str(name);
+    base_name.push_str("/");
+    base_name.push_str(version);
+    var rec_path = copy(base_name.view(), a);
+    rec_path.push_str(".release");
+    var sig_path = copy(base_name.view(), a);
+    sig_path.push_str(".sig");
+    var record = alloc.List(u8).init(a);
+    match try fetch(sys, r: r, path: rec_path.view(), a: a) {
+        some(b) => { record = b; }
+        none => { return fail(&mut sys.stderr, a: "the registry has no release ", b: base_name.view()); }
+    }
+    var sig_text = alloc.List(u8).init(a);
+    match try fetch(sys, r: r, path: sig_path.view(), a: a) {
+        some(b) => { sig_text = b; }
+        none => { return fail(&mut sys.stderr, a: "the registry has no signature for ", b: base_name.view()); }
+    }
+    var sig: [64]u8 = [0; 64];
+    let sl = lines(text_of(sig_text.items(), a).view(), a);
+    if sl.len() != 1 or not unhex(sl[0].view(), out: sig[0..64]) {
+        return fail(&mut sys.stderr, a: "a malformed signature for ", b: base_name.view());
+    }
+    if not ed25519.verify(key: r.key[0..32], message: record.items(), sig: sig[0..64]) {
+        return fail(&mut sys.stderr, a: "the signature does not match the registry's key: ", b: base_name.view());
+    }
+    // The record must be exactly the one for this name and version.
+    let rl = lines(text_of(record.items(), a).view(), a);
+    if rl.len() != 4 {
+        return fail(&mut sys.stderr, a: "a malformed release record: ", b: base_name.view());
+    }
+    let hash = text_of(rl[3].view().bytes()[7..rl[3].len()], a);
+    let expected = release_text(name: name, version: version, hash: hash.view(), a: a);
+    if not same(a: expected.view().bytes(), b: record.items()) {
+        return fail(&mut sys.stderr, a: "a release record for another package: ", b: base_name.view());
+    }
+    return hash;
+}
+
+/// The archive whose SHA-256 is hash: from the cache, or the registry,
+/// checked either way.
+pub fn archive(sys: &mut std.System, r: &Registry, hash: str, cache: str, a: alloc.Allocator) -> PkgError!alloc.List(u8) {
+    let cached = join(dir: cache, name: hash, a);
+    match sys.fs.read_bytes(cached.view(), a) {
+        ok(b) => {
+            if sha256_hex(b.items(), a).view().eq(hash) {
+                return b;
+            }
+        }
+        err(_) => { }
+    }
+    var obj = copy("objects/", a);
+    obj.push_str(hash);
+    var data = alloc.List(u8).init(a);
+    match try fetch(sys, r: r, path: obj.view(), a: a) {
+        some(b) => { data = b; }
+        none => { return fail(&mut sys.stderr, a: "the registry has no object ", b: hash); }
+    }
+    if not sha256_hex(data.items(), a).view().eq(hash) {
+        return fail(&mut sys.stderr, a: "an archive does not match its hash: ", b: hash);
+    }
+    make_dirs(&sys.fs, dir: cache, a: a);
+    _ = sys.fs.write_bytes(cached.view(), data.items());
+    return data;
+}
+
+// ---- Commands --------------------------------------------------------------------------------
+
+/// A dependency: name, version, and hash once known.
+pub type Dep = struct {
+    pub name: alloc.String,
+    pub version: alloc.String,
+    pub hash: alloc.String,
+}
+
+/// What `arche manifest` says of a package.arche.
+pub type Manifest = struct {
+    pub name: alloc.String,
+    pub version: alloc.String,
+    pub registry: alloc.String,
+    pub registry_key: alloc.String,
+    pub deps: alloc.List(Dep),
+}
+
+pub fn parse_manifest(text: str, a: alloc.Allocator) -> Manifest {
+    var m = Manifest {
+        name: alloc.String.init(a),
+        version: alloc.String.init(a),
+        registry: alloc.String.init(a),
+        registry_key: alloc.String.init(a),
+        deps: alloc.List(Dep).init(a),
+    };
+    for l in lines(text, a).items() {
+        let w = words(l.view(), a);
+        if w.len() < 2 {
+            continue;
+        }
+        let key = w[0].view();
+        if key.eq("name") {
+            m.name.push_str(w[1].view());
+        } else if key.eq("version") {
+            m.version.push_str(w[1].view());
+        } else if key.eq("registry") {
+            m.registry.push_str(w[1].view());
+        } else if key.eq("registry_key") {
+            m.registry_key.push_str(w[1].view());
+        } else if key.eq("dep") and w.len() >= 3 {
+            var h = alloc.String.init(a);
+            if w.len() >= 4 {
+                h.push_str(w[3].view());
+            }
+            m.deps.push(Dep { name: copy(w[1].view(), a), version: copy(w[2].view(), a), hash: h });
+        }
+    }
+    return m;
+}
+
+/// The registry a manifest names, with its key, and the anchors of ARCHE_CA.
+pub fn registry_of(sys: &mut std.System, m: &Manifest, dir: str, a: alloc.Allocator) -> PkgError!Registry {
+    if m.registry.len() == 0 or m.registry_key.len() == 0 {
+        return fail(&mut sys.stderr, a: "the manifest names no registry and registry_key", b: "");
+    }
+    var r = Registry { base: alloc.String.init(a), key: [0; 32], anchors: alloc.String.init(a) };
+    if m.registry.view().starts_with("https://") or m.registry.view().starts_with("/") {
+        r.base.push_str(m.registry.view());
+    } else {
+        r.base = join(dir: dir, name: m.registry.view(), a);
+    }
+    if not unhex(m.registry_key.view(), out: r.key[0..32]) {
+        return fail(&mut sys.stderr, a: "registry_key is not 64 hex digits: ", b: m.registry_key.view());
+    }
+    if r.base.view().starts_with("https://") {
+        match sys.env.get("ARCHE_CA", a) {
+            some(path) => {
+                r.anchors = match sys.fs.read_file(path.view(), a) {
+                    ok(got3) => { got3 }
+                    err(_) => { return fail(&mut sys.stderr, a: "cannot read ARCHE_CA: ", b: path.view()); }
+                };
+            }
+            none => { return fail(&mut sys.stderr, a: "an HTTPS registry needs ARCHE_CA, the PEM file of the anchors to trust", b: ""); }
+        }
+    }
+    return r;
+}
+
+/// Writes a new key: its secret seed, hex, to the file; its public key out.
+pub fn keygen(sys: &mut std.System, file: str, a: alloc.Allocator) -> PkgError!void {
+    if sys.fs.exists(file) {
+        return fail(&mut sys.stderr, a: "will not overwrite ", b: file);
+    }
+    var rng = random.Csprng.init(&mut sys.rand);
+    var seed: [32]u8 = [0; 32];
+    rng.fill(seed[0..32]);
+    var text = hex(seed[0..32], a);
+    text.push_str("\n");
+    match sys.fs.write_file(path: file, data: text.view()) {
+        ok(_) => { }
+        err(_) => { return fail(&mut sys.stderr, a: "cannot write ", b: file); }
+    }
+    let public = ed25519.public_key(seed[0..32]);
+    sys.stdout.write(hex(public[0..32], a).view());
+    sys.stdout.write("\n");
+}
+
+/// Publishes the package in dir to a registry directory, signed with the
+/// key in key_file. A version, once published, never changes.
+pub fn publish(sys: &mut std.System, dir: str, m: &Manifest, registry_dir: str, key_file: str, a: alloc.Allocator) -> PkgError!void {
+    if m.name.len() == 0 or m.version.len() == 0 {
+        return fail(&mut sys.stderr, a: "a published package has a name and a version", b: "");
+    }
+    let key_text = match sys.fs.read_file(key_file, a) {
+        ok(got4) => { got4 }
+        err(_) => { return fail(&mut sys.stderr, a: "cannot read the key ", b: key_file); }
+    };
+    let kl = lines(key_text.view(), a);
+    var seed: [32]u8 = [0; 32];
+    if kl.len() != 1 or not unhex(kl[0].view(), out: seed[0..32]) {
+        return fail(&mut sys.stderr, a: "a key file holds 64 hex digits: ", b: key_file);
+    }
+    let data = pack(&sys.fs, dir: dir, a: a);
+    let hash = sha256_hex(data.items(), a);
+    let pkg_dir = join(dir: registry_dir, name: m.name.view(), a);
+    var base_name = copy(m.version.view(), a);
+    var rec_path = join(dir: pkg_dir.view(), name: base_name.view(), a);
+    rec_path.push_str(".release");
+    if sys.fs.exists(rec_path.view()) {
+        return fail(&mut sys.stderr, a: "this version is published already, and versions never change: ", b: rec_path.view());
+    }
+    make_dirs(&sys.fs, dir: join(dir: registry_dir, name: "objects", a).view(), a: a);
+    make_dirs(&sys.fs, dir: pkg_dir.view(), a: a);
+    var obj = copy("objects/", a);
+    obj.push_str(hash.view());
+    match sys.fs.write_bytes(join(dir: registry_dir, name: obj.view(), a).view(), data.items()) {
+        ok(_) => { }
+        err(_) => { return fail(&mut sys.stderr, a: "cannot write ", b: obj.view()); }
+    }
+    let record = release_text(name: m.name.view(), version: m.version.view(), hash: hash.view(), a: a);
+    let sig = ed25519.sign(seed: seed[0..32], message: record.view().bytes());
+    var sig_text = hex(sig[0..64], a);
+    sig_text.push_str("\n");
+    var sig_path = join(dir: pkg_dir.view(), name: base_name.view(), a);
+    sig_path.push_str(".sig");
+    match sys.fs.write_file(path: sig_path.view(), data: sig_text.view()) {
+        ok(_) => { }
+        err(_) => { return fail(&mut sys.stderr, a: "cannot write ", b: sig_path.view()); }
+    }
+    match sys.fs.write_file(path: rec_path.view(), data: record.view()) {
+        ok(_) => { }
+        err(_) => { return fail(&mut sys.stderr, a: "cannot write ", b: rec_path.view()); }
+    }
+    let versions_path = join(dir: pkg_dir.view(), name: "versions", a);
+    var versions = sys.fs.read_file(versions_path.view(), a) catch alloc.String.init(a);
+    versions.push_str(m.version.view());
+    versions.push_str("\n");
+    match sys.fs.write_file(path: versions_path.view(), data: versions.view()) {
+        ok(_) => { }
+        err(_) => { return fail(&mut sys.stderr, a: "cannot write ", b: versions_path.view()); }
+    }
+    base_name = copy(m.name.view(), a);
+    base_name.push_str(" ");
+    base_name.push_str(m.version.view());
+    sys.stdout.write("published ");
+    sys.stdout.write(base_name.view());
+    sys.stdout.write(" sha256:");
+    sys.stdout.write(hash.view());
+    sys.stdout.write("\n");
+}
+
+/// The text of package.lock for these dependencies, sorted by name.
+pub fn lock_text(list: &alloc.List(Dep), a: alloc.Allocator) -> alloc.String {
+    let deps = list.items();
+    var order = alloc.List(u32).init(a);
+    var i: usize = 0;
+    while i < deps.len() : (i += 1) {
+        order.push(i as u32);
+    }
+    let o = order.items_mut();
+    var j: usize = 1;
+    while j < o.len() : (j += 1) {
+        var k = j;
+        while k > 0 and less(x: deps[o[k] as usize].name.view().bytes(), than: deps[o[k - 1] as usize].name.view().bytes()) : (k -= 1) {
+            let hold = o[k];
+            o[k] = o[k - 1];
+            o[k - 1] = hold;
+        }
+    }
+    var s = copy("# arche package lock: written by arche-driver pkg lock\n", a);
+    for x in order.items() {
+        let d = &deps[x.* as usize];
+        s.push_str(d.name.view());
+        s.push_str(" ");
+        s.push_str(d.version.view());
+        s.push_str(" sha256:");
+        s.push_str(d.hash.view());
+        s.push_str("\n");
+    }
+    return s;
+}
+
+/// The dependencies a package.lock lists.
+pub fn read_lock(text: str, a: alloc.Allocator) -> alloc.List(Dep) {
+    var out = alloc.List(Dep).init(a);
+    for l in lines(text, a).items() {
+        if l.view().starts_with("#") {
+            continue;
+        }
+        let w = words(l.view(), a);
+        if w.len() == 3 and w[2].view().starts_with("sha256:") {
+            out.push(Dep { name: copy(w[0].view(), a), version: copy(w[1].view(), a), hash: text_of(w[2].view().bytes()[7..w[2].len()], a) });
+        }
+    }
+    return out;
+}
+
+/// The highest of the versions listed, by their numbers.
+pub fn latest(text: str, a: alloc.Allocator) -> alloc.String {
+    var best = alloc.String.init(a);
+    for l in lines(text, a).items() {
+        if best.len() == 0 or version_less(x: best.view(), than: l.view()) {
+            best = copy(l.view(), a);
+        }
+    }
+    return best;
+}
+
+fn version_less(x: str, than: str) -> bool {
+    let a = x.bytes();
+    let b = than.bytes();
+    var i: usize = 0;
+    var j: usize = 0;
+    while i < a.len() or j < b.len() {
+        var p: u64 = 0;
+        while i < a.len() and a[i] != '.' : (i += 1) {
+            p = p * 10 + ((a[i] - '0') % 10) as u64;
+        }
+        var q: u64 = 0;
+        while j < b.len() and b[j] != '.' : (j += 1) {
+            q = q * 10 + ((b[j] - '0') % 10) as u64;
+        }
+        if p != q {
+            return p < q;
+        }
+        i += 1;
+        j += 1;
+    }
+    return false;
+}

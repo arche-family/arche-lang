@@ -52,9 +52,13 @@ pub type Module = struct {
     /// The edition its package declares (spec/arche.md §1.2); the
     /// library's is the first.
     pub edition: u32,
-    /// Whether it belongs to the package being built, not the library:
-    /// its manifest's needs and strict_unsafe apply to it.
+    /// Whether it belongs to the package being built or one of its
+    /// dependencies, not the library: its manifest's needs and
+    /// strict_unsafe apply to it.
     pub in_package: bool,
+    /// Its package: 0 the root's, k + 1 the k-th dependency's; NO_PACKAGE
+    /// for the library.
+    pub package: u32,
 
     /// The source text of a token.
     pub fn token_text(self: &Module, t: u32) -> str {
@@ -83,6 +87,24 @@ pub type Module = struct {
     }
 }
 
+pub const NO_PACKAGE: u32 = 4294967295;
+
+/// A dependency: its name, its directory, and its own manifest, whose
+/// needs and edition its modules follow (spec/arche.md §1.1).
+pub type Dep = struct {
+    pub name: alloc.String,
+    pub dir: alloc.String,
+    pub manifest: manifest.Manifest,
+}
+
+/// An import resolved: the module's name in the program, its file, and
+/// its package.
+pub type Resolved = struct {
+    pub dotted: alloc.String,
+    pub file: alloc.String,
+    pub package: u32,
+}
+
 pub type Program = struct {
     pub modules: alloc.List(Module),
     pub diags: diag.Diagnostics,
@@ -103,7 +125,18 @@ pub type Program = struct {
     pub record_uses: bool,
     /// What the package's manifest declares (manifest.arche).
     pub manifest: manifest.Manifest,
+    /// The dependencies package.lock lists, vendored in vendor/<name>/.
+    pub deps: alloc.List(Dep),
     root_dir: alloc.String,
+
+    /// The manifest of a module's package; the root's for the library's.
+    pub fn manifest_of(self: &Program, module: u32) -> &manifest.Manifest {
+        let pk = self.modules[module as usize].package;
+        if pk == 0 or pk == NO_PACKAGE {
+            return &self.manifest;
+        }
+        return &self.deps[(pk - 1) as usize].manifest;
+    }
 
     pub fn module(self: &Program, id: ModuleId) -> &Module {
         return &self.modules[id.index as usize];
@@ -142,12 +175,15 @@ fn is_identifier(s: str) -> bool {
 }
 
 /// Lexes and parses one file into a module, reporting into p.diags.
-fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.String, full: bool, in_package: bool) -> ModuleId {
+fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.String, full: bool, package: u32) -> ModuleId {
+    let in_package = package != NO_PACKAGE;
     let id = ModuleId { index: p.modules.len() as u32 };
     p.diags.file = id.index;
     var edition = manifest.FIRST_EDITION;
-    if in_package {
+    if package == 0 {
         edition = p.manifest.edition;
+    } else if in_package {
+        edition = p.deps[(package - 1) as usize].manifest.edition;
     }
     var lexed = diag.Diagnostics.init(p.a);
     lexed.file = id.index;
@@ -164,7 +200,7 @@ fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.S
     while i < found.len() : (i += 1) {
         p.diags.items.push(copy_diagnostic(&found[i], p.a));
     }
-    p.modules.push(Module { name: n, path: pa, display: di, text: text, tree: parsed.tree, full: full, edition: edition, in_package: in_package });
+    p.modules.push(Module { name: n, path: pa, display: di, text: text, tree: parsed.tree, full: full, edition: edition, in_package: in_package, package: package });
     return id;
 }
 
@@ -219,6 +255,144 @@ fn import_path(m: &Module, node: cst.NodeId, a: alloc.Allocator) -> ImportPath {
     return ImportPath { dotted: dotted, file: file, library: library, span: m.node_span(node) };
 }
 
+/// The dependency named name, as its index in p.deps, if there is one.
+pub fn dependency(p: &Program, name: str) -> ?u32 {
+    var i: usize = 0;
+    while i < p.deps.len() : (i += 1) {
+        if p.deps[i].name.view().eq(name) {
+            return i as u32;
+        }
+    }
+    return none;
+}
+
+/// An import written in a module, resolved (spec/arche.md §1.1): a
+/// dependency's name first reaches its package, vendor/<name>/, where
+/// <name>.<path> is <path>.arche and <name> alone is <name>.arche; in a
+/// dependency, the other paths are its own modules; in the root package
+/// they are the package's, and its own name may lead them.
+pub fn resolve_import(p: &Program, module: u32, dotted: str, a: alloc.Allocator) -> Resolved {
+    var first_end: usize = 0;
+    while first_end < dotted.len() and dotted[first_end] != '.' : (first_end += 1) {
+    }
+    let first = dotted[0..first_end];
+    var rest = "";
+    if first_end < dotted.len() {
+        rest = dotted[first_end + 1..dotted.len()];
+    }
+    var r = Resolved { dotted: alloc.String.init(a), file: alloc.String.init(a), package: 0 };
+    var dep: ?u32 = dependency(p, name: first);
+    var dep_rest = rest;
+    var dep_whole = rest.len() == 0;
+    let pk = p.modules[module as usize].package;
+    if pk != 0 and pk != NO_PACKAGE {
+        match dep {
+            some(_) => { }
+            none => {
+                // A path of the dependency's own.
+                dep = some(pk - 1);
+                dep_rest = dotted;
+                dep_whole = false;
+            }
+        }
+    }
+    match dep {
+        some(d) => {
+            let name = p.deps[d as usize].name.view();
+            r.package = d + 1;
+            r.dotted.push_str(name);
+            r.file.push_str("vendor/");
+            r.file.push_str(name);
+            r.file.push_str("/");
+            if dep_whole {
+                r.file.push_str(name);
+            } else {
+                r.dotted.push_str(".");
+                r.dotted.push_str(dep_rest);
+                var i: usize = 0;
+                while i < dep_rest.len() : (i += 1) {
+                    if dep_rest[i] == '.' {
+                        r.file.push_ascii('/');
+                    } else {
+                        r.file.push_ascii(dep_rest[i]);
+                    }
+                }
+            }
+            r.file.push_str(".arche");
+            return r;
+        }
+        none => { }
+    }
+    var own = dotted;
+    if p.manifest.found and rest.len() > 0 and first.eq(p.manifest.name.view()) {
+        own = rest;
+    }
+    r.dotted.push_str(own);
+    var i: usize = 0;
+    while i < own.len() : (i += 1) {
+        if own[i] == '.' {
+            r.file.push_ascii('/');
+        } else {
+            r.file.push_ascii(own[i]);
+        }
+    }
+    r.file.push_str(".arche");
+    return r;
+}
+
+/// The dependencies package.lock lists (name version hash, a line each),
+/// with their manifests from vendor/<name>/package.arche.
+fn read_lock(fs: &std.Fs, p: &mut Program, a: alloc.Allocator) {
+    var lock_path = alloc.String.init(a);
+    lock_path.push_str(p.root_dir.view());
+    lock_path.push_str("package.lock");
+    var text = alloc.String.init(a);
+    match fs.read_file(lock_path.view(), a) {
+        ok(t) => { text = t; }
+        err(_) => { return; }
+    }
+    let t = text.view();
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= t.len() : (i += 1) {
+        if i < t.len() and t[i] != '\n' {
+            continue;
+        }
+        let line = t[start..i];
+        start = i + 1;
+        if line.len() == 0 or line[0] == '#' {
+            continue;
+        }
+        var sp: usize = 0;
+        while sp < line.len() and line[sp] != ' ' : (sp += 1) {
+        }
+        var name = alloc.String.init(a);
+        name.push_str(line[0..sp]);
+        var dir = alloc.String.init(a);
+        dir.push_str("vendor/");
+        dir.push_str(name.view());
+        dir.push_str("/");
+        var mpath = alloc.String.init(a);
+        mpath.push_str(p.root_dir.view());
+        mpath.push_str(dir.view());
+        mpath.push_str("package.arche");
+        var m = manifest.defaults(a);
+        match fs.read_file(mpath.view(), a) {
+            ok(mtext) => {
+                var lexed = diag.Diagnostics.init(a);
+                let tokens = lexer.lex(mtext.view(), true, &mut lexed, a);
+                let parsed = parser.parse(tokens, mtext.view(), true, lexed, a);
+                var problems = parsed.diags;
+                if problems.count() == 0 {
+                    m = manifest.read(parsed.tree, text: mtext.view(), diags: &mut problems, a: a);
+                }
+            }
+            err(_) => { }
+        }
+        p.deps.push(Dep { name: name, dir: dir, manifest: m });
+    }
+}
+
 /// The imports of a module that name package modules, not library roots.
 fn package_imports(m: &Module, a: alloc.Allocator, lib_alloc: bool, lib_std: bool) -> alloc.List(ImportPath) {
     var out = alloc.List(ImportPath).init(a);
@@ -259,6 +433,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         tests: opts.tests,
         record_uses: false,
         manifest: manifest.defaults(a),
+        deps: alloc.List(Dep).init(a),
         root_dir: alloc.String.init(a),
     };
     var slash: ?usize = none;
@@ -317,7 +492,8 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         root_name = stem;
     }
     let root_full = p.full;
-    _ = add_module(&mut p, name: root_name, path: path, display: base, text, full: root_full, in_package: true);
+    read_lock(fs, p: &mut p, a: a);
+    _ = add_module(&mut p, name: root_name, path: path, display: base, text, full: root_full, package: 0);
 
     var next: usize = 0;
     while next < p.modules.len() : (next += 1) {
@@ -328,36 +504,45 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         var c: usize = 0;
         while c < ips.len() : (c += 1) {
             let ip = &ips[c];
-            match p.find(ip.dotted.view()) {
+            // core and its modules come from the library (spec/arche.md
+            // §1.1): full Arche, whatever the package is.
+            let written = ip.dotted.view();
+            let from_lib = written.eq("core") or written.starts_with("core.") or (p.lib_alloc and written.eq("alloc")) or
+                (p.lib_std and (written.eq("std") or written.starts_with("std."))) or
+                (p.full and (written.starts_with("crypto.") or written.eq("tls") or written.starts_with("tls.") or written.eq("http") or written.starts_with("http.")));
+            var r = Resolved { dotted: alloc.String.init(a), file: alloc.String.init(a), package: NO_PACKAGE };
+            if from_lib {
+                r.dotted.push_str(written);
+                r.file.push_str(ip.file.view());
+            } else {
+                r = resolve_import(&p, module: next as u32, dotted: written, a: a);
+            }
+            match p.find(r.dotted.view()) {
                 some(_) => { continue; }
                 none => { }
             }
-            // core and its modules come from the library (spec/arche.md
-            // §1.1): full Arche, whatever the package is.
-            let dotted = ip.dotted.view();
-            let from_lib = dotted.eq("core") or dotted.starts_with("core.") or (p.lib_alloc and dotted.eq("alloc")) or
-                (p.lib_std and (dotted.eq("std") or dotted.starts_with("std."))) or
-                (p.full and (dotted.starts_with("crypto.") or dotted.eq("tls") or dotted.starts_with("tls.") or dotted.eq("http") or dotted.starts_with("http.")));
             var full = alloc.String.init(a);
             var shown = alloc.String.init(a);
             if from_lib {
                 full.push_str(lib);
                 shown.push_str("lib/");
+                full.push_str(r.file.view());
+                shown.push_str(r.file.view());
             } else {
                 full.push_str(p.root_dir.view());
+                full.push_str(r.file.view());
+                shown.push_str(r.file.view());
             }
-            full.push_str(ip.file.view());
-            shown.push_str(ip.file.view());
             let module_full = from_lib or p.full;
             match fs.read_file(full.view(), a) {
                 ok(source) => {
-                    _ = add_module(&mut p, name: ip.dotted.view(), path: full.view(), display: shown.view(), source, full: module_full, in_package: not from_lib);
+                    _ = add_module(&mut p, name: r.dotted.view(), path: full.view(), display: shown.view(), source, full: module_full, package: r.package);
                 }
                 err(_) => {
                     p.diags.file = next as u32;
                     var msg = p.diags.new_message();
                     msg.push_str("cannot find module '");
-                    msg.push_str(ip.dotted.view());
+                    msg.push_str(r.dotted.view());
                     msg.push_str("': there is no readable file ");
                     msg.push_str(full.view());
                     p.diags.report_owned(codes.MODULE_NOT_FOUND, ip.span, msg);
@@ -381,6 +566,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
             full: true,
             edition: manifest.FIRST_EDITION,
             in_package: true,
+            package: 0,
         });
         let found = manifest_problems.items.items();
         var k: usize = 0;

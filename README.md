@@ -46,13 +46,13 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | Path | Contents | Status |
 | --- | --- | --- |
 | [`docs/plan.md`](docs/plan.md) | the full plan (Uzbek) | snapshot, 2026-11-03 |
-| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S25 (S19 on Windows) |
+| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S26 (S19 on Windows) |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | [`spec/arche.md`](spec/arche.md) | the full language, built on Arche-0 | draft 0.1 |
-| [`conformance/`](conformance/README.md) | specification tests | 452 tests |
+| [`conformance/`](conformance/README.md) | specification tests | 453 tests |
 | `stage0/` | bootstrap compiler, C11 | complete: compiles all of Arche-0 |
 | [`compiler/`](compiler/) | the Arche compiler, Arche-0, through LLVM | self-hosting: stage2 == stage3 |
-| [`driver/`](driver/) | `arche-driver build`/`run`: packages from `build.arche`, one object per module, cached by SHA-256 | a cached build is bit-identical to a clean one |
+| [`driver/`](driver/) | `arche-driver build`/`run`: packages from `build.arche`, one object per module, cached by SHA-256; `pkg add/lock/vendor/publish` and `arche-registry`: signed, content-addressed packages over HTTPS | a cached build is bit-identical to a clean one; tampered packages are refused |
 | [`docs/abi.md`](docs/abi.md) | layouts, calling convention, runtime | version 0 |
 | [`docs/error-codes.md`](docs/error-codes.md) | every diagnostic code | living |
 | [`lib/`](lib/) | the library: `core` (no OS, no allocator), `alloc`, `std` for Linux, `crypto` (constant time, checked in CI by [`ctcheck/`](ctcheck/)), `tls` (TLS 1.3 and X.509) and `http` (HTTP/1.1 and HTTP/2, server and client), interop-tested against OpenSSL, curl and Chrome by [`interop/`](interop/) | the compiler bootstraps on `lib/alloc` and `lib/std` too |

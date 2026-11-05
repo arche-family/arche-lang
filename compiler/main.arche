@@ -13,6 +13,7 @@
 ///     arche build <file> <out.ll>   compile it to LLVM IR (arche-build links it)
 ///     arche units <file> <dir>      the same, one LLVM module per module (arche-driver)
 ///     arche build-plan <build.arche>   the programs a build file lists
+///     arche manifest <package.arche>   what a manifest says, a field a line
 ///
 /// Functions take the capabilities they use one by one, not the whole
 /// std.System: a path read from sys.args can then be passed beside
@@ -52,6 +53,7 @@ fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("       arche build <file> <out.ll>\n");
     err_out.write("       arche units <file> <dir>       one LLVM module per module, for arche-driver\n");
     err_out.write("       arche build-plan <build.arche>  the programs it lists, as name<TAB>root lines\n");
+    err_out.write("       arche manifest <package.arche>  its fields, one a line, for arche-driver\n");
     err_out.write("       arche test <file> <out.ll>     the test blocks of <file>, run by std.testing\n");
     err_out.write("options, before the command: --lib-alloc, --lib-std, --target <linux-x86_64 | freestanding-x86_64 |\n");
     err_out.write("       freestanding-riscv64>, --panic-handler <module.function>\n");
@@ -448,7 +450,7 @@ fn move_edition(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: 
     var changed: u64 = 0;
     var m: usize = 0;
     while m < mods.len() : (m += 1) {
-        if not mods[m].in_package or from >= 2027 or to < 2027 {
+        if mods[m].package != 0 or from >= 2027 or to < 2027 {
             continue;
         }
         let text = mods[m].text.view();
@@ -834,6 +836,48 @@ fn build_plan(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: al
     return Failure.ErrorsFound;
 }
 
+/// `arche manifest`: a manifest's fields, a line each: name, version,
+/// edition, registry, registry_key, then dep <name> <version> [<hash>].
+fn show_manifest(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> Failure!void {
+    let source = try read(fs, err_out, path, a);
+    var diags = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(source.view(), true, &mut diags, a);
+    let parsed = parser.parse(tokens, source.view(), true, diags, a);
+    var problems = parsed.diags;
+    if problems.count() == 0 {
+        let m = manifest.read(parsed.tree, text: source.view(), diags: &mut problems, a: a);
+        if problems.count() == 0 {
+            out.write("name ");
+            out.write(m.name.view());
+            out.write("\nversion ");
+            out.write(m.version.view());
+            out.write("\nedition ");
+            out.write_u64(m.edition as u64);
+            out.write("\nregistry ");
+            out.write(m.registry.view());
+            out.write("\nregistry_key ");
+            out.write(m.registry_key.view());
+            out.write("\n");
+            let ds = m.dependencies.items();
+            var i: usize = 0;
+            while i < ds.len() : (i += 1) {
+                out.write("dep ");
+                out.write(ds[i].name.view());
+                out.write(" ");
+                out.write(ds[i].version.view());
+                if ds[i].hash.len() > 0 {
+                    out.write(" ");
+                    out.write(ds[i].hash.view());
+                }
+                out.write("\n");
+            }
+            return;
+        }
+    }
+    diag.write_text(err_out, &problems, 0, path: path, text: source.view());
+    return Failure.ErrorsFound;
+}
+
 fn dump_tokens(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str) -> Failure!void {
     let source = try read(fs, err_out, path, a);
     let text = source.view();
@@ -953,6 +997,8 @@ fn main(sys: &mut std.System) -> !void {
         try build_units(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), dir: sys.args.get(3 + k), opts: &opts);
     } else if command.eq("build-plan") and count == 3 {
         try build_plan(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));
+    } else if command.eq("manifest") and count == 3 {
+        try show_manifest(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));
     } else if command.eq("tokens") and count == 3 {
         try dump_tokens(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));
     } else if command.eq("build") and count == 4 {

@@ -2,21 +2,28 @@
 # Arche compiler.
 #
 #   make          build/arche-driver
-#   make check    clean and cached builds are bit-identical (check.sh)
+#   make check    clean and cached builds are bit-identical (check.sh);
+#                 packages are checked against the registry (pkg-check.sh)
 
 BUILD := build
 LIB := $(wildcard ../lib/*.arche ../lib/*/*.arche ../lib/*/*/*.arche)
 RUNTIME := ../compiler/runtime/rt.c ../compiler/runtime/math.inc
 
-all: $(BUILD)/arche-driver
+all: $(BUILD)/arche-driver $(BUILD)/arche-registry
 
-$(BUILD)/arche-driver: main.arche $(LIB) $(RUNTIME)
+$(BUILD)/arche-driver: main.arche pkg.arche $(LIB) $(RUNTIME)
 	$(MAKE) -C ../compiler
 	mkdir -p $(BUILD)
 	../compiler/arche-build main.arche $@
 
-check: $(BUILD)/arche-driver
+$(BUILD)/arche-registry: registry.arche $(LIB) $(RUNTIME)
+	$(MAKE) -C ../compiler
+	mkdir -p $(BUILD)
+	../compiler/arche-build registry.arche $@
+
+check: $(BUILD)/arche-driver $(BUILD)/arche-registry
 	sh ./check.sh $(BUILD)/arche-driver
+	sh ./pkg-check.sh $(BUILD)/arche-driver $(BUILD)/arche-registry
 
 clean:
 	rm -rf $(BUILD) example/build

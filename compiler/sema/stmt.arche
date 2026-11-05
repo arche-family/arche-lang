@@ -360,7 +360,7 @@ fn check_stmt(c: &mut ck.Checker, s: cst.NodeId) {
         }
         .ForStmt => { check_for(c, s); }
         .UnsafeStmt => {
-            if c.p.manifest.strict_unsafe and c.p.modules[c.module as usize].in_package and not safety_comment(c, ck.child(c, s, 0)) {
+            if c.p.modules[c.module as usize].in_package and c.p.manifest_of(c.module).strict_unsafe and not safety_comment(c, ck.child(c, s, 0)) {
                 let sp = ck.span_of(c, s);
                 ck.report(c, codes.NO_SAFETY_COMMENT, sp, "this package sets strict_unsafe: say why the block is safe in a '// SAFETY:' comment at its start");
             }

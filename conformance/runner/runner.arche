@@ -705,8 +705,8 @@ fn ends_with(s: str, suffix: str) -> bool {
 }
 
 /// Adds path if it is a file, or every *.arche file below it if it is a
-/// directory, leaving out names that start with '_' or '.', and package
-/// manifests (package.arche).
+/// directory, leaving out names that start with '_' or '.', vendor/ and
+/// build/ directories, and package manifests (package.arche).
 fn collect(fs: &std.Fs, path: str, files: &mut alloc.List(alloc.String), a: alloc.Allocator) -> bool {
     if not fs.exists(path) {
         return false;
@@ -715,7 +715,8 @@ fn collect(fs: &std.Fs, path: str, files: &mut alloc.List(alloc.String), a: allo
         ok(names) => {
             for n in names.items() {
                 let name = n.view();
-                if name.starts_with(".") or name.starts_with("_") {
+                // Support files, and a package's dependencies and build.
+                if name.starts_with(".") or name.starts_with("_") or name.eq("vendor") or name.eq("build") {
                     continue;
                 }
                 var child = alloc.String.init(a);

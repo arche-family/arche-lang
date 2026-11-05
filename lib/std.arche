@@ -186,6 +186,19 @@ pub type Fs = struct {
         return bytes;
     }
 
+    /// Writes bytes, which need not be text, to a file, made or emptied.
+    pub fn write_bytes(self: &Fs, path: str, data: []u8) -> IoError!void {
+        var code: u16 = 0;
+        unsafe {
+            // SAFETY: both are read during the call only.
+            let fs = mem.null(u8) as *u8;
+            code = a0rt_write_file(fs: fs, path: mem.str_data(path), path_len: path.len() as u64, data: mem.slice_data(u8, data) as *u8, len: data.len() as u64);
+        }
+        if code != 0 {
+            return io_error(code);
+        }
+    }
+
     pub fn write_file(self: &Fs, path: str, data: str) -> IoError!void {
         var code: u16 = 0;
         unsafe {

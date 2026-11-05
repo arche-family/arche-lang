@@ -75,16 +75,17 @@ jobs:
       - name: Fuzz HTTP
         run: ./fuzz/http.sh 60
 
-  # docs/sprints.md S24: the build driver. A build from the cache is
-  # bit-identical to a clean one, and every conformance test passes when
-  # each module is compiled on its own.
+  # docs/sprints.md S24, S25: the build driver and the package manager. A
+  # build from the cache is bit-identical to a clean one, every conformance
+  # test passes when each module is compiled on its own, and packages with
+  # a bad hash or signature are refused.
   driver:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build the Arche compiler and the driver
         run: make -C stage0 && make -C compiler && make -C conformance && make -C driver
-      - name: Clean and cached builds are bit-identical
+      - name: Cached builds, and signed packages over HTTPS
         run: make -C driver check
       - name: Conformance tests, one object per module
         run: cd compiler && ../conformance/runner/build/runner --timeout 60 --compiler ./arche-build-units ../conformance/tests

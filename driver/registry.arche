@@ -1,0 +1,94 @@
+/// arche-registry: serves a registry directory (pkg.arche) over HTTPS,
+/// read-only. Its contents are content-addressed objects and signed
+/// release records, so the server need not be trusted: a client checks
+/// every signature and hash itself.
+///
+///     arche-registry <dir> <port> <chain-file> <key-file> [connections]
+import alloc;
+import crypto.random;
+import http;
+import http.server;
+import std;
+import tls;
+
+fn number(text: str) -> u64 {
+    var v: u64 = 0;
+    for c in text.bytes() {
+        if c.* >= '0' and c.* <= '9' {
+            v = v * 10 + (c.* - '0') as u64;
+        }
+    }
+    return v;
+}
+
+/// Whether a request path names a file under the directory: no "..", no
+/// empty or hidden parts.
+fn safe(path: []u8) -> bool {
+    if path.len() < 2 or path[0] != '/' {
+        return false;
+    }
+    var start: usize = 1;
+    var i: usize = 1;
+    while i <= path.len() : (i += 1) {
+        if i == path.len() or path[i] == '/' {
+            if i == start or path[start] == '.' {
+                return false;
+            }
+            start = i + 1;
+        }
+    }
+    for c in path {
+        if c.* == '?' or c.* == '%' or c.* == '\\' {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() != 5 and sys.args.len() != 6 {
+        sys.stderr.write("usage: arche-registry <dir> <port> <chain-file> <key-file> [connections]\n");
+        sys.proc.exit(2);
+    }
+    let a = sys.alloc;
+    var root = alloc.String.init(a);
+    root.push_str(sys.args.get(1));
+    let port = number(sys.args.get(2)) as u16;
+    var config = tls.ServerConfig.init(a);
+    let chain = try sys.fs.read_file(sys.args.get(3), a);
+    try config.certificates_pem(chain.view(), a);
+    let key = try sys.fs.read_file(sys.args.get(4), a);
+    try config.private_key_pem(key.view(), a);
+    config.accept_protocol("http/1.1");
+    var options = server.Options.init();
+    if sys.args.len() == 6 {
+        options.connections = number(sys.args.get(5));
+    }
+    var listener = try sys.net.listen(std.Address { ip: [127, 0, 0, 1], port: port });
+    sys.stdout.write("ready\n");
+    sys.stdout.flush();
+    let fs = &sys.fs;
+    let handler = fn [fs, &root](req: &http.Request, resp: &mut http.Response) {
+        if not req.method.view().eq("GET") {
+            resp.status = 405;
+            return;
+        }
+        let path = req.path();
+        if not safe(path.bytes()) {
+            resp.status = 404;
+            return;
+        }
+        var file = alloc.String.init(resp.alloc);
+        file.push_str(root.view());
+        file.push_str(path);
+        match fs.read_bytes(file.view(), resp.alloc) {
+            ok(data) => {
+                resp.headers.add(name: "content-type", value: "application/octet-stream");
+                resp.write_bytes(data.items());
+            }
+            err(_) => { resp.status = 404; }
+        }
+    };
+    try server.serve_tls(&listener, config: &config, handler: &handler, options: options, proc: &sys.proc, seeds: random.Csprng.init(&mut sys.rand), a);
+    listener.close();
+}
