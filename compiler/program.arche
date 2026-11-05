@@ -37,6 +37,37 @@ pub type Options = struct {
     pub tests: bool,
     /// A release build: the IR is optimized (ir/opt.arche).
     pub release: bool,
+    /// Files whose text is elsewhere: an editor's unsaved buffers.
+    pub overlays: alloc.List(Overlay),
+    /// The package's root, when the file is not at it; empty: its directory.
+    pub package: alloc.String,
+    /// The root file need not have a main: any module, checked on its own.
+    pub no_main: bool,
+}
+
+/// A file whose text is to be read from another one.
+pub type Overlay = struct {
+    pub path: alloc.String,
+    pub text_path: alloc.String,
+}
+
+/// The overlay of a path, if it has one.
+pub fn overlay_of(opts: &Options, path: str) -> ?usize {
+    var i: usize = 0;
+    while i < opts.overlays.len() : (i += 1) {
+        if opts.overlays[i].path.view().eq(path) {
+            return i;
+        }
+    }
+    return none;
+}
+
+/// A source file's text, from its overlay when it has one.
+fn read_source(fs: &std.Fs, opts: &Options, path: str, a: alloc.Allocator) -> std.IoError!alloc.String {
+    match overlay_of(opts, path: path) {
+        some(i) => { return fs.read_file(opts.overlays[i].text_path.view(), a); }
+        none => { return fs.read_file(path, a); }
+    }
 }
 
 pub type Module = struct {
@@ -125,6 +156,8 @@ pub type Program = struct {
     pub tests: bool,
     /// Whether the checker keeps where each name is used (arche query).
     pub record_uses: bool,
+    /// The root file need not have a main (Options.no_main).
+    pub no_main: bool,
     /// What the package's manifest declares (manifest.arche).
     pub manifest: manifest.Manifest,
     /// The dependencies package.lock lists, vendored in vendor/<name>/.
@@ -434,24 +467,40 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         panic_handler: handler,
         tests: opts.tests,
         record_uses: false,
+        no_main: opts.no_main,
         manifest: manifest.defaults(a),
         deps: alloc.List(Dep).init(a),
         root_dir: alloc.String.init(a),
     };
-    var slash: ?usize = none;
-    var i: usize = 0;
-    while i < path.len() : (i += 1) {
-        if path[i] == '/' {
-            slash = some(i);
+    var base = path;
+    var at_package = false;
+    if opts.package.len() > 0 {
+        var dir = alloc.String.init(a);
+        dir.push_str(opts.package.view());
+        if dir.view()[dir.len() - 1] != '/' {
+            dir.push_str("/");
+        }
+        if path.starts_with(dir.view()) {
+            p.root_dir.push_str(dir.view());
+            base = path[dir.len()..path.len()];
+            at_package = true;
         }
     }
-    var base = path;
-    match slash {
-        some(s) => {
-            p.root_dir.push_str(path[0..s + 1]);
-            base = path[s + 1..path.len()];
+    if not at_package {
+        var slash: ?usize = none;
+        var i: usize = 0;
+        while i < path.len() : (i += 1) {
+            if path[i] == '/' {
+                slash = some(i);
+            }
         }
-        none => { }
+        match slash {
+            some(s) => {
+                p.root_dir.push_str(path[0..s + 1]);
+                base = path[s + 1..path.len()];
+            }
+            none => { }
+        }
     }
     var manifest_path = alloc.String.init(a);
     manifest_path.push_str(p.root_dir.view());
@@ -459,7 +508,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
     var manifest_problems = diag.Diagnostics.init(a);
     var manifest_tree = cst.Tree { tokens: alloc.List(tk.Token).init(a), nodes: alloc.List(cst.Node).init(a), children: alloc.List(cst.NodeId).init(a), root: cst.NodeId { index: 0 } };
     var manifest_text = alloc.String.init(a);
-    match fs.read_file(manifest_path.view(), a) {
+    match read_source(fs, opts, path: manifest_path.view(), a: a) {
         ok(mtext) => {
             p.full = true;
             p.lib_alloc = true;
@@ -489,9 +538,24 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
     if base.len() > 6 and base[base.len() - 6..base.len()].eq(".arche") {
         stem = base[0..base.len() - 6];
     }
+    // Below the package's root, its path names it: a/b.arche is a.b.
+    var dotted_root = alloc.String.init(a);
+    var dotted_ok = stem.len() > 0;
+    var part: usize = 0;
+    var at: usize = 0;
+    while at <= stem.len() : (at += 1) {
+        if at == stem.len() or stem[at] == '/' {
+            dotted_ok = dotted_ok and is_identifier(stem[part..at]);
+            if part > 0 {
+                dotted_root.push_str(".");
+            }
+            dotted_root.push_str(stem[part..at]);
+            part = at + 1;
+        }
+    }
     var root_name = "";
-    if is_identifier(stem) {
-        root_name = stem;
+    if dotted_ok {
+        root_name = dotted_root.view();
     }
     let root_full = p.full;
     read_lock(fs, p: &mut p, a: a);
@@ -536,7 +600,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
                 shown.push_str(r.file.view());
             }
             let module_full = from_lib or p.full;
-            match fs.read_file(full.view(), a) {
+            match read_source(fs, opts, path: full.view(), a: a) {
                 ok(source) => {
                     _ = add_module(&mut p, name: r.dotted.view(), path: full.view(), display: shown.view(), source, full: module_full, package: r.package);
                 }

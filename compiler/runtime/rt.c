@@ -1456,7 +1456,8 @@ _Noreturn void a0rt_start(i64 *sp) {
 // the machine has processors (--jobs n to choose); each one's output is
 // kept and shown after its result line, in the tests' order, so a run reads
 // the same however the children interleave. The seed is always printed;
-// --seed repeats a run, --filter runs the tests whose names contain a text.
+// --seed repeats a run, --filter runs the tests whose names contain a text,
+// and --json writes the report as JSON, for editors.
 
 typedef struct {
     const u8 *name;
@@ -1633,10 +1634,47 @@ static void collect(Run *runs, u64 count) {
     }
 }
 
+// Text as a JSON string; a byte that is not part of valid UTF-8 goes as U+FFFD.
+static void say_json_string(const u8 *p, u64 n) {
+    static const char hex[] = "0123456789abcdef";
+    say("\"");
+    u64 i = 0;
+    while (i < n) {
+        u8 c = p[i];
+        if (c == '"' || c == '\\') {
+            a0rt_write_byte(&out_fd, '\\');
+            a0rt_write_byte(&out_fd, c);
+            i++;
+        } else if (c == '\n') {
+            say("\\n");
+            i++;
+        } else if (c < 0x20 || c == 0x7f) {
+            say("\\u00");
+            a0rt_write_byte(&out_fd, (u8)hex[c >> 4]);
+            a0rt_write_byte(&out_fd, (u8)hex[c & 15]);
+            i++;
+        } else if (c < 0x80) {
+            a0rt_write_byte(&out_fd, c);
+            i++;
+        } else {
+            u64 len = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+            if (i + len <= n && valid_utf8(p + i, len)) {
+                a0rt_write(&out_fd, p + i, len);
+                i += len;
+            } else {
+                say("\\ufffd");
+                i++;
+            }
+        }
+    }
+    say("\"");
+}
+
 u16 a0rt_run_tests(System *sys) {
     Str filter = {(const u8 *)"", 0};
     u64 seed = 0;
     int seeded = 0;
+    int json = 0;
     u64 jobs = 0;
     for (u64 i = 1; i < sys->nargs; i++) {
         Str a = sys->args[i];
@@ -1647,8 +1685,10 @@ u16 a0rt_run_tests(System *sys) {
             i++;
         } else if (i + 1 < sys->nargs && a.len == 6 && memcmp(a.ptr, "--jobs", 6) == 0 && parse_u64(&sys->args[i + 1], &jobs) && jobs > 0) {
             i++;
+        } else if (a.len == 6 && memcmp(a.ptr, "--json", 6) == 0) {
+            json = 1;
         } else {
-            say("usage: <test binary> [--filter <text>] [--seed <number>] [--jobs <number>]\n");
+            say("usage: <test binary> [--filter <text>] [--seed <number>] [--jobs <number>] [--json]\n");
             exit_with(2);
         }
     }
@@ -1663,9 +1703,15 @@ u16 a0rt_run_tests(System *sys) {
         sys3(SYS_CLOCK_GETTIME, 1, (i64)ts, 0);
         seed = mix((u64)ts[0] * 1000000000UL + (u64)ts[1] + (u64)sys1(SYS_GETPID, 0));
     }
-    say("seed: ");
-    a0rt_write_u64(&out_fd, seed);
-    say("\n");
+    if (json) {
+        say("{\"seed\": ");
+        a0rt_write_u64(&out_fd, seed);
+        say(", \"tests\": [");
+    } else {
+        say("seed: ");
+        a0rt_write_u64(&out_fd, seed);
+        say("\n");
+    }
     flush_all();
     u64 count = &a0_test_count ? a0_test_count : 0;
     Run *runs = a0rt_alloc((count ? count : 1) * sizeof(Run));
@@ -1689,18 +1735,27 @@ u16 a0rt_run_tests(System *sys) {
             Run *r = &runs[shown];
             if (r->state == 2) {
                 const TestEntry *t = &a0_tests[shown];
-                say("test ");
-                a0rt_write(&out_fd, t->name, t->name_len);
                 if (r->status == 0) {
-                    say(" ... ok\n");
                     passed++;
                 } else {
-                    say(" ... FAILED\n");
                     failed++;
                 }
-                a0rt_write(&out_fd, r->stdout_kept.data, r->stdout_kept.len);
-                flush_all();
-                a0rt_write(&err_fd, r->stderr_kept.data, r->stderr_kept.len);
+                if (json) {
+                    say(passed + failed > 1 ? ",\n  {\"name\": " : "\n  {\"name\": ");
+                    say_json_string(t->name, t->name_len);
+                    say(r->status == 0 ? ", \"ok\": true, \"stdout\": " : ", \"ok\": false, \"stdout\": ");
+                    say_json_string(r->stdout_kept.data, r->stdout_kept.len);
+                    say(", \"stderr\": ");
+                    say_json_string(r->stderr_kept.data, r->stderr_kept.len);
+                    say("}");
+                } else {
+                    say("test ");
+                    a0rt_write(&out_fd, t->name, t->name_len);
+                    say(r->status == 0 ? " ... ok\n" : " ... FAILED\n");
+                    a0rt_write(&out_fd, r->stdout_kept.data, r->stdout_kept.len);
+                    flush_all();
+                    a0rt_write(&err_fd, r->stderr_kept.data, r->stderr_kept.len);
+                }
                 flush_all();
                 r->state = 3;
                 running--;
@@ -1711,16 +1766,28 @@ u16 a0rt_run_tests(System *sys) {
             collect(runs, next);
         }
     }
-    a0rt_write_u64(&out_fd, passed);
-    say(" passed, ");
-    a0rt_write_u64(&out_fd, failed);
-    say(" failed, ");
-    a0rt_write_u64(&out_fd, skipped);
-    say(" filtered out\n");
+    if (json) {
+        say(passed + failed > 0 ? "\n], \"passed\": " : "], \"passed\": ");
+        a0rt_write_u64(&out_fd, passed);
+        say(", \"failed\": ");
+        a0rt_write_u64(&out_fd, failed);
+        say(", \"filtered\": ");
+        a0rt_write_u64(&out_fd, skipped);
+        say("}\n");
+    } else {
+        a0rt_write_u64(&out_fd, passed);
+        say(" passed, ");
+        a0rt_write_u64(&out_fd, failed);
+        say(" failed, ");
+        a0rt_write_u64(&out_fd, skipped);
+        say(" filtered out\n");
+    }
     if (failed) {
-        say("rerun with --seed ");
-        a0rt_write_u64(&out_fd, seed);
-        say("\n");
+        if (!json) {
+            say("rerun with --seed ");
+            a0rt_write_u64(&out_fd, seed);
+            say("\n");
+        }
         exit_with(1);
     }
     return 0;

@@ -8,7 +8,8 @@
 ///     arche fix --edition <N> <file>   move the file's package to edition N
 ///     arche explain <code>          what an error code means, with an example
 ///     arche fmt [--check] <file>    lay the file out the one way (syntax/fmt.arche)
-///     arche query <what> <file> <line>:<column>   def, refs, type or callers
+///     arche query [--json] <what> <file> <line>:<column>   def, refs, type, callers or hover
+///     arche complete <file> <line>:<column>   what may be written there, as JSON
 ///     arche doc <file> <module>     its public items and their comments, as Markdown
 ///     arche build <file> <out.ll>   compile it to LLVM IR (arche-build links it)
 ///     arche units <file> <dir>      the same, one LLVM module per module (arche-driver)
@@ -21,6 +22,7 @@
 import std;
 import alloc;
 import diag;
+import complete;
 import doc;
 import explain;
 import program;
@@ -46,7 +48,8 @@ fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("       arche fix --edition <year> <file>   move the package to an edition\n");
     err_out.write("       arche explain [--example] <code>   what an error code means, or just its example\n");
     err_out.write("       arche fmt [--check] <file>      lay the file out; --check only says whether it is\n");
-    err_out.write("       arche query def|refs|type|callers <file> <line>:<column>\n");
+    err_out.write("       arche query [--json] def|refs|type|callers|hover <file> <line>:<column>\n");
+    err_out.write("       arche complete <file> <line>:<column>   what may be written there, as JSON\n");
     err_out.write("       arche doc <file> <module>        the module's documentation, as Markdown\n");
     err_out.write("       arche doc --tests <file> <module> <out.arche>   its examples, as tests\n");
     err_out.write("       arche tokens <file>\n");
@@ -56,7 +59,8 @@ fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("       arche build-plan <build.arche>  the programs it lists, as name<TAB>root lines\n");
     err_out.write("       arche manifest <package.arche>  its fields, one a line, for arche-driver\n");
     err_out.write("       arche test <file> <out.ll>     the test blocks of <file>, run by std.testing\n");
-    err_out.write("options, before the command: --release, --lib-alloc, --lib-std, --target <linux-x86_64 | freestanding-x86_64 |\n");
+    err_out.write("options, before the command: --overlay <file> <text-file>, --package <dir>, --no-main, --release, --lib-alloc, --lib-std,\n");
+    err_out.write("       --target <linux-x86_64 | freestanding-x86_64 |\n");
     err_out.write("       freestanding-riscv64>, --panic-handler <module.function>\n");
     return Failure.BadUsage;
 }
@@ -154,6 +158,62 @@ fn read(fs: &std.Fs, err_out: &mut std.Output, path: str, a: alloc.Allocator) ->
     }
 }
 
+/// The root file's text, from its overlay when it has one (--overlay).
+fn read_root(fs: &std.Fs, err_out: &mut std.Output, path: str, opts: &program.Options, a: alloc.Allocator) -> Failure!alloc.String {
+    match program.overlay_of(opts, path: path) {
+        some(i) => { return read(fs, err_out, opts.overlays[i].text_path.view(), a); }
+        none => { return read(fs, err_out, path, a); }
+    }
+}
+
+/// Whether the path's file name is name.
+fn file_is(path: str, name: str) -> bool {
+    var cut: usize = 0;
+    var i: usize = 0;
+    while i < path.len() : (i += 1) {
+        if path[i] == '/' {
+            cut = i + 1;
+        }
+    }
+    return path[cut..path.len()].eq(name);
+}
+
+/// Checks a manifest or a build file, which are read, not compiled.
+fn check_declarations(
+    out: &mut std.Output,
+    err_out: &mut std.Output,
+    path: str,
+    text: str,
+    json: bool,
+    a: alloc.Allocator,
+) -> Failure!void {
+    var lexed = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(text, true, &mut lexed, a);
+    let parsed = parser.parse(tokens, text, true, lexed, a);
+    var problems = parsed.diags;
+    if problems.count() == 0 {
+        if file_is(path: path, name: "package.arche") {
+            _ = manifest.read(parsed.tree, text: text, diags: &mut problems, a: a);
+        } else {
+            _ = manifest.read_build(parsed.tree, text: text, diags: &mut problems, a: a);
+        }
+    }
+    if json {
+        var first = true;
+        out.write("[");
+        diag.write_json(out, &problems, 0, path: path, text: text, first: &mut first);
+        if not first {
+            out.write("\n");
+        }
+        out.write("]\n");
+    } else {
+        diag.write_text(err_out, &problems, 0, path: path, text: text);
+    }
+    if problems.count() > 0 {
+        return Failure.ErrorsFound;
+    }
+}
+
 fn check(
     out: &mut std.Output,
     err_out: &mut std.Output,
@@ -163,7 +223,11 @@ fn check(
     json: bool,
     opts: &program.Options,
 ) -> Failure!void {
-    let source = try read(fs, err_out, path, a);
+    let source = try read_root(fs, err_out, path: path, opts: opts, a: a);
+    if file_is(path: path, name: "package.arche") or file_is(path: path, name: "build.arche") {
+        try check_declarations(out: out, err_out: err_out, path: path, text: source.view(), json: json, a: a);
+        return;
+    }
     var p = program.load(fs, path: path, source, a, opts);
     if p.diags.count() == 0 {
         p = sema.check(p);
@@ -382,7 +446,7 @@ fn line_column(text: str) -> ?[2]u32 {
 }
 
 /// `arche query`: what the name at line:column of the file is (query.arche).
-fn query_at(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, what: str, path: str, at: str, opts: &program.Options) -> Failure!void {
+fn query_at(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, what: str, path: str, at: str, json: bool, opts: &program.Options) -> Failure!void {
     var lc: [2]u32 = [0, 0];
     match line_column(at) {
         some(v) => { lc = v; }
@@ -391,7 +455,7 @@ fn query_at(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: allo
             return Failure.BadUsage;
         }
     }
-    let source = try read(fs, err_out, path, a);
+    let source = try read_root(fs, err_out, path: path, opts: opts, a: a);
     var p = program.load(fs, path: path, source, a, opts);
     if p.diags.count() > 0 {
         program.write_diagnostics(err_out, &p, false);
@@ -399,11 +463,29 @@ fn query_at(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: allo
     }
     p.record_uses = true;
     let c = sema.analyze(p);
-    if c.p.diags.count() > 0 {
+    // A file with type errors still gets answers from JSON's users, editors,
+    // which show the errors on their own.
+    if c.p.diags.count() > 0 and not json {
         program.write_diagnostics(err_out, &c.p, false);
         return Failure.ErrorsFound;
     }
-    if not query.run(out: out, err_out: err_out, c: &c, what: what, line: lc[0], column: lc[1], a: a) {
+    if not query.run(out: out, err_out: err_out, c: &c, what: what, line: lc[0], column: lc[1], json: json, a: a) {
+        return Failure.BadUsage;
+    }
+}
+
+/// `arche complete` (complete.arche).
+fn complete_at(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, at: str, opts: &program.Options) -> Failure!void {
+    var lc: [2]u32 = [0, 0];
+    match line_column(at) {
+        some(v) => { lc = v; }
+        none => {
+            err_out.write("arche complete: the place is written line:column, like 12:5\n");
+            return Failure.BadUsage;
+        }
+    }
+    let source = try read_root(fs, err_out, path: path, opts: opts, a: a);
+    if not complete.run(out: out, err_out: err_out, fs: fs, path: path, text: source.view(), line: lc[0], column: lc[1], opts: opts, a: a) {
         return Failure.BadUsage;
     }
 }
@@ -962,6 +1044,9 @@ fn main(sys: &mut std.System) -> !void {
         panic_handler: alloc.String.init(sys.alloc),
         tests: false,
         release: false,
+        overlays: alloc.List(program.Overlay).init(sys.alloc),
+        package: alloc.String.init(sys.alloc),
+        no_main: false,
     };
     var first: usize = 1;
     while first + 1 < n and sys.args.get(first).starts_with("--") : (first += 1) {
@@ -972,6 +1057,18 @@ fn main(sys: &mut std.System) -> !void {
             opts.lib_std = true;
         } else if o.eq("--release") {
             opts.release = true;
+        } else if o.eq("--no-main") {
+            opts.no_main = true;
+        } else if o.eq("--package") and first + 2 < n {
+            first += 1;
+            opts.package.push_str(sys.args.get(first));
+        } else if o.eq("--overlay") and first + 3 < n {
+            var file = alloc.String.init(sys.alloc);
+            file.push_str(sys.args.get(first + 1));
+            var text_file = alloc.String.init(sys.alloc);
+            text_file.push_str(sys.args.get(first + 2));
+            opts.overlays.push(program.Overlay { path: file, text_path: text_file });
+            first += 2;
         } else if o.eq("--target") {
             first += 1;
             match program.target_by_name(sys.args.get(first)) {
@@ -1008,7 +1105,11 @@ fn main(sys: &mut std.System) -> !void {
     } else if command.eq("fmt") and count == 4 and sys.args.get(2 + k).eq("--check") {
         try format_file(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3 + k), check_only: true);
     } else if command.eq("query") and count == 5 {
-        try query_at(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, what: sys.args.get(2 + k), path: sys.args.get(3 + k), at: sys.args.get(4 + k), opts: &opts);
+        try query_at(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, what: sys.args.get(2 + k), path: sys.args.get(3 + k), at: sys.args.get(4 + k), json: false, opts: &opts);
+    } else if command.eq("query") and count == 6 and sys.args.get(2 + k).eq("--json") {
+        try query_at(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, what: sys.args.get(3 + k), path: sys.args.get(4 + k), at: sys.args.get(5 + k), json: true, opts: &opts);
+    } else if command.eq("complete") and count == 4 {
+        try complete_at(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), at: sys.args.get(3 + k), opts: &opts);
     } else if command.eq("doc") and count == 4 {
         try document(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), module: sys.args.get(3 + k), tests_path: "");
     } else if command.eq("doc") and count == 6 and sys.args.get(2 + k).eq("--tests") {

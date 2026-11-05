@@ -4,16 +4,14 @@
 /// works fails a test.
 import alloc;
 import diag;
+import program;
 import syntax.lexer;
 import syntax.parser;
 import syntax.cst;
 import syntax.token as tk;
 
 /// A parsed file and its text.
-type File = struct {
-    tree: cst.Tree,
-    text: alloc.String,
-}
+type File = program.Module;
 
 fn parse(text: str, a: alloc.Allocator) -> ?File {
     var lexed = diag.Diagnostics.init(a);
@@ -22,19 +20,32 @@ fn parse(text: str, a: alloc.Allocator) -> ?File {
     if parsed.diags.count() > 0 {
         return none;
     }
-    var copy = alloc.String.init(a);
-    copy.push_str(text);
-    return File { tree: parsed.tree, text: copy };
+    return parse_any(text, a);
 }
 
-fn token_text(f: &File, t: u32) -> str {
-    let tok = f.tree.tokens[t as usize];
-    return f.text.view()[tok.start as usize..(tok.start + tok.len) as usize];
+/// The file's syntax tree, whatever errors it has: the parser recovers.
+pub fn parse_any(text: str, a: alloc.Allocator) -> File {
+    var lexed = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(text, true, &mut lexed, a);
+    let parsed = parser.parse(tokens, text, true, lexed, a);
+    var copy = alloc.String.init(a);
+    copy.push_str(text);
+    return File {
+        name: alloc.String.init(a),
+        path: alloc.String.init(a),
+        display: alloc.String.init(a),
+        text: copy,
+        tree: parsed.tree,
+        full: true,
+        edition: 2026,
+        in_package: true,
+        package: 0,
+    };
 }
 
 /// The doc comment lines just before the token at, without their `///`
 /// and the space after it.
-fn doc_before(f: &File, at: u32, a: alloc.Allocator) -> alloc.List(alloc.String) {
+pub fn doc_before(f: &File, at: u32, a: alloc.Allocator) -> alloc.List(alloc.String) {
     var lines = alloc.List(alloc.String).init(a);
     var first = at;
     while first > 0 {
@@ -43,7 +54,7 @@ fn doc_before(f: &File, at: u32, a: alloc.Allocator) -> alloc.List(alloc.String)
             first -= 1;
         } else if k == tk.Kind.Whitespace {
             // A blank line ends the comment that belongs to the item.
-            let w = token_text(f, first - 1);
+            let w = f.token_text(first - 1);
             var newlines: u32 = 0;
             var i: usize = 0;
             while i < w.len() : (i += 1) {
@@ -62,7 +73,7 @@ fn doc_before(f: &File, at: u32, a: alloc.Allocator) -> alloc.List(alloc.String)
     var t = first;
     while t < at : (t += 1) {
         if f.tree.tokens[t as usize].kind == tk.Kind.DocComment {
-            let s = token_text(f, t);
+            let s = f.token_text(t);
             var start: usize = 3;
             if s.len() > 3 and s[3] == ' ' {
                 start = 4;
@@ -77,7 +88,7 @@ fn doc_before(f: &File, at: u32, a: alloc.Allocator) -> alloc.List(alloc.String)
 
 /// The significant tokens of a node from its first up to (not with) the
 /// first `{` of its own, or all of them, as text with single spaces.
-fn signature(f: &File, n: cst.NodeId, out: &mut alloc.String) {
+pub fn signature(f: &File, n: cst.NodeId, out: &mut alloc.String) {
     let node = f.tree.node(n);
     var t = f.tree.first_token(n);
     var first = true;
@@ -95,7 +106,7 @@ fn signature(f: &File, n: cst.NodeId, out: &mut alloc.String) {
         } else if (k == tk.Kind.RParen or k == tk.Kind.RBracket) and depth > 0 {
             depth -= 1;
         }
-        let w = token_text(f, t);
+        let w = f.token_text(t);
         // Spaces as the source has them, one at most.
         if not first and t > 0 and f.tree.tokens[(t - 1) as usize].kind == tk.Kind.Whitespace {
             out.push_str(" ");
@@ -115,7 +126,7 @@ fn item_name(f: &File, n: cst.NodeId) -> str {
     var t = f.tree.first_token(n);
     while t < node.end : (t += 1) {
         if f.tree.tokens[t as usize].kind == tk.Kind.Ident {
-            return token_text(f, t);
+            return f.token_text(t);
         }
     }
     return "";
@@ -150,7 +161,7 @@ fn item_markdown(f: &File, n: cst.NodeId, owner: str, out: &mut alloc.String, a:
 
 /// The module's documentation as Markdown, or none when it does not parse.
 pub fn markdown(text: str, module: str, a: alloc.Allocator) -> ?alloc.String {
-    var f = File { tree: parse_or_empty(a), text: alloc.String.init(a) };
+    var f = empty_file(a);
     match parse(text, a) {
         some(p) => { f = p; }
         none => { return none; }
@@ -190,10 +201,20 @@ pub fn markdown(text: str, module: str, a: alloc.Allocator) -> ?alloc.String {
     return out;
 }
 
-fn parse_or_empty(a: alloc.Allocator) -> cst.Tree {
+fn empty_file(a: alloc.Allocator) -> File {
     var lexed = diag.Diagnostics.init(a);
     let tokens = lexer.lex("", true, &mut lexed, a);
-    return parser.parse(tokens, "", true, lexed, a).tree;
+    return File {
+        name: alloc.String.init(a),
+        path: alloc.String.init(a),
+        display: alloc.String.init(a),
+        text: alloc.String.init(a),
+        tree: parser.parse(tokens, "", true, lexed, a).tree,
+        full: true,
+        edition: 2026,
+        in_package: true,
+        package: 0,
+    };
 }
 
 /// Whether text has the line.
@@ -297,7 +318,7 @@ fn add_examples(lines: &alloc.List(alloc.String), item: str, imports: &mut alloc
 /// A file of tests from the examples in the module's comments; how many
 /// there are goes to count. The module is imported as module (dotted).
 pub fn examples(text: str, module: str, count: &mut u32, a: alloc.Allocator) -> ?alloc.String {
-    var f = File { tree: parse_or_empty(a), text: alloc.String.init(a) };
+    var f = empty_file(a);
     match parse(text, a) {
         some(p) => { f = p; }
         none => { return none; }

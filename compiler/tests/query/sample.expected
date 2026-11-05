@@ -24,3 +24,17 @@ $ arche query def query/sample.arche 12:13
 query/sample.arche:3:6
 $ arche query type query/sample.arche 19:28
 u32
+$ arche query hover query/sample.arche 13:14
+fn area(width: u32, height: u32) -> u32
+$ arche query --json def query/sample.arche 13:14
+[{"file": "query/sample.arche", "line": 8, "column": 4, "end_line": 8, "end_column": 8}]
+$ arche query --json refs query/sample.arche 8:5
+[{"file": "query/sample.arche", "line": 8, "column": 4, "end_line": 8, "end_column": 8, "declared": true}, {"file": "query/sample.arche", "line": 13, "column": 13, "end_line": 13, "end_column": 17}, {"file": "query/sample.arche", "line": 14, "column": 16, "end_line": 14, "end_column": 20}, {"file": "query/sample.arche", "line": 19, "column": 28, "end_line": 19, "end_column": 32}]
+$ arche query --json callers query/sample.arche 8:5
+[{"file": "query/sample.arche", "line": 13, "column": 13, "end_line": 13, "end_column": 17, "in": "twice"}, {"file": "query/sample.arche", "line": 14, "column": 16, "end_line": 14, "end_column": 20, "in": "twice"}, {"file": "query/sample.arche", "line": 19, "column": 28, "end_line": 19, "end_column": 32, "in": "main"}]
+$ arche query --json type query/sample.arche 13:27
+{"type": "u32"}
+$ arche query --json hover query/sample.arche 13:14
+{"signature": "fn area(width: u32, height: u32) -> u32", "doc": "", "type": "u32"}
+$ arche query --json hover query/sample.arche 13:27
+{"signature": "x: u32", "doc": "", "type": "u32"}

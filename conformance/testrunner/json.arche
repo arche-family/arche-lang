@@ -1,0 +1,27 @@
+// test: run
+// spec: std.testing
+// stage0: skip
+// exit: 1
+// args: --json --seed 7 --filter one
+// stdout: {"seed": 7, "tests": [
+// stdout:   {"name": "good one", "ok": true, "stdout": "", "stderr": ""},
+// stdout:   {"name": "bad one", "ok": false, "stdout": "a \"quoted\" line\n", "stderr": "panic: boom\n  at json.arche:22:5\n"}
+// stdout: ], "passed": 1, "failed": 1, "filtered": 1}
+import std;
+import std.testing;
+
+test "good one" {
+    let two: u32 = 2;
+    assert(two == 2);
+}
+
+test "bad one" (t: &mut testing.Test) {
+    let sys = t.system();
+    sys.stdout.write("a \"quoted\" line\n");
+    sys.stdout.flush();
+    panic("boom");
+}
+
+test "left out by the filter" {
+    assert(true);
+}

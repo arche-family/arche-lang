@@ -7,9 +7,15 @@
 ///     type     the type of the innermost expression there
 ///     callers  the calls of the function named there, with the function
 ///              each is in
+///     hover    the declaration's signature and comment, and the type there
+///
+/// With --json each answer is a JSON value: a list of places for def, refs
+/// and callers, an object for type and hover. A file with type errors still
+/// gets answers: what the checker could work out.
 import std;
 import alloc;
 import diag;
+import doc;
 import program;
 import sema.check as ck;
 import syntax.cst;
@@ -22,7 +28,7 @@ type Place = struct {
 }
 
 /// The offset of a line and a column (both from 1, the column in bytes).
-fn offset_of(text: str, line: u32, column: u32) -> ?u32 {
+pub fn offset_of(text: str, line: u32, column: u32) -> ?u32 {
     var l: u32 = 1;
     var i: usize = 0;
     while l < line and i < text.len() : (i += 1) {
@@ -169,8 +175,123 @@ fn type_at(c: &ck.Checker, at: Place) -> ?u32 {
     return best;
 }
 
+/// A place as JSON: its start and end.
+fn write_json_place(out: &mut std.Output, c: &ck.Checker, at: Place) {
+    let m = &c.p.modules[at.module as usize];
+    let t = m.tree.tokens[at.token as usize];
+    let from = diag.position(m.text.view(), t.start);
+    let to = diag.position(m.text.view(), t.start + t.len);
+    out.write("{\"file\": ");
+    diag.write_json_string(out, m.path.view());
+    out.write(", \"line\": ");
+    out.write_u64(from.line as u64);
+    out.write(", \"column\": ");
+    out.write_u64(from.column as u64);
+    out.write(", \"end_line\": ");
+    out.write_u64(to.line as u64);
+    out.write(", \"end_column\": ");
+    out.write_u64(to.column as u64);
+}
+
+fn write_places(out: &mut std.Output, c: &ck.Checker, target: Place, refs: &alloc.List(Place), with_fn: bool) {
+    out.write("[");
+    var wrote = false;
+    if not with_fn {
+        write_json_place(out, c, at: target);
+        out.write(", \"declared\": true}");
+        wrote = true;
+    }
+    let rs = refs.items();
+    var i: usize = 0;
+    while i < rs.len() : (i += 1) {
+        if wrote {
+            out.write(", ");
+        }
+        write_json_place(out, c, at: rs[i]);
+        if with_fn {
+            out.write(", \"in\": ");
+            diag.write_json_string(out, enclosing_fn(c, rs[i]));
+        }
+        out.write("}");
+        wrote = true;
+    }
+    out.write("]\n");
+}
+
+/// The first identifier of a node: the name of what it declares.
+fn first_name(m: &program.Module, n: cst.Node) -> u32 {
+    var t = n.first;
+    while t < n.end : (t += 1) {
+        if m.tree.tokens[t as usize].kind == tk.Kind.Ident {
+            return t;
+        }
+    }
+    return ck.NONE;
+}
+
+/// The declaration a token names, as its node, if it has a signature worth
+/// showing: a function, a type, a constant, a field, a variant, a parameter.
+fn declaration_of(m: &program.Module, token: u32) -> ?u32 {
+    let nodes = m.tree.nodes.items();
+    var i: usize = 0;
+    while i < nodes.len() : (i += 1) {
+        let k = nodes[i].kind;
+        if k == cst.Kind.FnDecl or k == cst.Kind.TypeDecl or k == cst.Kind.ConstDecl or k == cst.Kind.FieldDecl or k == cst.Kind.Variant or k == cst.Kind.Param {
+            if first_name(m, n: nodes[i]) == token {
+                return i as u32;
+            }
+        }
+    }
+    return none;
+}
+
+/// The hover text of a name: its signature, comment and type.
+fn hover(out: &mut std.Output, c: &ck.Checker, at: Place, target: Place, json: bool, a: alloc.Allocator) {
+    var signature = alloc.String.init(a);
+    var comment = alloc.String.init(a);
+    let m = &c.p.modules[target.module as usize];
+    match declaration_of(m, token: target.token) {
+        some(n) => {
+            let id = cst.NodeId { index: n };
+            doc.signature(m, id, out: &mut signature);
+            let lines = doc.doc_before(m, at: m.tree.first_token(id), a: a);
+            let ls = lines.items();
+            var i: usize = 0;
+            while i < ls.len() : (i += 1) {
+                comment.push_str(ls[i].view());
+                comment.push_str("\n");
+            }
+        }
+        none => { }
+    }
+    var type_text = alloc.String.init(a);
+    match type_at(c, at) {
+        some(n) => { ck.write_type(c, &mut type_text, c.node_types[at.module as usize][n as usize]); }
+        none => { }
+    }
+    if json {
+        out.write("{\"signature\": ");
+        diag.write_json_string(out, signature.view());
+        out.write(", \"doc\": ");
+        diag.write_json_string(out, comment.view());
+        out.write(", \"type\": ");
+        diag.write_json_string(out, type_text.view());
+        out.write("}\n");
+        return;
+    }
+    if signature.len() > 0 {
+        out.write(signature.view());
+        out.write("\n");
+    }
+    out.write(comment.view());
+    if signature.len() == 0 {
+        out.write(type_text.view());
+        out.write("\n");
+    }
+}
+
 /// Runs a query; false when there is nothing at the place.
-pub fn run(out: &mut std.Output, err_out: &mut std.Output, c: &ck.Checker, what: str, line: u32, column: u32, a: alloc.Allocator) -> bool {
+pub fn run(out: &mut std.Output, err_out: &mut std.Output, c: &ck.Checker, what: str, line: u32, column: u32, json: bool, a: alloc.Allocator) -> bool {
     let root: u32 = 0;
     var offset: u32 = 0;
     match offset_of(c.p.modules[root as usize].text.view(), line: line, column: column) {
@@ -191,14 +312,24 @@ pub fn run(out: &mut std.Output, err_out: &mut std.Output, c: &ck.Checker, what:
     let at = Place { module: root, token: token };
     let target = target_of(c, at);
     if what.eq("def") {
+        if json {
+            out.write("[");
+            write_json_place(out, c, at: target);
+            out.write("}]\n");
+            return true;
+        }
         write_place(out, c, target);
         out.write("\n");
         return true;
     }
     if what.eq("refs") {
+        let refs = references(c, target, a);
+        if json {
+            write_places(out, c, target: target, refs: &refs, with_fn: false);
+            return true;
+        }
         write_place(out, c, target);
         out.write(": declared\n");
-        let refs = references(c, target, a);
         var i: usize = 0;
         while i < refs.len() : (i += 1) {
             write_place(out, c, refs[i]);
@@ -220,6 +351,10 @@ pub fn run(out: &mut std.Output, err_out: &mut std.Output, c: &ck.Checker, what:
             return false;
         }
         let refs = references(c, target, a);
+        if json {
+            write_places(out, c, target: target, refs: &refs, with_fn: true);
+            return true;
+        }
         var k: usize = 0;
         while k < refs.len() : (k += 1) {
             write_place(out, c, refs[k]);
@@ -237,8 +372,14 @@ pub fn run(out: &mut std.Output, err_out: &mut std.Output, c: &ck.Checker, what:
             some(n) => {
                 var text = alloc.String.init(a);
                 ck.write_type(c, &mut text, c.node_types[root as usize][n as usize]);
-                out.write(text.view());
-                out.write("\n");
+                if json {
+                    out.write("{\"type\": ");
+                    diag.write_json_string(out, text.view());
+                    out.write("}\n");
+                } else {
+                    out.write(text.view());
+                    out.write("\n");
+                }
                 return true;
             }
             none => {
@@ -247,6 +388,10 @@ pub fn run(out: &mut std.Output, err_out: &mut std.Output, c: &ck.Checker, what:
             }
         }
     }
-    err_out.write("arche query: def, refs, type or callers\n");
+    if what.eq("hover") {
+        hover(out, c, at: at, target: target, json: json, a: a);
+        return true;
+    }
+    err_out.write("arche query: def, refs, type, callers or hover\n");
     return false;
 }

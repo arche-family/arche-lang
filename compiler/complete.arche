@@ -1,0 +1,591 @@
+/// arche complete (docs/sprints.md S36): what may be written at a place of a
+/// file, as a JSON list of labels, kinds and details.
+///
+/// After a dot, the members of what comes before it: a value's fields and
+/// methods, a type's variants and functions, a module's public items. The
+/// text there does not parse yet, so the checker sees it with the dot and
+/// the unfinished name taken out. Elsewhere, the names in scope, the module's
+/// items, the types and the keywords, from the syntax tree alone, so a file
+/// that does not parse still gets them. If a member's receiver cannot be
+/// worked out, the file's other words are offered instead of nothing.
+import std;
+import alloc;
+import diag;
+import doc;
+import program;
+import query;
+import sema.check as ck;
+import sema.expr;
+import sema.types as ty;
+import syntax.cst;
+import syntax.lexer;
+import syntax.token as tk;
+
+const NONE: u32 = 4294967295;
+
+type Item = struct {
+    label: alloc.String,
+    kind: alloc.String,
+    detail: alloc.String,
+}
+
+/// What is offered: each label once, starting with what is already written.
+type Results = struct {
+    items: alloc.List(Item),
+    prefix: alloc.String,
+    a: alloc.Allocator,
+
+    fn add(self: &mut Results, label: str, kind: str, detail: str) {
+        if not label.starts_with(self.prefix.view()) {
+            return;
+        }
+        var i: usize = 0;
+        while i < self.items.len() : (i += 1) {
+            if self.items[i].label.view().eq(label) {
+                return;
+            }
+        }
+        var l = alloc.String.init(self.a);
+        l.push_str(label);
+        var k = alloc.String.init(self.a);
+        k.push_str(kind);
+        var d = alloc.String.init(self.a);
+        d.push_str(detail);
+        self.items.push(Item { label: l, kind: k, detail: d });
+    }
+
+    fn write(self: &Results, out: &mut std.Output) {
+        out.write("[");
+        var i: usize = 0;
+        while i < self.items.len() : (i += 1) {
+            if i > 0 {
+                out.write(",");
+            }
+            out.write("\n  {\"label\": ");
+            diag.write_json_string(out, self.items[i].label.view());
+            out.write(", \"kind\": ");
+            diag.write_json_string(out, self.items[i].kind.view());
+            out.write(", \"detail\": ");
+            diag.write_json_string(out, self.items[i].detail.view());
+            out.write("}");
+        }
+        if self.items.len() > 0 {
+            out.write("\n");
+        }
+        out.write("]\n");
+    }
+}
+
+// ---- Names in scope, from the syntax tree --------------------------------------------
+
+fn token_end(m: &program.Module, t: u32) -> u32 {
+    let tok = m.tree.tokens[t as usize];
+    return tok.start + tok.len;
+}
+
+/// Whether the node reaches the offset: its first token starts before it,
+/// and its last ends at it or after.
+fn holds(m: &program.Module, n: cst.NodeId, offset: u32) -> bool {
+    let node = m.tree.node(n);
+    if node.end <= node.first {
+        return false;
+    }
+    let first = m.tree.tokens[m.tree.first_token(n) as usize].start;
+    return first <= offset and offset <= token_end(m, t: node.end - 1);
+}
+
+fn first_ident(m: &program.Module, n: cst.NodeId) -> u32 {
+    let node = m.tree.node(n);
+    var t = node.first;
+    while t < node.end : (t += 1) {
+        if m.tree.tokens[t as usize].kind == tk.Kind.Ident {
+            return t;
+        }
+    }
+    return NONE;
+}
+
+fn last_ident(m: &program.Module, n: cst.NodeId) -> u32 {
+    let node = m.tree.node(n);
+    var found = NONE;
+    var t = node.first;
+    while t < node.end : (t += 1) {
+        if m.tree.tokens[t as usize].kind == tk.Kind.Ident {
+            found = t;
+        }
+    }
+    return found;
+}
+
+fn add_token(m: &program.Module, t: u32, kind: str, detail: str, r: &mut Results) {
+    if t != NONE {
+        r.add(label: m.token_text(t), kind: kind, detail: detail);
+    }
+}
+
+/// The names a pattern binds.
+fn add_bindings(m: &program.Module, n: cst.NodeId, r: &mut Results) {
+    let node = m.tree.node(n);
+    if node.kind == cst.Kind.BindPat {
+        add_token(m, t: first_ident(m, n), kind: "variable", detail: "", r: r);
+    } else if node.kind == cst.Kind.FieldPat {
+        add_token(m, t: last_ident(m, n), kind: "variable", detail: "", r: r);
+    } else if node.kind == cst.Kind.SomePat or node.kind == cst.Kind.OkPat or node.kind == cst.Kind.ErrPat or node.kind == cst.Kind.VariantPat {
+        var i: u32 = 0;
+        while i < node.children_len : (i += 1) {
+            add_bindings(m, n: m.tree.child(node, i), r: r);
+        }
+    }
+}
+
+/// The locals in scope at the offset, innermost last, by walking down the
+/// nodes that hold it.
+fn add_locals(m: &program.Module, n: cst.NodeId, offset: u32, r: &mut Results, a: alloc.Allocator) {
+    let node = m.tree.node(n);
+    if node.kind == cst.Kind.RegionStmt {
+        add_token(m, t: first_ident(m, n), kind: "variable", detail: "alloc.Allocator", r: r);
+    }
+    var i: u32 = 0;
+    while i < node.children_len : (i += 1) {
+        let ch = m.tree.child(node, i);
+        let k = m.tree.node(ch).kind;
+        if k == cst.Kind.Param {
+            var sig = alloc.String.init(a);
+            doc.signature(m, ch, out: &mut sig);
+            add_token(m, t: first_ident(m, ch), kind: "variable", detail: sig.view(), r: r);
+        } else if k == cst.Kind.LetStmt {
+            if not holds(m, n: ch, offset: offset) and m.tree.tokens[m.tree.first_token(ch) as usize].start < offset {
+                add_token(m, t: first_ident(m, ch), kind: "variable", detail: "", r: r);
+            }
+        } else if k == cst.Kind.BindPat or k == cst.Kind.SomePat or k == cst.Kind.OkPat or k == cst.Kind.ErrPat or k == cst.Kind.VariantPat {
+            add_bindings(m, n: ch, r: r);
+        }
+        if holds(m, n: ch, offset: offset) {
+            add_locals(m, n: ch, offset: offset, r: r, a: a);
+        }
+    }
+}
+
+/// The module's own items and what its imports bind.
+fn add_items(m: &program.Module, r: &mut Results, a: alloc.Allocator) {
+    let root = m.tree.node(m.tree.root);
+    var i: u32 = 0;
+    while i < root.children_len : (i += 1) {
+        let ch = m.tree.child(root, i);
+        let k = m.tree.node(ch).kind;
+        if k == cst.Kind.Import {
+            add_token(m, t: last_ident(m, ch), kind: "module", detail: "", r: r);
+        } else if k == cst.Kind.FnDecl or k == cst.Kind.TypeDecl or k == cst.Kind.ConstDecl {
+            var sig = alloc.String.init(a);
+            doc.signature(m, ch, out: &mut sig);
+            var kind = "function";
+            if k == cst.Kind.TypeDecl {
+                kind = "type";
+            } else if k == cst.Kind.ConstDecl {
+                kind = "constant";
+            }
+            add_token(m, t: first_ident(m, ch), kind: kind, detail: sig.view(), r: r);
+        }
+    }
+}
+
+fn add_each(words: str, kind: str, r: &mut Results) {
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= words.len() : (i += 1) {
+        if i == words.len() or words[i] == ' ' {
+            if i > start {
+                r.add(label: words[start..i], kind: kind, detail: "");
+            }
+            start = i + 1;
+        }
+    }
+}
+
+fn add_language(r: &mut Results) {
+    add_each(words: "u8 u16 u32 u64 usize i8 i16 i32 i64 isize f32 f64 bool str void noreturn", kind: "type", r: r);
+    add_each(words: "panic assert unreachable", kind: "function", r: r);
+    add_each(words: "let var if else while for in match return break continue defer try catch orelse fn const type struct enum error pub import as and or not true false none some ok err test interface impl where dyn comptime unsafe region requires ensures nopanic asm", kind: "keyword", r: r);
+}
+
+// ---- Members, from the checker ---------------------------------------------------------
+
+fn signature_of(c: &ck.Checker, d: u32, a: alloc.Allocator) -> alloc.String {
+    let decl = c.decls[d as usize];
+    var sig = alloc.String.init(a);
+    doc.signature(&c.p.modules[decl.module as usize], decl.node, out: &mut sig);
+    return sig;
+}
+
+/// The methods of a declared type: those taking self, or all of them.
+fn add_methods(c: &ck.Checker, decl: u32, with_self_only: bool, r: &mut Results, a: alloc.Allocator) {
+    let d = c.decls[decl as usize];
+    var i = d.methods_start;
+    while i < d.methods_start + d.methods_len : (i += 1) {
+        let md = c.methods[i as usize];
+        let m = c.decls[md as usize];
+        if m.module != 0 and not m.is_pub {
+            continue;
+        }
+        if with_self_only and not c.fns[m.fn_index as usize].has_self {
+            continue;
+        }
+        let sig = signature_of(c, d: md, a: a);
+        r.add(label: c.names.text(m.name), kind: "method", detail: sig.view());
+    }
+}
+
+/// What a value of a type has after a dot.
+fn add_value_members(c: &ck.Checker, t0: ty.TypeId, r: &mut Results, a: alloc.Allocator) {
+    var t = t0;
+    if c.t.kind(t) == ty.Kind.Ref {
+        t = c.t.elem(t);
+    }
+    let info = c.t.get(t);
+    match info.kind {
+        .Struct => {
+            let d = c.decls[info.decl as usize];
+            var i = d.members_start;
+            while i < d.members_start + d.members_len : (i += 1) {
+                let f = c.fields[i as usize];
+                if d.module == 0 or f.is_pub {
+                    var text = alloc.String.init(a);
+                    ck.write_type(c, &mut text, f.type_id);
+                    r.add(label: c.names.text(f.name), kind: "field", detail: text.view());
+                }
+            }
+            add_methods(c, decl: info.decl, with_self_only: true, r: r, a: a);
+        }
+        .Enum | .Interface | .Dyn => {
+            if info.decl != ty.NO_DECL {
+                add_methods(c, decl: info.decl, with_self_only: true, r: r, a: a);
+            }
+        }
+        .Str => { add_each(words: "len eq starts_with bytes", kind: "method", r: r); }
+        .Slice | .Array => { add_each(words: "len", kind: "method", r: r); }
+        .List => { add_each(words: "push pop len clear items items_mut", kind: "method", r: r); }
+        .Map => { add_each(words: "put get remove len", kind: "method", r: r); }
+        .Ptr => { add_each(words: "add as_ref as_mut read_volatile write_volatile addr", kind: "method", r: r); }
+        .Float => { add_each(words: "sqrt abs floor ceil trunc", kind: "method", r: r); }
+        .Builtin => {
+            match info.builtin {
+                .System => { add_each(words: "fs stdout stderr args alloc", kind: "field", r: r); }
+                .Output => { add_each(words: "write write_byte write_u64 write_i64", kind: "method", r: r); }
+                .Args => { add_each(words: "len get", kind: "method", r: r); }
+                .Fs => { add_each(words: "read_file read_bytes write_file", kind: "method", r: r); }
+                .String => { add_each(words: "push_str push_ascii view len", kind: "method", r: r); }
+                .Interner => { add_each(words: "intern text", kind: "method", r: r); }
+                _ => { }
+            }
+        }
+        _ => { }
+    }
+}
+
+/// What a type has after a dot: variants, errors and functions.
+fn add_type_members(c: &ck.Checker, t: ty.TypeId, r: &mut Results, a: alloc.Allocator) {
+    let info = c.t.get(t);
+    if info.kind == ty.Kind.Enum {
+        let d = c.decls[info.decl as usize];
+        var i = d.members_start;
+        while i < d.members_start + d.members_len : (i += 1) {
+            r.add(label: c.names.text(c.variants[i as usize].name), kind: "variant", detail: "");
+        }
+    } else if info.kind == ty.Kind.ErrorSet and info.decl != ck.NONE {
+        let d = c.decls[info.decl as usize];
+        var i = d.members_start;
+        while i < d.members_start + d.members_len : (i += 1) {
+            let id = c.error_members[i as usize];
+            r.add(label: c.names.text(c.error_names[(id - 1) as usize]), kind: "variant", detail: "");
+        }
+    }
+    if info.kind == ty.Kind.Struct or info.kind == ty.Kind.Enum or info.kind == ty.Kind.Interface {
+        add_methods(c, decl: info.decl, with_self_only: false, r: r, a: a);
+    }
+}
+
+/// What a module gives after a dot: its public items.
+fn add_module_members(c: &ck.Checker, module: u32, r: &mut Results, a: alloc.Allocator) {
+    var d: usize = 0;
+    while d < c.decls.len() : (d += 1) {
+        let decl = c.decls[d];
+        if decl.module != module or decl.owner != ck.NONE or decl.impl_index != ck.NONE or decl.template != ck.NONE or not decl.is_pub {
+            continue;
+        }
+        var kind = "type";
+        if decl.kind == ck.DeclKind.Fn {
+            kind = "function";
+        } else if decl.kind == ck.DeclKind.Const {
+            kind = "constant";
+        }
+        let sig = signature_of(c, d: d as u32, a: a);
+        r.add(label: c.names.text(decl.name), kind: kind, detail: sig.view());
+    }
+}
+
+/// The members of the expression spanning the bytes first..last of the root
+/// module; false when no expression there has a type the checker knows.
+fn add_members_at(c: &mut ck.Checker, first: u32, last: u32, r: &mut Results, a: alloc.Allocator) -> bool {
+    c.module = 0;
+    c.env_len = 0;
+    c.cur_table = ck.NONE;
+    let nnodes = c.p.modules[0].tree.nodes.len();
+    var best = NONE;
+    var i: usize = 0;
+    while i < nnodes : (i += 1) {
+        let id = cst.NodeId { index: i as u32 };
+        let node = c.p.modules[0].tree.node(id);
+        if node.end <= node.first or node.kind == cst.Kind.Arg {
+            continue;
+        }
+        let start = c.p.modules[0].tree.tokens[c.p.modules[0].tree.first_token(id) as usize].start;
+        if start != first or token_end(&c.p.modules[0], t: node.end - 1) != last {
+            continue;
+        }
+        if best == NONE {
+            best = i as u32;
+        }
+        if not ck.is_invalid(c, c.node_types[0][i]) {
+            add_value_members(c, t0: c.node_types[0][i], r: r, a: a);
+            return true;
+        }
+    }
+    if best == NONE {
+        return false;
+    }
+    // No value: a type or a module, as a path.
+    let p = expr.path(c, cst.NodeId { index: best });
+    match p.kind {
+        .Type => {
+            add_type_members(c, t: p.type_id, r: r, a: a);
+            return true;
+        }
+        .Module => {
+            add_module_members(c, module: p.alias.module, r: r, a: a);
+            return true;
+        }
+        .Library => {
+            if p.alias.library == ck.Library.Std {
+                add_each(words: "System Fs Output Args IoError", kind: "type", r: r);
+            } else {
+                add_each(words: "Allocator List Map String Interner Symbol", kind: "type", r: r);
+            }
+            return true;
+        }
+        .NotPath => { return false; }
+    }
+}
+
+// ---- The place -------------------------------------------------------------------------
+
+fn previous(ts: []tk.Token, at: u32) -> u32 {
+    var i = at;
+    while i > 0 {
+        i -= 1;
+        if not ts[i as usize].kind.is_trivia() {
+            return i;
+        }
+    }
+    return NONE;
+}
+
+fn next(ts: []tk.Token, at: u32) -> u32 {
+    var i = at as usize + 1;
+    while i < ts.len() : (i += 1) {
+        if not ts[i].kind.is_trivia() {
+            return i as u32;
+        }
+    }
+    return NONE;
+}
+
+/// The token that opens the bracket closed at `at`, or NONE.
+fn opening(ts: []tk.Token, at: u32) -> u32 {
+    var depth: u32 = 0;
+    var i = at;
+    while true {
+        let k = ts[i as usize].kind;
+        if k == tk.Kind.RParen or k == tk.Kind.RBracket {
+            depth += 1;
+        } else if k == tk.Kind.LParen or k == tk.Kind.LBracket {
+            depth -= 1;
+            if depth == 0 {
+                return i;
+            }
+        }
+        if i == 0 {
+            return NONE;
+        }
+        i -= 1;
+    }
+    return NONE;
+}
+
+/// The first token of the postfix expression that ends at `end`, or NONE.
+fn chain_start(ts: []tk.Token, end: u32) -> u32 {
+    var i = end;
+    while i != NONE {
+        let k = ts[i as usize].kind;
+        if k == tk.Kind.RParen or k == tk.Kind.RBracket {
+            let open = opening(ts, at: i);
+            if open == NONE {
+                return NONE;
+            }
+            let before = previous(ts, at: open);
+            if before == NONE {
+                return open;
+            }
+            let bk = ts[before as usize].kind;
+            if bk == tk.Kind.Ident or bk == tk.Kind.RParen or bk == tk.Kind.RBracket or bk == tk.Kind.DotStar {
+                i = before;
+            } else {
+                return open;
+            }
+        } else if k == tk.Kind.DotStar {
+            i = previous(ts, at: i);
+        } else if k == tk.Kind.Ident {
+            let before = previous(ts, at: i);
+            if before == NONE or ts[before as usize].kind != tk.Kind.Dot {
+                return i;
+            }
+            i = previous(ts, at: before);
+        } else if k == tk.Kind.String or k == tk.Kind.Int or k == tk.Kind.Char {
+            return i;
+        } else {
+            return NONE;
+        }
+    }
+    return NONE;
+}
+
+/// Whether a bracket opened before the token is still open, in its statement.
+fn inside_brackets(ts: []tk.Token, at: u32) -> bool {
+    var depth: i32 = 0;
+    var i = at;
+    while i > 0 {
+        i -= 1;
+        let k = ts[i as usize].kind;
+        if k == tk.Kind.RParen or k == tk.Kind.RBracket {
+            depth += 1;
+        } else if k == tk.Kind.LParen or k == tk.Kind.LBracket {
+            depth -= 1;
+            if depth < 0 {
+                return true;
+            }
+        } else if k == tk.Kind.Semi or k == tk.Kind.LBrace or k == tk.Kind.RBrace {
+            return false;
+        }
+    }
+    return false;
+}
+
+fn is_word_start(c: u8) -> bool {
+    return c == '_' or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+}
+
+/// The file's identifiers, for when nothing better is known.
+fn add_words(ts: []tk.Token, text: str, except: u32, r: &mut Results) {
+    var i: usize = 0;
+    while i < ts.len() : (i += 1) {
+        if ts[i].kind == tk.Kind.Ident and i as u32 != except {
+            r.add(label: text[ts[i].start as usize..(ts[i].start + ts[i].len) as usize], kind: "text", detail: "");
+        }
+    }
+}
+
+/// Writes what may be written at the line and column of the file whose text
+/// is given; false when the file has no such place.
+pub fn run(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, path: str, text: str, line: u32, column: u32, opts: &program.Options, a: alloc.Allocator) -> bool {
+    var offset: u32 = 0;
+    match query.offset_of(text, line: line, column: column) {
+        some(o) => { offset = o; }
+        none => {
+            err_out.write("arche complete: the file has no such line and column\n");
+            return false;
+        }
+    }
+    var r = Results { items: alloc.List(Item).init(a), prefix: alloc.String.init(a), a: a };
+    var lexed = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(text, true, &mut lexed, a);
+    let ts = tokens.items();
+    // The token that holds the cursor, or ends at it.
+    var at = NONE;
+    var i: usize = 0;
+    while i < ts.len() and at == NONE : (i += 1) {
+        if ts[i].start < offset and offset <= ts[i].start + ts[i].len {
+            at = i as u32;
+        }
+    }
+    var word = NONE;
+    var word_end = offset;
+    var last = NONE;
+    if at != NONE {
+        let k = ts[at as usize].kind;
+        let end = ts[at as usize].start + ts[at as usize].len;
+        if k == tk.Kind.Comment or k == tk.Kind.DocComment or ((k == tk.Kind.String or k == tk.Kind.Char) and offset < end) {
+            r.write(out);
+            return true; // in a comment or a literal: nothing
+        }
+        if is_word_start(text[ts[at as usize].start as usize]) and not k.is_trivia() {
+            word = at;
+            word_end = end;
+            r.prefix.push_str(text[ts[at as usize].start as usize..offset as usize]);
+            last = previous(ts, at: at);
+        } else if k.is_trivia() {
+            last = previous(ts, at: at);
+        } else {
+            last = at;
+        }
+    }
+    if last != NONE and ts[last as usize].kind == tk.Kind.Dot {
+        let start = chain_start(ts, end: previous(ts, at: last));
+        if start != NONE {
+            // The text without the dot and the unfinished name, with a
+            // semicolon if the statement ended there.
+            let dot_at = ts[last as usize].start;
+            var fixed = alloc.String.init(a);
+            fixed.push_str(text[0..dot_at as usize]);
+            var after = last;
+            if word != NONE {
+                after = word;
+            }
+            let following = next(ts, at: after);
+            var ends_statement = following == NONE or ts[following as usize].kind == tk.Kind.Eof or ts[following as usize].kind == tk.Kind.RBrace;
+            if not ends_statement {
+                var nl = false;
+                var b = word_end;
+                while b < ts[following as usize].start : (b += 1) {
+                    if text[b as usize] == '\n' {
+                        nl = true;
+                    }
+                }
+                let fk = ts[following as usize].kind;
+                ends_statement = nl and fk != tk.Kind.LBrace and fk != tk.Kind.Dot;
+            }
+            if ends_statement and not inside_brackets(ts, at: start) {
+                fixed.push_str(";");
+            }
+            fixed.push_str(text[word_end as usize..text.len()]);
+            let p = program.load(fs, path: path, fixed, a, opts);
+            if p.diags.count() == 0 {
+                let first = ts[start as usize].start;
+                let chain_last = previous(ts, at: last);
+                let end = ts[chain_last as usize].start + ts[chain_last as usize].len;
+                var c = ck.analyze(p);
+                if add_members_at(&mut c, first: first, last: end, r: &mut r, a: a) {
+                    r.write(out);
+                    return true;
+                }
+            }
+        }
+        add_words(ts, text, except: word, r: &mut r);
+        r.write(out);
+        return true;
+    }
+    let m = doc.parse_any(text, a);
+    add_locals(&m, n: m.tree.root, offset: offset, r: &mut r, a: a);
+    add_items(&m, r: &mut r, a: a);
+    add_language(&mut r);
+    r.write(out);
+    return true;
+}

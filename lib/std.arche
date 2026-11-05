@@ -22,6 +22,7 @@ pub type System = struct {
     pub proc: Proc,
     pub net: Net,
     pub rand: Rand,
+    pub stdin: Input,
 }
 
 /// Arche-0's errors of reading and writing files (spec/arche-0.md §11).
@@ -209,6 +210,29 @@ pub type Fs = struct {
         if code != 0 {
             return io_error(code);
         }
+    }
+
+    /// The directory that relative paths start from.
+    pub fn current_dir(self: &Fs, a: alloc.Allocator) -> FsError!alloc.String {
+        var buf: [4096]u8 = [0; 4096];
+        var n: i64 = 0;
+        unsafe {
+            // SAFETY: getcwd writes at most 4096 bytes, with a NUL, and returns
+            // how many.
+            n = linux.syscall(linux.GETCWD, [linux.arg(u8, &buf[0] as *u8), 4096, 0, 0, 0, 0]);
+        }
+        if linux.errno(n) != 0 {
+            return errno_error(linux.errno(n));
+        }
+        if n < 1 or not utf8.valid(buf[0..(n - 1) as usize]) {
+            return FsError.IoFailed;
+        }
+        var s = alloc.String.init(a);
+        unsafe {
+            // SAFETY: checked just now.
+            s.push_str(mem.str_from(buf[0..(n - 1) as usize]));
+        }
+        return s;
     }
 
     /// Whether something is at path.
@@ -817,6 +841,44 @@ fn io_wait(fd: i64, events: u32) {
     unsafe {
         // SAFETY: the runtime only polls fd.
         a0rt_io_wait(fd, events);
+    }
+}
+
+/// What the program is given to read: file descriptor 0. A task that waits
+/// for it lets the others run.
+pub type Input = struct {
+    unique: core.Unique,
+
+    /// Up to into.len() bytes; 0 at the end of the input.
+    pub fn read(self: &mut Input, into: []mut u8) -> IoError!usize {
+        io_wait(0, events: POLLIN);
+        var r: i64 = -linux.EINTR;
+        while linux.errno(r) == linux.EINTR {
+            unsafe {
+                // SAFETY: read writes at most into.len() bytes.
+                r = linux.syscall(linux.READ, [0, linux.arg(u8, mem.slice_data(u8, into) as *u8), into.len() as i64, 0, 0, 0]);
+            }
+        }
+        if linux.errno(r) != 0 {
+            return IoError.IoFailed;
+        }
+        return r as usize;
+    }
+
+    /// Whether a read would not wait, after waiting at most this long for
+    /// it to be so. The end of the input counts: the read gives 0. Nothing
+    /// else runs meanwhile, unlike in read.
+    pub fn ready(self: &Input, timeout_ms: u32) -> bool {
+        // struct pollfd: fd 0, POLLIN in the events' low byte.
+        var fds: [8]u8 = [0, 0, 0, 0, 1, 0, 0, 0];
+        var r: i64 = -linux.EINTR;
+        while linux.errno(r) == linux.EINTR {
+            unsafe {
+                // SAFETY: poll reads one pollfd and writes its revents.
+                r = linux.syscall(linux.POLL, [linux.arg(u8, &fds[0] as *u8), 1, timeout_ms as i64, 0, 0, 0]);
+            }
+        }
+        return r > 0;
     }
 }
 

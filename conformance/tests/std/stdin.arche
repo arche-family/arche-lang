@@ -1,0 +1,22 @@
+// test: run
+// spec: arche/1.3
+// stage0: skip
+// stdout: ready
+// stdout: 0 bytes
+// stdout: an absolute directory
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    // The runner gives a test /dev/null: at its end from the start.
+    if sys.stdin.ready(0) {
+        sys.stdout.write("ready\n");
+    }
+    var buf: [16]u8 = [0; 16];
+    let n = try sys.stdin.read(buf[0..16]);
+    sys.stdout.write_u64(n as u64);
+    sys.stdout.write(" bytes\n");
+    let dir = try sys.fs.current_dir(sys.alloc);
+    if dir.view().starts_with("/") and sys.fs.exists(dir.view()) {
+        sys.stdout.write("an absolute directory\n");
+    }
+}
