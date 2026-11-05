@@ -46,12 +46,13 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | Path | Contents | Status |
 | --- | --- | --- |
 | [`docs/plan.md`](docs/plan.md) | the full plan (Uzbek) | snapshot, 2026-11-05 |
-| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language, and S35 for the libraries the Arche OS phone needs (Uzbek) | current sprint: S26 (S19 on Windows) |
+| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language, and S35 for the libraries the Arche OS phone needs (Uzbek) | current sprint: S27 (S19 on Windows) |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | [`spec/arche.md`](spec/arche.md) | the full language, built on Arche-0 | draft 0.1 |
 | [`conformance/`](conformance/README.md) | specification tests | 453 tests |
 | `stage0/` | bootstrap compiler, C11 | complete: compiles all of Arche-0 |
-| [`compiler/`](compiler/) | the Arche compiler, Arche-0, through LLVM | self-hosting: stage2 == stage3 |
+| [`compiler/`](compiler/) | the Arche compiler, Arche-0, through LLVM; `--release` runs its own optimizer | self-hosting: stage2 == stage3, in release builds too |
+| [`bench/`](bench/) | compile-time and run-time benchmarks | [baseline](bench/baseline.md) |
 | [`driver/`](driver/) | `arche-driver build`/`run`: packages from `build.arche`, one object per module, cached by SHA-256; `pkg add/lock/vendor/publish` and `arche-registry`: signed, content-addressed packages over HTTPS | a cached build is bit-identical to a clean one; tampered packages are refused |
 | [`docs/abi.md`](docs/abi.md) | layouts, calling convention, runtime | version 0 |
 | [`docs/error-codes.md`](docs/error-codes.md) | every diagnostic code | living |

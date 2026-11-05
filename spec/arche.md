@@ -283,7 +283,7 @@ fn split(s: str, at: usize) -> Halves
 ```
 
 - `requires` conditions are checked at every call, before the body; `ensures` conditions after it, at every return, where `result` names the result (a parameter cannot be named `result` then, E0305). A failed condition traps with `contract failed: <condition>` and the location of the condition. The checks live in the function itself, so every way of calling it, directly, through `&dyn` or as an instance, checks them.
-- Debug builds check every condition. Release builds remove those the compiler proves always true, and keep the rest. (There is one build mode until `arche build` has release builds, sprint S24: every condition is checked.)
+- Debug builds check every condition. Release builds (`arche --release`) remove those the compiler proves always true, and keep the rest: a condition is a branch to a trap, and the optimizer drops the branch when constants and the checks already made decide it.
 - A condition is a `bool` expression over the parameters (and `result`) (E0401) that calls only functions without capabilities, side effects or `unsafe`; the compiler does not check that last part yet.
 
 ### 8.2 `nopanic`

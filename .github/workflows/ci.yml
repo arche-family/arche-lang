@@ -23,6 +23,8 @@ jobs:
         run: make -C compiler CC=${{ matrix.cc }}
       - name: Compiler tests
         run: make -C compiler check CC=${{ matrix.cc }}
+      - name: Conformance tests, release builds
+        run: cd compiler && ARCHE_FLAGS=--release ../conformance/runner/build/runner --timeout 60 --compiler ./arche-build ../conformance/tests
       - name: Fuzz the parser
         run: cd /tmp && python3 -I $GITHUB_WORKSPACE/compiler/fuzz.py $GITHUB_WORKSPACE/compiler/build/arche 60
       - name: Differential, stage0 against the Arche compiler

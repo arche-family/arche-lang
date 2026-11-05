@@ -1,0 +1,77 @@
+/// The runtime benchmarks of docs/sprints.md S26: recursion (fib), a loop
+/// over a large array (sieve), hashing (map) and sorting (sort). Each
+/// prints its time and a result, so no work can be skipped.
+import std;
+import alloc;
+import core.slice;
+
+fn fib(n: u32) -> u64 {
+    if n < 2 {
+        return n as u64;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn ms(sys: &mut std.System, t0: u64) -> u64 {
+    return (sys.clock.monotonic_ns() - t0) / 1000000;
+}
+
+fn line(sys: &mut std.System, name: str, result: u64, t: u64) {
+    sys.stdout.write(name);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(t);
+    sys.stdout.write(" ms (");
+    sys.stdout.write_u64(result);
+    sys.stdout.write(")\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var t = sys.clock.monotonic_ns();
+    let f = fib(35);
+    line(sys, name: "fib", result: f, t: ms(sys, t0: t));
+
+    t = sys.clock.monotonic_ns();
+    let limit: usize = 50000000;
+    var sieve = alloc.List(u8).init(sys.alloc);
+    var i: usize = 0;
+    while i < limit : (i += 1) {
+        sieve.push(1);
+    }
+    var count: u64 = 0;
+    var p: usize = 2;
+    while p < limit : (p += 1) {
+        if sieve[p] == 1 {
+            count += 1;
+            var m = p * p;
+            while m < limit : (m += p) {
+                sieve[m] = 0;
+            }
+        }
+    }
+    line(sys, name: "sieve", result: count, t: ms(sys, t0: t));
+
+    t = sys.clock.monotonic_ns();
+    var map = alloc.Map(u64, u64).init(sys.alloc);
+    var k: u64 = 0;
+    while k < 2000000 : (k += 1) {
+        map.put((k *% 2654435761) % 4294967296, k);
+    }
+    var sum: u64 = 0;
+    k = 0;
+    while k < 2000000 : (k += 1) {
+        sum +%= map.get((k *% 2654435761) % 4294967296) orelse 0;
+    }
+    line(sys, name: "map", result: sum, t: ms(sys, t0: t));
+
+    t = sys.clock.monotonic_ns();
+    var xs = alloc.List(u32).init(sys.alloc);
+    var x: u64 = 42;
+    while xs.len() < 5000000 {
+        x = x *% 6364136223846793005 +% 1442695040888963407;
+        xs.push((x >> 32) as u32);
+    }
+    slice.sort(u32, xs.items_mut());
+    let n = xs.len();
+    let check = xs[0] as u64 + xs[n / 2] as u64 + xs[n - 1] as u64;
+    line(sys, name: "sort", result: check, t: ms(sys, t0: t));
+}

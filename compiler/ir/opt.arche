@@ -1,0 +1,2080 @@
+/// The optimizer of a release build (docs/sprints.md S26), on the IR of
+/// ir.arche, one function at a time:
+///
+/// 1. mem2reg: a stack slot that is only loaded and stored as one scalar
+///    becomes SSA values, joined by phis where control flow meets;
+/// 2. SCCP, sparse conditional constant propagation: values known to be
+///    constant are replaced by constants, and a branch on a known
+///    condition by a jump, so code that cannot run goes;
+/// 3. GVN, value numbering over the dominator tree: a pure operation that
+///    one dominating it computes already is replaced by it; a load is too,
+///    while nothing may have written memory since; and a branch on a
+///    condition already decided on the way there is a jump: this removes
+///    bounds checks a loop's own test makes redundant;
+/// 4. LICM: pure operations of a loop whose operands do not change in it
+///    move to the block before it;
+/// 5. DCE: what nothing needs goes.
+///
+/// A contract (requires, ensures) whose condition these prove true is a
+/// branch on a constant, and goes with the code it would have run. The
+/// passes keep the meaning of the program: no operation that may trap,
+/// write memory or call is moved or removed unless it cannot run.
+import alloc;
+import ir.ir;
+
+const NONE: u32 = 4294967295;
+
+// ---- Operands ---------------------------------------------------------------------------
+
+/// The values an instruction uses, in out.
+fn operands(f: &ir.Function, id: u32, out: &mut alloc.List(u32)) {
+    out.clear();
+    let i = f.insts[id as usize];
+    match i.op {
+        .Load | .Gep | .Memzero | .OverflowBit | .Ext | .Trunc | .FNeg | .FConv | .IntToPtr | .PtrToInt | .AtomicLoad | .AsmOut | .Ret => {
+            out.push(i.a);
+        }
+        .CondBr => { out.push(i.a); }
+        .Store | .GepIndex | .Memcpy | .Bin | .Overflow | .Cmp | .FBin | .FCmp | .AtomicStore | .AtomicRmw => {
+            out.push(i.a);
+            out.push(i.b);
+        }
+        .CmpXchg => {
+            out.push(i.a);
+            out.push(i.b);
+            out.push(i.c);
+        }
+        .FMath => {
+            out.push(i.a);
+            if i.flag == 5 or i.flag == 6 {
+                out.push(i.b);
+            }
+            if i.flag == 6 {
+                out.push(i.c);
+            }
+        }
+        .Call | .Asm => {
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 1) {
+                out.push(f.args[k as usize]);
+            }
+        }
+        .CallIndirect => {
+            out.push(i.a);
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 1) {
+                out.push(f.args[k as usize]);
+            }
+        }
+        .Phi => {
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 2) {
+                out.push(f.args[(k + 1) as usize]);
+            }
+        }
+        _ => { }
+    }
+}
+
+/// The value v stands for now, through the replacements in map.
+fn resolve(map: &mut alloc.List(u32), v: u32) -> u32 {
+    if v as usize >= map.len() {
+        return v;
+    }
+    var r = v;
+    while map.items_mut()[r as usize] != r {
+        r = map.items_mut()[r as usize];
+    }
+    var x = v;
+    while map.items_mut()[x as usize] != r {
+        let next = map.items_mut()[x as usize];
+        map.items_mut()[x as usize] = r;
+        x = next;
+    }
+    return r;
+}
+
+fn identity(n: usize, a: alloc.Allocator) -> alloc.List(u32) {
+    var map = alloc.List(u32).init(a);
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        map.push(i as u32);
+    }
+    return map;
+}
+
+/// Replaces the instruction's operands as map says.
+fn rewrite(f: &mut ir.Function, id: u32, map: &mut alloc.List(u32)) {
+    let i = f.insts[id as usize];
+    match i.op {
+        .Load | .Gep | .Memzero | .OverflowBit | .Ext | .Trunc | .FNeg | .FConv | .IntToPtr | .PtrToInt | .AtomicLoad | .AsmOut | .Ret | .CondBr => {
+            f.insts[id as usize].a = resolve(map, v: i.a);
+        }
+        .Store | .GepIndex | .Memcpy | .Bin | .Overflow | .Cmp | .FBin | .FCmp | .AtomicStore | .AtomicRmw => {
+            f.insts[id as usize].a = resolve(map, v: i.a);
+            f.insts[id as usize].b = resolve(map, v: i.b);
+        }
+        .CmpXchg => {
+            f.insts[id as usize].a = resolve(map, v: i.a);
+            f.insts[id as usize].b = resolve(map, v: i.b);
+            f.insts[id as usize].c = resolve(map, v: i.c);
+        }
+        .FMath => {
+            f.insts[id as usize].a = resolve(map, v: i.a);
+            if i.flag == 5 or i.flag == 6 {
+                f.insts[id as usize].b = resolve(map, v: i.b);
+            }
+            if i.flag == 6 {
+                f.insts[id as usize].c = resolve(map, v: i.c);
+            }
+        }
+        .Call | .Asm => {
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 1) {
+                f.args[k as usize] = resolve(map, v: f.args[k as usize]);
+            }
+        }
+        .CallIndirect => {
+            f.insts[id as usize].a = resolve(map, v: i.a);
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 1) {
+                f.args[k as usize] = resolve(map, v: f.args[k as usize]);
+            }
+        }
+        .Phi => {
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 2) {
+                f.args[(k + 1) as usize] = resolve(map, v: f.args[(k + 1) as usize]);
+            }
+        }
+        _ => { }
+    }
+}
+
+/// Rewrites every instruction in a block through map.
+fn rewrite_all(f: &mut ir.Function, map: &mut alloc.List(u32)) {
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        var k: usize = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            let id = f.blocks[b].insts[k];
+            rewrite(f, id: id, map: map);
+        }
+    }
+}
+
+/// An instruction no other needs may go: it writes nothing, calls nothing
+/// and cannot trap. A division may trap, but only when its checks did not
+/// stop it, and those stay; removing one nothing uses is safe.
+fn pure(i: ir.Inst) -> bool {
+    match i.op {
+        .Const | .Param | .Alloca | .Gep | .GepIndex | .Bin | .Overflow | .OverflowBit | .Cmp | .Ext | .Trunc | .Global | .VTable |
+            .FBin | .FNeg | .FCmp | .FConv | .FMath | .IntToPtr | .PtrToInt | .Phi | .AsmOut => {
+            return true;
+        }
+        .Load => { return i.flag & ir.LOAD_VOLATILE == 0; }
+        _ => { return false; }
+    }
+}
+
+/// Whether the instruction may write memory, or do anything a load must
+/// not be moved across.
+fn writes(i: ir.Inst) -> bool {
+    match i.op {
+        .Store | .Memcpy | .Memzero | .Call | .CallIndirect | .Asm | .AtomicStore | .AtomicRmw | .CmpXchg | .Fence | .AtomicLoad => {
+            return true;
+        }
+        .Load => { return i.flag & ir.LOAD_VOLATILE != 0; }
+        _ => { return false; }
+    }
+}
+
+/// A constant of type t, made once per function and kept out of the blocks:
+/// the emitter writes constants where they are used.
+type Consts = struct {
+    ids: alloc.List(u32),
+
+    fn init(a: alloc.Allocator) -> Consts {
+        return Consts { ids: alloc.List(u32).init(a) };
+    }
+}
+
+fn constant(f: &mut ir.Function, map: &mut alloc.List(u32), t: ir.Ty, v: u64) -> u32 {
+    var i = ir.inst(ir.Op.Const, t);
+    i.imm = v & mask(t);
+    let id = f.insts.len() as u32;
+    f.insts.push(i);
+    map.push(id);
+    return id;
+}
+
+fn bits(t: ir.Ty) -> u32 {
+    match t {
+        .I1 => { return 1; }
+        .I8 => { return 8; }
+        .I16 => { return 16; }
+        .I32 => { return 32; }
+        _ => { return 64; }
+    }
+}
+
+fn mask(t: ir.Ty) -> u64 {
+    let n = bits(t);
+    if n == 64 {
+        return 18446744073709551615;
+    }
+    let one: u64 = 1;
+    return (one << n) - 1;
+}
+
+fn size_of(t: ir.Ty) -> u64 {
+    match t {
+        .I1 | .I8 => { return 1; }
+        .I16 => { return 2; }
+        .I32 | .F32 => { return 4; }
+        .Void => { return 0; }
+        _ => { return 8; }
+    }
+}
+
+fn is_int(t: ir.Ty) -> bool {
+    return t == ir.Ty.I1 or t == ir.Ty.I8 or t == ir.Ty.I16 or t == ir.Ty.I32 or t == ir.Ty.I64;
+}
+
+/// v, of n bits, as a signed number.
+fn signed(v: u64, n: u32) -> i64 {
+    if n == 64 {
+        return v as% i64;
+    }
+    let one: u64 = 1;
+    let sign = one << (n - 1);
+    if v & sign != 0 {
+        return (v | ~((one << n) - 1)) as% i64;
+    }
+    return v as i64;
+}
+
+// ---- The control flow graph ---------------------------------------------------------------
+
+fn terminator(f: &ir.Function, b: u32) -> u32 {
+    let ids = f.blocks[b as usize].insts.items();
+    return ids[ids.len() - 1];
+}
+
+/// The blocks control goes to from b, in order; a CondBr to one block
+/// twice gives it twice.
+fn successors(f: &ir.Function, b: u32, out: &mut alloc.List(u32)) {
+    out.clear();
+    let t = f.insts[terminator(f, b: b) as usize];
+    if t.op == ir.Op.Br {
+        out.push(t.a);
+    } else if t.op == ir.Op.CondBr {
+        out.push(t.b);
+        out.push(t.c);
+    }
+}
+
+type Cfg = struct {
+    /// For each block, its predecessors' range in preds (an edge each).
+    pred_start: alloc.List(u32),
+    preds: alloc.List(u32),
+    /// Reverse postorder of the blocks reached from the entry, and each
+    /// block's place in it (NONE when unreached).
+    rpo: alloc.List(u32),
+    order: alloc.List(u32),
+    idom: alloc.List(u32),
+    /// The dominator tree: each block's children's range in kids.
+    kid_start: alloc.List(u32),
+    kids: alloc.List(u32),
+
+    fn pred_count(self: &Cfg, b: u32) -> u32 {
+        return self.pred_start[(b + 1) as usize] - self.pred_start[b as usize];
+    }
+
+    fn reached(self: &Cfg, b: u32) -> bool {
+        return self.order[b as usize] != NONE;
+    }
+
+    /// Whether a dominates b.
+    fn dominates(self: &Cfg, a: u32, b: u32) -> bool {
+        if not self.reached(b) {
+            return false;
+        }
+        var x = b;
+        while true {
+            if x == a {
+                return true;
+            }
+            if x == 0 {
+                return false;
+            }
+            x = self.idom[x as usize];
+        }
+        return false;
+    }
+}
+
+fn build_cfg(f: &ir.Function, a: alloc.Allocator) -> Cfg {
+    let n = f.blocks.len();
+    var c = Cfg {
+        pred_start: alloc.List(u32).init(a),
+        preds: alloc.List(u32).init(a),
+        rpo: alloc.List(u32).init(a),
+        order: alloc.List(u32).init(a),
+        idom: alloc.List(u32).init(a),
+        kid_start: alloc.List(u32).init(a),
+        kids: alloc.List(u32).init(a),
+    };
+    var succ = alloc.List(u32).init(a);
+    // Reverse postorder, by a depth-first walk with an explicit stack.
+    var seen = alloc.List(bool).init(a);
+    var b: usize = 0;
+    while b < n : (b += 1) {
+        seen.push(false);
+        c.order.push(NONE);
+        c.idom.push(NONE);
+    }
+    var post = alloc.List(u32).init(a);
+    var stack = alloc.List(u32).init(a);
+    var next = alloc.List(u32).init(a);
+    stack.push(0);
+    next.push(0);
+    seen[0] = true;
+    while stack.len() > 0 {
+        let top = stack.len() - 1;
+        let blk = stack[top];
+        successors(f, b: blk, out: &mut succ);
+        let k = next[top];
+        if k < succ.len() as u32 {
+            next[top] = k + 1;
+            let s = succ[k as usize];
+            if not seen[s as usize] {
+                seen[s as usize] = true;
+                stack.push(s);
+                next.push(0);
+            }
+        } else {
+            post.push(blk);
+            _ = stack.pop();
+            _ = next.pop();
+        }
+    }
+    var i = post.len();
+    while i > 0 : (i -= 1) {
+        c.order[post[i - 1] as usize] = c.rpo.len() as u32;
+        c.rpo.push(post[i - 1]);
+    }
+    // Predecessors, reached blocks only, an entry per edge.
+    var count = alloc.List(u32).init(a);
+    b = 0;
+    while b <= n : (b += 1) {
+        count.push(0);
+    }
+    b = 0;
+    while b < n : (b += 1) {
+        if c.order[b] == NONE {
+            continue;
+        }
+        successors(f, b: b as u32, out: &mut succ);
+        for_each_count(&mut count, succ: &succ);
+    }
+    var total: u32 = 0;
+    b = 0;
+    while b < n : (b += 1) {
+        c.pred_start.push(total);
+        total += count[b];
+    }
+    c.pred_start.push(total);
+    var fill = alloc.List(u32).init(a);
+    b = 0;
+    while b < n : (b += 1) {
+        fill.push(c.pred_start[b]);
+    }
+    i = 0;
+    while i < total as usize : (i += 1) {
+        c.preds.push(0);
+    }
+    b = 0;
+    while b < n : (b += 1) {
+        if c.order[b] == NONE {
+            continue;
+        }
+        successors(f, b: b as u32, out: &mut succ);
+        var k: usize = 0;
+        while k < succ.len() : (k += 1) {
+            let s = succ[k] as usize;
+            c.preds[fill[s] as usize] = b as u32;
+            fill[s] += 1;
+        }
+    }
+    // Dominators: Cooper, Harvey and Kennedy's iteration.
+    c.idom[0] = 0;
+    var changed = true;
+    while changed {
+        changed = false;
+        var r: usize = 1;
+        while r < c.rpo.len() : (r += 1) {
+            let blk = c.rpo[r];
+            var new_idom = NONE;
+            var p = c.pred_start[blk as usize];
+            while p < c.pred_start[(blk + 1) as usize] : (p += 1) {
+                let pred = c.preds[p as usize];
+                if c.idom[pred as usize] == NONE {
+                    continue;
+                }
+                if new_idom == NONE {
+                    new_idom = pred;
+                } else {
+                    new_idom = intersect(&c, x: pred, y: new_idom);
+                }
+            }
+            if new_idom != NONE and c.idom[blk as usize] != new_idom {
+                c.idom[blk as usize] = new_idom;
+                changed = true;
+            }
+        }
+    }
+    // The dominator tree's children.
+    var kc = alloc.List(u32).init(a);
+    b = 0;
+    while b <= n : (b += 1) {
+        kc.push(0);
+    }
+    var r: usize = 1;
+    while r < c.rpo.len() : (r += 1) {
+        kc[c.idom[c.rpo[r] as usize] as usize] += 1;
+    }
+    var at: u32 = 0;
+    b = 0;
+    while b < n : (b += 1) {
+        c.kid_start.push(at);
+        at += kc[b];
+    }
+    c.kid_start.push(at);
+    var kfill = alloc.List(u32).init(a);
+    b = 0;
+    while b < n : (b += 1) {
+        kfill.push(c.kid_start[b]);
+    }
+    i = 0;
+    while i < at as usize : (i += 1) {
+        c.kids.push(0);
+    }
+    r = 1;
+    while r < c.rpo.len() : (r += 1) {
+        let blk = c.rpo[r];
+        let d = c.idom[blk as usize] as usize;
+        c.kids[kfill[d] as usize] = blk;
+        kfill[d] += 1;
+    }
+    return c;
+}
+
+fn for_each_count(count: &mut alloc.List(u32), succ: &alloc.List(u32)) {
+    var k: usize = 0;
+    while k < succ.len() : (k += 1) {
+        count.items_mut()[succ.items()[k] as usize] += 1;
+    }
+}
+
+fn intersect(c: &Cfg, x: u32, y: u32) -> u32 {
+    var p = x;
+    var q = y;
+    while p != q {
+        while c.order[p as usize] > c.order[q as usize] {
+            p = c.idom[p as usize];
+        }
+        while c.order[q as usize] > c.order[p as usize] {
+            q = c.idom[q as usize];
+        }
+    }
+    return p;
+}
+
+/// The dominator tree in preorder, from the entry.
+fn dom_preorder(c: &Cfg, a: alloc.Allocator) -> alloc.List(u32) {
+    var out = alloc.List(u32).init(a);
+    var stack = alloc.List(u32).init(a);
+    stack.push(0);
+    while stack.len() > 0 {
+        let b = stack[stack.len() - 1];
+        _ = stack.pop();
+        out.push(b);
+        var k = c.kid_start[(b + 1) as usize];
+        while k > c.kid_start[b as usize] : (k -= 1) {
+            stack.push(c.kids[(k - 1) as usize]);
+        }
+    }
+    return out;
+}
+
+/// Makes blocks that are not reached hold only Unreachable, and drops the
+/// phi entries of edges that are gone. A phi left with one value, or the
+/// same value from everywhere, is that value.
+fn clean_cfg(f: &mut ir.Function, map: &mut alloc.List(u32), a: alloc.Allocator) {
+    // A CondBr to one block both ways is a Br.
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        let t = terminator(f, b: b as u32);
+        if f.insts[t as usize].op == ir.Op.CondBr and f.insts[t as usize].b == f.insts[t as usize].c {
+            let target = f.insts[t as usize].b;
+            var br = ir.inst(ir.Op.Br, ir.Ty.Void);
+            br.a = target;
+            f.insts[t as usize] = br;
+        }
+    }
+    let c = build_cfg(f, a: a);
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        if c.reached(b as u32) {
+            continue;
+        }
+        let only = f.blocks[b].insts.len() == 1 and f.insts[f.blocks[b].insts[0] as usize].op == ir.Op.Unreachable;
+        if not only {
+            let u = f.insts.len() as u32;
+            f.insts.push(ir.inst(ir.Op.Unreachable, ir.Ty.Void));
+            map.push(u);
+            f.blocks[b].insts.clear();
+            f.blocks[b].insts.push(u);
+        }
+    }
+    // Phis: an entry for each edge that is left.
+    var kept = alloc.List(u32).init(a);
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        if not c.reached(b as u32) {
+            continue;
+        }
+        var k: usize = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            let id = f.blocks[b].insts[k];
+            if f.insts[id as usize].op != ir.Op.Phi {
+                break;
+            }
+            let ph = f.insts[id as usize];
+            kept.clear();
+            // Each predecessor edge takes the first unused entry from it.
+            var used = alloc.List(bool).init(a);
+            var e = ph.args_start;
+            while e < ph.args_start + ph.args_len : (e += 2) {
+                used.push(false);
+            }
+            var p = c.pred_start[b];
+            while p < c.pred_start[b + 1] : (p += 1) {
+                let pred = c.preds[p as usize];
+                var j: u32 = 0;
+                var found = false;
+                while j < ph.args_len / 2 and not found : (j += 1) {
+                    if not used[j as usize] and f.args[(ph.args_start + 2 * j) as usize] == pred {
+                        used[j as usize] = true;
+                        kept.push(pred);
+                        kept.push(f.args[(ph.args_start + 2 * j + 1) as usize]);
+                        found = true;
+                    }
+                }
+            }
+            let start = f.args.len() as u32;
+            var q: usize = 0;
+            while q < kept.len() : (q += 1) {
+                f.args.push(kept[q]);
+            }
+            f.insts[id as usize].args_start = start;
+            f.insts[id as usize].args_len = kept.len() as u32;
+            // One value from every edge: the phi is that value.
+            var same = NONE;
+            var all = true;
+            q = 1;
+            while q < kept.len() : (q += 2) {
+                let v = resolve(map, v: kept[q]);
+                if v != id {
+                    if same == NONE {
+                        same = v;
+                    } else if same != v {
+                        all = false;
+                    }
+                }
+            }
+            if all and same != NONE {
+                map.items_mut()[id as usize] = same;
+            }
+        }
+    }
+    rewrite_all(f, map: map);
+    remove_replaced(f, map: map);
+}
+
+/// Takes out of the blocks the phis replaced by other values.
+fn remove_replaced(f: &mut ir.Function, map: &mut alloc.List(u32)) {
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        var w: usize = 0;
+        var r: usize = 0;
+        while r < f.blocks[b].insts.len() : (r += 1) {
+            let id = f.blocks[b].insts[r];
+            let gone = f.insts[id as usize].op == ir.Op.Phi and resolve(map, v: id) != id;
+            if not gone {
+                f.blocks[b].insts[w] = id;
+                w += 1;
+            }
+        }
+        while f.blocks[b].insts.len() > w {
+            _ = f.blocks[b].insts.pop();
+        }
+    }
+}
+
+// ---- mem2reg --------------------------------------------------------------------------------
+
+/// Promotes stack slots to SSA values.
+fn mem2reg(f: &mut ir.Function, map: &mut alloc.List(u32), a: alloc.Allocator) {
+    let n = f.insts.len();
+    // Which slots qualify, and as which type.
+    var slot_ty = alloc.List(ir.Ty).init(a);
+    var promotable = alloc.List(bool).init(a);
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        slot_ty.push(ir.Ty.Void);
+        promotable.push(f.insts[i].op == ir.Op.Alloca);
+    }
+    var ops = alloc.List(u32).init(a);
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        var k: usize = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            let id = f.blocks[b].insts[k];
+            let ins = f.insts[id as usize];
+            var used_as = NONE;
+            if ins.op == ir.Op.Load and ins.flag == 0 and f.insts[ins.a as usize].op == ir.Op.Alloca {
+                used_as = ins.a;
+                note_type(&mut slot_ty, promotable: &mut promotable, slot: ins.a, t: ins.ty);
+            } else if ins.op == ir.Op.Store and ins.flag == 0 and f.insts[ins.b as usize].op == ir.Op.Alloca and ins.a != ins.b {
+                used_as = ins.b;
+                note_type(&mut slot_ty, promotable: &mut promotable, slot: ins.b, t: f.insts[ins.a as usize].ty);
+            } else if ins.op == ir.Op.Memzero and f.insts[ins.a as usize].op == ir.Op.Alloca and ins.imm == f.insts[ins.a as usize].imm {
+                used_as = ins.a;
+            }
+            // Any other use of a slot's address keeps it in memory.
+            operands(f, id: id, out: &mut ops);
+            var o: usize = 0;
+            while o < ops.len() : (o += 1) {
+                let v = ops[o];
+                if f.insts[v as usize].op == ir.Op.Alloca and v != used_as {
+                    promotable[v as usize] = false;
+                }
+            }
+            // A slot stored as a value elsewhere escapes, even if also used
+            // as this store's address.
+            if ins.op == ir.Op.Store and f.insts[ins.a as usize].op == ir.Op.Alloca {
+                promotable[ins.a as usize] = false;
+            }
+        }
+    }
+    var count: u32 = 0;
+    i = 0;
+    while i < n : (i += 1) {
+        if promotable[i] {
+            let t = slot_ty[i];
+            if t == ir.Ty.Void or size_of(t) != f.insts[i].imm or not (is_int(t) or t == ir.Ty.Ptr or t == ir.Ty.F32 or t == ir.Ty.F64) {
+                // No load at all: the slot is dead. Otherwise it stays.
+                promotable[i] = t == ir.Ty.Void;
+            }
+            if promotable[i] {
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return;
+    }
+    let c = build_cfg(f, a: a);
+    // Phis where the stores' dominance frontiers meet.
+    var df = alloc.List(alloc.List(u32)).init(a);
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        df.push(alloc.List(u32).init(a));
+    }
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        if not c.reached(b as u32) or c.pred_count(b as u32) < 2 {
+            continue;
+        }
+        var p = c.pred_start[b];
+        while p < c.pred_start[b + 1] : (p += 1) {
+            var runner = c.preds[p as usize];
+            while runner != c.idom[b] {
+                let have = df[runner as usize].len();
+                if have == 0 or df[runner as usize][have - 1] != b as u32 {
+                    df[runner as usize].push(b as u32);
+                }
+                runner = c.idom[runner as usize];
+            }
+        }
+    }
+    // For each slot: the blocks that store to it.
+    var phi_slot = alloc.List(u32).init(a);
+    var has_phi = alloc.List(u32).init(a);
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        has_phi.push(NONE);
+    }
+    var work = alloc.List(u32).init(a);
+    var phis_of = alloc.List(alloc.List(u32)).init(a);
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        phis_of.push(alloc.List(u32).init(a));
+    }
+    var s: usize = 0;
+    while s < n : (s += 1) {
+        if not promotable[s] or slot_ty[s] == ir.Ty.Void {
+            continue;
+        }
+        work.clear();
+        b = 0;
+        while b < f.blocks.len() : (b += 1) {
+            if not c.reached(b as u32) {
+                continue;
+            }
+            var k: usize = 0;
+            var stores = false;
+            while k < f.blocks[b].insts.len() and not stores : (k += 1) {
+                let ins = f.insts[f.blocks[b].insts[k] as usize];
+                stores = (ins.op == ir.Op.Store and ins.b == s as u32) or (ins.op == ir.Op.Memzero and ins.a == s as u32);
+            }
+            if stores {
+                work.push(b as u32);
+            }
+        }
+        while work.len() > 0 {
+            let x = work[work.len() - 1];
+            _ = work.pop();
+            let frontier = df[x as usize].items();
+            var d: usize = 0;
+            while d < frontier.len() : (d += 1) {
+                let y = frontier[d];
+                if has_phi[y as usize] == s as u32 {
+                    continue;
+                }
+                has_phi[y as usize] = s as u32;
+                // A phi with room for an entry per incoming edge.
+                var ph = ir.inst(ir.Op.Phi, slot_ty[s]);
+                ph.args_start = f.args.len() as u32;
+                ph.args_len = 2 * c.pred_count(y);
+                var e: u32 = 0;
+                while e < ph.args_len : (e += 1) {
+                    f.args.push(NONE);
+                }
+                let pid = f.insts.len() as u32;
+                f.insts.push(ph);
+                map.push(pid);
+                phi_slot.push(pid);
+                phi_slot.push(s as u32);
+                phis_of[y as usize].push(pid);
+                work.push(y);
+            }
+        }
+    }
+    // The slot each phi stands for.
+    var slot_of_phi = alloc.List(u32).init(a);
+    i = 0;
+    while i < f.insts.len() : (i += 1) {
+        slot_of_phi.push(NONE);
+    }
+    var q: usize = 0;
+    while q < phi_slot.len() : (q += 2) {
+        slot_of_phi[phi_slot[q] as usize] = phi_slot[q + 1];
+    }
+    // Renaming, over the dominator tree with an explicit stack: cur is each
+    // slot's value now; undo restores it when a subtree is done.
+    var cur = alloc.List(u32).init(a);
+    i = 0;
+    while i < n : (i += 1) {
+        cur.push(NONE);
+    }
+    var zeros = alloc.List(u32).init(a);
+    i = 0;
+    while i < 9 : (i += 1) {
+        zeros.push(NONE);
+    }
+    var undo = alloc.List(u32).init(a);
+    var stack = alloc.List(u32).init(a);
+    var dead = alloc.List(bool).init(a);
+    i = 0;
+    while i < f.insts.len() : (i += 1) {
+        dead.push(false);
+    }
+    var succ = alloc.List(u32).init(a);
+    stack.push(0);
+    while stack.len() > 0 {
+        let top = stack[stack.len() - 1];
+        _ = stack.pop();
+        if top & 0x80000000 != 0 {
+            // Leaving a block: undo its definitions.
+            // Entries are (old value, slot), the slot on top: a slot is never
+            // NONE, which marks where the block's entries begin.
+            while undo.len() > 0 and undo[undo.len() - 1] != NONE {
+                let slot = undo[undo.len() - 1];
+                _ = undo.pop();
+                let old = undo[undo.len() - 1];
+                _ = undo.pop();
+                cur[slot as usize] = old;
+            }
+            _ = undo.pop();
+            continue;
+        }
+        let blk = top;
+        undo.push(NONE);
+        stack.push(blk | 0x80000000);
+        let phis = phis_of[blk as usize].items();
+        var k: usize = 0;
+        while k < phis.len() : (k += 1) {
+            let slot = slot_of_phi[phis[k] as usize];
+            undo.push(cur[slot as usize]);
+            undo.push(slot);
+            cur[slot as usize] = phis[k];
+        }
+        k = 0;
+        while k < f.blocks[blk as usize].insts.len() : (k += 1) {
+            let id = f.blocks[blk as usize].insts[k];
+            let ins = f.insts[id as usize];
+            if ins.op == ir.Op.Load and ins.flag == 0 and promotable[ins.a as usize] {
+                var v = cur[ins.a as usize];
+                if v == NONE {
+                    v = zero_of(f, map: map, zeros: &mut zeros, t: ins.ty);
+                }
+                map.items_mut()[id as usize] = v;
+                dead[id as usize] = true;
+            } else if ins.op == ir.Op.Store and ins.flag == 0 and promotable[ins.b as usize] {
+                undo.push(cur[ins.b as usize]);
+                undo.push(ins.b);
+                cur[ins.b as usize] = ins.a;
+                dead[id as usize] = true;
+            } else if ins.op == ir.Op.Memzero and promotable[ins.a as usize] {
+                undo.push(cur[ins.a as usize]);
+                undo.push(ins.a);
+                if slot_ty[ins.a as usize] != ir.Ty.Void {
+                    cur[ins.a as usize] = zero_of(f, map: map, zeros: &mut zeros, t: slot_ty[ins.a as usize]);
+                }
+                dead[id as usize] = true;
+            } else if ins.op == ir.Op.Alloca and promotable[id as usize] {
+                dead[id as usize] = true;
+            }
+        }
+        // The entries of the successors' phis for this edge.
+        successors(f, b: blk, out: &mut succ);
+        var e: usize = 0;
+        while e < succ.len() : (e += 1) {
+            let sb = succ[e];
+            let sp = phis_of[sb as usize].items();
+            var j: usize = 0;
+            while j < sp.len() : (j += 1) {
+                let ph = f.insts[sp[j] as usize];
+                let slot = slot_of_phi[sp[j] as usize];
+                var v = cur[slot as usize];
+                if v == NONE {
+                    v = zero_of(f, map: map, zeros: &mut zeros, t: ph.ty);
+                }
+                // The first free entry: one per edge from this block.
+                var at = ph.args_start;
+                while at < ph.args_start + ph.args_len and f.args[at as usize] != NONE : (at += 2) {
+                }
+                if at < ph.args_start + ph.args_len {
+                    f.args[at as usize] = blk;
+                    f.args[(at + 1) as usize] = v;
+                }
+            }
+        }
+        var kk = c.kid_start[(blk + 1) as usize];
+        while kk > c.kid_start[blk as usize] : (kk -= 1) {
+            stack.push(c.kids[(kk - 1) as usize]);
+        }
+    }
+    // The phis go first in their blocks; what was promoted goes.
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        var fresh = alloc.List(u32).init(a);
+        let phis = phis_of[b].items();
+        var k: usize = 0;
+        while k < phis.len() : (k += 1) {
+            fresh.push(phis[k]);
+        }
+        k = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            let id = f.blocks[b].insts[k];
+            if (id as usize) < dead.len() and dead[id as usize] {
+                continue;
+            }
+            fresh.push(id);
+        }
+        f.blocks[b].insts = fresh;
+    }
+    f.ssa = true;
+    rewrite_all(f, map: map);
+}
+
+fn note_type(slot_ty: &mut alloc.List(ir.Ty), promotable: &mut alloc.List(bool), slot: u32, t: ir.Ty) {
+    let have = slot_ty.items_mut()[slot as usize];
+    if have == ir.Ty.Void {
+        slot_ty.items_mut()[slot as usize] = t;
+    } else if have != t {
+        promotable.items_mut()[slot as usize] = false;
+    }
+}
+
+fn zero_of(f: &mut ir.Function, map: &mut alloc.List(u32), zeros: &mut alloc.List(u32), t: ir.Ty) -> u32 {
+    var k: usize = 0;
+    if t == ir.Ty.I1 { k = 1; }
+    if t == ir.Ty.I8 { k = 2; }
+    if t == ir.Ty.I16 { k = 3; }
+    if t == ir.Ty.I32 { k = 4; }
+    if t == ir.Ty.I64 { k = 5; }
+    if t == ir.Ty.Ptr { k = 6; }
+    if t == ir.Ty.F32 { k = 7; }
+    if t == ir.Ty.F64 { k = 8; }
+    if zeros.items_mut()[k] == NONE {
+        zeros.items_mut()[k] = constant(f, map: map, t: t, v: 0);
+    }
+    return zeros.items_mut()[k];
+}
+
+// ---- SCCP -----------------------------------------------------------------------------------
+
+/// A value's state: not known yet, one constant, or more than one.
+const TOP: u32 = 0;
+const CONST: u32 = 1;
+const OVER: u32 = 2;
+
+type Lattice = struct {
+    state: alloc.List(u32),
+    value: alloc.List(u64),
+}
+
+fn set_state(l: &mut Lattice, id: u32, st: u32, v: u64, changed: &mut alloc.List(u32)) {
+    let old = l.state[id as usize];
+    if old == OVER or (old == st and (st != CONST or l.value[id as usize] == v)) {
+        return;
+    }
+    var nst = st;
+    if old == CONST and st == CONST and l.value[id as usize] != v {
+        nst = OVER;
+    }
+    if old > nst {
+        return;
+    }
+    l.state[id as usize] = nst;
+    l.value[id as usize] = v;
+    changed.push(id);
+}
+
+/// The value of a pure integer operation on constants, if it has one.
+/// Constants are kept to their type's width.
+fn fold(f: &ir.Function, i: ir.Inst, x_in: u64, y_in: u64) -> ?u64 {
+    let t = i.ty;
+    let x = x_in & mask(f.insts[i.a as usize].ty);
+    var y = y_in;
+    if i.op == ir.Op.Bin or i.op == ir.Op.Cmp or i.op == ir.Op.Overflow {
+        y = y_in & mask(f.insts[i.b as usize].ty);
+    }
+    match i.op {
+        .Bin => {
+            let n = bits(t);
+            let m = mask(t);
+            let k = i.flag;
+            if k == 0 { return (x +% y) & m; }
+            if k == 1 { return (x -% y) & m; }
+            if k == 2 { return (x *% y) & m; }
+            if k == 3 or k == 5 {
+                let sx = signed(x, n: n);
+                let sy = signed(y, n: n);
+                if sy == 0 or (sy == -1 and x == (mask(t) >> 1) + 1) {
+                    return none;
+                }
+                if k == 3 {
+                    return (sx / sy) as% u64 & m;
+                }
+                return (sx % sy) as% u64 & m;
+            }
+            if k == 4 or k == 6 {
+                if y == 0 {
+                    return none;
+                }
+                if k == 4 {
+                    return x / y;
+                }
+                return x % y;
+            }
+            if k == 7 { return x & y; }
+            if k == 8 { return x | y; }
+            if k == 9 { return x ^ y; }
+            if y >= n as u64 {
+                return none;
+            }
+            if k == 10 { return (x << (y as u32)) & m; }
+            if k == 11 { return x >> (y as u32); }
+            return (signed(x, n: n) >> (y as u32)) as% u64 & m;
+        }
+        .Cmp => {
+            let n = bits(f.insts[i.a as usize].ty);
+            let sx = signed(x, n: n);
+            let sy = signed(y, n: n);
+            var r = false;
+            let k = i.flag;
+            if k == 0 { r = x == y; }
+            if k == 1 { r = x != y; }
+            if k == 2 { r = sx < sy; }
+            if k == 3 { r = sx <= sy; }
+            if k == 4 { r = sx > sy; }
+            if k == 5 { r = sx >= sy; }
+            if k == 6 { r = x < y; }
+            if k == 7 { r = x <= y; }
+            if k == 8 { r = x > y; }
+            if k == 9 { r = x >= y; }
+            if r {
+                return 1;
+            }
+            return 0;
+        }
+        .Ext => {
+            let from = bits(f.insts[i.a as usize].ty);
+            if i.flag == 1 {
+                return signed(x, n: from) as% u64 & mask(t);
+            }
+            return x;
+        }
+        .Trunc => { return x & mask(t); }
+        .Overflow => { return (overflow(i, x: x, y: y) & mask(t)); }
+        _ => { return none; }
+    }
+}
+
+/// The wrapped result of an Overflow; overflowed says whether it did.
+fn overflow(i: ir.Inst, x: u64, y: u64) -> u64 {
+    let k = i.flag;
+    if k == 0 or k == 1 { return x +% y; }
+    if k == 2 or k == 3 { return x -% y; }
+    return x *% y;
+}
+
+fn overflowed(f: &ir.Function, i: ir.Inst, x: u64, y: u64) -> bool {
+    let t = i.ty;
+    let n = bits(t);
+    let m = mask(t);
+    let k = i.flag;
+    if k == 1 {
+        if n < 64 {
+            return x + y > m;
+        }
+        return x +% y < x;
+    }
+    if k == 3 {
+        return y > x;
+    }
+    if k == 5 {
+        if x == 0 or y == 0 {
+            return false;
+        }
+        if n <= 32 {
+            return x * y > m;
+        }
+        return (x *% y) / y != x;
+    }
+    let sx = signed(x, n: n);
+    let sy = signed(y, n: n);
+    let one: i64 = 1;
+    var lo: i64 = -9223372036854775807 - 1;
+    var hi: i64 = 9223372036854775807;
+    if n < 64 {
+        lo = -(one << (n - 1));
+        hi = (one << (n - 1)) - 1;
+    }
+    if k == 0 {
+        if sy > 0 { return sx > hi - sy; }
+        return sx < lo - sy;
+    }
+    if k == 2 {
+        if sy > 0 { return sx < lo + sy; }
+        return sx > hi + sy;
+    }
+    // SMul.
+    if sx == 0 or sy == 0 {
+        return false;
+    }
+    if n <= 32 {
+        let p = sx * sy;
+        return p < lo or p > hi;
+    }
+    if (sx == -1 and sy == lo) or (sy == -1 and sx == lo) {
+        return true;
+    }
+    let p = sx *% sy;
+    return p / sy != sx;
+}
+
+fn sccp(f: &mut ir.Function, map: &mut alloc.List(u32), a: alloc.Allocator) {
+    let n = f.insts.len();
+    var l = Lattice { state: alloc.List(u32).init(a), value: alloc.List(u64).init(a) };
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        l.state.push(TOP);
+        l.value.push(0);
+    }
+    // Users of each value, and the block of each instruction.
+    var block_of = alloc.List(u32).init(a);
+    var user_count = alloc.List(u32).init(a);
+    i = 0;
+    while i <= n : (i += 1) {
+        block_of.push(NONE);
+        user_count.push(0);
+    }
+    var ops = alloc.List(u32).init(a);
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        var k: usize = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            let id = f.blocks[b].insts[k];
+            block_of[id as usize] = b as u32;
+            operands(f, id: id, out: &mut ops);
+            var o: usize = 0;
+            while o < ops.len() : (o += 1) {
+                if (ops[o] as usize) < n {
+                    user_count[ops[o] as usize] += 1;
+                }
+            }
+        }
+    }
+    var user_start = alloc.List(u32).init(a);
+    var total: u32 = 0;
+    i = 0;
+    while i < n : (i += 1) {
+        user_start.push(total);
+        total += user_count[i];
+    }
+    user_start.push(total);
+    var users = alloc.List(u32).init(a);
+    var fill = alloc.List(u32).init(a);
+    i = 0;
+    while i < total as usize : (i += 1) {
+        users.push(0);
+    }
+    i = 0;
+    while i < n : (i += 1) {
+        fill.push(user_start[i]);
+    }
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        var k: usize = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            let id = f.blocks[b].insts[k];
+            operands(f, id: id, out: &mut ops);
+            var o: usize = 0;
+            while o < ops.len() : (o += 1) {
+                let v = ops[o] as usize;
+                if v < n {
+                    users[fill[v] as usize] = id;
+                    fill[v] += 1;
+                }
+            }
+        }
+    }
+    // Constants are known from the start; values with no block (constants
+    // the passes made) too.
+    i = 0;
+    while i < n : (i += 1) {
+        if f.insts[i].op == ir.Op.Const {
+            l.state[i] = CONST;
+            l.value[i] = f.insts[i].imm & mask(f.insts[i].ty);
+        }
+    }
+    var block_live = alloc.List(bool).init(a);
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        block_live.push(false);
+    }
+    var block_work = alloc.List(u32).init(a);
+    var inst_work = alloc.List(u32).init(a);
+    block_work.push(0);
+    while block_work.len() > 0 or inst_work.len() > 0 {
+        while block_work.len() > 0 {
+            let blk = block_work[block_work.len() - 1];
+            _ = block_work.pop();
+            let first_time = not block_live[blk as usize];
+            block_live[blk as usize] = true;
+            var k: usize = 0;
+            while k < f.blocks[blk as usize].insts.len() : (k += 1) {
+                let id = f.blocks[blk as usize].insts[k];
+                if first_time or f.insts[id as usize].op == ir.Op.Phi {
+                    visit(f, id: id, l: &mut l, block_of: &block_of, block_work: &mut block_work, changed: &mut inst_work, block_live: &block_live);
+                }
+            }
+        }
+        while inst_work.len() > 0 {
+            let v = inst_work[inst_work.len() - 1];
+            _ = inst_work.pop();
+            var u = user_start[v as usize];
+            while u < user_start[(v + 1) as usize] : (u += 1) {
+                let user = users[u as usize];
+                let ub = block_of[user as usize];
+                if ub != NONE and block_live[ub as usize] {
+                    visit(f, id: user, l: &mut l, block_of: &block_of, block_work: &mut block_work, changed: &mut inst_work, block_live: &block_live);
+                }
+            }
+        }
+    }
+    // Rewrite: known values become constants, decided branches jumps.
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        if not block_live[b] {
+            continue;
+        }
+        var k: usize = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            let id = f.blocks[b].insts[k];
+            let ins = f.insts[id as usize];
+            if ins.op == ir.Op.CondBr and l.state[ins.a as usize] == CONST {
+                var target = ins.c;
+                if l.value[ins.a as usize] & 1 == 1 {
+                    target = ins.b;
+                }
+                var br = ir.inst(ir.Op.Br, ir.Ty.Void);
+                br.a = target;
+                f.insts[id as usize] = br;
+            } else if ins.op != ir.Op.Const and pure(ins) and ins.op != ir.Op.Overflow and is_int(ins.ty) and l.state[id as usize] == CONST {
+                map.items_mut()[id as usize] = constant(f, map: map, t: ins.ty, v: l.value[id as usize]);
+            }
+        }
+    }
+    rewrite_all(f, map: map);
+}
+
+/// Evaluates one instruction, a phi with the edges live so far.
+fn visit(f: &ir.Function, id: u32, l: &mut Lattice, block_of: &alloc.List(u32), block_work: &mut alloc.List(u32), changed: &mut alloc.List(u32), block_live: &alloc.List(bool)) {
+    let ins = f.insts[id as usize];
+    match ins.op {
+        .Const => { }
+        .Phi => {
+            var st = TOP;
+            var v: u64 = 0;
+            var k = ins.args_start;
+            while k < ins.args_start + ins.args_len : (k += 2) {
+                let from = f.args[k as usize];
+                // An entry counts once its block runs and jumps here.
+                if from as usize >= block_live.len() or not block_live.items()[from as usize] or not jumps_to(f, from: from, to: block_of.items()[id as usize]) {
+                    continue;
+                }
+                let x = f.args[(k + 1) as usize];
+                let xs = l.state[x as usize];
+                if xs == OVER {
+                    st = OVER;
+                } else if xs == CONST {
+                    if st == TOP {
+                        st = CONST;
+                        v = l.value[x as usize];
+                    } else if st == CONST and v != l.value[x as usize] {
+                        st = OVER;
+                    }
+                }
+            }
+            if st != TOP {
+                set_state(l, id: id, st: st, v: v, changed: changed);
+            }
+        }
+        .Bin | .Cmp | .Overflow => {
+            let sa = l.state[ins.a as usize];
+            let sb = l.state[ins.b as usize];
+            if not is_int(f.insts[ins.a as usize].ty) or sa == OVER or sb == OVER {
+                set_state(l, id: id, st: OVER, v: 0, changed: changed);
+            } else if sa == CONST and sb == CONST {
+                match fold(f, i: ins, x_in: l.value[ins.a as usize], y_in: l.value[ins.b as usize]) {
+                    some(r) => { set_state(l, id: id, st: CONST, v: r, changed: changed); }
+                    none => { set_state(l, id: id, st: OVER, v: 0, changed: changed); }
+                }
+            }
+        }
+        .OverflowBit => {
+            let o = f.insts[ins.a as usize];
+            let sa = l.state[o.a as usize];
+            let sb = l.state[o.b as usize];
+            if sa == OVER or sb == OVER or l.state[ins.a as usize] == OVER {
+                set_state(l, id: id, st: OVER, v: 0, changed: changed);
+            } else if sa == CONST and sb == CONST {
+                var r: u64 = 0;
+                if overflowed(f, i: o, x: l.value[o.a as usize] & mask(o.ty), y: l.value[o.b as usize] & mask(o.ty)) {
+                    r = 1;
+                }
+                set_state(l, id: id, st: CONST, v: r, changed: changed);
+            }
+        }
+        .Ext | .Trunc => {
+            let sa = l.state[ins.a as usize];
+            if not is_int(f.insts[ins.a as usize].ty) or not is_int(ins.ty) or sa == OVER {
+                set_state(l, id: id, st: OVER, v: 0, changed: changed);
+            } else if sa == CONST {
+                match fold(f, i: ins, x_in: l.value[ins.a as usize], y_in: 0) {
+                    some(r) => { set_state(l, id: id, st: CONST, v: r, changed: changed); }
+                    none => { set_state(l, id: id, st: OVER, v: 0, changed: changed); }
+                }
+            }
+        }
+        .CondBr => {
+            let sc = l.state[ins.a as usize];
+            if sc == CONST {
+                if l.value[ins.a as usize] & 1 == 1 {
+                    mark_block(ins.b, block_live: block_live, block_work: block_work);
+                } else {
+                    mark_block(ins.c, block_live: block_live, block_work: block_work);
+                }
+            } else if sc == OVER {
+                mark_block(ins.b, block_live: block_live, block_work: block_work);
+                mark_block(ins.c, block_live: block_live, block_work: block_work);
+            }
+        }
+        .Br => { mark_block(ins.a, block_live: block_live, block_work: block_work); }
+        _ => {
+            if ir.has_value(ins) {
+                set_state(l, id: id, st: OVER, v: 0, changed: changed);
+            }
+        }
+    }
+}
+
+/// Queues a block when it is not running yet; the phis of a running one
+/// are visited again, since a new edge may reach them.
+fn mark_block(b: u32, block_live: &alloc.List(bool), block_work: &mut alloc.List(u32)) {
+    _ = block_live;
+    block_work.push(b);
+}
+
+/// Whether the block's terminator, as decided so far, jumps to `to`. A
+/// CondBr counts when its condition is not known false or true the other
+/// way: SCCP's phis are evaluated on executable edges.
+fn jumps_to(f: &ir.Function, from: u32, to: u32) -> bool {
+    let t = f.insts[terminator(f, b: from) as usize];
+    if t.op == ir.Op.Br {
+        return t.a == to;
+    }
+    if t.op == ir.Op.CondBr {
+        return t.b == to or t.c == to;
+    }
+    return false;
+}
+
+// ---- GVN, loads and branches ------------------------------------------------------------
+
+type Key = struct {
+    op: ir.Op,
+    ty: ir.Ty,
+    a: u32,
+    b: u32,
+    c: u32,
+    imm: u64,
+    flag: u32,
+}
+
+fn numbered(i: ir.Inst) -> bool {
+    match i.op {
+        .Gep | .GepIndex | .Bin | .Overflow | .OverflowBit | .Cmp | .Ext | .Trunc | .Global | .VTable | .FBin | .FNeg | .FCmp | .FConv |
+            .IntToPtr | .PtrToInt => {
+            return true;
+        }
+        .FMath => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn key_of(i: ir.Inst) -> Key {
+    var x = i.a;
+    var y = i.b;
+    // Operands of commutative operations in one order.
+    let commutes = (i.op == ir.Op.Bin and (i.flag == 0 or i.flag == 2 or i.flag == 7 or i.flag == 8 or i.flag == 9)) or
+        (i.op == ir.Op.Cmp and (i.flag == 0 or i.flag == 1)) or
+        (i.op == ir.Op.Overflow and (i.flag == 0 or i.flag == 1 or i.flag == 4 or i.flag == 5));
+    if commutes and y < x {
+        x = i.b;
+        y = i.a;
+    }
+    var c: u32 = 0;
+    var k = Key { op: i.op, ty: i.ty, a: 0, b: 0, c: 0, imm: i.imm, flag: i.flag };
+    match i.op {
+        .Gep | .Ext | .Trunc | .OverflowBit | .FNeg | .FConv | .IntToPtr | .PtrToInt => { k.a = x; }
+        .Global | .VTable => { }
+        .FMath => {
+            k.a = x;
+            if i.flag == 5 or i.flag == 6 {
+                k.b = y;
+            }
+            if i.flag == 6 {
+                c = i.c;
+            }
+        }
+        _ => {
+            k.a = x;
+            k.b = y;
+        }
+    }
+    k.c = c;
+    return k;
+}
+
+/// A load's address and type, for loads that need not be repeated.
+type LoadKey = struct {
+    addr: u32,
+    ty: ir.Ty,
+}
+
+fn gvn(f: &mut ir.Function, map: &mut alloc.List(u32), a: alloc.Allocator) {
+    let c = build_cfg(f, a: a);
+    var table = alloc.Map(Key, u32).init(a);
+    var undo = alloc.List(Key).init(a);
+    var undo_mark = alloc.List(u32).init(a);
+    // Conditions decided on the way down the tree: 1 true, 2 false.
+    var known = alloc.Map(u32, u32).init(a);
+    var known_undo = alloc.List(u32).init(a);
+    var known_mark = alloc.List(u32).init(a);
+    // Loads, valid within a block and down a chain of single predecessors.
+    var loads = alloc.Map(LoadKey, u32).init(a);
+    var load_keys = alloc.List(LoadKey).init(a);
+    var snap_keys = alloc.List(alloc.List(LoadKey)).init(a);
+    var snap_vals = alloc.List(alloc.List(u32)).init(a);
+    var sb: usize = 0;
+    while sb < f.blocks.len() : (sb += 1) {
+        snap_keys.push(alloc.List(LoadKey).init(a));
+        snap_vals.push(alloc.List(u32).init(a));
+    }
+    var stack = alloc.List(u32).init(a);
+    stack.push(0);
+    while stack.len() > 0 {
+        let top = stack[stack.len() - 1];
+        _ = stack.pop();
+        if top & 0x80000000 != 0 {
+            let mark = undo_mark[undo_mark.len() - 1];
+            _ = undo_mark.pop();
+            while undo.len() > mark as usize {
+                let k = undo[undo.len() - 1];
+                _ = undo.pop();
+                _ = table.remove(k);
+            }
+            let km = known_mark[known_mark.len() - 1];
+            _ = known_mark.pop();
+            while known_undo.len() > km as usize {
+                let k = known_undo[known_undo.len() - 1];
+                _ = known_undo.pop();
+                _ = known.remove(k);
+            }
+            continue;
+        }
+        let blk = top;
+        undo_mark.push(undo.len() as u32);
+        known_mark.push(known_undo.len() as u32);
+        stack.push(blk | 0x80000000);
+        // A block entered only from its dominator by one edge of a branch
+        // knows which way the branch went; and sees the loads it saw.
+        clear_loads(&mut loads, keys: &mut load_keys);
+        let single = blk != 0 and c.pred_count(blk) == 1 and c.preds[c.pred_start[blk as usize] as usize] == c.idom[blk as usize];
+        if single {
+            let p = c.idom[blk as usize];
+            let t = f.insts[terminator(f, b: p) as usize];
+            if t.op == ir.Op.CondBr and t.b != t.c {
+                let cond = resolve(map, v: t.a);
+                match known.get(cond) {
+                    some(_) => { }
+                    none => {
+                        if t.b == blk {
+                            known.put(cond, 1);
+                        } else {
+                            known.put(cond, 2);
+                        }
+                        known_undo.push(cond);
+                    }
+                }
+            }
+            let sk = snap_keys[p as usize].items();
+            let sv = snap_vals[p as usize].items();
+            var q: usize = 0;
+            while q < sk.len() : (q += 1) {
+                loads.put(sk[q], sv[q]);
+                load_keys.push(sk[q]);
+            }
+        }
+        var k: usize = 0;
+        while k < f.blocks[blk as usize].insts.len() : (k += 1) {
+            let id = f.blocks[blk as usize].insts[k];
+            rewrite(f, id: id, map: map);
+            let ins = f.insts[id as usize];
+            if numbered(ins) {
+                let key = key_of(ins);
+                match table.get(key) {
+                    some(leader) => { map.items_mut()[id as usize] = leader; }
+                    none => {
+                        table.put(key, id);
+                        undo.push(key);
+                    }
+                }
+            } else if ins.op == ir.Op.Load and ins.flag == 0 {
+                let lk = LoadKey { addr: ins.a, ty: ins.ty };
+                match loads.get(lk) {
+                    some(v) => { map.items_mut()[id as usize] = v; }
+                    none => {
+                        loads.put(lk, id);
+                        load_keys.push(lk);
+                    }
+                }
+            } else if writes(ins) {
+                clear_loads(&mut loads, keys: &mut load_keys);
+                // What was just stored is what a load there reads.
+                if ins.op == ir.Op.Store and ins.flag == 0 {
+                    let lk = LoadKey { addr: ins.b, ty: f.insts[ins.a as usize].ty };
+                    loads.put(lk, ins.a);
+                    load_keys.push(lk);
+                }
+            } else if ins.op == ir.Op.CondBr {
+                let cond = resolve(map, v: ins.a);
+                match known.get(cond) {
+                    some(way) => {
+                        var br = ir.inst(ir.Op.Br, ir.Ty.Void);
+                        br.a = ins.c;
+                        if way == 1 {
+                            br.a = ins.b;
+                        }
+                        f.insts[id as usize] = br;
+                    }
+                    none => { }
+                }
+            }
+        }
+        // The loads known at the end, for children entered from here alone.
+        if c.kid_start[(blk + 1) as usize] > c.kid_start[blk as usize] {
+            snap_keys[blk as usize].clear();
+            snap_vals[blk as usize].clear();
+            var q: usize = 0;
+            while q < load_keys.len() : (q += 1) {
+                match loads.get(load_keys[q]) {
+                    some(v) => {
+                        snap_keys[blk as usize].push(load_keys[q]);
+                        snap_vals[blk as usize].push(v);
+                    }
+                    none => { }
+                }
+            }
+        }
+        var kk = c.kid_start[(blk + 1) as usize];
+        while kk > c.kid_start[blk as usize] : (kk -= 1) {
+            stack.push(c.kids[(kk - 1) as usize]);
+        }
+    }
+    rewrite_all(f, map: map);
+}
+
+fn clear_loads(loads: &mut alloc.Map(LoadKey, u32), keys: &mut alloc.List(LoadKey)) {
+    while keys.len() > 0 {
+        let k = keys.items_mut()[keys.len() - 1];
+        _ = keys.pop();
+        _ = loads.remove(k);
+    }
+}
+
+// ---- LICM -----------------------------------------------------------------------------------
+
+/// Whether an operation may move to before its loop: pure, and unable to
+/// trap or read memory.
+fn hoistable(i: ir.Inst) -> bool {
+    match i.op {
+        .Gep | .GepIndex | .Cmp | .Ext | .Trunc | .Global | .VTable | .FBin | .FNeg | .FCmp | .FConv | .IntToPtr | .PtrToInt | .Overflow | .OverflowBit => {
+            return true;
+        }
+        .Bin => { return i.flag < 3 or i.flag > 6; }
+        _ => { return false; }
+    }
+}
+
+fn licm(f: &mut ir.Function, map: &mut alloc.List(u32), a: alloc.Allocator) {
+    let c = build_cfg(f, a: a);
+    var block_of = alloc.List(u32).init(a);
+    var i: usize = 0;
+    while i < f.insts.len() : (i += 1) {
+        block_of.push(NONE);
+    }
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        var k: usize = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            block_of[f.blocks[b].insts[k] as usize] = b as u32;
+        }
+    }
+    var in_loop = alloc.List(bool).init(a);
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        in_loop.push(false);
+    }
+    var work = alloc.List(u32).init(a);
+    var ops = alloc.List(u32).init(a);
+    // Each back edge latch -> header, the header dominating the latch.
+    var r: usize = 0;
+    while r < c.rpo.len() : (r += 1) {
+        let header = c.rpo[r];
+        var p = c.pred_start[header as usize];
+        var latches: u32 = 0;
+        var outside = NONE;
+        var outside_count: u32 = 0;
+        while p < c.pred_start[(header + 1) as usize] : (p += 1) {
+            let pred = c.preds[p as usize];
+            if c.dominates(a: header, b: pred) {
+                latches += 1;
+            } else {
+                outside = pred;
+                outside_count += 1;
+            }
+        }
+        if latches == 0 or outside_count != 1 {
+            continue;
+        }
+        // The preheader: the one way in, jumping straight to the header.
+        let pt = f.insts[terminator(f, b: outside) as usize];
+        if pt.op != ir.Op.Br {
+            continue;
+        }
+        // The loop: blocks that reach a latch without going through the header.
+        b = 0;
+        while b < f.blocks.len() : (b += 1) {
+            in_loop[b] = false;
+        }
+        in_loop[header as usize] = true;
+        work.clear();
+        p = c.pred_start[header as usize];
+        while p < c.pred_start[(header + 1) as usize] : (p += 1) {
+            let pred = c.preds[p as usize];
+            if c.dominates(a: header, b: pred) and not in_loop[pred as usize] {
+                in_loop[pred as usize] = true;
+                work.push(pred);
+            }
+        }
+        while work.len() > 0 {
+            let x = work[work.len() - 1];
+            _ = work.pop();
+            var q = c.pred_start[x as usize];
+            while q < c.pred_start[(x + 1) as usize] : (q += 1) {
+                let y = c.preds[q as usize];
+                if not in_loop[y as usize] {
+                    in_loop[y as usize] = true;
+                    work.push(y);
+                }
+            }
+        }
+        // Hoist, in the loop's reverse postorder, until nothing moves.
+        var moved = true;
+        while moved {
+            moved = false;
+            var rr: usize = 0;
+            while rr < c.rpo.len() : (rr += 1) {
+                let lb = c.rpo[rr];
+                if not in_loop[lb as usize] {
+                    continue;
+                }
+                var k: usize = 0;
+                while k < f.blocks[lb as usize].insts.len() {
+                    let id = f.blocks[lb as usize].insts[k];
+                    let ins = f.insts[id as usize];
+                    var invariant = hoistable(ins);
+                    if invariant {
+                        operands(f, id: id, out: &mut ops);
+                        var o: usize = 0;
+                        while o < ops.len() : (o += 1) {
+                            let def = block_of[ops[o] as usize];
+                            if def != NONE and in_loop[def as usize] {
+                                invariant = false;
+                            }
+                        }
+                    }
+                    if invariant {
+                        // Out of the loop block, into the preheader before its jump.
+                        var w = k;
+                        while w + 1 < f.blocks[lb as usize].insts.len() : (w += 1) {
+                            let moved_id = f.blocks[lb as usize].insts[w + 1];
+                            f.blocks[lb as usize].insts[w] = moved_id;
+                        }
+                        _ = f.blocks[lb as usize].insts.pop();
+                        let at = f.blocks[outside as usize].insts.len() - 1;
+                        let last = f.blocks[outside as usize].insts[at];
+                        f.blocks[outside as usize].insts[at] = id;
+                        f.blocks[outside as usize].insts.push(last);
+                        block_of[id as usize] = outside;
+                        moved = true;
+                    } else {
+                        k += 1;
+                    }
+                }
+            }
+        }
+    }
+    _ = map;
+}
+
+// ---- DCE ------------------------------------------------------------------------------------
+
+fn dce(f: &mut ir.Function, a: alloc.Allocator) {
+    var live = alloc.List(bool).init(a);
+    var i: usize = 0;
+    while i < f.insts.len() : (i += 1) {
+        live.push(false);
+    }
+    var work = alloc.List(u32).init(a);
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        var k: usize = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            let id = f.blocks[b].insts[k];
+            let ins = f.insts[id as usize];
+            if not pure(ins) or ins.op == ir.Op.Param {
+                live[id as usize] = true;
+                work.push(id);
+            }
+        }
+    }
+    var ops = alloc.List(u32).init(a);
+    while work.len() > 0 {
+        let id = work[work.len() - 1];
+        _ = work.pop();
+        operands(f, id: id, out: &mut ops);
+        var o: usize = 0;
+        while o < ops.len() : (o += 1) {
+            let v = ops[o] as usize;
+            if v < live.len() and not live[v] {
+                live[v] = true;
+                work.push(v as u32);
+            }
+        }
+        // An AsmOut keeps its Asm, and an OverflowBit its Overflow.
+    }
+    b = 0;
+    while b < f.blocks.len() : (b += 1) {
+        var w: usize = 0;
+        var r: usize = 0;
+        while r < f.blocks[b].insts.len() : (r += 1) {
+            let id = f.blocks[b].insts[r];
+            if live[id as usize] {
+                f.blocks[b].insts[w] = id;
+                w += 1;
+            }
+        }
+        while f.blocks[b].insts.len() > w {
+            _ = f.blocks[b].insts.pop();
+        }
+    }
+}
+
+// ---- The pipeline ---------------------------------------------------------------------------
+
+/// Optimizes one function, for a release build.
+pub fn optimize(f: &mut ir.Function, a: alloc.Allocator) {
+    if f.stub or f.no_frame or f.blocks.len() == 0 {
+        return;
+    }
+    var map = identity(f.insts.len(), a);
+    clean_cfg(f, map: &mut map, a: a);
+    mem2reg(f, map: &mut map, a: a);
+    if not f.ssa {
+        f.ssa = true;
+    }
+    var round: u32 = 0;
+    while round < 2 : (round += 1) {
+        sccp(f, map: &mut map, a: a);
+        clean_cfg(f, map: &mut map, a: a);
+        gvn(f, map: &mut map, a: a);
+        clean_cfg(f, map: &mut map, a: a);
+        dce(f, a: a);
+    }
+    licm(f, map: &mut map, a: a);
+    dce(f, a: a);
+}
+
+// ---- Inlining ---------------------------------------------------------------------------
+
+/// The most instructions a function inlined into its callers may have.
+const INLINE_LIMIT: usize = 40;
+
+/// Whether calls of f are inlined: small, a leaf (it calls no function of
+/// the program, so inlining never grows without end), and plain.
+fn inlinable(m: &ir.Module, g: u32) -> bool {
+    let f = &m.functions[g as usize];
+    if f.stub or f.no_frame or f.ssa or f.blocks.len() == 0 or f.section.len() > 0 {
+        return false;
+    }
+    // Its size, without the blocks that end in Unreachable: a trap's code
+    // runs once at most.
+    var count: usize = 0;
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        let n = f.blocks[b].insts.len();
+        if n > 0 and f.insts[f.blocks[b].insts[n - 1] as usize].op != ir.Op.Unreachable {
+            count += n;
+        }
+        var k: usize = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            let i = f.insts[f.blocks[b].insts[k] as usize];
+            if (i.op == ir.Op.Call and i.flag == 0) or i.op == ir.Op.Phi or i.op == ir.Op.Asm or i.op == ir.Op.AsmOut {
+                return false;
+            }
+        }
+    }
+    return count <= INLINE_LIMIT;
+}
+
+/// Inlines, into every function, the calls of small leaf functions.
+pub fn inline_calls(m: &mut ir.Module, a: alloc.Allocator) {
+    var small = alloc.List(bool).init(a);
+    var g: usize = 0;
+    while g < m.functions.len() : (g += 1) {
+        small.push(inlinable(m, g: g as u32));
+    }
+    var f: usize = 0;
+    while f < m.functions.len() : (f += 1) {
+        if m.functions[f].stub or m.functions[f].no_frame or small[f] {
+            continue;
+        }
+        // The calls to inline, found first: inlining adds blocks.
+        var calls = alloc.List(u32).init(a);
+        var b: usize = 0;
+        while b < m.functions[f].blocks.len() : (b += 1) {
+            var k: usize = 0;
+            while k < m.functions[f].blocks[b].insts.len() : (k += 1) {
+                let id = m.functions[f].blocks[b].insts[k];
+                let i = m.functions[f].insts[id as usize];
+                if i.op == ir.Op.Call and i.flag == 0 and i.imm as usize != f and small[i.imm as usize] {
+                    calls.push(id);
+                }
+            }
+        }
+        var c: usize = 0;
+        while c < calls.len() : (c += 1) {
+            inline_one(m, caller: f as u32, call: calls[c], a: a);
+        }
+    }
+}
+
+/// The block that holds an instruction, and where in it.
+fn find_inst(f: &ir.Function, id: u32) -> [2]u32 {
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        var k: usize = 0;
+        while k < f.blocks[b].insts.len() : (k += 1) {
+            if f.blocks[b].insts[k] == id {
+                return [b as u32, k as u32];
+            }
+        }
+    }
+    return [NONE, NONE];
+}
+
+fn inline_one(m: &mut ir.Module, caller: u32, call: u32, a: alloc.Allocator) {
+    let site = find_inst(&m.functions[caller as usize], id: call);
+    if site[0] == NONE {
+        return;
+    }
+    let ci = m.functions[caller as usize].insts[call as usize];
+    let callee = ci.imm as usize;
+    // The callee's code, copied: its instructions and its args.
+    var g_insts = alloc.List(ir.Inst).init(a);
+    var g_args = alloc.List(u32).init(a);
+    var g_blocks = alloc.List(alloc.List(u32)).init(a);
+    var gi: usize = 0;
+    while gi < m.functions[callee].insts.len() : (gi += 1) {
+        g_insts.push(m.functions[callee].insts[gi]);
+    }
+    gi = 0;
+    while gi < m.functions[callee].args.len() : (gi += 1) {
+        g_args.push(m.functions[callee].args[gi]);
+    }
+    var gb: usize = 0;
+    while gb < m.functions[callee].blocks.len() : (gb += 1) {
+        var list = alloc.List(u32).init(a);
+        var k: usize = 0;
+        while k < m.functions[callee].blocks[gb].insts.len() : (k += 1) {
+            list.push(m.functions[callee].blocks[gb].insts[k]);
+        }
+        g_blocks.push(list);
+    }
+    let ret_ty = m.functions[callee].ret;
+    let f = &mut m.functions[caller as usize];
+    let ib = f.insts.len() as u32;
+    let bb = f.blocks.len() as u32;
+    let cont = bb + g_blocks.len() as u32;
+    // The values the callee's parameters stand for.
+    var param_value = alloc.List(u32).init(a);
+    gi = 0;
+    while gi < g_insts.len() : (gi += 1) {
+        param_value.push(NONE);
+    }
+    gi = 0;
+    while gi < g_insts.len() : (gi += 1) {
+        if g_insts[gi].op == ir.Op.Param and (g_insts[gi].imm as u32) < ci.args_len {
+            param_value[gi] = f.args[(ci.args_start + g_insts[gi].imm as u32) as usize];
+        }
+    }
+    // The callee's instructions, renumbered after the caller's.
+    var rets = alloc.List(u32).init(a);
+    gi = 0;
+    while gi < g_insts.len() : (gi += 1) {
+        var i = g_insts[gi];
+        let start = f.args.len() as u32;
+        if i.op == ir.Op.Call or i.op == ir.Op.CallIndirect or i.op == ir.Op.Asm {
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 1) {
+                f.args.push(renumber(v: g_args[k as usize], ib: ib, param_value: &param_value));
+            }
+            i.args_start = start;
+        }
+        match i.op {
+            .Br => { i.a = i.a + bb; }
+            .CondBr => {
+                i.a = renumber(v: i.a, ib: ib, param_value: &param_value);
+                i.b = i.b + bb;
+                i.c = i.c + bb;
+            }
+            .Ret | .RetVoid => {
+                // Back to the caller; the value is taken below, by block.
+                i = ir.inst(ir.Op.Br, ir.Ty.Void);
+                i.a = cont;
+            }
+            .Param => {
+                // Its uses are the call's arguments now; the copy names
+                // nothing, so the caller's own parameters stay its only ones.
+                i = ir.inst(ir.Op.Const, i.ty);
+            }
+            _ => { renumber_operands(&mut i, ib: ib, param_value: &param_value); }
+        }
+        f.insts.push(i);
+    }
+    // The returning blocks, for the result's phi.
+    var ret_blocks = alloc.List(u32).init(a);
+    gb = 0;
+    while gb < g_blocks.len() : (gb += 1) {
+        let list = g_blocks[gb].items();
+        let last = g_insts[list[list.len() - 1] as usize];
+        if last.op == ir.Op.Ret or last.op == ir.Op.RetVoid {
+            ret_blocks.push(bb + gb as u32);
+            if last.op == ir.Op.Ret {
+                rets.push(renumber(v: last.a, ib: ib, param_value: &param_value));
+            } else {
+                rets.push(NONE);
+            }
+        }
+        var copy = alloc.List(u32).init(a);
+        var k: usize = 0;
+        while k < list.len() : (k += 1) {
+            copy.push(list[k] + ib);
+        }
+        f.blocks.push(ir.Block { insts: copy });
+    }
+    // The caller's block, split: the rest goes to the continuation.
+    var rest = alloc.List(u32).init(a);
+    var k = site[1] + 1;
+    while k < f.blocks[site[0] as usize].insts.len() as u32 : (k += 1) {
+        rest.push(f.blocks[site[0] as usize].insts[k as usize]);
+    }
+    while f.blocks[site[0] as usize].insts.len() as u32 > site[1] {
+        _ = f.blocks[site[0] as usize].insts.pop();
+    }
+    var jump = ir.inst(ir.Op.Br, ir.Ty.Void);
+    jump.a = bb;
+    let jid = f.insts.len() as u32;
+    f.insts.push(jump);
+    f.blocks[site[0] as usize].insts.push(jid);
+    // The result: the value returned, or a phi of the values.
+    var map = identity(f.insts.len(), a);
+    var cont_insts = alloc.List(u32).init(a);
+    if ret_ty != ir.Ty.Void and ret_blocks.len() > 0 {
+        if ret_blocks.len() == 1 {
+            map[call as usize] = rets[0];
+        } else {
+            var ph = ir.inst(ir.Op.Phi, ret_ty);
+            ph.args_start = f.args.len() as u32;
+            ph.args_len = 2 * ret_blocks.len() as u32;
+            var r: usize = 0;
+            while r < ret_blocks.len() : (r += 1) {
+                f.args.push(ret_blocks[r]);
+                f.args.push(rets[r]);
+            }
+            let pid = f.insts.len() as u32;
+            f.insts.push(ph);
+            map.push(pid);
+            map[call as usize] = pid;
+            cont_insts.push(pid);
+        }
+    }
+    var q: usize = 0;
+    while q < rest.len() : (q += 1) {
+        cont_insts.push(rest[q]);
+    }
+    f.blocks.push(ir.Block { insts: cont_insts });
+    // The phis of the blocks the caller's block went to now come from the
+    // continuation.
+    let term = f.blocks[cont as usize].insts[f.blocks[cont as usize].insts.len() - 1];
+    retarget_phis(f, from: site[0], to: cont, term: term);
+    f.ssa = true;
+    rewrite_all(f, map: &mut map);
+}
+
+fn retarget_phis(f: &mut ir.Function, from: u32, to: u32, term: u32) {
+    let t = f.insts[term as usize];
+    var targets: [2]u32 = [NONE, NONE];
+    if t.op == ir.Op.Br {
+        targets[0] = t.a;
+    } else if t.op == ir.Op.CondBr {
+        targets[0] = t.b;
+        targets[1] = t.c;
+    }
+    var j: usize = 0;
+    while j < 2 : (j += 1) {
+        if targets[j] == NONE {
+            continue;
+        }
+        let sb = targets[j] as usize;
+        var k: usize = 0;
+        while k < f.blocks[sb].insts.len() : (k += 1) {
+            let id = f.blocks[sb].insts[k];
+            if f.insts[id as usize].op != ir.Op.Phi {
+                break;
+            }
+            let ph = f.insts[id as usize];
+            var e = ph.args_start;
+            while e < ph.args_start + ph.args_len : (e += 2) {
+                if f.args[e as usize] == from {
+                    f.args[e as usize] = to;
+                }
+            }
+        }
+    }
+}
+
+fn renumber(v: u32, ib: u32, param_value: &alloc.List(u32)) -> u32 {
+    if param_value.items()[v as usize] != NONE {
+        return param_value.items()[v as usize];
+    }
+    return v + ib;
+}
+
+/// The operands of a copied instruction, renumbered (args are done apart).
+fn renumber_operands(i: &mut ir.Inst, ib: u32, param_value: &alloc.List(u32)) {
+    match i.op {
+        .Load | .Gep | .Memzero | .OverflowBit | .Ext | .Trunc | .FNeg | .FConv | .IntToPtr | .PtrToInt | .AtomicLoad | .AsmOut | .CallIndirect => {
+            i.a = renumber(v: i.a, ib: ib, param_value: param_value);
+        }
+        .Store | .GepIndex | .Memcpy | .Bin | .Overflow | .Cmp | .FBin | .FCmp | .AtomicStore | .AtomicRmw => {
+            i.a = renumber(v: i.a, ib: ib, param_value: param_value);
+            i.b = renumber(v: i.b, ib: ib, param_value: param_value);
+        }
+        .CmpXchg => {
+            i.a = renumber(v: i.a, ib: ib, param_value: param_value);
+            i.b = renumber(v: i.b, ib: ib, param_value: param_value);
+            i.c = renumber(v: i.c, ib: ib, param_value: param_value);
+        }
+        .FMath => {
+            i.a = renumber(v: i.a, ib: ib, param_value: param_value);
+            if i.flag == 5 or i.flag == 6 {
+                i.b = renumber(v: i.b, ib: ib, param_value: param_value);
+            }
+            if i.flag == 6 {
+                i.c = renumber(v: i.c, ib: ib, param_value: param_value);
+            }
+        }
+        _ => { }
+    }
+}

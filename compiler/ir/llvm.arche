@@ -175,6 +175,25 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
     let t = ty_text(i.ty);
     match i.op {
         .Const | .Param | .Alloca | .VTable => { }
+        .Phi => {
+            // Phis come first in their block (opt.arche).
+            line_start(out, id);
+            out.push_str("phi ");
+            out.push_str(t);
+            out.push_str(" ");
+            var k = i.args_start;
+            while k < i.args_start + i.args_len : (k += 2) {
+                if k > i.args_start {
+                    out.push_str(", ");
+                }
+                out.push_str("[ ");
+                operand(out, m, f, f.args[(k + 1) as usize]);
+                out.push_str(", %bb");
+                ir.write_number(out, f.args[k as usize] as u64);
+                out.push_str(" ]");
+            }
+            out.push_str("\n");
+        }
         .Asm => {
             let at = &m.asms[i.imm as usize];
             let outs = at.outputs.items();
@@ -694,16 +713,22 @@ fn emit_function(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, interna
         ir.write_number(out, b as u64);
         out.push_str(":\n");
         if b == 0 {
-            // Every stack slot is made on entry, so loops do not grow the stack.
-            var k: usize = 0;
-            while k < insts.len() : (k += 1) {
-                if insts[k].op == ir.Op.Alloca {
-                    line_start(out, k as u32);
-                    out.push_str("alloca i8, i64 ");
-                    ir.write_number(out, insts[k].imm);
-                    out.push_str(", align ");
-                    ir.write_number(out, insts[k].flag as u64);
-                    out.push_str("\n");
+            // Every stack slot is made on entry, so loops do not grow the
+            // stack: those of every block, in the order of the blocks.
+            var bb: usize = 0;
+            while bb < blocks.len() : (bb += 1) {
+                let in_block = blocks[bb].insts.items();
+                var k: usize = 0;
+                while k < in_block.len() : (k += 1) {
+                    let id = in_block[k];
+                    if insts[id as usize].op == ir.Op.Alloca {
+                        line_start(out, id);
+                        out.push_str("alloca i8, i64 ");
+                        ir.write_number(out, insts[id as usize].imm);
+                        out.push_str(", align ");
+                        ir.write_number(out, insts[id as usize].flag as u64);
+                        out.push_str("\n");
+                    }
                 }
             }
         }

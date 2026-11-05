@@ -79,6 +79,9 @@ pub type Op = enum {
     /// what was there.
     CmpXchg,
     Fence,
+    /// An SSA join (opt.arche): args holds pairs, a predecessor block and
+    /// the value from it. Phis come first in their block.
+    Phi,
     /// imm: the callee (a function, or an external when flag is 1); args:
     /// a range of the function's args list.
     Call,
@@ -199,6 +202,9 @@ pub type Function = struct {
     /// A placeholder that keeps the numbering, never called: a test block
     /// of another module, an interface's method. It is not written out.
     pub stub: bool,
+    /// Optimized (opt.arche): it has phis, and an operand may be numbered
+    /// after its user, as long as its definition dominates the use.
+    pub ssa: bool,
 }
 
 pub type External = struct {
@@ -357,6 +363,7 @@ pub fn new_function(name: str, ret: Ty, a: alloc.Allocator) -> Function {
         no_frame: false,
         section: alloc.String.init(a),
         stub: false,
+        ssa: false,
     };
     f.blocks.push(Block { insts: alloc.List(u32).init(a) });
     return f;
@@ -441,6 +448,9 @@ fn problem(inst_index: u32, what: ProblemKind) -> Problem {
 }
 
 fn operand_ok(f: &Function, user: u32, v: u32) -> bool {
+    if f.ssa {
+        return v as usize < f.insts.len() and has_value(f.insts[v as usize]);
+    }
     return v < user and has_value(f.insts[v as usize]);
 }
 

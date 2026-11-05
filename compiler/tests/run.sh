@@ -5,7 +5,8 @@
 # fmt/<name>.formatted, which stays as it is, and so do the compiler's and
 # the library's sources; and of `arche query`: the queries in
 # query/<name>.cases give query/<name>.expected; and of `arche doc`:
-# doc/<name>.arche gives doc/<name>.md; and of `arche fix --edition`.
+# doc/<name>.arche gives doc/<name>.md; of `arche fix --edition`; and of
+# a release build's proofs (release/).
 # Usage: run.sh <arche>
 set -u
 arche=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -59,5 +60,13 @@ mkdir -p "$work/edition"
 cp edition/before/* "$work/edition/"
 "$arche" fix --edition 2027 "$work/edition/main.arche" > /dev/null || status=1
 diff -r edition/after "$work/edition" || status=1
-[ "$status" -eq 0 ] && echo "diagnostics, fixes, layout, queries, docs and editions: ok"
+# A release build proves release/contracts.arche's contracts and checks
+# from its constants: its main keeps no trap, and calls nothing it inlined.
+"$arche" --release build release/contracts.arche "$work/contracts.ll" || status=1
+main=$(awk '/define internal i16 @a0_9contracts_4main/,/^}/' "$work/contracts.ll")
+if [ -z "$main" ] || printf '%s\n' "$main" | grep -q "a0rt_trap\|@a0_9contracts_4half"; then
+    echo "release: the contracts of release/contracts.arche are not proven away"
+    status=1
+fi
+[ "$status" -eq 0 ] && echo "diagnostics, fixes, layout, queries, docs, editions and release: ok"
 exit "$status"

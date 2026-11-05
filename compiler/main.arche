@@ -34,6 +34,7 @@ import syntax.cst;
 import syntax.fmt;
 import ir.ir;
 import ir.llvm;
+import ir.opt;
 import lower.lower;
 
 /// What `arche` exits with, besides success (§10: `error: <name>`, status 1).
@@ -55,7 +56,7 @@ fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("       arche build-plan <build.arche>  the programs it lists, as name<TAB>root lines\n");
     err_out.write("       arche manifest <package.arche>  its fields, one a line, for arche-driver\n");
     err_out.write("       arche test <file> <out.ll>     the test blocks of <file>, run by std.testing\n");
-    err_out.write("options, before the command: --lib-alloc, --lib-std, --target <linux-x86_64 | freestanding-x86_64 |\n");
+    err_out.write("options, before the command: --release, --lib-alloc, --lib-std, --target <linux-x86_64 | freestanding-x86_64 |\n");
     err_out.write("       freestanding-riscv64>, --panic-handler <module.function>\n");
     return Failure.BadUsage;
 }
@@ -676,6 +677,16 @@ fn fix(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.All
     }
 }
 
+/// A release build's optimizer, on every function (ir/opt.arche): small
+/// leaf functions inlined first, then each function on its own.
+fn optimize_all(m: &mut ir.Module, a: alloc.Allocator) {
+    opt.inline_calls(m, a: a);
+    var i: usize = 0;
+    while i < m.functions.len() : (i += 1) {
+        opt.optimize(&mut m.functions[i], a: a);
+    }
+}
+
 fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, out_path: str, opts: &program.Options) -> Failure!void {
     let source = try read(fs, err_out, path, a);
     let p = program.load(fs, path: path, source, a, opts);
@@ -688,7 +699,10 @@ fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, o
         program.write_diagnostics(err_out, &c.p, false);
         return Failure.ErrorsFound;
     }
-    let m = lower.lower(c);
+    var m = lower.lower(c);
+    if opts.release {
+        optimize_all(&mut m, a: a);
+    }
     // The verifier checks every function the lowering made.
     let fns = m.functions.items();
     var i: usize = 0;
@@ -752,7 +766,10 @@ fn build_units(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: a
         nm.push_str(c.p.modules[mi].display.view());
         names.push(nm);
     }
-    let m = lower.lower(c);
+    var m = lower.lower(c);
+    if opts.release {
+        optimize_all(&mut m, a: a);
+    }
     while unit_of.len() < m.functions.len() {
         unit_of.push(0);
     }
@@ -944,6 +961,7 @@ fn main(sys: &mut std.System) -> !void {
         target: program.Target.LinuxX86_64,
         panic_handler: alloc.String.init(sys.alloc),
         tests: false,
+        release: false,
     };
     var first: usize = 1;
     while first + 1 < n and sys.args.get(first).starts_with("--") : (first += 1) {
@@ -952,6 +970,8 @@ fn main(sys: &mut std.System) -> !void {
             opts.lib_alloc = true;
         } else if o.eq("--lib-std") {
             opts.lib_std = true;
+        } else if o.eq("--release") {
+            opts.release = true;
         } else if o.eq("--target") {
             first += 1;
             match program.target_by_name(sys.args.get(first)) {

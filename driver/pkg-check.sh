@@ -135,7 +135,9 @@ grep -q "does not match its hash" out || fail "the hash mismatch is not reported
 
 # A changed release record: its signature no longer matches.
 cp kept-object "registry/objects/$object"
-sed -i 's/^sha256 ./sha256 0/' registry/words/1.0.0.release
+cp registry/words/1.0.0.release kept-record
+sed -i 's/^sha256 .*/sha256 0000000000000000000000000000000000000000000000000000000000000000/' registry/words/1.0.0.release
+cmp -s kept-record registry/words/1.0.0.release && fail "the test did not change the release record"
 rm -rf app/build/pkg
 if "$driver" pkg lock --dir app > out 2>&1; then
     fail "a release record that does not match its signature was accepted"
