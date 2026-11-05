@@ -1,0 +1,436 @@
+/// An HTTP server, and a small HTTP/1.1 client. Each connection is a task
+/// of its own, its memory a region that goes when it closes; sockets do
+/// not block, so connections wait for the network side by side. Over TLS
+/// the client chooses HTTP/2 or HTTP/1.1 by ALPN; in the clear, a client
+/// that starts with HTTP/2's preface gets HTTP/2 (prior knowledge).
+import alloc;
+import crypto.random;
+import http;
+import http.h1;
+import http.h2;
+import std;
+import std.task;
+import tls;
+
+/// The handler: it reads the request and fills in the response.
+pub type Handler = &dyn fn(&http.Request, &mut http.Response);
+
+/// A socket in the clear, or a TLS connection over one.
+pub type Transport = enum {
+    Plain { sock: std.Socket },
+    Secure { conn: tls.Conn },
+
+    pub fn read(self: &mut Transport, into: []mut u8) -> http.HttpError!usize {
+        match self {
+            .Plain { sock } => {
+                match sock.read(into) {
+                    ok(n) => { return n; }
+                    err(_) => { return http.HttpError.Closed; }
+                }
+            }
+            .Secure { conn } => {
+                match conn.read(into) {
+                    ok(n) => { return n; }
+                    err(_) => { return http.HttpError.Closed; }
+                }
+            }
+        }
+    }
+
+    pub fn write(self: &mut Transport, data: []u8) -> http.HttpError!void {
+        match self {
+            .Plain { sock } => {
+                match sock.write(data) {
+                    ok(_) => { }
+                    err(_) => { return http.HttpError.Closed; }
+                }
+            }
+            .Secure { conn } => {
+                match conn.write(data) {
+                    ok(_) => { }
+                    err(_) => { return http.HttpError.Closed; }
+                }
+            }
+        }
+    }
+
+    pub fn close(self: &mut Transport) {
+        match self {
+            .Plain { sock } => { sock.close(); }
+            .Secure { conn } => { conn.close(); }
+        }
+    }
+
+    /// The protocol TLS agreed on by ALPN; empty in the clear.
+    fn protocol(self: &Transport) -> []u8 {
+        match self {
+            .Plain { sock } => {
+                _ = sock;
+                return "".bytes();
+            }
+            .Secure { conn } => { return conn.protocol(); }
+        }
+    }
+}
+
+/// Limits for what a client may send.
+pub type Options = struct {
+    /// How many connections to serve before returning; 0 for no end.
+    pub connections: u64,
+    /// The largest request body.
+    pub max_body: usize,
+
+    pub fn init() -> Options {
+        return Options { connections: 0, max_body: 16777216 };
+    }
+}
+
+/// Serves HTTP/1.1 and HTTP/2 in the clear on the listener.
+pub fn serve(listener: &std.Listener, handler: Handler, options: Options, proc: &std.Proc, a: alloc.Allocator) -> task.TaskError!void {
+    var served: u64 = 0;
+    try task.scope(proc, fn [listener, handler, options, &mut served, a](s: &mut task.Scope) -> !void {
+        while options.connections == 0 or served < options.connections {
+            var sock = try listener.accept();
+            served += 1;
+            s.spawn(fn [sock, handler, options, a]() -> !void {
+                var t = Transport.Plain { sock: sock };
+                region r {
+                    connection(&mut t, handler: handler, options: options, r);
+                }
+                t.close();
+            });
+        }
+    });
+}
+
+/// Serves HTTP/2 and HTTP/1.1 over TLS on the listener: the config should
+/// accept "h2" and "http/1.1" (tls.ServerConfig.accept_protocol). Each
+/// connection's secret randomness comes from seeds
+/// (random.Csprng.init(&mut sys.rand)).
+pub fn serve_tls(listener: &std.Listener, config: &tls.ServerConfig, handler: Handler, options: Options, proc: &std.Proc, seeds: random.Csprng, a: alloc.Allocator) -> task.TaskError!void {
+    var served: u64 = 0;
+    var rng = seeds;
+    try task.scope(proc, fn [listener, config, handler, options, &mut rng, &mut served, a](s: &mut task.Scope) -> !void {
+        while options.connections == 0 or served < options.connections {
+            var sock = try listener.accept();
+            served += 1;
+            // Drawn here: tasks share no generator.
+            var seed: [32]u8 = [0; 32];
+            rng.fill(seed[0..32]);
+            s.spawn(fn [sock, config, seed, handler, options, a]() -> !void {
+                region r {
+                    let engine = tls.Engine.server(config, seed: seed, r);
+                    match tls.Conn.over(sock, engine: engine) {
+                        ok(conn) => {
+                            var t = Transport.Secure { conn: conn };
+                            connection(&mut t, handler: handler, options: options, r);
+                            t.close();
+                        }
+                        err(_) => { }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Serves one connection until it closes, by the protocol it speaks.
+pub fn connection(t: &mut Transport, handler: Handler, options: Options, a: alloc.Allocator) {
+    var input = alloc.List(u8).init(a);
+    var h2_wanted = http.same_name(a: t.protocol(), b: "h2".bytes());
+    if not h2_wanted and t.protocol().len() == 0 {
+        // In the clear: HTTP/2 if the first bytes are its preface.
+        let p = h2.PREFACE.bytes();
+        var buf: [4096]u8 = [0; 4096];
+        while input.len() < p.len() and prefix_of(a: input.items(), whole: p) {
+            match t.read(buf[0..4096]) {
+                ok(n) => {
+                    if n == 0 {
+                        return;
+                    }
+                    for x in buf[0..n] {
+                        input.push(x.*);
+                    }
+                }
+                err(_) => { return; }
+            }
+        }
+        h2_wanted = input.len() >= p.len() and prefix_of(a: p, whole: input.items());
+    }
+    if h2_wanted {
+        _ = serve_h2(t, handler: handler, input: input.items(), a);
+    } else {
+        _ = serve_h1(t, handler: handler, options: options, input: &mut input, a);
+    }
+}
+
+/// Whether a is where b starts (or b where a does, whichever is shorter).
+fn prefix_of(a: []u8, whole: []u8) -> bool {
+    var n = a.len();
+    if whole.len() < n {
+        n = whole.len();
+    }
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        if a[i] != whole[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn take_front(list: &mut alloc.List(u8), n: usize) {
+    let left = list.len() - n;
+    let b = list.items_mut();
+    var i: usize = 0;
+    while i < left : (i += 1) {
+        b[i] = b[n + i];
+    }
+    while list.len() > left {
+        _ = list.pop();
+    }
+}
+
+fn fill(t: &mut Transport, input: &mut alloc.List(u8)) -> http.HttpError!usize {
+    var buf: [8192]u8 = [0; 8192];
+    let n = try t.read(buf[0..8192]);
+    for x in buf[0..n] {
+        input.push(x.*);
+    }
+    return n;
+}
+
+fn error_response(t: &mut Transport, status: u16, a: alloc.Allocator) {
+    var resp = http.Response.init(a);
+    resp.status = status;
+    resp.headers.add(name: "content-type", value: "text/plain");
+    resp.write(http.reason(status));
+    resp.write("\n");
+    var out = alloc.List(u8).init(a);
+    h1.write_response(&resp, head_only: false, keep_alive: false, out: &mut out);
+    _ = t.write(out.items());
+}
+
+fn serve_h1(t: &mut Transport, handler: Handler, options: Options, input: &mut alloc.List(u8), a: alloc.Allocator) -> http.HttpError!void {
+    while true {
+        // The head.
+        var end: usize = 0;
+        var have = false;
+        while not have {
+            match h1.head_end(input.items()) {
+                some(e) => {
+                    end = e;
+                    have = true;
+                }
+                none => {
+                    if input.len() > h1.MAX_HEAD {
+                        error_response(t, status: 431, a);
+                        return http.HttpError.TooLarge;
+                    }
+                    if try fill(t, input: input) == 0 {
+                        return;
+                    }
+                }
+            }
+        }
+        // Each request's memory is its own.
+        var keep = false;
+        region rq {
+            var req = http.Request.init(rq);
+            match h1.parse_request(input.items(), end: end, req: &mut req) {
+                ok(_) => { }
+                err(e) => {
+                    if e == http.HttpError.Unsupported {
+                        error_response(t, status: 505, a: rq);
+                    } else {
+                        error_response(t, status: 400, a: rq);
+                    }
+                    return e;
+                }
+            }
+            take_front(input, n: end);
+            var framing = h1.Body.Empty;
+            match h1.framing(&req.headers, request: true) {
+                ok(f) => { framing = f; }
+                err(e) => {
+                    if e == http.HttpError.Unsupported {
+                        error_response(t, status: 501, a: rq);
+                    } else {
+                        error_response(t, status: 400, a: rq);
+                    }
+                    return e;
+                }
+            }
+            match req.headers.find("expect") {
+                some(i) => {
+                    if http.same_name(a: req.headers.value(i).bytes(), b: "100-continue".bytes()) and req.version == 11 and input.len() == 0 {
+                        try t.write("HTTP/1.1 100 Continue\r\n\r\n".bytes());
+                    }
+                }
+                none => { }
+            }
+            match framing {
+                .Empty => { }
+                .Length { n } => {
+                    if n > options.max_body {
+                        error_response(t, status: 413, a: rq);
+                        return http.HttpError.TooLarge;
+                    }
+                    while input.len() < n {
+                        if try fill(t, input: input) == 0 {
+                            return http.HttpError.Closed;
+                        }
+                    }
+                    for x in input.items()[0..n] {
+                        req.body.push(x.*);
+                    }
+                    take_front(input, n: n);
+                }
+                .Chunked => {
+                    var chunks = h1.Chunks.init();
+                    while not chunks.done {
+                        if input.len() == 0 {
+                            if try fill(t, input: input) == 0 {
+                                return http.HttpError.Closed;
+                            }
+                        }
+                        match chunks.feed(input.items(), body: &mut req.body, max: options.max_body) {
+                            ok(used) => { take_front(input, n: used); }
+                            err(e) => {
+                                error_response(t, status: 400, a: rq);
+                                return e;
+                            }
+                        }
+                    }
+                }
+                .UntilClose => { }
+            }
+            var resp = http.Response.init(rq);
+            handler(&req, &mut resp);
+            keep = h1.keeps_alive(&req);
+            var out = alloc.List(u8).init(rq);
+            h1.write_response(&resp, head_only: req.method.view().eq("HEAD"), keep_alive: keep, out: &mut out);
+            try t.write(out.items());
+        }
+        if not keep {
+            return;
+        }
+    }
+}
+
+fn serve_h2(t: &mut Transport, handler: Handler, input: []u8, a: alloc.Allocator) -> http.HttpError!void {
+    var c = h2.Connection.init(a);
+    var fed = c.feed(input);
+    var buf: [16384]u8 = [0; 16384];
+    while true {
+        if c.output().len() > 0 {
+            let w = t.write(c.output());
+            c.sent();
+            try w;
+        }
+        try fed;
+        // Requests that are complete, answered in turn.
+        var next = c.next_request();
+        while true {
+            var id: u32 = 0;
+            match next {
+                some(x) => { id = x; }
+                none => { break; }
+            }
+            region rq {
+                var resp = http.Response.init(rq);
+                handler(c.request(id), &mut resp);
+                c.respond(id, resp: &resp, head_only: c.request(id).method.view().eq("HEAD"));
+            }
+            if c.output().len() > 0 {
+                let w = t.write(c.output());
+                c.sent();
+                try w;
+            }
+            next = c.next_request();
+        }
+        if c.finished() {
+            return;
+        }
+        let n = try t.read(buf[0..16384]);
+        if n == 0 {
+            return;
+        }
+        fed = c.feed(buf[0..n]);
+    }
+}
+
+// ---- Client -----------------------------------------------------------------------------------
+
+/// Sends req over t with HTTP/1.1 and reads the response into resp; the
+/// connection is left open when the response says it may be.
+pub fn fetch(t: &mut Transport, req: &http.Request, resp: &mut http.Response, a: alloc.Allocator) -> http.HttpError!void {
+    var out = alloc.List(u8).init(a);
+    h1.write_request(req, out: &mut out);
+    try t.write(out.items());
+    var input = alloc.List(u8).init(a);
+    var end: usize = 0;
+    var have = false;
+    while not have {
+        match h1.head_end(input.items()) {
+            some(e) => {
+                end = e;
+                have = true;
+            }
+            none => {
+                if input.len() > h1.MAX_HEAD {
+                    return http.HttpError.TooLarge;
+                }
+                if try fill(t, input: &mut input) == 0 {
+                    return http.HttpError.Closed;
+                }
+            }
+        }
+    }
+    try h1.parse_response(input.items(), end: end, resp: resp);
+    take_front(&mut input, n: end);
+    if req.method.view().eq("HEAD") or http.bodiless(resp.status) {
+        return;
+    }
+    let framing = try h1.framing(&resp.headers, request: false);
+    match framing {
+        .Empty => { }
+        .Length { n } => {
+            while input.len() < n {
+                if try fill(t, input: &mut input) == 0 {
+                    return http.HttpError.Closed;
+                }
+            }
+            for x in input.items()[0..n] {
+                resp.body.push(x.*);
+            }
+        }
+        .Chunked => {
+            var chunks = h1.Chunks.init();
+            while not chunks.done {
+                if input.len() == 0 {
+                    if try fill(t, input: &mut input) == 0 {
+                        return http.HttpError.Closed;
+                    }
+                }
+                let used = try chunks.feed(input.items(), body: &mut resp.body, max: 1073741824);
+                take_front(&mut input, n: used);
+            }
+        }
+        .UntilClose => {
+            for x in input.items() {
+                resp.body.push(x.*);
+            }
+            while true {
+                var buf: [8192]u8 = [0; 8192];
+                let n = try t.read(buf[0..8192]);
+                if n == 0 {
+                    return;
+                }
+                for x in buf[0..n] {
+                    resp.body.push(x.*);
+                }
+            }
+        }
+    }
+}

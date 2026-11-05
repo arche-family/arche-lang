@@ -43,7 +43,7 @@ static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     return r;
 }
 
-enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MPROTECT = 10, SYS_MUNMAP = 11, SYS_GETPID = 39, SYS_FORK = 57,
+enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MPROTECT = 10, SYS_MUNMAP = 11, SYS_GETPID = 39, SYS_FORK = 57, SYS_POLL = 7, SYS_DUP2 = 33, SYS_PIPE2 = 293, SYS_SCHED_GETAFFINITY = 204,
        SYS_EXIT = 60, SYS_WAIT4 = 61, SYS_CLOCK_GETTIME = 228, SYS_EXIT_GROUP = 231, SYS_OPENAT = 257 };
 enum { AT_FDCWD = -100, O_RDONLY = 0, O_WRONLY = 1, O_CREAT = 0100, O_TRUNC = 01000, O_CLOEXEC = 02000000 };
 enum { ENOENT = 2, EACCES = 13, ENOTDIR = 20, EISDIR = 21, EPERM = 1 };
@@ -702,12 +702,13 @@ void a0rt_die(const char *message, u64 len) {
 //
 // Tasks are fibers: each has a stack of its own, and a0rt_ctx_switch moves
 // between them. They run on one thread, and switch only where a task waits:
-// for a scope's tasks, a channel, a lock, or by yielding. Which ready task
-// runs next comes from a generator with a seed, so a run repeats with the
-// same seed: arche test gives each test its own, and other programs a
-// fixed one.
+// for a scope's tasks, a channel, a lock, a socket, or by yielding. Which
+// ready task runs next comes from a generator with a seed, so a run repeats
+// with the same seed: arche test gives each test its own, and other programs
+// a fixed one. When no task is ready and some wait for sockets, poll waits
+// for the kernel to make one ready (std's sockets do not block).
 
-enum { READY, RUNNING, WAITING, DONE };
+enum { READY, RUNNING, WAITING, DONE, WAITING_IO };
 enum { TASK_STACK = 256 * 1024, GUARD = 4096 };
 
 typedef struct Fiber {
@@ -716,18 +717,18 @@ typedef struct Fiber {
     u16 (*fn)(void *env);
     void *env;
     struct TaskScope *scope;
-    struct Fiber *next_in_scope;
     const void *waiting_on;
     int state;
+    int io_fd;
+    short io_events;
 } Fiber;
 
 typedef struct TaskScope {
     u32 pending;
     u32 failed;      // 1: a task returned an error; 2: one panicked
-    Fiber *tasks;
 } TaskScope;
 
-static Fiber main_fiber = {0, 0, 0, 0, 0, 0, 0, RUNNING};
+static Fiber main_fiber = {0, 0, 0, 0, 0, 0, RUNNING, -1, 0};
 static Fiber *current_fiber = &main_fiber;
 static Fiber **fibers;
 static u64 fiber_count, fiber_cap;
@@ -778,15 +779,74 @@ static void switch_to(Fiber *next) {
     a0rt_ctx_switch(&prev->rsp, next->rsp);
 }
 
-// The next fiber to run, chosen among the ready ones; when none is ready
-// and some wait, every task is waiting for another: a deadlock.
-static Fiber *pick(void) {
-    u64 ready = main_fiber.state == READY ? 1 : 0;
-    for (u64 i = 0; i < fiber_count; i++) {
-        ready += fibers[i]->state == READY;
+typedef struct PollFd {
+    int fd;
+    short events;
+    short revents;
+} PollFd;
+
+static PollFd *poll_fds;
+static Fiber **poll_fibers;
+static u64 poll_cap;
+
+static void poll_add(Fiber *f, u64 *n) {
+    if (f->state != WAITING_IO) {
+        return;
     }
-    if (ready == 0) {
+    if (*n == poll_cap) {
+        u64 cap = poll_cap ? poll_cap * 2 : 16;
+        PollFd *fds = a0rt_alloc(cap * sizeof(PollFd));
+        Fiber **who = a0rt_alloc(cap * sizeof(Fiber *));
+        for (u64 i = 0; i < *n; i++) {
+            fds[i] = poll_fds[i];
+            who[i] = poll_fibers[i];
+        }
+        poll_fds = fds;
+        poll_fibers = who;
+        poll_cap = cap;
+    }
+    poll_fds[*n].fd = f->io_fd;
+    poll_fds[*n].events = f->io_events;
+    poll_fds[*n].revents = 0;
+    poll_fibers[*n] = f;
+    (*n)++;
+}
+
+// Blocks until a socket some fiber waits for is ready, and makes that
+// fiber ready. With none waiting for one, every task waits for another.
+static void poll_io(void) {
+    u64 n = 0;
+    poll_add(&main_fiber, &n);
+    for (u64 i = 0; i < fiber_count; i++) {
+        poll_add(fibers[i], &n);
+    }
+    if (n == 0) {
         a0rt_die("deadlock: every task is waiting", 31);
+    }
+    i64 r;
+    do {
+        r = sys3(SYS_POLL, (i64)poll_fds, (i64)n, -1);
+    } while (r == -4);
+    for (u64 i = 0; i < n; i++) {
+        // An error or a hang-up wakes the fiber too: its next call says so.
+        if (poll_fds[i].revents != 0 || r < 0) {
+            poll_fibers[i]->state = READY;
+        }
+    }
+}
+
+// The next fiber to run, chosen among the ready ones; when none is ready,
+// one waiting for a socket, once the socket is.
+static Fiber *pick(void) {
+    u64 ready = 0;
+    while (ready == 0) {
+        ready = main_fiber.state == READY ? 1 : 0;
+        for (u64 i = 0; i < fiber_count; i++) {
+            ready += fibers[i]->state == READY;
+        }
+        if (ready == 0) {
+            poll_io();
+        }
     }
     u64 k = sched_next() % ready;
     if (main_fiber.state == READY) {
@@ -804,6 +864,14 @@ static Fiber *pick(void) {
         }
     }
     return &main_fiber;
+}
+
+// Waits until fd is ready for events (poll's POLLIN, POLLOUT).
+void a0rt_io_wait(i64 fd, u32 events) {
+    current_fiber->state = WAITING_IO;
+    current_fiber->io_fd = (int)fd;
+    current_fiber->io_events = (short)events;
+    switch_to(pick());
 }
 
 // Lets other ready tasks run first.
@@ -860,15 +928,46 @@ static void fiber_entry(void) {
     task_finish(err ? 1 : 0);
 }
 
+// Fibers that finished, kept with their stacks for the next spawn: a
+// server's scope may outlive many of its tasks.
+enum { SPARE_MAX = 64 };
+static Fiber *spare[SPARE_MAX];
+static u64 spare_count;
+
+// Moves finished fibers out of the list. The running fiber is not one of
+// them, so no stack in use is touched.
+static void reap(void) {
+    u64 kept = 0;
+    for (u64 i = 0; i < fiber_count; i++) {
+        Fiber *f = fibers[i];
+        if (f->state == DONE && f != current_fiber) {
+            if (spare_count < SPARE_MAX) {
+                spare[spare_count++] = f;
+            } else {
+                sys3(SYS_MUNMAP, (i64)f->stack, TASK_STACK + GUARD, 0);
+            }
+        } else {
+            fibers[kept++] = f;
+        }
+    }
+    fiber_count = kept;
+}
+
 void a0rt_spawn(void *scope, void *fn, void *env) {
     TaskScope *s = scope;
-    Fiber *f = a0rt_alloc(sizeof(Fiber));
-    i64 p = sys6(SYS_MMAP, 0, TASK_STACK + GUARD, 3, 0x22, -1, 0);
-    if (p < 0 && p > -4096) {
-        a0rt_die("out of memory", 13);
+    reap();
+    Fiber *f;
+    if (spare_count > 0) {
+        f = spare[--spare_count];
+    } else {
+        f = a0rt_alloc(sizeof(Fiber));
+        i64 p = sys6(SYS_MMAP, 0, TASK_STACK + GUARD, 3, 0x22, -1, 0);
+        if (p < 0 && p > -4096) {
+            a0rt_die("out of memory", 13);
+        }
+        sys3(SYS_MPROTECT, p, GUARD, 0); // the stack's end faults, not overflows
+        f->stack = (u8 *)p;
     }
-    sys3(SYS_MPROTECT, p, GUARD, 0); // the stack's end faults, not overflows
-    f->stack = (u8 *)p;
     u64 *top = (u64 *)(f->stack + TASK_STACK + GUARD);
     top[-1] = 0;                  // fiber_entry's return address: none
     top[-2] = (u64)fiber_entry;   // where a0rt_ctx_switch returns to
@@ -880,8 +979,8 @@ void a0rt_spawn(void *scope, void *fn, void *env) {
     f->env = env;
     f->scope = s;
     f->state = READY;
-    f->next_in_scope = s->tasks;
-    s->tasks = f;
+    f->waiting_on = 0;
+    f->io_fd = -1;
     s->pending++;
     if (fiber_count == fiber_cap) {
         u64 cap = fiber_cap ? fiber_cap * 2 : 16;
@@ -1349,9 +1448,11 @@ _Noreturn void a0rt_start(i64 *sp) {
 // ---- the test runner (arche test, lib/std/testing.arche) ---------------------------
 //
 // A test build has a table of its tests. Each runs in a child process, so a
-// panic fails that test and the others still run. The seed is always
-// printed; --seed repeats a run, --filter runs the tests whose names
-// contain a text.
+// panic fails that test and the others still run. As many run at once as
+// the machine has processors (--jobs n to choose); each one's output is
+// kept and shown after its result line, in the tests' order, so a run reads
+// the same however the children interleave. The seed is always printed;
+// --seed repeats a run, --filter runs the tests whose names contain a text.
 
 typedef struct {
     const u8 *name;
@@ -1403,10 +1504,136 @@ static void say(const char *text) {
     a0rt_write(&out_fd, (const u8 *)text, c_strlen(text));
 }
 
+// What a test child wrote, kept until its result is shown.
+typedef struct {
+    u8 *data;
+    u64 len, cap;
+} Kept;
+
+static void keep(Kept *k, const u8 *p, u64 n) {
+    if (k->len + n > k->cap) {
+        u64 cap = k->cap ? k->cap * 2 : 1024;
+        while (cap < k->len + n) {
+            cap *= 2;
+        }
+        u8 *grown = a0rt_alloc(cap);
+        memcpy(grown, k->data, k->len);
+        k->data = grown;
+        k->cap = cap;
+    }
+    memcpy(k->data + k->len, p, n);
+    k->len += n;
+}
+
+typedef struct {
+    i64 pid;
+    int out, err;    // the pipes from the child's stdout and stderr; -1 once closed
+    int status;
+    int state;       // 0 not started, 1 running, 2 done, 3 shown
+    Kept stdout_kept, stderr_kept;
+} Run;
+
+static u64 processors(void) {
+    u64 mask[16];
+    for (int i = 0; i < 16; i++) {
+        mask[i] = 0;
+    }
+    i64 n = sys3(SYS_SCHED_GETAFFINITY, 0, sizeof(mask), (i64)mask);
+    u64 count = 0;
+    for (i64 i = 0; i < n / 8 && i < 16; i++) {
+        count += (u64)__builtin_popcountll(mask[i]);
+    }
+    return count ? count : 1;
+}
+
+static void start_test(System *sys, u64 i, u64 seed, Run *r) {
+    int out[2], err[2];
+    if (sys3(SYS_PIPE2, (i64)out, 0x80000, 0) < 0 || sys3(SYS_PIPE2, (i64)err, 0x80000, 0) < 0) {
+        a0rt_die("cannot make a pipe for a test", 29);
+    }
+    flush_all();
+    i64 pid = sys1(SYS_FORK, 0);
+    if (pid == 0) {
+        sys3(SYS_DUP2, out[1], 1, 0);
+        sys3(SYS_DUP2, err[1], 2, 0);
+        const TestEntry *t = &a0_tests[i];
+        // std.testing.Test: {seed, system}.
+        u64 test[2] = {mix(seed ^ mix(i)), (u64)sys};
+        a0rt_sched_seed(mix(test[0]));
+        if (t->takes_test) {
+            ((void (*)(u64 *))t->function)(test);
+        } else {
+            ((void (*)(void))t->function)();
+        }
+        exit_with(0);
+    }
+    sys1(SYS_CLOSE, out[1]);
+    sys1(SYS_CLOSE, err[1]);
+    r->pid = pid;
+    r->out = out[0];
+    r->err = err[0];
+    r->state = 1;
+}
+
+// Reads what the running children wrote; a child whose pipes are both
+// closed has ended, and is waited for.
+static void collect(Run *runs, u64 count) {
+    PollFd fds[128];
+    Run *who[128];
+    int *which[128];
+    u64 n = 0;
+    for (u64 i = 0; i < count && n + 2 <= 128; i++) {
+        Run *r = &runs[i];
+        if (r->state != 1) {
+            continue;
+        }
+        int *ends[2] = {&r->out, &r->err};
+        for (int k = 0; k < 2; k++) {
+            if (*ends[k] >= 0) {
+                fds[n].fd = *ends[k];
+                fds[n].events = 1;
+                fds[n].revents = 0;
+                who[n] = r;
+                which[n] = ends[k];
+                n++;
+            }
+        }
+    }
+    if (n > 0) {
+        i64 p;
+        do {
+            p = sys3(SYS_POLL, (i64)fds, (i64)n, -1);
+        } while (p == -4);
+        u8 buf[4096];
+        for (u64 j = 0; j < n; j++) {
+            if (fds[j].revents == 0) {
+                continue;
+            }
+            i64 got = sys3(SYS_READ, *which[j], (i64)buf, sizeof(buf));
+            if (got > 0) {
+                keep(which[j] == &who[j]->out ? &who[j]->stdout_kept : &who[j]->stderr_kept, buf, (u64)got);
+            } else if (got != -4) {
+                sys1(SYS_CLOSE, *which[j]);
+                *which[j] = -1;
+            }
+        }
+    }
+    for (u64 i = 0; i < count; i++) {
+        Run *r = &runs[i];
+        if (r->state == 1 && r->out < 0 && r->err < 0) {
+            int status = 0;
+            sys4(SYS_WAIT4, r->pid, (i64)&status, 0, 0);
+            r->status = status;
+            r->state = 2;
+        }
+    }
+}
+
 u16 a0rt_run_tests(System *sys) {
     Str filter = {(const u8 *)"", 0};
     u64 seed = 0;
     int seeded = 0;
+    u64 jobs = 0;
     for (u64 i = 1; i < sys->nargs; i++) {
         Str a = sys->args[i];
         if (i + 1 < sys->nargs && a.len == 8 && memcmp(a.ptr, "--filter", 8) == 0) {
@@ -1414,10 +1641,18 @@ u16 a0rt_run_tests(System *sys) {
         } else if (i + 1 < sys->nargs && a.len == 6 && memcmp(a.ptr, "--seed", 6) == 0 && parse_u64(&sys->args[i + 1], &seed)) {
             seeded = 1;
             i++;
+        } else if (i + 1 < sys->nargs && a.len == 6 && memcmp(a.ptr, "--jobs", 6) == 0 && parse_u64(&sys->args[i + 1], &jobs) && jobs > 0) {
+            i++;
         } else {
-            say("usage: <test binary> [--filter <text>] [--seed <number>]\n");
+            say("usage: <test binary> [--filter <text>] [--seed <number>] [--jobs <number>]\n");
             exit_with(2);
         }
+    }
+    if (jobs == 0) {
+        jobs = processors();
+    }
+    if (jobs > 64) {
+        jobs = 64;
     }
     if (!seeded) {
         i64 ts[2] = {0, 0};
@@ -1427,38 +1662,49 @@ u16 a0rt_run_tests(System *sys) {
     say("seed: ");
     a0rt_write_u64(&out_fd, seed);
     say("\n");
+    flush_all();
     u64 count = &a0_test_count ? a0_test_count : 0;
+    Run *runs = a0rt_alloc((count ? count : 1) * sizeof(Run));
     u64 passed = 0, failed = 0, skipped = 0;
-    for (u64 i = 0; i < count; i++) {
-        const TestEntry *t = &a0_tests[i];
-        if (!contains(t->name, t->name_len, filter.ptr, filter.len)) {
-            skipped++;
-            continue;
-        }
-        say("test ");
-        a0rt_write(&out_fd, t->name, t->name_len);
-        say(" ... ");
-        flush_all();
-        i64 pid = sys1(SYS_FORK, 0);
-        if (pid == 0) {
-            // std.testing.Test: {seed, system}.
-            u64 test[2] = {mix(seed ^ mix(i)), (u64)sys};
-            a0rt_sched_seed(mix(test[0]));
-            if (t->takes_test) {
-                ((void (*)(u64 *))t->function)(test);
+    u64 next = 0, shown = 0, running = 0;
+    while (shown < count) {
+        // Start tests while there is room.
+        while (next < count && running < jobs) {
+            const TestEntry *t = &a0_tests[next];
+            if (!contains(t->name, t->name_len, filter.ptr, filter.len)) {
+                runs[next].state = 3;
+                skipped++;
             } else {
-                ((void (*)(void))t->function)();
+                start_test(sys, next, seed, &runs[next]);
+                running++;
             }
-            exit_with(0);
+            next++;
         }
-        int status = 0;
-        sys4(SYS_WAIT4, pid, (i64)&status, 0, 0);
-        if (status == 0) {
-            say("ok\n");
-            passed++;
-        } else {
-            say("FAILED\n");
-            failed++;
+        // Show the results that are next in order.
+        while (shown < count && runs[shown].state >= 2) {
+            Run *r = &runs[shown];
+            if (r->state == 2) {
+                const TestEntry *t = &a0_tests[shown];
+                say("test ");
+                a0rt_write(&out_fd, t->name, t->name_len);
+                if (r->status == 0) {
+                    say(" ... ok\n");
+                    passed++;
+                } else {
+                    say(" ... FAILED\n");
+                    failed++;
+                }
+                a0rt_write(&out_fd, r->stdout_kept.data, r->stdout_kept.len);
+                flush_all();
+                a0rt_write(&err_fd, r->stderr_kept.data, r->stderr_kept.len);
+                flush_all();
+                r->state = 3;
+                running--;
+            }
+            shown++;
+        }
+        if (shown < count && running > 0) {
+            collect(runs, next);
         }
     }
     a0rt_write_u64(&out_fd, passed);

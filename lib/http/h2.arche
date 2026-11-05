@@ -1,0 +1,834 @@
+/// HTTP/2 (RFC 9113), the server's side, without I/O: frames in through
+/// feed, frames out through output, requests out through next_request
+/// and responses in through respond. Streams are multiplexed: requests
+/// on many streams arrive interleaved, and response data goes out as
+/// each stream's and the connection's flow-control windows allow.
+import alloc;
+import http;
+import http.hpack;
+
+const DATA: u8 = 0;
+const HEADERS: u8 = 1;
+const PRIORITY: u8 = 2;
+const RST_STREAM: u8 = 3;
+const SETTINGS: u8 = 4;
+const PUSH_PROMISE: u8 = 5;
+const PING: u8 = 6;
+const GOAWAY: u8 = 7;
+const WINDOW_UPDATE: u8 = 8;
+const CONTINUATION: u8 = 9;
+
+const END_STREAM: u8 = 0x1;
+const ACK: u8 = 0x1;
+const END_HEADERS: u8 = 0x4;
+const PADDED: u8 = 0x8;
+const PRIORITY_FLAG: u8 = 0x20;
+
+// Error codes (RFC 9113 §7).
+const NO_ERROR: u32 = 0;
+const PROTOCOL_ERROR: u32 = 1;
+const FLOW_CONTROL_ERROR: u32 = 3;
+const STREAM_CLOSED: u32 = 5;
+const FRAME_SIZE_ERROR: u32 = 6;
+const REFUSED_STREAM: u32 = 7;
+const CANCEL: u32 = 8;
+const COMPRESSION_ERROR: u32 = 9;
+
+/// What a client sends first.
+pub const PREFACE: str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// What this server asks of the client.
+const MAX_STREAMS: usize = 100;
+const MAX_FRAME: usize = 16384;
+const WINDOW: i64 = 1048576;
+const MAX_WINDOW: i64 = 2147483647;
+/// The most a request's body may be.
+pub const MAX_BODY: usize = 16777216;
+
+type StreamState = enum { Free, Open, Responding, Closed }
+
+type Stream = struct {
+    id: u32,
+    state: StreamState,
+    request: http.Request,
+    block: alloc.List(u8),
+    /// Whether the request has ended (END_STREAM).
+    ended: bool,
+    /// Whether next_request gave it out already.
+    taken: bool,
+    send_window: i64,
+    recv_window: i64,
+    /// The response's body, from sent on.
+    data: alloc.List(u8),
+    sent: usize,
+}
+
+/// Bytes that arrive at the back and leave from the front.
+type Queue = struct {
+    bytes: alloc.List(u8),
+    start: usize,
+
+    fn view(self: &Queue) -> []u8 {
+        return self.bytes.items()[self.start..self.bytes.len()];
+    }
+
+    fn take(self: &mut Queue, n: usize) {
+        self.start += n;
+        if self.start == self.bytes.len() {
+            self.bytes.clear();
+            self.start = 0;
+        } else if self.start >= 65536 {
+            let from = self.start;
+            let left = self.bytes.len() - from;
+            let b = self.bytes.items_mut();
+            var i: usize = 0;
+            while i < left : (i += 1) {
+                b[i] = b[from + i];
+            }
+            while self.bytes.len() > left {
+                _ = self.bytes.pop();
+            }
+            self.start = 0;
+        }
+    }
+}
+
+fn put8(out: &mut alloc.List(u8), v: u8) {
+    out.push(v);
+}
+
+fn put32(out: &mut alloc.List(u8), v: u32) {
+    out.push((v >> 24) as u8);
+    out.push(((v >> 16) & 0xff) as u8);
+    out.push(((v >> 8) & 0xff) as u8);
+    out.push((v & 0xff) as u8);
+}
+
+fn frame_header(out: &mut alloc.List(u8), length: usize, kind: u8, flags: u8, stream: u32) {
+    out.push(((length >> 16) & 0xff) as u8);
+    out.push(((length >> 8) & 0xff) as u8);
+    out.push((length & 0xff) as u8);
+    out.push(kind);
+    out.push(flags);
+    put32(out, v: stream & 0x7fffffff);
+}
+
+fn get32(b: []u8, at: usize) -> u32 {
+    return ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | b[at + 3] as u32;
+}
+
+fn connection_specific(name: str) -> bool {
+    return name.eq("connection") or name.eq("keep-alive") or name.eq("proxy-connection") or
+        name.eq("transfer-encoding") or name.eq("upgrade");
+}
+
+pub type Connection = struct {
+    a: alloc.Allocator,
+    decoder: hpack.Decoder,
+    input: Queue,
+    out: alloc.List(u8),
+    preface: bool,
+    streams: alloc.List(Stream),
+    last_stream: u32,
+    /// The stream whose header block goes on in CONTINUATION frames, or 0.
+    continuing: u32,
+    peer_max_frame: usize,
+    peer_window: i64,
+    send_window: i64,
+    recv_window: i64,
+    goaway: bool,
+    failed: bool,
+
+    /// A connection that has its preface (SETTINGS) ready in output.
+    pub fn init(a: alloc.Allocator) -> Connection {
+        var c = Connection {
+            a: a,
+            decoder: hpack.Decoder.init(4096, a),
+            input: Queue { bytes: alloc.List(u8).init(a), start: 0 },
+            out: alloc.List(u8).init(a),
+            preface: false,
+            streams: alloc.List(Stream).init(a),
+            last_stream: 0,
+            continuing: 0,
+            peer_max_frame: 16384,
+            peer_window: 65535,
+            send_window: 65535,
+            recv_window: 65535,
+            goaway: false,
+            failed: false,
+        };
+        frame_header(&mut c.out, length: 18, kind: SETTINGS, flags: 0, stream: 0);
+        c.setting(3, value: MAX_STREAMS as u32);
+        c.setting(4, value: WINDOW as u32);
+        c.setting(6, value: 65536);
+        // The connection's own window grows to match the streams'.
+        frame_header(&mut c.out, length: 4, kind: WINDOW_UPDATE, flags: 0, stream: 0);
+        put32(&mut c.out, v: (WINDOW - 65535) as u32);
+        c.recv_window = WINDOW;
+        return c;
+    }
+
+    fn setting(self: &mut Connection, id: u16, value: u32) {
+        put8(&mut self.out, (id >> 8) as u8);
+        put8(&mut self.out, (id & 0xff) as u8);
+        put32(&mut self.out, v: value);
+    }
+
+    pub fn output(self: &Connection) -> []u8 {
+        return self.out.items();
+    }
+
+    pub fn sent(self: &mut Connection) {
+        self.out.clear();
+    }
+
+    /// Whether the client has said it is done (GOAWAY) and nothing is left
+    /// to send, or the connection failed.
+    pub fn finished(self: &Connection) -> bool {
+        if self.failed {
+            return true;
+        }
+        if not self.goaway {
+            return false;
+        }
+        for s in self.streams.items() {
+            if s.state == StreamState.Open or s.state == StreamState.Responding {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Bytes from the client. A connection error puts GOAWAY in output.
+    pub fn feed(self: &mut Connection, data: []u8) -> http.HttpError!void {
+        if self.failed {
+            return http.HttpError.Closed;
+        }
+        for x in data {
+            self.input.bytes.push(x.*);
+        }
+        match self.frames() {
+            ok(_) => { }
+            err(e) => {
+                var code = PROTOCOL_ERROR;
+                if e == http.HttpError.Compression {
+                    code = COMPRESSION_ERROR;
+                } else if e == http.HttpError.FlowControl {
+                    code = FLOW_CONTROL_ERROR;
+                } else if e == http.HttpError.TooLarge {
+                    code = FRAME_SIZE_ERROR;
+                }
+                frame_header(&mut self.out, length: 8, kind: GOAWAY, flags: 0, stream: 0);
+                put32(&mut self.out, v: self.last_stream);
+                put32(&mut self.out, v: code);
+                self.failed = true;
+                return e;
+            }
+        }
+    }
+
+    fn frames(self: &mut Connection) -> http.HttpError!void {
+        if not self.preface {
+            let v = self.input.view();
+            let p = PREFACE.bytes();
+            var n = v.len();
+            if n > p.len() {
+                n = p.len();
+            }
+            var i: usize = 0;
+            while i < n : (i += 1) {
+                if v[i] != p[i] {
+                    return http.HttpError.Protocol;
+                }
+            }
+            if n < p.len() {
+                return;
+            }
+            self.input.take(p.len());
+            self.preface = true;
+        }
+        while self.input.view().len() >= 9 {
+            let v = self.input.view();
+            let length = ((v[0] as usize) << 16) | ((v[1] as usize) << 8) | v[2] as usize;
+            if length > MAX_FRAME {
+                return http.HttpError.TooLarge;
+            }
+            if v.len() < 9 + length {
+                return;
+            }
+            let kind = v[3];
+            let flags = v[4];
+            let stream = get32(v, at: 5) & 0x7fffffff;
+            var payload = alloc.List(u8).init(self.a);
+            for x in v[9..9 + length] {
+                payload.push(x.*);
+            }
+            self.input.take(9 + length);
+            if self.continuing != 0 and (kind != CONTINUATION or stream != self.continuing) {
+                return http.HttpError.Protocol;
+            }
+            try self.frame(kind: kind, flags: flags, stream: stream, p: payload.items());
+        }
+    }
+
+    fn find(self: &Connection, id: u32) -> ?usize {
+        var i: usize = 0;
+        while i < self.streams.len() : (i += 1) {
+            let s = &self.streams.items()[i];
+            if s.id == id and s.state != StreamState.Free {
+                return i;
+            }
+        }
+        return none;
+    }
+
+    fn open_count(self: &Connection) -> usize {
+        var n: usize = 0;
+        for s in self.streams.items() {
+            if s.state == StreamState.Open or s.state == StreamState.Responding {
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// A slot for a new stream: a free one, or a new one at the end.
+    fn new_stream(self: &mut Connection, id: u32) -> usize {
+        var i: usize = 0;
+        while i < self.streams.len() : (i += 1) {
+            if self.streams.items()[i].state == StreamState.Free or self.streams.items()[i].state == StreamState.Closed {
+                let s = &mut self.streams.items_mut()[i];
+                s.id = id;
+                s.state = StreamState.Open;
+                s.request = http.Request.init(self.a);
+                s.request.version = 20;
+                s.block.clear();
+                s.ended = false;
+                s.taken = false;
+                s.send_window = self.peer_window;
+                s.recv_window = WINDOW;
+                s.data.clear();
+                s.sent = 0;
+                return i;
+            }
+        }
+        var r = http.Request.init(self.a);
+        r.version = 20;
+        self.streams.push(Stream {
+            id: id,
+            state: StreamState.Open,
+            request: r,
+            block: alloc.List(u8).init(self.a),
+            ended: false,
+            taken: false,
+            send_window: self.peer_window,
+            recv_window: WINDOW,
+            data: alloc.List(u8).init(self.a),
+            sent: 0,
+        });
+        return self.streams.len() - 1;
+    }
+
+    fn reset(self: &mut Connection, id: u32, code: u32) {
+        frame_header(&mut self.out, length: 4, kind: RST_STREAM, flags: 0, stream: id);
+        put32(&mut self.out, v: code);
+        match self.find(id) {
+            some(i) => { self.streams.items_mut()[i].state = StreamState.Closed; }
+            none => { }
+        }
+    }
+
+    fn window_update(self: &mut Connection, stream: u32, n: usize) {
+        frame_header(&mut self.out, length: 4, kind: WINDOW_UPDATE, flags: 0, stream: stream);
+        put32(&mut self.out, v: n as u32);
+    }
+
+    fn frame(self: &mut Connection, kind: u8, flags: u8, stream: u32, p: []u8) -> http.HttpError!void {
+        if kind == DATA {
+            try self.data_frame(flags, stream: stream, p: p);
+        } else if kind == HEADERS {
+            try self.headers_frame(flags, stream: stream, p: p);
+        } else if kind == CONTINUATION {
+            if self.continuing == 0 {
+                return http.HttpError.Protocol;
+            }
+            try self.block_part(stream, p: p, end_headers: flags & END_HEADERS != 0);
+        } else if kind == PRIORITY {
+            if stream == 0 {
+                return http.HttpError.Protocol;
+            }
+            if p.len() != 5 {
+                self.reset(id: stream, code: FRAME_SIZE_ERROR);
+            }
+        } else if kind == RST_STREAM {
+            if stream == 0 or stream > self.last_stream {
+                return http.HttpError.Protocol;
+            }
+            if p.len() != 4 {
+                return http.HttpError.TooLarge;
+            }
+            match self.find(stream) {
+                some(i) => { self.streams.items_mut()[i].state = StreamState.Closed; }
+                none => { }
+            }
+        } else if kind == SETTINGS {
+            try self.settings(flags, stream: stream, p: p);
+        } else if kind == PUSH_PROMISE {
+            return http.HttpError.Protocol;
+        } else if kind == PING {
+            if stream != 0 {
+                return http.HttpError.Protocol;
+            }
+            if p.len() != 8 {
+                return http.HttpError.TooLarge;
+            }
+            if flags & ACK == 0 {
+                frame_header(&mut self.out, length: 8, kind: PING, flags: ACK, stream: 0);
+                for x in p {
+                    self.out.push(x.*);
+                }
+            }
+        } else if kind == GOAWAY {
+            if stream != 0 {
+                return http.HttpError.Protocol;
+            }
+            self.goaway = true;
+        } else if kind == WINDOW_UPDATE {
+            if p.len() != 4 {
+                return http.HttpError.TooLarge;
+            }
+            let n = (get32(p, at: 0) & 0x7fffffff) as i64;
+            if stream == 0 {
+                if n == 0 {
+                    return http.HttpError.Protocol;
+                }
+                self.send_window += n;
+                if self.send_window > MAX_WINDOW {
+                    return http.HttpError.FlowControl;
+                }
+            } else {
+                match self.find(stream) {
+                    some(i) => {
+                        if n == 0 {
+                            self.reset(id: stream, code: PROTOCOL_ERROR);
+                        } else {
+                            let s = &mut self.streams.items_mut()[i];
+                            s.send_window += n;
+                            if s.send_window > MAX_WINDOW {
+                                self.reset(id: stream, code: FLOW_CONTROL_ERROR);
+                            }
+                        }
+                    }
+                    none => {
+                        if stream > self.last_stream {
+                            return http.HttpError.Protocol;
+                        }
+                    }
+                }
+            }
+            self.flush();
+        }
+        // Frames of unknown types are ignored (RFC 9113 §4.1).
+    }
+
+    fn settings(self: &mut Connection, flags: u8, stream: u32, p: []u8) -> http.HttpError!void {
+        if stream != 0 {
+            return http.HttpError.Protocol;
+        }
+        if flags & ACK != 0 {
+            if p.len() != 0 {
+                return http.HttpError.TooLarge;
+            }
+            return;
+        }
+        if p.len() % 6 != 0 {
+            return http.HttpError.TooLarge;
+        }
+        var at: usize = 0;
+        while at < p.len() : (at += 6) {
+            let id = ((p[at] as u16) << 8) | p[at + 1] as u16;
+            let value = get32(p, at: at + 2);
+            if id == 2 and value > 1 {
+                return http.HttpError.Protocol;
+            }
+            if id == 4 {
+                if value > 0x7fffffff {
+                    return http.HttpError.FlowControl;
+                }
+                let delta = value as i64 - self.peer_window;
+                self.peer_window = value as i64;
+                for s in self.streams.items_mut() {
+                    if s.state == StreamState.Open or s.state == StreamState.Responding {
+                        s.send_window += delta;
+                        if s.send_window > MAX_WINDOW {
+                            return http.HttpError.FlowControl;
+                        }
+                    }
+                }
+            }
+            if id == 5 {
+                if value < 16384 or value > 16777215 {
+                    return http.HttpError.Protocol;
+                }
+                self.peer_max_frame = value as usize;
+            }
+        }
+        frame_header(&mut self.out, length: 0, kind: SETTINGS, flags: ACK, stream: 0);
+        self.flush();
+    }
+
+    /// The payload without its padding, and the pad length checked.
+    fn unpadded(flags: u8, p: []u8) -> http.HttpError![2]usize {
+        if flags & PADDED == 0 {
+            return [0, p.len()];
+        }
+        if p.len() < 1 or (p[0] as usize) >= p.len() {
+            return http.HttpError.Protocol;
+        }
+        return [1, p.len() - p[0] as usize];
+    }
+
+    fn data_frame(self: &mut Connection, flags: u8, stream: u32, p: []u8) -> http.HttpError!void {
+        if stream == 0 {
+            return http.HttpError.Protocol;
+        }
+        // Flow control counts the whole payload, padding too.
+        self.recv_window -= p.len() as i64;
+        if self.recv_window < 0 {
+            return http.HttpError.FlowControl;
+        }
+        if p.len() > 0 {
+            self.window_update(0, n: p.len());
+            self.recv_window += p.len() as i64;
+        }
+        let range = try Connection.unpadded(flags, p: p);
+        var index: usize = 0;
+        match self.find(stream) {
+            some(i) => { index = i; }
+            none => {
+                if stream > self.last_stream {
+                    return http.HttpError.Protocol;
+                }
+                self.reset(id: stream, code: STREAM_CLOSED);
+                return;
+            }
+        }
+        if self.streams.items()[index].state != StreamState.Open or self.streams.items()[index].ended {
+            self.reset(id: stream, code: STREAM_CLOSED);
+            return;
+        }
+        if self.streams.items()[index].request.body.len() + (range[1] - range[0]) > MAX_BODY {
+            self.reset(id: stream, code: CANCEL);
+            return;
+        }
+        let s = &mut self.streams.items_mut()[index];
+        for x in p[range[0]..range[1]] {
+            s.request.body.push(x.*);
+        }
+        let end = flags & END_STREAM != 0;
+        if end {
+            s.ended = true;
+        }
+        if not end and p.len() > 0 {
+            self.window_update(stream, n: p.len());
+        }
+    }
+
+    fn headers_frame(self: &mut Connection, flags: u8, stream: u32, p: []u8) -> http.HttpError!void {
+        if stream == 0 or stream % 2 == 0 {
+            return http.HttpError.Protocol;
+        }
+        let range = try Connection.unpadded(flags, p: p);
+        var start = range[0];
+        if flags & PRIORITY_FLAG != 0 {
+            start += 5;
+            if start > range[1] {
+                return http.HttpError.Protocol;
+            }
+            if get32(p, at: range[0]) & 0x7fffffff == stream {
+                return http.HttpError.Protocol;
+            }
+        }
+        match self.find(stream) {
+            some(i) => {
+                // Trailers: the request's last fields, ending it.
+                let s = &self.streams.items()[i];
+                if s.state != StreamState.Open or s.ended or flags & END_STREAM == 0 {
+                    return http.HttpError.Protocol;
+                }
+            }
+            none => {
+                if stream <= self.last_stream or self.goaway {
+                    return http.HttpError.Protocol;
+                }
+                self.last_stream = stream;
+                _ = self.new_stream(stream);
+            }
+        }
+        var i: usize = 0;
+        match self.find(stream) {
+            some(k) => { i = k; }
+            none => { }
+        }
+        let s = &mut self.streams.items_mut()[i];
+        s.block.clear();
+        if flags & END_STREAM != 0 {
+            s.ended = true;
+        }
+        self.continuing = stream;
+        try self.block_part(stream, p: p[start..range[1]], end_headers: flags & END_HEADERS != 0);
+    }
+
+    fn block_part(self: &mut Connection, stream: u32, p: []u8, end_headers: bool) -> http.HttpError!void {
+        var index: usize = 0;
+        match self.find(stream) {
+            some(i) => { index = i; }
+            none => { return http.HttpError.Protocol; }
+        }
+        let s = &mut self.streams.items_mut()[index];
+        if s.block.len() + p.len() > 65536 {
+            return http.HttpError.Compression;
+        }
+        for x in p {
+            s.block.push(x.*);
+        }
+        if not end_headers {
+            return;
+        }
+        self.continuing = 0;
+        try self.decode_block(index);
+    }
+
+    /// Decodes a stream's finished header block: a request's fields, or
+    /// its trailers.
+    fn decode_block(self: &mut Connection, index: usize) -> http.HttpError!void {
+        var fields = http.Headers.init(self.a);
+        var block = alloc.List(u8).init(self.a);
+        for x in self.streams.items()[index].block.items() {
+            block.push(x.*);
+        }
+        // The table must see every block, even a refused stream's.
+        try self.decoder.decode(block.items(), out: &mut fields);
+        let id = self.streams.items()[index].id;
+        let trailers = self.streams.items()[index].request.method.len() > 0;
+        if not trailers and self.open_count() > MAX_STREAMS {
+            self.reset(id: id, code: REFUSED_STREAM);
+            return;
+        }
+        var regular = false;
+        var i: usize = 0;
+        var bad = false;
+        let s = &mut self.streams.items_mut()[index];
+        while i < fields.len() : (i += 1) {
+            let name = fields.name(i);
+            let value = fields.value(i);
+            for c in name.bytes() {
+                if c.* >= 'A' and c.* <= 'Z' {
+                    bad = true;
+                }
+            }
+            if name.starts_with(":") {
+                if regular or trailers {
+                    bad = true;
+                } else if name.eq(":method") and s.request.method.len() == 0 {
+                    s.request.method.push_str(value);
+                } else if name.eq(":path") and s.request.target.len() == 0 and value.len() > 0 {
+                    s.request.target.push_str(value);
+                } else if name.eq(":authority") and s.request.authority.len() == 0 {
+                    s.request.authority.push_str(value);
+                } else if not name.eq(":scheme") {
+                    bad = true;
+                }
+            } else {
+                regular = true;
+                if connection_specific(name) or (name.eq("te") and not value.eq("trailers")) {
+                    bad = true;
+                }
+                if not trailers {
+                    s.request.headers.add(name: name, value: value);
+                    if name.eq("host") and s.request.authority.len() == 0 {
+                        s.request.authority.push_str(value);
+                    }
+                }
+            }
+        }
+        if s.request.method.len() == 0 or (s.request.target.len() == 0 and not s.request.method.view().eq("CONNECT")) {
+            bad = true;
+        }
+        if bad {
+            self.reset(id: id, code: PROTOCOL_ERROR);
+        }
+    }
+
+    /// A stream whose request is complete and not given out yet.
+    pub fn next_request(self: &mut Connection) -> ?u32 {
+        for s in self.streams.items_mut() {
+            if s.state == StreamState.Open and s.ended and not s.taken {
+                s.taken = true;
+                s.state = StreamState.Responding;
+                return s.id;
+            }
+        }
+        return none;
+    }
+
+    pub fn request(self: &Connection, id: u32) -> &http.Request {
+        var i: usize = 0;
+        while i < self.streams.len() : (i += 1) {
+            if self.streams.items()[i].id == id {
+                return &self.streams.items()[i].request;
+            }
+        }
+        return &self.streams.items()[0].request;
+    }
+
+    /// Sends the response on its stream: the fields now, the body as the
+    /// windows let it go (HEAD: no body).
+    pub fn respond(self: &mut Connection, id: u32, resp: &http.Response, head_only: bool) {
+        var index: usize = 0;
+        match self.find(id) {
+            some(i) => { index = i; }
+            none => { return; }
+        }
+        if self.streams.items()[index].state != StreamState.Responding {
+            return;
+        }
+        var block = alloc.List(u8).init(self.a);
+        var status: [3]u8 = [0; 3];
+        status[0] = '0' + (resp.status / 100) as u8;
+        status[1] = '0' + ((resp.status / 10) % 10) as u8;
+        status[2] = '0' + (resp.status % 10) as u8;
+        var text = alloc.String.init(self.a);
+        for c in status[0..3] {
+            text.push_ascii(c.*);
+        }
+        hpack.encode(&mut block, name: ":status", value: text.view());
+        var i: usize = 0;
+        var has_length = false;
+        while i < resp.headers.len() : (i += 1) {
+            let name = resp.headers.name(i);
+            if not connection_specific(name) {
+                hpack.encode(&mut block, name: name, value: resp.headers.value(i));
+            }
+            if name.eq("content-length") {
+                has_length = true;
+            }
+        }
+        let has_body = not http.bodiless(resp.status);
+        if has_body and not has_length {
+            var n = resp.body.len();
+            var digits: [20]u8 = [0; 20];
+            var k: usize = 0;
+            while true {
+                digits[k] = '0' + (n % 10) as u8;
+                k += 1;
+                n = n / 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            var len_text = alloc.String.init(self.a);
+            while k > 0 : (k -= 1) {
+                len_text.push_ascii(digits[k - 1]);
+            }
+            hpack.encode(&mut block, name: "content-length", value: len_text.view());
+        }
+        let no_data = head_only or not has_body or resp.body.len() == 0;
+        // HEADERS, then CONTINUATION frames if the block is long.
+        let b = block.items();
+        var at: usize = 0;
+        var first = true;
+        while first or at < b.len() {
+            var n = b.len() - at;
+            if n > self.peer_max_frame {
+                n = self.peer_max_frame;
+            }
+            var flags: u8 = 0;
+            if at + n == b.len() {
+                flags = END_HEADERS;
+            }
+            var kind = CONTINUATION;
+            if first {
+                kind = HEADERS;
+                if no_data {
+                    flags = flags | END_STREAM;
+                }
+            }
+            frame_header(&mut self.out, length: n, kind: kind, flags: flags, stream: id);
+            for x in b[at..at + n] {
+                self.out.push(x.*);
+            }
+            at += n;
+            first = false;
+        }
+        let s = &mut self.streams.items_mut()[index];
+        if no_data {
+            s.state = StreamState.Closed;
+            return;
+        }
+        for x in resp.body.items() {
+            s.data.push(x.*);
+        }
+        s.sent = 0;
+        self.flush();
+    }
+
+    /// Sends what response data the windows allow.
+    fn flush(self: &mut Connection) {
+        var i: usize = 0;
+        while i < self.streams.len() : (i += 1) {
+            if self.send_window <= 0 {
+                return;
+            }
+            let s = &mut self.streams.items_mut()[i];
+            if s.state != StreamState.Responding or s.data.len() == 0 {
+                continue;
+            }
+            while s.sent < s.data.len() and s.send_window > 0 and self.send_window > 0 {
+                var n = s.data.len() - s.sent;
+                if n > self.peer_max_frame {
+                    n = self.peer_max_frame;
+                }
+                if n as i64 > s.send_window {
+                    n = s.send_window as usize;
+                }
+                if n as i64 > self.send_window {
+                    n = self.send_window as usize;
+                }
+                var flags: u8 = 0;
+                if s.sent + n == s.data.len() {
+                    flags = END_STREAM;
+                }
+                frame_header(&mut self.out, length: n, kind: DATA, flags: flags, stream: s.id);
+                for x in s.data.items()[s.sent..s.sent + n] {
+                    self.out.push(x.*);
+                }
+                s.sent += n;
+                s.send_window -= n as i64;
+                self.send_window -= n as i64;
+            }
+            if s.sent == s.data.len() {
+                s.state = StreamState.Closed;
+                s.data.clear();
+            }
+        }
+    }
+
+    /// Whether response data waits for the client to open a window.
+    pub fn blocked(self: &Connection) -> bool {
+        for s in self.streams.items() {
+            if s.state == StreamState.Responding and s.data.len() > 0 and s.sent < s.data.len() {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Says goodbye: no new streams after the last one seen.
+    pub fn close(self: &mut Connection) {
+        frame_header(&mut self.out, length: 8, kind: GOAWAY, flags: 0, stream: 0);
+        put32(&mut self.out, v: self.last_stream);
+        put32(&mut self.out, v: NO_ERROR);
+        self.goaway = true;
+    }
+}

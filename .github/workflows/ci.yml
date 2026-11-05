@@ -58,9 +58,9 @@ jobs:
       - name: Time lib/crypto on fixed and random secrets
         run: ./ctcheck/run.sh
 
-  # docs/sprints.md S21: lib/tls against OpenSSL and curl, both ways, and a
-  # minute of fuzzing the handshake and certificates.
-  tls:
+  # docs/sprints.md S21, S22: lib/tls against OpenSSL and curl, both ways,
+  # lib/http against curl and Chrome, and a minute of fuzzing each.
+  network:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,3 +70,7 @@ jobs:
         run: ./interop/tls.sh
       - name: Fuzz TLS
         run: ./fuzz/tls.sh 60
+      - name: HTTP interop with curl and Chrome
+        run: ./interop/http.sh
+      - name: Fuzz HTTP
+        run: ./fuzz/http.sh 60

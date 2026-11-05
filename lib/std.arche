@@ -40,6 +40,7 @@ extern "c" fn a0rt_write_f32(output: *i64, x: f32);
 extern "c" fn a0rt_fs_read(path: *u8, path_len: u64, out: *mut u8, utf8: bool) -> u16;
 extern "c" fn a0rt_write_file(fs: *u8, path: *u8, path_len: u64, data: *u8, len: u64) -> u16;
 extern "c" fn a0rt_flush_all();
+extern "c" fn a0rt_io_wait(fd: i64, events: u32);
 extern "c" fn a0rt_exit(status: u8) -> noreturn;
 
 /// The runtime's error numbers, 1 to 5 in IoError's order.
@@ -585,7 +586,20 @@ fn net_error(e: i64) -> NetError {
     return NetError.NetFailed;
 }
 
-/// TCP over IPv4.
+/// poll(2)'s events: the socket can be read, or written.
+const POLLIN: u32 = 1;
+const POLLOUT: u32 = 4;
+
+/// Waits until fd is ready; other tasks run meanwhile (rt.c).
+fn io_wait(fd: i64, events: u32) {
+    unsafe {
+        // SAFETY: the runtime only polls fd.
+        a0rt_io_wait(fd, events);
+    }
+}
+
+/// TCP over IPv4. Sockets do not block the program: a task that waits for
+/// one lets the others run.
 pub type Net = struct {
     unique: core.Unique,
 
@@ -594,12 +608,22 @@ pub type Net = struct {
         var fd: i64 = 0;
         var r: i64 = 0;
         unsafe {
-            // SAFETY: AF_INET, SOCK_STREAM | SOCK_CLOEXEC; sa is 16 bytes.
-            fd = linux.syscall(linux.SOCKET, [2, 0x80001, 0, 0, 0, 0]);
+            // SAFETY: AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+            // sa is 16 bytes; SO_ERROR is one int.
+            fd = linux.syscall(linux.SOCKET, [2, 0x80801, 0, 0, 0, 0]);
             if linux.errno(fd) != 0 {
                 return net_error(linux.errno(fd));
             }
             r = linux.syscall(linux.CONNECT, [fd, linux.arg(SockAddr, &sa as *SockAddr), 16, 0, 0, 0]);
+            if linux.errno(r) == linux.EINPROGRESS {
+                io_wait(fd, events: POLLOUT);
+                var e: i32 = 0;
+                var len: u32 = 4;
+                r = linux.syscall(linux.GETSOCKOPT, [fd, 1, 4, linux.arg(i32, &e as *i32), linux.arg(u32, &len as *u32), 0]);
+                if linux.errno(r) == 0 and e != 0 {
+                    r = -(e as i64);
+                }
+            }
             if linux.errno(r) != 0 {
                 _ = linux.syscall(linux.CLOSE, [fd, 0, 0, 0, 0, 0]);
                 return net_error(linux.errno(r));
@@ -615,7 +639,7 @@ pub type Net = struct {
         var fd: i64 = 0;
         unsafe {
             // SAFETY: as connect; SO_REUSEADDR takes one int.
-            fd = linux.syscall(linux.SOCKET, [2, 0x80001, 0, 0, 0, 0]);
+            fd = linux.syscall(linux.SOCKET, [2, 0x80801, 0, 0, 0, 0]);
             if linux.errno(fd) != 0 {
                 return net_error(linux.errno(fd));
             }
@@ -649,10 +673,16 @@ pub type Listener = struct {
     }
 
     pub fn accept(self: &Listener) -> NetError!Socket {
-        var fd: i64 = 0;
-        unsafe {
-            // SAFETY: the peer's address is not asked for.
-            fd = linux.syscall(linux.ACCEPT, [self.fd, 0, 0, 0, 0, 0]);
+        var fd: i64 = -linux.EAGAIN;
+        while linux.errno(fd) == linux.EAGAIN or linux.errno(fd) == linux.EINTR {
+            unsafe {
+                // SAFETY: the peer's address is not asked for; the new
+                // socket is SOCK_NONBLOCK | SOCK_CLOEXEC too.
+                fd = linux.syscall(linux.ACCEPT4, [self.fd, 0, 0, 0x80800, 0, 0]);
+            }
+            if linux.errno(fd) == linux.EAGAIN {
+                io_wait(self.fd, events: POLLIN);
+            }
         }
         if linux.errno(fd) != 0 {
             return net_error(linux.errno(fd));
@@ -676,10 +706,15 @@ pub type Socket = struct {
 
     /// Up to into.len() bytes; 0 when the peer has closed.
     pub fn read(self: &mut Socket, into: []mut u8) -> NetError!usize {
-        var r: i64 = 0;
-        unsafe {
-            // SAFETY: read writes at most into.len() bytes.
-            r = linux.syscall(linux.READ, [self.fd, linux.arg(u8, mem.slice_data(u8, into) as *u8), into.len() as i64, 0, 0, 0]);
+        var r: i64 = -linux.EAGAIN;
+        while linux.errno(r) == linux.EAGAIN or linux.errno(r) == linux.EINTR {
+            unsafe {
+                // SAFETY: read writes at most into.len() bytes.
+                r = linux.syscall(linux.READ, [self.fd, linux.arg(u8, mem.slice_data(u8, into) as *u8), into.len() as i64, 0, 0, 0]);
+            }
+            if linux.errno(r) == linux.EAGAIN {
+                io_wait(self.fd, events: POLLIN);
+            }
         }
         if linux.errno(r) != 0 {
             return net_error(linux.errno(r));
@@ -693,8 +728,15 @@ pub type Socket = struct {
         while done < data.len() {
             var r: i64 = 0;
             unsafe {
-                // SAFETY: write reads the bytes left in data.
-                r = linux.syscall(linux.WRITE, [self.fd, linux.arg(u8, mem.slice_data(u8, data)) + done as i64, (data.len() - done) as i64, 0, 0, 0]);
+                // SAFETY: send reads the bytes left in data. MSG_NOSIGNAL:
+                // a peer that has gone is an error, not SIGPIPE.
+                r = linux.syscall(linux.SENDTO, [self.fd, linux.arg(u8, mem.slice_data(u8, data)) + done as i64, (data.len() - done) as i64, 0x4000, 0, 0]);
+            }
+            if linux.errno(r) == linux.EAGAIN or linux.errno(r) == linux.EINTR {
+                if linux.errno(r) == linux.EAGAIN {
+                    io_wait(self.fd, events: POLLOUT);
+                }
+                continue;
             }
             if linux.errno(r) != 0 {
                 return net_error(linux.errno(r));

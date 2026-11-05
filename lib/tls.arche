@@ -1583,6 +1583,19 @@ pub type Conn = struct {
         }
     }
 
+    /// Runs the engine's handshake over sock: a client's or a server's,
+    /// whichever the engine is. On an error the socket is closed.
+    pub fn over(sock: std.Socket, engine: Engine) -> TlsError!Conn {
+        var c = Conn { sock: sock, engine: engine };
+        match c.handshake() {
+            ok(_) => { return c; }
+            err(e) => {
+                c.sock.close();
+                return e;
+            }
+        }
+    }
+
     fn handshake(self: &mut Conn) -> TlsError!void {
         while not self.engine.connected() {
             try self.pump();

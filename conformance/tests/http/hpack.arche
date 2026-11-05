@@ -1,0 +1,101 @@
+// test: run
+// spec: http (RFC 7541 Appendix C)
+// stage0: skip
+// stdout: :method: GET
+// stdout: :scheme: http
+// stdout: :path: /
+// stdout: :authority: www.example.com
+// stdout: --
+// stdout: :method: GET
+// stdout: :scheme: http
+// stdout: :path: /
+// stdout: :authority: www.example.com
+// stdout: cache-control: no-cache
+// stdout: --
+// stdout: :method: GET
+// stdout: :scheme: https
+// stdout: :path: /index.html
+// stdout: :authority: www.example.com
+// stdout: custom-key: custom-value
+// stdout: --
+// stdout: :status: 302
+// stdout: cache-control: private
+// stdout: date: Mon, 21 Oct 2013 20:13:21 GMT
+// stdout: location: https://www.example.com
+// stdout: --
+// stdout: :status: 307
+// stdout: cache-control: private
+// stdout: date: Mon, 21 Oct 2013 20:13:21 GMT
+// stdout: location: https://www.example.com
+// stdout: --
+// stdout: :status: 200
+// stdout: cache-control: private
+// stdout: date: Mon, 21 Oct 2013 20:13:22 GMT
+// stdout: location: https://www.example.com
+// stdout: content-encoding: gzip
+// stdout: set-cookie: foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1
+// stdout: --
+// stdout: :status: 200
+// stdout: content-type: text/plain
+// stdout: x-arche: yes
+import std;
+import alloc;
+import http;
+import http.hpack;
+
+fn nibble(c: u8) -> u8 {
+    if c >= 'a' {
+        return c - 'a' + 10;
+    }
+    return c - '0';
+}
+
+fn block(text: str, a: alloc.Allocator) -> alloc.List(u8) {
+    let b = text.bytes();
+    var out = alloc.List(u8).init(a);
+    var i: usize = 0;
+    while i < b.len() : (i += 2) {
+        out.push(nibble(b[i]) * 16 + nibble(b[i + 1]));
+    }
+    return out;
+}
+
+fn show(sys: &mut std.System, d: &mut hpack.Decoder, text: str) -> !void {
+    let b = block(text, sys.alloc);
+    var h = http.Headers.init(sys.alloc);
+    try d.decode(b.items(), out: &mut h);
+    var i: usize = 0;
+    while i < h.len() : (i += 1) {
+        sys.stdout.write(h.name(i));
+        sys.stdout.write(": ");
+        sys.stdout.write(h.value(i));
+        sys.stdout.write("\n");
+    }
+    sys.stdout.write("--\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var requests = hpack.Decoder.init(4096, sys.alloc);
+    try show(sys, d: &mut requests, text: "828684418cf1e3c2e5f23a6ba0ab90f4ff");
+    try show(sys, d: &mut requests, text: "828684be5886a8eb10649cbf");
+    try show(sys, d: &mut requests, text: "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf");
+    var responses = hpack.Decoder.init(256, sys.alloc);
+    try show(sys, d: &mut responses, text: "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3");
+    try show(sys, d: &mut responses, text: "4883640effc1c0bf");
+    try show(sys, d: &mut responses, text: "88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007");
+    // The encoder's output decodes to what went in.
+    var enc = alloc.List(u8).init(sys.alloc);
+    hpack.encode(&mut enc, name: ":status", value: "200");
+    hpack.encode(&mut enc, name: "content-type", value: "text/plain");
+    hpack.encode(&mut enc, name: "x-arche", value: "yes");
+    var fresh = hpack.Decoder.init(4096, sys.alloc);
+    var h = http.Headers.init(sys.alloc);
+    try fresh.decode(enc.items(), out: &mut h);
+    var i: usize = 0;
+    while i < h.len() : (i += 1) {
+        sys.stdout.write(h.name(i));
+        sys.stdout.write(": ");
+        sys.stdout.write(h.value(i));
+        sys.stdout.write("\n");
+    }
+}

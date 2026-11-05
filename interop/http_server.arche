@@ -1,0 +1,98 @@
+/// HTTP interop server (docs/sprints.md S22): serves count connections on
+/// 127.0.0.1:port, over TLS when given a certificate chain and a key (PEM
+/// files), in the clear otherwise.
+///
+///   /            a short page that names the protocol
+///   /echo        the request's body back
+///   /big?n=N     N bytes, for flow control
+///   /chunked     a body in chunks (HTTP/1.1)
+///   /headers     the request's fields, one per line
+import alloc;
+import std;
+import http;
+import http.server;
+import crypto.random;
+import tls;
+
+fn number(text: str) -> u64 {
+    var v: u64 = 0;
+    for c in text.bytes() {
+        if c.* >= '0' and c.* <= '9' {
+            v = v * 10 + (c.* - '0') as u64;
+        }
+    }
+    return v;
+}
+
+fn version_name(v: u8) -> str {
+    if v == 20 {
+        return "HTTP/2";
+    }
+    if v == 11 {
+        return "HTTP/1.1";
+    }
+    return "HTTP/1.0";
+}
+
+fn handle(req: &http.Request, resp: &mut http.Response) {
+    let path = req.path();
+    if path.eq("/echo") {
+        resp.headers.add(name: "content-type", value: "application/octet-stream");
+        resp.write_bytes(req.body.items());
+    } else if path.eq("/big") {
+        let t = req.target.view();
+        let n = number(t[path.len()..t.len()]);
+        var i: u64 = 0;
+        while i < n : (i += 1) {
+            resp.body.push('a' + (i % 26) as u8);
+        }
+    } else if path.eq("/chunked") {
+        resp.chunked = true;
+        resp.write("chunked body from arche\n");
+    } else if path.eq("/headers") {
+        var i: usize = 0;
+        while i < req.headers.len() : (i += 1) {
+            resp.write(req.headers.name(i));
+            resp.write(": ");
+            resp.write(req.headers.value(i));
+            resp.write("\n");
+        }
+    } else if path.eq("/") {
+        resp.headers.add(name: "content-type", value: "text/html; charset=utf-8");
+        resp.write("<!doctype html><html><body><p id=\"p\">hello from arche over ");
+        resp.write(version_name(req.version));
+        resp.write("</p></body></html>\n");
+    } else {
+        resp.status = 404;
+        resp.write("not found\n");
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() != 3 and sys.args.len() != 5 {
+        sys.stderr.write("usage: http_server <port> <count> [<chain-file> <key-file>]\n");
+        sys.proc.exit(2);
+    }
+    let port = number(sys.args.get(1)) as u16;
+    var options = server.Options.init();
+    options.connections = number(sys.args.get(2));
+    var listener = try sys.net.listen(std.Address { ip: [127, 0, 0, 1], port: port });
+    sys.stdout.write("ready\n");
+    sys.stdout.flush();
+    let handler = fn [](req: &http.Request, resp: &mut http.Response) {
+        handle(req, resp: resp);
+    };
+    if sys.args.len() == 3 {
+        try server.serve(&listener, handler: &handler, options: options, proc: &sys.proc, sys.alloc);
+    } else {
+        var config = tls.ServerConfig.init(sys.alloc);
+        let chain = try sys.fs.read_file(sys.args.get(3), sys.alloc);
+        try config.certificates_pem(chain.view(), sys.alloc);
+        let key = try sys.fs.read_file(sys.args.get(4), sys.alloc);
+        try config.private_key_pem(key.view(), sys.alloc);
+        config.accept_protocol("h2");
+        config.accept_protocol("http/1.1");
+        try server.serve_tls(&listener, config: &config, handler: &handler, options: options, proc: &sys.proc, seeds: random.Csprng.init(&mut sys.rand), sys.alloc);
+    }
+    listener.close();
+}

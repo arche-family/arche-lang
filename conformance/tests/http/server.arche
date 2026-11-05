@@ -1,0 +1,119 @@
+// test: run
+// spec: http (RFC 9110, RFC 9112)
+// stage0: skip
+// stdout: 200 hello /first
+// stdout: 200 hello /second
+// stdout: 404 not found
+// stdout: tls: 200 hello /secure
+import std;
+import std.task;
+import alloc;
+import http;
+import http.server;
+import crypto.random;
+import tls;
+import tls.x509;
+
+fn handle(req: &http.Request, resp: &mut http.Response) {
+    if req.path().eq("/missing") {
+        resp.status = 404;
+        resp.write("not found");
+        return;
+    }
+    resp.write("hello ");
+    resp.write(req.target.view());
+}
+
+fn show(out: &mut std.Output, label: str, resp: &http.Response) {
+    out.write(label);
+    out.write_u64(resp.status as u64);
+    out.write(" ");
+    for c in resp.body.items() {
+        out.write_byte(c.*);
+    }
+    out.write("\n");
+}
+
+fn get(t: &mut server.Transport, target: str, a: alloc.Allocator) -> http.HttpError!http.Response {
+    var req = http.Request.init(a);
+    req.method.push_str("GET");
+    req.target.push_str(target);
+    req.authority.push_str("localhost");
+    var resp = http.Response.init(a);
+    try server.fetch(t, req: &req, resp: &mut resp, a);
+    return resp;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let handler = fn [](req: &http.Request, resp: &mut http.Response) {
+        handle(req, resp: resp);
+    };
+    // In the clear: three requests on one kept-alive connection, a server
+    // task and this program's client side by side.
+    var listener = try sys.net.listen(std.Address { ip: [127, 0, 0, 1], port: 0 });
+    let port = listener.port();
+    var options = server.Options.init();
+    options.connections = 1;
+    let net = &sys.net;
+    let proc = &sys.proc;
+    var out = alloc.List(http.Response).init(a);
+    try task.scope(proc, fn [&listener, &handler, options, proc, net, port, &mut out, a](s: &mut task.Scope) -> !void {
+        s.spawn(fn [&listener, &handler, options, proc, a]() -> !void {
+            try server.serve(&listener, handler: &handler, options: options, proc: proc, a);
+        });
+        let sock = try net.connect(std.Address { ip: [127, 0, 0, 1], port: port });
+        var t = server.Transport.Plain { sock: sock };
+        out.push(try get(&mut t, target: "/first", a));
+        out.push(try get(&mut t, target: "/second", a));
+        out.push(try get(&mut t, target: "/missing", a));
+        t.close();
+    });
+    listener.close();
+    for r in out.items() {
+        show(&mut sys.stdout, label: "", resp: r);
+    }
+
+    // Over TLS, with a certificate made here.
+    let ca_key = x509.PrivateKey { key: x509.Key.Ed25519, secret: [3; 32] };
+    let ca_name = x509.name_of("Test CA", a);
+    var ca_t = x509.Template.init("Test CA", a);
+    ca_t.ca = true;
+    ca_t.not_before = 1700000000;
+    ca_t.not_after = 4102444800;
+    let ca = x509.create(&ca_t, key: &ca_key, issuer: ca_name.items(), signer: &ca_key, a);
+    let key = x509.PrivateKey { key: x509.Key.EcdsaP256, secret: [4; 32] };
+    var leaf_t = x509.Template.init("localhost", a);
+    leaf_t.add_name("localhost", a);
+    leaf_t.not_before = 1700000000;
+    leaf_t.not_after = 4102444800;
+    let leaf = x509.create(&leaf_t, key: &key, issuer: ca_name.items(), signer: &ca_key, a);
+    var sc = tls.ServerConfig.init(a);
+    sc.add_certificate(leaf.items());
+    sc.private_key(key);
+    sc.accept_protocol("http/1.1");
+    var cc = tls.ClientConfig.init("localhost", now: 1800000000, a);
+    cc.trust(ca.items());
+    cc.offer_protocol("http/1.1");
+    var secure = try sys.net.listen(std.Address { ip: [127, 0, 0, 1], port: 0 });
+    let secure_port = secure.port();
+    let rand = &mut sys.rand;
+    var got = alloc.List(http.Response).init(a);
+    try task.scope(proc, fn [&secure, &sc, &cc, &handler, options, proc, net, secure_port, rand, &mut got, a](s: &mut task.Scope) -> !void {
+        var seed: [32]u8 = [0; 32];
+        rand.fill(seed[0..32]);
+        s.spawn(fn [&secure, &sc, &handler, options, proc, seed, a]() -> !void {
+            try server.serve_tls(&secure, config: &sc, handler: &handler, options: options, proc: proc, seeds: random.Csprng.from_seed(seed), a);
+        });
+        let sock = try net.connect(std.Address { ip: [127, 0, 0, 1], port: secure_port });
+        rand.fill(seed[0..32]);
+        let conn = try tls.Conn.over(sock, engine: tls.Engine.client(&cc, seed: seed, a));
+        var t = server.Transport.Secure { conn: conn };
+        got.push(try get(&mut t, target: "/secure", a));
+        t.close();
+    });
+    secure.close();
+    for r in got.items() {
+        show(&mut sys.stdout, label: "tls: ", resp: r);
+    }
+}

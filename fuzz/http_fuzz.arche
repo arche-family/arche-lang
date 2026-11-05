@@ -1,0 +1,306 @@
+/// Fuzzes lib/http (docs/sprints.md S22): HTTP/1.1 heads and chunked
+/// bodies, HPACK blocks, and HTTP/2 connections, each made from a valid
+/// example by flipping bits, changing bytes, cutting, inserting, doubling
+/// or replacing with noise, and fed in pieces of random size. Every input
+/// must give an error or a result; a panic is a bug.
+///
+/// usage: http_fuzz <seconds> [seed]. The seed printed first repeats a run.
+import alloc;
+import core.rand;
+import std;
+import http;
+import http.h1;
+import http.h2;
+import http.hpack;
+
+fn mangle(data: []u8, g: &mut rand.Seeded, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    for x in data {
+        out.push(x.*);
+    }
+    let rounds = g.below(3) + 1;
+    var k: u64 = 0;
+    while k < rounds : (k += 1) {
+        let how = g.below(6);
+        let n = out.len() as u64;
+        if how == 0 and n > 0 {
+            let at = g.below(n) as usize;
+            let one: u8 = 1;
+            out.items_mut()[at] = out.items()[at] ^ (one << (g.below(8) as u32));
+        } else if how == 1 and n > 0 {
+            let at = g.below(n) as usize;
+            out.items_mut()[at] = (g.next_u64() & 0xff) as u8;
+        } else if how == 2 {
+            let keep = g.below(n + 1);
+            while out.len() as u64 > keep {
+                _ = out.pop();
+            }
+        } else if how == 3 {
+            let extra = g.below(8) + 1;
+            let at = g.below(n + 1) as usize;
+            var copy = alloc.List(u8).init(a);
+            var i: usize = 0;
+            while i <= out.len() : (i += 1) {
+                if i == at {
+                    var e: u64 = 0;
+                    while e < extra : (e += 1) {
+                        copy.push((g.next_u64() & 0xff) as u8);
+                    }
+                }
+                if i < out.len() {
+                    copy.push(out.items()[i]);
+                }
+            }
+            out = copy;
+        } else if how == 4 {
+            let half = out.len() / 2;
+            var i: usize = 0;
+            while i < half : (i += 1) {
+                out.push(out.items()[i]);
+            }
+        } else {
+            out.clear();
+            let len = g.below(200);
+            var e: u64 = 0;
+            while e < len : (e += 1) {
+                out.push((g.next_u64() & 0xff) as u8);
+            }
+        }
+    }
+    return out;
+}
+
+fn requests(i: u64) -> str {
+    if i == 0 {
+        return "GET /index.html?q=1 HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n";
+    }
+    if i == 1 {
+        return "POST /upload HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;x=y\r\nhello\r\n3\r\nabc\r\n0\r\nT: v\r\n\r\n";
+    }
+    if i == 2 {
+        return "PUT /x HTTP/1.0\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\nbody";
+    }
+    return "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok";
+}
+
+fn h1_case(g: &mut rand.Seeded, a: alloc.Allocator) {
+    let which = g.below(4);
+    let input = mangle(requests(which).bytes(), g: g, a);
+    let b = input.items();
+    var end: usize = 0;
+    match h1.head_end(b) {
+        some(e) => { end = e; }
+        none => { return; }
+    }
+    var req = http.Request.init(a);
+    match h1.parse_request(b, end: end, req: &mut req) {
+        ok(_) => {
+            _ = h1.keeps_alive(&req);
+            _ = req.path();
+            match h1.framing(&req.headers, request: true) {
+                ok(f) => {
+                    match f {
+                        .Chunked => {
+                            var chunks = h1.Chunks.init();
+                            var at = end;
+                            while at < b.len() and not chunks.done {
+                                var stop = at + (g.below(8) as usize) + 1;
+                                if stop > b.len() {
+                                    stop = b.len();
+                                }
+                                match chunks.feed(b[at..stop], body: &mut req.body, max: 1000) {
+                                    ok(n) => { at += n; }
+                                    err(_) => { return; }
+                                }
+                            }
+                        }
+                        .Length { n } => { _ = n; }
+                        .Empty => { }
+                        .UntilClose => { }
+                    }
+                }
+                err(_) => { }
+            }
+        }
+        err(_) => { }
+    }
+    var resp = http.Response.init(a);
+    match h1.parse_response(b, end: end, resp: &mut resp) {
+        ok(_) => {
+            var out = alloc.List(u8).init(a);
+            h1.write_response(&resp, head_only: false, keep_alive: true, out: &mut out);
+        }
+        err(_) => { }
+    }
+}
+
+fn hex_block(text: str, a: alloc.Allocator) -> alloc.List(u8) {
+    let b = text.bytes();
+    var out = alloc.List(u8).init(a);
+    var i: usize = 0;
+    while i + 1 < b.len() : (i += 2) {
+        var v: u8 = 0;
+        var k: usize = 0;
+        while k < 2 : (k += 1) {
+            let c = b[i + k];
+            var d: u8 = c - '0';
+            if c >= 'a' {
+                d = c - 'a' + 10;
+            }
+            v = v * 16 + d;
+        }
+        out.push(v);
+    }
+    return out;
+}
+
+fn hpack_case(g: &mut rand.Seeded, a: alloc.Allocator) {
+    // RFC 7541 C.4.1 to C.4.3 and C.6.1, Huffman and the table in use.
+    var d = hpack.Decoder.init(256, a);
+    var k: u64 = 0;
+    while k < 4 : (k += 1) {
+        var text = "828684418cf1e3c2e5f23a6ba0ab90f4ff";
+        if k == 1 {
+            text = "828684be5886a8eb10649cbf";
+        } else if k == 2 {
+            text = "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf";
+        } else if k == 3 {
+            text = "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3";
+        }
+        let block = hex_block(text, a);
+        var input = alloc.List(u8).init(a);
+        if g.chance(50) {
+            input = mangle(block.items(), g: g, a);
+        } else {
+            for x in block.items() {
+                input.push(x.*);
+            }
+        }
+        var h = http.Headers.init(a);
+        match d.decode(input.items(), out: &mut h) {
+            ok(_) => { }
+            err(_) => { }
+        }
+    }
+}
+
+fn frame(out: &mut alloc.List(u8), kind: u8, flags: u8, stream: u32, payload: []u8) {
+    let n = payload.len();
+    out.push(((n >> 16) & 0xff) as u8);
+    out.push(((n >> 8) & 0xff) as u8);
+    out.push((n & 0xff) as u8);
+    out.push(kind);
+    out.push(flags);
+    out.push((stream >> 24) as u8);
+    out.push(((stream >> 16) & 0xff) as u8);
+    out.push(((stream >> 8) & 0xff) as u8);
+    out.push((stream & 0xff) as u8);
+    for x in payload {
+        out.push(x.*);
+    }
+}
+
+fn h2_case(g: &mut rand.Seeded, a: alloc.Allocator) {
+    var input = alloc.List(u8).init(a);
+    for c in h2.PREFACE.bytes() {
+        input.push(c.*);
+    }
+    let settings: [12]u8 = [0, 4, 0, 0, 0x40, 0, 0, 5, 0, 0, 0x40, 0];
+    frame(&mut input, kind: 4, flags: 0, stream: 0, payload: settings[0..12]);
+    var get = alloc.List(u8).init(a);
+    hpack.encode(&mut get, name: ":method", value: "GET");
+    hpack.encode(&mut get, name: ":scheme", value: "https");
+    hpack.encode(&mut get, name: ":path", value: "/a");
+    hpack.encode(&mut get, name: "user-agent", value: "fuzz");
+    var post = alloc.List(u8).init(a);
+    hpack.encode(&mut post, name: ":method", value: "POST");
+    hpack.encode(&mut post, name: ":scheme", value: "https");
+    hpack.encode(&mut post, name: ":path", value: "/echo");
+    frame(&mut input, kind: 1, flags: 0, stream: 1, payload: post.items()[0..3]);
+    frame(&mut input, kind: 9, flags: 4, stream: 1, payload: post.items()[3..post.len()]);
+    frame(&mut input, kind: 1, flags: 0x25, stream: 3, payload: get.items());
+    let padded: [6]u8 = [2, 'h', 'i', '!', 0, 0];
+    frame(&mut input, kind: 0, flags: 0x8, stream: 1, payload: padded[0..6]);
+    frame(&mut input, kind: 6, flags: 0, stream: 0, payload: "12345678".bytes());
+    let inc: [4]u8 = [0, 0, 1, 0];
+    frame(&mut input, kind: 8, flags: 0, stream: 0, payload: inc[0..4]);
+    frame(&mut input, kind: 8, flags: 0, stream: 1, payload: inc[0..4]);
+    frame(&mut input, kind: 0, flags: 1, stream: 1, payload: "x".bytes());
+    let code: [4]u8 = [0, 0, 0, 8];
+    frame(&mut input, kind: 3, flags: 0, stream: 3, payload: code[0..4]);
+    let away: [8]u8 = [0, 0, 0, 3, 0, 0, 0, 0];
+    frame(&mut input, kind: 7, flags: 0, stream: 0, payload: away[0..8]);
+    let bytes = mangle(input.items(), g: g, a);
+    let b = bytes.items();
+    var c = h2.Connection.init(a);
+    var at: usize = 0;
+    while at < b.len() {
+        var stop = at + (g.below(64) as usize) + 1;
+        if stop > b.len() {
+            stop = b.len();
+        }
+        match c.feed(b[at..stop]) {
+            ok(_) => { }
+            err(_) => { return; }
+        }
+        at = stop;
+        while true {
+            var id: u32 = 0;
+            match c.next_request() {
+                some(x) => { id = x; }
+                none => { break; }
+            }
+            var resp = http.Response.init(a);
+            resp.write_bytes(c.request(id).body.items());
+            var i: u64 = 0;
+            let extra = g.below(70000);
+            while i < extra : (i += 1) {
+                resp.body.push('z');
+            }
+            c.respond(id, resp: &resp, head_only: g.chance(10));
+        }
+        c.sent();
+    }
+    _ = c.finished();
+}
+
+fn number(text: str) -> u64 {
+    var v: u64 = 0;
+    for c in text.bytes() {
+        v = v * 10 + (c.* - '0') as u64;
+    }
+    return v;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() < 2 {
+        sys.stderr.write("usage: http_fuzz <seconds> [seed]\n");
+        sys.proc.exit(2);
+    }
+    let seconds = number(sys.args.get(1));
+    var seed = sys.rand.next_u64() % 1000000000;
+    if sys.args.len() > 2 {
+        seed = number(sys.args.get(2));
+    }
+    sys.stdout.write("seed ");
+    sys.stdout.write_u64(seed);
+    sys.stdout.write("\n");
+    sys.stdout.flush();
+    var g = rand.Seeded.init(seed);
+    let start = sys.clock.monotonic_ns();
+    var cases: u64 = 0;
+    while sys.clock.monotonic_ns() - start < seconds * 1000000000 : (cases += 1) {
+        let which = g.below(3);
+        region r {
+            if which == 0 {
+                h1_case(&mut g, r);
+            } else if which == 1 {
+                hpack_case(&mut g, r);
+            } else {
+                h2_case(&mut g, r);
+            }
+        }
+    }
+    sys.stdout.write_u64(cases);
+    sys.stdout.write(" cases, no panic\n");
+}

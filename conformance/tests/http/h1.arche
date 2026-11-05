@@ -1,0 +1,206 @@
+// test: run
+// spec: http (RFC 9112)
+// stage0: skip
+// stdout: POST /upload?x=1 HTTP/11 host=example.com fields=3
+// stdout: framing: chunked
+// stdout: body: hello, world! (done, 3 bytes left)
+// stdout: keep-alive: yes
+// stdout: no host: Malformed
+// stdout: folded line: Malformed
+// stdout: space before colon: Malformed
+// stdout: HTTP/2.0 line: Unsupported
+// stdout: length and chunked: Malformed
+// stdout: two lengths: Malformed
+// stdout: gzip coding: Unsupported
+// stdout: same length twice: length 5
+// stdout: bad chunk size: Malformed
+// stdout: HTTP/1.0 keep-alive: no
+// stdout: incomplete head: none
+// stdout: HTTP/1.1 201 Created|content-type: text/plain|content-length: 2||ok
+// stdout: HTTP/1.1 200 OK|transfer-encoding: chunked|connection: close||3|abc|0||
+// stdout: response: 404 body framing length 9
+import std;
+import alloc;
+import http;
+import http.h1;
+
+fn error_name(e: http.HttpError) -> str {
+    if e == http.HttpError.Malformed { return "Malformed"; }
+    if e == http.HttpError.Unsupported { return "Unsupported"; }
+    if e == http.HttpError.TooLarge { return "TooLarge"; }
+    return "other";
+}
+
+/// Parses a head and its framing; prints the error, if there is one.
+fn attempt(sys: &mut std.System, label: str, text: str) {
+    sys.stdout.write(label);
+    sys.stdout.write(": ");
+    let b = text.bytes();
+    var end: usize = 0;
+    match h1.head_end(b) {
+        some(e) => { end = e; }
+        none => {
+            sys.stdout.write("none\n");
+            return;
+        }
+    }
+    var req = http.Request.init(sys.alloc);
+    match h1.parse_request(b, end: end, req: &mut req) {
+        ok(_) => { }
+        err(e) => {
+            sys.stdout.write(error_name(e));
+            sys.stdout.write("\n");
+            return;
+        }
+    }
+    match h1.framing(&req.headers, request: true) {
+        ok(f) => {
+            match f {
+                .Length { n } => {
+                    sys.stdout.write("length ");
+                    sys.stdout.write_u64(n as u64);
+                }
+                .Chunked => { sys.stdout.write("chunked"); }
+                .Empty => { sys.stdout.write("empty"); }
+                .UntilClose => { sys.stdout.write("until close"); }
+            }
+        }
+        err(e) => { sys.stdout.write(error_name(e)); }
+    }
+    sys.stdout.write("\n");
+}
+
+fn shown(b: []u8, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    for c in b {
+        if c.* == '\n' {
+            s.push_ascii('|');
+        } else if c.* != '\r' {
+            s.push_ascii(c.*);
+        }
+    }
+    return s;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let text = "\r\nPOST /upload?x=1 HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nX-Note:   spaced  \r\n\r\n5;ext=1\r\nhello\r\n8\r\n, world!\r\n0\r\nTrailer: t\r\n\r\nGET";
+    let b = text.bytes();
+    var end: usize = 0;
+    match h1.head_end(b) {
+        some(e) => { end = e; }
+        none => { }
+    }
+    var req = http.Request.init(a);
+    try h1.parse_request(b, end: end, req: &mut req);
+    sys.stdout.write(req.method.view());
+    sys.stdout.write(" ");
+    sys.stdout.write(req.target.view());
+    sys.stdout.write(" HTTP/");
+    sys.stdout.write_u64(req.version as u64);
+    sys.stdout.write(" host=");
+    sys.stdout.write(req.authority.view());
+    sys.stdout.write(" fields=");
+    sys.stdout.write_u64(req.headers.len() as u64);
+    sys.stdout.write("\n");
+    let f = try h1.framing(&req.headers, request: true);
+    match f {
+        .Chunked => { sys.stdout.write("framing: chunked\n"); }
+        .Length { n } => { _ = n; sys.stdout.write("framing: length\n"); }
+        .Empty => { sys.stdout.write("framing: empty\n"); }
+        .UntilClose => { sys.stdout.write("framing: until close\n"); }
+    }
+    // The chunked body, fed a few bytes at a time.
+    var chunks = h1.Chunks.init();
+    var at = end;
+    while not chunks.done {
+        var stop = at + 3;
+        if stop > b.len() {
+            stop = b.len();
+        }
+        at += try chunks.feed(b[at..stop], body: &mut req.body, max: 1000);
+    }
+    sys.stdout.write("body: ");
+    for c in req.body.items() {
+        sys.stdout.write_byte(c.*);
+    }
+    sys.stdout.write(" (done, ");
+    sys.stdout.write_u64((b.len() - at) as u64);
+    sys.stdout.write(" bytes left)\n");
+    sys.stdout.write("keep-alive: ");
+    if h1.keeps_alive(&req) {
+        sys.stdout.write("yes\n");
+    } else {
+        sys.stdout.write("no\n");
+    }
+
+    attempt(sys, label: "no host", text: "GET / HTTP/1.1\r\n\r\n");
+    attempt(sys, label: "folded line", text: "GET / HTTP/1.1\r\nHost: a\r\n b\r\n\r\n");
+    attempt(sys, label: "space before colon", text: "GET / HTTP/1.1\r\nHost : a\r\n\r\n");
+    attempt(sys, label: "HTTP/2.0 line", text: "GET / HTTP/1.2\r\nHost: a\r\n\r\n");
+    attempt(sys, label: "length and chunked", text: "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n");
+    attempt(sys, label: "two lengths", text: "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n");
+    attempt(sys, label: "gzip coding", text: "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n");
+    attempt(sys, label: "same length twice", text: "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n");
+    var bad = h1.Chunks.init();
+    var sink = alloc.List(u8).init(a);
+    sys.stdout.write("bad chunk size: ");
+    match bad.feed("zz\r\n".bytes(), body: &mut sink, max: 100) {
+        ok(_) => { sys.stdout.write("accepted\n"); }
+        err(e) => {
+            sys.stdout.write(error_name(e));
+            sys.stdout.write("\n");
+        }
+    }
+    let old = "GET / HTTP/1.0\r\n\r\n".bytes();
+    var r10 = http.Request.init(a);
+    try h1.parse_request(old, end: old.len(), req: &mut r10);
+    sys.stdout.write("HTTP/1.0 keep-alive: ");
+    if h1.keeps_alive(&r10) {
+        sys.stdout.write("yes\n");
+    } else {
+        sys.stdout.write("no\n");
+    }
+    attempt(sys, label: "incomplete head", text: "GET / HTTP/1.1\r\nHost: a\r\n");
+
+    // Writing responses.
+    var resp = http.Response.init(a);
+    resp.status = 201;
+    resp.headers.add(name: "Content-Type", value: "text/plain");
+    resp.headers.add(name: "Content-Length", value: "999");
+    resp.write("ok");
+    var out = alloc.List(u8).init(a);
+    h1.write_response(&resp, head_only: false, keep_alive: true, out: &mut out);
+    sys.stdout.write(shown(out.items(), a).view());
+    sys.stdout.write("\n");
+    var chunked = http.Response.init(a);
+    chunked.chunked = true;
+    chunked.write("abc");
+    out.clear();
+    h1.write_response(&chunked, head_only: false, keep_alive: false, out: &mut out);
+    sys.stdout.write(shown(out.items(), a).view());
+    sys.stdout.write("\n");
+
+    // A response read back.
+    let raw = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found".bytes();
+    var back = http.Response.init(a);
+    var rend: usize = 0;
+    match h1.head_end(raw) {
+        some(e) => { rend = e; }
+        none => { }
+    }
+    try h1.parse_response(raw, end: rend, resp: &mut back);
+    sys.stdout.write("response: ");
+    sys.stdout.write_u64(back.status as u64);
+    sys.stdout.write(" body framing ");
+    match try h1.framing(&back.headers, request: false) {
+        .Length { n } => {
+            sys.stdout.write("length ");
+            sys.stdout.write_u64(n as u64);
+        }
+        .Chunked => { sys.stdout.write("chunked"); }
+        .Empty => { sys.stdout.write("empty"); }
+        .UntilClose => { sys.stdout.write("until close"); }
+    }
+    sys.stdout.write("\n");
+}

@@ -1,0 +1,33 @@
+// test: run
+// spec: arche/9
+// stage0: skip
+// stdout: 4 bytes echoed
+import std;
+import std.task;
+
+/// A server task and a client task in one program: before the netpoller
+/// the server's accept blocked the client forever.
+fn main(sys: &mut std.System) -> !void {
+    var listener = try sys.net.listen(std.Address { ip: [127, 0, 0, 1], port: 0 });
+    let port = listener.port();
+    let net = &sys.net;
+    var got: u32 = 0;
+    try task.scope(&sys.proc, fn [&listener, net, port, &mut got](s: &mut task.Scope) -> !void {
+        s.spawn(fn [&listener]() -> !void {
+            var c = try listener.accept();
+            var buf: [16]u8 = [0; 16];
+            let n = try c.read(buf[0..16]);
+            try c.write(buf[0..n]);
+            c.close();
+        });
+        var k = try net.connect(std.Address { ip: [127, 0, 0, 1], port: port });
+        try k.write("ping".bytes());
+        var buf: [16]u8 = [0; 16];
+        let n = try k.read(buf[0..16]);
+        got = n as u32;
+        k.close();
+    });
+    listener.close();
+    sys.stdout.write_u64(got as u64);
+    sys.stdout.write(" bytes echoed\n");
+}

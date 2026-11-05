@@ -1,0 +1,250 @@
+// test: run
+// spec: http (RFC 9113)
+// stage0: skip
+// stdout: SETTINGS flags 0 stream 0 length 18
+// stdout: SETTINGS flags 1 stream 0 length 0
+// stdout: PING flags 1 stream 0 length 8
+// stdout: requests: 1 3
+// stdout: HEADERS flags 4 stream 1 length 6 | :status: 200 | content-length: 14
+// stdout: DATA flags 1 stream 1 length 14 | POST /echo:hi!
+// stdout: HEADERS flags 4 stream 3 length 5 | :status: 200 | content-length: 6
+// stdout: DATA flags 1 stream 3 length 6 | GET /a
+// stdout: big: 65515 bytes before a window update, then the rest
+// stdout: stream 0 HEADERS: GOAWAY PROTOCOL_ERROR
+// stdout: bad preface: GOAWAY PROTOCOL_ERROR
+import std;
+import alloc;
+import http;
+import http.h2;
+import http.hpack;
+
+fn frame(out: &mut alloc.List(u8), kind: u8, flags: u8, stream: u32, payload: []u8) {
+    let n = payload.len();
+    out.push(((n >> 16) & 0xff) as u8);
+    out.push(((n >> 8) & 0xff) as u8);
+    out.push((n & 0xff) as u8);
+    out.push(kind);
+    out.push(flags);
+    out.push((stream >> 24) as u8);
+    out.push(((stream >> 16) & 0xff) as u8);
+    out.push(((stream >> 8) & 0xff) as u8);
+    out.push((stream & 0xff) as u8);
+    for x in payload {
+        out.push(x.*);
+    }
+}
+
+fn kind_name(k: u8) -> str {
+    if k == 0 { return "DATA"; }
+    if k == 1 { return "HEADERS"; }
+    if k == 3 { return "RST_STREAM"; }
+    if k == 4 { return "SETTINGS"; }
+    if k == 6 { return "PING"; }
+    if k == 7 { return "GOAWAY"; }
+    if k == 8 { return "WINDOW_UPDATE"; }
+    return "other";
+}
+
+/// Prints the server's frames, decoding header blocks and showing data.
+fn show(sys: &mut std.System, b: []u8, d: &mut hpack.Decoder) -> !void {
+    var at: usize = 0;
+    while at + 9 <= b.len() {
+        let n = ((b[at] as usize) << 16) | ((b[at + 1] as usize) << 8) | b[at + 2] as usize;
+        let kind = b[at + 3];
+        sys.stdout.write(kind_name(kind));
+        sys.stdout.write(" flags ");
+        sys.stdout.write_u64(b[at + 4] as u64);
+        sys.stdout.write(" stream ");
+        sys.stdout.write_u64(b[at + 8] as u64);
+        sys.stdout.write(" length ");
+        sys.stdout.write_u64(n as u64);
+        let p = b[at + 9..at + 9 + n];
+        if kind == 1 {
+            var h = http.Headers.init(sys.alloc);
+            try d.decode(p, out: &mut h);
+            var i: usize = 0;
+            while i < h.len() : (i += 1) {
+                sys.stdout.write(" | ");
+                sys.stdout.write(h.name(i));
+                sys.stdout.write(": ");
+                sys.stdout.write(h.value(i));
+            }
+        } else if kind == 0 {
+            sys.stdout.write(" | ");
+            for c in p {
+                sys.stdout.write_byte(c.*);
+            }
+        }
+        sys.stdout.write("\n");
+        at += 9 + n;
+    }
+}
+
+fn answer(c: &mut h2.Connection, a: alloc.Allocator) {
+    while true {
+        var id: u32 = 0;
+        match c.next_request() {
+            some(x) => { id = x; }
+            none => { return; }
+        }
+        var resp = http.Response.init(a);
+        let req = c.request(id);
+        resp.write(req.method.view());
+        resp.write(" ");
+        resp.write(req.target.view());
+        if req.body.len() > 0 {
+            resp.write(":");
+            resp.write_bytes(req.body.items());
+        }
+        c.respond(id, resp: &resp, head_only: false);
+    }
+}
+
+/// Feeds bad bytes to a new connection and prints how it went away.
+fn refused(sys: &mut std.System, label: str, input: []u8) {
+    var c = h2.Connection.init(sys.alloc);
+    c.sent();
+    sys.stdout.write(label);
+    sys.stdout.write(": ");
+    match c.feed(input) {
+        ok(_) => { sys.stdout.write("accepted\n"); }
+        err(_) => {
+            let o = c.output();
+            if o.len() == 17 and o[3] == 7 and o[16] == 1 {
+                sys.stdout.write("GOAWAY PROTOCOL_ERROR\n");
+            } else {
+                sys.stdout.write("another ending\n");
+            }
+        }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    var input = alloc.List(u8).init(a);
+    for c in h2.PREFACE.bytes() {
+        input.push(c.*);
+    }
+    frame(&mut input, kind: 4, flags: 0, stream: 0, payload: "".bytes());
+    var get = alloc.List(u8).init(a);
+    hpack.encode(&mut get, name: ":method", value: "GET");
+    hpack.encode(&mut get, name: ":scheme", value: "https");
+    hpack.encode(&mut get, name: ":path", value: "/a");
+    hpack.encode(&mut get, name: ":authority", value: "example.com");
+    var post = alloc.List(u8).init(a);
+    hpack.encode(&mut post, name: ":method", value: "POST");
+    hpack.encode(&mut post, name: ":scheme", value: "https");
+    hpack.encode(&mut post, name: ":path", value: "/echo");
+    // Stream 1's fields come in two frames, stream 3 opens and ends in
+    // between its fields and its data: the streams interleave.
+    frame(&mut input, kind: 1, flags: 0, stream: 1, payload: post.items()[0..2]);
+    frame(&mut input, kind: 9, flags: 4, stream: 1, payload: post.items()[2..post.len()]);
+    frame(&mut input, kind: 1, flags: 5, stream: 3, payload: get.items());
+    frame(&mut input, kind: 0, flags: 0, stream: 1, payload: "hi".bytes());
+    frame(&mut input, kind: 6, flags: 0, stream: 0, payload: "12345678".bytes());
+    frame(&mut input, kind: 0, flags: 1, stream: 1, payload: "!".bytes());
+
+    var c = h2.Connection.init(a);
+    var d = hpack.Decoder.init(4096, a);
+    try c.feed(input.items());
+    // The preface's SETTINGS, the ACK and the PING's answer; the window
+    // updates are left out of what is shown.
+    var shown = alloc.List(u8).init(a);
+    let o = c.output();
+    var at: usize = 0;
+    while at + 9 <= o.len() {
+        let n = ((o[at] as usize) << 16) | ((o[at + 1] as usize) << 8) | o[at + 2] as usize;
+        if o[at + 3] != 8 {
+            for x in o[at..at + 9 + n] {
+                shown.push(x.*);
+            }
+        }
+        at += 9 + n;
+    }
+    try show(sys, b: shown.items(), d: &mut d);
+    c.sent();
+    // Requests come out in stream order.
+    var first: u32 = 0;
+    var second: u32 = 0;
+    match c.next_request() {
+        some(x) => { first = x; }
+        none => { }
+    }
+    match c.next_request() {
+        some(x) => { second = x; }
+        none => { }
+    }
+    sys.stdout.write("requests: ");
+    sys.stdout.write_u64(first as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(second as u64);
+    sys.stdout.write("\n");
+    var r1 = http.Response.init(a);
+    r1.write("POST /echo:");
+    r1.write_bytes(c.request(first).body.items());
+    c.respond(first, resp: &r1, head_only: false);
+    var r3 = http.Response.init(a);
+    r3.write("GET /a");
+    c.respond(second, resp: &r3, head_only: false);
+    try show(sys, b: c.output(), d: &mut d);
+    c.sent();
+
+    // A body larger than the client's window waits for WINDOW_UPDATE.
+    var more = alloc.List(u8).init(a);
+    var get2 = alloc.List(u8).init(a);
+    hpack.encode(&mut get2, name: ":method", value: "GET");
+    hpack.encode(&mut get2, name: ":scheme", value: "https");
+    hpack.encode(&mut get2, name: ":path", value: "/big");
+    frame(&mut more, kind: 1, flags: 5, stream: 5, payload: get2.items());
+    try c.feed(more.items());
+    c.sent();
+    match c.next_request() {
+        some(id) => {
+            var big = http.Response.init(a);
+            var i: u32 = 0;
+            while i < 100000 : (i += 1) {
+                big.body.push('x');
+            }
+            c.respond(id, resp: &big, head_only: false);
+        }
+        none => { }
+    }
+    let before = data_bytes(c.output());
+    c.sent();
+    more.clear();
+    let inc: [4]u8 = [0, 1, 0, 0];
+    frame(&mut more, kind: 8, flags: 0, stream: 0, payload: inc[0..4]);
+    frame(&mut more, kind: 8, flags: 0, stream: 5, payload: inc[0..4]);
+    try c.feed(more.items());
+    let after = data_bytes(c.output());
+    // The connection's window, 65535, less the 20 bytes sent above.
+    sys.stdout.write("big: ");
+    sys.stdout.write_u64(before as u64);
+    if before + after == 100000 {
+        sys.stdout.write(" bytes before a window update, then the rest\n");
+    } else {
+        sys.stdout.write(" bytes before, and not the rest after\n");
+    }
+
+    var bad = alloc.List(u8).init(a);
+    for x in h2.PREFACE.bytes() {
+        bad.push(x.*);
+    }
+    frame(&mut bad, kind: 1, flags: 5, stream: 0, payload: get.items());
+    refused(sys, label: "stream 0 HEADERS", input: bad.items());
+    refused(sys, label: "bad preface", input: "GET / HTTP/1.1\r\n\r\n".bytes());
+}
+
+/// How many bytes of DATA payload the frames in b carry.
+fn data_bytes(b: []u8) -> usize {
+    var total: usize = 0;
+    var at: usize = 0;
+    while at + 9 <= b.len() {
+        let n = ((b[at] as usize) << 16) | ((b[at + 1] as usize) << 8) | b[at + 2] as usize;
+        if b[at + 3] == 0 {
+            total += n;
+        }
+        at += 9 + n;
+    }
+    return total;
+}
