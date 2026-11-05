@@ -39,6 +39,7 @@ check: $(BUILD)/arche
 	sh ./tests/run.sh $(BUILD)/arche
 	sh ./explain-check.sh $(BUILD)/arche
 	sh ./doctest.sh $(BUILD)/arche
+	python3 -I ../editors/check-grammar.py ..
 
 clean:
 	rm -rf $(BUILD)

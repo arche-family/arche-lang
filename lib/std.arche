@@ -278,6 +278,15 @@ pub type Fs = struct {
     }
 
     pub fn make_dir(self: &Fs, path: str) -> FsError!void {
+        try self.make_dir_with(path, mode: 0x1ED);
+    }
+
+    /// As make_dir, but only this user can enter it (0700).
+    pub fn make_private_dir(self: &Fs, path: str) -> FsError!void {
+        try self.make_dir_with(path, mode: 0x1C0);
+    }
+
+    fn make_dir_with(self: &Fs, path: str, mode: i64) -> FsError!void {
         var buf: [4096]u8 = [0; 4096];
         if not linux.c_path(path, buf[0..4096]) {
             return FsError.NotFound;
@@ -285,7 +294,7 @@ pub type Fs = struct {
         var r: i64 = 0;
         unsafe {
             // SAFETY: the path is NUL-terminated in buf.
-            r = linux.syscall(linux.MKDIRAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x1ED, 0, 0, 0]);
+            r = linux.syscall(linux.MKDIRAT, [self.dir, linux.arg(u8, &buf[0] as *u8), mode, 0, 0, 0]);
         }
         if linux.errno(r) != 0 {
             return errno_error(linux.errno(r));

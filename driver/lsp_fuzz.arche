@@ -1,0 +1,265 @@
+/// Fuzzes arche-lsp's message parser (lsp_proto.arche; docs/sprints.md S36):
+/// sessions made from valid messages by flipping bits, changing bytes,
+/// cutting, inserting, doubling or replacing with noise, fed in pieces of
+/// random size, then read as the server reads them; and positions and URIs
+/// from the same kind of bytes. Every input must give an error or a result; a
+/// panic is a bug.
+///
+/// usage: lsp_fuzz <seconds> [seed]. The seed printed first repeats a run.
+import alloc;
+import core.mem;
+import core.rand;
+import core.utf8;
+import lsp_proto as proto;
+import std;
+
+fn mangle(data: []u8, g: &mut rand.Seeded, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    for x in data {
+        out.push(x.*);
+    }
+    let rounds = g.below(3) + 1;
+    var k: u64 = 0;
+    while k < rounds : (k += 1) {
+        let how = g.below(6);
+        let n = out.len() as u64;
+        if how == 0 and n > 0 {
+            let at = g.below(n) as usize;
+            let one: u8 = 1;
+            out.items_mut()[at] = out.items()[at] ^ (one << (g.below(8) as u32));
+        } else if how == 1 and n > 0 {
+            let at = g.below(n) as usize;
+            out.items_mut()[at] = (g.next_u64() & 0xff) as u8;
+        } else if how == 2 {
+            let keep = g.below(n + 1);
+            while out.len() as u64 > keep {
+                _ = out.pop();
+            }
+        } else if how == 3 {
+            let extra = g.below(8) + 1;
+            let at = g.below(n + 1) as usize;
+            var copy = alloc.List(u8).init(a);
+            var i: usize = 0;
+            while i <= out.len() : (i += 1) {
+                if i == at {
+                    var e: u64 = 0;
+                    while e < extra : (e += 1) {
+                        copy.push((g.next_u64() & 0xff) as u8);
+                    }
+                }
+                if i < out.len() {
+                    copy.push(out.items()[i]);
+                }
+            }
+            out = copy;
+        } else if how == 4 {
+            let half = out.len() / 2;
+            var i: usize = 0;
+            while i < half : (i += 1) {
+                out.push(out.items()[i]);
+            }
+        } else {
+            out.clear();
+            let len = g.below(200);
+            var e: u64 = 0;
+            while e < len : (e += 1) {
+                out.push((g.next_u64() & 0xff) as u8);
+            }
+        }
+    }
+    return out;
+}
+
+fn message(i: u64) -> str {
+    if i == 0 {
+        return "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"processId\":12,\"rootUri\":null,\"capabilities\":{\"textDocument\":{\"hover\":{\"contentFormat\":[\"markdown\"]}}}}}";
+    }
+    if i == 1 {
+        return "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///a/b%20c/d.arche\",\"languageId\":\"arche\",\"version\":3,\"text\":\"fn main() {\\n\\t\\\"\\u00f3\\ud835\\udc31\\\"\\n}\\n\"}}}";
+    }
+    if i == 2 {
+        return "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///a/d.arche\",\"version\":4},\"contentChanges\":[{\"text\":\"one\"},{\"text\":\"two\"}]}}";
+    }
+    if i == 3 {
+        return "{\"jsonrpc\":\"2.0\",\"id\":\"seven\",\"method\":\"textDocument/references\",\"params\":{\"textDocument\":{\"uri\":\"file:///a/d.arche\"},\"position\":{\"line\":4,\"character\":10},\"context\":{\"includeDeclaration\":false}}}";
+    }
+    if i == 4 {
+        return "[{\"file\":\"/a/d.arche\",\"line\":1,\"column\":2,\"severity\":\"error\",\"code\":\"E0301\",\"message\":\"no\",\"fix\":{\"line\":1,\"column\":2,\"end_line\":1,\"end_column\":3,\"replacement\":\"x\"}},{\"fix\":null}]";
+    }
+    return "{\"jsonrpc\":\"2.0\",\"id\":-1.5e3,\"method\":\"shutdown\",\"params\":[[],{},null,true,false,[[1,[2,[3]]]]]}";
+}
+
+fn read_body(body: []u8, a: alloc.Allocator) {
+    match proto.flatten(body, a) {
+        some(f) => {
+            _ = proto.raw_id(&f, a);
+            _ = f.text("method");
+            _ = f.has("params");
+            _ = f.number("params.position.line");
+            _ = f.number("params.textDocument.version");
+            _ = f.boolean("params.context.includeDeclaration", or_else: true);
+            let changes = f.count("params.contentChanges");
+            // A count is what the array has.
+            var key = alloc.String.init(a);
+            key.push_str("params.contentChanges.");
+            proto.push_number(&mut key, n: changes as u64);
+            assert(not f.has(key.view()));
+            _ = f.count("");
+            _ = f.text("0.message");
+            let uri = f.text("params.textDocument.uri");
+            match proto.uri_path(uri.view(), a) {
+                some(p) => { _ = proto.path_uri(p.view(), a); }
+                none => { }
+            }
+        }
+        none => { }
+    }
+}
+
+/// A session's bytes, in pieces, read as the server's loop reads them.
+fn frames_case(g: &mut rand.Seeded, a: alloc.Allocator) {
+    var wire = alloc.List(u8).init(a);
+    let count = g.below(4) + 1;
+    var m: u64 = 0;
+    while m < count : (m += 1) {
+        let body = mangle(message(g.below(6)).bytes(), g, a);
+        var head = alloc.String.init(a);
+        head.push_str("Content-Length: ");
+        proto.push_number(&mut head, n: body.len() as u64);
+        head.push_str("\r\n\r\n");
+        var frame = alloc.List(u8).init(a);
+        for c in head.view().bytes() {
+            frame.push(c.*);
+        }
+        for c in body.items() {
+            frame.push(c.*);
+        }
+        // Mostly sound frames, so that bodies are reached; sometimes not.
+        if g.below(8) == 0 {
+            frame = mangle(frame.items(), g, a);
+        }
+        for c in frame.items() {
+            wire.push(c.*);
+        }
+    }
+    var input = alloc.List(u8).init(a);
+    var at: usize = 0;
+    while at < wire.len() {
+        var piece = (g.below(256) + 1) as usize;
+        if piece > wire.len() - at {
+            piece = wire.len() - at;
+        }
+        var i: usize = 0;
+        while i < piece : (i += 1) {
+            input.push(wire.items()[at + i]);
+        }
+        at += piece;
+        var more = true;
+        while more {
+            match proto.next_frame(input.items()) {
+                .Ready { start, end } => {
+                    assert(start <= end and end <= input.len());
+                    read_body(input.items()[start..end], a);
+                    let before = input.len();
+                    proto.take_front(&mut input, n: end);
+                    assert(input.len() == before - end);
+                }
+                .Bad => { return; }
+                .Need => { more = false; }
+            }
+        }
+    }
+}
+
+fn positions_case(g: &mut rand.Seeded, a: alloc.Allocator) {
+    let text = mangle("fn f() {\r\n    let ó = \"𝐱\";\n\n}".bytes(), g, a);
+    let t = text.items();
+    let r = proto.line_range(t, line: g.below(8) as u32);
+    assert(r[0] <= r[1] and r[1] <= t.len());
+    let line = t[r[0]..r[1]];
+    let column = g.below(40) as u32;
+    let byte = proto.byte_column(line, utf16: column);
+    assert(byte <= line.len());
+    // A character of two units may stand across the column asked for.
+    assert(proto.utf16_column(line, byte: byte) <= column + 1);
+    let end = proto.word_end(line, byte: g.below(line.len() as u64 + 2) as usize);
+    assert(end <= line.len());
+}
+
+fn uris_case(g: &mut rand.Seeded, a: alloc.Allocator) {
+    let bytes = mangle("/home/ó/with space/a%20b/𝐱.arche".bytes(), g, a);
+    if not utf8.valid(bytes.items()) {
+        return;
+    }
+    var text = "";
+    unsafe {
+        // SAFETY: checked just now.
+        text = mem.str_from(bytes.items());
+    }
+    // Any text as a URI gives a path or nothing.
+    match proto.uri_path(text, a) {
+        some(_) => { }
+        none => { }
+    }
+    // An absolute path comes back from its URI as it was.
+    var path = alloc.String.init(a);
+    path.push_str("/");
+    path.push_str(text);
+    var has_nul = false;
+    for c in path.view().bytes() {
+        if c.* == 0 {
+            has_nul = true;
+        }
+    }
+    let uri = proto.path_uri(path.view(), a);
+    match proto.uri_path(uri.view(), a) {
+        some(back) => {
+            assert(not has_nul);
+            assert(back.view().eq(path.view()));
+        }
+        none => { assert(has_nul); }
+    }
+}
+
+fn number(text: str) -> u64 {
+    var n: u64 = 0;
+    for c in text.bytes() {
+        if c.* >= '0' and c.* <= '9' {
+            n = n * 10 + (c.* - '0') as u64;
+        }
+    }
+    return n;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() < 2 {
+        sys.stderr.write("usage: lsp_fuzz <seconds> [seed]\n");
+        sys.proc.exit(2);
+    }
+    let seconds = number(sys.args.get(1));
+    var seed = sys.rand.next_u64() % 1000000000;
+    if sys.args.len() > 2 {
+        seed = number(sys.args.get(2));
+    }
+    sys.stdout.write("seed ");
+    sys.stdout.write_u64(seed);
+    sys.stdout.write("\n");
+    sys.stdout.flush();
+    var g = rand.Seeded.init(seed);
+    let start = sys.clock.monotonic_ns();
+    var cases: u64 = 0;
+    while sys.clock.monotonic_ns() - start < seconds * 1000000000 : (cases += 1) {
+        let which = g.below(4);
+        region r {
+            if which < 2 {
+                frames_case(&mut g, r);
+            } else if which == 2 {
+                positions_case(&mut g, r);
+            } else {
+                uris_case(&mut g, r);
+            }
+        }
+    }
+    sys.stdout.write_u64(cases);
+    sys.stdout.write(" cases, no panic\n");
+}

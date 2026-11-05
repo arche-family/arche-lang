@@ -1,0 +1,1040 @@
+/// arche-lsp: the language server (docs/sprints.md S36), over stdin and
+/// stdout, for editors.
+///
+/// The compiler stays in Arche-0, which has no stdin and does its work in one
+/// arena it never frees, so it cannot be a long-lived server. This program
+/// is, and asks it: each request runs `arche check`, `query`, `complete` or
+/// `fmt` as a process of its own. An open file's text lives in a file of the
+/// server's temporary directory, handed to the compiler with --overlay, and
+/// not in this program's memory, which each message's work gets from a region
+/// of its own: however long the server runs and however much is typed, it
+/// does not grow.
+///
+/// Diagnostics wait until the client pauses: messages that are already there
+/// are handled first, so a burst of typing is checked once. The compiler is
+/// found through ARCHE, beside this program, in the repository's layout, or
+/// in PATH.
+import alloc;
+import lsp_proto as proto;
+import std;
+import std.json;
+import std.path;
+
+/// An open file.
+type Doc = struct {
+    open: bool,
+    uri: alloc.String,
+    path: alloc.String,
+    /// Where its text is.
+    text_path: alloc.String,
+    /// The package it belongs to: the nearest directory with a manifest.
+    package: alloc.String,
+    version: i64,
+    has_version: bool,
+    /// Its diagnostics are out of date.
+    pending: bool,
+}
+
+/// A file that is not open, for which errors were published.
+type Reported = struct {
+    path: alloc.String,
+    active: bool,
+}
+
+type Server = struct {
+    arche: alloc.String,
+    work: alloc.String,
+    docs: alloc.List(Doc),
+    reported: alloc.List(Reported),
+    initialized: bool,
+    shut_down: bool,
+    /// For what is kept for the whole session.
+    heap: alloc.Allocator,
+}
+
+fn copy(text: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str(text);
+    return s;
+}
+
+fn join(dir: str, name: str, a: alloc.Allocator) -> alloc.String {
+    var s = copy(dir, a);
+    if dir.len() > 0 and dir.bytes()[dir.len() - 1] != '/' {
+        s.push_str("/");
+    }
+    s.push_str(name);
+    return s;
+}
+
+// ---- Writing messages -----------------------------------------------------------------------
+
+fn send(out: &mut std.Output, body: str) {
+    out.write("Content-Length: ");
+    out.write_u64(body.len() as u64);
+    out.write("\r\n\r\n");
+    out.write(body);
+    out.flush();
+}
+
+/// A response whose result is the JSON text given.
+fn respond(out: &mut std.Output, id: str, result: str, a: alloc.Allocator) {
+    var m = copy("{\"jsonrpc\":\"2.0\",\"id\":", a);
+    m.push_str(id);
+    m.push_str(",\"result\":");
+    m.push_str(result);
+    m.push_str("}");
+    send(out, body: m.view());
+}
+
+fn respond_error(out: &mut std.Output, id: str, code: i64, message: str, a: alloc.Allocator) {
+    var m = copy("{\"jsonrpc\":\"2.0\",\"id\":", a);
+    if id.len() == 0 {
+        m.push_str("null");
+    } else {
+        m.push_str(id);
+    }
+    m.push_str(",\"error\":{\"code\":-");
+    proto.push_number(&mut m, n: (-code) as u64);
+    m.push_str(",\"message\":");
+    json.write_string(message, out: &mut m);
+    m.push_str("}}");
+    send(out, body: m.view());
+}
+
+fn push_position(m: &mut alloc.String, line: u32, character: u32) {
+    m.push_str("{\"line\":");
+    proto.push_number(m, n: line as u64);
+    m.push_str(",\"character\":");
+    proto.push_number(m, n: character as u64);
+    m.push_str("}");
+}
+
+/// The range from one (line, byte column) to another, both from 1 as the
+/// compiler counts, in the given text.
+fn push_range(m: &mut alloc.String, text: []u8, from_line: u32, from_col: u32, to_line: u32, to_col: u32) {
+    let fl = line_of(text, one_based: from_line);
+    let tl = line_of(text, one_based: to_line);
+    m.push_str("{\"start\":");
+    push_position(m, line: minus_one(from_line), character: proto.utf16_column(text[fl[0]..fl[1]], byte: minus_one(from_col) as usize));
+    m.push_str(",\"end\":");
+    push_position(m, line: minus_one(to_line), character: proto.utf16_column(text[tl[0]..tl[1]], byte: minus_one(to_col) as usize));
+    m.push_str("}");
+}
+
+fn minus_one(v: u32) -> u32 {
+    if v == 0 {
+        return 0;
+    }
+    return v - 1;
+}
+
+fn line_of(text: []u8, one_based: u32) -> [2]usize {
+    return proto.line_range(text, line: minus_one(one_based));
+}
+
+// ---- Files and the compiler ----------------------------------------------------------------
+
+/// A compiler run's answer.
+type Answer = struct {
+    /// It ended by itself, not by a crash or the time limit.
+    finished: bool,
+    status: u8,
+    stdout: alloc.String,
+}
+
+fn run_compiler(sys: &mut std.System, s: &Server, package: str, command: &alloc.List(alloc.String), a: alloc.Allocator) -> Answer {
+    var cmd = std.Command.init(a);
+    cmd.arg(s.arche.view(), a);
+    if package.len() > 0 {
+        cmd.arg("--package", a);
+        cmd.arg(package, a);
+        cmd.arg("--no-main", a);
+    }
+    for d in s.docs.items() {
+        if d.open {
+            cmd.arg("--overlay", a);
+            cmd.arg(d.path.view(), a);
+            cmd.arg(d.text_path.view(), a);
+        }
+    }
+    for w in command.items() {
+        cmd.arg(w.view(), a);
+    }
+    let out_path = join(dir: s.work.view(), name: "out", a);
+    let err_path = join(dir: s.work.view(), name: "err", a);
+    cmd.stdout_path.push_str(out_path.view());
+    cmd.stderr_path.push_str(err_path.view());
+    cmd.timeout_ms = 30000;
+    var answer = Answer { finished: false, status: 0, stdout: alloc.String.init(a) };
+    match sys.proc.spawn(&cmd, env: &sys.env, clock: &sys.clock, a) {
+        ok(ending) => {
+            match ending {
+                .Exited { status } => {
+                    // 0 or 1 are its answers; 101 is a panic, 126 and 127 a
+                    // program that did not start.
+                    answer.finished = status == 0 or status == 1;
+                    answer.status = status;
+                }
+                .Signaled { signal } => { _ = signal; }
+                .TimedOut => { }
+            }
+        }
+        err(_) => { }
+    }
+    match sys.fs.read_file(out_path.view(), a) {
+        ok(t) => { answer.stdout = t; }
+        err(_) => { }
+    }
+    if not answer.finished {
+        // The compiler itself failed: the editor's log should say so.
+        sys.stderr.write("arche-lsp: the compiler did not finish: ");
+        sys.stderr.write(s.arche.view());
+        sys.stderr.write("\n");
+        match sys.fs.read_file(err_path.view(), a) {
+            ok(t) => { sys.stderr.write(t.view()); }
+            err(_) => { }
+        }
+        sys.stderr.flush();
+    }
+    return answer;
+}
+
+/// A command's first words.
+fn words(first: str, second: str, a: alloc.Allocator) -> alloc.List(alloc.String) {
+    var l = alloc.List(alloc.String).init(a);
+    l.push(copy(first, a));
+    if second.len() > 0 {
+        l.push(copy(second, a));
+    }
+    return l;
+}
+
+/// The nearest directory above the file with a manifest; its own if none.
+fn package_of(fs: &std.Fs, file: str, a: alloc.Allocator) -> alloc.String {
+    let own = path.parent(file);
+    var dir = copy(own, a);
+    while true {
+        if fs.exists(join(dir: dir.view(), name: "package.arche", a).view()) {
+            return dir;
+        }
+        let up = copy(path.parent(dir.view()), a);
+        if up.len() == 0 or up.view().eq(dir.view()) {
+            return copy(own, a);
+        }
+        dir = up;
+    }
+    return copy(own, a);
+}
+
+fn find_doc(s: &Server, uri: str) -> ?usize {
+    var i: usize = 0;
+    while i < s.docs.len() : (i += 1) {
+        if s.docs.items()[i].open and s.docs.items()[i].uri.view().eq(uri) {
+            return i;
+        }
+    }
+    return none;
+}
+
+fn find_doc_by_path(s: &Server, file: str) -> ?usize {
+    var i: usize = 0;
+    while i < s.docs.len() : (i += 1) {
+        if s.docs.items()[i].open and s.docs.items()[i].path.view().eq(file) {
+            return i;
+        }
+    }
+    return none;
+}
+
+/// A file's URI: an open one's as the client spelled it, since the client
+/// may encode a name differently and goes by its own spelling.
+fn uri_of_file(s: &Server, file: str, a: alloc.Allocator) -> alloc.String {
+    match find_doc_by_path(s, file: file) {
+        some(i) => { return copy(s.docs.items()[i].uri.view(), a); }
+        none => { return proto.path_uri(file, a); }
+    }
+}
+
+fn same_bytes(x: []u8, y: []u8) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.len() : (i += 1) {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The text of a file: an open one's unsaved text, or what is on the disk.
+fn text_of_file(sys: &mut std.System, s: &Server, file: str, a: alloc.Allocator) -> alloc.List(u8) {
+    var source = copy(file, a);
+    match find_doc_by_path(s, file: file) {
+        some(i) => { source = copy(s.docs.items()[i].text_path.view(), a); }
+        none => { }
+    }
+    match sys.fs.read_bytes(source.view(), a) {
+        ok(b) => { return b; }
+        err(_) => { return alloc.List(u8).init(a); }
+    }
+}
+
+/// The compiler's name for a position in the document: line:column in bytes,
+/// both from 1. An LSP position may be past the end of its line, or of the
+/// file: it then means the end.
+fn place(text: []u8, line: u32, character: u32, a: alloc.Allocator) -> alloc.String {
+    let r = proto.line_range(text, line: line);
+    var out = alloc.String.init(a);
+    proto.push_number(&mut out, n: line as u64 + 1);
+    out.push_str(":");
+    proto.push_number(&mut out, n: proto.byte_column(text[r[0]..r[1]], utf16: character) as u64 + 1);
+    return out;
+}
+
+// ---- Diagnostics ----------------------------------------------------------------------------
+
+/// Publishes one file's diagnostics, the items of the check whose file it is.
+fn publish(sys: &mut std.System, s: &Server, file: str, f: &proto.Flat, count: usize, a: alloc.Allocator) {
+    let normal = path.normalize(file, a);
+    let text = text_of_file(sys, s, file: normal.view(), a: a);
+    let t = text.items();
+    var m = copy("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":", a);
+    json.write_string(uri_of_file(s, file: normal.view(), a: a).view(), out: &mut m);
+    match find_doc_by_path(s, file: normal.view()) {
+        some(d) => {
+            if s.docs.items()[d].has_version {
+                m.push_str(",\"version\":");
+                proto.push_number(&mut m, n: s.docs.items()[d].version as u64);
+            }
+        }
+        none => { }
+    }
+    m.push_str(",\"diagnostics\":[");
+    var wrote = false;
+    var i: usize = 0;
+    while i < count : (i += 1) {
+        var key = alloc.String.init(a);
+        proto.push_number(&mut key, n: i as u64);
+        if not path.normalize(field(f, item: key.view(), name: "file", a: a).view(), a).view().eq(normal.view()) {
+            continue;
+        }
+        if wrote {
+            m.push_str(",");
+        }
+        wrote = true;
+        let line = number_field(f, item: key.view(), name: "line", a: a);
+        let col = number_field(f, item: key.view(), name: "column", a: a);
+        let r = line_of(t, one_based: line);
+        let text_line = t[r[0]..r[1]];
+        let end = proto.word_end(text_line, byte: minus_one(col) as usize);
+        m.push_str("{\"range\":");
+        push_range(&mut m, text: t, from_line: line, from_col: col, to_line: line, to_col: end as u32 + 1);
+        m.push_str(",\"severity\":1,\"source\":\"arche\",\"code\":");
+        json.write_string(field(f, item: key.view(), name: "code", a: a).view(), out: &mut m);
+        m.push_str(",\"message\":");
+        json.write_string(field(f, item: key.view(), name: "message", a: a).view(), out: &mut m);
+        m.push_str("}");
+    }
+    m.push_str("]}}");
+    send(&mut sys.stdout, body: m.view());
+}
+
+fn field(f: &proto.Flat, item: str, name: str, a: alloc.Allocator) -> alloc.String {
+    var p = copy(item, a);
+    p.push_str(".");
+    p.push_str(name);
+    return f.text(p.view());
+}
+
+fn number_field(f: &proto.Flat, item: str, name: str, a: alloc.Allocator) -> u32 {
+    var p = copy(item, a);
+    p.push_str(".");
+    p.push_str(name);
+    return f.number(p.view()) orelse 0;
+}
+
+/// Checks a document and publishes what comes of it: for it, for files with
+/// errors that it imports, and nothing any more for those that had some.
+fn check_doc(sys: &mut std.System, s: &mut Server, index: usize, a: alloc.Allocator) {
+    s.docs.items_mut()[index].pending = false;
+    let file = copy(s.docs.items()[index].path.view(), a);
+    let package = copy(s.docs.items()[index].package.view(), a);
+    var command = words(first: "check", second: "--json", a: a);
+    command.push(copy(file.view(), a));
+    let answer = run_compiler(sys, s, package: package.view(), command: &command, a: a);
+    if not answer.finished {
+        return;
+    }
+    var f = proto.Flat.init(a);
+    match proto.flatten(answer.stdout.view().bytes(), a) {
+        some(parsed) => { f = parsed; }
+        none => { return; }
+    }
+    let count = f.count("");
+    var seen = alloc.List(alloc.String).init(a);
+    publish(sys, s, file: file.view(), f: &f, count: count, a: a);
+    seen.push(copy(file.view(), a));
+    // The other files with errors, each once.
+    var i: usize = 0;
+    while i < count : (i += 1) {
+        var key = alloc.String.init(a);
+        proto.push_number(&mut key, n: i as u64);
+        let other = path.normalize(field(&f, item: key.view(), name: "file", a: a).view(), a);
+        var known = false;
+        for x in seen.items() {
+            if x.view().eq(other.view()) {
+                known = true;
+            }
+        }
+        if not known {
+            seen.push(copy(other.view(), a));
+            publish(sys, s, file: other.view(), f: &f, count: count, a: a);
+            note_reported(s, file: other.view());
+        }
+    }
+    // Files not open whose errors are gone.
+    var r: usize = 0;
+    while r < s.reported.len() : (r += 1) {
+        if not s.reported.items()[r].active {
+            continue;
+        }
+        let was = copy(s.reported.items()[r].path.view(), a);
+        var known = false;
+        for x in seen.items() {
+            if x.view().eq(was.view()) {
+                known = true;
+            }
+        }
+        var is_open = false;
+        match find_doc_by_path(s, file: was.view()) {
+            some(_) => { is_open = true; }
+            none => { }
+        }
+        if not known and not is_open {
+            let empty = proto.Flat.init(a);
+            publish(sys, s, file: was.view(), f: &empty, count: 0, a: a);
+            s.reported.items_mut()[r].active = false;
+        }
+    }
+}
+
+fn note_reported(s: &mut Server, file: str) {
+    var i: usize = 0;
+    while i < s.reported.len() : (i += 1) {
+        if s.reported.items()[i].path.view().eq(file) {
+            s.reported.items_mut()[i].active = true;
+            return;
+        }
+    }
+    // The server's own allocator: a file's name, kept for the session.
+    s.reported.push(Reported { path: copy(file, s.heap), active: true });
+}
+
+fn any_pending(s: &Server) -> bool {
+    for d in s.docs.items() {
+        if d.open and d.pending {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The documents of a package, all to be checked again: a change in one
+/// module may break those that import it. The changed one comes first.
+fn mark_pending(s: &mut Server, package: str) {
+    let ds = s.docs.items_mut();
+    var i: usize = 0;
+    while i < ds.len() : (i += 1) {
+        if ds[i].open and ds[i].package.view().eq(package) {
+            ds[i].pending = true;
+        }
+    }
+}
+
+// ---- Requests -------------------------------------------------------------------------------
+
+fn push_location(m: &mut alloc.String, f: &proto.Flat, item: str, sys: &mut std.System, s: &Server, a: alloc.Allocator) {
+    let normal = path.normalize(field(f, item: item, name: "file", a: a).view(), a);
+    let text = text_of_file(sys, s, file: normal.view(), a: a);
+    m.push_str("{\"uri\":");
+    json.write_string(uri_of_file(s, file: normal.view(), a: a).view(), out: m);
+    m.push_str(",\"range\":");
+    push_range(m, text: text.items(), from_line: number_field(f, item: item, name: "line", a: a), from_col: number_field(f, item: item, name: "column", a: a), to_line: number_field(f, item: item, name: "end_line", a: a), to_col: number_field(f, item: item, name: "end_column", a: a));
+    m.push_str("}");
+}
+
+/// A request about a place: runs the query and hands back its parsed answer.
+fn ask_at(sys: &mut std.System, s: &Server, index: usize, f: &proto.Flat, first: str, second: str, a: alloc.Allocator) -> ?proto.Flat {
+    let file = copy(s.docs.items()[index].path.view(), a);
+    let package = copy(s.docs.items()[index].package.view(), a);
+    let text = text_of_file(sys, s, file: file.view(), a: a);
+    let line = f.number("params.position.line") orelse 0;
+    let character = f.number("params.position.character") orelse 0;
+    let at = place(text.items(), line: line, character: character, a: a);
+    var command = alloc.List(alloc.String).init(a);
+    command.push(copy(first, a));
+    if first.eq("query") {
+        command.push(copy("--json", a));
+    }
+    if second.len() > 0 {
+        command.push(copy(second, a));
+    }
+    command.push(copy(file.view(), a));
+    command.push(copy(at.view(), a));
+    let answer = run_compiler(sys, s, package: package.view(), command: &command, a: a);
+    if not answer.finished or answer.status != 0 {
+        return none;
+    }
+    return proto.flatten(answer.stdout.view().bytes(), a);
+}
+
+fn locations(sys: &mut std.System, s: &Server, id: str, answer: ?proto.Flat, include_declared: bool, a: alloc.Allocator) {
+    match answer {
+        some(q) => {
+            let n = q.count("");
+            var m = copy("[", a);
+            var wrote = false;
+            var i: usize = 0;
+            while i < n : (i += 1) {
+                var key = alloc.String.init(a);
+                proto.push_number(&mut key, n: i as u64);
+                var dp = copy(key.view(), a);
+                dp.push_str(".declared");
+                if q.boolean(dp.view(), or_else: false) and not include_declared {
+                    continue;
+                }
+                if wrote {
+                    m.push_str(",");
+                }
+                wrote = true;
+                push_location(&mut m, f: &q, item: key.view(), sys: sys, s: s, a: a);
+            }
+            m.push_str("]");
+            respond(&mut sys.stdout, id: id, result: m.view(), a: a);
+        }
+        none => { respond(&mut sys.stdout, id: id, result: "null", a: a); }
+    }
+}
+
+fn hover(sys: &mut std.System, s: &Server, id: str, answer: ?proto.Flat, a: alloc.Allocator) {
+    match answer {
+        some(q) => {
+            let signature = q.text("signature");
+            let comment = q.text("doc");
+            let type_text = q.text("type");
+            var shown = copy(signature.view(), a);
+            if shown.len() == 0 {
+                shown = copy(type_text.view(), a);
+            }
+            if shown.len() == 0 {
+                respond(&mut sys.stdout, id: id, result: "null", a: a);
+                return;
+            }
+            var body = copy("```arche\n", a);
+            body.push_str(shown.view());
+            body.push_str("\n```");
+            if comment.len() > 0 {
+                body.push_str("\n\n");
+                var end = comment.len();
+                while end > 0 and comment.view().bytes()[end - 1] == '\n' {
+                    end -= 1;
+                }
+                body.push_str(comment.view()[0..end]);
+            }
+            var m = copy("{\"contents\":{\"kind\":\"markdown\",\"value\":", a);
+            json.write_string(body.view(), out: &mut m);
+            m.push_str("}}");
+            respond(&mut sys.stdout, id: id, result: m.view(), a: a);
+        }
+        none => { respond(&mut sys.stdout, id: id, result: "null", a: a); }
+    }
+}
+
+/// LSP's number for the compiler's kind of completion.
+fn completion_kind(kind: str) -> u64 {
+    if kind.eq("method") { return 2; }
+    if kind.eq("function") { return 3; }
+    if kind.eq("field") { return 5; }
+    if kind.eq("variable") { return 6; }
+    if kind.eq("type") { return 7; }
+    if kind.eq("module") { return 9; }
+    if kind.eq("keyword") { return 14; }
+    if kind.eq("variant") { return 20; }
+    if kind.eq("constant") { return 21; }
+    return 1;
+}
+
+fn completion(sys: &mut std.System, id: str, answer: ?proto.Flat, a: alloc.Allocator) {
+    var m = copy("{\"isIncomplete\":false,\"items\":[", a);
+    match answer {
+        some(q) => {
+            let n = q.count("");
+            var i: usize = 0;
+            while i < n : (i += 1) {
+                var key = alloc.String.init(a);
+                proto.push_number(&mut key, n: i as u64);
+                if i > 0 {
+                    m.push_str(",");
+                }
+                m.push_str("{\"label\":");
+                json.write_string(field(&q, item: key.view(), name: "label", a: a).view(), out: &mut m);
+                m.push_str(",\"kind\":");
+                proto.push_number(&mut m, n: completion_kind(field(&q, item: key.view(), name: "kind", a: a).view()));
+                let detail = field(&q, item: key.view(), name: "detail", a: a);
+                if detail.len() > 0 {
+                    m.push_str(",\"detail\":");
+                    json.write_string(detail.view(), out: &mut m);
+                }
+                m.push_str("}");
+            }
+        }
+        none => { }
+    }
+    m.push_str("]}");
+    respond(&mut sys.stdout, id: id, result: m.view(), a: a);
+}
+
+/// The whole document replaced by the formatted text, if it differs.
+fn formatting(sys: &mut std.System, s: &Server, id: str, index: usize, a: alloc.Allocator) {
+    let file = copy(s.docs.items()[index].path.view(), a);
+    let text = text_of_file(sys, s, file: file.view(), a: a);
+    let scratch = join(dir: s.work.view(), name: "format.arche", a);
+    match sys.fs.write_bytes(scratch.view(), text.items()) {
+        ok(_) => { }
+        err(_) => {
+            respond(&mut sys.stdout, id: id, result: "null", a: a);
+            return;
+        }
+    }
+    var command = words(first: "fmt", second: "", a: a);
+    command.push(copy(scratch.view(), a));
+    let answer = run_compiler(sys, s, package: "", command: &command, a: a);
+    if not answer.finished or answer.status != 0 {
+        // A lexical error: nothing to format yet.
+        respond(&mut sys.stdout, id: id, result: "null", a: a);
+        return;
+    }
+    var formatted = alloc.String.init(a);
+    match sys.fs.read_file(scratch.view(), a) {
+        ok(t) => { formatted = t; }
+        err(_) => { }
+    }
+    if same_bytes(x: formatted.view().bytes(), y: text.items()) {
+        respond(&mut sys.stdout, id: id, result: "[]", a: a);
+        return;
+    }
+    var lines: u32 = 0;
+    for c in text.items() {
+        if c.* == '\n' {
+            lines += 1;
+        }
+    }
+    var m = copy("[{\"range\":{\"start\":", a);
+    push_position(&mut m, line: 0, character: 0);
+    m.push_str(",\"end\":");
+    push_position(&mut m, line: lines + 1, character: 0);
+    m.push_str("},\"newText\":");
+    json.write_string(formatted.view(), out: &mut m);
+    m.push_str("}]");
+    respond(&mut sys.stdout, id: id, result: m.view(), a: a);
+}
+
+/// The fixes of the diagnostics in the requested lines.
+fn code_action(sys: &mut std.System, s: &Server, id: str, index: usize, request: &proto.Flat, a: alloc.Allocator) {
+    let file = copy(s.docs.items()[index].path.view(), a);
+    let uri = copy(s.docs.items()[index].uri.view(), a);
+    let package = copy(s.docs.items()[index].package.view(), a);
+    let from = (request.number("params.range.start.line") orelse 0) + 1;
+    let to = (request.number("params.range.end.line") orelse 0) + 1;
+    var command = words(first: "check", second: "--json", a: a);
+    command.push(copy(file.view(), a));
+    let answer = run_compiler(sys, s, package: package.view(), command: &command, a: a);
+    let text = text_of_file(sys, s, file: file.view(), a: a);
+    var m = copy("[", a);
+    var wrote = false;
+    if answer.finished {
+        match proto.flatten(answer.stdout.view().bytes(), a) {
+            some(q) => {
+                let n = q.count("");
+                var i: usize = 0;
+                while i < n : (i += 1) {
+                    var key = alloc.String.init(a);
+                    proto.push_number(&mut key, n: i as u64);
+                    let line = number_field(&q, item: key.view(), name: "line", a: a);
+                    var fix_key = copy(key.view(), a);
+                    fix_key.push_str(".fix");
+                    let fix_line = number_field(&q, item: fix_key.view(), name: "line", a: a);
+                    if fix_line == 0 or line < from or line > to or not field(&q, item: key.view(), name: "file", a: a).view().eq(file.view()) {
+                        continue;
+                    }
+                    if wrote {
+                        m.push_str(",");
+                    }
+                    wrote = true;
+                    var title = copy("Fix: ", a);
+                    title.push_str(field(&q, item: key.view(), name: "message", a: a).view());
+                    m.push_str("{\"title\":");
+                    json.write_string(title.view(), out: &mut m);
+                    m.push_str(",\"kind\":\"quickfix\",\"edit\":{\"changes\":{");
+                    json.write_string(uri.view(), out: &mut m);
+                    m.push_str(":[{\"range\":");
+                    push_range(&mut m, text: text.items(), from_line: fix_line, from_col: number_field(&q, item: fix_key.view(), name: "column", a: a), to_line: number_field(&q, item: fix_key.view(), name: "end_line", a: a), to_col: number_field(&q, item: fix_key.view(), name: "end_column", a: a));
+                    m.push_str(",\"newText\":");
+                    json.write_string(field(&q, item: fix_key.view(), name: "replacement", a: a).view(), out: &mut m);
+                    m.push_str("}]}}}");
+                }
+            }
+            none => { }
+        }
+    }
+    m.push_str("]");
+    respond(&mut sys.stdout, id: id, result: m.view(), a: a);
+}
+
+const CAPABILITIES: str = "{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":true},\"definitionProvider\":true,\"referencesProvider\":true,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"documentFormattingProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},\"serverInfo\":{\"name\":\"arche-lsp\",\"version\":\"0.1.0\"}}";
+
+// ---- Notifications about documents -------------------------------------------------------------
+
+fn did_open(sys: &mut std.System, s: &mut Server, f: &proto.Flat, heap: alloc.Allocator, a: alloc.Allocator) {
+    let uri = f.text("params.textDocument.uri");
+    var file = alloc.String.init(a);
+    match proto.uri_path(uri.view(), a) {
+        some(p) => { file = path.normalize(p.view(), a); }
+        none => { return; }
+    }
+    if not path.is_absolute(file.view()) {
+        return;
+    }
+    // A file keeps its slot, and its text's name in the work directory, by
+    // number, when it is opened again: what is kept grows only with the
+    // files a session ever opens.
+    var slot = s.docs.len();
+    var i: usize = 0;
+    while i < s.docs.len() : (i += 1) {
+        if s.docs.items()[i].uri.view().eq(uri.view()) {
+            slot = i;
+            break;
+        }
+    }
+    var name = copy("doc", a);
+    proto.push_number(&mut name, n: slot as u64);
+    let text_path = join(dir: s.work.view(), name: name.view(), a);
+    let text = f.text("params.textDocument.text");
+    match sys.fs.write_file(path: text_path.view(), data: text.view()) {
+        ok(_) => { }
+        err(_) => { return; }
+    }
+    let package = package_of(&sys.fs, file: file.view(), a: a);
+    if slot == s.docs.len() {
+        s.docs.push(Doc {
+            open: true,
+            uri: copy(uri.view(), heap),
+            path: copy(file.view(), heap),
+            text_path: copy(text_path.view(), heap),
+            package: copy(package.view(), heap),
+            version: 0,
+            has_version: false,
+            pending: true,
+        });
+    } else {
+        // A manifest may have come or gone since.
+        if not s.docs.items()[slot].package.view().eq(package.view()) {
+            s.docs.items_mut()[slot].package = copy(package.view(), heap);
+        }
+        s.docs.items_mut()[slot].open = true;
+    }
+    match f.number("params.textDocument.version") {
+        some(v) => {
+            s.docs.items_mut()[slot].version = v as i64;
+            s.docs.items_mut()[slot].has_version = true;
+        }
+        none => { s.docs.items_mut()[slot].has_version = false; }
+    }
+    mark_pending(s, package: package.view());
+}
+
+fn did_change(sys: &mut std.System, s: &mut Server, f: &proto.Flat, a: alloc.Allocator) {
+    let uri = f.text("params.textDocument.uri");
+    var index: usize = 0;
+    match find_doc(s, uri: uri.view()) {
+        some(i) => { index = i; }
+        none => { return; }
+    }
+    // Full sync: the last change holds the whole text.
+    let changes = f.count("params.contentChanges");
+    if changes == 0 {
+        return;
+    }
+    var key = copy("params.contentChanges.", a);
+    proto.push_number(&mut key, n: changes as u64 - 1);
+    key.push_str(".text");
+    if not f.has(key.view()) {
+        return;
+    }
+    let text = f.text(key.view());
+    let text_path = copy(s.docs.items()[index].text_path.view(), a);
+    match sys.fs.write_file(path: text_path.view(), data: text.view()) {
+        ok(_) => { }
+        err(_) => { return; }
+    }
+    match f.number("params.textDocument.version") {
+        some(v) => {
+            s.docs.items_mut()[index].version = v as i64;
+            s.docs.items_mut()[index].has_version = true;
+        }
+        none => { }
+    }
+    let package = copy(s.docs.items()[index].package.view(), a);
+    mark_pending(s, package: package.view());
+}
+
+fn did_close(sys: &mut std.System, s: &mut Server, f: &proto.Flat, a: alloc.Allocator) {
+    let uri = f.text("params.textDocument.uri");
+    var index: usize = 0;
+    match find_doc(s, uri: uri.view()) {
+        some(i) => { index = i; }
+        none => { return; }
+    }
+    let file = copy(s.docs.items()[index].path.view(), a);
+    let package = copy(s.docs.items()[index].package.view(), a);
+    // The file's diagnostics go first, against the text it had.
+    let empty = proto.Flat.init(a);
+    publish(sys, s, file: file.view(), f: &empty, count: 0, a: a);
+    s.docs.items_mut()[index].open = false;
+    s.docs.items_mut()[index].pending = false;
+    _ = sys.fs.remove(s.docs.items()[index].text_path.view());
+    mark_pending(s, package: package.view());
+}
+
+// ---- One message ----------------------------------------------------------------------------
+
+/// The open document a request is about, by its params.textDocument.uri.
+fn request_doc(s: &Server, f: &proto.Flat) -> ?usize {
+    let uri = f.text("params.textDocument.uri");
+    return find_doc(s, uri: uri.view());
+}
+
+fn handle(sys: &mut std.System, s: &mut Server, body: []u8, heap: alloc.Allocator, a: alloc.Allocator) {
+    var f = proto.Flat.init(a);
+    match proto.flatten(body, a) {
+        some(parsed) => { f = parsed; }
+        none => {
+            respond_error(&mut sys.stdout, id: "", code: -32700, message: "not valid JSON", a: a);
+            return;
+        }
+    }
+    let method = f.text("method");
+    let id = proto.raw_id(&f, a);
+    let is_request = id.len() > 0;
+    if method.len() == 0 {
+        // A response to something this server never asks: nothing to do.
+        if not f.has("id") {
+            respond_error(&mut sys.stdout, id: "", code: -32600, message: "a message has a method", a: a);
+        }
+        return;
+    }
+    let name = method.view();
+    if name.eq("exit") {
+        finish(sys, s, a: a);
+    }
+    if s.shut_down {
+        if is_request {
+            respond_error(&mut sys.stdout, id: id.view(), code: -32600, message: "the server has shut down", a: a);
+        }
+        return;
+    }
+    if name.eq("initialize") {
+        s.initialized = true;
+        if is_request {
+            respond(&mut sys.stdout, id: id.view(), result: CAPABILITIES, a: a);
+        }
+        return;
+    }
+    if not s.initialized {
+        if is_request {
+            respond_error(&mut sys.stdout, id: id.view(), code: -32002, message: "the server is not initialized", a: a);
+        }
+        return;
+    }
+    if not is_request {
+        if name.eq("textDocument/didOpen") {
+            did_open(sys, s, f: &f, heap: heap, a: a);
+        } else if name.eq("textDocument/didChange") {
+            did_change(sys, s, f: &f, a: a);
+        } else if name.eq("textDocument/didClose") {
+            did_close(sys, s, f: &f, a: a);
+        } else if name.eq("textDocument/didSave") {
+            match request_doc(s, f: &f) {
+                some(i) => {
+                    let package = copy(s.docs.items()[i].package.view(), a);
+                    mark_pending(s, package: package.view());
+                }
+                none => { }
+            }
+        }
+        return;
+    }
+    if name.eq("shutdown") {
+        s.shut_down = true;
+        respond(&mut sys.stdout, id: id.view(), result: "null", a: a);
+        return;
+    }
+    let known = name.eq("textDocument/definition") or name.eq("textDocument/references") or name.eq("textDocument/hover") or
+        name.eq("textDocument/completion") or name.eq("textDocument/formatting") or name.eq("textDocument/codeAction");
+    if not known {
+        respond_error(&mut sys.stdout, id: id.view(), code: -32601, message: "no such method", a: a);
+        return;
+    }
+    var index: usize = 0;
+    match request_doc(s, f: &f) {
+        some(i) => { index = i; }
+        none => {
+            respond(&mut sys.stdout, id: id.view(), result: "null", a: a);
+            return;
+        }
+    }
+    if name.eq("textDocument/definition") {
+        let q = ask_at(sys, s, index: index, f: &f, first: "query", second: "def", a: a);
+        locations(sys, s, id: id.view(), answer: q, include_declared: true, a: a);
+    } else if name.eq("textDocument/references") {
+        let q = ask_at(sys, s, index: index, f: &f, first: "query", second: "refs", a: a);
+        locations(sys, s, id: id.view(), answer: q, include_declared: f.boolean("params.context.includeDeclaration", or_else: true), a: a);
+    } else if name.eq("textDocument/hover") {
+        let q = ask_at(sys, s, index: index, f: &f, first: "query", second: "hover", a: a);
+        hover(sys, s, id: id.view(), answer: q, a: a);
+    } else if name.eq("textDocument/completion") {
+        let q = ask_at(sys, s, index: index, f: &f, first: "complete", second: "", a: a);
+        completion(sys, id: id.view(), answer: q, a: a);
+    } else if name.eq("textDocument/formatting") {
+        formatting(sys, s, id: id.view(), index: index, a: a);
+    } else {
+        code_action(sys, s, id: id.view(), index: index, request: &f, a: a);
+    }
+}
+
+/// Removes the work directory and ends: status 0 after a shutdown request,
+/// 1 when the client went away without one, as the protocol says.
+fn finish(sys: &mut std.System, s: &Server, a: alloc.Allocator) {
+    match sys.fs.list(s.work.view(), a) {
+        ok(names) => {
+            for n in names.items() {
+                _ = sys.fs.remove(join(dir: s.work.view(), name: n.view(), a).view());
+            }
+        }
+        err(_) => { }
+    }
+    _ = sys.fs.remove(s.work.view());
+    if s.shut_down {
+        sys.proc.exit(0);
+    }
+    sys.proc.exit(1);
+}
+
+// ---- Starting ---------------------------------------------------------------------------------
+
+/// The compiler to run: ARCHE, beside this program, in the repository's
+/// layout (driver/build/arche-lsp, compiler/build/arche), or in PATH.
+fn find_arche(sys: &mut std.System, a: alloc.Allocator) -> alloc.String {
+    match sys.env.get("ARCHE", a) {
+        some(v) => {
+            if v.len() > 0 {
+                return absolute(sys, file: v.view(), a: a);
+            }
+        }
+        none => { }
+    }
+    let program = copy(sys.args.get(0), a);
+    let dir = path.parent(program.view());
+    if dir.len() > 0 {
+        let beside = join(dir: dir, name: "arche", a);
+        if sys.fs.exists(beside.view()) {
+            return absolute(sys, file: beside.view(), a: a);
+        }
+        let repository = join(dir: dir, name: "../../compiler/build/arche", a);
+        if sys.fs.exists(repository.view()) {
+            return absolute(sys, file: repository.view(), a: a);
+        }
+    }
+    return copy("arche", a);
+}
+
+fn absolute(sys: &mut std.System, file: str, a: alloc.Allocator) -> alloc.String {
+    if path.is_absolute(file) {
+        return path.normalize(file, a);
+    }
+    if path.parent(file).len() == 0 {
+        return copy(file, a);
+    }
+    match sys.fs.current_dir(a) {
+        ok(dir) => { return path.normalize(join(dir: dir.view(), name: file, a).view(), a); }
+        err(_) => { return copy(file, a); }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let heap = sys.alloc;
+    var work = try sys.fs.temp_dir(env: &sys.env, heap);
+    work.push_str("/arche-lsp-");
+    proto.push_number(&mut work, n: sys.proc.pid() as u64);
+    work.push_str("-");
+    proto.push_number(&mut work, n: sys.rand.next_u64() % 1000000);
+    // Unsaved text is for this user alone.
+    try sys.fs.make_private_dir(work.view());
+    var server = Server {
+        arche: find_arche(sys, a: heap),
+        work: work,
+        docs: alloc.List(Doc).init(heap),
+        reported: alloc.List(Reported).init(heap),
+        initialized: false,
+        shut_down: false,
+        heap: heap,
+    };
+    var input = alloc.List(u8).init(heap);
+    var chunk: [65536]u8 = [0; 65536];
+    while true {
+        var ready = false;
+        match proto.next_frame(input.items()) {
+            .Ready { start, end } => {
+                region r {
+                    handle(sys, &mut server, body: input.items()[start..end], heap: heap, a: r);
+                }
+                proto.take_front(&mut input, n: end);
+                ready = true;
+            }
+            .Bad => {
+                sys.stderr.write("arche-lsp: the input is not the language server protocol\n");
+                region r {
+                    finish(sys, &server, a: r);
+                }
+            }
+            .Need => { }
+        }
+        if ready {
+            continue;
+        }
+        // The client has paused: diagnostics, one document at a time, while
+        // it stays quiet.
+        if any_pending(&server) and not sys.stdin.ready(20) {
+            var index: usize = 0;
+            while not (server.docs.items()[index].open and server.docs.items()[index].pending) {
+                index += 1;
+            }
+            region r {
+                check_doc(sys, &mut server, index: index, a: r);
+            }
+            continue;
+        }
+        let n = try sys.stdin.read(chunk[0..65536]);
+        if n == 0 {
+            region r {
+                finish(sys, &server, a: r);
+            }
+        }
+        for c in chunk[0..n] {
+            input.push(c.*);
+        }
+    }
+}

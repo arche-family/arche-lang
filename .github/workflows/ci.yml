@@ -111,7 +111,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build the Arche compiler and the driver
         run: make -C stage0 && make -C compiler && make -C conformance && make -C driver
-      - name: Cached builds, and signed packages over HTTPS
+      - name: Cached builds, signed packages over HTTPS, a language server session
         run: make -C driver check
+      - name: Fuzz the language server's message parser
+        run: ./fuzz/lsp.sh 60
       - name: Conformance tests, one object per module
         run: cd compiler && ../conformance/runner/build/runner --timeout 60 --compiler ./arche-build-units ../conformance/tests

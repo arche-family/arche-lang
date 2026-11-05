@@ -1,0 +1,592 @@
+/// The Language Server Protocol's plumbing, without I/O, for arche-lsp
+/// (lsp.arche) and its fuzzer (lsp_fuzz.arche): frames, messages, positions
+/// and URIs. Whatever bytes a client sends, these give an error or a result,
+/// never a panic.
+import alloc;
+import core.mem;
+import core.utf8;
+import std;
+import std.json;
+
+/// The largest message: larger is a broken client, not a large file.
+pub const MAX_MESSAGE: usize = 67108864;
+const MAX_HEADER: usize = 8192;
+
+// ---- Frames -----------------------------------------------------------------------------
+
+/// What comes next in the bytes read so far.
+pub type Next = enum {
+    /// More bytes are needed.
+    Need,
+    /// A message's body is at bytes[start..end].
+    Ready { start: usize, end: usize },
+    /// Not the base protocol: nothing can be read after this.
+    Bad,
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 'A' and c <= 'Z' {
+        return c + 32;
+    }
+    return c;
+}
+
+fn starts_with_name(b: []u8, name: str) -> bool {
+    let n = name.bytes();
+    if b.len() < n.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n.len() : (i += 1) {
+        if lower(b[i]) != n[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The first message in the bytes: headers, an empty line, then as many
+/// bytes as Content-Length says.
+pub fn next_frame(b: []u8) -> Next {
+    var head_end: usize = 0;
+    var i: usize = 0;
+    while i + 3 < b.len() and head_end == 0 : (i += 1) {
+        if b[i] == '\r' and b[i + 1] == '\n' and b[i + 2] == '\r' and b[i + 3] == '\n' {
+            head_end = i;
+        }
+    }
+    if head_end == 0 {
+        if b.len() > MAX_HEADER {
+            return Next.Bad;
+        }
+        return Next.Need;
+    }
+    if head_end > MAX_HEADER {
+        return Next.Bad;
+    }
+    var length: usize = 0;
+    var has_length = false;
+    var line: usize = 0;
+    while line <= head_end {
+        var e = line;
+        while e < head_end and b[e] != '\r' : (e += 1) {
+        }
+        let text = b[line..e];
+        var colon: usize = 0;
+        while colon < text.len() and text[colon] != ':' : (colon += 1) {
+        }
+        if colon == 0 or colon == text.len() {
+            return Next.Bad;
+        }
+        if starts_with_name(text, name: "content-length:") {
+            var v: usize = 0;
+            var digits: u32 = 0;
+            var k = colon + 1;
+            while k < text.len() : (k += 1) {
+                let c = text[k];
+                if c >= '0' and c <= '9' {
+                    digits += 1;
+                    if digits > 10 {
+                        return Next.Bad;
+                    }
+                    v = v * 10 + (c - '0') as usize;
+                } else if c != ' ' {
+                    return Next.Bad;
+                }
+            }
+            if digits == 0 or v > MAX_MESSAGE {
+                return Next.Bad;
+            }
+            length = v;
+            has_length = true;
+        }
+        line = e + 2;
+    }
+    if not has_length {
+        return Next.Bad;
+    }
+    let start = head_end + 4;
+    if b.len() - start < length {
+        return Next.Need;
+    }
+    return Next.Ready { start: start, end: start + length };
+}
+
+/// Removes the first n bytes.
+pub fn take_front(list: &mut alloc.List(u8), n: usize) {
+    let left = list.len() - n;
+    let b = list.items_mut();
+    var i: usize = 0;
+    while i < left : (i += 1) {
+        b[i] = b[n + i];
+    }
+    while list.len() > left {
+        _ = list.pop();
+    }
+}
+
+// ---- Messages -----------------------------------------------------------------------------
+
+/// What a message may cost as paths, in bytes: a long key above many values
+/// repeats in each of their paths, and this is where that stops.
+const MAX_PATHS: u64 = 268435456;
+
+/// A JSON value as paths: {"a": {"b": [1, "x"]}} has "a.b.0" with the text 1
+/// and "a.b.1" with the text x. A view cannot be kept in a field or an
+/// optional, so nothing here hands out a piece of the tree; a missing or
+/// mistyped field is simply not there, which is what a client's bad message
+/// should come to. Paths are found by hash: the compiler's answer about a
+/// file full of errors has many.
+pub type Flat = struct {
+    paths: alloc.List(alloc.String),
+    texts: alloc.List(alloc.String),
+    /// 's' a string, 'n' a number, 't' and 'f' a boolean, '0' null, 'A' an
+    /// array with its length as the text, 'o' an object.
+    kinds: alloc.List(u8),
+    /// 0 for an empty slot, i + 1 for path i; a power of two of them.
+    slots: alloc.List(u32),
+    spent: u64,
+    a: alloc.Allocator,
+
+    pub fn init(a: alloc.Allocator) -> Flat {
+        return Flat { paths: alloc.List(alloc.String).init(a), texts: alloc.List(alloc.String).init(a), kinds: alloc.List(u8).init(a), slots: alloc.List(u32).init(a), spent: 0, a: a };
+    }
+
+    fn add(self: &mut Flat, path: str, kind: u8, text: str) {
+        var p = alloc.String.init(self.a);
+        p.push_str(path);
+        var t = alloc.String.init(self.a);
+        t.push_str(text);
+        self.paths.push(p);
+        self.texts.push(t);
+        self.kinds.push(kind);
+    }
+
+    fn index(self: &mut Flat) {
+        var n: usize = 16;
+        while n < self.paths.len() * 2 {
+            n *= 2;
+        }
+        var e: usize = 0;
+        while e < n : (e += 1) {
+            self.slots.push(0);
+        }
+        let mask = n - 1;
+        var i: usize = 0;
+        while i < self.paths.len() : (i += 1) {
+            var at = hash_of(self.paths.items()[i].view()) & mask;
+            while self.slots.items()[at] != 0 {
+                at = (at + 1) & mask;
+            }
+            self.slots.items_mut()[at] = (i + 1) as u32;
+        }
+    }
+
+    fn find(self: &Flat, path: str) -> ?usize {
+        let slots = self.slots.items();
+        if slots.len() == 0 {
+            return none;
+        }
+        let mask = slots.len() - 1;
+        var at = hash_of(path) & mask;
+        while slots[at] != 0 {
+            let i = (slots[at] - 1) as usize;
+            if self.paths.items()[i].view().eq(path) {
+                return i;
+            }
+            at = (at + 1) & mask;
+        }
+        return none;
+    }
+
+    /// Whether the value at path is there, of any kind.
+    pub fn has(self: &Flat, path: str) -> bool {
+        match self.find(path) {
+            some(_) => { return true; }
+            none => { return false; }
+        }
+    }
+
+    /// The string at path; empty when there is none.
+    pub fn text(self: &Flat, path: str) -> alloc.String {
+        var out = alloc.String.init(self.a);
+        match self.find(path) {
+            some(i) => {
+                if self.kinds.items()[i] == 's' {
+                    out.push_str(self.texts.items()[i].view());
+                }
+            }
+            none => { }
+        }
+        return out;
+    }
+
+    /// The whole number at path, if it is one.
+    pub fn number(self: &Flat, path: str) -> ?u32 {
+        match self.find(path) {
+            some(i) => {
+                if self.kinds.items()[i] != 'n' {
+                    return none;
+                }
+                return whole(self.texts.items()[i].view());
+            }
+            none => { return none; }
+        }
+    }
+
+    /// The boolean at path; or_else when there is none.
+    pub fn boolean(self: &Flat, path: str, or_else: bool) -> bool {
+        match self.find(path) {
+            some(i) => {
+                if self.kinds.items()[i] == 't' {
+                    return true;
+                }
+                if self.kinds.items()[i] == 'f' {
+                    return false;
+                }
+                return or_else;
+            }
+            none => { return or_else; }
+        }
+    }
+
+    /// How many items the array at path has; 0 when there is none.
+    pub fn count(self: &Flat, path: str) -> usize {
+        match self.find(path) {
+            some(i) => {
+                if self.kinds.items()[i] != 'A' {
+                    return 0;
+                }
+                return (whole(self.texts.items()[i].view()) orelse 0) as usize;
+            }
+            none => { return 0; }
+        }
+    }
+}
+
+fn hash_of(text: str) -> usize {
+    var h: u32 = 2166136261;
+    for c in text.bytes() {
+        h = (h ^ (c.* as u32)) *% 16777619;
+    }
+    return h as usize;
+}
+
+/// The number a decimal text is, if it fits.
+fn whole(text: str) -> ?u32 {
+    let b = text.bytes();
+    if b.len() == 0 or b.len() > 10 {
+        return none;
+    }
+    var v: u64 = 0;
+    for c in b {
+        if c.* < '0' or c.* > '9' {
+            return none;
+        }
+        v = v * 10 + (c.* - '0') as u64;
+    }
+    if v > 4294967295 {
+        return none;
+    }
+    return v as u32;
+}
+
+pub fn push_number(s: &mut alloc.String, n: u64) {
+    var digits: [20]u8 = [0; 20];
+    var k: usize = 0;
+    var v = n;
+    while true {
+        digits[k] = '0' + (v % 10) as u8;
+        k += 1;
+        v = v / 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while k > 0 : (k -= 1) {
+        s.push_ascii(digits[k - 1]);
+    }
+}
+
+fn add_value(v: &json.Value, path: str, out: &mut Flat, a: alloc.Allocator) {
+    out.spent += path.len() as u64 + 64;
+    if out.spent > MAX_PATHS {
+        return;
+    }
+    match v {
+        .Null => { out.add(path: path, kind: '0', text: ""); }
+        .Bool { value } => {
+            if value.* {
+                out.add(path: path, kind: 't', text: "");
+            } else {
+                out.add(path: path, kind: 'f', text: "");
+            }
+        }
+        .Number { text } => { out.add(path: path, kind: 'n', text: text.view()); }
+        .Text { value } => { out.add(path: path, kind: 's', text: value.view()); }
+        .Array { items } => {
+            var length = alloc.String.init(a);
+            push_number(&mut length, n: items.len() as u64);
+            out.add(path: path, kind: 'A', text: length.view());
+            var i: usize = 0;
+            while i < items.len() : (i += 1) {
+                var p = alloc.String.init(a);
+                p.push_str(path);
+                if path.len() > 0 {
+                    p.push_str(".");
+                }
+                push_number(&mut p, n: i as u64);
+                add_value(&items.items()[i], path: p.view(), out: out, a: a);
+            }
+        }
+        .Object { keys, values } => {
+            out.add(path: path, kind: 'o', text: "");
+            var i: usize = 0;
+            while i < keys.len() : (i += 1) {
+                var p = alloc.String.init(a);
+                p.push_str(path);
+                if path.len() > 0 {
+                    p.push_str(".");
+                }
+                p.push_str(keys.items()[i].view());
+                add_value(&values.items()[i], path: p.view(), out: out, a: a);
+            }
+        }
+    }
+}
+
+/// A message's body as paths, or none when it is not valid JSON.
+pub fn flatten(body: []u8, a: alloc.Allocator) -> ?Flat {
+    if not utf8.valid(body) {
+        return none;
+    }
+    var text = "";
+    unsafe {
+        // SAFETY: checked just now.
+        text = mem.str_from(body);
+    }
+    match json.parse(text, a) {
+        ok(v) => {
+            var f = Flat.init(a);
+            add_value(&v, path: "", out: &mut f, a: a);
+            if f.spent > MAX_PATHS {
+                return none;
+            }
+            f.index();
+            return f;
+        }
+        err(_) => { return none; }
+    }
+}
+
+/// The request's id as JSON, a number or a string, to send back as it came;
+/// empty when it has none.
+pub fn raw_id(f: &Flat, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    match f.find("id") {
+        some(i) => {
+            let kind = f.kinds.items()[i];
+            if kind == 'n' {
+                out.push_str(f.texts.items()[i].view());
+            } else if kind == 's' {
+                json.write_string(f.texts.items()[i].view(), out: &mut out);
+            }
+        }
+        none => { }
+    }
+    return out;
+}
+
+// ---- Positions ----------------------------------------------------------------------------
+
+/// Where a line of the text starts and ends, without its line ending. A line
+/// past the end is empty, at the end of the text.
+pub fn line_range(text: []u8, line: u32) -> [2]usize {
+    var at: usize = 0;
+    var l: u32 = 0;
+    while l < line and at < text.len() {
+        if text[at] == '\n' {
+            l += 1;
+        }
+        at += 1;
+    }
+    if l < line {
+        return [text.len(), text.len()];
+    }
+    var e = at;
+    while e < text.len() and text[e] != '\n' : (e += 1) {
+    }
+    if e > at and text[e - 1] == '\r' {
+        e -= 1;
+    }
+    return [at, e];
+}
+
+fn char_len(c: u8) -> usize {
+    if c < 0x80 {
+        return 1;
+    }
+    if c >= 0xF0 {
+        return 4;
+    }
+    if c >= 0xE0 {
+        return 3;
+    }
+    if c >= 0xC0 {
+        return 2;
+    }
+    return 1;
+}
+
+/// LSP counts columns in UTF-16 units, the compiler in bytes: the byte
+/// offset, in the line, of a UTF-16 column; the line's end if it is past it.
+pub fn byte_column(line: []u8, utf16: u32) -> usize {
+    var at: usize = 0;
+    var units: u32 = 0;
+    while at < line.len() and units < utf16 {
+        let n = char_len(line[at]);
+        if n == 4 {
+            units += 2;
+        } else {
+            units += 1;
+        }
+        at += n;
+    }
+    if at > line.len() {
+        return line.len();
+    }
+    return at;
+}
+
+/// The UTF-16 column of a byte offset in the line.
+pub fn utf16_column(line: []u8, byte: usize) -> u32 {
+    var at: usize = 0;
+    var units: u32 = 0;
+    while at < line.len() and at < byte {
+        let n = char_len(line[at]);
+        if n == 4 {
+            units += 2;
+        } else {
+            units += 1;
+        }
+        at += n;
+    }
+    return units;
+}
+
+fn word_byte(c: u8) -> bool {
+    return c == '_' or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
+}
+
+/// Where what starts at a byte of the line ends, for a diagnostic's range: at
+/// the end of a word, or after one character.
+pub fn word_end(line: []u8, byte: usize) -> usize {
+    if byte >= line.len() {
+        return line.len();
+    }
+    if not word_byte(line[byte]) {
+        let e = byte + char_len(line[byte]);
+        if e > line.len() {
+            return line.len();
+        }
+        return e;
+    }
+    var e = byte;
+    while e < line.len() and word_byte(line[e]) : (e += 1) {
+    }
+    return e;
+}
+
+// ---- URIs ---------------------------------------------------------------------------------
+
+fn hex_value(c: u8) -> ?u8 {
+    if c >= '0' and c <= '9' {
+        return c - '0';
+    }
+    if c >= 'a' and c <= 'f' {
+        return c - 'a' + 10;
+    }
+    if c >= 'A' and c <= 'F' {
+        return c - 'A' + 10;
+    }
+    return none;
+}
+
+/// The path of a file:// URI, or none for any other. On Windows the drive
+/// comes after the URI's slash: file:///C:/a is C:/a, and an editor may write
+/// it file:///c%3A/a.
+pub fn uri_path(uri: str, a: alloc.Allocator) -> ?alloc.String {
+    let b = uri.bytes();
+    let scheme = "file://".bytes();
+    if b.len() <= scheme.len() or not starts_with_name(b, name: "file://") {
+        return none;
+    }
+    var at = scheme.len();
+    // file://localhost/path is file:///path.
+    if b[at] != '/' {
+        if not starts_with_name(b[at..b.len()], name: "localhost/") {
+            return none;
+        }
+        at += 9;
+    }
+    var bytes = alloc.List(u8).init(a);
+    while at < b.len() : (at += 1) {
+        var c = b[at];
+        if c == '%' {
+            if at + 2 >= b.len() {
+                return none;
+            }
+            match hex_value(b[at + 1]) {
+                some(hi) => {
+                    match hex_value(b[at + 2]) {
+                        some(lo) => { c = hi * 16 + lo; }
+                        none => { return none; }
+                    }
+                }
+                none => { return none; }
+            }
+            at += 2;
+        }
+        if c == 0 {
+            return none;
+        }
+        bytes.push(c);
+    }
+    let decoded = bytes.items();
+    if not utf8.valid(decoded) {
+        return none;
+    }
+    var from: usize = 0;
+    if std.SYSTEM.eq("windows") and decoded.len() >= 3 and decoded[0] == '/' and decoded[2] == ':' and
+        ((decoded[1] >= 'a' and decoded[1] <= 'z') or (decoded[1] >= 'A' and decoded[1] <= 'Z')) {
+        from = 1;
+    }
+    var out = alloc.String.init(a);
+    unsafe {
+        // SAFETY: checked just now; the '/' left out is one whole character.
+        out.push_str(mem.str_from(decoded[from..decoded.len()]));
+    }
+    return out;
+}
+
+/// The file:// URI of an absolute path: a drive, on Windows, after a slash.
+pub fn path_uri(path: str, a: alloc.Allocator) -> alloc.String {
+    let digits = "0123456789ABCDEF".bytes();
+    var out = alloc.String.init(a);
+    out.push_str("file://");
+    if not path.starts_with("/") {
+        out.push_str("/");
+    }
+    for p in path.bytes() {
+        let c = p.*;
+        let plain = word_byte(c) or c == '/' or c == '-' or c == '.' or c == '~' or c == ':';
+        if plain {
+            out.push_ascii(c);
+        } else {
+            out.push_ascii('%');
+            out.push_ascii(digits[(c >> 4) as usize]);
+            out.push_ascii(digits[(c & 15) as usize]);
+        }
+    }
+    return out;
+}

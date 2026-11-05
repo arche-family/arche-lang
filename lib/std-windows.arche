@@ -287,6 +287,17 @@ pub type Fs = struct {
         }
     }
 
+    /// As make_dir, but only this user can enter it.
+    pub fn make_private_dir(self: &Fs, path: str) -> FsError!void {
+        var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if not win.wide(path, buf[0..PATH_UNITS]) {
+            return FsError.NotFound;
+        }
+        if not win.make_private_directory(buf[0..PATH_UNITS]) {
+            return last_fs_error();
+        }
+    }
+
     /// Removes a file, or an empty directory.
     pub fn remove(self: &Fs, path: str) -> FsError!void {
         var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];

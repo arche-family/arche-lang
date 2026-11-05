@@ -142,6 +142,8 @@ extern "c" fn PeekNamedPipe(pipe: i64, into: *mut u8, n: u32, read: *mut u32, wa
 extern "c" fn GetConsoleMode(it: i64, mode: *mut u32) -> i32;
 extern "c" fn GetFileAttributesW(path: *u16) -> u32;
 extern "c" fn CreateDirectoryW(path: *u16, security: *u8) -> i32;
+extern "c" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(text: *u16, revision: u32, descriptor: *mut u64, size: *mut u32) -> i32;
+extern "c" fn LocalFree(memory: u64) -> u64;
 extern "c" fn RemoveDirectoryW(path: *u16) -> i32;
 extern "c" fn DeleteFileW(path: *u16) -> i32;
 extern "c" fn MoveFileExW(from: *u16, to: *u16, flags: u32) -> i32;
@@ -394,6 +396,29 @@ pub fn file_attributes(path: []u16) -> u32 {
     unsafe {
         // SAFETY: path is NUL-terminated UTF-16.
         return GetFileAttributesW(mem.slice_data(u16, path));
+    }
+}
+
+/// A directory only its owner can enter, nor what is made in it: its access
+/// list, which keeps nothing from the directory above, names the owner and
+/// no one else (D:P, full access for OWNER RIGHTS, passed on to what is in it).
+pub fn make_private_directory(path: []u16) -> bool {
+    var list: [32]u16 = [0; 32];
+    if not wide("D:P(A;OICI;FA;;;OW)", list[0..32]) {
+        return false;
+    }
+    var descriptor: u64 = 0;
+    unsafe {
+        // SAFETY: the text and the path are NUL-terminated UTF-16, the call
+        // writes descriptor alone, and security is read during the call only.
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(text: mem.slice_data(u16, list[0..32]), revision: 1,
+            descriptor: &mut descriptor as *mut u64, size: mem.null(u32) as *mut u32) == 0 {
+            return false;
+        }
+        var security = Security { length: 24, descriptor: descriptor, inherit: 0 };
+        let made = CreateDirectoryW(mem.slice_data(u16, path), &security as *Security as *u8) != 0;
+        _ = LocalFree(descriptor);
+        return made;
     }
 }
 

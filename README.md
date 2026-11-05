@@ -46,14 +46,15 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | Path | Contents | Status |
 | --- | --- | --- |
 | [`docs/plan.md`](docs/plan.md) | the full plan (Uzbek) | snapshot, 2026-11-05 |
-| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language, S35 for the libraries the Arche OS phone needs, S36–S37 for editors and macOS (Uzbek) | current sprint: S36, then S27 |
+| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language, S35 for the libraries the Arche OS phone needs, S36–S37 for editors and macOS (Uzbek) | current sprint: S27 |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | [`spec/arche.md`](spec/arche.md) | the full language, built on Arche-0 | draft 0.1 |
 | [`conformance/`](conformance/README.md) | specification tests | 460 tests, on Linux and Windows |
 | `stage0/` | bootstrap compiler, C11 | complete: compiles all of Arche-0 |
 | [`compiler/`](compiler/) | the Arche compiler, Arche-0, through LLVM; `--release` runs its own optimizer; `--target` picks the system | self-hosting: stage2 == stage3, in release builds and on Windows too |
 | [`bench/`](bench/) | compile-time and run-time benchmarks | [baseline](bench/baseline.md) |
-| [`driver/`](driver/) | `arche-driver build`/`run`: packages from `build.arche`, one object per module, cached by SHA-256; `pkg add/lock/vendor/publish` and `arche-registry`: signed, content-addressed packages over HTTPS | a cached build is bit-identical to a clean one; tampered packages are refused |
+| [`driver/`](driver/) | `arche-driver build`/`run`: packages from `build.arche`, one object per module, cached by SHA-256; `pkg add/lock/vendor/publish` and `arche-registry`: signed, content-addressed packages over HTTPS; `arche-lsp`: a language server that runs the compiler per request | a cached build is bit-identical to a clean one; tampered packages are refused; a real editor session passes, with diagnostics under a second on the compiler's source |
+| [`editors/`](editors/README.md) | TextMate grammar and how to use `arche-lsp` | the grammar's keywords are compared with the lexer's |
 | [`docs/abi.md`](docs/abi.md) | layouts, calling convention, runtime | version 0 |
 | [`docs/error-codes.md`](docs/error-codes.md) | every diagnostic code | living |
 | [`lib/`](lib/) | the library: `core` (no OS, no allocator), `alloc`, `std` for Linux and Windows, `crypto` (constant time, checked in CI by [`ctcheck/`](ctcheck/)), `tls` (TLS 1.3 and X.509) and `http` (HTTP/1.1 and HTTP/2, server and client), interop-tested against OpenSSL, curl and Chrome by [`interop/`](interop/) | the compiler bootstraps on `lib/alloc` and `lib/std` too |
