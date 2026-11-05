@@ -13,15 +13,31 @@ import syntax.token as tk;
 
 pub type ModuleId = struct { pub index: u32 }
 
-/// What the program is built for (spec/arche.md §10.3): Linux with std, or
-/// a machine without an operating system, with core and alloc only.
-pub type Target = enum { LinuxX86_64, FreestandingX86_64, FreestandingRiscv64 }
+/// What the program is built for (spec/arche.md §10.3): a host with std,
+/// Linux or Windows, or a machine without an operating system, with core
+/// and alloc only.
+pub type Target = enum { LinuxX86_64, WindowsX86_64, FreestandingX86_64, FreestandingRiscv64 }
 
 pub fn target_by_name(name: str) -> ?Target {
     if name.eq("linux-x86_64") { return Target.LinuxX86_64; }
+    if name.eq("windows-x86_64") { return Target.WindowsX86_64; }
     if name.eq("freestanding-x86_64") { return Target.FreestandingX86_64; }
     if name.eq("freestanding-riscv64") { return Target.FreestandingRiscv64; }
     return none;
+}
+
+/// Whether the target has an operating system under it, and so std.
+pub fn hosted(t: Target) -> bool {
+    return t == Target.LinuxX86_64 or t == Target.WindowsX86_64;
+}
+
+/// The file of the library's std for a target: each host has its own
+/// (lib/std.arche, lib/std-windows.arche; docs/abi.md).
+pub fn std_file(t: Target) -> str {
+    if t == Target.WindowsX86_64 {
+        return "std-windows.arche";
+    }
+    return "std.arche";
 }
 
 /// The options of one compilation, from the command line.
@@ -449,7 +465,7 @@ fn package_imports(m: &Module, a: alloc.Allocator, lib_alloc: bool, lib_std: boo
 /// Starts from the root file, whose text the caller has read, and loads,
 /// breadth first, every module it imports.
 pub fn freestanding(p: &Program) -> bool {
-    return p.target != Target.LinuxX86_64;
+    return not hosted(p.target);
 }
 
 pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts: &Options) -> Program {
@@ -461,8 +477,8 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         diags: diag.Diagnostics.init(a),
         a: a,
         full: false,
-        lib_alloc: opts.lib_alloc or opts.lib_std or opts.target != Target.LinuxX86_64,
-        lib_std: opts.lib_std and opts.target == Target.LinuxX86_64,
+        lib_alloc: opts.lib_alloc or opts.lib_std or not hosted(opts.target),
+        lib_std: opts.lib_std and hosted(opts.target),
         target: opts.target,
         panic_handler: handler,
         tests: opts.tests,
@@ -512,7 +528,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         ok(mtext) => {
             p.full = true;
             p.lib_alloc = true;
-            p.lib_std = p.target == Target.LinuxX86_64;
+            p.lib_std = hosted(p.target);
             var lexed = diag.Diagnostics.init(a);
             let tokens = lexer.lex(mtext.view(), true, &mut lexed, a);
             let parsed = parser.parse(tokens, mtext.view(), true, lexed, a);
@@ -579,7 +595,13 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
             var r = Resolved { dotted: alloc.String.init(a), file: alloc.String.init(a), package: NO_PACKAGE };
             if from_lib {
                 r.dotted.push_str(written);
-                r.file.push_str(ip.file.view());
+                if written.eq("std") {
+                    // Each host has its own std; the module is std for all
+                    // of them (std_file, docs/abi.md).
+                    r.file.push_str(std_file(p.target));
+                } else {
+                    r.file.push_str(ip.file.view());
+                }
             } else {
                 r = resolve_import(&p, module: next as u32, dotted: written, a: a);
             }

@@ -9,21 +9,23 @@ if [ $# -ne 2 ]; then
     exit 2
 fi
 here=$(cd "$(dirname "$0")" && pwd)
-cc=${CLANG:-clang}
-rt="$here/build/rt-sections.o"
-if [ ! -f "$rt" ] || [ "$here/runtime/rt.c" -nt "$rt" ] || [ "$here/runtime/math.inc" -nt "$rt" ]; then
-    $cc -c -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -fno-pie -ffunction-sections -fdata-sections \
+. "$here/target.sh"
+cc=$CLANG
+rt="$here/build/rt-sections-$ARCHE_TARGET.o"
+if [ ! -f "$rt" ] || [ "$here/runtime/rt.c" -nt "$rt" ] || [ "$here/runtime/math.inc" -nt "$rt" ] ||
+    [ "$here/runtime/linux.inc" -nt "$rt" ] || [ "$here/runtime/windows.inc" -nt "$rt" ]; then
+    $cc -c -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector $RT_FLAGS -ffunction-sections -fdata-sections \
         -Wall -Wextra -Werror -o "$rt.tmp.$$" "$here/runtime/rt.c"
     mv "$rt.tmp.$$" "$rt"
 fi
 units="$2.units"
 rm -rf "$units"
 mkdir -p "$units"
-"${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} units "$1" "$units" > "$units/list"
+"${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG units "$1" "$units" > "$units/list"
 objects=""
 for u in $(cat "$units/list"); do
-    $cc -c -O1 -fno-pie -ffunction-sections -fdata-sections -Wno-override-module -o "$u.o" "$u"
+    $cc -c -O1 $RT_FLAGS -ffunction-sections -fdata-sections -Wno-override-module -o "$u.o" "$u"
     objects="$objects $u.o"
 done
 # shellcheck disable=SC2086
-$cc -nostdlib -static -fno-pie -Wl,--gc-sections -o "$2" $objects "$rt"
+$cc $LINK_FLAGS $GC_FLAGS -o "$2" $objects "$rt"

@@ -8,6 +8,16 @@ set -eu
 
 runner=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 cd "$(dirname "$0")"
+# The mock compiler is a shell script, and so is each program it writes;
+# Windows starts neither on its own, so this self-test runs where they do
+# (docs/sprints.md S19). On Windows the runner is checked by the
+# conformance suite itself, which it builds with the real compiler.
+case $(uname -s) in
+MINGW* | MSYS* | CYGWIN*)
+    echo "selftest: skipped: the mock compiler and its programs are shell scripts"
+    exit 0
+    ;;
+esac
 actual=$(mktemp)
 trap 'rm -f "$actual"' EXIT
 status=0

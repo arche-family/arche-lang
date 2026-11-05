@@ -32,6 +32,30 @@ jobs:
       - name: Bootstrap, stage2 == stage3
         run: CC=${{ matrix.cc }} ./bootstrap.sh
 
+  # docs/sprints.md S19: the same compiler and the same library on Windows,
+  # built with clang and linked with lld-link against Win32. The image has
+  # LLVM and the Windows SDK; make comes from Chocolatey. The checkout is
+  # LF, as .gitattributes asks, which the compiler's own source needs.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install make
+        run: choco install make --no-progress -y
+      - name: Build stage0 and the Arche compiler
+        run: make -C stage0 CC=clang && make -C compiler CC=clang
+      - name: Compiler and std tests
+        run: make -C compiler check CC=clang
+      - name: Conformance tests with stage0
+        run: make -C conformance check CC=clang
+      - name: The build driver and the package manager
+        run: make -C conformance && make -C driver && make -C driver check
+      - name: Bootstrap, stage2 == stage3
+        run: CC=clang ./bootstrap.sh
+
   # docs/sprints.md S16: freestanding binaries, built with core and alloc
   # only, boot in QEMU on x86-64 and RISC-V 64 and write over serial.
   freestanding:

@@ -1,9 +1,17 @@
 /// Paths as text, '/' between parts, as on Linux. Nothing here reads the
-/// file system.
+/// file system. Windows takes '/' in every path of its own, so only what
+/// an absolute path looks like differs there (is_absolute).
 import alloc;
 
+/// Whether the path starts from the root: after a separator, or after the
+/// drive Windows names first ("C:\\" or "C:/").
 pub fn is_absolute(p: str) -> bool {
-    return p.len() > 0 and p.bytes()[0] == '/';
+    let b = p.bytes();
+    if b.len() > 0 and (b[0] == '/' or b[0] == '\\') {
+        return true;
+    }
+    let letter = b.len() > 0 and ((b[0] >= 'A' and b[0] <= 'Z') or (b[0] >= 'a' and b[0] <= 'z'));
+    return b.len() >= 3 and letter and b[1] == ':' and (b[2] == '/' or b[2] == '\\');
 }
 
 fn last_slash(p: str) -> ?usize {

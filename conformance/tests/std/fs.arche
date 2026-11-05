@@ -7,9 +7,10 @@ import alloc;
 import core.fmt;
 
 fn main(sys: &mut std.System) -> !void {
-    // A directory of this process's own, under /tmp.
-    var dir = alloc.String.init(sys.alloc);
-    dir.push_str("/tmp/arche-std-");
+    // A directory of this process's own, where the system keeps the files
+    // that need not outlive it.
+    var dir = try sys.fs.temp_dir(env: &sys.env, sys.alloc);
+    dir.push_str("/arche-std-");
     var digits: [20]u8 = [0; 20];
     let n = fmt.decimal(sys.proc.pid() as u64, digits[0..20]);
     for d in digits[0..n] {
@@ -47,10 +48,14 @@ fn main(sys: &mut std.System) -> !void {
     try sys.fs.remove(b.view());
     try sys.fs.remove(c.view());
     try sys.fs.remove(dir.view());
-    match sys.fs.make_dir("/") {
+    // A directory that is already there is AlreadyExists, whatever the
+    // system calls it (docs/sprints.md S19).
+    try sys.fs.make_dir(dir.view());
+    match sys.fs.make_dir(dir.view()) {
         ok(_) => { sys.stdout.write("made"); }
         err(.AlreadyExists) => { sys.stdout.write("exists"); }
         err(_) => { sys.stdout.write("other"); }
     }
+    try sys.fs.remove(dir.view());
     sys.stdout.write("\n");
 }

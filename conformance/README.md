@@ -15,6 +15,10 @@ make -C conformance check                    # run tests/ with stage0
 conformance/runner/build/runner --stage0 --compiler stage0/arche0-build conformance/tests/<chapter>/<name>.arche   # one test
 ```
 
+The compiler command may carry arguments of its own, so that a system
+which starts no script of its own is given a shell and the script:
+`--compiler "sh ./arche-build"` (docs/sprints.md S19).
+
 ## Test format
 
 A test is one `.arche` file. Its header is the run of `// key: value` lines at the top of the file; the first line of another form ends it. An unknown key is an error, so an ordinary comment in the header must not look like `// word: …`.
@@ -47,6 +51,7 @@ fn f() {
 | `test` | both | `run` or `compile-error`; required |
 | `spec` | both | the spec section the test covers, e.g. `7.2`; required |
 | `stage0` | both | `skip`: the rule is in spec §12, and stage0 may accept the program |
+| `system` | both | `linux` or `windows`: the test is only for that system, and is skipped on the others. For what one system alone has, such as its own system calls; a rule that holds everywhere gets a test without this key |
 | `exit` | `run` | expected exit status; default 0 |
 | `stdout` | `run` | one line of expected stdout; repeated lines build it, each followed by `\n`; no `stdout` lines means no output |
 | `stderr` | `run` | text stderr must contain; repeated lines must appear in this order |
@@ -70,8 +75,9 @@ The runner calls the compiler as `<command> <source> <output>`:
 ## How a test runs
 
 - The compiler runs in the runner's directory. The program runs in the test file's directory, so it can read files that sit beside the test.
-- stdin is `/dev/null`. stdout and stderr are captured separately.
-- Each step has a time limit (`--timeout`, default 10 s). On timeout, or when the step ends, its whole process group is killed.
+- stdin is the system's empty file (`/dev/null`, `NUL`). stdout and stderr are captured separately.
+- Each step has a time limit (`--timeout`, default 10 s). On timeout, or when the step ends, everything it started is killed with it: its process group on Linux, its job on Windows.
+- A test marked for another system is skipped (`system`). The runner knows the system it was built for from `std.SYSTEM`.
 - `--stage0` skips tests marked `stage0: skip` and does not check `code`.
 - `--codes E01,E02` runs only the compile-error tests whose `code` starts with one of the prefixes and skips the rest: for a compiler that checks programs but cannot build them yet. Codes are listed in [`docs/error-codes.md`](../docs/error-codes.md).
 - Tests run in path order. The report has one `PASS`, `FAIL` or `SKIP` line per test, details under each failure, and a count line at the end. The runner exits with 1 if any test failed.

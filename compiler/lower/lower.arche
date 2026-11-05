@@ -1067,16 +1067,27 @@ pub fn lower(c: ck.Checker) -> ir.Module {
         l.f = ir.new_function("", ir.Ty.Void, a);
     }
     l.c.cur_table = ck.NONE;
+    // A hosted target has an entry that the runtime calls, and the names
+    // of the program's errors for it (docs/abi.md); a freestanding one
+    // exports its own entry (spec/arche.md §10.3).
+    var hosted = false;
     match l.c.p.target {
         .LinuxX86_64 => {
             l.m.triple.push_str("x86_64-pc-linux-gnu");
-            entry(&mut l);
-            error_names(&mut l);
-            let e = l.f;
-            l.m.functions.push(e);
+            hosted = true;
+        }
+        .WindowsX86_64 => {
+            l.m.triple.push_str("x86_64-pc-windows-msvc");
+            hosted = true;
         }
         .FreestandingX86_64 => { l.m.triple.push_str("x86_64-unknown-none-elf"); }
         .FreestandingRiscv64 => { l.m.triple.push_str("riscv64-unknown-none-elf"); }
+    }
+    if hosted {
+        entry(&mut l);
+        error_names(&mut l);
+        let e = l.f;
+        l.m.functions.push(e);
     }
     return l.m;
 }

@@ -7,6 +7,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+// Windows opens the standard output and error in text mode, where the C
+// library writes a carriage return before every newline; what an Arche
+// program writes is bytes (docs/sprints.md S19, main below). The two calls
+// that change a stream back to bytes are declared here, because io.h does
+// not compile under -std=c11.
+int _fileno(FILE *stream);
+int _setmode(int fd, int mode);
+#define A0_MODE_BINARY 0x8000
+#endif
+
 // ---- exit -------------------------------------------------------------------
 
 // §10: outputs are flushed before the process exits, however it exits.
@@ -249,6 +260,24 @@ a0_str a0_alloc_Interner_text(a0_alloc_Interner *self, a0_alloc_Symbol sym, a0_l
 
 // ---- std.Fs -------------------------------------------------------------------
 
+#if defined(_WIN32)
+// Windows refuses to open a directory as a file with the same error it
+// uses for a file one may not read, so the two are told apart by the
+// attributes. The call is declared here to keep windows.h out of a file
+// that every C compiler has to build.
+unsigned long GetFileAttributesA(const char *path);
+
+static int is_directory(const char *path) {
+    unsigned long attributes = GetFileAttributesA(path);
+    return attributes != 0xFFFFFFFFul && (attributes & 0x10u) != 0;
+}
+#else
+static int is_directory(const char *path) {
+    (void)path;
+    return 0;
+}
+#endif
+
 static a0_err io_error(int e) {
     switch (e) {
     case ENOENT:
@@ -289,11 +318,12 @@ a0_res_String a0_std_Fs_read_file(a0_std_Fs *self, a0_str path, a0_alloc_Allocat
     }
     errno = 0;
     FILE *f = fopen(p, "rb");
-    free(p);
     if (!f) {
-        r.err = io_error(errno);
+        r.err = is_directory(p) ? A0_ERR_IS_DIRECTORY : io_error(errno);
+        free(p);
         return r;
     }
+    free(p);
     uint8_t chunk[65536];
     size_t n;
     errno = 0;
@@ -320,11 +350,12 @@ a0_res_bytes a0_std_Fs_read_bytes(a0_std_Fs *self, a0_str path, a0_alloc_Allocat
     }
     errno = 0;
     FILE *f = fopen(p, "rb");
-    free(p);
     if (!f) {
-        r.err = io_error(errno);
+        r.err = is_directory(p) ? A0_ERR_IS_DIRECTORY : io_error(errno);
+        free(p);
         return r;
     }
+    free(p);
     uint8_t chunk[65536];
     size_t n;
     errno = 0;
@@ -355,10 +386,12 @@ a0_err a0_std_Fs_write_file(a0_std_Fs *self, a0_str path, a0_str data) {
     }
     errno = 0;
     FILE *f = fopen(p, "wb");
-    free(p);
     if (!f) {
-        return io_error(errno);
+        a0_err e = is_directory(p) ? A0_ERR_IS_DIRECTORY : io_error(errno);
+        free(p);
+        return e;
     }
+    free(p);
     bool ok = data.len == 0 || fwrite(data.ptr, 1, (size_t)data.len, f) == data.len;
     int e = errno;
     if (fclose(f) != 0 || !ok) {
@@ -402,6 +435,12 @@ a0_str a0_std_Args_get(a0_std_Args *self, uint64_t i, a0_loc loc) {
 
 int main(int argc, char **argv) {
     static a0_std_System sys;
+#if defined(_WIN32)
+    // The bytes a program writes are its own, with no carriage return
+    // added to them.
+    _setmode(_fileno(stdout), A0_MODE_BINARY);
+    _setmode(_fileno(stderr), A0_MODE_BINARY);
+#endif
     sys.out.f = stdout;
     sys.err.f = stderr;
 

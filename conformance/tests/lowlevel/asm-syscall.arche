@@ -1,0 +1,26 @@
+// test: run
+// spec: arche/10.2
+// stage0: skip
+// system: linux
+// stdout: raw
+import std;
+
+// A system call written out by hand: the registers an asm names are the
+// ones the call wants. Linux alone takes its calls this way, so this test
+// is for Linux (conformance/README.md, docs/sprints.md S19).
+fn write_raw(text: str) -> i64 {
+    var n: i64 = 1; // write(2)
+    let fd: i64 = 1;
+    let b = text.bytes();
+    unsafe {
+        // SAFETY: write(fd, p, len) reads len bytes at p, which b holds.
+        let p = &b[0] as *u8;
+        asm("syscall", inout("rax") n, in("rdi") fd, in("rsi") p, in("rdx") b.len(), clobber("rcx"), clobber("r11"));
+    }
+    return n;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    // The raw write goes around the buffered output: flush order is ours.
+    _ = write_raw("raw\n");
+}

@@ -7,24 +7,23 @@
 import std;
 import alloc;
 
-fn argv(a: alloc.Allocator, script: str) -> alloc.List(alloc.String) {
-    var list = alloc.List(alloc.String).init(a);
-    var sh = alloc.String.init(a);
-    sh.push_str("/bin/sh");
-    list.push(sh);
-    var c = alloc.String.init(a);
-    c.push_str("-c");
-    list.push(c);
-    var s = alloc.String.init(a);
-    s.push_str(script);
-    list.push(s);
-    return list;
-}
-
+// The child is this program again, with an argument: no program for a
+// shell is on every system, and the ones that are write their lines
+// differently (docs/sprints.md S19).
 fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() > 1 and sys.args.get(1).eq("child") {
+        sys.stdout.write("child\n");
+        sys.proc.exit(3);
+    }
     sys.stdout.write("before ");
-    let three = argv(sys.alloc, script: "echo child; exit 3");
-    let status = try sys.proc.run(&three, env: &sys.env, sys.alloc);
+    var argv = alloc.List(alloc.String).init(sys.alloc);
+    var program = alloc.String.init(sys.alloc);
+    program.push_str(sys.args.get(0));
+    argv.push(program);
+    var word = alloc.String.init(sys.alloc);
+    word.push_str("child");
+    argv.push(word);
+    let status = try sys.proc.run(&argv, env: &sys.env, sys.alloc);
     sys.stdout.write("status ");
     sys.stdout.write_u64(status as u64);
     var missing = alloc.List(alloc.String).init(sys.alloc);

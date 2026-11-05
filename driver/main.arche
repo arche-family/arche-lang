@@ -33,8 +33,42 @@ import crypto.sha2;
 import pkg;
 import std;
 
-const COMPILE_FLAGS: str = "-c -O1 -fno-pie -ffunction-sections -fdata-sections -Wno-override-module";
-const RUNTIME_FLAGS: str = "-c -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -fno-pie -ffunction-sections -fdata-sections";
+/// How clang is called, for the system the driver runs on. The compiler's
+/// own scripts have the same in compiler/target.sh; a flag is part of an
+/// object's cache key, so a build for another system makes its own.
+fn compile_flags() -> str {
+    if std.SYSTEM.eq("windows") {
+        return "-c -O1 --target=x86_64-pc-windows-msvc -ffunction-sections -fdata-sections -Wno-override-module";
+    }
+    return "-c -O1 -fno-pie -ffunction-sections -fdata-sections -Wno-override-module";
+}
+
+fn runtime_flags() -> str {
+    if std.SYSTEM.eq("windows") {
+        return "-c -O2 --target=x86_64-pc-windows-msvc -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -ffunction-sections -fdata-sections";
+    }
+    return "-c -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -fno-pie -ffunction-sections -fdata-sections";
+}
+
+/// The link, without a C library: on Windows the runtime owns the entry
+/// point and Win32 comes from the system's import libraries, and the time
+/// of the link is left out of the file (-Brepro) so that a build repeats.
+/// The linker's options are written with a dash, which the shells of
+/// Windows leave alone. The last flag takes the output's name.
+fn link_flags() -> str {
+    if std.SYSTEM.eq("windows") {
+        return "--target=x86_64-pc-windows-msvc -fuse-ld=lld -nostdlib -Wl,-entry:a0rt_entry -Wl,-subsystem:console -Wl,-Brepro -Wl,-opt:ref -lkernel32 -lws2_32 -ladvapi32 -o";
+    }
+    return "-nostdlib -static -fno-pie -Wl,--gc-sections -o";
+}
+
+/// What the compiler is told to build for, as the module std says.
+fn target_name() -> str {
+    if std.SYSTEM.eq("windows") {
+        return "windows-x86_64";
+    }
+    return "linux-x86_64";
+}
 
 fn join(dir: str, name: str, a: alloc.Allocator) -> alloc.String {
     var s = alloc.String.init(a);
@@ -51,12 +85,14 @@ fn parent(path: str) -> str {
     var cut: usize = 0;
     var i: usize = 0;
     while i < b.len() : (i += 1) {
-        if b[i] == '/' {
+        // Windows names a program with backslashes, whatever separator the
+        // paths of the build use (docs/sprints.md S19).
+        if b[i] == '/' or b[i] == '\\' {
             cut = i;
         }
     }
     if cut == 0 {
-        if b.len() > 0 and b[0] == '/' {
+        if b.len() > 0 and (b[0] == '/' or b[0] == '\\') {
             return "/";
         }
         return ".";
@@ -286,6 +322,8 @@ fn build_program(sys: &mut std.System, tools: &Tools, dir: str, name: str, root:
     let list_file = join(dir: out_dir.view(), name: list_name.view(), a);
     var argv = alloc.List(alloc.String).init(a);
     argv.push(text_of(tools.arche.view().bytes(), a));
+    argv.push(text_of("--target".bytes(), a));
+    argv.push(text_of(target_name().bytes(), a));
     argv.push(text_of("units".bytes(), a));
     argv.push(join(dir: dir, name: root, a));
     argv.push(text_of(units_dir.view().bytes(), a));
@@ -299,11 +337,11 @@ fn build_program(sys: &mut std.System, tools: &Tools, dir: str, name: str, root:
     var objects = alloc.List(alloc.String).init(a);
     var hits: u32 = 0;
     for u in units.items() {
-        objects.push(try object(sys, tools: tools, source: u.view(), flags: COMPILE_FLAGS, cache: cache.view(), hits: &mut hits, a: a));
+        objects.push(try object(sys, tools: tools, source: u.view(), flags: compile_flags(), cache: cache.view(), hits: &mut hits, a: a));
     }
     var rt_hits: u32 = 0;
     let math = join(dir: parent(tools.runtime.view()), name: "math.inc", a);
-    let rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: math.view(), flags: RUNTIME_FLAGS, cache: cache.view(), hits: &mut rt_hits, a: a);
+    let rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: math.view(), flags: runtime_flags(), cache: cache.view(), hits: &mut rt_hits, a: a);
     // Linked to a file of its own, then moved into place.
     let program = join(dir: out_dir.view(), name: name, a);
     var tmp = alloc.String.init(a);
@@ -311,7 +349,7 @@ fn build_program(sys: &mut std.System, tools: &Tools, dir: str, name: str, root:
     tmp.push_str(".tmp");
     var link = alloc.List(alloc.String).init(a);
     link.push(text_of(tools.clang.view().bytes(), a));
-    for f in args_of("-nostdlib -static -fno-pie -Wl,--gc-sections -o", a).items() {
+    for f in args_of(link_flags(), a).items() {
         link.push(text_of(f.view().bytes(), a));
     }
     link.push(text_of(tmp.view().bytes(), a));

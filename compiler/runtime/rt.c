@@ -1,52 +1,61 @@
 // The runtime of programs the Arche compiler builds (docs/abi.md).
 //
-// It calls no C library: it has its own entry point, talks to Linux through
-// system calls only, and allocates from memory it maps itself. x86-64 Linux.
+// It calls no C library: it has its own entry point, talks to the system
+// through its system calls alone, and allocates from memory it maps itself.
+// x86-64 Linux and Windows (docs/sprints.md S19): everything that differs
+// between them is in linux.inc and windows.inc, included at the end of this
+// file, and reached only through the os_ functions below.
 // Build: clang -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector
 
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
-typedef unsigned long u64;
-typedef long i64;
+// Windows counts a long as four bytes and Linux as eight; long long is
+// eight on both.
+typedef unsigned long long u64;
+typedef long long i64;
 
-// ---- system calls -------------------------------------------------------------
+// ---- the system ---------------------------------------------------------------
+//
+// What a system gives the runtime. A handle is a file, a socket, or one of
+// 0, 1 and 2, this program's standard input, output and error. An operation
+// on a file answers with what it did, or with a negated code below, so that
+// a failure reads the same on every system; std turns those into IoError
+// (lib/std.arche, docs/abi.md).
 
-static i64 sys1(i64 n, i64 a) {
-    i64 r;
-    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a) : "rcx", "r11", "memory");
-    return r;
-}
+enum { IO_NOT_FOUND = 1, IO_ACCESS = 2, IO_IS_DIR = 3, IO_INVALID_UTF8 = 4, IO_FAILED = 5 };
 
-static i64 sys3(i64 n, i64 a, i64 b, i64 c) {
-    i64 r;
-    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
-    return r;
-}
+typedef struct Fiber Fiber;
+typedef struct Run Run;
+typedef struct Kept Kept;
+typedef struct System System;
 
-static i64 sys4(i64 n, i64 a, i64 b, i64 c, i64 d) {
-    i64 r;
-    register i64 r10 __asm__("r10") = d;
-    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10) : "rcx", "r11", "memory");
-    return r;
-}
-
-static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
-    i64 r;
-    register i64 r10 __asm__("r10") = d;
-    register i64 r8 __asm__("r8") = e;
-    register i64 r9 __asm__("r9") = f;
-    __asm__ volatile("syscall"
-                     : "=a"(r)
-                     : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9)
-                     : "rcx", "r11", "memory");
-    return r;
-}
-
-enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MPROTECT = 10, SYS_MUNMAP = 11, SYS_GETPID = 39, SYS_FORK = 57, SYS_POLL = 7, SYS_DUP2 = 33, SYS_PIPE2 = 293, SYS_SCHED_GETAFFINITY = 204,
-       SYS_EXIT = 60, SYS_WAIT4 = 61, SYS_CLOCK_GETTIME = 228, SYS_EXIT_GROUP = 231, SYS_OPENAT = 257 };
-enum { AT_FDCWD = -100, O_RDONLY = 0, O_WRONLY = 1, O_CREAT = 0100, O_TRUNC = 01000, O_CLOEXEC = 02000000 };
-enum { ENOENT = 2, EACCES = 13, ENOTDIR = 20, EISDIR = 21, EPERM = 1 };
+// memory: pages that are zero until written
+static void *os_map(u64 n);
+static void os_unmap(void *p, u64 n);
+static u8 *os_stack_map(u64 n);        // a task's stack; its lowest page faults
+static void os_stack_unmap(u8 *p, u64 n);
+// files and output
+static i64 os_open_read(const u8 *path, u64 path_len);
+static i64 os_open_write(const u8 *path, u64 path_len);
+static i64 os_read(i64 handle, u8 *p, u64 n);
+static i64 os_write(i64 handle, const u8 *p, u64 n);
+static void os_close(i64 handle);
+static i64 os_fs_dir(void);            // std.Fs.dir, as this system names the current directory
+// the process
+_Noreturn static void os_exit(int status);
+static u64 os_seed(void);              // the clock and this process, for a test run's seed
+static u64 os_processors(void);
+// tasks (spec/arche.md §9)
+void a0rt_ctx_switch(u64 *save_rsp, u64 load_rsp);
+static void os_stack_switch(const Fiber *next);
+static u64 os_fiber_frame(void);   // how many words of a new fiber's stack its frame takes
+static u64 os_fiber_saved(void);   // which of them a0rt_ctx_switch returns through
+static void os_poll(const i64 *handles, const short *events, u8 *ready, u64 n);
+// the test runner: a child process for each test
+static void os_test_child(System *sys);
+static void os_start_test(System *sys, u64 i, u64 seed, Run *r);
+static void os_collect(Run *runs, u64 count);
 
 // ---- memory ---------------------------------------------------------------------
 
@@ -108,11 +117,11 @@ static u8 *heap_next;
 static u64 heap_left;
 
 static void *map_pages(u64 n) {
-    i64 p = sys6(SYS_MMAP, 0, (i64)n, 3 /* read, write */, 0x22 /* private, anonymous */, -1, 0);
-    if (p < 0 && p > -4096) {
+    void *p = os_map(n);
+    if (!p) {
         a0rt_die("out of memory", 13);
     }
-    return (void *)p;
+    return p;
 }
 
 static void *alloc_bytes(u64 n) {
@@ -222,7 +231,7 @@ void a0rt_region_end(u64 handle) {
     Chunk *c = a->last;
     while (c) {
         Chunk *prev = c->prev;
-        sys3(SYS_MUNMAP, (i64)c, (i64)c->size, 0);
+        os_unmap(c, c->size);
         c = prev;
     }
     a->free_next = free_arenas;
@@ -279,7 +288,7 @@ static Buffer buffers[3];
 static void flush(Buffer *b) {
     u64 done = 0;
     while (done < b->len) {
-        i64 n = sys3(SYS_WRITE, b->fd, (i64)(b->data + done), (i64)(b->len - done));
+        i64 n = os_write(b->fd, b->data + done, b->len - done);
         if (n <= 0) {
             break;
         }
@@ -684,8 +693,7 @@ void a0rt_trace_start(const u8 *file, u64 file_len, u32 line, u32 col) {
 
 static _Noreturn void exit_with(int status) {
     flush_all();
-    sys1(SYS_EXIT_GROUP, status);
-    __builtin_unreachable();
+    os_exit(status);
 }
 
 static const i64 err_fd = 2;
@@ -713,17 +721,17 @@ void a0rt_die(const char *message, u64 len) {
 enum { READY, RUNNING, WAITING, DONE, WAITING_IO };
 enum { TASK_STACK = 256 * 1024, GUARD = 4096 };
 
-typedef struct Fiber {
+struct Fiber {
     u64 rsp;
-    u8 *stack;
+    u8 *stack;      // 0 for the thread's own: the fiber main runs on
     u16 (*fn)(void *env);
     void *env;
     struct TaskScope *scope;
     const void *waiting_on;
     int state;
-    int io_fd;
+    i64 io_fd;      // the socket it waits for: a descriptor, or a handle
     short io_events;
-} Fiber;
+};
 
 typedef struct TaskScope {
     u32 pending;
@@ -735,26 +743,6 @@ static Fiber *current_fiber = &main_fiber;
 static Fiber **fibers;
 static u64 fiber_count, fiber_cap;
 static u64 sched_state = 0x853C49E6748FEA9BUL;
-
-void a0rt_ctx_switch(u64 *save_rsp, u64 load_rsp);
-__asm__(".text\n"
-        ".global a0rt_ctx_switch\n"
-        "a0rt_ctx_switch:\n"
-        "    push %rbp\n"
-        "    push %rbx\n"
-        "    push %r12\n"
-        "    push %r13\n"
-        "    push %r14\n"
-        "    push %r15\n"
-        "    mov %rsp, (%rdi)\n"
-        "    mov %rsi, %rsp\n"
-        "    pop %r15\n"
-        "    pop %r14\n"
-        "    pop %r13\n"
-        "    pop %r12\n"
-        "    pop %rbx\n"
-        "    pop %rbp\n"
-        "    ret\n");
 
 // The scheduler's seed: arche test sets it for each test.
 void a0rt_sched_seed(u64 seed) {
@@ -778,16 +766,14 @@ static void switch_to(Fiber *next) {
     }
     current_fiber = next;
     next->state = RUNNING;
+    os_stack_switch(next);
     a0rt_ctx_switch(&prev->rsp, next->rsp);
 }
 
-typedef struct PollFd {
-    int fd;
-    short events;
-    short revents;
-} PollFd;
-
-static PollFd *poll_fds;
+// The sockets the waiting fibers wait for, as os_poll takes them.
+static i64 *poll_handles;
+static short *poll_events;
+static u8 *poll_ready;
 static Fiber **poll_fibers;
 static u64 poll_cap;
 
@@ -797,19 +783,24 @@ static void poll_add(Fiber *f, u64 *n) {
     }
     if (*n == poll_cap) {
         u64 cap = poll_cap ? poll_cap * 2 : 16;
-        PollFd *fds = a0rt_alloc(cap * sizeof(PollFd));
+        i64 *handles = a0rt_alloc(cap * sizeof(i64));
+        short *events = a0rt_alloc(cap * sizeof(short));
+        u8 *ready = a0rt_alloc(cap);
         Fiber **who = a0rt_alloc(cap * sizeof(Fiber *));
         for (u64 i = 0; i < *n; i++) {
-            fds[i] = poll_fds[i];
+            handles[i] = poll_handles[i];
+            events[i] = poll_events[i];
             who[i] = poll_fibers[i];
         }
-        poll_fds = fds;
+        poll_handles = handles;
+        poll_events = events;
+        poll_ready = ready;
         poll_fibers = who;
         poll_cap = cap;
     }
-    poll_fds[*n].fd = f->io_fd;
-    poll_fds[*n].events = f->io_events;
-    poll_fds[*n].revents = 0;
+    poll_handles[*n] = f->io_fd;
+    poll_events[*n] = f->io_events;
+    poll_ready[*n] = 0;
     poll_fibers[*n] = f;
     (*n)++;
 }
@@ -825,13 +816,9 @@ static void poll_io(void) {
     if (n == 0) {
         a0rt_die("deadlock: every task is waiting", 31);
     }
-    i64 r;
-    do {
-        r = sys3(SYS_POLL, (i64)poll_fds, (i64)n, -1);
-    } while (r == -4);
+    os_poll(poll_handles, poll_events, poll_ready, n);
     for (u64 i = 0; i < n; i++) {
-        // An error or a hang-up wakes the fiber too: its next call says so.
-        if (poll_fds[i].revents != 0 || r < 0) {
+        if (poll_ready[i]) {
             poll_fibers[i]->state = READY;
         }
     }
@@ -871,7 +858,7 @@ static Fiber *pick(void) {
 // Waits until fd is ready for events (poll's POLLIN, POLLOUT).
 void a0rt_io_wait(i64 fd, u32 events) {
     current_fiber->state = WAITING_IO;
-    current_fiber->io_fd = (int)fd;
+    current_fiber->io_fd = fd;
     current_fiber->io_events = (short)events;
     switch_to(pick());
 }
@@ -946,7 +933,7 @@ static void reap(void) {
             if (spare_count < SPARE_MAX) {
                 spare[spare_count++] = f;
             } else {
-                sys3(SYS_MUNMAP, (i64)f->stack, TASK_STACK + GUARD, 0);
+                os_stack_unmap(f->stack, TASK_STACK + GUARD);
             }
         } else {
             fibers[kept++] = f;
@@ -963,20 +950,24 @@ void a0rt_spawn(void *scope, void *fn, void *env) {
         f = spare[--spare_count];
     } else {
         f = a0rt_alloc(sizeof(Fiber));
-        i64 p = sys6(SYS_MMAP, 0, TASK_STACK + GUARD, 3, 0x22, -1, 0);
-        if (p < 0 && p > -4096) {
+        u8 *p = os_stack_map(TASK_STACK + GUARD);
+        if (!p) {
             a0rt_die("out of memory", 13);
         }
-        sys3(SYS_MPROTECT, p, GUARD, 0); // the stack's end faults, not overflows
-        f->stack = (u8 *)p;
+        f->stack = p;
     }
+    // The frame a0rt_ctx_switch returns through, as this system's one
+    // leaves it: the registers it restores, all zero for a fiber that has
+    // not run, then where it returns to and that frame's own return
+    // address, which nothing uses.
+    u64 words = os_fiber_frame();
     u64 *top = (u64 *)(f->stack + TASK_STACK + GUARD);
-    top[-1] = 0;                  // fiber_entry's return address: none
-    top[-2] = (u64)fiber_entry;   // where a0rt_ctx_switch returns to
-    for (int i = 3; i <= 8; i++) {
-        top[-i] = 0;              // rbp, rbx, r12 to r15
+    u64 *frame = top - words;
+    for (u64 i = 0; i < words; i++) {
+        frame[i] = 0;
     }
-    f->rsp = (u64)(top - 8);
+    frame[os_fiber_saved()] = (u64)fiber_entry;
+    f->rsp = (u64)frame;
     f->fn = (u16 (*)(void *))fn;
     f->env = env;
     f->scope = s;
@@ -1007,7 +998,7 @@ u32 a0rt_scope_wait(void *scope) {
     for (u64 i = 0; i < fiber_count; i++) {
         Fiber *f = fibers[i];
         if (f->scope == s) {
-            sys3(SYS_MUNMAP, (i64)f->stack, TASK_STACK + GUARD, 0);
+            os_stack_unmap(f->stack, TASK_STACK + GUARD);
         } else {
             fibers[kept++] = f;
         }
@@ -1037,19 +1028,9 @@ _Noreturn void a0rt_trap(const u8 *message, u64 len, const u8 *file, u64 file_le
 
 // ---- std.Fs -------------------------------------------------------------------------
 
+// What an os_ operation answered with, as the IoError's number.
 static u16 io_error(i64 e) {
-    switch (-e) {
-    case ENOENT:
-    case ENOTDIR:
-        return 1; // NotFound
-    case EACCES:
-    case EPERM:
-        return 2; // AccessDenied
-    case EISDIR:
-        return 3; // IsDirectory
-    default:
-        return 5; // IoFailed
-    }
+    return (u16)(-e);
 }
 
 static int valid_utf8(const u8 *s, u64 n) {
@@ -1089,25 +1070,9 @@ static int valid_utf8(const u8 *s, u64 n) {
 }
 
 // A NUL-terminated copy of a path; NULL when it holds a NUL byte.
-static char *c_path(const u8 *p, u64 n) {
-    for (u64 i = 0; i < n; i++) {
-        if (p[i] == 0) {
-            return 0;
-        }
-    }
-    char *s = a0rt_alloc(n + 1);
-    memcpy(s, p, n);
-    s[n] = 0;
-    return s;
-}
-
 // Reads a whole file into a List(u8) or String {data, len, cap, alloc}.
 static u16 read_into(const u8 *path, u64 path_len, u64 *out) {
-    char *p = c_path(path, path_len);
-    if (!p) {
-        return 1;
-    }
-    i64 fd = sys4(SYS_OPENAT, AT_FDCWD, (i64)p, O_RDONLY | O_CLOEXEC, 0);
+    i64 fd = os_open_read(path, path_len);
     if (fd < 0) {
         return io_error(fd);
     }
@@ -1117,9 +1082,9 @@ static u16 read_into(const u8 *path, u64 path_len, u64 *out) {
             out[0] = (u64)grow_in(out[3], (void *)out[0], out[1], cap);
             out[2] = cap;
         }
-        i64 n = sys3(SYS_READ, fd, (i64)(out[0] + out[1]), (i64)(out[2] - out[1]));
+        i64 n = os_read(fd, (u8 *)(out[0] + out[1]), out[2] - out[1]);
         if (n < 0) {
-            sys1(SYS_CLOSE, fd);
+            os_close(fd);
             return io_error(n);
         }
         if (n == 0) {
@@ -1127,7 +1092,7 @@ static u16 read_into(const u8 *path, u64 path_len, u64 *out) {
         }
         out[1] += (u64)n;
     }
-    sys1(SYS_CLOSE, fd);
+    os_close(fd);
     return 0;
 }
 
@@ -1173,24 +1138,20 @@ void a0rt_read_bytes(const void *fs, const u8 *path, u64 path_len, u64 allocator
 
 u16 a0rt_write_file(const void *fs, const u8 *path, u64 path_len, const u8 *data, u64 len) {
     (void)fs;
-    char *p = c_path(path, path_len);
-    if (!p) {
-        return 1;
-    }
-    i64 fd = sys4(SYS_OPENAT, AT_FDCWD, (i64)p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    i64 fd = os_open_write(path, path_len);
     if (fd < 0) {
         return io_error(fd);
     }
     u64 done = 0;
     while (done < len) {
-        i64 n = sys3(SYS_WRITE, fd, (i64)(data + done), (i64)(len - done));
+        i64 n = os_write(fd, data + done, len - done);
         if (n < 0) {
-            sys1(SYS_CLOSE, fd);
+            os_close(fd);
             return io_error(n);
         }
         done += (u64)n;
     }
-    sys1(SYS_CLOSE, fd);
+    os_close(fd);
     return 0;
 }
 
@@ -1386,8 +1347,10 @@ u32 a0rt_intern(Interner *in, const u8 *p, u64 n) {
 // ---- entry --------------------------------------------------------------------------
 
 // std.System: {fs, stdout, stderr, args {items, len}, allocator}, and
-// for lib/std.arche the environment after them (docs/abi.md).
-typedef struct {
+// for lib/std.arche the environment after them (docs/abi.md). Windows
+// gives no array of the environment, and leaves envp 0: its std asks the
+// system for a name at a time (lib/std-windows.arche).
+struct System {
     i64 fs;
     i64 stdout_fd;
     i64 stderr_fd;
@@ -1395,7 +1358,7 @@ typedef struct {
     u64 nargs;
     u64 allocator;
     char **envp;
-} System;
+};
 
 extern u16 a0_entry(System *sys);
 extern const Str a0_error_names[];
@@ -1408,27 +1371,25 @@ static u64 c_strlen(const char *s) {
     return n;
 }
 
-_Noreturn void a0rt_start(i64 *sp) {
+// Builds std.System from what the system gave the program, calls its main,
+// and ends the program: every entry point (linux.inc, windows.inc) comes
+// here with the arguments as UTF-8 text.
+_Noreturn static void run_program(Str *args, u64 nargs, char **envp) {
     buffers[1].fd = 1;
     buffers[2].fd = 2;
-    i64 argc = sp[0];
-    char **argv = (char **)(sp + 1);
     static System sys;
     // Fs works on paths from the current directory (std.Fs.dir).
-    sys.fs = AT_FDCWD;
+    sys.fs = os_fs_dir();
     sys.stdout_fd = 1;
     sys.stderr_fd = 2;
-    sys.args = a0rt_alloc((u64)(argc > 0 ? argc : 1) * sizeof(Str));
-    for (i64 i = 0; i < argc; i++) {
-        u64 n = c_strlen(argv[i]);
-        if (!valid_utf8((const u8 *)argv[i], n)) {
+    for (u64 i = 0; i < nargs; i++) {
+        if (!valid_utf8(args[i].ptr, args[i].len)) {
             a0rt_die("an argument is not valid UTF-8", 30);
         }
-        sys.args[i].ptr = (const u8 *)argv[i];
-        sys.args[i].len = n;
     }
-    sys.nargs = (u64)argc;
-    sys.envp = argv + argc + 1;
+    sys.args = args;
+    sys.nargs = nargs;
+    sys.envp = envp;
     u16 err = a0_entry(&sys);
     if (err) {
         flush_all();
@@ -1466,8 +1427,25 @@ typedef struct {
     u64 takes_test;
 } TestEntry;
 
+// A build that is not a test build defines neither table. On Linux the
+// names are weak, and are then 0; on Windows the linker points them at the
+// empty tables windows.inc gives it (/alternatename).
+#if defined(_WIN32)
+extern const TestEntry a0_tests[];
+extern const u64 a0_test_count;
+#else
 extern const TestEntry a0_tests[] __attribute__((weak));
 extern const u64 a0_test_count __attribute__((weak));
+#endif
+
+// How many tests this build has: none when it is not a test build.
+static u64 test_count(void) {
+#if defined(_WIN32)
+    return a0_test_count;
+#else
+    return &a0_test_count ? a0_test_count : 0;
+#endif
+}
 
 static int contains(const u8 *hay, u64 n, const u8 *needle, u64 m) {
     if (m == 0) {
@@ -1510,10 +1488,10 @@ static void say(const char *text) {
 }
 
 // What a test child wrote, kept until its result is shown.
-typedef struct {
+struct Kept {
     u8 *data;
     u64 len, cap;
-} Kept;
+};
 
 static void keep(Kept *k, const u8 *p, u64 n) {
     if (k->len + n > k->cap) {
@@ -1530,107 +1508,25 @@ static void keep(Kept *k, const u8 *p, u64 n) {
     k->len += n;
 }
 
-typedef struct {
-    i64 pid;
-    int out, err;    // the pipes from the child's stdout and stderr; -1 once closed
+struct Run {
+    i64 child;       // the child process: a process id, or a handle
+    i64 out, err;    // where its output comes from, while it has not ended
     int status;
     int state;       // 0 not started, 1 running, 2 done, 3 shown
     Kept stdout_kept, stderr_kept;
-} Run;
+};
 
-static u64 processors(void) {
-    u64 mask[16];
-    for (int i = 0; i < 16; i++) {
-        mask[i] = 0;
-    }
-    i64 n = sys3(SYS_SCHED_GETAFFINITY, 0, sizeof(mask), (i64)mask);
-    u64 count = 0;
-    for (i64 i = 0; i < n / 8 && i < 16; i++) {
-        count += (u64)__builtin_popcountll(mask[i]);
-    }
-    return count ? count : 1;
-}
-
-static void start_test(System *sys, u64 i, u64 seed, Run *r) {
-    int out[2], err[2];
-    if (sys3(SYS_PIPE2, (i64)out, 0x80000, 0) < 0 || sys3(SYS_PIPE2, (i64)err, 0x80000, 0) < 0) {
-        a0rt_die("cannot make a pipe for a test", 29);
-    }
-    flush_all();
-    i64 pid = sys1(SYS_FORK, 0);
-    if (pid == 0) {
-        sys3(SYS_DUP2, out[1], 1, 0);
-        sys3(SYS_DUP2, err[1], 2, 0);
-        const TestEntry *t = &a0_tests[i];
-        // std.testing.Test: {seed, system}.
-        u64 test[2] = {mix(seed ^ mix(i)), (u64)sys};
-        a0rt_sched_seed(mix(test[0]));
-        if (t->takes_test) {
-            ((void (*)(u64 *))t->function)(test);
-        } else {
-            ((void (*)(void))t->function)();
-        }
-        exit_with(0);
-    }
-    sys1(SYS_CLOSE, out[1]);
-    sys1(SYS_CLOSE, err[1]);
-    r->pid = pid;
-    r->out = out[0];
-    r->err = err[0];
-    r->state = 1;
-}
-
-// Reads what the running children wrote; a child whose pipes are both
-// closed has ended, and is waited for.
-static void collect(Run *runs, u64 count) {
-    PollFd fds[128];
-    Run *who[128];
-    int *which[128];
-    u64 n = 0;
-    for (u64 i = 0; i < count && n + 2 <= 128; i++) {
-        Run *r = &runs[i];
-        if (r->state != 1) {
-            continue;
-        }
-        int *ends[2] = {&r->out, &r->err};
-        for (int k = 0; k < 2; k++) {
-            if (*ends[k] >= 0) {
-                fds[n].fd = *ends[k];
-                fds[n].events = 1;
-                fds[n].revents = 0;
-                who[n] = r;
-                which[n] = ends[k];
-                n++;
-            }
-        }
-    }
-    if (n > 0) {
-        i64 p;
-        do {
-            p = sys3(SYS_POLL, (i64)fds, (i64)n, -1);
-        } while (p == -4);
-        u8 buf[4096];
-        for (u64 j = 0; j < n; j++) {
-            if (fds[j].revents == 0) {
-                continue;
-            }
-            i64 got = sys3(SYS_READ, *which[j], (i64)buf, sizeof(buf));
-            if (got > 0) {
-                keep(which[j] == &who[j]->out ? &who[j]->stdout_kept : &who[j]->stderr_kept, buf, (u64)got);
-            } else if (got != -4) {
-                sys1(SYS_CLOSE, *which[j]);
-                *which[j] = -1;
-            }
-        }
-    }
-    for (u64 i = 0; i < count; i++) {
-        Run *r = &runs[i];
-        if (r->state == 1 && r->out < 0 && r->err < 0) {
-            int status = 0;
-            sys4(SYS_WAIT4, r->pid, (i64)&status, 0, 0);
-            r->status = status;
-            r->state = 2;
-        }
+// Runs the test numbered i with the run's seed, in the child process the
+// system made for it (os_start_test).
+static void run_test(System *sys, u64 i, u64 seed) {
+    const TestEntry *t = &a0_tests[i];
+    // std.testing.Test: {seed, system}.
+    u64 test[2] = {mix(seed ^ mix(i)), (u64)sys};
+    a0rt_sched_seed(mix(test[0]));
+    if (t->takes_test) {
+        ((void (*)(u64 *))t->function)(test);
+    } else {
+        ((void (*)(void))t->function)();
     }
 }
 
@@ -1671,6 +1567,9 @@ static void say_json_string(const u8 *p, u64 n) {
 }
 
 u16 a0rt_run_tests(System *sys) {
+    // On a system without fork, a child is this program started again for
+    // one test: it runs that test here and never returns (windows.inc).
+    os_test_child(sys);
     Str filter = {(const u8 *)"", 0};
     u64 seed = 0;
     int seeded = 0;
@@ -1693,15 +1592,15 @@ u16 a0rt_run_tests(System *sys) {
         }
     }
     if (jobs == 0) {
-        jobs = processors();
+        jobs = os_processors();
     }
+    // A child is waited for among the running ones, which some systems
+    // count no higher than this.
     if (jobs > 64) {
         jobs = 64;
     }
     if (!seeded) {
-        i64 ts[2] = {0, 0};
-        sys3(SYS_CLOCK_GETTIME, 1, (i64)ts, 0);
-        seed = mix((u64)ts[0] * 1000000000UL + (u64)ts[1] + (u64)sys1(SYS_GETPID, 0));
+        seed = mix(os_seed());
     }
     if (json) {
         say("{\"seed\": ");
@@ -1713,7 +1612,7 @@ u16 a0rt_run_tests(System *sys) {
         say("\n");
     }
     flush_all();
-    u64 count = &a0_test_count ? a0_test_count : 0;
+    u64 count = test_count();
     Run *runs = a0rt_alloc((count ? count : 1) * sizeof(Run));
     u64 passed = 0, failed = 0, skipped = 0;
     u64 next = 0, shown = 0, running = 0;
@@ -1725,7 +1624,7 @@ u16 a0rt_run_tests(System *sys) {
                 runs[next].state = 3;
                 skipped++;
             } else {
-                start_test(sys, next, seed, &runs[next]);
+                os_start_test(sys, next, seed, &runs[next]);
                 running++;
             }
             next++;
@@ -1763,7 +1662,7 @@ u16 a0rt_run_tests(System *sys) {
             shown++;
         }
         if (shown < count && running > 0) {
-            collect(runs, next);
+            os_collect(runs, next);
         }
     }
     if (json) {
@@ -1793,12 +1692,13 @@ u16 a0rt_run_tests(System *sys) {
     return 0;
 }
 
-// The kernel starts the program here, with argc at the top of the stack.
-__asm__(".text\n"
-        ".global _start\n"
-        "_start:\n"
-        "    xor %rbp, %rbp\n"
-        "    mov %rsp, %rdi\n"
-        "    and $-16, %rsp\n"
-        "    call a0rt_start\n"
-        "    hlt\n");
+// ---- the system -----------------------------------------------------------------
+//
+// The half of the runtime that one system alone has: memory, files, the
+// test runner's children, the switch between fibers, and the entry point
+// the system starts the program at, which ends in run_program above.
+#if defined(_WIN32)
+#include "windows.inc"
+#else
+#include "linux.inc"
+#endif

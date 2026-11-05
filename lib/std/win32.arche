@@ -1,0 +1,702 @@
+/// Win32 on x86-64, without the C library: the calls std is built on
+/// (spec/arche.md §10.2, docs/sprints.md S19). The system takes paths and
+/// names as UTF-16, so the text crosses over as UTF-16 and comes back as
+/// UTF-8 (wide, push_utf8). A handle is an i64, as the runtime keeps them
+/// (compiler/runtime/windows.inc): a call that fails answers 0, or
+/// INVALID_HANDLE for a handle, and leaves the reason in last_error.
+///
+/// Windows alone has these; the same std on Linux is lib/std.arche, on
+/// system calls from std.linux.
+import alloc;
+import core.mem;
+
+/// What GetLastError says, for the failures std tells apart.
+pub const ERROR_FILE_NOT_FOUND: u32 = 2;
+pub const ERROR_PATH_NOT_FOUND: u32 = 3;
+pub const ERROR_ACCESS_DENIED: u32 = 5;
+pub const ERROR_NO_MORE_FILES: u32 = 18;
+pub const ERROR_HANDLE_EOF: u32 = 38;
+pub const ERROR_FILE_EXISTS: u32 = 80;
+pub const ERROR_BROKEN_PIPE: u32 = 109;
+pub const ERROR_INVALID_NAME: u32 = 123;
+pub const ERROR_DIR_NOT_EMPTY: u32 = 145;
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
+pub const ERROR_DIRECTORY: u32 = 267;
+pub const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
+
+/// What the sockets say (WSAGetLastError), which is not GetLastError.
+pub const WSAEWOULDBLOCK: i32 = 10035;
+pub const WSAEINPROGRESS: i32 = 10036;
+pub const WSAEADDRINUSE: i32 = 10048;
+pub const WSAECONNREFUSED: i32 = 10061;
+
+pub const INVALID_HANDLE: i64 = -1;
+
+/// CreateFileW: what to do with the file, and what to let others do.
+pub const GENERIC_READ: u32 = 0x80000000;
+pub const GENERIC_WRITE: u32 = 0x40000000;
+pub const FILE_SHARE_ALL: u32 = 7;
+pub const CREATE_ALWAYS: u32 = 2;
+pub const OPEN_EXISTING: u32 = 3;
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+pub const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
+
+/// GetStdHandle: this program's input, output and error.
+pub const STD_INPUT: u32 = 0xFFFFFFF6;
+pub const STD_OUTPUT: u32 = 0xFFFFFFF5;
+pub const STD_ERROR: u32 = 0xFFFFFFF4;
+
+/// MoveFileExW replaces what is already there, as rename does.
+pub const MOVEFILE_REPLACE_EXISTING: u32 = 1;
+
+/// CreateProcessW: the child is held back until it is in a job of its own,
+/// so that everything it starts can be ended with it.
+pub const CREATE_SUSPENDED: u32 = 4;
+pub const STARTF_USESTDHANDLES: u32 = 0x100;
+
+/// WaitForSingleObject: it ended, rather than its time being up.
+pub const WAIT_OBJECT: u32 = 0;
+pub const INFINITE: u32 = 0xFFFFFFFF;
+
+/// A socket that is not one, and the call that makes a socket not block.
+pub const INVALID_SOCKET: i64 = -1;
+pub const FIONBIO: u32 = 0x8004667E;
+pub const SOL_SOCKET: i32 = 0xFFFF;
+pub const SO_ERROR: i32 = 0x1007;
+
+/// How large a WIN32_FIND_DATAW is, and where the name sits in it.
+pub const FIND_DATA_SIZE: usize = 592;
+pub const FIND_DATA_NAME: usize = 44;
+
+// ---- the system's own types -----------------------------------------------------
+//
+// Each is laid out as C lays it out, which for the types Arche has is the
+// layout it already uses (docs/abi.md): the padding between the fields is
+// the same, so Win32 reads them as its own.
+
+/// SECURITY_ATTRIBUTES: whether a child may inherit the handle.
+type Security = extern struct {
+    length: u32,
+    descriptor: u64,
+    inherit: i32,
+}
+
+/// STARTUPINFOW: how a child starts, and what its standard handles are.
+pub type Startup = extern struct {
+    pub cb: u32,
+    reserved: u64,
+    desktop: u64,
+    title: u64,
+    x: u32,
+    y: u32,
+    x_size: u32,
+    y_size: u32,
+    x_chars: u32,
+    y_chars: u32,
+    fill: u32,
+    pub flags: u32,
+    show_window: u16,
+    reserved2: u16,
+    reserved3: u64,
+    pub std_input: i64,
+    pub std_output: i64,
+    pub std_error: i64,
+}
+
+/// PROCESS_INFORMATION: what starting a program gives back.
+pub type Made = extern struct {
+    pub process: i64,
+    pub thread: i64,
+    pub pid: u32,
+    pub tid: u32,
+}
+
+/// A STARTUPINFOW that says the three handles below are the child's, and
+/// nothing else.
+pub fn new_startup() -> Startup {
+    return Startup {
+        cb: 104, reserved: 0, desktop: 0, title: 0, x: 0, y: 0, x_size: 0, y_size: 0, x_chars: 0, y_chars: 0,
+        fill: 0, flags: STARTF_USESTDHANDLES, show_window: 0, reserved2: 0, reserved3: 0,
+        std_input: INVALID_HANDLE, std_output: INVALID_HANDLE, std_error: INVALID_HANDLE,
+    };
+}
+
+pub fn new_made() -> Made {
+    return Made { process: INVALID_HANDLE, thread: INVALID_HANDLE, pid: 0, tid: 0 };
+}
+
+// ---- the calls ------------------------------------------------------------------
+//
+// kernel32 and its friends, by name: the linker takes each from the import
+// library of the system, so no header and no C library are needed. Only
+// integers and raw pointers cross over (spec/arche.md §10.2), so a handle
+// is an i64 and a text a pointer to UTF-16.
+
+extern "c" fn GetLastError() -> u32;
+extern "c" fn CloseHandle(it: i64) -> i32;
+extern "c" fn GetStdHandle(which: u32) -> i64;
+extern "c" fn CreateFileW(path: *u16, access: u32, share: u32, security: *u8, disposition: u32, flags: u32, from: i64) -> i64;
+extern "c" fn ReadFile(file: i64, into: *mut u8, n: u32, got: *mut u32, overlapped: *u8) -> i32;
+extern "c" fn PeekNamedPipe(pipe: i64, into: *mut u8, n: u32, read: *mut u32, waiting: *mut u32, left: *mut u32) -> i32;
+extern "c" fn GetConsoleMode(it: i64, mode: *mut u32) -> i32;
+extern "c" fn GetFileAttributesW(path: *u16) -> u32;
+extern "c" fn CreateDirectoryW(path: *u16, security: *u8) -> i32;
+extern "c" fn RemoveDirectoryW(path: *u16) -> i32;
+extern "c" fn DeleteFileW(path: *u16) -> i32;
+extern "c" fn MoveFileExW(from: *u16, to: *u16, flags: u32) -> i32;
+extern "c" fn FindFirstFileW(pattern: *u16, data: *mut u8) -> i64;
+extern "c" fn FindNextFileW(search: i64, data: *mut u8) -> i32;
+extern "c" fn FindClose(search: i64) -> i32;
+extern "c" fn GetCurrentDirectoryW(n: u32, into: *mut u16) -> u32;
+extern "c" fn GetEnvironmentVariableW(name: *u16, into: *mut u16, n: u32) -> u32;
+extern "c" fn GetCurrentProcessId() -> u32;
+extern "c" fn QueryPerformanceCounter(count: *mut i64) -> i32;
+extern "c" fn QueryPerformanceFrequency(count: *mut i64) -> i32;
+extern "c" fn GetSystemTimeAsFileTime(ticks: *mut u64);
+extern "c" fn Sleep(milliseconds: u32);
+extern "c" fn CreateProcessW(program: *u16, command: *mut u16, process_security: *u8, thread_security: *u8, inherit: i32,
+    flags: u32, environment: *u8, directory: *u16, startup: *u8, made: *mut u8) -> i32;
+extern "c" fn WaitForSingleObject(it: i64, milliseconds: u32) -> u32;
+extern "c" fn GetExitCodeProcess(process: i64, status: *mut u32) -> i32;
+extern "c" fn TerminateProcess(process: i64, status: u32) -> i32;
+extern "c" fn ResumeThread(thread: i64) -> u32;
+extern "c" fn AssignProcessToJobObject(job: i64, process: i64) -> i32;
+extern "c" fn CreateJobObjectW(security: *u8, name: *u16) -> i64;
+extern "c" fn TerminateJobObject(job: i64, status: u32) -> i32;
+/// Randomness from the system: RtlGenRandom, which advapi32 exports under
+/// this name.
+extern "c" fn SystemFunction036(into: *mut u8, n: u32) -> u8;
+/// The sockets (ws2_32). The runtime has started them already
+/// (compiler/runtime/windows.inc).
+extern "c" fn WSAGetLastError() -> i32;
+extern "c" fn socket(family: i32, kind: i32, protocol: i32) -> i64;
+extern "c" fn closesocket(s: i64) -> i32;
+extern "c" fn ioctlsocket(s: i64, command: u32, value: *mut u32) -> i32;
+extern "c" fn connect(s: i64, address: *u8, len: i32) -> i32;
+extern "c" fn bind(s: i64, address: *u8, len: i32) -> i32;
+extern "c" fn listen(s: i64, backlog: i32) -> i32;
+extern "c" fn accept(s: i64, address: *mut u8, len: *mut i32) -> i64;
+extern "c" fn getsockname(s: i64, address: *mut u8, len: *mut i32) -> i32;
+extern "c" fn setsockopt(s: i64, level: i32, name: i32, value: *u8, len: i32) -> i32;
+extern "c" fn getsockopt(s: i64, level: i32, name: i32, value: *mut u8, len: *mut i32) -> i32;
+extern "c" fn recv(s: i64, into: *mut u8, n: i32, flags: i32) -> i32;
+extern "c" fn send(s: i64, data: *u8, n: i32, flags: i32) -> i32;
+
+// ---- text -----------------------------------------------------------------------
+
+/// A path as Win32 wants it: UTF-16, NUL-terminated, in a buffer of the
+/// caller's. False when it does not fit or the text holds a NUL itself.
+pub fn wide(text: str, buf: []mut u16) -> bool {
+    let b = text.bytes();
+    var at: usize = 0;
+    var i: usize = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == 0 {
+            return false;
+        }
+        var cp: u32 = 0;
+        var len: usize = 1;
+        if c < 0x80 {
+            cp = c as u32;
+        } else if c < 0xE0 {
+            cp = (c & 0x1F) as u32;
+            len = 2;
+        } else if c < 0xF0 {
+            cp = (c & 0x0F) as u32;
+            len = 3;
+        } else {
+            cp = (c & 0x07) as u32;
+            len = 4;
+        }
+        if i + len > b.len() {
+            return false;
+        }
+        var k: usize = 1;
+        while k < len : (k += 1) {
+            cp = (cp << 6) | (b[i + k] & 0x3F) as u32;
+        }
+        i += len;
+        if cp < 0x10000 {
+            if at + 1 >= buf.len() {
+                return false;
+            }
+            buf[at] = cp as u16;
+            at += 1;
+        } else {
+            if at + 2 >= buf.len() {
+                return false;
+            }
+            let v = cp - 0x10000;
+            buf[at] = (0xD800 + (v >> 10)) as u16;
+            buf[at + 1] = (0xDC00 + (v & 0x3FF)) as u16;
+            at += 2;
+        }
+    }
+    if at >= buf.len() {
+        return false;
+    }
+    buf[at] = 0;
+    return true;
+}
+
+/// Appends UTF-16 to text as UTF-8; a lone surrogate, which is no
+/// character, goes as U+FFFD.
+pub fn push_utf8(out: &mut alloc.String, w: []u16) {
+    var i: usize = 0;
+    while i < w.len() {
+        var cp = w[i] as u32;
+        i += 1;
+        if cp >= 0xD800 and cp < 0xDC00 {
+            if i < w.len() and w[i] as u32 >= 0xDC00 and w[i] as u32 < 0xE000 {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (w[i] as u32 - 0xDC00);
+                i += 1;
+            } else {
+                cp = 0xFFFD;
+            }
+        } else if cp >= 0xDC00 and cp < 0xE000 {
+            cp = 0xFFFD;
+        }
+        if cp < 0x80 {
+            out.push_ascii(cp as u8);
+        } else {
+            var b: [4]u8 = [0; 4];
+            var n: usize = 0;
+            if cp < 0x800 {
+                b[0] = (0xC0 | (cp >> 6)) as u8;
+                b[1] = (0x80 | (cp & 0x3F)) as u8;
+                n = 2;
+            } else if cp < 0x10000 {
+                b[0] = (0xE0 | (cp >> 12)) as u8;
+                b[1] = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+                b[2] = (0x80 | (cp & 0x3F)) as u8;
+                n = 3;
+            } else {
+                b[0] = (0xF0 | (cp >> 18)) as u8;
+                b[1] = (0x80 | ((cp >> 12) & 0x3F)) as u8;
+                b[2] = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+                b[3] = (0x80 | (cp & 0x3F)) as u8;
+                n = 4;
+            }
+            unsafe {
+                // SAFETY: the bytes just written are one character of
+                // UTF-8, made from one code point that is not a surrogate.
+                out.push_str(mem.str_from(b[0..n]));
+            }
+        }
+    }
+}
+
+/// How many units of UTF-16 there are before the first NUL, at most limit.
+pub fn wide_len(w: []u16, limit: usize) -> usize {
+    var n: usize = 0;
+    while n < limit and n < w.len() and w[n] != 0 : (n += 1) {
+    }
+    return n;
+}
+
+// ---- what std calls -------------------------------------------------------------
+//
+// One wrapper for each call, so that the unsafe code of a foreign call is
+// here and std reads as Arche.
+
+pub fn last_error() -> u32 {
+    unsafe {
+        // SAFETY: it reads this thread's own last error.
+        return GetLastError();
+    }
+}
+
+pub fn socket_error() -> i32 {
+    unsafe {
+        // SAFETY: as last_error, for the sockets.
+        return WSAGetLastError();
+    }
+}
+
+pub fn close(it: i64) {
+    unsafe {
+        // SAFETY: the caller owns the handle and gives it up here.
+        _ = CloseHandle(it);
+    }
+}
+
+pub fn std_handle(which: u32) -> i64 {
+    unsafe {
+        // SAFETY: it reads one of this process's own handles.
+        return GetStdHandle(which);
+    }
+}
+
+/// Opens or makes a file; INVALID_HANDLE when it cannot. A handle a child
+/// is to inherit says so here, which Win32 wants as a structure of its own.
+pub fn open_file(path: []u16, access: u32, share: u32, disposition: u32, inherit: bool) -> i64 {
+    var security = Security { length: 24, descriptor: 0, inherit: if inherit { 1 } else { 0 } };
+    unsafe {
+        // SAFETY: path is NUL-terminated UTF-16 (wide), and security is
+        // read during the call only.
+        return CreateFileW(path: mem.slice_data(u16, path), access: access, share: share,
+            security: &security as *Security as *u8, disposition: disposition,
+            flags: FILE_ATTRIBUTE_NORMAL, from: 0);
+    }
+}
+
+/// Reads into a buffer: how many bytes, or -1. 0 means the end.
+pub fn read(file: i64, into: []mut u8) -> i64 {
+    var got: u32 = 0;
+    var worked: i32 = 0;
+    unsafe {
+        // SAFETY: ReadFile writes at most into.len() bytes, and how many
+        // into got.
+        worked = ReadFile(file, mem.slice_data(u8, into) as *mut u8, into.len() as u32, &mut got as *mut u32, mem.null(u8) as *u8);
+    }
+    if worked == 0 {
+        // A pipe whose writer has gone has simply ended, as a file does.
+        if last_error() == ERROR_BROKEN_PIPE or last_error() == ERROR_HANDLE_EOF {
+            return 0;
+        }
+        return -1;
+    }
+    return got as i64;
+}
+
+/// How many bytes are waiting in a pipe; -1 when it is not a pipe, and 0
+/// with a broken pipe, which has ended.
+pub fn pipe_waiting(pipe: i64) -> i64 {
+    var waiting: u32 = 0;
+    var worked: i32 = 0;
+    unsafe {
+        // SAFETY: nothing is read; only the count is written.
+        worked = PeekNamedPipe(pipe: pipe, into: mem.null(u8), n: 0, read: mem.null(u32),
+            waiting: &mut waiting as *mut u32, left: mem.null(u32));
+    }
+    if worked == 0 {
+        if last_error() == ERROR_BROKEN_PIPE {
+            return 0;
+        }
+        return -1;
+    }
+    return waiting as i64;
+}
+
+/// Whether the handle is a console, which is waited for, and not a file
+/// or the empty device, which are ready at once (std.Input).
+pub fn is_console(it: i64) -> bool {
+    var mode: u32 = 0;
+    unsafe {
+        // SAFETY: it writes one mode, and fails for what is no console.
+        return GetConsoleMode(it: it, mode: &mut mode as *mut u32) != 0;
+    }
+}
+
+pub fn file_attributes(path: []u16) -> u32 {
+    unsafe {
+        // SAFETY: path is NUL-terminated UTF-16.
+        return GetFileAttributesW(mem.slice_data(u16, path));
+    }
+}
+
+pub fn make_directory(path: []u16) -> bool {
+    unsafe {
+        // SAFETY: as above; the directory gets the default rights.
+        return CreateDirectoryW(mem.slice_data(u16, path), mem.null(u8) as *u8) != 0;
+    }
+}
+
+pub fn remove_directory(path: []u16) -> bool {
+    unsafe {
+        // SAFETY: as above.
+        return RemoveDirectoryW(mem.slice_data(u16, path)) != 0;
+    }
+}
+
+pub fn delete_file(path: []u16) -> bool {
+    unsafe {
+        // SAFETY: as above.
+        return DeleteFileW(mem.slice_data(u16, path)) != 0;
+    }
+}
+
+pub fn move_file(from: []u16, to: []u16) -> bool {
+    unsafe {
+        // SAFETY: both are NUL-terminated UTF-16.
+        return MoveFileExW(from: mem.slice_data(u16, from), to: mem.slice_data(u16, to),
+            flags: MOVEFILE_REPLACE_EXISTING) != 0;
+    }
+}
+
+/// Begins a walk over the names that match the pattern, writing the first
+/// into data (FIND_DATA_SIZE bytes); INVALID_HANDLE when there is none.
+pub fn find_first(pattern: []u16, data: []mut u8) -> i64 {
+    unsafe {
+        // SAFETY: data is as large as a WIN32_FIND_DATAW.
+        return FindFirstFileW(mem.slice_data(u16, pattern), mem.slice_data(u8, data) as *mut u8);
+    }
+}
+
+pub fn find_next(search: i64, data: []mut u8) -> bool {
+    unsafe {
+        // SAFETY: as find_first.
+        return FindNextFileW(search, mem.slice_data(u8, data) as *mut u8) != 0;
+    }
+}
+
+pub fn find_close(search: i64) {
+    unsafe {
+        // SAFETY: the walk the caller began, which ends here.
+        _ = FindClose(search);
+    }
+}
+
+/// The directory relative paths start from, as UTF-16: how many units, 0
+/// when it cannot be read.
+pub fn current_directory(into: []mut u16) -> usize {
+    unsafe {
+        // SAFETY: it writes at most into.len() units, with a NUL.
+        return GetCurrentDirectoryW(into.len() as u32, mem.slice_data(u16, into) as *mut u16) as usize;
+    }
+}
+
+/// The value of an environment variable, as UTF-16: how many units, 0 when
+/// there is no such variable.
+pub fn environment_variable(name: []u16, into: []mut u16) -> usize {
+    unsafe {
+        // SAFETY: name is NUL-terminated; it writes at most into.len().
+        return GetEnvironmentVariableW(mem.slice_data(u16, name), mem.slice_data(u16, into) as *mut u16, into.len() as u32) as usize;
+    }
+}
+
+pub fn process_id() -> u32 {
+    unsafe {
+        // SAFETY: it reads this process's own number.
+        return GetCurrentProcessId();
+    }
+}
+
+/// The clock that only goes forward, in its own ticks, and how many of
+/// them make a second.
+pub fn performance_counter() -> u64 {
+    var count: i64 = 0;
+    unsafe {
+        // SAFETY: it writes one count.
+        _ = QueryPerformanceCounter(&mut count as *mut i64);
+    }
+    return count as% u64;
+}
+
+pub fn performance_frequency() -> u64 {
+    var count: i64 = 1;
+    unsafe {
+        // SAFETY: as above; it is the same for the whole run.
+        _ = QueryPerformanceFrequency(&mut count as *mut i64);
+    }
+    if count <= 0 {
+        return 1;
+    }
+    return count as% u64;
+}
+
+/// The wall clock, in hundreds of nanoseconds since 1601-01-01 UTC.
+pub fn file_time() -> u64 {
+    var ticks: u64 = 0;
+    unsafe {
+        // SAFETY: it writes one FILETIME, which is eight bytes.
+        GetSystemTimeAsFileTime(&mut ticks as *mut u64);
+    }
+    return ticks;
+}
+
+pub fn sleep_ms(milliseconds: u32) {
+    unsafe {
+        // SAFETY: it only waits.
+        Sleep(milliseconds);
+    }
+}
+
+/// Starts a program, and tells about it in made. A program that is the
+/// empty text means the command line names it, and Windows looks for it in
+/// PATH; an empty directory means this program's own. The command line is
+/// the child's to read, so Windows may write in it.
+pub fn create_process(program: []u16, command: []mut u16, flags: u32, directory: []u16, startup: &Startup,
+    made: &mut Made) -> bool {
+    unsafe {
+        // SAFETY: both texts are NUL-terminated UTF-16 (wide), startup is
+        // the caller's STARTUPINFOW, and made is written during the call.
+        var name = mem.null(u16) as *u16;
+        if program.len() > 0 and program[0] != 0 {
+            name = mem.slice_data(u16, program);
+        }
+        var dir = mem.null(u16) as *u16;
+        if directory.len() > 0 and directory[0] != 0 {
+            dir = mem.slice_data(u16, directory);
+        }
+        return CreateProcessW(program: name, command: mem.slice_data(u16, command) as *mut u16,
+            process_security: mem.null(u8) as *u8, thread_security: mem.null(u8) as *u8,
+            inherit: 1, flags: flags, environment: mem.null(u8) as *u8, directory: dir,
+            startup: startup as *Startup as *u8, made: made as *mut Made as *mut u8) != 0;
+    }
+}
+
+pub fn wait_for(it: i64, milliseconds: u32) -> u32 {
+    unsafe {
+        // SAFETY: it waits for a handle of the caller's.
+        return WaitForSingleObject(it, milliseconds);
+    }
+}
+
+/// The status a process ended with; 259 while it still runs.
+pub fn exit_status(process: i64) -> u32 {
+    var status: u32 = 259;
+    unsafe {
+        // SAFETY: it writes one status.
+        _ = GetExitCodeProcess(process, &mut status as *mut u32);
+    }
+    return status;
+}
+
+pub fn terminate(process: i64, status: u32) {
+    unsafe {
+        // SAFETY: the process is the caller's to end.
+        _ = TerminateProcess(process, status);
+    }
+}
+
+pub fn resume_thread(thread: i64) {
+    unsafe {
+        // SAFETY: the thread is the one CreateProcessW made, held back
+        // until it is in a job of its own.
+        _ = ResumeThread(thread);
+    }
+}
+
+/// A job: everything a process in it starts is in it too, so one call ends
+/// the whole tree (Proc.spawn).
+pub fn create_job() -> i64 {
+    unsafe {
+        // SAFETY: a job of no name, with the default rights.
+        return CreateJobObjectW(mem.null(u8) as *u8, mem.null(u16) as *u16);
+    }
+}
+
+pub fn assign_job(job: i64, process: i64) -> bool {
+    unsafe {
+        // SAFETY: both handles are the caller's.
+        return AssignProcessToJobObject(job: job, process: process) != 0;
+    }
+}
+
+pub fn terminate_job(job: i64, status: u32) {
+    unsafe {
+        // SAFETY: as above; every process in the job ends.
+        _ = TerminateJobObject(job, status);
+    }
+}
+
+pub fn random(into: []mut u8) -> bool {
+    unsafe {
+        // SAFETY: it writes exactly into.len() bytes.
+        return SystemFunction036(mem.slice_data(u8, into) as *mut u8, into.len() as u32) != 0;
+    }
+}
+
+// ---- the sockets ----------------------------------------------------------------
+
+pub fn new_socket(family: i32, kind: i32, protocol: i32) -> i64 {
+    unsafe {
+        // SAFETY: the sockets were started by the runtime.
+        return socket(family: family, kind: kind, protocol: protocol);
+    }
+}
+
+pub fn close_socket(s: i64) {
+    unsafe {
+        // SAFETY: the socket is the caller's to give up.
+        _ = closesocket(s);
+    }
+}
+
+/// Makes the socket answer at once instead of waiting, so that a task can
+/// let the others run (std.Net).
+pub fn no_block(s: i64) -> bool {
+    var one: u32 = 1;
+    unsafe {
+        // SAFETY: it reads the one value.
+        return ioctlsocket(s, FIONBIO, &mut one as *mut u32) == 0;
+    }
+}
+
+pub fn socket_connect(s: i64, address: []u8) -> i32 {
+    unsafe {
+        // SAFETY: address is a sockaddr of address.len() bytes.
+        return connect(s, mem.slice_data(u8, address), address.len() as i32);
+    }
+}
+
+pub fn socket_bind(s: i64, address: []u8) -> i32 {
+    unsafe {
+        // SAFETY: as socket_connect.
+        return bind(s, mem.slice_data(u8, address), address.len() as i32);
+    }
+}
+
+pub fn socket_listen(s: i64, backlog: i32) -> i32 {
+    unsafe {
+        // SAFETY: it only marks the socket as listening.
+        return listen(s, backlog);
+    }
+}
+
+pub fn socket_accept(s: i64) -> i64 {
+    unsafe {
+        // SAFETY: the peer's address is not asked for.
+        return accept(s, mem.null(u8), mem.null(i32));
+    }
+}
+
+/// The address the socket is bound to, into a sockaddr of the caller's.
+pub fn socket_name(s: i64, address: []mut u8) -> bool {
+    var len = address.len() as i32;
+    unsafe {
+        // SAFETY: it writes at most len bytes of address, and how many.
+        return getsockname(s, mem.slice_data(u8, address) as *mut u8, &mut len as *mut i32) == 0;
+    }
+}
+
+pub fn set_option(s: i64, level: i32, name: i32, value: []u8) -> bool {
+    unsafe {
+        // SAFETY: value is value.len() bytes the call reads.
+        return setsockopt(s: s, level: level, name: name, value: mem.slice_data(u8, value),
+            len: value.len() as i32) == 0;
+    }
+}
+
+/// The error a socket kept from an operation that had not finished yet.
+pub fn pending_error(s: i64) -> i32 {
+    var e: i32 = 0;
+    var len: i32 = 4;
+    unsafe {
+        // SAFETY: SO_ERROR is one int, which it writes.
+        if getsockopt(s: s, level: SOL_SOCKET, name: SO_ERROR, value: &mut e as *mut i32 as *mut u8,
+            len: &mut len as *mut i32) != 0 {
+            return 0;
+        }
+    }
+    return e;
+}
+
+/// Reads from a socket: how many bytes, 0 when the peer has closed, or -1.
+pub fn socket_read(s: i64, into: []mut u8) -> i64 {
+    unsafe {
+        // SAFETY: it writes at most into.len() bytes.
+        return recv(s: s, into: mem.slice_data(u8, into) as *mut u8, n: into.len() as i32, flags: 0) as i64;
+    }
+}
+
+/// Writes to a socket: how many bytes went, or -1.
+pub fn socket_write(s: i64, data: []u8) -> i64 {
+    unsafe {
+        // SAFETY: it reads data.len() bytes.
+        return send(s: s, data: mem.slice_data(u8, data), n: data.len() as i32, flags: 0) as i64;
+    }
+}

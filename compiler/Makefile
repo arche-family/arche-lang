@@ -10,11 +10,20 @@
 
 STAGE0 := ../stage0
 BUILD := build
-SOURCES := $(shell find . -name '*.arche' -not -path './build/*')
+SOURCES := $(wildcard *.arche */*.arche */*/*.arche)
+# Windows starts no script of its own: the runner is given a shell and the
+# script to run in it (docs/sprints.md S19).
+ifeq ($(OS),Windows_NT)
+BUILD_CMD := sh ./arche-build
+TESTS_CMD := sh ./arche-build-tests
+else
+BUILD_CMD := ./arche-build
+TESTS_CMD := ./arche-build-tests
+endif
 
 all: $(BUILD)/arche
 
-$(BUILD)/arche: $(SOURCES) | $(BUILD)
+$(BUILD)/arche: $(SOURCES) $(STAGE0)/runtime/arche0_rt.c $(STAGE0)/runtime/arche0_rt.h | $(BUILD)
 	$(MAKE) -C $(STAGE0)
 	$(STAGE0)/arche0-build main.arche $@
 
@@ -23,8 +32,8 @@ $(BUILD):
 
 check: $(BUILD)/arche
 	$(MAKE) -C ../conformance
-	../conformance/runner/build/runner --timeout 30 --compiler ./arche-build ../conformance/tests
-	../conformance/runner/build/runner --timeout 30 --compiler ./arche-build-tests ../conformance/testrunner
+	../conformance/runner/build/runner --timeout 30 --compiler "$(BUILD_CMD)" ../conformance/tests
+	../conformance/runner/build/runner --timeout 30 --compiler "$(TESTS_CMD)" ../conformance/testrunner
 	sh ./check-valid.sh $(BUILD)/arche ../conformance/tests
 	sh ./roundtrip.sh $(BUILD)/arche ../conformance/tests .
 	sh ./tests/run.sh $(BUILD)/arche

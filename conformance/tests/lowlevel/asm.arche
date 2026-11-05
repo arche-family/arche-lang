@@ -1,7 +1,6 @@
 // test: run
 // spec: arche/10.2
 // stage0: skip
-// stdout: raw
 // stdout: 42
 // stdout: tsc
 import std;
@@ -13,18 +12,6 @@ fn add_asm(a: u64, b: u64) -> u64 {
         asm("addq %1, %0", inout(reg) x, in(reg) b, clobber("cc"));
     }
     return x;
-}
-
-fn write_raw(text: str) -> i64 {
-    var n: i64 = 1; // write(2)
-    let fd: i64 = 1;
-    let b = text.bytes();
-    unsafe {
-        // SAFETY: write(fd, p, len) reads len bytes at p, which b holds.
-        let p = &b[0] as *u8;
-        asm("syscall", inout("rax") n, in("rdi") fd, in("rsi") p, in("rdx") b.len(), clobber("rcx"), clobber("r11"));
-    }
-    return n;
 }
 
 fn main(sys: &mut std.System) -> !void {
@@ -39,6 +26,4 @@ fn main(sys: &mut std.System) -> !void {
     if lo != 0 or hi != 0 {
         sys.stdout.write("tsc\n");
     }
-    // The raw write goes around the buffered output: flush order is ours.
-    _ = write_raw("raw\n");
 }
