@@ -1,7 +1,9 @@
 #!/bin/sh
 # Golden tests of `arche check`: text and JSON diagnostics, fixes included;
-# and of `arche fix`: each fix/<name>.arche becomes fix/<name>.fixed, which
-# checks clean.
+# of `arche fix`: each fix/<name>.arche becomes fix/<name>.fixed, which
+# checks clean; and of `arche fmt`: fmt/<name>.arche becomes
+# fmt/<name>.formatted, which stays as it is, and so do the compiler's and
+# the library's sources.
 # Usage: run.sh <arche>
 set -u
 arche=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -25,5 +27,17 @@ for f in fix/*.arche; do
     diff -u "$name.fixed" "$work/case.arche" || status=1
     "$arche" check "$work/case.arche" || status=1
 done
-[ "$status" -eq 0 ] && echo "diagnostics and fixes: ok"
+for f in fmt/*.arche; do
+    name=${f%.arche}
+    cp "$f" "$work/case.arche"
+    "$arche" fmt "$work/case.arche" || status=1
+    diff -u "$name.formatted" "$work/case.arche" || status=1
+    "$arche" fmt --check "$work/case.arche" || status=1
+done
+for f in ../*.arche ../syntax/*.arche ../sema/*.arche ../lower/*.arche ../ir/*.arche ../../lib/*.arche ../../lib/*/*.arche ../../lib/*/*/*.arche \
+    ../../interop/*.arche ../../fuzz/*.arche ../../ctcheck/*.arche ../../freestanding/*.arche; do
+    [ -f "$f" ] || continue
+    "$arche" fmt --check "$f" || status=1
+done
+[ "$status" -eq 0 ] && echo "diagnostics, fixes and layout: ok"
 exit "$status"

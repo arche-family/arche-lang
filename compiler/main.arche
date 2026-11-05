@@ -6,6 +6,7 @@
 ///     arche cst <file>              print it again from its syntax tree
 ///     arche fix <file>              apply the fixes the checker suggests
 ///     arche explain <code>          what an error code means, with an example
+///     arche fmt [--check] <file>    lay the file out the one way (syntax/fmt.arche)
 ///     arche build <file> <out.ll>   compile it to LLVM IR (arche-build links it)
 ///
 /// Functions take the capabilities they use one by one, not the whole
@@ -20,6 +21,7 @@ import sema.check as sema;
 import syntax.lexer;
 import syntax.parser;
 import syntax.cst;
+import syntax.fmt;
 import ir.ir;
 import ir.llvm;
 import lower.lower;
@@ -31,6 +33,7 @@ fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("usage: arche check [--json] <file>\n");
     err_out.write("       arche fix <file>                apply the checker's fixes to the files\n");
     err_out.write("       arche explain [--example] <code>   what an error code means, or just its example\n");
+    err_out.write("       arche fmt [--check] <file>      lay the file out; --check only says whether it is\n");
     err_out.write("       arche tokens <file>\n");
     err_out.write("       arche cst <file>\n");
     err_out.write("       arche build <file> <out.ll>\n");
@@ -244,6 +247,39 @@ fn explain_code(out: &mut std.Output, err_out: &mut std.Output, text: str, only_
     }
     if n == 101 {
         out.write("    (the byte 0xFF)\n");
+    }
+}
+
+/// `arche fmt`: rewrites the file laid out, or with --check says whether it
+/// is (status 1 when not).
+fn format_file(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, check_only: bool) -> Failure!void {
+    let source = try read(fs, err_out, path, a);
+    var text = alloc.String.init(a);
+    match fmt.format(source.view(), a) {
+        some(t) => { text = t; }
+        none => {
+            err_out.write("arche fmt: ");
+            err_out.write(path);
+            err_out.write(" has a lexical error; arche check says which\n");
+            return Failure.ErrorsFound;
+        }
+    }
+    if text.view().eq(source.view()) {
+        return;
+    }
+    if check_only {
+        out.write(path);
+        out.write(": not formatted\n");
+        return Failure.ErrorsFound;
+    }
+    match fs.write_file(path: path, data: text.view()) {
+        ok(_) => { }
+        err(_) => {
+            err_out.write("arche: cannot write ");
+            err_out.write(path);
+            err_out.write("\n");
+            return Failure.CannotWrite;
+        }
     }
 }
 
@@ -505,6 +541,10 @@ fn main(sys: &mut std.System) -> !void {
         try explain_code(out: &mut sys.stdout, err_out: &mut sys.stderr, text: sys.args.get(2 + k), only_example: false);
     } else if command.eq("explain") and count == 4 and sys.args.get(2 + k).eq("--example") {
         try explain_code(out: &mut sys.stdout, err_out: &mut sys.stderr, text: sys.args.get(3 + k), only_example: true);
+    } else if command.eq("fmt") and count == 3 {
+        try format_file(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), check_only: false);
+    } else if command.eq("fmt") and count == 4 and sys.args.get(2 + k).eq("--check") {
+        try format_file(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3 + k), check_only: true);
     } else if command.eq("tokens") and count == 3 {
         try dump_tokens(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));
     } else if command.eq("build") and count == 4 {

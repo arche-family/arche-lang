@@ -1,0 +1,318 @@
+/// arche fmt (docs/sprints.md S23): one layout, with no settings. It keeps
+/// where lines break and works on the lossless token stream, so comments
+/// stay where they are; it sets
+///
+/// - indentation: four spaces inside each bracket left open on an earlier
+///   line, counted from the line that opened a parenthesis or a square
+///   bracket, or from the first line of the statement that opened a brace;
+///   among statements, four more for a line that goes on from one ending
+///   in an operator;
+/// - spaces in a line: one around binary operators, assignments, `=>` and
+///   `->`, one after `,`, `;` and `:`, none inside brackets, before `,` and
+///   `;`, around `.`, `..` and `.*`, or after a prefix operator; elsewhere,
+///   before a `while` step's `:` too, one if the source had any;
+/// - blank lines: at most one, none at the start of the file, none just
+///   inside a block's braces; the file ends with one newline.
+///
+/// The tokens other than whitespace are the same before and after, which
+/// format checks before it returns.
+import alloc;
+import diag;
+import syntax.lexer;
+import syntax.token as tk;
+
+/// A token kept for the layout: its kind and text, and whether the source
+/// had whitespace before it on its line.
+type Piece = struct {
+    kind: tk.Kind,
+    start: u32,
+    len: u32,
+    spaced: bool,
+}
+
+/// A line: its pieces, and how many blank lines came before it.
+type Line = struct {
+    first: usize,
+    count: usize,
+    blanks_before: u32,
+}
+
+fn is_open(k: tk.Kind) -> bool {
+    return k == tk.Kind.LParen or k == tk.Kind.LBracket or k == tk.Kind.LBrace;
+}
+
+fn is_close(k: tk.Kind) -> bool {
+    return k == tk.Kind.RParen or k == tk.Kind.RBracket or k == tk.Kind.RBrace;
+}
+
+fn is_comment(k: tk.Kind) -> bool {
+    return k == tk.Kind.Comment or k == tk.Kind.DocComment;
+}
+
+/// Whether a token ends an operand, so that an operator after it is binary.
+fn ends_operand(k: tk.Kind) -> bool {
+    return k == tk.Kind.Ident or k == tk.Kind.Int or k == tk.Kind.Float or k == tk.Kind.Char or
+        k == tk.Kind.String or k == tk.Kind.RParen or k == tk.Kind.RBracket or k == tk.Kind.DotStar or
+        k == tk.Kind.KwTrue or k == tk.Kind.KwFalse or k == tk.Kind.KwNone or k == tk.Kind.Underscore;
+}
+
+/// Operators that are binary after an operand and prefix elsewhere.
+fn maybe_prefix(k: tk.Kind) -> bool {
+    return k == tk.Kind.Minus or k == tk.Kind.Star or k == tk.Kind.Amp;
+}
+
+/// Operators that are always binary, and assignments.
+fn always_binary(k: tk.Kind) -> bool {
+    return k == tk.Kind.Plus or k == tk.Kind.Slash or k == tk.Kind.Percent or
+        k == tk.Kind.PlusWrap or k == tk.Kind.MinusWrap or k == tk.Kind.StarWrap or
+        k == tk.Kind.Pipe or k == tk.Kind.Caret or k == tk.Kind.Shl or k == tk.Kind.Shr or
+        k == tk.Kind.EqEq or k == tk.Kind.NotEq or k == tk.Kind.Lt or k == tk.Kind.Le or
+        k == tk.Kind.Gt or k == tk.Kind.Ge or k == tk.Kind.Assign or k == tk.Kind.PlusAssign or
+        k == tk.Kind.MinusAssign or k == tk.Kind.StarAssign or k == tk.Kind.SlashAssign or
+        k == tk.Kind.PercentAssign or k == tk.Kind.PlusWrapAssign or k == tk.Kind.MinusWrapAssign or
+        k == tk.Kind.StarWrapAssign or k == tk.Kind.AmpAssign or k == tk.Kind.PipeAssign or
+        k == tk.Kind.CaretAssign or k == tk.Kind.ShlAssign or k == tk.Kind.ShrAssign or
+        k == tk.Kind.FatArrow or k == tk.Kind.Arrow;
+}
+
+/// Whether a line ending in this token goes on in the next line.
+fn continues(k: tk.Kind) -> bool {
+    return always_binary(k) or maybe_prefix(k) or k == tk.Kind.KwAnd or k == tk.Kind.KwOr or
+        k == tk.Kind.KwOrelse or k == tk.Kind.KwCatch;
+}
+
+/// The space between two pieces of a line, b after a. operand says
+/// whether a binary operator after a is binary; prefix whether a is an
+/// operator used as a prefix.
+fn space_between(a: &Piece, b: &Piece, a_binary: bool, b_binary: bool) -> bool {
+    let ak = a.kind;
+    let bk = b.kind;
+    if is_comment(bk) {
+        return true;
+    }
+    if bk == tk.Kind.Colon {
+        return b.spaced;
+    }
+    // A member, a dereference and a range follow an operand closely; a
+    // variant's leading dot or a rest pattern's .. keeps the source's space.
+    if bk == tk.Kind.Dot or bk == tk.Kind.DotStar or bk == tk.Kind.DotDot or bk == tk.Kind.DotDotEq {
+        if ends_operand(ak) {
+            return false;
+        }
+        return b.spaced;
+    }
+    if ak == tk.Kind.DotDot or ak == tk.Kind.DotDotEq {
+        if bk == tk.Kind.RBrace or bk == tk.Kind.RBracket or bk == tk.Kind.RParen or bk == tk.Kind.Comma {
+            return b.spaced;
+        }
+        return false;
+    }
+    if bk == tk.Kind.Comma or bk == tk.Kind.Semi or bk == tk.Kind.RParen or bk == tk.Kind.RBracket {
+        return false;
+    }
+    if ak == tk.Kind.LParen or ak == tk.Kind.LBracket or ak == tk.Kind.Dot or ak == tk.Kind.Tilde or
+        ak == tk.Kind.Bang or ak == tk.Kind.Question {
+        return false;
+    }
+    if ak == tk.Kind.Comma or ak == tk.Kind.Semi or ak == tk.Kind.Colon {
+        return true;
+    }
+    if (always_binary(bk) or b_binary) and bk != tk.Kind.Bang {
+        return true;
+    }
+    if always_binary(ak) or a_binary {
+        return true;
+    }
+    if maybe_prefix(ak) {
+        // A prefix: &x, -1, *u8, and &mut x.
+        return false;
+    }
+    return b.spaced;
+}
+
+/// The file laid out, or none when its tokens could not be kept: then it
+/// has a lexical error, and check says which.
+pub fn format(text: str, a: alloc.Allocator) -> ?alloc.String {
+    var diags = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(text, true, &mut diags, a);
+    if diags.count() > 0 {
+        return none;
+    }
+    // Pieces and lines.
+    var pieces = alloc.List(Piece).init(a);
+    var lines = alloc.List(Line).init(a);
+    var newlines: u32 = 0;
+    var spaced = false;
+    var line_open = false;
+    let ts = tokens.items();
+    var i: usize = 0;
+    while i < ts.len() : (i += 1) {
+        let t = ts[i];
+        if t.kind == tk.Kind.Eof {
+            break;
+        }
+        if t.kind == tk.Kind.Whitespace {
+            var k: u32 = 0;
+            while k < t.len : (k += 1) {
+                if text[(t.start + k) as usize] == '\n' {
+                    newlines += 1;
+                    line_open = false;
+                }
+            }
+            spaced = true;
+            continue;
+        }
+        if not line_open {
+            var blanks: u32 = 0;
+            if newlines > 1 {
+                blanks = newlines - 1;
+            }
+            lines.push(Line { first: pieces.len(), count: 0, blanks_before: blanks });
+            line_open = true;
+            spaced = false;
+        }
+        newlines = 0;
+        pieces.push(Piece { kind: t.kind, start: t.start, len: t.len, spaced: spaced });
+        let last = lines.len() - 1;
+        lines[last].count += 1;
+        spaced = false;
+    }
+    // Layout.
+    var out = alloc.String.init(a);
+    var stack = alloc.List(u32).init(a);
+    var braces = alloc.List(bool).init(a);
+    var stmt_indent: u32 = 0;
+    let ps = pieces.items();
+    let ls = lines.items();
+    var prev_last = tk.Kind.Eof;
+    var prev_opened = false;
+    var chain_base: u32 = 0;
+    var in_chain = false;
+    var prev_indent: u32 = 0;
+    var prev_opened_block = false;
+    var li: usize = 0;
+    while li < ls.len() : (li += 1) {
+        let line = ls[li];
+        let first = &ps[line.first];
+        // The indentation: the innermost open bracket's line, plus four;
+        // a line that starts by closing brackets goes back to where they
+        // opened.
+        var depth = stack.len();
+        var j: usize = 0;
+        while j < line.count and is_close(ps[line.first + j].kind) and depth > 0 : (j += 1) {
+            depth -= 1;
+        }
+        var indent: u32 = 0;
+        if j > 0 {
+            indent = stack[depth];
+        } else if depth > 0 {
+            indent = stack[depth - 1] + 4;
+        }
+        let among_statements = depth == 0 or braces[depth - 1];
+        // A contract or a where clause, on lines of its own between a
+        // function's signature and its body.
+        let clause = first.kind == tk.Kind.KwRequires or first.kind == tk.Kind.KwEnsures or first.kind == tk.Kind.KwWhere;
+        let goes_on = continues(prev_last) and not prev_opened and not is_comment(first.kind) and j == 0 and among_statements;
+        if clause and j == 0 {
+            indent = stmt_indent + 4;
+        } else if goes_on {
+            if not in_chain {
+                chain_base = prev_indent;
+                in_chain = true;
+            }
+            indent = chain_base + 4;
+        } else if not is_comment(first.kind) {
+            in_chain = false;
+            if among_statements and not clause {
+                stmt_indent = indent;
+            }
+        }
+        // Blank lines: one at most, none after an opening brace or before a
+        // closing one, none at the start.
+        if line.blanks_before > 0 and li > 0 and not prev_opened_block and not is_close(first.kind) {
+            out.push_str("\n");
+        }
+        var s: u32 = 0;
+        while s < indent : (s += 1) {
+            out.push_ascii(' ');
+        }
+        // The pieces, and the brackets they open and close.
+        let depth_before = stack.len();
+        var k: usize = 0;
+        var prev_binary = false;
+        while k < line.count : (k += 1) {
+            let p = &ps[line.first + k];
+            var binary = false;
+            if maybe_prefix(p.kind) and k > 0 and ends_operand(ps[line.first + k - 1].kind) {
+                binary = true;
+            }
+            if maybe_prefix(p.kind) and k == 0 and continues(prev_last) == false and ends_operand(prev_last) {
+                binary = true;
+            }
+            if k > 0 and space_between(a: &ps[line.first + k - 1], b: p, a_binary: prev_binary, b_binary: binary) {
+                out.push_ascii(' ');
+            }
+            out.push_str(text[p.start as usize..(p.start + p.len) as usize]);
+            if is_open(p.kind) {
+                // A block is indented from its statement's first line.
+                if p.kind == tk.Kind.LBrace {
+                    stack.push(stmt_indent);
+                    braces.push(true);
+                } else {
+                    stack.push(indent);
+                    braces.push(false);
+                }
+            } else if is_close(p.kind) and stack.len() > 0 {
+                _ = stack.pop();
+                _ = braces.pop();
+            }
+            prev_binary = binary;
+        }
+        out.push_str("\n");
+        // What the next line needs to know about this one.
+        var last_code = line.count;
+        while last_code > 0 and is_comment(ps[line.first + last_code - 1].kind) : (last_code -= 1) {
+        }
+        if last_code > 0 {
+            prev_last = ps[line.first + last_code - 1].kind;
+            prev_opened = stack.len() > depth_before;
+            prev_indent = indent;
+            prev_opened_block = prev_last == tk.Kind.LBrace;
+        } else {
+            prev_opened_block = false;
+        }
+    }
+    if not same_tokens(a_text: text, b: out.view(), a) {
+        return none;
+    }
+    return out;
+}
+
+/// Whether two texts have the same tokens, whitespace aside.
+fn same_tokens(a_text: str, b: str, a: alloc.Allocator) -> bool {
+    var d1 = diag.Diagnostics.init(a);
+    var d2 = diag.Diagnostics.init(a);
+    let t1 = lexer.lex(a_text, true, &mut d1, a);
+    let t2 = lexer.lex(b, true, &mut d2, a);
+    let x = t1.items();
+    let y = t2.items();
+    var i: usize = 0;
+    var j: usize = 0;
+    while true {
+        while i < x.len() and x[i].kind == tk.Kind.Whitespace : (i += 1) {
+        }
+        while j < y.len() and y[j].kind == tk.Kind.Whitespace : (j += 1) {
+        }
+        if i == x.len() or j == y.len() {
+            return i == x.len() and j == y.len();
+        }
+        let p = a_text[x[i].start as usize..(x[i].start + x[i].len) as usize];
+        let q = b[y[j].start as usize..(y[j].start + y[j].len) as usize];
+        if x[i].kind != y[j].kind or not p.eq(q) {
+            return false;
+        }
+        i += 1;
+        j += 1;
+    }
+    return false;
+}
