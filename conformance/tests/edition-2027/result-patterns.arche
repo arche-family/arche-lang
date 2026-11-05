@@ -1,0 +1,26 @@
+// test: run
+// spec: arche/1.2
+// stage0: skip
+// stdout: 4 odd
+import std;
+
+fn half(n: u32) -> std.IoError!u32 {
+    if n % 2 == 1 {
+        return std.IoError.IoFailed;
+    }
+    return n / 2;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let ok: u32 = 3;
+    let err: u32 = 5;
+    match half(ok + err) {
+        .ok(v) => { sys.stdout.write_u64(v as u64); }
+        .err(_) => { sys.stdout.write("odd"); }
+    }
+    match half(ok) {
+        .ok(v) => { sys.stdout.write_u64(v as u64); }
+        .err(_) => { sys.stdout.write(" odd"); }
+    }
+    sys.stdout.write("\n");
+}

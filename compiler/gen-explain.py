@@ -6,7 +6,9 @@ An example is compiler/explain/<code>.arche when there is one, else the
 shortest compile-error test that names the code (conformance/tests and
 conformance/testrunner), without its header. In an example of its own, a
 first line `// arche <options> check` gives the options to check it with,
-and a line `// package` says it is full Arche (a package.arche beside it).
+a line `// package` says it is full Arche (a package.arche beside it), a
+line `// manifest: <text>` gives that package.arche, and a line
+`// as package.arche` says the example is the manifest itself.
 E0101's example ends with the byte 0xFF, which arche explain adds.
 
 Usage: python3 -I compiler/gen-explain.py [output]   (default: compiler/explain.arche)
@@ -78,7 +80,7 @@ def literal(text):
 
 def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "compiler/explain.arche")
-    meaning, example, full, options = [], [], [], []
+    meaning, example, full, options, manifests, files = [], [], [], [], [], []
     for code, text in codes():
         n = int(code[1:])
         meaning.append((n, text))
@@ -90,8 +92,18 @@ def main():
             if m:
                 options.append((n, m.group(1)))
                 body = body.split("\n", 1)[1]
-            is_full = body.startswith("// package\n")
-            if is_full:
+            is_full = False
+            while True:
+                first = body.split("\n", 1)[0]
+                if first == "// package":
+                    is_full = True
+                elif first.startswith("// manifest: "):
+                    is_full = True
+                    manifests.append((n, first[len("// manifest: "):] + "\n"))
+                elif first == "// as package.arche":
+                    files.append((n, "package.arche"))
+                else:
+                    break
                 body = body.split("\n", 1)[1]
             example.append((n, body))
             full.append((n, is_full))
@@ -133,6 +145,18 @@ def main():
     for n, o in options:
         lines.append("    if code == %d {" % n)
         lines.append("        return %s;" % literal(o))
+        lines.append("    }")
+    lines += ["    return \"\";", "}", "", "/// The package.arche the example needs, or \"\" for one that only says",
+              "/// the package is full Arche.", "pub fn example_manifest(code: u16) -> str {"]
+    for n, m in manifests:
+        lines.append("    if code == %d {" % n)
+        lines.append("        return %s;" % literal(m))
+        lines.append("    }")
+    lines += ["    return \"\";", "}", "", "/// The name the example's file must have, or \"\" for any.",
+              "pub fn example_file(code: u16) -> str {"]
+    for n, f in files:
+        lines.append("    if code == %d {" % n)
+        lines.append("        return %s;" % literal(f))
         lines.append("    }")
     lines += ["    return \"\";", "}", ""]
     open(out_path, "w", encoding="utf-8", newline="").write("\n".join(lines))

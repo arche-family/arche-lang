@@ -5,7 +5,7 @@
 # fmt/<name>.formatted, which stays as it is, and so do the compiler's and
 # the library's sources; and of `arche query`: the queries in
 # query/<name>.cases give query/<name>.expected; and of `arche doc`:
-# doc/<name>.arche gives doc/<name>.md.
+# doc/<name>.arche gives doc/<name>.md; and of `arche fix --edition`.
 # Usage: run.sh <arche>
 set -u
 arche=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -54,5 +54,10 @@ for f in doc/*.arche; do
     "$arche" doc "$f" "$(basename "$name")" > "$out" || status=1
     diff -u "$name.md" "$out" || status=1
 done
-[ "$status" -eq 0 ] && echo "diagnostics, fixes, layout, queries and docs: ok"
+# arche fix --edition: edition/before becomes edition/after, which builds.
+mkdir -p "$work/edition"
+cp edition/before/* "$work/edition/"
+"$arche" fix --edition 2027 "$work/edition/main.arche" > /dev/null || status=1
+diff -r edition/after "$work/edition" || status=1
+[ "$status" -eq 0 ] && echo "diagnostics, fixes, layout, queries, docs and editions: ok"
 exit "$status"

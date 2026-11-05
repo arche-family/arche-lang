@@ -22,16 +22,20 @@ for code in $(sed -n 's/^| `\(E[0-9]\{4\}\)` | .*|$/\1/p' "$here/../docs/error-c
     fi
     case_dir="$work/$code"
     mkdir -p "$case_dir"
-    "$arche" explain --example "$code" > "$case_dir/case.arche"
-    if [ ! -s "$case_dir/case.arche" ]; then
+    file=$("$arche" explain --example-file "$code")
+    [ -n "$file" ] || file=case.arche
+    "$arche" explain --example "$code" > "$case_dir/$file"
+    if [ ! -s "$case_dir/$file" ]; then
         echo "explain: $code has no example"
         status=1
         continue
     fi
     "$arche" explain "$code" | grep -q "in a package" && echo "// A manifest." > "$case_dir/package.arche"
+    "$arche" explain --example-manifest "$code" > "$case_dir/manifest"
+    [ -s "$case_dir/manifest" ] && cp "$case_dir/manifest" "$case_dir/package.arche"
     options=$("$arche" explain "$code" | sed -n 's/.*`arche \(.*\) check` reports.*/\1/p')
     # shellcheck disable=SC2086
-    if "$arche" $options check "$case_dir/case.arche" > /dev/null 2> "$case_dir/out"; then
+    if "$arche" $options check "$case_dir/$file" > /dev/null 2> "$case_dir/out"; then
         echo "explain: the example of $code checks clean"
         status=1
     elif ! grep -q "error\[$code\]" "$case_dir/out"; then

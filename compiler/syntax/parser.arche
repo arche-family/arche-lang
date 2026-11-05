@@ -32,11 +32,18 @@ type Parser = struct {
     no_struct_lit: bool,
     /// Full Arche (spec/arche.md), not Arche-0.
     full: bool,
+    /// The package's edition (spec/arche.md §1.2).
+    edition: u32,
     /// The expression statement being parsed may be its block's value.
     block_value_ok: bool,
 }
 
 pub fn parse(tokens: alloc.List(tk.Token), text: str, full: bool, diags: diag.Diagnostics, a: alloc.Allocator) -> Parsed {
+    return parse_edition(tokens, text, full, edition: 2026, diags: diags, a: a);
+}
+
+/// parse, with the rules of an edition (spec/arche.md §1.2).
+pub fn parse_edition(tokens: alloc.List(tk.Token), text: str, full: bool, edition: u32, diags: diag.Diagnostics, a: alloc.Allocator) -> Parsed {
     var copy = alloc.String.init(a);
     copy.push_str(text);
     var p = Parser {
@@ -48,6 +55,7 @@ pub fn parse(tokens: alloc.List(tk.Token), text: str, full: bool, diags: diag.Di
         last_end: 0,
         no_struct_lit: false,
         full: full,
+        edition: edition,
         block_value_ok: false,
     };
     skip_trivia(&mut p);
@@ -89,6 +97,12 @@ fn peek_third(p: &Parser) -> tk.Kind {
         }
     }
     return p.tokens[i as usize].kind;
+}
+
+/// The text of the token at i.
+fn token_text_at(p: &Parser, i: u32) -> str {
+    let t = p.tokens[i as usize];
+    return p.text.view()[t.start as usize..(t.start + t.len) as usize];
 }
 
 fn peek_second(p: &Parser) -> tk.Kind {
@@ -1512,6 +1526,31 @@ fn parse_pattern(p: &mut Parser) {
             _ = close(p, m, cst.Kind.WildcardPat);
         }
         .Ident => {
+            // ok(…) and err(…) of an older edition, in edition 2027.
+            let is_ok = token_text_at(p, p.pos).eq("ok");
+            let is_err = token_text_at(p, p.pos).eq("err");
+            if p.edition >= 2027 and peek_second(p) == tk.Kind.LParen and (is_ok or is_err) {
+                let place = p.tokens[p.pos as usize].start;
+                var m2 = p.diags.new_message();
+                if is_ok {
+                    m2.push_str("in edition 2027 this pattern is '.ok(…)'");
+                } else {
+                    m2.push_str("in edition 2027 this pattern is '.err(…)'");
+                }
+                p.diags.report_owned(codes.OLD_RESULT_PATTERN, diag.Span { start: place, len: 0 }, m2);
+                p.diags.attach_fix(diag.Span { start: place, len: 0 }, ".");
+                // Read on as the pattern it was, so one error is reported.
+                advance(p);
+                advance(p);
+                parse_pattern(p);
+                _ = expect(p, tk.Kind.RParen, "')'");
+                if is_ok {
+                    _ = close(p, m, cst.Kind.OkPat);
+                } else {
+                    _ = close(p, m, cst.Kind.ErrPat);
+                }
+                return;
+            }
             advance(p);
             _ = close(p, m, cst.Kind.BindPat);
         }
@@ -1540,6 +1579,23 @@ fn parse_pattern(p: &mut Parser) {
         }
         .Dot => {
             advance(p);
+            // .ok(p) and .err(p): the patterns of an error union, from
+            // edition 2027.
+            if p.edition >= 2027 and at(p, tk.Kind.Ident) and peek_second(p) == tk.Kind.LParen {
+                let is_ok = token_text_at(p, p.pos).eq("ok");
+                if is_ok or token_text_at(p, p.pos).eq("err") {
+                    advance(p);
+                    advance(p);
+                    parse_pattern(p);
+                    _ = expect(p, tk.Kind.RParen, "')'");
+                    if is_ok {
+                        _ = close(p, m, cst.Kind.OkPat);
+                    } else {
+                        _ = close(p, m, cst.Kind.ErrPat);
+                    }
+                    return;
+                }
+            }
             _ = expect(p, tk.Kind.Ident, "a variant or error name");
             if accept(p, tk.Kind.LBrace) {
                 while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {

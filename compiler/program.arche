@@ -5,6 +5,7 @@ import std;
 import alloc;
 import codes;
 import diag;
+import manifest;
 import syntax.cst;
 import syntax.lexer;
 import syntax.parser;
@@ -48,6 +49,12 @@ pub type Module = struct {
     /// Full Arche (spec/arche.md), not Arche-0: the package has a manifest,
     /// or the module is part of the library.
     pub full: bool,
+    /// The edition its package declares (spec/arche.md §1.2); the
+    /// library's is the first.
+    pub edition: u32,
+    /// Whether it belongs to the package being built, not the library:
+    /// its manifest's needs and strict_unsafe apply to it.
+    pub in_package: bool,
 
     /// The source text of a token.
     pub fn token_text(self: &Module, t: u32) -> str {
@@ -94,6 +101,8 @@ pub type Program = struct {
     pub tests: bool,
     /// Whether the checker keeps where each name is used (arche query).
     pub record_uses: bool,
+    /// What the package's manifest declares (manifest.arche).
+    pub manifest: manifest.Manifest,
     root_dir: alloc.String,
 
     pub fn module(self: &Program, id: ModuleId) -> &Module {
@@ -133,13 +142,17 @@ fn is_identifier(s: str) -> bool {
 }
 
 /// Lexes and parses one file into a module, reporting into p.diags.
-fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.String, full: bool) -> ModuleId {
+fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.String, full: bool, in_package: bool) -> ModuleId {
     let id = ModuleId { index: p.modules.len() as u32 };
     p.diags.file = id.index;
+    var edition = manifest.FIRST_EDITION;
+    if in_package {
+        edition = p.manifest.edition;
+    }
     var lexed = diag.Diagnostics.init(p.a);
     lexed.file = id.index;
-    let tokens = lexer.lex(text.view(), full, &mut lexed, p.a);
-    let parsed = parser.parse(tokens, text.view(), full, lexed, p.a);
+    let tokens = lexer.lex_edition(text.view(), full, edition: edition, diags: &mut lexed, a: p.a);
+    let parsed = parser.parse_edition(tokens, text.view(), full, edition: edition, diags: lexed, a: p.a);
     var n = alloc.String.init(p.a);
     n.push_str(name);
     var pa = alloc.String.init(p.a);
@@ -151,7 +164,7 @@ fn add_module(p: &mut Program, name: str, path: str, display: str, text: alloc.S
     while i < found.len() : (i += 1) {
         p.diags.items.push(copy_diagnostic(&found[i], p.a));
     }
-    p.modules.push(Module { name: n, path: pa, display: di, text: text, tree: parsed.tree, full: full });
+    p.modules.push(Module { name: n, path: pa, display: di, text: text, tree: parsed.tree, full: full, edition: edition, in_package: in_package });
     return id;
 }
 
@@ -245,6 +258,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         panic_handler: handler,
         tests: opts.tests,
         record_uses: false,
+        manifest: manifest.defaults(a),
         root_dir: alloc.String.init(a),
     };
     var slash: ?usize = none;
@@ -262,14 +276,35 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         }
         none => { }
     }
-    var manifest = alloc.String.init(a);
-    manifest.push_str(p.root_dir.view());
-    manifest.push_str("package.arche");
-    match fs.read_bytes(manifest.view(), a) {
-        ok(_) => {
+    var manifest_path = alloc.String.init(a);
+    manifest_path.push_str(p.root_dir.view());
+    manifest_path.push_str("package.arche");
+    var manifest_problems = diag.Diagnostics.init(a);
+    var manifest_tree = cst.Tree { tokens: alloc.List(tk.Token).init(a), nodes: alloc.List(cst.Node).init(a), children: alloc.List(cst.NodeId).init(a), root: cst.NodeId { index: 0 } };
+    var manifest_text = alloc.String.init(a);
+    match fs.read_file(manifest_path.view(), a) {
+        ok(mtext) => {
             p.full = true;
             p.lib_alloc = true;
             p.lib_std = p.target == Target.LinuxX86_64;
+            var lexed = diag.Diagnostics.init(a);
+            let tokens = lexer.lex(mtext.view(), true, &mut lexed, a);
+            let parsed = parser.parse(tokens, mtext.view(), true, lexed, a);
+            let found = parsed.diags.items.items();
+            var k: usize = 0;
+            while k < found.len() : (k += 1) {
+                manifest_problems.items.push(copy_diagnostic(&found[k], a));
+            }
+            // Diagnostics need only the text; the tree goes to the reader.
+            if found.len() == 0 {
+                p.manifest = manifest.read(parsed.tree, text: mtext.view(), diags: &mut manifest_problems, a: a);
+                if p.panic_handler.len() == 0 {
+                    p.panic_handler.push_str(p.manifest.panic_handler.view());
+                }
+            } else {
+                manifest_tree = parsed.tree;
+            }
+            manifest_text = mtext;
         }
         err(_) => { }
     }
@@ -282,7 +317,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         root_name = stem;
     }
     let root_full = p.full;
-    _ = add_module(&mut p, name: root_name, path: path, display: base, text, root_full);
+    _ = add_module(&mut p, name: root_name, path: path, display: base, text, full: root_full, in_package: true);
 
     var next: usize = 0;
     while next < p.modules.len() : (next += 1) {
@@ -316,7 +351,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
             let module_full = from_lib or p.full;
             match fs.read_file(full.view(), a) {
                 ok(source) => {
-                    _ = add_module(&mut p, name: ip.dotted.view(), path: full.view(), display: shown.view(), source, module_full);
+                    _ = add_module(&mut p, name: ip.dotted.view(), path: full.view(), display: shown.view(), source, full: module_full, in_package: not from_lib);
                 }
                 err(_) => {
                     p.diags.file = next as u32;
@@ -328,6 +363,31 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
                     p.diags.report_owned(codes.MODULE_NOT_FOUND, ip.span, msg);
                 }
             }
+        }
+    }
+    // A manifest that cannot be read is shown as a file of its own.
+    if manifest_problems.count() > 0 {
+        let index = p.modules.len() as u32;
+        var name = alloc.String.init(a);
+        name.push_str("package");
+        var shown_name = alloc.String.init(a);
+        shown_name.push_str("package.arche");
+        p.modules.push(Module {
+            name: name,
+            path: manifest_path,
+            display: shown_name,
+            text: manifest_text,
+            tree: manifest_tree,
+            full: true,
+            edition: manifest.FIRST_EDITION,
+            in_package: true,
+        });
+        let found = manifest_problems.items.items();
+        var k: usize = 0;
+        while k < found.len() : (k += 1) {
+            var d = copy_diagnostic(&found[k], a);
+            d.file = index;
+            p.diags.items.push(d);
         }
     }
     return p;

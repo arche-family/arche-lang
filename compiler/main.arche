@@ -5,6 +5,7 @@
 ///     arche tokens <file>           list its tokens, trivia included
 ///     arche cst <file>              print it again from its syntax tree
 ///     arche fix <file>              apply the fixes the checker suggests
+///     arche fix --edition <N> <file>   move the file's package to edition N
 ///     arche explain <code>          what an error code means, with an example
 ///     arche fmt [--check] <file>    lay the file out the one way (syntax/fmt.arche)
 ///     arche query <what> <file> <line>:<column>   def, refs, type or callers
@@ -21,6 +22,8 @@ import doc;
 import explain;
 import program;
 import query;
+import manifest;
+import syntax.token as tk;
 import sema.check as sema;
 import syntax.lexer;
 import syntax.parser;
@@ -36,6 +39,7 @@ type Failure = error { ErrorsFound, BadUsage, CannotRead, CannotWrite, BadIr }
 fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("usage: arche check [--json] <file>\n");
     err_out.write("       arche fix <file>                apply the checker's fixes to the files\n");
+    err_out.write("       arche fix --edition <year> <file>   move the package to an edition\n");
     err_out.write("       arche explain [--example] <code>   what an error code means, or just its example\n");
     err_out.write("       arche fmt [--check] <file>      lay the file out; --check only says whether it is\n");
     err_out.write("       arche query def|refs|type|callers <file> <line>:<column>\n");
@@ -196,9 +200,11 @@ fn write_code(out: &mut std.Output, n: u16) {
     out.write_u64(n as u64);
 }
 
-/// `arche explain`: the meaning of a code and its example; with --example
-/// only the example, as a file to check (the byte E0101's needs included).
-fn explain_code(out: &mut std.Output, err_out: &mut std.Output, text: str, only_example: bool) -> Failure!void {
+/// `arche explain`: the meaning of a code and its example. With --example
+/// only the example, as a file to check (the byte E0101's needs included);
+/// --example-manifest its package.arche, --example-file the name its file
+/// must have.
+fn explain_code(out: &mut std.Output, err_out: &mut std.Output, text: str, only_example: bool, part: str) -> Failure!void {
     var n: u16 = 0;
     match code_number(text) {
         some(v) => { n = v; }
@@ -215,6 +221,15 @@ fn explain_code(out: &mut std.Output, err_out: &mut std.Output, text: str, only_
         return Failure.BadUsage;
     }
     let example = explain.example(n);
+    if part.eq("--example-manifest") {
+        out.write(explain.example_manifest(n));
+        return;
+    }
+    if part.eq("--example-file") {
+        out.write(explain.example_file(n));
+        out.write("\n");
+        return;
+    }
     if only_example {
         out.write(example);
         if n == 101 {
@@ -232,7 +247,14 @@ fn explain_code(out: &mut std.Output, err_out: &mut std.Output, text: str, only_
     }
     out.write("\nFor example, ");
     let options = explain.example_options(n);
-    if explain.example_is_full(n) {
+    let manifest_text = explain.example_manifest(n);
+    if explain.example_file(n).len() > 0 {
+        out.write("as the manifest package.arche, ");
+    } else if manifest_text.len() > 0 {
+        out.write("in a package whose package.arche is\n\n    ");
+        out.write(manifest_text);
+        out.write("\n");
+    } else if explain.example_is_full(n) {
         out.write("in a package (a package.arche beside it, so full Arche), ");
     }
     out.write("`arche ");
@@ -376,6 +398,161 @@ fn query_at(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: allo
     }
     if not query.run(out: out, err_out: err_out, c: &c, what: what, line: lc[0], column: lc[1], a: a) {
         return Failure.BadUsage;
+    }
+}
+
+/// `arche fix --edition N`: moves the package of the root file from its
+/// edition to N (spec/arche.md §1.2). From 2026 to 2027 the patterns
+/// ok(…) and err(…) gain a dot; nothing else changes, since in 2026 no
+/// name can be ok or err. Then the manifest says N, and the package is
+/// checked: in the new edition it must check as cleanly as before.
+fn move_edition(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, year: str, path: str, opts: &program.Options) -> Failure!void {
+    var to: u32 = 0;
+    var i: usize = 0;
+    while i < year.len() : (i += 1) {
+        if year[i] < '0' or year[i] > '9' or to > 100000 {
+            to = 0;
+            break;
+        }
+        to = to * 10 + (year[i] - '0') as u32;
+    }
+    if to < manifest.FIRST_EDITION or to > manifest.LATEST_EDITION {
+        err_out.write("arche fix: the editions are 2026 and 2027\n");
+        return Failure.BadUsage;
+    }
+    let source = try read(fs, err_out, path, a);
+    var p = program.load(fs, path: path, source, a, opts);
+    if not p.manifest.found {
+        err_out.write("arche fix --edition: the package needs a manifest that declares PACKAGE, to say its edition\n");
+        return Failure.BadUsage;
+    }
+    let from = p.manifest.edition;
+    if p.diags.count() == 0 {
+        p = sema.check(p);
+    }
+    if p.diags.count() > 0 {
+        err_out.write("arche fix --edition: the package must check cleanly first\n");
+        program.write_diagnostics(err_out, &p, false);
+        return Failure.ErrorsFound;
+    }
+    if to < from {
+        err_out.write("arche fix --edition: a package moves to a newer edition, not an older one\n");
+        return Failure.BadUsage;
+    }
+    // The package's own modules, rewritten.
+    let mods = p.modules.items();
+    var changed: u64 = 0;
+    var m: usize = 0;
+    while m < mods.len() : (m += 1) {
+        if not mods[m].in_package or from >= 2027 or to < 2027 {
+            continue;
+        }
+        let text = mods[m].text.view();
+        let ts = mods[m].tree.tokens.items();
+        var result = alloc.String.init(a);
+        var at: usize = 0;
+        var t: usize = 0;
+        while t < ts.len() : (t += 1) {
+            let k = ts[t].kind;
+            if (k == tk.Kind.KwOk or k == tk.Kind.KwErr) and in_pattern(&mods[m].tree, token: t as u32) {
+                let start = ts[t].start as usize;
+                result.push_str(text[at..start]);
+                result.push_str(".");
+                at = start;
+                changed += 1;
+            }
+        }
+        result.push_str(text[at..text.len()]);
+        if not result.view().eq(text) {
+            match fs.write_file(path: mods[m].path.view(), data: result.view()) {
+                ok(_) => { }
+                err(_) => {
+                    err_out.write("arche: cannot write ");
+                    err_out.write(mods[m].path.view());
+                    err_out.write("\n");
+                    return Failure.CannotWrite;
+                }
+            }
+        }
+    }
+    try set_edition(err_out, fs: fs, a: a, path: path, year: year);
+    // The same package checks in its new edition.
+    let again = try read(fs, err_out, path, a);
+    var q = program.load(fs, path: path, again, a, opts);
+    if q.diags.count() == 0 {
+        q = sema.check(q);
+    }
+    program.write_diagnostics(err_out, &q, false);
+    if q.diags.count() > 0 {
+        err_out.write("arche fix --edition: the package does not check in the new edition\n");
+        return Failure.ErrorsFound;
+    }
+    out.write("arche fix: edition ");
+    out.write_u64(from as u64);
+    out.write(" to ");
+    out.write_u64(to as u64);
+    out.write(", ");
+    out.write_u64(changed);
+    out.write(" changes\n");
+}
+
+/// Whether a token is the keyword of an ok(…) or err(…) pattern.
+fn in_pattern(tree: &cst.Tree, token: u32) -> bool {
+    let nodes = tree.nodes.items();
+    var i: usize = 0;
+    while i < nodes.len() : (i += 1) {
+        let n = nodes[i];
+        if (n.kind == cst.Kind.OkPat or n.kind == cst.Kind.ErrPat) and tree.first_token(cst.NodeId { index: i as u32 }) == token {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Rewrites the edition in the manifest beside the root file.
+fn set_edition(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, year: str) -> Failure!void {
+    var dir_end: usize = 0;
+    var i: usize = 0;
+    while i < path.len() : (i += 1) {
+        if path[i] == '/' {
+            dir_end = i + 1;
+        }
+    }
+    var mpath = alloc.String.init(a);
+    mpath.push_str(path[0..dir_end]);
+    mpath.push_str("package.arche");
+    let text = try read(fs, err_out, mpath.view(), a);
+    let t = text.view();
+    var out = alloc.String.init(a);
+    // After "edition:", the number that follows.
+    var k: usize = 0;
+    var done = false;
+    while k + 8 <= t.len() and not done : (k += 1) {
+        if t[k..k + 8].eq("edition:") {
+            var s = k + 8;
+            while s < t.len() and t[s] == ' ' : (s += 1) {
+            }
+            var e = s;
+            while e < t.len() and t[e] >= '0' and t[e] <= '9' : (e += 1) {
+            }
+            out.push_str(t[0..s]);
+            out.push_str(year);
+            out.push_str(t[e..t.len()]);
+            done = true;
+        }
+    }
+    if not done {
+        err_out.write("arche fix --edition: the manifest has no edition: field to change\n");
+        return Failure.BadUsage;
+    }
+    match fs.write_file(path: mpath.view(), data: out.view()) {
+        ok(_) => { }
+        err(_) => {
+            err_out.write("arche: cannot write ");
+            err_out.write(mpath.view());
+            err_out.write("\n");
+            return Failure.CannotWrite;
+        }
     }
 }
 
@@ -631,12 +808,14 @@ fn main(sys: &mut std.System) -> !void {
         try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3 + k), json: true, opts: &opts);
     } else if command.eq("check") and count == 3 {
         try check(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), json: false, opts: &opts);
+    } else if command.eq("fix") and count == 5 and sys.args.get(2 + k).eq("--edition") {
+        try move_edition(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, year: sys.args.get(3 + k), path: sys.args.get(4 + k), opts: &opts);
     } else if command.eq("fix") and count == 3 {
         try fix(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), opts: &opts);
     } else if command.eq("explain") and count == 3 {
-        try explain_code(out: &mut sys.stdout, err_out: &mut sys.stderr, text: sys.args.get(2 + k), only_example: false);
-    } else if command.eq("explain") and count == 4 and sys.args.get(2 + k).eq("--example") {
-        try explain_code(out: &mut sys.stdout, err_out: &mut sys.stderr, text: sys.args.get(3 + k), only_example: true);
+        try explain_code(out: &mut sys.stdout, err_out: &mut sys.stderr, text: sys.args.get(2 + k), only_example: false, part: "");
+    } else if command.eq("explain") and count == 4 and sys.args.get(2 + k).starts_with("--example") {
+        try explain_code(out: &mut sys.stdout, err_out: &mut sys.stderr, text: sys.args.get(3 + k), only_example: true, part: sys.args.get(2 + k));
     } else if command.eq("fmt") and count == 3 {
         try format_file(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), check_only: false);
     } else if command.eq("fmt") and count == 4 and sys.args.get(2 + k).eq("--check") {

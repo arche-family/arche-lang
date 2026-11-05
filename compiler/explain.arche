@@ -92,6 +92,9 @@ pub fn meaning(code: u16) -> str {
     if code == 211 {
         return "`pub` before `test` or `import`.";
     }
+    if code == 212 {
+        return "In edition 2027, a pattern `ok(…)` or `err(…)`: they are `.ok(…)` and `.err(…)`, like variants (§1.2).";
+    }
     if code == 301 {
         return "An unknown name where a value is expected.";
     }
@@ -282,7 +285,13 @@ pub fn meaning(code: u16) -> str {
         return "A view chosen by an `if` or `match` expression whose branches view different places (spec/arche.md §3.1).";
     }
     if code == 801 {
-        return "A capability type that the package manifest does not list in `needs` (§1.3). Not reported yet: manifests are read from sprint S24.";
+        return "A capability type, or a capability field of `std.System`, that the package manifest does not list in `needs` (§1.3).";
+    }
+    if code == 802 {
+        return "A manifest (`package.arche`) or a build file (`build.arche`) that is not one constant of the expected form: an unknown field, or a value that is not a literal of its kind (§1.1).";
+    }
+    if code == 803 {
+        return "A manifest's `edition` that is not an edition: 2026 or 2027 (§1.2).";
     }
     if code == 810 {
         return "A `for` loop over a value that is not a range, a slice or an iterator (§3.2).";
@@ -339,7 +348,7 @@ pub fn meaning(code: u16) -> str {
         return "An operation that can panic or trap in a `nopanic` function, or a call of a function that is not `nopanic` (§8.2).";
     }
     if code == 920 {
-        return "An `unsafe` block without a `// SAFETY:` comment, in a package that sets `strict_unsafe` (§10.1). Not reported yet: manifests are read from sprint S24.";
+        return "An `unsafe` block without a `// SAFETY:` comment at its start, in a package that sets `strict_unsafe` (§10.1).";
     }
     if code == 921 {
         return "An operation that needs `unsafe` outside an `unsafe` block or `unsafe fn`: a raw pointer made, read, written, offset or turned into a view, or an `unsafe fn` called (§10.1).";
@@ -459,6 +468,9 @@ pub fn example(code: u16) -> str {
     }
     if code == 211 {
         return "pub import std;\n\nfn main(sys: &mut std.System) -> !void {\n}\n";
+    }
+    if code == 212 {
+        return "import std;\n\nfn main(sys: &mut std.System) -> !void {\n    match sys.fs.read_file(\"notes.txt\", sys.alloc) {\n        ok(text) => { sys.stdout.write(text.view()); }\n        .err(_) => { }\n    }\n}\n";
     }
     if code == 301 {
         return "import std;\n\nfn main(sys: &mut std.System) -> !void {\n    system.out.write(\"x\");\n}\n";
@@ -649,6 +661,15 @@ pub fn example(code: u16) -> str {
     if code == 607 {
         return "import std;\n\nfn main(sys: &mut std.System) -> !void {\n\n    let a: u32 = 1;\n    let b: u32 = 2;\n    let n: u32 = 3;\n    let r = if n > 2 { &a } else { &b };\n}\n";
     }
+    if code == 801 {
+        return "import std;\n\nfn main(sys: &mut std.System) -> !void {\n    _ = sys.net.connect(std.Address { ip: [127, 0, 0, 1], port: 80 });\n}\n";
+    }
+    if code == 802 {
+        return "import std.build;\n\nconst PACKAGE: build.Package = build.Package {\n    name: \"demo\",\n    colour: \"blue\",\n};\n";
+    }
+    if code == 803 {
+        return "import std.build;\n\nconst PACKAGE: build.Package = build.Package {\n    name: \"demo\",\n    edition: 2031,\n};\n";
+    }
     if code == 810 {
         return "import std;\n\nfn main(sys: &mut std.System) -> !void {\n\n    let n: u32 = 5;\n    for i in n {\n    }\n}\n";
     }
@@ -703,6 +724,9 @@ pub fn example(code: u16) -> str {
     if code == 910 {
         return "import std;\n\nnopanic fn stop() {\n    panic(\"no\");\n}\n\nfn main(sys: &mut std.System) -> !void {\n}\n";
     }
+    if code == 920 {
+        return "import std;\n\nfn main(sys: &mut std.System) -> !void {\n    var x: u64 = 0;\n    unsafe {\n        let p = &mut x as *mut u64;\n        p.* = 1;\n    }\n}\n";
+    }
     if code == 921 {
         return "import std;\n\nfn main(sys: &mut std.System) -> !void {\n\n    asm(\"nop\");\n}\n";
     }
@@ -735,6 +759,9 @@ pub fn example(code: u16) -> str {
 
 /// Whether the example is full Arche: it needs a package.arche beside it.
 pub fn example_is_full(code: u16) -> bool {
+    if code == 212 {
+        return true;
+    }
     if code == 305 {
         return true;
     }
@@ -784,6 +811,9 @@ pub fn example_is_full(code: u16) -> bool {
         return true;
     }
     if code == 607 {
+        return true;
+    }
+    if code == 801 {
         return true;
     }
     if code == 810 {
@@ -840,6 +870,9 @@ pub fn example_is_full(code: u16) -> bool {
     if code == 910 {
         return true;
     }
+    if code == 920 {
+        return true;
+    }
     if code == 921 {
         return true;
     }
@@ -874,6 +907,32 @@ pub fn example_is_full(code: u16) -> bool {
 pub fn example_options(code: u16) -> str {
     if code == 928 {
         return "--target freestanding-x86_64";
+    }
+    return "";
+}
+
+/// The package.arche the example needs, or "" for one that only says
+/// the package is full Arche.
+pub fn example_manifest(code: u16) -> str {
+    if code == 212 {
+        return "import std.build; const PACKAGE: build.Package = build.Package { name: \"demo\", edition: 2027 };\n";
+    }
+    if code == 801 {
+        return "import std.build; const PACKAGE: build.Package = build.Package { name: \"demo\", needs: [build.Capability.Fs] };\n";
+    }
+    if code == 920 {
+        return "import std.build; const PACKAGE: build.Package = build.Package { name: \"demo\", needs: [], strict_unsafe: true };\n";
+    }
+    return "";
+}
+
+/// The name the example's file must have, or "" for any.
+pub fn example_file(code: u16) -> str {
+    if code == 802 {
+        return "package.arche";
+    }
+    if code == 803 {
+        return "package.arche";
     }
     return "";
 }

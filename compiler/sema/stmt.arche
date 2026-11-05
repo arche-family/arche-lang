@@ -360,6 +360,10 @@ fn check_stmt(c: &mut ck.Checker, s: cst.NodeId) {
         }
         .ForStmt => { check_for(c, s); }
         .UnsafeStmt => {
+            if c.p.manifest.strict_unsafe and c.p.modules[c.module as usize].in_package and not safety_comment(c, ck.child(c, s, 0)) {
+                let sp = ck.span_of(c, s);
+                ck.report(c, codes.NO_SAFETY_COMMENT, sp, "this package sets strict_unsafe: say why the block is safe in a '// SAFETY:' comment at its start");
+            }
             c.unsafe_depth += 1;
             check_block(c, ck.child(c, s, 0));
             c.unsafe_depth -= 1;
@@ -1452,6 +1456,25 @@ pub fn block_ends(c: &ck.Checker, b: cst.NodeId) -> bool {
     while i < count : (i += 1) {
         if stmt_ends(c, ck.child(c, b, i)) {
             return true;
+        }
+    }
+    return false;
+}
+
+/// Whether a block starts with a `// SAFETY:` comment (spec/arche.md §10.1).
+fn safety_comment(c: &ck.Checker, block: cst.NodeId) -> bool {
+    let m = &c.p.modules[c.module as usize];
+    let n = m.tree.node(block);
+    var t = n.first;
+    var seen_brace = false;
+    while t < n.end : (t += 1) {
+        let k = m.tree.tokens[t as usize].kind;
+        if k == tk.Kind.LBrace and not seen_brace {
+            seen_brace = true;
+        } else if seen_brace and k == tk.Kind.Comment {
+            return m.token_text(t).starts_with("// SAFETY:");
+        } else if seen_brace and k != tk.Kind.Whitespace {
+            return false;
         }
     }
     return false;

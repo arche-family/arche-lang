@@ -10,6 +10,7 @@ import sema.floats;
 import sema.memory;
 import sema.stmt;
 import sema.types as ty;
+import manifest;
 
 // ---- paths ------------------------------------------------------------------
 //
@@ -838,6 +839,19 @@ pub type FieldRef = struct {
     pub name_token: u32,
 }
 
+/// Whether t is std.System, Arche-0's or the library's.
+fn is_system(c: &ck.Checker, t: ty.TypeId) -> bool {
+    let info = c.t.get(t);
+    if info.kind == ty.Kind.Builtin {
+        return info.builtin == ty.Builtin.System;
+    }
+    if info.kind != ty.Kind.Struct {
+        return false;
+    }
+    let d = c.decls[info.decl as usize];
+    return c.names.text(d.name).eq("System") and c.p.modules[d.module as usize].name.view().eq("std");
+}
+
 pub fn find_field(c: &mut ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> FieldRef {
     let info = c.t.get(t);
     var r = FieldRef { type_id: ty.invalid(), is_pub: true, owner_module: c.module, found: false, name_token: ck.NONE };
@@ -1055,6 +1069,12 @@ fn check_field(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     let s = ck.span_of(c, n);
     ck.require_visible(c, s, f.owner_module, f.is_pub, "this field");
     ck.set_ref(c, n, ck.VALUE_FIELD);
+    if is_system(c, t) {
+        let bit = manifest.system_field(ck.text(c, nt));
+        if bit != 0 {
+            ck.require_capability(c, bit, s: s);
+        }
+    }
     if f.name_token != ck.NONE {
         ck.note_use(c, token: nt, decl_module: f.owner_module, decl_token: f.name_token);
     }

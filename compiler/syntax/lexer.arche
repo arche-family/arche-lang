@@ -14,10 +14,25 @@ import syntax.token as tk;
 /// full: the file is full Arche (spec/arche.md), where words Arche-0
 /// reserves can be keywords; otherwise it is Arche-0.
 pub fn lex(text: str, full: bool, diags: &mut diag.Diagnostics, a: alloc.Allocator) -> alloc.List(tk.Token) {
+    return lex_edition(text, full, edition: 2026, diags: diags, a: a);
+}
+
+/// lex, with the rules of an edition (spec/arche.md §1.2): from 2027,
+/// `ok` and `err` are names, not keywords; the patterns `.ok(…)` and
+/// `.err(…)` take their place.
+pub fn lex_edition(text: str, full: bool, edition: u32, diags: &mut diag.Diagnostics, a: alloc.Allocator) -> alloc.List(tk.Token) {
     var tokens = alloc.List(tk.Token).init(a);
     var i: usize = 0;
     while i < text.len() {
         i = lex_one(text, i, full, &mut tokens, diags);
+        // An edition-2027 file: ok and err are names.
+        if edition >= 2027 {
+            let last = tokens.len() - 1;
+            let k = tokens[last].kind;
+            if k == tk.Kind.KwOk or k == tk.Kind.KwErr {
+                tokens[last].kind = tk.Kind.Ident;
+            }
+        }
     }
     push(&mut tokens, tk.Kind.Eof, start: i, end: i, value: 0);
     return tokens;

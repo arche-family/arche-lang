@@ -1,0 +1,16 @@
+// test: run
+// spec: arche/10.1
+// stage0: skip
+// stdout: 7
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var x: u64 = 0;
+    unsafe {
+        // SAFETY: the pointer is made from x here, and x outlives it.
+        let p = &mut x as *mut u64;
+        p.* = 7;
+    }
+    sys.stdout.write_u64(x);
+    sys.stdout.write("\n");
+}
