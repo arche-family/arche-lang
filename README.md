@@ -45,8 +45,8 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 
 | Path | Contents | Status |
 | --- | --- | --- |
-| [`docs/plan.md`](docs/plan.md) | the full plan (Uzbek) | snapshot, 2026-11-03 |
-| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language (Uzbek) | current sprint: S26 (S19 on Windows) |
+| [`docs/plan.md`](docs/plan.md) | the full plan (Uzbek) | snapshot, 2026-11-05 |
+| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language, and S35 for the libraries the Arche OS phone needs (Uzbek) | current sprint: S26 (S19 on Windows) |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | [`spec/arche.md`](spec/arche.md) | the full language, built on Arche-0 | draft 0.1 |
 | [`conformance/`](conformance/README.md) | specification tests | 453 tests |
@@ -59,7 +59,7 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 
 ## Related
 
-[arche-os](https://github.com/arche-family/arche-os) — a capability-based microkernel operating system written in Arche.
+[arche-os](https://github.com/arche-family/arche-os) — a capability-based microkernel operating system written in Arche. Its first product is a managed phone, and its application model is [Nimadir](https://github.com/Nodirbek-Abdulaxadov/nimadir)'s: WASM components on a WIT contract, which is why the WASM runtime here implements the Component Model.
 
 ## License
 

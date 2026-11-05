@@ -1,6 +1,6 @@
 # Arche tili — sprintlar
 
-> 2026-11-03 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
+> 2026-11-05 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
 **Joriy sprint:** S26 (S19 Windows muhitida bajariladi: MSYS2 UCRT64 — clang, lld, llvm, make, python, git). S0–S4, S6–S18 va S20–S25 yopilgan: compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da; full-Arche paketlarida generics (monomorphization), comptime interpreter, interface'lar (`impl`, `where`, `&dyn`), `for`, closure'lar (`&dyn fn(P) -> R`), `region` (arena, E0901), `unsafe` va raw pointer'lar, `if`/`match` ifoda sifatida, labeled loop'lar, `f32`/`f64`, `requires`/`ensures`, `nopanic` va error return trace ishlaydi. Manifest (`package.arche`) o'qiladi: `needs` (E0801), `strict_unsafe` (E0920), `panic_handler`, xato manifest E0802/E0803. Kutubxona `lib/`'da: `core` (OS va allocator'siz, compiler buni majburlaydi) va `alloc` Arche'da yozilgan; full-Arche paketlari shu `alloc`'ni ishlatadi, compiler ham `--lib-alloc` bilan shu kutubxona ustida bootstrap bo'ladi (stage2 == stage3). `freestanding` target'i bor: `asm`, `naked`, volatile, atomic'lar, `packed`/`align`, `section`/`export`, `extern "c"` va panic handler bilan `freestanding/`'dagi dasturlar QEMU'da x86-64 va RISC-V 64'da ishga tushib serial'ga yozadi (CI'da) — arche-os ishi boshlanishi mumkin. `std` Linux uchun Arche'da (`lib/std.arche`): Arche-0'ning `System`/`Fs`/`Output`/`Args`'i va `Clock`, `Env`, `Proc`, `Net`, `Rand` capability'lari syscall'lar orqali, `std.json`, `std.path`, `core.rand`; compiler `--lib-std` bilan shu kutubxona ustida ham bootstrap bo'ladi (stage2 == stage3); `arche test` testlarni alohida process'larda, seed bilan, filter va property-based tekshiruv bilan ishga tushiradi. Concurrency: `std.task` — structured `scope`, `spawn`, `Channel(T)`, `Shared(T)`, seed'li scheduler (bir xil seed — bir xil tartib), task capture qoidalari (E0902, E0903, E0603), deadlock aniqlanadi. Kripto `lib/crypto/`'da: SHA-256/384/512, HMAC, HKDF, ChaCha20-Poly1305, AES-128/256-GCM, X25519, Ed25519, ECDSA P-256 (RFC 6979 nonce) va ChaCha20 CSPRNG, standart vector'lar bilan; `ctcheck/` dudect usulida (Welch t-testi, ataylab sizdiradigan nazorat funksiyasi bilan) constant-time'ni CI'da har commit'da tekshiradi. TLS 1.3 `lib/tls`'da: I/O'siz `Engine` (client va server) va socket ustidagi `Conn`, uchta cipher suite, X25519 va secp256r1, ECDSA P-256 va Ed25519 imzolari, ALPN, KeyUpdate; X.509 parse, zanjir, muddat va host nomi tekshiruvi, PEM, PKCS #8/SEC 1 kalitlar va sertifikat yaratish (`x509.create`); `interop/tls.sh` OpenSSL (s_server, s_client) va curl bilan ikki tomonga interop'ni, `fuzz/tls.sh` handshake va sertifikatlar fuzzing'ini CI'da ishlatadi. HTTP `lib/http`'da: HTTP/1.1 (keep-alive, chunked ikki tomonga, 100-continue, request smuggling'ga qarshi framing qoidalari), HTTP/2 (HPACK Huffman va dinamik jadval bilan, stream multiplexing, flow control), `http.server` — har ulanish alohida task va region'da, TLS ustida ALPN bilan h2/http1.1, ochiq matnda h2 prior knowledge; kichik HTTP/1.1 client (`fetch`). Runtime'da netpoller: socket'lar bloklamaydi, kutayotgan task boshqalarga yo'l beradi (`poll`); tugagan fiber stack'lari qayta ishlatiladi; `arche test` testlarni parallel (`--jobs`) ishlatadi. `interop/http.sh` curl (HTTP/1.1, h2c, TLS ustida h2, multiplexing, katta yuklash/yuklab olish) va headless Chrome bilan, `fuzz/http_fuzz.arche` h1 parser, HPACK va h2 frame'larini CI'da tekshiradi. Toolchain buyruqlari: `arche fix` (checker tuzatishlarini qo'llaydi, apply-fixes.py o'rnida), `arche explain` (har xato kodining ma'nosi va misoli; misollar conformance testlaridan generatsiya qilinadi va har biri o'z kodini berishi tekshiriladi), `arche fmt` (sozlamasiz, lossless CST ustida; compiler va lib manbalarida o'zgarishsiz), `arche query def|refs|type|callers`, `arche doc` (Markdown va doc-comment misollari test sifatida, `compiler/doctest.sh`); conformance runner endi Arche'da (`conformance/runner/runner.arche`, `std.Command`/`Proc.spawn` ustida), C11 runner olib tashlandi. Edition'lar: 2026 va 2027 (2027'da `ok`/`err` nom, natija pattern'lari `.ok(…)`/`.err(…)`, eskisi E0212 fix bilan), `arche fix --edition` paketni ko'chiradi va qayta tekshiradi. Build: `build.arche` dasturlarni sanaydi, `driver/` (to'liq Arche'da, `arche-driver build|run|clean`) compiler'ni va clang'ni boshqaradi — compiler `arche units` bilan har modulni alohida LLVM birligi qilib beradi, har birining obyekti SHA-256 bo'yicha cache'lanadi; bitta modul o'zgarsa faqat u qayta kompilyatsiya bo'ladi va cache'dan build toza build bilan bit-identical (`driver/check.sh`). Symbol nomlari endi faqat o'z modulining matniga bog'liq (closure va impl — node raqami, instance — argumentlar hash'i). Runtime'ga libc'siz `floor/ceil/trunc/fmod/fma` (va `f` shakllari) qo'shildi — ilgari ular faqat constant-folding tufayli ishlardi. Paketlar: `arche-driver pkg add|lock|vendor|publish|keygen`; registry content-addressed (arxiv SHA-256 nomi bilan, o'zgarmas), release yozuvlari Ed25519 bilan imzolangan, `arche-registry` uni HTTPS orqali beradi (o'zimizning TLS va HTTP ustida); `package.lock` har dependency'ni hash bilan qayd etadi, `vendor/<nomi>/`dan compiler topadi, har dependency o'z manifestining `needs`/edition'iga bo'ysunadi; `driver/pkg-check.sh` imzo yoki hash buzilgan paketning, begona kalitning, ikki marta publish'ning rad etilishini va bir xil source + lockfile → bit-identical dasturni tekshiradi. Ochiq qolganlar: S5'da parser'ni 24 soat fuzz qilish (CI har commit'da 60 soniya fuzz qiladi); S11'dagi comptime interpreter hozircha faqat integer va `bool` kodni bajaradi; S12'da `where` bilan cheklangan `T` qiymatida faqat constraint method'lari qolishi hali tekshirilmaydi, generic `impl` va `core.Iter` S15'da; S13'da closure'ni `comptime F: type` bilan olish (turini nomlash) S15'da `core` bilan, `  S14'da contract shartlarining side effect'siz ekanligi hali tekshirilmaydi, release build (isbotlangan shartlarni olib tashlash) S26'da, `nopanic` isboti hozircha faqat literal'lar bilan ishlaydi; S15'da Allocator hozircha handle (dastur heap'i yoki region arena'si, runtime'da C'da): page, pool va general allocator'larni Arche turlari sifatida Allocator interface'i orqali ulash, `core.fmt`'da float, Arche-0 paketlarida standart holda kutubxona `alloc`'i (stage0 o'zinikini ishlatadi) keyinroq; S16'da `target_features` va konstantalarga `section` hali yo'q, `core.atomic.U32` kabi turlar S18'da, `naked` va `asm`'ning 32-bitlik boot kodini tekshirish faqat QEMU orqali; S17'da `Fs`'ni katalogga toraytirish (`within`) va Net'da IPv6/UDP/DNS keyinroq, Arche-0 paketlari standart holda hali compiler'ning o'z std'ini ishlatadi; S18'da task'lar bitta OS thread'da fiber sifatida ishlaydi: socket'lar S22'dan beri bloklamaydi, lekin fayl va `sleep_ns` hali hammasini to'xtatadi, ko'p protsessorda parallel worker'lar keyinroq; `core.atomic.U32` kabi turlar hali yo'q; S20'da AES dasturiy (AES-NI yo'q, sekin), X25519 TweetNaCl usulida — tezlashtirish S26'da; S21'da RSA va P-384 sertifikatlari (internetdagi ko'p serverlar), HelloRetryRequest, session resumption/0-RTT va client sertifikatlari yo'q, sertifikat bekor qilinishi (CRL/OCSP) tekshirilmaydi; S22'da HTTP/2 client, server push, HPACK encoder'ning dinamik jadvali va h2c Upgrade yo'q, javob tanasi to'liq xotirada yig'iladi (streaming yo'q), uzoq yashaydigan h2 ulanishida so'rovlar xotirasi ulanish yopilguncha qaytmaydi; S23'da `arche query` struct literal maydonlari, variant'lar va comptime parametrlarini hali bog'lamaydi, `arche fmt` qatorlarni bo'lmaydi va qo'shmaydi (faqat indentatsiya, bo'shliqlar va bo'sh qatorlar), E0801 va E0920 misollari manifest bilan S24'da qo'shildi; S24'da compiler Arche-0'da qolgani uchun `arche build`/`run` alohida `arche-driver` dasturi, front-end (tekshiruv) har build'da butun dasturni qayta tekshiradi (tez: ~60 ms), cache faqat backend (clang) ishini saqlaydi, `dependencies` o'qiladi; S25'da versiyalar aniq (range va semver yechimi yo'q, bitta paketning ikki versiyasi xato), registry host'i IPv4 yoki localhost (DNS yo'q), registry bitta kalit bilan imzolaydi (har publisher'ning o'z kaliti keyinroq).
 
@@ -27,6 +27,7 @@
 | 7. Backend'lar | S26–S30 | optimizatsiya, o'z backend'lari, linker, WASM |
 | 8. Web va WASM | S31–S33 | WASM runtime, web server |
 | 9. Yakuniy qabul | S34 | rejaning yakuniy qabul mezoni |
+| 10. Telefon kutubxonalari | S35 | Arche OS telefoni uchun: shrift, PNG, D-Bus, `std.linux` qo'shimchalari |
 
 ```mermaid
 flowchart LR
@@ -40,6 +41,8 @@ flowchart LR
     f6 --> f9["9. Yakuniy qabul"]
     f8 --> f9
     f4 -.->|S16 dan keyin| os["arche-os"]
+    f4 --> f10["10. Telefon kutubxonalari"]
+    f10 -.-> os
 ```
 
 Bosqichlar raqam tartibida yoziladi. Bir nechta ishchi bo'lsa, grafikdagi parallel tarmoqlar bir vaqtda olib borilishi mumkin.
@@ -305,8 +308,9 @@ Bosqich natijasi: to'liq spec bor va compiler concurrency hamda past darajadan t
 
 - Ikkala target uchun o'z backend'i va LLVM orqali release.
 - Har target'ning calling convention'i ABI hujjatiga yoziladi.
+- `freestanding` ARM64'da: exception vector'lar, system register'lar `asm` orqali, `aarch64-unknown-none` linker script'i (Arche OS Trek B).
 
-**Qabul:** cross-build'da har target'da stage2 == stage3. Testlar QEMU user-mode'da o'tadi.
+**Qabul:** cross-build'da har target'da stage2 == stage3. Testlar QEMU user-mode'da o'tadi. `freestanding/` dasturlari QEMU `virt` (aarch64) da ham ishga tushib serial'ga (PL011) yozadi va CI'da tekshiriladi.
 
 ### S29. O'z object format'i va linker
 
@@ -329,8 +333,10 @@ Bosqich natijasi: to'liq spec bor va compiler concurrency hamda past darajadan t
 
 - Interpreter, keyin baseline JIT.
 - Host interfeys: capability'lar WASM import sifatida beriladi, modul faqat o'ziga berilgan import'larga kira oladi.
+- Component Model: WIT va canonical ABI (string, list, record, variant, option, result) — Nimadir kontrakti uchun.
+- Resurs chegaralari: har chaqiruvga vaqt deadline'i va linear memory uchun yuqori chegara.
 
-**Qabul:** WASM spec testsuite'i interpreter'da ham, JIT'da ham o'tadi. Berilmagan import'ga murojaat rad etiladi.
+**Qabul:** WASM spec testsuite'i interpreter'da ham, JIT'da ham o'tadi. Berilmagan import'ga murojaat rad etiladi. Nimadir'ning `counter`, `hello` va `store` component'lari qayta build qilinmasdan ishlaydi; `runaway` vaqt va xotira chegarasida to'xtatiladi.
 
 ### S32. Web server va framework
 
@@ -363,3 +369,17 @@ Bosqich natijasi: to'liq spec bor va compiler concurrency hamda past darajadan t
 - bootstrap'da stage2 == stage3 barcha target'larda;
 - compiler va `std` testlari barcha target'larda o'tadi;
 - Linux'da Arche'da yozilgan web server HTTPS so'rovga javob beradi.
+
+## 10. Telefon kutubxonalari
+
+Arche OS telefonining Trek A'si (Linux kernel ustida Arche userspace) uchun. Faqat 4-bosqichga (`std`) tayanadi, shuning uchun S26–S34 bilan parallel, hatto ulardan oldin ham olib borilishi mumkin. Tilning yakuniy qabuli (S34) bu sprintni kutmaydi.
+
+### S35. Shrift, PNG, D-Bus va `std.linux`
+
+- TrueType parse va rasterizer (antialiasing), glyph cache; lotin va kirill.
+- PNG decoder (deflate bilan).
+- D-Bus client: message format, autentifikatsiya, method call va signal'lar.
+- `std.linux`: DRM/KMS dumb buffer, evdev input, PID 1 sifatida ishlash (bola process'larni yig'ish).
+- Shrift, PNG va D-Bus parser'lari uchun fuzzing.
+
+**Qabul:** shrift golden image testlari har platformada bit-identical. PNG decoder PngSuite'dan o'tadi. D-Bus client `dbus-daemon` bilan interop qiladi va ModemManager'dan modem ro'yxatini oladi. QEMU aarch64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi.
