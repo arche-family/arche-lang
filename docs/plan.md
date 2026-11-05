@@ -4,7 +4,7 @@
 
 ## Maqsad va doira
 
-Yakuniy natija noldan qurilgan Arche tili: self-hosted compiler, toolchain, standard library va kutubxonalar (kripto, TLS, HTTP, web framework, WASM). Til Linux va Windows'da OS'siz to'liq ishlaydi.
+Yakuniy natija noldan qurilgan Arche tili: self-hosted compiler, toolchain, standard library va kutubxonalar (kripto, TLS, HTTP, web framework, WASM). Til Linux va Windows'da (keyinroq macOS'da) OS'siz to'liq ishlaydi.
 
 **Arche OS alohida rejada.** Bu hujjat OS bilan faqat ABI (syscall interfeysi) va `freestanding` target orqali bog'langan. Kernel uchun tilga qo'yiladigan talablar spetsifikatsiya jadvalidagi "Past daraja" qatorida.
 
@@ -126,7 +126,7 @@ Compiler bitta `arche` binary'si sifatida chiqadi, hajmi taxminan 60–100k qato
 | Register allocation | linear scan | stage2 == stage3 |
 | Backend'lar | x86-64, ARM64, RISC-V 64, WASM | har target'da cross-build stage2 == stage3 |
 | Assembler + linker | o'z object format'i, static linking | tashqi tool'siz executable chiqadi |
-| Debug info | source map, stack trace | panic'da fayl:qator chiqadi |
+| Debug info | source map, stack trace, DWARF | panic'da fayl:qator chiqadi; `gdb`'da breakpoint va lokal o'zgaruvchilar ishlaydi |
 | Diagnostika | xato kodi, aniq joy, avtomatik qo'llanadigan fix; matn va JSON formatda | har xato kodi uchun misol test |
 
 **Rejimlar:** debug build IR'dan to'g'ridan-to'g'ri, minimal optimizatsiya bilan kod chiqaradi. Release build barcha pass'larni ishlatadi. Incremental compilation module darajasida, content-hash cache bilan ishlaydi.
@@ -147,20 +147,22 @@ Qabul: ABI hujjati + har target uchun ABI test suite. Unda boshqa modulda compil
 
 ## Toolchain va package manager
 
-Barcha vositalar bitta `arche` binary'sida jamlanadi. Build tizimi, formatter yoki package manager uchun alohida til ishlatilmaydi.
+Vositalar `arche` binary'sida jamlanadi. Compiler Arche-0'da qolgani uchun (process ishga tushirolmaydi, stdin va tarmoq yo'q) bularga muhtoj vositalar ikkinchi dasturda, to'liq Arche'da: `arche-driver` va `arche-lsp`. Build tizimi, formatter yoki package manager uchun alohida til ishlatilmaydi.
 
 | Buyruq | Vazifa |
 | --- | --- |
-| `arche build` | build fayli `build.arche` Arche'ning o'zida yoziladi; incremental, content-hash cache bilan |
-| `arche run` | build qilib ishga tushiradi |
+| `arche-driver build` | build fayli `build.arche` Arche'ning o'zida yoziladi; incremental, content-hash cache bilan |
+| `arche-driver run` | build qilib ishga tushiradi |
 | `arche test` | `test` bloklarini parallel ishga tushiradi, filter bor; seed har doim chiqariladi |
 | `arche check --json` | diagnostikani JSON'da beradi: xato kodi, joy, avtomatik qo'llanadigan fix (edit sifatida) |
 | `arche fix` | fix'larni qo'llaydi; `--edition` bilan kodni yangi edition'ga ko'chiradi |
-| `arche query` | definition, reference, type va caller'larni so'raydi: LSP'siz navigatsiya |
+| `arche query` | definition, reference, type va caller'larni so'raydi; `arche-lsp` ham shunga tayanadi |
+| `arche complete` | berilgan joyda mumkin bo'lgan nomlar, field'lar va method'lar |
 | `arche explain` | xato kodini misol bilan tushuntiradi |
 | `arche fmt` | yagona format, sozlamalarsiz |
-| `arche doc` | doc comment'lardan HTML chiqaradi; doc'dagi misollar test sifatida ishga tushadi |
-| `arche pkg` | dependency qo'shadi, lock qiladi, vendor qiladi |
+| `arche doc` | doc comment'lardan Markdown chiqaradi; doc'dagi misollar test sifatida ishga tushadi |
+| `arche-driver pkg` | dependency qo'shadi, lock qiladi, vendor qiladi |
+| `arche-lsp` | editor'lar uchun LSP server |
 
 **Package manager:**
 
@@ -168,6 +170,11 @@ Barcha vositalar bitta `arche` binary'sida jamlanadi. Build tizimi, formatter yo
 - Lockfile'da har dependency content hash bilan qayd etiladi.
 - Registry content-addressed bo'ladi: versiyalar o'zgarmas va Ed25519 bilan imzolangan.
 - Reproducible build kafolatlanadi: bir xil source va lockfile har doim bit-identical output beradi.
+
+**Editor integratsiyasi:**
+
+- `arche-lsp` har so'rovda compiler'ni alohida process'da ishga tushiradi. Compiler butun ishini bitta arena'da qiladi va xotirani bo'shatmaydi, shuning uchun uzoq yashaydigan server uning ichida bo'la olmaydi.
+- Compiler saqlanmagan matnni qabul qiladi, shuning uchun xato yozish paytida ko'rinadi. Rang berish uchun TextMate grammatikasi bor.
 
 ## Standard library
 
@@ -179,7 +186,7 @@ Standard library uch qatlamdan iborat, har biri pastdagisiga tayanadi. Kernel fa
 | `alloc` | Allocator interface; page, arena, pool va general allocator'lar; region runtime; List, Map, Set, String, Interner | kernel va userland |
 | `std` | capability turlari (Fs, Net, Clock, Env, Proc), fayl, process, task/scope, channel, `Shared(T)`, time, path, JSON, test runner | userland |
 
-**Platformalar:** `std` uch backend'ga ega: bootstrap monitor (gipotetik rejada; faqat Fs va konsol), host (Linux, Windows) va Arche OS (OS rejasidagi syscall API ustida).
+**Platformalar:** `std` uch backend'ga ega: bootstrap monitor (gipotetik rejada; faqat Fs va konsol), host (Linux, Windows, keyinroq macOS) va Arche OS (OS rejasidagi syscall API ustida).
 
 **Linux backend'idagi qo'shimchalar** (Arche OS telefonining Trek A'si uchun: Linux kernel ustida Arche userspace): DRM/KMS dumb buffer (ekranga chizish), evdev (touch va tugmalar) va `init` sifatida ishlash (PID 1: bola process'larni yig'ish, signal'lar). Ular `std.linux`'da, capability turlari orqali beriladi.
 
@@ -270,3 +277,4 @@ Eng katta risk hajmda: til tomoni taxminan 125–205k qator (OS'siz). Quyidagi q
 | Comptime | generics, macro va build bitta mexanizmda | suiiste'mol qilinsa compile sekinlashadi → comptime qadam limiti va profiler |
 | Hajm | spec va conformance test birinchi yoziladi | spec va testlar tayyor bo'lsa, boshqalar komponentlarni parallel yoza oladi |
 | Arche OS telefoni | ARM64 `freestanding`, Component Model va telefon kutubxonalari til rejasiga qo'shildi | ish hajmi oshadi; Trek A uchun kerakli qismlar (Component Model, D-Bus, shrift) web server'dan oldin bajarilishi mumkin, ular faqat `std`'ga tayanadi |
+| Editor integratsiyasi | `arche-lsp` va DWARF rejaga qo'shildi; LSP compiler ichida emas, alohida dasturda | ish hajmi oshadi; har so'rovda yangi process katta paketlarda sekinlashishi mumkin |
