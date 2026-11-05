@@ -1,6 +1,6 @@
 # Arche — til, compiler va kutubxonalar: to'liq reja
 
-> 2026-11-03 holatidagi nusxa. Arche OS rejasi alohida: [arche-os/docs/plan.md](https://github.com/arche-family/arche-os/blob/main/docs/plan.md).
+> 2026-11-05 holatidagi nusxa. Arche OS rejasi alohida: [arche-os/docs/plan.md](https://github.com/arche-family/arche-os/blob/main/docs/plan.md).
 
 ## Maqsad va doira
 
@@ -17,7 +17,7 @@ Yakuniy natija noldan qurilgan Arche tili: self-hosted compiler, toolchain, stan
 - Standard library (`core`, `alloc`, `std`) va uning backend'lari
 - Kutubxonalar: kripto, TLS 1.3, HTTP/1.1 va HTTP/2, web framework, WASM backend va runtime
 
-**Doiradan tashqarida:** Arche OS (alohida reja), brauzer, GUI.
+**Doiradan tashqarida:** Arche OS (alohida reja), brauzer, GUI toolkit. UI server Arche OS rejasida; bu rejada faqat u tayanadigan kutubxonalar bor ("Arche OS telefoni uchun kutubxonalar" bo'limi).
 
 **Yakuniy qabul mezoni:** bootstrap'da stage2 va stage3 bit-identical chiqadi. Compiler va std testlari barcha target'larda o'tadi. Linux'da Arche'da yozilgan web server HTTPS so'rovga javob beradi.
 
@@ -50,8 +50,11 @@ flowchart TD
     stage0 --> compiler["Compiler<br/>stage1–3, self-host"]
     compiler --> std["Standard library<br/>core, alloc, std"]
     compiler --> crypto["Kripto<br/>SHA, AEAD, X25519"]
-    compiler --> wasm["WASM runtime<br/>sandbox, capability"]
+    compiler --> wasm["WASM runtime<br/>sandbox, capability,<br/>Component Model"]
     compiler -.-> os["Arche OS<br/>alohida reja"]
+    std --> uilib["Telefon kutubxonalari<br/>shrift, PNG, D-Bus"]
+    uilib -.-> os
+    wasm -.-> os
     crypto --> tls["TLS 1.3"]
     std --> web["Web server<br/>HTTPS, region"]
     tls --> web
@@ -99,7 +102,7 @@ Spetsifikatsiya compiler'dan oldin yoziladi va conformance test suite bilan birg
 | Determinizm | map iteration = qo'shilish tartibi; seed'li random; testlar uchun seed'li scheduler |
 | Evolyutsiya | har paketda `edition`; eski kod o'z edition qoidalari bilan compile bo'laveradi |
 | Undefined behavior | faqat `unsafe` ichida bo'lishi mumkin |
-| Past daraja | `asm` blok, `naked` funksiyalar, `volatile` o'qish/yozish, atomic'lar va memory ordering, `packed` va `align(N)`, section nazorati, `freestanding` target; hammasi `unsafe` ichida (kernel talablari OS rejasida) |
+| Past daraja | `asm` blok, `naked` funksiyalar, `volatile` o'qish/yozish, atomic'lar va memory ordering, `packed` va `align(N)`, section nazorati, `freestanding` target (x86-64, RISC-V 64 va ARM64); hammasi `unsafe` ichida (kernel talablari OS rejasida) |
 
 **Deliverable'lar:**
 
@@ -178,6 +181,8 @@ Standard library uch qatlamdan iborat, har biri pastdagisiga tayanadi. Kernel fa
 
 **Platformalar:** `std` uch backend'ga ega: bootstrap monitor (gipotetik rejada; faqat Fs va konsol), host (Linux, Windows) va Arche OS (OS rejasidagi syscall API ustida).
 
+**Linux backend'idagi qo'shimchalar** (Arche OS telefonining Trek A'si uchun: Linux kernel ustida Arche userspace): DRM/KMS dumb buffer (ekranga chizish), evdev (touch va tugmalar) va `init` sifatida ishlash (PID 1: bola process'larni yig'ish, signal'lar). Ular `std.linux`'da, capability turlari orqali beriladi.
+
 Qabul: `core` freestanding holda build bo'ladi (OS'siz, allocator'siz). `std` testlari barcha backend'larda ham o'tadi.
 
 ## Kripto, TLS va HTTP
@@ -207,9 +212,22 @@ Web server har request'ni o'z region'ida bajaradi. Handler ichidagi barcha alloc
 - Backend: Arche → WASM. Bootstrap bo'limidagi stack codegen g'oyasi bu yerda deyarli 1:1 tushadi.
 - Runtime: WASM runtime host'da ham, Arche OS'da ham ishlaydi (interpreter va baseline JIT).
 - Host interfeys: capability'lar WASM import sifatida beriladi, modul faqat o'ziga berilgan import'larga kira oladi.
+- **Component Model:** WIT bilan tasvirlangan interfeyslar va canonical ABI (string, list, record, variant, option, result). Arche OS ilova modeli [Nimadir](https://github.com/Nodirbek-Abdulaxadov/nimadir) kontraktiga quriladi, shuning uchun Nimadir uchun Rust, C# yoki Python'da yozilgan component'lar Arche runtime'ida qayta build qilinmasdan ishlashi kerak.
+- **Resurs chegaralari:** har chaqiruvga vaqt deadline'i (epoch uslubida: kompilyatsiya qilingan kod sikl va funksiya boshida hisoblagichni tekshiradi) va linear memory uchun yuqori chegara. Chegaradan oshgan modul to'xtatiladi va host qaysi chegara ekanini biladi.
 - Server handler'larni WASM modul sifatida sandbox'da yuklay oladi.
 
-Qabul: Linux'da web server HTTPS (TLS 1.3, HTTP/2) orqali static fayl va JSON API javoblarini beradi. WASM modul handler sifatida ishlaydi. Throughput va p99 latency o'lchanib, regressiya testlari uchun baseline qilib qo'yiladi.
+Qabul: Nimadir'ning `counter`, `hello` va `store` component'lari Arche runtime'ida ishlaydi, `runaway` component'i vaqt va xotira chegarasida to'xtatiladi. Linux'da web server HTTPS (TLS 1.3, HTTP/2) orqali static fayl va JSON API javoblarini beradi. WASM modul handler sifatida ishlaydi. Throughput va p99 latency o'lchanib, regressiya testlari uchun baseline qilib qo'yiladi.
+
+## Arche OS telefoni uchun kutubxonalar
+
+Arche OS'ning birinchi mahsuloti telefon (OS rejasidagi "Mahsulot yo'nalishi" va "Telefon: ikki trek" bo'limlari). Uning UI server'i va tizim xizmatlari quyidagi kutubxonalarga tayanadi. Ular OS'ga bog'liq emas va host'da ham ishlaydi, shuning uchun til rejasida turadi.
+
+- **Shrift:** TrueType parse va rasterizer (antialiasing bilan), glyph cache. Lotin va kirill (o'zbek tilining ikkala yozuvi, rus); murakkab skriptlar keyinroq.
+- **Rasm:** PNG decoder (deflate bilan); keyin JPEG.
+- **D-Bus client:** message format, autentifikatsiya, method call va signal'lar. Trek A'da ModemManager, iwd va PipeWire bilan gaplashish uchun; Trek B'da kerak emas.
+- **Fuzzing:** shrift, PNG va D-Bus parser'lari boshidan fuzz qilinadi: ular tashqi ma'lumotni o'qiydi.
+
+Qabul: shrift rasterizer'i bir xil matnni har platformada bit-identical chizadi (golden image testlari). PNG decoder PngSuite'dan o'tadi. D-Bus client Linux'dagi `dbus-daemon` bilan interop qiladi va ModemManager'dan modem ro'yxatini oladi.
 
 ## Test va sifat
 
@@ -251,3 +269,4 @@ Eng katta risk hajmda: til tomoni taxminan 125–205k qator (OS'siz). Quyidagi q
 | GC yo'q | kernel'dan web'gacha bitta memory model | UI ham arena + handle bilan yoziladi, GC'li yordamchi til bo'lmaydi; bu noqulaylik ongli ravishda qabul qilinadi |
 | Comptime | generics, macro va build bitta mexanizmda | suiiste'mol qilinsa compile sekinlashadi → comptime qadam limiti va profiler |
 | Hajm | spec va conformance test birinchi yoziladi | spec va testlar tayyor bo'lsa, boshqalar komponentlarni parallel yoza oladi |
+| Arche OS telefoni | ARM64 `freestanding`, Component Model va telefon kutubxonalari til rejasiga qo'shildi | ish hajmi oshadi; Trek A uchun kerakli qismlar (Component Model, D-Bus, shrift) web server'dan oldin bajarilishi mumkin, ular faqat `std`'ga tayanadi |
