@@ -77,6 +77,15 @@ pub type Headers = struct {
     }
 
     /// The index of the first field with the name, if any.
+    ///
+    /// ```arche
+    /// var h = http.Headers.init(sys.alloc);
+    /// h.add(name: "Content-Type", value: "text/plain");
+    /// match h.find("content-type") {
+    ///     some(i) => { assert(h.value(i).eq("text/plain") and h.name(i).eq("content-type")); }
+    ///     none => { assert(false); }
+    /// }
+    /// ```
     pub fn find(self: &Headers, name: str) -> ?usize {
         var i: usize = 0;
         while i < self.names.len() : (i += 1) {

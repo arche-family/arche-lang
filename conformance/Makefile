@@ -1,12 +1,11 @@
-# Conformance tests and their runner.
+# Conformance tests and their runner, which is written in Arche
+# (runner/runner.arche) and built by the Arche compiler.
 #
-#   make             build the runner
+#   make             build the runner (and the compiler, if it is not built)
 #   make selftest    check the runner against its own sample tests
 #   make check       run tests/ with COMPILER (default: stage0)
 #   make clean       remove the runner build
 
-CFLAGS ?= -O2 -g
-WARN := -std=c11 -Wall -Wextra -Werror
 BUILD := runner/build
 RUNNER := $(BUILD)/runner
 
@@ -15,8 +14,11 @@ RUNNER_FLAGS ?= --stage0
 
 all: $(RUNNER)
 
-$(RUNNER): runner/runner.c | $(BUILD)
-	$(CC) $(WARN) $(CFLAGS) $(LDFLAGS) -o $@ runner/runner.c
+LIB := $(wildcard ../lib/*.arche ../lib/*/*.arche ../lib/*/*/*.arche)
+
+$(RUNNER): runner/runner.arche $(LIB) ../compiler/runtime/rt.c | $(BUILD)
+	$(MAKE) -C ../compiler
+	../compiler/arche-build runner/runner.arche $@
 
 $(BUILD):
 	mkdir -p $@

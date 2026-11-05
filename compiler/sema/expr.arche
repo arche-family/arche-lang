@@ -543,6 +543,7 @@ fn check_name(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
             if in_constant(c) {
                 return not_constant(c, n); // a run-time binding, where a constant is needed
             }
+            ck.note_use(c, token: t, decl_module: c.module, decl_token: b.name_token);
             return b.type_id;
         }
         none => { }
@@ -833,18 +834,20 @@ pub type FieldRef = struct {
     pub is_pub: bool,
     pub owner_module: u32,
     pub found: bool,
+    /// The field's name token in owner_module, or NONE (a built-in's field).
+    pub name_token: u32,
 }
 
 pub fn find_field(c: &mut ck.Checker, t: ty.TypeId, name: alloc.Symbol) -> FieldRef {
     let info = c.t.get(t);
-    var r = FieldRef { type_id: ty.invalid(), is_pub: true, owner_module: c.module, found: false };
+    var r = FieldRef { type_id: ty.invalid(), is_pub: true, owner_module: c.module, found: false, name_token: ck.NONE };
     if info.kind == ty.Kind.Struct {
         let d = c.decls[info.decl as usize];
         var i = d.members_start;
         while i < d.members_start + d.members_len : (i += 1) {
             let f = c.fields[i as usize];
             if f.name == name {
-                return FieldRef { type_id: f.type_id, is_pub: f.is_pub, owner_module: d.module, found: true };
+                return FieldRef { type_id: f.type_id, is_pub: f.is_pub, owner_module: d.module, found: true, name_token: f.name_token };
             }
         }
         return r;
@@ -1052,6 +1055,9 @@ fn check_field(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
     let s = ck.span_of(c, n);
     ck.require_visible(c, s, f.owner_module, f.is_pub, "this field");
     ck.set_ref(c, n, ck.VALUE_FIELD);
+    if f.name_token != ck.NONE {
+        ck.note_use(c, token: nt, decl_module: f.owner_module, decl_token: f.name_token);
+    }
     return f.type_id;
 }
 

@@ -26,6 +26,15 @@ pub fn index_of(comptime T: type, items: []T, x: &T) -> ?usize where T: core.Eq 
     return none;
 }
 
+/// Whether x is one of items.
+///
+/// ```arche
+/// let primes: [4]u32 = [2, 3, 5, 7];
+/// let five: u32 = 5;
+/// let six: u32 = 6;
+/// assert(slice.contains(u32, primes[0..4], x: &five));
+/// assert(not slice.contains(u32, primes[0..4], x: &six));
+/// ```
 pub fn contains(comptime T: type, items: []T, x: &T) -> bool where T: core.Eq {
     match index_of(T, items, x: x) {
         some(_) => { return true; }
@@ -47,6 +56,13 @@ pub fn reverse(comptime T: type, items: []mut T) {
 
 /// Sorts items in place, in O(n log n) and without allocating: heapsort.
 /// Equal items may change order.
+///
+/// ```arche
+/// var xs: [5]u32 = [3, 1, 4, 1, 5];
+/// slice.sort(u32, xs[0..5]);
+/// assert(xs[0] == 1 and xs[1] == 1 and xs[4] == 5);
+/// assert(slice.is_sorted(u32, xs[0..5]));
+/// ```
 pub fn sort(comptime T: type, items: []mut T) where T: core.Ord {
     let n = items.len();
     if n < 2 {

@@ -3,7 +3,9 @@
 # of `arche fix`: each fix/<name>.arche becomes fix/<name>.fixed, which
 # checks clean; and of `arche fmt`: fmt/<name>.arche becomes
 # fmt/<name>.formatted, which stays as it is, and so do the compiler's and
-# the library's sources.
+# the library's sources; and of `arche query`: the queries in
+# query/<name>.cases give query/<name>.expected; and of `arche doc`:
+# doc/<name>.arche gives doc/<name>.md.
 # Usage: run.sh <arche>
 set -u
 arche=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -35,9 +37,22 @@ for f in fmt/*.arche; do
     "$arche" fmt --check "$work/case.arche" || status=1
 done
 for f in ../*.arche ../syntax/*.arche ../sema/*.arche ../lower/*.arche ../ir/*.arche ../../lib/*.arche ../../lib/*/*.arche ../../lib/*/*/*.arche \
-    ../../interop/*.arche ../../fuzz/*.arche ../../ctcheck/*.arche ../../freestanding/*.arche; do
+    ../../interop/*.arche ../../fuzz/*.arche ../../ctcheck/*.arche ../../freestanding/*.arche ../../conformance/runner/*.arche; do
     [ -f "$f" ] || continue
     "$arche" fmt --check "$f" || status=1
 done
-[ "$status" -eq 0 ] && echo "diagnostics, fixes and layout: ok"
+for f in query/*.arche; do
+    name=${f%.arche}
+    while read -r what at; do
+        echo "\$ arche query $what $f $at"
+        "$arche" query "$what" "$f" "$at" 2>&1
+    done < "$name.cases" > "$out"
+    diff -u "$name.expected" "$out" || status=1
+done
+for f in doc/*.arche; do
+    name=${f%.arche}
+    "$arche" doc "$f" "$(basename "$name")" > "$out" || status=1
+    diff -u "$name.md" "$out" || status=1
+done
+[ "$status" -eq 0 ] && echo "diagnostics, fixes, layout, queries and docs: ok"
 exit "$status"

@@ -5,7 +5,7 @@ Tests of the Arche specification. Every rule gets at least one positive and one 
 | Path | Contents |
 | --- | --- |
 | `tests/` | the tests, grouped by spec chapter |
-| `runner/` | the test runner (C11 + POSIX), until `arche test` replaces it in S23 |
+| `runner/` | the test runner, in Arche (`runner.arche`), built by the Arche compiler; it replaced the C11 runner of S0 in S23 |
 | `runner/selftest/` | sample tests and a mock compiler that check the runner itself |
 | `testrunner/` | tests of `arche test` and `std.testing`, built with `compiler/arche-build-tests` |
 

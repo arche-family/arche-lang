@@ -18,6 +18,13 @@ fn last_slash(p: str) -> ?usize {
 }
 
 /// The last part: "c.txt" of "a/b/c.txt"; the whole path without a '/'.
+///
+/// ```arche
+/// assert(path.file_name("a/b/c.txt").eq("c.txt"));
+/// assert(path.file_name("c.txt").eq("c.txt"));
+/// assert(path.extension("a/b/c.txt").eq("txt"));
+/// assert(path.parent("a/b/c.txt").eq("a/b"));
+/// ```
 pub fn file_name(p: str) -> str {
     match last_slash(p) {
         some(i) => { return p[i + 1..p.len()]; }
@@ -53,6 +60,13 @@ pub fn extension(p: str) -> str {
 }
 
 /// base and name with one '/' between; name alone when it is absolute.
+///
+/// ```arche
+/// let p = path.join(base: "lib/", name: "core.arche", sys.alloc);
+/// assert(p.view().eq("lib/core.arche"));
+/// let q = path.join(base: "lib", name: "/etc/hosts", sys.alloc);
+/// assert(q.view().eq("/etc/hosts"));
+/// ```
 pub fn join(base: str, name: str, a: alloc.Allocator) -> alloc.String {
     var out = alloc.String.init(a);
     if is_absolute(name) or base.len() == 0 {

@@ -177,6 +177,15 @@ pub type FnInfo = struct {
     pub ncomptime: u32,
 }
 
+/// Where a name is used, and the name it refers to: tokens of modules.
+/// Kept only for arche query (program.Program.record_uses).
+pub type Use = struct {
+    pub module: u32,
+    pub token: u32,
+    pub decl_module: u32,
+    pub decl_token: u32,
+}
+
 pub type Binding = struct {
     pub name: alloc.Symbol,
     pub name_token: u32,
@@ -206,6 +215,8 @@ pub type Checker = struct {
     /// Per module, per CST node: the declaration a name or call refers to
     /// (a constant, a function), or NONE.
     pub node_refs: alloc.List(alloc.List(u32)),
+    /// Names' uses, when the program asks for them.
+    pub uses: alloc.List(Use),
     pub scope: alloc.List(Binding),
     /// The module whose code is being checked.
     pub module: u32,
@@ -617,7 +628,38 @@ pub fn ref_of(c: &Checker, n: cst.NodeId) -> u32 {
     return c.node_refs[c.module as usize][n.index as usize];
 }
 
+/// Notes that the token, in the module being checked, names what is
+/// declared at decl_token of decl_module (arche query).
+pub fn note_use(c: &mut Checker, token: u32, decl_module: u32, decl_token: u32) {
+    if c.p.record_uses {
+        c.uses.push(Use { module: c.module, token: token, decl_module: decl_module, decl_token: decl_token });
+    }
+}
+
+/// The token that names what a node refers to: a call's callee's, a path's
+/// or a member's last identifier.
+pub fn naming_token(c: &Checker, n: cst.NodeId) -> u32 {
+    var m = n;
+    while kind_of(c, m) == cst.Kind.CallExpr and child_count(c, m) > 0 {
+        m = child(c, m, 0);
+    }
+    let toks = own(c, m);
+    var found = ident_of(c, m);
+    let ts = toks.items();
+    var i: usize = 0;
+    while i < ts.len() : (i += 1) {
+        if tok_kind(c, ts[i]) == tk.Kind.Ident {
+            found = ts[i];
+        }
+    }
+    return found;
+}
+
 pub fn set_ref(c: &mut Checker, n: cst.NodeId, d: u32) {
+    if c.p.record_uses and d < ENV_REF {
+        let t = naming_token(c, n);
+        note_use(c, token: t, decl_module: c.decls[d as usize].module, decl_token: c.decls[d as usize].name_token);
+    }
     if c.cur_table != NONE {
         c.ref_tables[c.cur_table as usize].put(n.index, d);
         return;
@@ -1459,6 +1501,7 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
             some(d) => {
                 let k = c.decls[d as usize].kind;
                 if k != DeclKind.Fn and k != DeclKind.Const {
+                    note_use(c, token: first, decl_module: c.decls[d as usize].module, decl_token: c.decls[d as usize].name_token);
                     if c.decls[d as usize].generic {
                         return instance_from_type_args(c, d, n);
                     }
@@ -1502,6 +1545,7 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
                     some(d) => {
                         let decl = c.decls[d as usize];
                         if decl.kind != DeclKind.Fn and decl.kind != DeclKind.Const {
+                            note_use(c, token: second, decl_module: decl.module, decl_token: decl.name_token);
                             let s = span_of(c, n);
                             require_visible(c, s, decl.module, decl.is_pub, "this type");
                             if decl.generic {
@@ -2984,6 +3028,7 @@ pub fn analyze(p: program.Program) -> Checker {
         imports: alloc.List(alloc.Map(alloc.Symbol, Alias)).init(a),
         node_types: alloc.List(alloc.List(ty.TypeId)).init(a),
         node_refs: alloc.List(alloc.List(u32)).init(a),
+        uses: alloc.List(Use).init(a),
         scope: alloc.List(Binding).init(a),
         module: 0,
         fn_index: NONE,

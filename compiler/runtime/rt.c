@@ -1412,6 +1412,8 @@ _Noreturn void a0rt_start(i64 *sp) {
     i64 argc = sp[0];
     char **argv = (char **)(sp + 1);
     static System sys;
+    // Fs works on paths from the current directory (std.Fs.dir).
+    sys.fs = AT_FDCWD;
     sys.stdout_fd = 1;
     sys.stderr_fd = 2;
     sys.args = a0rt_alloc((u64)(argc > 0 ? argc : 1) * sizeof(Str));

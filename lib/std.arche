@@ -523,6 +523,215 @@ pub type Proc = struct {
         }
         return code;
     }
+
+    /// Starts cmd with stdin from /dev/null, in a process group of its own,
+    /// and waits for it, or until its time is up; then the whole group is
+    /// killed, so nothing it started outlives it. A program without a '/'
+    /// in its name is looked for in PATH.
+    pub fn spawn(self: &Proc, cmd: &Command, env: &Env, clock: &Clock, a: alloc.Allocator) -> ProcError!Ending {
+        if cmd.argv.len() == 0 {
+            return ProcError.NotFound;
+        }
+        // The candidates for argv[0]: itself, or each directory of PATH.
+        var programs = alloc.List(alloc.List(u8)).init(a);
+        let name = cmd.argv[0].view();
+        var has_slash = false;
+        for c in name.bytes() {
+            if c.* == '/' {
+                has_slash = true;
+            }
+        }
+        if has_slash {
+            programs.push(c_string(name, a));
+        } else {
+            let path = env.get("PATH", a) orelse alloc.String.init(a);
+            let pb = path.view().bytes();
+            var start: usize = 0;
+            var i: usize = 0;
+            while i <= pb.len() : (i += 1) {
+                if i == pb.len() or pb[i] == ':' {
+                    var full = alloc.String.init(a);
+                    if i > start {
+                        unsafe {
+                            // SAFETY: a part of a str, split at an ASCII ':'.
+                            full.push_str(mem.str_from(pb[start..i]));
+                        }
+                        full.push_str("/");
+                    }
+                    full.push_str(name);
+                    programs.push(c_string(full.view(), a));
+                    start = i + 1;
+                }
+            }
+        }
+        var texts = alloc.List(alloc.List(u8)).init(a);
+        for s in cmd.argv.items() {
+            texts.push(c_string(s.view(), a));
+        }
+        var ptrs = alloc.List(u64).init(a);
+        for t in texts.items() {
+            unsafe {
+                // SAFETY: each copy lives until the call ends.
+                ptrs.push(mem.slice_data(u8, t.items()).addr() as u64);
+            }
+        }
+        ptrs.push(0);
+        let dir = c_string(cmd.dir.view(), a);
+        let out_file = c_string(cmd.stdout_path.view(), a);
+        let err_file = c_string(cmd.stderr_path.view(), a);
+        let null = c_string("/dev/null", a);
+        var pid: i64 = 0;
+        unsafe {
+            // SAFETY: what is buffered is written once, by the parent.
+            a0rt_flush_all();
+            pid = linux.syscall(linux.FORK, [0, 0, 0, 0, 0, 0]);
+        }
+        if linux.errno(pid) != 0 {
+            return ProcError.ProcFailed;
+        }
+        if pid == 0 {
+            unsafe {
+                // SAFETY: the child sets itself up and execs, or ends
+                // without the parent's buffers.
+                _ = linux.syscall(linux.SETPGID, [0, 0, 0, 0, 0, 0]);
+                let f = linux.syscall(linux.OPENAT, [linux.AT_FDCWD, linux.arg(u8, mem.slice_data(u8, null.items())), 0, 0, 0, 0]);
+                if linux.errno(f) == 0 {
+                    _ = linux.syscall(linux.DUP2, [f, 0, 0, 0, 0, 0]);
+                }
+            }
+            if cmd.stdout_path.len() > 0 {
+                redirect(&out_file, fd: 1);
+            }
+            if cmd.stderr_path.len() > 0 {
+                if cmd.stderr_path.view().eq(cmd.stdout_path.view()) {
+                    unsafe {
+                        // SAFETY: both go to the file opened as stdout.
+                        _ = linux.syscall(linux.DUP2, [1, 2, 0, 0, 0, 0]);
+                    }
+                } else {
+                    redirect(&err_file, fd: 2);
+                }
+            }
+            unsafe {
+                // SAFETY: as above.
+                if cmd.dir.len() > 0 {
+                    let r = linux.syscall(linux.CHDIR, [linux.arg(u8, mem.slice_data(u8, dir.items())), 0, 0, 0, 0, 0]);
+                    if linux.errno(r) != 0 {
+                        _ = linux.syscall(linux.EXIT, [126, 0, 0, 0, 0, 0]);
+                    }
+                }
+                var code: i64 = 127;
+                for p in programs.items() {
+                    let r = linux.syscall(linux.EXECVE, [linux.arg(u8, mem.slice_data(u8, p.items())), linux.arg(u64, mem.slice_data(u64, ptrs.items())), env.vars.addr() as% i64, 0, 0, 0]);
+                    if linux.errno(r) != linux.ENOENT {
+                        code = 126;
+                    }
+                }
+                _ = linux.syscall(linux.EXIT, [code, 0, 0, 0, 0, 0]);
+            }
+        }
+        unsafe {
+            // SAFETY: the child's group, set from both sides so neither
+            // waits for the other.
+            _ = linux.syscall(linux.SETPGID, [pid, pid, 0, 0, 0, 0]);
+        }
+        // Waits with WNOWAIT, which leaves the child a zombie: its group
+        // id stays reserved until the group is killed below.
+        let start = clock.monotonic_ns();
+        var timed_out = false;
+        while true {
+            var info: [128]u8 = [0; 128];
+            var r: i64 = 0;
+            unsafe {
+                // SAFETY: waitid writes a siginfo_t, 128 bytes.
+                r = linux.syscall(linux.WAITID, [1, pid, linux.arg(u8, &info[0] as *u8), 0x1000004 | 1, 0, 0]);
+            }
+            let child = (info[16] as i64) | ((info[17] as i64) << 8) | ((info[18] as i64) << 16) | ((info[19] as i64) << 24);
+            if r == 0 and child == pid {
+                break;
+            }
+            if cmd.timeout_ms > 0 and clock.monotonic_ns() - start >= cmd.timeout_ms * 1000000 {
+                timed_out = true;
+                break;
+            }
+            clock.sleep_ns(5000000);
+        }
+        var status: i32 = 0;
+        unsafe {
+            // SAFETY: the group the child made; then wait4 writes one int.
+            _ = linux.syscall(linux.KILL, [-pid, 9, 0, 0, 0, 0]);
+            var w: i64 = -linux.EINTR;
+            while linux.errno(w) == linux.EINTR {
+                w = linux.syscall(linux.WAIT4, [pid, linux.arg(i32, &status as *i32), 0, 0, 0, 0]);
+            }
+        }
+        if timed_out {
+            return Ending.TimedOut;
+        }
+        if (status & 0x7F) != 0 {
+            return Ending.Signaled { signal: (status & 0x7F) as u8 };
+        }
+        return Ending.Exited { status: ((status >> 8) & 0xFF) as u8 };
+    }
+}
+
+/// A program to start: its arguments, the directory it runs in, and where
+/// its output goes (Proc.spawn).
+pub type Command = struct {
+    pub argv: alloc.List(alloc.String),
+    /// The directory to run in; empty for this program's.
+    pub dir: alloc.String,
+    /// Files for its stdout and stderr, made or emptied; empty to share
+    /// this program's. The same path for both puts them in one file.
+    pub stdout_path: alloc.String,
+    pub stderr_path: alloc.String,
+    /// How long it may run, in milliseconds; 0 for as long as it takes.
+    pub timeout_ms: u64,
+
+    pub fn init(a: alloc.Allocator) -> Command {
+        return Command {
+            argv: alloc.List(alloc.String).init(a),
+            dir: alloc.String.init(a),
+            stdout_path: alloc.String.init(a),
+            stderr_path: alloc.String.init(a),
+            timeout_ms: 0,
+        };
+    }
+
+    /// Adds an argument; the first is the program.
+    pub fn arg(self: &mut Command, text: str, a: alloc.Allocator) {
+        var s = alloc.String.init(a);
+        s.push_str(text);
+        self.argv.push(s);
+    }
+}
+
+/// How a started program ended.
+pub type Ending = enum {
+    Exited { status: u8 },
+    Signaled { signal: u8 },
+    TimedOut,
+}
+
+fn c_string(text: str, a: alloc.Allocator) -> alloc.List(u8) {
+    var t = alloc.List(u8).init(a);
+    for b in text.bytes() {
+        t.push(b.*);
+    }
+    t.push(0);
+    return t;
+}
+
+/// In a child that has forked: opens path for output onto fd, or ends.
+fn redirect(path: &alloc.List(u8), fd: i64) {
+    unsafe {
+        // SAFETY: path is NUL-terminated; O_WRONLY | O_CREAT | O_TRUNC, 0644.
+        let f = linux.syscall(linux.OPENAT, [linux.AT_FDCWD, linux.arg(u8, mem.slice_data(u8, path.items())), 0x241, 0x1A4, 0, 0]);
+        if linux.errno(f) != 0 {
+            _ = linux.syscall(linux.EXIT, [126, 0, 0, 0, 0, 0]);
+        }
+        _ = linux.syscall(linux.DUP2, [f, fd, 0, 0, 0, 0]);
+    }
 }
 
 // ---- Rand -------------------------------------------------------------------------

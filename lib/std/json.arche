@@ -22,6 +22,16 @@ pub type JsonError = error { Syntax, TooDeep }
 /// stack overflow.
 pub const MAX_DEPTH: u32 = 128;
 
+/// The value text holds, or the error that stops it.
+///
+/// ```arche
+/// import alloc;
+/// let v = json.parse("{\"b\": [1, true, null], \"a\": \"x\"}", sys.alloc) catch json.Value.Null;
+/// var out = alloc.String.init(sys.alloc);
+/// json.write(&v, out: &mut out);
+/// // Keys keep their order: b, then a.
+/// assert(out.view().eq("{\"b\":[1,true,null],\"a\":\"x\"}"));
+/// ```
 pub fn parse(text: str, a: alloc.Allocator) -> JsonError!Value {
     let b = text.bytes();
     var p = Parser { at: 0, a: a };

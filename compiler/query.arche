@@ -1,0 +1,252 @@
+/// arche query (docs/sprints.md S23): what a name at a place in the root
+/// file is. The checker keeps every use of a name with the declaration it
+/// refers to (sema.check.Use); a query reads them.
+///
+///     def      where the name is declared
+///     refs     the declaration and every use, in every module
+///     type     the type of the innermost expression there
+///     callers  the calls of the function named there, with the function
+///              each is in
+import std;
+import alloc;
+import diag;
+import program;
+import sema.check as ck;
+import syntax.cst;
+import syntax.token as tk;
+
+/// A place: a token of a module.
+type Place = struct {
+    module: u32,
+    token: u32,
+}
+
+/// The offset of a line and a column (both from 1, the column in bytes).
+fn offset_of(text: str, line: u32, column: u32) -> ?u32 {
+    var l: u32 = 1;
+    var i: usize = 0;
+    while l < line and i < text.len() : (i += 1) {
+        if text[i] == '\n' {
+            l += 1;
+        }
+    }
+    if l != line {
+        return none;
+    }
+    let at = i + (column as usize) - 1;
+    if column == 0 or at > text.len() {
+        return none;
+    }
+    return at as u32;
+}
+
+/// The identifier at an offset, or just before it (a cursor after a name).
+fn token_at(c: &ck.Checker, module: u32, offset: u32) -> ?u32 {
+    let tree = &c.p.modules[module as usize].tree;
+    let ts = tree.tokens.items();
+    var i: usize = 0;
+    while i < ts.len() : (i += 1) {
+        let t = ts[i];
+        if t.kind == tk.Kind.Ident and t.start <= offset and offset <= t.start + t.len {
+            return i as u32;
+        }
+    }
+    return none;
+}
+
+/// What the token names: a use's declaration, or the token itself.
+fn target_of(c: &ck.Checker, at: Place) -> Place {
+    let us = c.uses.items();
+    var i: usize = 0;
+    while i < us.len() : (i += 1) {
+        if us[i].module == at.module and us[i].token == at.token {
+            return Place { module: us[i].decl_module, token: us[i].decl_token };
+        }
+    }
+    return at;
+}
+
+fn write_place(out: &mut std.Output, c: &ck.Checker, at: Place) {
+    let m = &c.p.modules[at.module as usize];
+    let t = m.tree.tokens[at.token as usize];
+    let pos = diag.position(m.text.view(), t.start);
+    out.write(m.path.view());
+    out.write(":");
+    out.write_u64(pos.line as u64);
+    out.write(":");
+    out.write_u64(pos.column as u64);
+}
+
+/// The function a token is in, by name, or "".
+fn enclosing_fn(c: &ck.Checker, at: Place) -> str {
+    let m = &c.p.modules[at.module as usize];
+    let nodes = m.tree.nodes.items();
+    var best: u32 = ck.NONE;
+    var best_size: u32 = 0;
+    var i: usize = 0;
+    while i < nodes.len() : (i += 1) {
+        let n = nodes[i];
+        if n.kind == cst.Kind.FnDecl and n.first <= at.token and at.token < n.end {
+            if best == ck.NONE or n.end - n.first < best_size {
+                best = i as u32;
+                best_size = n.end - n.first;
+            }
+        }
+    }
+    if best == ck.NONE {
+        return "";
+    }
+    // The function's name: the first identifier after `fn`.
+    let n = nodes[best as usize];
+    var seen_fn = false;
+    var t = n.first;
+    while t < n.end : (t += 1) {
+        let k = m.tree.tokens[t as usize].kind;
+        if k == tk.Kind.KwFn {
+            seen_fn = true;
+        } else if seen_fn and k == tk.Kind.Ident {
+            return m.token_text(t);
+        }
+    }
+    return "";
+}
+
+/// The places that name the target, the declaration first, each once, in
+/// module and token order.
+fn references(c: &ck.Checker, target: Place, a: alloc.Allocator) -> alloc.List(Place) {
+    var found = alloc.List(Place).init(a);
+    let us = c.uses.items();
+    var u: usize = 0;
+    while u < us.len() : (u += 1) {
+        if us[u].decl_module == target.module and us[u].decl_token == target.token {
+            let p = Place { module: us[u].module, token: us[u].token };
+            var seen = p.module == target.module and p.token == target.token;
+            var q: usize = 0;
+            while q < found.len() : (q += 1) {
+                if found[q].module == p.module and found[q].token == p.token {
+                    seen = true;
+                }
+            }
+            if not seen {
+                found.push(p);
+            }
+        }
+    }
+    // Insertion sort, by module, then token.
+    let fs = found.items_mut();
+    var i: usize = 1;
+    while i < fs.len() : (i += 1) {
+        var k = i;
+        while k > 0 and (fs[k - 1].module > fs[k].module or (fs[k - 1].module == fs[k].module and fs[k - 1].token > fs[k].token)) : (k -= 1) {
+            let x = fs[k - 1];
+            fs[k - 1] = fs[k];
+            fs[k] = x;
+        }
+    }
+    return found;
+}
+
+/// The type of the innermost expression at the token, or invalid.
+fn type_at(c: &ck.Checker, at: Place) -> ?u32 {
+    let m = &c.p.modules[at.module as usize];
+    let nodes = m.tree.nodes.items();
+    let types = c.node_types[at.module as usize].items();
+    var best: u32 = ck.NONE;
+    var best_size: u32 = 0;
+    var i: usize = 0;
+    while i < nodes.len() and i < types.len() : (i += 1) {
+        let n = nodes[i];
+        if n.first <= at.token and at.token < n.end and types[i].index != 0 {
+            if best == ck.NONE or n.end - n.first < best_size {
+                best = i as u32;
+                best_size = n.end - n.first;
+            }
+        }
+    }
+    if best == ck.NONE {
+        return none;
+    }
+    return best;
+}
+
+/// Runs a query; false when there is nothing at the place.
+pub fn run(out: &mut std.Output, err_out: &mut std.Output, c: &ck.Checker, what: str, line: u32, column: u32, a: alloc.Allocator) -> bool {
+    let root: u32 = 0;
+    var offset: u32 = 0;
+    match offset_of(c.p.modules[root as usize].text.view(), line: line, column: column) {
+        some(o) => { offset = o; }
+        none => {
+            err_out.write("arche query: the file has no such line and column\n");
+            return false;
+        }
+    }
+    var token: u32 = 0;
+    match token_at(c, module: root, offset: offset) {
+        some(t) => { token = t; }
+        none => {
+            err_out.write("arche query: there is no name there\n");
+            return false;
+        }
+    }
+    let at = Place { module: root, token: token };
+    let target = target_of(c, at);
+    if what.eq("def") {
+        write_place(out, c, target);
+        out.write("\n");
+        return true;
+    }
+    if what.eq("refs") {
+        write_place(out, c, target);
+        out.write(": declared\n");
+        let refs = references(c, target, a);
+        var i: usize = 0;
+        while i < refs.len() : (i += 1) {
+            write_place(out, c, refs[i]);
+            out.write("\n");
+        }
+        return true;
+    }
+    if what.eq("callers") {
+        var is_fn = false;
+        let ds = c.decls.items();
+        var i: usize = 0;
+        while i < ds.len() : (i += 1) {
+            if ds[i].module == target.module and ds[i].name_token == target.token and ds[i].kind == ck.DeclKind.Fn {
+                is_fn = true;
+            }
+        }
+        if not is_fn {
+            err_out.write("arche query: that is not a function\n");
+            return false;
+        }
+        let refs = references(c, target, a);
+        var k: usize = 0;
+        while k < refs.len() : (k += 1) {
+            write_place(out, c, refs[k]);
+            let f = enclosing_fn(c, refs[k]);
+            if f.len() > 0 {
+                out.write(": in ");
+                out.write(f);
+            }
+            out.write("\n");
+        }
+        return true;
+    }
+    if what.eq("type") {
+        match type_at(c, at) {
+            some(n) => {
+                var text = alloc.String.init(a);
+                ck.write_type(c, &mut text, c.node_types[root as usize][n as usize]);
+                out.write(text.view());
+                out.write("\n");
+                return true;
+            }
+            none => {
+                err_out.write("arche query: no expression with a type there\n");
+                return false;
+            }
+        }
+    }
+    err_out.write("arche query: def, refs, type or callers\n");
+    return false;
+}

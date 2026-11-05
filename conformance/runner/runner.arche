@@ -1,0 +1,900 @@
+/// Conformance test runner. The test format is described in
+/// conformance/README.md.
+///
+/// usage: runner --compiler <command> [--stage0] [--codes <prefixes>]
+///               [--timeout <seconds>] [--filter <text>] <path>...
+///
+/// In Arche since S23 (docs/sprints.md), built by the Arche compiler; the
+/// C11 runner it replaces was there for before Arche could be.
+import alloc;
+import core.mem;
+import std;
+
+fn find(hay: []u8, from: usize, needle: []u8) -> ?usize {
+    var i = from;
+    while i + needle.len() <= hay.len() : (i += 1) {
+        var k: usize = 0;
+        while k < needle.len() and hay[i + k] == needle[k] : (k += 1) {
+        }
+        if k == needle.len() {
+            return i;
+        }
+    }
+    return none;
+}
+
+fn alnum(c: u8) -> bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
+}
+
+/// code appears in text as a whole word: E0001 does not match E00012.
+fn has_code(text: []u8, code: []u8) -> bool {
+    var at: usize = 0;
+    while true {
+        match find(hay: text, from: at, needle: code) {
+            some(i) => {
+                let before = i > 0 and alnum(text[i - 1]);
+                let after = i + code.len() < text.len() and alnum(text[i + code.len()]);
+                if not before and not after {
+                    return true;
+                }
+                at = i + 1;
+            }
+            none => { return false; }
+        }
+    }
+    return false;
+}
+
+fn parse_uint(s: []u8, max: u64) -> ?u64 {
+    if s.len() == 0 {
+        return none;
+    }
+    var v: u64 = 0;
+    for c in s {
+        if c.* < '0' or c.* > '9' {
+            return none;
+        }
+        let d = (c.* - '0') as u64;
+        if v > (max - d) / 10 {
+            return none;
+        }
+        v = v * 10 + d;
+    }
+    return v;
+}
+
+fn text_of(b: []u8, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    unsafe {
+        // SAFETY: every caller passes a part of a str split at ASCII bytes.
+        s.push_str(mem.str_from(b));
+    }
+    return s;
+}
+
+// ---- The test header ------------------------------------------------------------------
+
+type Kind = enum { Run, CompileError }
+
+type Test = struct {
+    seen: [9]bool,
+    kind: Kind,
+    stage0_skip: bool,
+    exit_code: u8,
+    stdout_text: alloc.List(u8),
+    stderr_parts: alloc.List(alloc.String),
+    args: alloc.List(alloc.String),
+    line: u64,
+    code: alloc.String,
+}
+
+const K_TEST: usize = 0;
+const K_SPEC: usize = 1;
+const K_STAGE0: usize = 2;
+const K_EXIT: usize = 3;
+const K_STDOUT: usize = 4;
+const K_STDERR: usize = 5;
+const K_ARGS: usize = 6;
+const K_LINE: usize = 7;
+const K_CODE: usize = 8;
+
+fn key_name(k: usize) -> str {
+    if k == K_TEST { return "test"; }
+    if k == K_SPEC { return "spec"; }
+    if k == K_STAGE0 { return "stage0"; }
+    if k == K_EXIT { return "exit"; }
+    if k == K_STDOUT { return "stdout"; }
+    if k == K_STDERR { return "stderr"; }
+    if k == K_ARGS { return "args"; }
+    if k == K_LINE { return "line"; }
+    return "code";
+}
+
+fn repeats(k: usize) -> bool {
+    return k == K_STDOUT or k == K_STDERR or k == K_ARGS;
+}
+
+/// Applies one `// key: value` line.
+fn apply_key(t: &mut Test, key: usize, v: []u8, a: alloc.Allocator) -> bool {
+    if key == K_TEST {
+        if mem_eq(a: v, b: "run".bytes()) {
+            t.kind = Kind.Run;
+            return true;
+        }
+        if mem_eq(a: v, b: "compile-error".bytes()) {
+            t.kind = Kind.CompileError;
+            return true;
+        }
+        return false;
+    }
+    if key == K_SPEC {
+        return v.len() > 0;
+    }
+    if key == K_STAGE0 {
+        t.stage0_skip = mem_eq(a: v, b: "skip".bytes());
+        return t.stage0_skip;
+    }
+    if key == K_EXIT {
+        match parse_uint(v, max: 255) {
+            some(n) => {
+                t.exit_code = n as u8;
+                return true;
+            }
+            none => { return false; }
+        }
+    }
+    if key == K_STDOUT {
+        for c in v {
+            t.stdout_text.push(c.*);
+        }
+        t.stdout_text.push('\n');
+        return true;
+    }
+    if key == K_STDERR {
+        if v.len() == 0 {
+            return false;
+        }
+        t.stderr_parts.push(text_of(v, a));
+        return true;
+    }
+    if key == K_ARGS {
+        let before = t.args.len();
+        var p: usize = 0;
+        while p < v.len() {
+            while p < v.len() and v[p] == ' ' : (p += 1) {
+            }
+            let start = p;
+            while p < v.len() and v[p] != ' ' : (p += 1) {
+            }
+            if p > start {
+                t.args.push(text_of(v[start..p], a));
+            }
+        }
+        return t.args.len() > before;
+    }
+    if key == K_LINE {
+        match parse_uint(v, max: 9223372036854775807) {
+            some(n) => {
+                t.line = n;
+                return n > 0;
+            }
+            none => { return false; }
+        }
+    }
+    if v.len() == 0 {
+        return false;
+    }
+    t.code.push_str(text_of(v, a).view());
+    return true;
+}
+
+fn mem_eq(a: []u8, b: []u8) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len() : (i += 1) {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn lower_or_digit(c: u8) -> bool {
+    return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-';
+}
+
+/// The header is the run of `// key: value` lines at the start of the file;
+/// what is wrong with it, in err, when it is.
+fn parse_header(src: []u8, t: &mut Test, problem: &mut alloc.String, a: alloc.Allocator) -> bool {
+    var pos: usize = 0;
+    var lineno: u64 = 0;
+    while pos < src.len() {
+        var nl = pos;
+        while nl < src.len() and src[nl] != '\n' : (nl += 1) {
+        }
+        let line = src[pos..nl];
+        let n = line.len();
+        lineno += 1;
+        if n < 4 or line[0] != '/' or line[1] != '/' or line[2] != ' ' {
+            break;
+        }
+        var k: usize = 3;
+        while k < n and lower_or_digit(line[k]) : (k += 1) {
+        }
+        if k == 3 or k >= n or line[k] != ':' {
+            break;
+        }
+        let name = line[3..k];
+        var v = k + 1;
+        if v < n and line[v] == ' ' {
+            v += 1;
+        }
+        var key: usize = 9;
+        var i: usize = 0;
+        while i < 9 : (i += 1) {
+            if mem_eq(a: key_name(i).bytes(), b: name) {
+                key = i;
+            }
+        }
+        if key == 9 {
+            problem.push_str("line ");
+            put_number(problem, n: lineno);
+            problem.push_str(": unknown key '");
+            problem.push_str(text_of(name, a).view());
+            problem.push_str("'");
+            return false;
+        }
+        if t.seen[key] and not repeats(key) {
+            problem.push_str("line ");
+            put_number(problem, n: lineno);
+            problem.push_str(": duplicate '");
+            problem.push_str(key_name(key));
+            problem.push_str("'");
+            return false;
+        }
+        t.seen[key] = true;
+        if not apply_key(t, key: key, v: line[v..n], a) {
+            problem.push_str("line ");
+            put_number(problem, n: lineno);
+            problem.push_str(": invalid value for '");
+            problem.push_str(key_name(key));
+            problem.push_str("': '");
+            problem.push_str(text_of(line[v..n], a).view());
+            problem.push_str("'");
+            return false;
+        }
+        pos = nl;
+        if nl < src.len() {
+            pos += 1;
+        }
+    }
+    if not t.seen[K_TEST] {
+        problem.push_str("missing 'test'");
+        return false;
+    }
+    if not t.seen[K_SPEC] {
+        problem.push_str("missing 'spec'");
+        return false;
+    }
+    if t.kind == Kind.Run {
+        if t.seen[K_LINE] or t.seen[K_CODE] {
+            problem.push_str("'");
+            if t.seen[K_LINE] {
+                problem.push_str("line");
+            } else {
+                problem.push_str("code");
+            }
+            problem.push_str("' is allowed only with 'test: compile-error'");
+            return false;
+        }
+    } else {
+        var i: usize = K_EXIT;
+        while i <= K_ARGS : (i += 1) {
+            if t.seen[i] {
+                problem.push_str("'");
+                problem.push_str(key_name(i));
+                problem.push_str("' is allowed only with 'test: run'");
+                return false;
+            }
+        }
+        if not t.seen[K_LINE] {
+            problem.push_str("missing 'line'");
+            return false;
+        }
+    }
+    return true;
+}
+
+fn put_number(s: &mut alloc.String, n: u64) {
+    var digits: [20]u8 = [0; 20];
+    var k: usize = 0;
+    var v = n;
+    while true {
+        digits[k] = '0' + (v % 10) as u8;
+        k += 1;
+        v = v / 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while k > 0 : (k -= 1) {
+        s.push_ascii(digits[k - 1]);
+    }
+}
+
+// ---- Reporting --------------------------------------------------------------------------
+
+fn verdict(out: &mut std.Output, word: str, path: str, detail: str) {
+    out.write(word);
+    out.write(" ");
+    out.write(path);
+    if detail.len() > 0 {
+        out.write(": ");
+        out.write(detail);
+    }
+    out.write("\n");
+}
+
+/// Output as indented lines, at most 20 of them.
+fn show_lines(out: &mut std.Output, b: []u8) {
+    if b.len() == 0 {
+        out.write("  (no output)\n");
+        return;
+    }
+    var pos: usize = 0;
+    var shown: u32 = 0;
+    while pos < b.len() {
+        if shown == 20 {
+            out.write("  | ...\n");
+            return;
+        }
+        var nl = pos;
+        while nl < b.len() and b[nl] != '\n' : (nl += 1) {
+        }
+        out.write("  | ");
+        for c in b[pos..nl] {
+            out.write_byte(c.*);
+        }
+        out.write("\n");
+        pos = nl;
+        if nl < b.len() {
+            pos += 1;
+        }
+        shown += 1;
+    }
+}
+
+fn hex_digit(v: u8) -> u8 {
+    if v < 10 {
+        return '0' + v;
+    }
+    return 'A' + v - 10;
+}
+
+/// `label "text"` with C-style escapes, cut at 400 bytes.
+fn show_escaped(out: &mut std.Output, label: str, b: []u8) {
+    var limit = b.len();
+    if limit > 400 {
+        limit = 400;
+    }
+    out.write("  ");
+    out.write(label);
+    out.write(" \"");
+    for p in b[0..limit] {
+        let c = p.*;
+        if c == '\n' {
+            out.write("\\n");
+        } else if c == '\t' {
+            out.write("\\t");
+        } else if c == '\\' {
+            out.write("\\\\");
+        } else if c == '"' {
+            out.write("\\\"");
+        } else if c < 0x20 or c == 0x7F {
+            out.write("\\x");
+            out.write_byte(hex_digit(c >> 4));
+            out.write_byte(hex_digit(c & 15));
+        } else {
+            out.write_byte(c);
+        }
+    }
+    out.write("\"");
+    if b.len() > limit {
+        out.write(" (");
+        out.write_u64((b.len() - limit) as u64);
+        out.write(" more bytes)");
+    }
+    out.write("\n");
+}
+
+// ---- Running a test ---------------------------------------------------------------------
+
+type Options = struct {
+    compiler: alloc.String,
+    stage0: bool,
+    timeout: u64,
+    filter: alloc.String,
+    codes: alloc.String,
+    has_codes: bool,
+}
+
+/// With --codes, only compile-error tests whose code starts with one of
+/// the prefixes run: for a compiler that checks programs but cannot build
+/// them yet.
+fn code_selected(o: &Options, t: &Test) -> bool {
+    if not o.has_codes {
+        return true;
+    }
+    if t.kind != Kind.CompileError or t.code.len() == 0 {
+        return false;
+    }
+    let p = o.codes.view().bytes();
+    let code = t.code.view().bytes();
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= p.len() : (i += 1) {
+        if i == p.len() or p[i] == ',' {
+            let n = i - start;
+            if n > 0 and code.len() >= n and mem_eq(a: code[0..n], b: p[start..i]) {
+                return true;
+            }
+            start = i + 1;
+        }
+    }
+    return false;
+}
+
+type Result = enum { Pass, Fail, Skip }
+
+/// The directory of a path: "." for a bare name.
+fn dir_of(path: str, a: alloc.Allocator) -> alloc.String {
+    let b = path.bytes();
+    var slash = b.len();
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        if b[i] == '/' {
+            slash = i;
+        }
+    }
+    if slash == b.len() {
+        return text_of(".".bytes(), a);
+    }
+    if slash == 0 {
+        return text_of("/".bytes(), a);
+    }
+    return text_of(b[0..slash], a);
+}
+
+fn number_text(n: u64, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    put_number(&mut s, n: n);
+    return s;
+}
+
+fn check_compile_error(out: &mut std.Output, path: str, t: &Test, o: &Options, diag: []u8, a: alloc.Allocator) -> Result {
+    var needle = alloc.String.init(a);
+    needle.push_str(path);
+    needle.push_str(":");
+    put_number(&mut needle, n: t.line);
+    needle.push_str(":");
+    match find(hay: diag, from: 0, needle: needle.view().bytes()) {
+        some(_) => { }
+        none => {
+            var m = alloc.String.init(a);
+            m.push_str("diagnostics do not point at ");
+            m.push_str(path);
+            m.push_str(":");
+            put_number(&mut m, n: t.line);
+            verdict(out, word: "FAIL", path: path, detail: m.view());
+            show_lines(out, b: diag);
+            return Result.Fail;
+        }
+    }
+    if t.code.len() > 0 and not o.stage0 and not has_code(text: diag, code: t.code.view().bytes()) {
+        var m = alloc.String.init(a);
+        m.push_str("diagnostics do not mention ");
+        m.push_str(t.code.view());
+        verdict(out, word: "FAIL", path: path, detail: m.view());
+        show_lines(out, b: diag);
+        return Result.Fail;
+    }
+    verdict(out, word: "PASS", path: path, detail: "");
+    return Result.Pass;
+}
+
+fn read_or_empty(fs: &std.Fs, path: str, a: alloc.Allocator) -> alloc.List(u8) {
+    return fs.read_bytes(path, a) catch alloc.List(u8).init(a);
+}
+
+fn temp_path(tmp: str, name: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str(tmp);
+    s.push_str("/");
+    s.push_str(name);
+    return s;
+}
+
+fn check_run(sys: &mut std.System, path: str, t: &Test, o: &Options, tmp: str, exe: str, a: alloc.Allocator) -> Result {
+    var cmd = std.Command.init(a);
+    cmd.arg(exe, a);
+    for arg in t.args.items() {
+        cmd.arg(arg.view(), a);
+    }
+    cmd.dir = dir_of(path, a);
+    let out_path = temp_path(tmp: tmp, name: "stdout", a);
+    let err_path = temp_path(tmp: tmp, name: "stderr", a);
+    cmd.stdout_path.push_str(out_path.view());
+    cmd.stderr_path.push_str(err_path.view());
+    cmd.timeout_ms = o.timeout * 1000;
+    var ending = std.Ending.TimedOut;
+    match sys.proc.spawn(&cmd, env: &sys.env, clock: &sys.clock, a) {
+        ok(e) => { ending = e; }
+        err(_) => {
+            verdict(&mut sys.stdout, word: "FAIL", path: path, detail: "cannot start the program");
+            return Result.Fail;
+        }
+    }
+    let got = read_or_empty(&sys.fs, out_path.view(), a);
+    let errors = read_or_empty(&sys.fs, err_path.view(), a);
+    let out = &mut sys.stdout;
+    var m = alloc.String.init(a);
+    match ending {
+        .TimedOut => {
+            m.push_str("timed out after ");
+            put_number(&mut m, n: o.timeout);
+            m.push_str(" s");
+            verdict(out, word: "FAIL", path: path, detail: m.view());
+            return Result.Fail;
+        }
+        .Signaled { signal } => {
+            m.push_str("killed by signal ");
+            put_number(&mut m, n: signal as u64);
+            verdict(out, word: "FAIL", path: path, detail: m.view());
+            show_lines(out, b: errors.items());
+            return Result.Fail;
+        }
+        .Exited { status } => {
+            if status != t.exit_code {
+                m.push_str("exit status ");
+                put_number(&mut m, n: status as u64);
+                m.push_str(", expected ");
+                put_number(&mut m, n: t.exit_code as u64);
+                verdict(out, word: "FAIL", path: path, detail: m.view());
+                show_lines(out, b: errors.items());
+                return Result.Fail;
+            }
+        }
+    }
+    if not mem_eq(a: got.items(), b: t.stdout_text.items()) {
+        verdict(out, word: "FAIL", path: path, detail: "stdout differs");
+        show_escaped(out, label: "expected:", b: t.stdout_text.items());
+        show_escaped(out, label: "actual:  ", b: got.items());
+        return Result.Fail;
+    }
+    var from: usize = 0;
+    for part in t.stderr_parts.items() {
+        match find(hay: errors.items(), from: from, needle: part.view().bytes()) {
+            some(at) => { from = at + part.len(); }
+            none => {
+                m.push_str("stderr does not contain \"");
+                m.push_str(part.view());
+                m.push_str("\"");
+                verdict(out, word: "FAIL", path: path, detail: m.view());
+                show_lines(out, b: errors.items());
+                return Result.Fail;
+            }
+        }
+    }
+    verdict(out, word: "PASS", path: path, detail: "");
+    return Result.Pass;
+}
+
+/// Empties dir, keeping the directory itself.
+fn clear_dir(fs: &std.Fs, dir: str, a: alloc.Allocator) {
+    let names = fs.list(dir, a) catch alloc.List(alloc.String).init(a);
+    for n in names.items() {
+        let p = temp_path(tmp: dir, name: n.view(), a);
+        match fs.list(p.view(), a) {
+            ok(_) => { clear_dir(fs, dir: p.view(), a: a); }
+            err(_) => { }
+        }
+        _ = fs.remove(p.view());
+    }
+}
+
+fn run_test(sys: &mut std.System, path: str, o: &Options, tmp: str, a: alloc.Allocator) -> Result {
+    let exe = temp_path(tmp: tmp, name: "prog", a);
+    let diag_path = temp_path(tmp: tmp, name: "compile", a);
+    var t = Test {
+        seen: [false; 9],
+        kind: Kind.Run,
+        stage0_skip: false,
+        exit_code: 0,
+        stdout_text: alloc.List(u8).init(a),
+        stderr_parts: alloc.List(alloc.String).init(a),
+        args: alloc.List(alloc.String).init(a),
+        line: 0,
+        code: alloc.String.init(a),
+    };
+    var result = Result.Fail;
+    match sys.fs.read_bytes(path, a) {
+        ok(src) => {
+            var problem = alloc.String.init(a);
+            if not parse_header(src.items(), t: &mut t, problem: &mut problem, a) {
+                var m = alloc.String.init(a);
+                m.push_str("bad header: ");
+                m.push_str(problem.view());
+                verdict(&mut sys.stdout, word: "FAIL", path: path, detail: m.view());
+            } else if (o.stage0 and t.stage0_skip) or not code_selected(o, t: &t) {
+                verdict(&mut sys.stdout, word: "SKIP", path: path, detail: "");
+                result = Result.Skip;
+            } else {
+                result = compile_and_check(sys, path: path, t: &t, o: o, tmp: tmp, exe: exe.view(), diag_path: diag_path.view(), a: a);
+            }
+        }
+        err(_) => {
+            verdict(&mut sys.stdout, word: "FAIL", path: path, detail: "cannot read the file");
+        }
+    }
+    clear_dir(&sys.fs, dir: tmp, a: a);
+    return result;
+}
+
+fn compile_and_check(sys: &mut std.System, path: str, t: &Test, o: &Options, tmp: str, exe: str, diag_path: str, a: alloc.Allocator) -> Result {
+    var cmd = std.Command.init(a);
+    cmd.arg(o.compiler.view(), a);
+    cmd.arg(path, a);
+    cmd.arg(exe, a);
+    cmd.stdout_path.push_str(diag_path);
+    cmd.stderr_path.push_str(diag_path);
+    cmd.timeout_ms = o.timeout * 1000;
+    var ending = std.Ending.TimedOut;
+    match sys.proc.spawn(&cmd, env: &sys.env, clock: &sys.clock, a) {
+        ok(e) => { ending = e; }
+        err(_) => {
+            verdict(&mut sys.stdout, word: "FAIL", path: path, detail: "cannot start the compiler");
+            return Result.Fail;
+        }
+    }
+    let diag = read_or_empty(&sys.fs, diag_path, a);
+    var m = alloc.String.init(a);
+    var code: u8 = 0;
+    match ending {
+        .TimedOut => {
+            m.push_str("compiler timed out after ");
+            put_number(&mut m, n: o.timeout);
+            m.push_str(" s");
+            verdict(&mut sys.stdout, word: "FAIL", path: path, detail: m.view());
+            return Result.Fail;
+        }
+        .Signaled { signal } => {
+            m.push_str("compiler killed by signal ");
+            put_number(&mut m, n: signal as u64);
+            verdict(&mut sys.stdout, word: "FAIL", path: path, detail: m.view());
+            show_lines(&mut sys.stdout, b: diag.items());
+            return Result.Fail;
+        }
+        .Exited { status } => { code = status; }
+    }
+    if t.kind == Kind.CompileError {
+        if code == 0 {
+            verdict(&mut sys.stdout, word: "FAIL", path: path, detail: "compiled, but a compile error was expected");
+            return Result.Fail;
+        }
+        return check_compile_error(&mut sys.stdout, path: path, t: t, o: o, diag: diag.items(), a: a);
+    }
+    if code != 0 {
+        m.push_str("compile failed with status ");
+        put_number(&mut m, n: code as u64);
+        verdict(&mut sys.stdout, word: "FAIL", path: path, detail: m.view());
+        show_lines(&mut sys.stdout, b: diag.items());
+        return Result.Fail;
+    }
+    return check_run(sys, path: path, t: t, o: o, tmp: tmp, exe: exe, a: a);
+}
+
+// ---- Main -------------------------------------------------------------------------------
+
+fn ends_with(s: str, suffix: str) -> bool {
+    let b = s.bytes();
+    let x = suffix.bytes();
+    return b.len() >= x.len() and mem_eq(a: b[b.len() - x.len()..b.len()], b: x);
+}
+
+/// Adds path if it is a file, or every *.arche file below it if it is a
+/// directory, leaving out names that start with '_' or '.', and package
+/// manifests (package.arche).
+fn collect(fs: &std.Fs, path: str, files: &mut alloc.List(alloc.String), a: alloc.Allocator) -> bool {
+    if not fs.exists(path) {
+        return false;
+    }
+    match fs.list(path, a) {
+        ok(names) => {
+            for n in names.items() {
+                let name = n.view();
+                if name.starts_with(".") or name.starts_with("_") {
+                    continue;
+                }
+                var child = alloc.String.init(a);
+                child.push_str(path);
+                if not ends_with(s: path, suffix: "/") {
+                    child.push_str("/");
+                }
+                child.push_str(name);
+                match fs.list(child.view(), a) {
+                    ok(_) => {
+                        if not collect(fs, path: child.view(), files: files, a: a) {
+                            return false;
+                        }
+                    }
+                    err(_) => {
+                        if ends_with(s: name, suffix: ".arche") and not name.eq("package.arche") {
+                            files.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        err(_) => {
+            var s = alloc.String.init(a);
+            s.push_str(path);
+            files.push(s);
+        }
+    }
+    return true;
+}
+
+fn less(x: []u8, y: []u8) -> bool {
+    var i: usize = 0;
+    while i < x.len() and i < y.len() : (i += 1) {
+        if x[i] != y[i] {
+            return x[i] < y[i];
+        }
+    }
+    return x.len() < y.len();
+}
+
+fn usage(to: &mut std.Output) -> u8 {
+    to.write("usage: runner --compiler <command> [--stage0] [--codes <prefixes>] [--timeout <seconds>] [--filter <text>] <path>...\n");
+    return 2;
+}
+
+fn die(to: &mut std.Output, proc: &std.Proc, message: str, what: str) -> noreturn {
+    to.write("runner: ");
+    to.write(message);
+    to.write(what);
+    to.write("\n");
+    proc.exit(2);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    var o = Options {
+        compiler: alloc.String.init(a),
+        stage0: false,
+        timeout: 10,
+        filter: alloc.String.init(a),
+        codes: alloc.String.init(a),
+        has_codes: false,
+    };
+    var files = alloc.List(alloc.String).init(a);
+    var path_args: u32 = 0;
+    var has_compiler = false;
+    var has_filter = false;
+    var i: usize = 1;
+    while i < sys.args.len() : (i += 1) {
+        let arg = sys.args.get(i);
+        let has_value = i + 1 < sys.args.len();
+        if arg.eq("--compiler") and has_value {
+            i += 1;
+            o.compiler.push_str(sys.args.get(i));
+            has_compiler = true;
+        } else if arg.eq("--timeout") and has_value {
+            i += 1;
+            match parse_uint(sys.args.get(i).bytes(), max: 3600) {
+                some(v) => {
+                    if v == 0 {
+                        die(&mut sys.stderr, proc: &sys.proc, message: "invalid --timeout: ", what: sys.args.get(i));
+                    }
+                    o.timeout = v;
+                }
+                none => { die(&mut sys.stderr, proc: &sys.proc, message: "invalid --timeout: ", what: sys.args.get(i)); }
+            }
+        } else if arg.eq("--filter") and has_value {
+            i += 1;
+            o.filter.push_str(sys.args.get(i));
+            has_filter = true;
+        } else if arg.eq("--codes") and has_value {
+            i += 1;
+            o.codes.push_str(sys.args.get(i));
+            o.has_codes = true;
+        } else if arg.eq("--stage0") {
+            o.stage0 = true;
+        } else if arg.starts_with("-") {
+            sys.proc.exit(usage(&mut sys.stderr));
+        } else {
+            if not collect(&sys.fs, path: arg, files: &mut files, a: a) {
+                die(&mut sys.stderr, proc: &sys.proc, message: "cannot open ", what: arg);
+            }
+            path_args += 1;
+        }
+    }
+    if not has_compiler or path_args == 0 {
+        sys.proc.exit(usage(&mut sys.stderr));
+    }
+    // Sorted by bytes; insertion sort keeps it simple for a few hundred.
+    let fs_items = files.items_mut();
+    var j: usize = 1;
+    while j < fs_items.len() : (j += 1) {
+        var k = j;
+        while k > 0 and less(x: fs_items[k].view().bytes(), y: fs_items[k - 1].view().bytes()) : (k -= 1) {
+            let hold = text_of(fs_items[k].view().bytes(), a);
+            fs_items[k] = text_of(fs_items[k - 1].view().bytes(), a);
+            fs_items[k - 1] = hold;
+        }
+    }
+    // A directory of its own for the files each test makes.
+    var tmp = alloc.String.init(a);
+    match sys.env.get("TMPDIR", a) {
+        some(t) => {
+            if t.len() > 0 {
+                tmp.push_str(t.view());
+            } else {
+                tmp.push_str("/tmp");
+            }
+        }
+        none => { tmp.push_str("/tmp"); }
+    }
+    tmp.push_str("/arche-runner-");
+    put_number(&mut tmp, n: sys.proc.pid() as u64);
+    tmp.push_str("-");
+    put_number(&mut tmp, n: sys.rand.next_u64() % 1000000);
+    match sys.fs.make_dir(tmp.view()) {
+        ok(_) => { }
+        err(_) => { die(&mut sys.stderr, proc: &sys.proc, message: "cannot create a temporary directory ", what: tmp.view()); }
+    }
+    var passed: u64 = 0;
+    var failed: u64 = 0;
+    var skipped: u64 = 0;
+    let all = files.items();
+    var n: usize = 0;
+    while n < all.len() : (n += 1) {
+        let path = all[n].view();
+        if n > 0 and path.eq(all[n - 1].view()) {
+            continue;
+        }
+        if has_filter and not contains(hay: path.bytes(), part: o.filter.view().bytes()) {
+            continue;
+        }
+        region r {
+            match run_test(sys, path: path, o: &o, tmp: tmp.view(), a: r) {
+                .Pass => { passed += 1; }
+                .Fail => { failed += 1; }
+                .Skip => { skipped += 1; }
+            }
+        }
+    }
+    sys.stdout.write_u64(passed);
+    sys.stdout.write(" passed, ");
+    sys.stdout.write_u64(failed);
+    sys.stdout.write(" failed, ");
+    sys.stdout.write_u64(skipped);
+    sys.stdout.write(" skipped\n");
+    match sys.fs.remove(tmp.view()) {
+        ok(_) => { }
+        err(_) => { die(&mut sys.stderr, proc: &sys.proc, message: "cannot remove ", what: tmp.view()); }
+    }
+    if failed > 0 {
+        sys.proc.exit(1);
+    }
+}
+
+fn contains(hay: []u8, part: []u8) -> bool {
+    match find(hay: hay, from: 0, needle: part) {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}

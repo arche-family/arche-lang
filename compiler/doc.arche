@@ -1,0 +1,347 @@
+/// arche doc (docs/sprints.md S23): a module's public items with their doc
+/// comments, as Markdown; and the examples in those comments, the
+/// ```arche blocks, as a file of tests, so that an example that no longer
+/// works fails a test.
+import alloc;
+import diag;
+import syntax.lexer;
+import syntax.parser;
+import syntax.cst;
+import syntax.token as tk;
+
+/// A parsed file and its text.
+type File = struct {
+    tree: cst.Tree,
+    text: alloc.String,
+}
+
+fn parse(text: str, a: alloc.Allocator) -> ?File {
+    var lexed = diag.Diagnostics.init(a);
+    let tokens = lexer.lex(text, true, &mut lexed, a);
+    let parsed = parser.parse(tokens, text, true, lexed, a);
+    if parsed.diags.count() > 0 {
+        return none;
+    }
+    var copy = alloc.String.init(a);
+    copy.push_str(text);
+    return File { tree: parsed.tree, text: copy };
+}
+
+fn token_text(f: &File, t: u32) -> str {
+    let tok = f.tree.tokens[t as usize];
+    return f.text.view()[tok.start as usize..(tok.start + tok.len) as usize];
+}
+
+/// The doc comment lines just before the token at, without their `///`
+/// and the space after it.
+fn doc_before(f: &File, at: u32, a: alloc.Allocator) -> alloc.List(alloc.String) {
+    var lines = alloc.List(alloc.String).init(a);
+    var first = at;
+    while first > 0 {
+        let k = f.tree.tokens[(first - 1) as usize].kind;
+        if k == tk.Kind.DocComment {
+            first -= 1;
+        } else if k == tk.Kind.Whitespace {
+            // A blank line ends the comment that belongs to the item.
+            let w = token_text(f, first - 1);
+            var newlines: u32 = 0;
+            var i: usize = 0;
+            while i < w.len() : (i += 1) {
+                if w[i] == '\n' {
+                    newlines += 1;
+                }
+            }
+            if newlines > 1 {
+                break;
+            }
+            first -= 1;
+        } else {
+            break;
+        }
+    }
+    var t = first;
+    while t < at : (t += 1) {
+        if f.tree.tokens[t as usize].kind == tk.Kind.DocComment {
+            let s = token_text(f, t);
+            var start: usize = 3;
+            if s.len() > 3 and s[3] == ' ' {
+                start = 4;
+            }
+            var line = alloc.String.init(a);
+            line.push_str(s[start..s.len()]);
+            lines.push(line);
+        }
+    }
+    return lines;
+}
+
+/// The significant tokens of a node from its first up to (not with) the
+/// first `{` of its own, or all of them, as text with single spaces.
+fn signature(f: &File, n: cst.NodeId, out: &mut alloc.String) {
+    let node = f.tree.node(n);
+    var t = f.tree.first_token(n);
+    var first = true;
+    var depth: u32 = 0;
+    while t < node.end : (t += 1) {
+        let k = f.tree.tokens[t as usize].kind;
+        if k.is_trivia() {
+            continue;
+        }
+        if k == tk.Kind.LBrace and depth == 0 {
+            return;
+        }
+        if k == tk.Kind.LParen or k == tk.Kind.LBracket {
+            depth += 1;
+        } else if (k == tk.Kind.RParen or k == tk.Kind.RBracket) and depth > 0 {
+            depth -= 1;
+        }
+        let w = token_text(f, t);
+        // Spaces as the source has them, one at most.
+        if not first and t > 0 and f.tree.tokens[(t - 1) as usize].kind == tk.Kind.Whitespace {
+            out.push_str(" ");
+        }
+        out.push_str(w);
+        first = false;
+    }
+}
+
+fn is_pub(f: &File, n: cst.NodeId) -> bool {
+    return f.tree.tokens[f.tree.first_token(n) as usize].kind == tk.Kind.KwPub;
+}
+
+/// The name of an item: the first identifier after its keyword.
+fn item_name(f: &File, n: cst.NodeId) -> str {
+    let node = f.tree.node(n);
+    var t = f.tree.first_token(n);
+    while t < node.end : (t += 1) {
+        if f.tree.tokens[t as usize].kind == tk.Kind.Ident {
+            return token_text(f, t);
+        }
+    }
+    return "";
+}
+
+fn add_lines(out: &mut alloc.String, lines: &alloc.List(alloc.String)) {
+    let ls = lines.items();
+    var i: usize = 0;
+    while i < ls.len() : (i += 1) {
+        out.push_str(ls[i].view());
+        out.push_str("\n");
+    }
+}
+
+/// One documented item: its heading, its signature, its comment.
+fn item_markdown(f: &File, n: cst.NodeId, owner: str, out: &mut alloc.String, a: alloc.Allocator) {
+    out.push_str("\n## ");
+    if owner.len() > 0 {
+        out.push_str(owner);
+        out.push_str(".");
+    }
+    out.push_str(item_name(f, n));
+    out.push_str("\n\n```arche\n");
+    signature(f, n, out: out);
+    out.push_str("\n```\n");
+    let lines = doc_before(f, at: f.tree.first_token(n), a: a);
+    if lines.len() > 0 {
+        out.push_str("\n");
+        add_lines(out, lines: &lines);
+    }
+}
+
+/// The module's documentation as Markdown, or none when it does not parse.
+pub fn markdown(text: str, module: str, a: alloc.Allocator) -> ?alloc.String {
+    var f = File { tree: parse_or_empty(a), text: alloc.String.init(a) };
+    match parse(text, a) {
+        some(p) => { f = p; }
+        none => { return none; }
+    }
+    var out = alloc.String.init(a);
+    out.push_str("# ");
+    out.push_str(module);
+    out.push_str("\n");
+    let root = f.tree.node(f.tree.root);
+    // The module's own comment: before its first item.
+    if root.children_len > 0 {
+        let lines = doc_before(&f, at: f.tree.first_token(f.tree.child(root, 0)), a: a);
+        if lines.len() > 0 and f.tree.node(f.tree.child(root, 0)).kind == cst.Kind.Import {
+            out.push_str("\n");
+            add_lines(&mut out, lines: &lines);
+        }
+    }
+    var i: u32 = 0;
+    while i < root.children_len : (i += 1) {
+        let n = f.tree.child(root, i);
+        let kind = f.tree.node(n).kind;
+        if (kind == cst.Kind.FnDecl or kind == cst.Kind.ConstDecl or kind == cst.Kind.TypeDecl) and is_pub(&f, n) {
+            item_markdown(&f, n, owner: "", out: &mut out, a: a);
+            if kind == cst.Kind.TypeDecl {
+                // Its public methods, under it.
+                let tn = f.tree.node(n);
+                var j: u32 = 0;
+                while j < tn.children_len : (j += 1) {
+                    let m = f.tree.child(tn, j);
+                    if f.tree.node(m).kind == cst.Kind.FnDecl and is_pub(&f, m) {
+                        item_markdown(&f, m, owner: item_name(&f, n), out: &mut out, a: a);
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+fn parse_or_empty(a: alloc.Allocator) -> cst.Tree {
+    var lexed = diag.Diagnostics.init(a);
+    let tokens = lexer.lex("", true, &mut lexed, a);
+    return parser.parse(tokens, "", true, lexed, a).tree;
+}
+
+/// Whether text has the line.
+fn has_line(text: str, line: str) -> bool {
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= text.len() : (i += 1) {
+        if i == text.len() or text[i] == '\n' {
+            if text[start..i].eq(line) {
+                return true;
+            }
+            start = i + 1;
+        }
+    }
+    return false;
+}
+
+/// Whether an example uses sys, the test's capabilities.
+fn uses_system(lines: []alloc.String, from: usize) -> bool {
+    var i = from;
+    while i < lines.len() : (i += 1) {
+        let l = lines[i].view();
+        if l.eq("```") {
+            return false;
+        }
+        let b = l.bytes();
+        var k: usize = 0;
+        while k + 4 <= b.len() : (k += 1) {
+            if b[k] == 's' and b[k + 1] == 'y' and b[k + 2] == 's' and b[k + 3] == '.' {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// The examples of a comment, appended to out as tests named after the item.
+/// An example that uses sys gets it from the test (std.testing).
+fn add_examples(lines: &alloc.List(alloc.String), item: str, imports: &mut alloc.String, tests: &mut alloc.String, count: &mut u32) {
+    let ls = lines.items();
+    var i: usize = 0;
+    var inside = false;
+    var body_started = false;
+    while i < ls.len() : (i += 1) {
+        let l = ls[i].view();
+        if not inside {
+            if l.eq("```arche") {
+                inside = true;
+                body_started = false;
+                count.* += 1;
+                tests.push_str("\ntest \"");
+                tests.push_str(item);
+                tests.push_str(", example ");
+                var digits: [10]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                var n = count.*;
+                var k: usize = 0;
+                while true {
+                    digits[k] = '0' + (n % 10) as u8;
+                    k += 1;
+                    n = n / 10;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                while k > 0 : (k -= 1) {
+                    tests.push_ascii(digits[k - 1]);
+                }
+                if uses_system(ls, from: i + 1) {
+                    tests.push_str("\" (t: &mut testing.Test) {\n    let sys = t.system();\n");
+                    if not has_line(text: imports.view(), line: "import std.testing;") {
+                        imports.push_str("import std.testing;\n");
+                    }
+                } else {
+                    tests.push_str("\" {\n");
+                }
+            }
+            continue;
+        }
+        if l.eq("```") {
+            inside = false;
+            tests.push_str("}\n");
+            continue;
+        }
+        // Imports at the top of an example go to the top of the file.
+        if not body_started and l.starts_with("import ") {
+            if not has_line(text: imports.view(), line: l) {
+                imports.push_str(l);
+                imports.push_str("\n");
+            }
+            continue;
+        }
+        body_started = true;
+        if l.len() > 0 {
+            tests.push_str("    ");
+            tests.push_str(l);
+        }
+        tests.push_str("\n");
+    }
+}
+
+/// A file of tests from the examples in the module's comments; how many
+/// there are goes to count. The module is imported as module (dotted).
+pub fn examples(text: str, module: str, count: &mut u32, a: alloc.Allocator) -> ?alloc.String {
+    var f = File { tree: parse_or_empty(a), text: alloc.String.init(a) };
+    match parse(text, a) {
+        some(p) => { f = p; }
+        none => { return none; }
+    }
+    // The module and std are imported already.
+    var imports = alloc.String.init(a);
+    imports.push_str("import std;\nimport ");
+    imports.push_str(module);
+    imports.push_str(";\n");
+    var tests = alloc.String.init(a);
+    let root = f.tree.node(f.tree.root);
+    if root.children_len > 0 and f.tree.node(f.tree.child(root, 0)).kind == cst.Kind.Import {
+        let lines = doc_before(&f, at: f.tree.first_token(f.tree.child(root, 0)), a: a);
+        add_examples(&lines, item: module, imports: &mut imports, tests: &mut tests, count: count);
+    }
+    var i: u32 = 0;
+    while i < root.children_len : (i += 1) {
+        let n = f.tree.child(root, i);
+        let kind = f.tree.node(n).kind;
+        if kind == cst.Kind.FnDecl or kind == cst.Kind.ConstDecl or kind == cst.Kind.TypeDecl {
+            let lines = doc_before(&f, at: f.tree.first_token(n), a: a);
+            add_examples(&lines, item: item_name(&f, n), imports: &mut imports, tests: &mut tests, count: count);
+            if kind == cst.Kind.TypeDecl {
+                let tn = f.tree.node(n);
+                var j: u32 = 0;
+                while j < tn.children_len : (j += 1) {
+                    let m = f.tree.child(tn, j);
+                    if f.tree.node(m).kind == cst.Kind.FnDecl {
+                        let ml = doc_before(&f, at: f.tree.first_token(m), a: a);
+                        var name = alloc.String.init(a);
+                        name.push_str(item_name(&f, n));
+                        name.push_str(".");
+                        name.push_str(item_name(&f, m));
+                        add_examples(&ml, item: name.view(), imports: &mut imports, tests: &mut tests, count: count);
+                    }
+                }
+            }
+        }
+    }
+    var out = alloc.String.init(a);
+    out.push_str("// The examples of ");
+    out.push_str(module);
+    out.push_str(", as tests: made by arche doc --tests.\n");
+    out.push_str(imports.view());
+    out.push_str(tests.view());
+    return out;
+}
