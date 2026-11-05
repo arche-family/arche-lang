@@ -207,7 +207,8 @@ def session(program, root):
     if os.name == "posix":
         expect("its mode", oct(os.stat(work_dir).st_mode & 0o777), oct(0o700))
     else:
-        rights = subprocess.run(["icacls", work_dir], capture_output=True).stdout.decode(errors="replace").upper()
+        # What it says after the directory's own name, which may hold "Users".
+        rights = subprocess.run(["icacls", work_dir], capture_output=True).stdout.decode(errors="replace").upper().replace(work_dir.upper(), "")
         if "OWNER RIGHTS" not in rights or "USERS" in rights or "EVERYONE" in rights:
             fail("the work directory is open to others:\n" + rights)
 
@@ -483,6 +484,25 @@ def session(program, root):
     print("  how a session ends")
 
 
+def client_gone(program):
+    """A client that stops reading: the server notices at the end of its input,
+    and tidies up, however much it had to write by then."""
+    p = subprocess.Popen([program], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p.stdout.close()
+    body = b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
+    frame = b"Content-Length: %d\r\n\r\n" % len(body) + body
+    try:
+        for _ in range(3):
+            p.stdin.write(frame)
+            p.stdin.flush()
+            time.sleep(0.1)
+    except OSError:
+        fail("the server died writing to a client that went away")
+    p.stdin.close()
+    expect("status when the client went away", p.wait(10), 1)
+    print("  a client that goes away")
+
+
 def many_errors(program, root):
     """A file full of errors: all of them come, and soon."""
     path = os.path.join(root, "many.arche")
@@ -562,6 +582,7 @@ def main():
         os.environ[name] = env_tmp
     try:
         session(program, os.path.realpath(root))
+        client_gone(program)
         many_errors(program, os.path.realpath(root))
         broken_compiler(program, os.path.realpath(root))
         responsive(program, repo)

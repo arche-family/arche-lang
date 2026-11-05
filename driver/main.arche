@@ -446,6 +446,10 @@ fn pkg_lock(sys: &mut std.System, tools: &Tools, dir: str, work: str, a: alloc.A
     var i: usize = 0;
     while i < queue.len() : (i += 1) {
         let name = text_of(queue[i].name.view().bytes(), a);
+        if not pkg.safe_name(name.view()) {
+            say(&mut sys.stderr, a: "arche-driver pkg: a package's name is an identifier, not ", b: name.view(), c: "");
+            return Failed.Failed;
+        }
         let version = text_of(queue[i].version.view().bytes(), a);
         var pinned = text_of(queue[i].hash.view().bytes(), a);
         var known = false;
@@ -526,6 +530,12 @@ fn pkg_vendor(sys: &mut std.System, tools: &Tools, dir: str, work: str, a: alloc
     };
     let cache = join(dir: work, name: "pkg", a);
     let vendor = join(dir: dir, name: "vendor", a);
+    for d in locked.items() {
+        if not pkg.safe_name(d.name.view()) {
+            say(&mut sys.stderr, a: "arche-driver pkg: a package's name is an identifier, not ", b: d.name.view(), c: "");
+            return Failed.Failed;
+        }
+    }
     pkg.remove_all(&sys.fs, path: vendor.view(), a: a);
     for d in locked.items() {
         let data = match pkg.archive(sys, r: &r, hash: d.hash.view(), cache: cache.view(), a: a) {

@@ -285,6 +285,35 @@ pub fn safe_path(p: []u8) -> bool {
     return true;
 }
 
+/// Whether text can name a package's directory: an identifier, as the
+/// compiler holds a manifest to. A lock file comes with a repository, so it is
+/// held to it again before anything is written by that name.
+pub fn safe_name(text: str) -> bool {
+    let b = text.bytes();
+    if b.len() == 0 or (b[0] >= '0' and b[0] <= '9') {
+        return false;
+    }
+    for c in b {
+        let word = c.* == '_' or (c.* >= 'a' and c.* <= 'z') or (c.* >= 'A' and c.* <= 'Z') or (c.* >= '0' and c.* <= '9');
+        if not word {
+            return false;
+        }
+    }
+    return true;
+}
+
+test "safe_name is an identifier" {
+    assert(safe_name("words"));
+    assert(safe_name("_a1"));
+    assert(not safe_name(""));
+    assert(not safe_name("1a"));
+    assert(not safe_name("../evil"));
+    assert(not safe_name(".."));
+    assert(not safe_name("a/b"));
+    assert(not safe_name("a\\b"));
+    assert(not safe_name("C:"));
+}
+
 test "safe_path keeps an archive's files inside its directory" {
     assert(safe_path("a.arche".bytes()));
     assert(safe_path("a/b c/d.arche".bytes()));

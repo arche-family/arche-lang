@@ -100,6 +100,20 @@ if "$arche" check --json "$work/overlay/package.arche" > "$out" 2> /dev/null; th
     status=1
 fi
 grep -q '"code": "E0802"' "$out" || { echo "manifest: not E0802:"; cat "$out"; status=1; }
+# Names in a manifest name directories too: none leads out of them.
+for field in 'name: "../evil", version: "1.0.0"' 'name: "good", version: "../../evil"' \
+    'name: "good", version: "1.0.0", dependencies: [build.dep("../evil", "1.0.0")]' \
+    'name: "good", version: "1.0.0", dependencies: [build.dep("ok", "1.0.0/../..")]' \
+    'name: "good", version: "1.0.0", dependencies: [build.dep("", "1.0.0")]'; do
+    printf 'import std.build;\n\nconst PACKAGE: build.Package = build.Package {\n    %s,\n};\n' "$field" > "$work/overlay/package.arche"
+    if "$arche" check --json "$work/overlay/package.arche" > "$out" 2> /dev/null; then
+        echo "manifest: accepted $field"
+        status=1
+    fi
+    grep -q '"code": "E0802"' "$out" || { echo "manifest: not E0802 for $field:"; cat "$out"; status=1; }
+done
+printf 'import std.build;\n\nconst PACKAGE: build.Package = build.Package {\n    name: "good_1",\n    version: "1.0.0-rc.1+build.5",\n    dependencies: [build.dep("other", "0.2.0")],\n};\n' > "$work/overlay/package.arche"
+"$arche" check "$work/overlay/package.arche" || { echo "manifest: a good one was refused"; status=1; }
 # arche fix --edition: edition/before becomes edition/after, which builds.
 mkdir -p "$work/edition"
 cp edition/before/* "$work/edition/"

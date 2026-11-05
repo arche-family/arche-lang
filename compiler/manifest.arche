@@ -224,6 +224,40 @@ fn parse(tree: cst.Tree, text: str, a: alloc.Allocator) -> Reader {
     return Reader { tree: tree, text: t };
 }
 
+/// Whether text can name a package: an identifier, since imports call it
+/// that, which also keeps it inside the directories it names.
+pub fn is_package_name(text: str) -> bool {
+    if text.len() == 0 or (text[0] >= '0' and text[0] <= '9') {
+        return false;
+    }
+    var i: usize = 0;
+    while i < text.len() : (i += 1) {
+        let c = text[i];
+        let word = c == '_' or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
+        if not word {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether text can be a version, which names a file: nothing that leaves a
+/// directory or means something else on another system.
+pub fn is_version(text: str) -> bool {
+    if text.len() == 0 or text[0] == '.' {
+        return false;
+    }
+    var i: usize = 0;
+    while i < text.len() : (i += 1) {
+        let c = text[i];
+        let plain = c == '.' or c == '-' or c == '+' or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
+        if not plain or (c == '.' and (i + 1 == text.len() or text[i + 1] == '.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Reads a manifest's syntax tree; problems go to diags, against it.
 pub fn read(tree: cst.Tree, text: str, diags: &mut diag.Diagnostics, a: alloc.Allocator) -> Manifest {
     let r = parse(tree, text, a);
@@ -252,8 +286,14 @@ pub fn read(tree: cst.Tree, text: str, diags: &mut diag.Diagnostics, a: alloc.Al
         if name.eq("name") {
             m.name = string_value(&r, v, diags: diags, a: a);
             has_name = true;
+            if m.name.len() > 0 and not is_package_name(m.name.view()) {
+                diags.report(codes.BAD_MANIFEST, span_of(&r, v), "a package's name is what imports call it: letters, digits and '_', not starting with a digit");
+            }
         } else if name.eq("version") {
             m.version = string_value(&r, v, diags: diags, a: a);
+            if m.version.len() > 0 and not is_version(m.version.view()) {
+                diags.report(codes.BAD_MANIFEST, span_of(&r, v), "a version is made of letters, digits, '.', '-' and '+', such as 1.2.0");
+            }
         } else if name.eq("edition") {
             var year: u32 = 0;
             if node(&r, v).kind == cst.Kind.IntLit {
@@ -301,11 +341,17 @@ pub fn read(tree: cst.Tree, text: str, diags: &mut diag.Diagnostics, a: alloc.Al
                         if args == 4 {
                             hash = string_value(&r, child(&r, child(&r, e, 3), 0), diags: diags, a: a);
                         }
-                        m.dependencies.push(Dependency {
-                            name: string_value(&r, child(&r, child(&r, e, 1), 0), diags: diags, a: a),
-                            version: string_value(&r, child(&r, child(&r, e, 2), 0), diags: diags, a: a),
-                            hash: hash,
-                        });
+                        let dep_name = string_value(&r, child(&r, child(&r, e, 1), 0), diags: diags, a: a);
+                        let dep_version = string_value(&r, child(&r, child(&r, e, 2), 0), diags: diags, a: a);
+                        // A dependency names the directories it goes into,
+                        // and it may come from another package's manifest.
+                        if not is_package_name(dep_name.view()) {
+                            diags.report(codes.BAD_MANIFEST, span_of(&r, e), "a dependency's name is what imports call it: letters, digits and '_', not starting with a digit");
+                        }
+                        if not is_version(dep_version.view()) {
+                            diags.report(codes.BAD_MANIFEST, span_of(&r, e), "a dependency's version is made of letters, digits, '.', '-' and '+', such as 1.2.0");
+                        }
+                        m.dependencies.push(Dependency { name: dep_name, version: dep_version, hash: hash });
                     }
                 }
             }

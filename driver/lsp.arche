@@ -976,6 +976,9 @@ fn absolute(sys: &mut std.System, file: str, a: alloc.Allocator) -> alloc.String
 
 fn main(sys: &mut std.System) -> !void {
     let heap = sys.alloc;
+    // A client that goes away while this writes is noticed where it reads,
+    // which ends the server in order.
+    sys.proc.ignore_broken_pipe();
     var work = try sys.fs.temp_dir(env: &sys.env, heap);
     work.push_str("/arche-lsp-");
     proto.push_number(&mut work, n: sys.proc.pid() as u64);

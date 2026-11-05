@@ -366,8 +366,7 @@ fn check_kind(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Typ
                 }
                 none => { }
             }
-            let s = ck.span_of(c, n);
-            ck.report(c, codes.NEEDS_CONTEXT, s, "'none' takes its type from context, e.g. 'let x: ?u32 = none;'");
+            report_no_context(c, n, expected, message: "'none' takes its type from context, e.g. 'let x: ?u32 = none;'");
             return ty.invalid();
         }
         .SomeExpr => { return check_some(c, n, expected); }
@@ -425,7 +424,7 @@ fn check_kind(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Typ
 fn expected_num(c: &ck.Checker, expected: ?ty.TypeId) -> ?ty.TypeId {
     match expected {
         some(e) => {
-            if ck.is_int(c, e) or ck.is_float(c, e) {
+            if ck.is_int(c, e) or ck.is_float(c, e) or ck.is_invalid(c, e) {
                 return e;
             }
         }
@@ -460,8 +459,7 @@ fn check_float(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Ty
         }
         none => { }
     }
-    let s = ck.span_of(c, n);
-    ck.report(c, codes.NEEDS_CONTEXT, s, "a float literal takes its type from context, e.g. 'let x: f64 = 1.5;'");
+    report_no_context(c, n, expected, message: "a float literal takes its type from context, e.g. 'let x: f64 = 1.5;'");
     return ty.invalid();
 }
 
@@ -500,8 +498,7 @@ fn check_int(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Type
         }
         none => {
             // Erasable (§5.6).
-            let s = ck.span_of(c, n);
-            ck.report(c, codes.NEEDS_CONTEXT, s, "an integer literal takes its type from context, e.g. 'let x: u32 = 5;'");
+            report_no_context(c, n, expected, message: "an integer literal takes its type from context, e.g. 'let x: u32 = 5;'");
             return ty.invalid();
         }
     }
@@ -1481,12 +1478,28 @@ fn method_params(c: &ck.Checker, m: Method) -> alloc.List(Param) {
 }
 
 /// Checks only the argument expressions: for calls that already failed.
+/// What would have given them a type is in error, so they expect that.
 fn check_args_loosely(c: &mut ck.Checker, call: cst.NodeId) {
     let nargs = ck.child_count(c, call) - 1;
     var k: u32 = 0;
     while k < nargs : (k += 1) {
-        _ = check(c, ck.child(c, ck.child(c, call, k + 1), 0), none);
+        _ = check(c, ck.child(c, ck.child(c, call, k + 1), 0), some(ty.invalid()));
     }
+}
+
+/// A literal with no type to take (§5.6). When what would give it one is
+/// already in error, that error has said what there is to say.
+fn report_no_context(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId, message: str) {
+    match expected {
+        some(e) => {
+            if ck.is_invalid(c, e) {
+                return;
+            }
+        }
+        none => { }
+    }
+    let s = ck.span_of(c, n);
+    ck.report(c, codes.NEEDS_CONTEXT, s, message);
 }
 
 fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId {
@@ -1498,7 +1511,7 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
             let nargs = ck.child_count(c, call) - 1;
             var k = ck.comptime_kinds(c, d).len() as u32;
             while k < nargs : (k += 1) {
-                _ = check(c, ck.child(c, ck.child(c, call, k + 1), 0), none);
+                _ = check(c, ck.child(c, ck.child(c, call, k + 1), 0), some(ty.invalid()));
             }
             return ty.invalid();
         }
@@ -2254,11 +2267,19 @@ fn check_array_lit(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> t
         }
         none => { }
     }
-    let s = ck.span_of(c, n);
-    ck.report(c, codes.NEEDS_CONTEXT, s, "an array literal takes its type from context, e.g. 'let a: [3]u32 = [1, 2, 3];'");
+    report_no_context(c, n, expected, message: "an array literal takes its type from context, e.g. 'let a: [3]u32 = [1, 2, 3];'");
+    var inner: ?ty.TypeId = none;
+    match expected {
+        some(e) => {
+            if ck.is_invalid(c, e) {
+                inner = expected;
+            }
+        }
+        none => { }
+    }
     var i: u32 = 0;
     while i < count : (i += 1) {
-        _ = check(c, ck.child(c, n, i), none);
+        _ = check(c, ck.child(c, n, i), inner);
     }
     return ty.invalid();
 }
@@ -2327,8 +2348,7 @@ fn check_unary(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty.Ty
                 return t;
             }
             none => {
-                let s = ck.span_of(c, n);
-                ck.report(c, codes.NEEDS_CONTEXT, s, "an integer literal takes its type from context, e.g. 'let x: i32 = -5;'");
+                report_no_context(c, n, expected, message: "an integer literal takes its type from context, e.g. 'let x: i32 = -5;'");
                 return ty.invalid();
             }
         }

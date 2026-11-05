@@ -1,0 +1,48 @@
+// test: run
+// spec: std
+// stage0: skip
+// system: linux
+// stdout: a write fails: -32
+// stdout: a child ends by signal 13
+import std;
+import std.linux;
+
+// A write to a pipe nobody reads: its result, if the program lives to see it.
+fn write_to_nobody() -> i64 {
+    var ends: [2]i32 = [0; 2];
+    var byte: [1]u8 = [0; 1];
+    unsafe {
+        // SAFETY: pipe2 writes the two descriptors, and write reads one byte.
+        _ = linux.syscall(linux.PIPE2, [linux.arg(i32, &ends[0] as *i32), 0, 0, 0, 0, 0]);
+        _ = linux.syscall(linux.CLOSE, [ends[0] as i64, 0, 0, 0, 0, 0]);
+        return linux.syscall(linux.WRITE, [ends[1] as i64, linux.arg(u8, &byte[0] as *u8), 1, 0, 0, 0]);
+    }
+}
+
+// ignore_broken_pipe is for this program alone: a child it starts goes by the
+// default, and is ended by the same write.
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() > 1 and sys.args.get(1).eq("child") {
+        _ = write_to_nobody();
+        sys.proc.exit(3);
+    }
+    sys.proc.ignore_broken_pipe();
+    sys.stdout.write("a write fails: ");
+    sys.stdout.write_i64(write_to_nobody());
+    sys.stdout.write("\n");
+    var cmd = std.Command.init(sys.alloc);
+    cmd.arg(sys.args.get(0), sys.alloc);
+    cmd.arg("child", sys.alloc);
+    match try sys.proc.spawn(&cmd, env: &sys.env, clock: &sys.clock, sys.alloc) {
+        .Exited { status } => {
+            sys.stdout.write("a child exits with ");
+            sys.stdout.write_u64(status as u64);
+        }
+        .Signaled { signal } => {
+            sys.stdout.write("a child ends by signal ");
+            sys.stdout.write_u64(signal as u64);
+        }
+        .TimedOut => { sys.stdout.write("timed out"); }
+    }
+    sys.stdout.write("\n");
+}

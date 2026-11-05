@@ -563,6 +563,11 @@ const NULL_DEVICE: str = "NUL";
 pub type Proc = struct {
     unique: core.Unique,
 
+    /// A write to a pipe nobody reads fails on Windows anyway, and what it
+    /// wrote is lost: there is no signal to turn off.
+    pub fn ignore_broken_pipe(self: &Proc) {
+    }
+
     pub fn pid(self: &Proc) -> u32 {
         return win.process_id();
     }

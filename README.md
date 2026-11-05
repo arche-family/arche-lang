@@ -49,7 +49,7 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language, S35 for the libraries the Arche OS phone needs, S36–S37 for editors and macOS (Uzbek) | current sprint: S27 |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | [`spec/arche.md`](spec/arche.md) | the full language, built on Arche-0 | draft 0.1 |
-| [`conformance/`](conformance/README.md) | specification tests | 460 tests, on Linux and Windows |
+| [`conformance/`](conformance/README.md) | specification tests | 461 tests, on Linux and Windows |
 | `stage0/` | bootstrap compiler, C11 | complete: compiles all of Arche-0 |
 | [`compiler/`](compiler/) | the Arche compiler, Arche-0, through LLVM; `--release` runs its own optimizer; `--target` picks the system | self-hosting: stage2 == stage3, in release builds and on Windows too |
 | [`bench/`](bench/) | compile-time and run-time benchmarks | [baseline](bench/baseline.md) |

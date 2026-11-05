@@ -86,6 +86,20 @@ MINGW* | MSYS* | CYGWIN*) ;;
     grep -q "must mean the same on every system" out || fail "the refusal does not say why: $(cat out)"
     ;;
 esac
+# A name that leads out of its directory is refused: in a manifest, and in a
+# lock file, which comes with a repository.
+mkdir escape
+manifest escape 1.0.0 "" 'build.dep("../evil", "1.0.0")' "$work/registry" > escape/package.arche
+if "$driver" pkg lock --dir escape > out 2>&1; then
+    fail "a dependency named ../evil was locked"
+fi
+mkdir escape2
+manifest escape2 1.0.0 "" "" "$work/registry" > escape2/package.arche
+printf '../../evil 1.0.0 sha256:%064d\n' 0 > escape2/package.lock
+if "$driver" pkg vendor --dir escape2 > out 2>&1; then
+    fail "a lock file's ../../evil was vendored"
+fi
+grep -q "is an identifier" out || fail "the refusal does not say why: $(cat out)"
 if "$driver" pkg publish "$work/registry" signing.key --dir words > out 2>&1; then
     fail "a version was published twice"
 fi

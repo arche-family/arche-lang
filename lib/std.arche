@@ -517,9 +517,30 @@ pub type Env = struct {
 
 pub type ProcError = error { NotFound, AccessDenied, Killed, ProcFailed }
 
+/// What the system does to this process when it writes to a pipe nobody
+/// reads: 0 ends it, as is the default, and 1 makes the write fail.
+fn set_broken_pipe(action: u64) {
+    // struct sigaction: the action, flags, a restorer that only a handler
+    // needs, and a mask.
+    var act: [4]u64 = [0; 4];
+    act[0] = action;
+    unsafe {
+        // SAFETY: the kernel reads act during the call only, and takes a
+        // mask of 8 bytes.
+        _ = linux.syscall(linux.RT_SIGACTION, [linux.SIGPIPE, linux.arg(u64, &act[0] as *u64), 0, 8, 0, 0]);
+    }
+}
+
 /// This process, and the ones it starts.
 pub type Proc = struct {
     unique: core.Unique,
+
+    /// A write to a pipe nobody reads fails from now on, and what it wrote
+    /// is lost, instead of ending the program: for a server whose client may
+    /// go away while it answers. The programs it starts are not affected.
+    pub fn ignore_broken_pipe(self: &Proc) {
+        set_broken_pipe(0x1);
+    }
 
     pub fn pid(self: &Proc) -> u32 {
         unsafe {
@@ -571,6 +592,8 @@ pub type Proc = struct {
             return ProcError.ProcFailed;
         }
         if pid == 0 {
+            // What this program does about a broken pipe is its own.
+            set_broken_pipe(0);
             unsafe {
                 // SAFETY: the child: exec, or end without the parent's buffers.
                 let path = mem.slice_data(u8, texts[0].items());
@@ -663,6 +686,8 @@ pub type Proc = struct {
             return ProcError.ProcFailed;
         }
         if pid == 0 {
+            // What this program does about a broken pipe is its own.
+            set_broken_pipe(0);
             unsafe {
                 // SAFETY: the child sets itself up and execs, or ends
                 // without the parent's buffers.
