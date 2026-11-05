@@ -1,0 +1,84 @@
+// test: run
+// spec: std
+// stage0: skip
+// system: windows
+// stdout: 1 1 1 1 0 0
+// stdout: C:/b|C:/b|C:/x|C:|C:/|C:y|C:../x|//server/share/x|/b|..|.
+// stdout: \\?\C:\a\..\b
+// stdout: C:\a|C:/|C:/|b.txt|txt|
+// stdout: D:/b|C:\a\b|C:/a/b
+import alloc;
+import std;
+import std.path;
+
+// On Windows a backslash separates too, and a drive comes first.
+fn flag(out: &mut std.Output, on: bool) {
+    if on {
+        out.write("1");
+    } else {
+        out.write("0");
+    }
+}
+
+fn say(out: &mut std.Output, s: alloc.String) {
+    out.write(s.view());
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let o = &mut sys.stdout;
+    flag(o, on: path.is_absolute("C:/x"));
+    o.write(" ");
+    flag(o, on: path.is_absolute("C:\\x"));
+    o.write(" ");
+    flag(o, on: path.is_absolute("/x"));
+    o.write(" ");
+    flag(o, on: path.is_absolute("\\x"));
+    o.write(" ");
+    flag(o, on: path.is_absolute("C:x"));
+    o.write(" ");
+    flag(o, on: path.is_absolute("x"));
+    o.write("\n");
+    say(o, s: path.normalize("C:/a/../b", a));
+    o.write("|");
+    say(o, s: path.normalize("C:\\a\\..\\b", a));
+    o.write("|");
+    say(o, s: path.normalize("C:/../../x", a));
+    o.write("|");
+    say(o, s: path.normalize("C:", a));
+    o.write("|");
+    say(o, s: path.normalize("C:/", a));
+    o.write("|");
+    say(o, s: path.normalize("C:x/../y", a));
+    o.write("|");
+    say(o, s: path.normalize("C:../x", a));
+    o.write("|");
+    say(o, s: path.normalize("\\\\server\\share\\x", a));
+    o.write("|");
+    say(o, s: path.normalize("/a/../b", a));
+    o.write("|");
+    say(o, s: path.normalize("a/../..", a));
+    o.write("|");
+    say(o, s: path.normalize("", a));
+    o.write("\n");
+    say(o, s: path.normalize("\\\\?\\C:\\a\\..\\b", a));
+    o.write("\n");
+    o.write(path.parent("C:\\a\\b.txt"));
+    o.write("|");
+    o.write(path.parent("C:/x"));
+    o.write("|");
+    o.write(path.parent("C:/"));
+    o.write("|");
+    o.write(path.file_name("C:\\a\\b.txt"));
+    o.write("|");
+    o.write(path.extension("C:\\a\\b.txt"));
+    o.write("|");
+    o.write(path.parent("C:x"));
+    o.write("\n");
+    say(o, s: path.join(base: "C:/a", name: "D:/b", a));
+    o.write("|");
+    say(o, s: path.join(base: "C:\\a\\", name: "b", a));
+    o.write("|");
+    say(o, s: path.join(base: "C:/a", name: "b", a));
+    o.write("\n");
+}

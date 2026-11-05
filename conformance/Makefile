@@ -22,7 +22,7 @@ all: $(RUNNER)
 
 LIB := $(wildcard ../lib/*.arche ../lib/*/*.arche ../lib/*/*/*.arche)
 
-$(RUNNER): runner/runner.arche $(LIB) ../compiler/runtime/rt.c ../compiler/runtime/math.inc | $(BUILD)
+$(RUNNER): runner/runner.arche $(LIB) ../compiler/runtime/rt.c $(wildcard ../compiler/runtime/*.inc) | $(BUILD)
 	$(MAKE) -C ../compiler
 	../compiler/arche-build runner/runner.arche $@
 

@@ -459,10 +459,23 @@ pub type Env = struct {
             }
             return alloc.String.init(a);
         }
-        if n >= PATH_UNITS {
-            return none;
-        }
         var s = alloc.String.init(a);
+        if n >= PATH_UNITS {
+            // Too long for this room, and n says how much it needs, a PATH
+            // can be. The value may have changed by the second call only if
+            // something else in this process changed it, and nothing does.
+            var room = alloc.List(u16).init(a);
+            var i: usize = 0;
+            while i < n : (i += 1) {
+                room.push(0);
+            }
+            let m = win.environment_variable(wname[0..PATH_UNITS], room.items_mut());
+            if m == 0 or m >= n {
+                return none;
+            }
+            win.push_utf8(&mut s, room.items()[0..m]);
+            return s;
+        }
         win.push_utf8(&mut s, value[0..n]);
         return s;
     }
@@ -492,35 +505,44 @@ fn push_arg(line: &mut alloc.String, text: str) {
     }
     line.push_str("\"");
     var i: usize = 0;
-    while i < b.len() : (i += 1) {
+    while i < b.len() {
         var slashes: usize = 0;
         while i < b.len() and b[i] == '\\' : (i += 1) {
             slashes += 1;
         }
-        if i == b.len() {
-            // The quote that ends the part must not be escaped by these.
-            var k: usize = 0;
-            while k < slashes * 2 : (k += 1) {
-                line.push_str("\\");
-            }
-            break;
+        // Backslashes count double before a quote, the one that ends the
+        // part included, and only there.
+        var written = slashes;
+        if i == b.len() or b[i] == '"' {
+            written = slashes * 2;
         }
         var k: usize = 0;
-        while k < slashes : (k += 1) {
+        while k < written : (k += 1) {
             line.push_str("\\");
         }
-        if b[i] == '"' {
-            // The backslashes before a quote are doubled, and the quote
-            // itself gets one of its own.
-            while k < slashes * 2 : (k += 1) {
-                line.push_str("\\");
-            }
+        if i < b.len() and b[i] == '"' {
             line.push_str("\\\"");
-        } else {
-            line.push_ascii(b[i]);
+            i += 1;
         }
+        // What is left up to the next of those two, whole characters.
+        let start = i;
+        while i < b.len() and b[i] != '\\' and b[i] != '"' : (i += 1) {
+        }
+        line.push_str(text[start..i]);
     }
     line.push_str("\"");
+}
+
+/// Room for a command line as UTF-16, which takes at most a unit for each
+/// of its bytes. A path has PATH_UNITS; Windows takes up to 32767 units
+/// here, and a link with an object for each module needs them.
+fn command_room(line: str, a: alloc.Allocator) -> alloc.List(u16) {
+    var room = alloc.List(u16).init(a);
+    var i: usize = 0;
+    while i <= line.len() : (i += 1) {
+        room.push(0);
+    }
+    return room;
 }
 
 /// The file a child reads as its standard input when it is given none.
@@ -557,8 +579,8 @@ pub type Proc = struct {
         for s in argv.items() {
             push_arg(&mut line, s.view());
         }
-        var command: [PATH_UNITS]u16 = [0; PATH_UNITS];
-        if not win.wide(line.view(), command[0..PATH_UNITS]) {
+        var command = command_room(line.view(), a);
+        if not win.wide(line.view(), command.items_mut()) {
             return ProcError.ProcFailed;
         }
         var startup = win.new_startup();
@@ -570,7 +592,7 @@ pub type Proc = struct {
             // shares this program's output, writes anything of its own.
             a0rt_flush_all();
         }
-        if not win.create_process(program: program[0..PATH_UNITS], command: command[0..PATH_UNITS], flags: 0,
+        if not win.create_process(program: program[0..PATH_UNITS], command: command.items_mut(), flags: 0,
             directory: empty[0..1], startup: &startup, made: &mut made) {
             let e = win.last_error();
             if e == win.ERROR_FILE_NOT_FOUND or e == win.ERROR_PATH_NOT_FOUND or e == win.ERROR_INVALID_NAME {
@@ -615,8 +637,8 @@ pub type Proc = struct {
         for s in cmd.argv.items() {
             push_arg(&mut line, s.view());
         }
-        var command: [PATH_UNITS]u16 = [0; PATH_UNITS];
-        if not win.wide(line.view(), command[0..PATH_UNITS]) {
+        var command = command_room(line.view(), a);
+        if not win.wide(line.view(), command.items_mut()) {
             return ProcError.ProcFailed;
         }
         var directory: [PATH_UNITS]u16 = [0; PATH_UNITS];
@@ -657,7 +679,7 @@ pub type Proc = struct {
         var made = win.new_made();
         // A name left empty means Windows looks for the program itself,
         // and so does a directory: both buffers are still all zero then.
-        let started = win.create_process(program: program[0..PATH_UNITS], command: command[0..PATH_UNITS],
+        let started = win.create_process(program: program[0..PATH_UNITS], command: command.items_mut(),
             flags: win.CREATE_SUSPENDED, directory: directory[0..PATH_UNITS],
             startup: &startup, made: &mut made);
         close_child_handles(&startup);

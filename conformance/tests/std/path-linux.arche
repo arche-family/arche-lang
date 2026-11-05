@@ -1,0 +1,56 @@
+// test: run
+// spec: std
+// stage0: skip
+// system: linux
+// stdout: 1 0 0 0
+// stdout: C:/b|c|/b|/x|.|..
+// stdout: |a\b|a/C:/x|/
+import alloc;
+import std;
+import std.path;
+
+// On Linux a backslash and a colon are a name's characters, as any other.
+fn flag(out: &mut std.Output, on: bool) {
+    if on {
+        out.write("1");
+    } else {
+        out.write("0");
+    }
+}
+
+fn say(out: &mut std.Output, s: alloc.String) {
+    out.write(s.view());
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let o = &mut sys.stdout;
+    flag(o, on: path.is_absolute("/x"));
+    o.write(" ");
+    flag(o, on: path.is_absolute("C:/x"));
+    o.write(" ");
+    flag(o, on: path.is_absolute("\\x"));
+    o.write(" ");
+    flag(o, on: path.is_absolute("x"));
+    o.write("\n");
+    say(o, s: path.normalize("C:/a/../b", a));
+    o.write("|");
+    say(o, s: path.normalize("a\\b/../c", a));
+    o.write("|");
+    say(o, s: path.normalize("/a/../b", a));
+    o.write("|");
+    say(o, s: path.normalize("/../../x", a));
+    o.write("|");
+    say(o, s: path.normalize("", a));
+    o.write("|");
+    say(o, s: path.normalize("a/../..", a));
+    o.write("\n");
+    o.write(path.parent("a\\b"));
+    o.write("|");
+    o.write(path.file_name("a\\b"));
+    o.write("|");
+    say(o, s: path.join(base: "a", name: "C:/x", a));
+    o.write("|");
+    o.write(path.parent("/c"));
+    o.write("\n");
+}

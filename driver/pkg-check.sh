@@ -71,6 +71,21 @@ pub fn greeting(name: str) -> str {
 EOF
 "$driver" pkg publish "$work/registry" signing.key --dir words > out || fail "publishing words failed: $(cat out)"
 "$driver" pkg publish "$work/registry" signing.key --dir textkit > out || fail "publishing textkit failed: $(cat out)"
+# A file name that means something else on another system is not published;
+# unpacking refuses one too (safe_path's own tests, make check). Windows
+# cannot make such a file, which is the point.
+case $(uname -s) in
+MINGW* | MSYS* | CYGWIN*) ;;
+*)
+    mkdir oddname
+    manifest oddname 1.0.0 "" "" "$work/registry" > oddname/package.arche
+    : > 'oddname/sub\evil.arche'
+    if "$driver" pkg publish "$work/registry" signing.key --dir oddname > out 2>&1; then
+        fail "a file name with a backslash was published"
+    fi
+    grep -q "must mean the same on every system" out || fail "the refusal does not say why: $(cat out)"
+    ;;
+esac
 if "$driver" pkg publish "$work/registry" signing.key --dir words > out 2>&1; then
     fail "a version was published twice"
 fi

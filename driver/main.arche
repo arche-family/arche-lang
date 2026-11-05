@@ -251,11 +251,12 @@ fn find_tools(sys: &mut std.System, work: str, a: alloc.Allocator) -> Failed!Too
 /// The object for some source text, from the cache or made now: what is
 /// compiled, with which flags, by which clang, decides its name.
 fn object(sys: &mut std.System, tools: &Tools, source: str, flags: str, cache: str, hits: &mut u32, a: alloc.Allocator) -> Failed!alloc.String {
-    return object_with(sys, tools: tools, source: source, also: "", flags: flags, cache: cache, hits: hits, a: a);
+    let nothing = alloc.List(alloc.String).init(a);
+    return object_with(sys, tools: tools, source: source, also: &nothing, flags: flags, cache: cache, hits: hits, a: a);
 }
 
-/// object, with a file the source includes as part of the key.
-fn object_with(sys: &mut std.System, tools: &Tools, source: str, also: str, flags: str, cache: str, hits: &mut u32, a: alloc.Allocator) -> Failed!alloc.String {
+/// object, with the files the source includes as part of the key.
+fn object_with(sys: &mut std.System, tools: &Tools, source: str, also: &alloc.List(alloc.String), flags: str, cache: str, hits: &mut u32, a: alloc.Allocator) -> Failed!alloc.String {
     var text = alloc.List(u8).init(a);
     match sys.fs.read_bytes(source, a) {
         ok(t) => { text = t; }
@@ -270,8 +271,8 @@ fn object_with(sys: &mut std.System, tools: &Tools, source: str, also: str, flag
     h.update(flags.bytes());
     h.update("\n".bytes());
     h.update(text.items());
-    if also.len() > 0 {
-        let more = sys.fs.read_bytes(also, a) catch alloc.List(u8).init(a);
+    for f in also.items() {
+        let more = sys.fs.read_bytes(f.view(), a) catch alloc.List(u8).init(a);
         h.update("\n".bytes());
         h.update(more.items());
     }
@@ -340,8 +341,12 @@ fn build_program(sys: &mut std.System, tools: &Tools, dir: str, name: str, root:
         objects.push(try object(sys, tools: tools, source: u.view(), flags: compile_flags(), cache: cache.view(), hits: &mut hits, a: a));
     }
     var rt_hits: u32 = 0;
-    let math = join(dir: parent(tools.runtime.view()), name: "math.inc", a);
-    let rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: math.view(), flags: runtime_flags(), cache: cache.view(), hits: &mut rt_hits, a: a);
+    // The runtime is rt.c and what it includes, one half for each system.
+    var includes = alloc.List(alloc.String).init(a);
+    includes.push(join(dir: parent(tools.runtime.view()), name: "math.inc", a));
+    includes.push(join(dir: parent(tools.runtime.view()), name: "linux.inc", a));
+    includes.push(join(dir: parent(tools.runtime.view()), name: "windows.inc", a));
+    let rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: &includes, flags: runtime_flags(), cache: cache.view(), hits: &mut rt_hits, a: a);
     // Linked to a file of its own, then moved into place.
     let program = join(dir: out_dir.view(), name: name, a);
     var tmp = alloc.String.init(a);

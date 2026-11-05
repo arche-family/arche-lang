@@ -529,7 +529,7 @@ static void os_test_child(System *sys) {
             }
             u64 count = test_count();
             if (which >= count) {
-                a0rt_die("a test child was given a test that is not there", 46);
+                a0rt_die("a test child was given a test that is not there", 47);
             }
             run_test(sys, which, seed);
             flush_all();
@@ -587,7 +587,7 @@ static void os_start_test(System *sys, u64 i, u64 seed, Run *r) {
     Handle err = CreateFileW(test_file(pid, i, 2), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, security,
                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if (out == invalid_handle() || err == invalid_handle()) {
-        a0rt_die("cannot make a file for a test's output", 37);
+        a0rt_die("cannot make a file for a test's output", 38);
     }
 
     u8 startup[104];
