@@ -1,0 +1,67 @@
+// test: run
+// spec: arche/2.2
+// stage0: skip
+// args: 7.5 2 0.1 10 -1 -2.5
+// stdout: 1.5
+// stdout: 5.551115123125783e-17
+// stdout: -3.0 -2.0 -2.0
+// stdout: 2.5 -0.0
+// stdout: ok
+import std;
+import core.math;
+
+/// A number from the arguments, so nothing is known until the program runs
+/// and every operation is computed then, by the runtime's functions where
+/// the processor has no instruction (floor, ceil, trunc, frem, fma).
+fn number(text: str) -> f64 {
+    let b = text.bytes();
+    var sign: f64 = 1.0;
+    var i: usize = 0;
+    if b[0] == '-' {
+        sign = -1.0;
+        i = 1;
+    }
+    var v: f64 = 0.0;
+    var scale: f64 = 0.0;
+    while i < b.len() : (i += 1) {
+        if b[i] == '.' {
+            scale = 1.0;
+        } else {
+            v = v * 10.0 + (b[i] - '0') as f64;
+            scale = scale * 10.0;
+        }
+    }
+    if scale > 0.0 {
+        v = v / scale;
+    }
+    return sign * v;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = number(sys.args.get(1));
+    let b = number(sys.args.get(2));
+    let c = number(sys.args.get(3));
+    let d = number(sys.args.get(4));
+    let e = number(sys.args.get(5));
+    let x = number(sys.args.get(6));
+    sys.stdout.write_f64(math.rem(a: a, b: b));
+    sys.stdout.write("\n");
+    // 0.1 * 10 - 1 is not 0 when computed with one rounding.
+    sys.stdout.write_f64(math.fma(a: c, b: d, c: e));
+    sys.stdout.write("\n");
+    sys.stdout.write_f64(math.floor(x));
+    sys.stdout.write(" ");
+    sys.stdout.write_f64(math.ceil(x));
+    sys.stdout.write(" ");
+    sys.stdout.write_f64(math.trunc(x));
+    sys.stdout.write("\n");
+    sys.stdout.write_f64(math.fabs(x));
+    sys.stdout.write(" ");
+    sys.stdout.write_f64(math.ceil(-c));
+    sys.stdout.write("\n");
+    let f: f32 = x as f32;
+    let two: f32 = 2.0;
+    if f.floor() == -3.0 and f.ceil() == -2.0 and f.trunc() == -2.0 and f * two == -5.0 {
+        sys.stdout.write("ok\n");
+    }
+}

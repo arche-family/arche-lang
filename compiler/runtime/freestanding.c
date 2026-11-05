@@ -17,6 +17,8 @@ typedef struct {
 
 // ---- what LLVM may call --------------------------------------------------------
 
+#include "math.inc"
+
 void *memcpy(void *dst, const void *src, u64 n) {
     u8 *d = dst;
     const u8 *s = src;

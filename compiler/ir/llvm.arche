@@ -652,9 +652,9 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
     }
 }
 
-fn emit_function(out: &mut alloc.String, m: &ir.Module, f: &ir.Function) {
+fn emit_function(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, internal: bool) {
     out.push_str("\ndefine ");
-    if f.internal {
+    if internal {
         out.push_str("internal ");
     }
     out.push_str(ty_text(f.ret));
@@ -740,6 +740,78 @@ fn byte_array(out: &mut alloc.String, b: []u8) {
         }
     }
     out.push_str("\"");
+}
+
+/// The declarations of the LLVM intrinsics the code may call.
+fn intrinsics(out: &mut alloc.String) {
+    out.push_str("\ndeclare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
+    out.push_str("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n");
+    // Float operations of IEEE 754 (spec/arche.md §2.2).
+    var fk: u32 = 0;
+    while fk < 6 : (fk += 1) {
+        var name = "sqrt";
+        if fk == 1 { name = "fabs"; }
+        if fk == 2 { name = "floor"; }
+        if fk == 3 { name = "ceil"; }
+        if fk == 4 { name = "trunc"; }
+        if fk == 5 { name = "fma"; }
+        out.push_str("declare float @llvm.");
+        out.push_str(name);
+        if fk == 5 {
+            out.push_str(".f32(float, float, float)\ndeclare double @llvm.");
+            out.push_str(name);
+            out.push_str(".f64(double, double, double)\n");
+        } else {
+            out.push_str(".f32(float)\ndeclare double @llvm.");
+            out.push_str(name);
+            out.push_str(".f64(double)\n");
+        }
+    }
+    // Saturating float to integer conversions (spec/arche.md §2.3).
+    var sw: u32 = 8;
+    while sw <= 64 : (sw *= 2) {
+        var sat: u32 = 0;
+        while sat < 4 : (sat += 1) {
+            var ft = "float";
+            var fs = "f32";
+            if sat % 2 == 1 {
+                ft = "double";
+                fs = "f64";
+            }
+            var sign = "si";
+            if sat >= 2 {
+                sign = "ui";
+            }
+            out.push_str("declare i");
+            ir.write_number(out, sw as u64);
+            out.push_str(" @llvm.fpto");
+            out.push_str(sign);
+            out.push_str(".sat.i");
+            ir.write_number(out, sw as u64);
+            out.push_str(".");
+            out.push_str(fs);
+            out.push_str("(");
+            out.push_str(ft);
+            out.push_str(")\n");
+        }
+    }
+    var k: u32 = 0;
+    while k < 6 : (k += 1) {
+        var w: u32 = 8;
+        while w <= 64 : (w *= 2) {
+            out.push_str("declare {i");
+            ir.write_number(out, w as u64);
+            out.push_str(", i1} @llvm.");
+            out.push_str(overflow_text(k));
+            out.push_str(".with.overflow.i");
+            ir.write_number(out, w as u64);
+            out.push_str("(i");
+            ir.write_number(out, w as u64);
+            out.push_str(", i");
+            ir.write_number(out, w as u64);
+            out.push_str(")\n");
+        }
+    }
 }
 
 pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
@@ -840,74 +912,7 @@ pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
         }
         out.push_str("]\n");
     }
-    out.push_str("\ndeclare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
-    out.push_str("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n");
-    // Float operations of IEEE 754 (spec/arche.md §2.2).
-    var fk: u32 = 0;
-    while fk < 6 : (fk += 1) {
-        var name = "sqrt";
-        if fk == 1 { name = "fabs"; }
-        if fk == 2 { name = "floor"; }
-        if fk == 3 { name = "ceil"; }
-        if fk == 4 { name = "trunc"; }
-        if fk == 5 { name = "fma"; }
-        out.push_str("declare float @llvm.");
-        out.push_str(name);
-        if fk == 5 {
-            out.push_str(".f32(float, float, float)\ndeclare double @llvm.");
-            out.push_str(name);
-            out.push_str(".f64(double, double, double)\n");
-        } else {
-            out.push_str(".f32(float)\ndeclare double @llvm.");
-            out.push_str(name);
-            out.push_str(".f64(double)\n");
-        }
-    }
-    // Saturating float to integer conversions (spec/arche.md §2.3).
-    var sw: u32 = 8;
-    while sw <= 64 : (sw *= 2) {
-        var sat: u32 = 0;
-        while sat < 4 : (sat += 1) {
-            var ft = "float";
-            var fs = "f32";
-            if sat % 2 == 1 {
-                ft = "double";
-                fs = "f64";
-            }
-            var sign = "si";
-            if sat >= 2 {
-                sign = "ui";
-            }
-            out.push_str("declare i");
-            ir.write_number(&mut out, sw as u64);
-            out.push_str(" @llvm.fpto");
-            out.push_str(sign);
-            out.push_str(".sat.i");
-            ir.write_number(&mut out, sw as u64);
-            out.push_str(".");
-            out.push_str(fs);
-            out.push_str("(");
-            out.push_str(ft);
-            out.push_str(")\n");
-        }
-    }
-    var k: u32 = 0;
-    while k < 6 : (k += 1) {
-        var w: u32 = 8;
-        while w <= 64 : (w *= 2) {
-            out.push_str("declare {i");
-            ir.write_number(&mut out, w as u64);
-            out.push_str(", i1} @llvm.");
-            out.push_str(overflow_text(k));
-            out.push_str(".with.overflow.i");
-            ir.write_number(&mut out, w as u64);
-            out.push_str("(i");
-            ir.write_number(&mut out, w as u64);
-            out.push_str(", i");
-            ir.write_number(&mut out, w as u64);
-            out.push_str(")\n");
-        }
-    }
+    intrinsics(&mut out);
     let es = m.externals.items();
     var x: usize = 0;
     while x < es.len() : (x += 1) {
@@ -941,7 +946,376 @@ pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
     let fs = m.functions.items();
     var i: usize = 0;
     while i < fs.len() : (i += 1) {
-        emit_function(&mut out, m, &fs[i]);
+        if not fs[i].stub {
+            emit_function(&mut out, m, &fs[i], fs[i].internal);
+        }
     }
     return out;
+}
+
+// ---- Units: one LLVM module for each module of the program -----------------------
+//
+// An incremental build (arche-driver) compiles each module of the program
+// on its own and keeps the object by the hash of its text. A unit holds
+// the functions of one module; it declares what it calls in others, and
+// has its own copies of the strings and method tables it uses, numbered in
+// the order it uses them, so its text depends on its own code only. A
+// function that another unit calls is not internal. The first unit, the
+// root module's, also has the program's tables (a0_error_names, a0_tests).
+
+const NO: u32 = 4294967295;
+
+/// Which functions another unit calls, or reaches through a method table.
+fn called_across(m: &ir.Module, unit_of: []u32, a: alloc.Allocator) -> alloc.List(bool) {
+    var across = alloc.List(bool).init(a);
+    var i: usize = 0;
+    while i < m.functions.len() : (i += 1) {
+        across.push(false);
+    }
+    let fs = m.functions.items();
+    var g: usize = 0;
+    while g < fs.len() : (g += 1) {
+        if fs[g].stub {
+            continue;
+        }
+        let insts = fs[g].insts.items();
+        var k: usize = 0;
+        while k < insts.len() : (k += 1) {
+            let i2 = insts[k];
+            if i2.op == ir.Op.Call and i2.flag == 0 and unit_of[i2.imm as usize] != unit_of[g] {
+                across[i2.imm as usize] = true;
+            } else if i2.op == ir.Op.VTable {
+                let vf = m.vtables[i2.imm as usize].functions.items();
+                var v: usize = 0;
+                while v < vf.len() : (v += 1) {
+                    if unit_of[vf[v] as usize] != unit_of[g] {
+                        across[vf[v] as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+    // The test table is in the first unit.
+    let ts = m.tests.items();
+    var t: usize = 0;
+    while t < ts.len() : (t += 1) {
+        if unit_of[ts[t].function as usize] != 0 {
+            across[ts[t].function as usize] = true;
+        }
+    }
+    return across;
+}
+
+fn declare_function(out: &mut alloc.String, f: &ir.Function) {
+    out.push_str("declare ");
+    out.push_str(ty_text(f.ret));
+    out.push_str(" @");
+    out.push_str(f.name.view());
+    out.push_str("(");
+    var p: usize = 0;
+    while p < f.params.len() : (p += 1) {
+        if p > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(ty_text(f.params[p]));
+    }
+    out.push_str(")\n");
+}
+
+fn starts_at(t: str, at: usize, word: str) -> bool {
+    if at + word.len() > t.len() {
+        return false;
+    }
+    return t[at..at + word.len()].eq(word);
+}
+
+/// The units of the program, one for each of its count modules, in order;
+/// a module with no code has an empty one (the root's never is).
+pub fn emit_units(m: &ir.Module, unit_of: []u32, count: u32, a: alloc.Allocator) -> alloc.List(alloc.String) {
+    let across = called_across(m, unit_of: unit_of, a: a);
+    var units = alloc.List(alloc.String).init(a);
+    var u: u32 = 0;
+    while u < count : (u += 1) {
+        units.push(emit_unit(m, unit_of: unit_of, across: across.items(), unit: u, a: a));
+    }
+    return units;
+}
+
+fn emit_unit(m: &ir.Module, unit_of: []u32, across: []bool, unit: u32, a: alloc.Allocator) -> alloc.String {
+    let fs = m.functions.items();
+    var mine = false;
+    var f: usize = 0;
+    while f < fs.len() : (f += 1) {
+        if unit_of[f] == unit and not fs[f].stub {
+            mine = true;
+        }
+    }
+    if not mine and unit != 0 {
+        return alloc.String.init(a);
+    }
+    // What the unit's functions use from elsewhere.
+    var calls = alloc.List(bool).init(a);
+    f = 0;
+    while f < fs.len() : (f += 1) {
+        calls.push(false);
+    }
+    var externs = alloc.List(bool).init(a);
+    var x: usize = 0;
+    while x < m.externals.len() : (x += 1) {
+        externs.push(false);
+    }
+    f = 0;
+    while f < fs.len() : (f += 1) {
+        if unit_of[f] != unit or fs[f].stub {
+            continue;
+        }
+        let insts = fs[f].insts.items();
+        var k: usize = 0;
+        while k < insts.len() : (k += 1) {
+            let i = insts[k];
+            if i.op == ir.Op.Call and i.flag == 0 {
+                calls[i.imm as usize] = true;
+            } else if i.op == ir.Op.Call and i.flag == 1 {
+                externs[i.imm as usize] = true;
+            } else if i.op == ir.Op.VTable {
+                let vf = m.vtables[i.imm as usize].functions.items();
+                var v: usize = 0;
+                while v < vf.len() : (v += 1) {
+                    calls[vf[v] as usize] = true;
+                }
+            }
+        }
+    }
+    var body = alloc.String.init(a);
+    if unit == 0 {
+        unit_tables(&mut body, m);
+        let ts = m.tests.items();
+        var t: usize = 0;
+        while t < ts.len() : (t += 1) {
+            calls[ts[t].function as usize] = true;
+        }
+    }
+    intrinsics(&mut body);
+    let es = m.externals.items();
+    x = 0;
+    while x < es.len() : (x += 1) {
+        if not externs[x] {
+            continue;
+        }
+        // An extern fn this unit defines, by export: no declaration.
+        var defined = false;
+        var fx: usize = 0;
+        while fx < fs.len() and not defined : (fx += 1) {
+            defined = unit_of[fx] == unit and fs[fx].name.view().eq(es[x].name.view());
+        }
+        if defined {
+            continue;
+        }
+        body.push_str("declare ");
+        body.push_str(ty_text(es[x].ret));
+        body.push_str(" @");
+        body.push_str(es[x].name.view());
+        body.push_str("(");
+        var p: usize = 0;
+        while p < es[x].params.len() : (p += 1) {
+            if p > 0 {
+                body.push_str(", ");
+            }
+            body.push_str(ty_text(es[x].params[p]));
+        }
+        body.push_str(")");
+        if es[x].noreturn {
+            body.push_str(" noreturn");
+        }
+        body.push_str("\n");
+    }
+    f = 0;
+    while f < fs.len() : (f += 1) {
+        if calls[f] and unit_of[f] != unit {
+            declare_function(&mut body, &fs[f]);
+        }
+    }
+    f = 0;
+    while f < fs.len() : (f += 1) {
+        if unit_of[f] == unit and not fs[f].stub {
+            emit_function(&mut body, m, &fs[f], fs[f].internal and not across[f]);
+        }
+    }
+    // Strings and method tables, renamed in the order the text uses them.
+    var gmap = alloc.List(u32).init(a);
+    var g: usize = 0;
+    while g < m.globals.len() : (g += 1) {
+        gmap.push(NO);
+    }
+    var gorder = alloc.List(u32).init(a);
+    var vmap = alloc.List(u32).init(a);
+    var v: usize = 0;
+    while v < m.vtables.len() : (v += 1) {
+        vmap.push(NO);
+    }
+    var vorder = alloc.List(u32).init(a);
+    let t = body.view();
+    var out = alloc.String.init(a);
+    out.push_str("; Generated by the Arche compiler. Do not edit.\n");
+    out.push_str("target triple = \"");
+    out.push_str(m.triple.view());
+    out.push_str("\"\n");
+    var at: usize = 0;
+    var copied: usize = 0;
+    while at < t.len() {
+        if t[at] != '@' {
+            at += 1;
+            continue;
+        }
+        var kind: u32 = 0;
+        var digits_at: usize = 0;
+        if starts_at(t: t, at: at + 1, word: ".str.") {
+            kind = 1;
+            digits_at = at + 6;
+        } else if starts_at(t: t, at: at + 1, word: "a0vt_") or starts_at(t: t, at: at + 1, word: "a0vc_") {
+            kind = 2;
+            digits_at = at + 6;
+        }
+        if kind == 0 {
+            at += 1;
+            continue;
+        }
+        var end = digits_at;
+        var n: u64 = 0;
+        while end < t.len() and t[end] >= '0' and t[end] <= '9' : (end += 1) {
+            n = n * 10 + (t[end] - '0') as u64;
+        }
+        if end == digits_at {
+            at += 1;
+            continue;
+        }
+        out.push_str(t[copied..at]);
+        if kind == 1 {
+            if gmap[n as usize] == NO {
+                gmap[n as usize] = gorder.len() as u32;
+                gorder.push(n as u32);
+            }
+            out.push_str("@.str.");
+            ir.write_number(&mut out, gmap[n as usize] as u64);
+        } else {
+            // The table of that name.
+            let name = t[at + 1..end];
+            var found = NO;
+            var q: usize = 0;
+            while q < m.vtables.len() and found == NO : (q += 1) {
+                if m.vtables[q].name.view().eq(name) {
+                    found = q as u32;
+                }
+            }
+            if vmap[found as usize] == NO {
+                vmap[found as usize] = vorder.len() as u32;
+                vorder.push(found);
+            }
+            out.push_str("@vt.");
+            ir.write_number(&mut out, vmap[found as usize] as u64);
+        }
+        at = end;
+        copied = end;
+    }
+    out.push_str(t[copied..t.len()]);
+    out.push_str("\n");
+    let gs = m.globals.items();
+    var k: usize = 0;
+    while k < gorder.len() : (k += 1) {
+        out.push_str("@.str.");
+        ir.write_number(&mut out, k as u64);
+        out.push_str(" = private unnamed_addr constant ");
+        byte_array(&mut out, gs[gorder[k] as usize].bytes.items());
+        out.push_str("\n");
+    }
+    let vts = m.vtables.items();
+    k = 0;
+    while k < vorder.len() : (k += 1) {
+        let vt = &vts[vorder[k] as usize];
+        let vf = vt.functions.items();
+        out.push_str("@vt.");
+        ir.write_number(&mut out, k as u64);
+        out.push_str(" = private unnamed_addr constant [");
+        var slots = vf.len() as u64;
+        if vt.size > 0 {
+            slots += 1;
+        }
+        ir.write_number(&mut out, slots);
+        out.push_str(" x ptr] [");
+        var e: usize = 0;
+        while e < vf.len() : (e += 1) {
+            if e > 0 {
+                out.push_str(", ");
+            }
+            out.push_str("ptr @");
+            out.push_str(m.functions[vf[e] as usize].name.view());
+        }
+        if vt.size > 0 {
+            out.push_str(", ptr inttoptr (i64 ");
+            ir.write_number(&mut out, vt.size);
+            out.push_str(" to ptr)");
+        }
+        out.push_str("]\n");
+    }
+    return out;
+}
+
+/// The root unit's tables: the tests (in a test build) and the strings the
+/// runtime reads by name.
+fn unit_tables(out: &mut alloc.String, m: &ir.Module) {
+    let gs = m.globals.items();
+    if m.test_mode {
+        let ts = m.tests.items();
+        out.push_str("@a0_tests = constant [");
+        ir.write_number(out, ts.len() as u64);
+        out.push_str(" x {ptr, i64, ptr, i64}] ");
+        if ts.len() == 0 {
+            out.push_str("zeroinitializer");
+        } else {
+            out.push_str("[");
+            var q: usize = 0;
+            while q < ts.len() : (q += 1) {
+                if q > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str("{ptr, i64, ptr, i64} {ptr @");
+                out.push_str(gs[ts[q].name as usize].name.view());
+                out.push_str(", i64 ");
+                ir.write_number(out, gs[ts[q].name as usize].bytes.len() as u64);
+                out.push_str(", ptr @");
+                out.push_str(m.functions[ts[q].function as usize].name.view());
+                if ts[q].takes_test {
+                    out.push_str(", i64 1}");
+                } else {
+                    out.push_str(", i64 0}");
+                }
+            }
+            out.push_str("]");
+        }
+        out.push_str("\n@a0_test_count = constant i64 ");
+        ir.write_number(out, ts.len() as u64);
+        out.push_str("\n");
+    }
+    let tables = m.tables.items();
+    var t: usize = 0;
+    while t < tables.len() : (t += 1) {
+        let entries = tables[t].entries.items();
+        out.push_str("@");
+        out.push_str(tables[t].name.view());
+        out.push_str(" = constant [");
+        ir.write_number(out, entries.len() as u64);
+        out.push_str(" x {ptr, i64}] [");
+        var e: usize = 0;
+        while e < entries.len() : (e += 1) {
+            if e > 0 {
+                out.push_str(", ");
+            }
+            out.push_str("{ptr, i64} {ptr @");
+            out.push_str(gs[entries[e] as usize].name.view());
+            out.push_str(", i64 ");
+            ir.write_number(out, gs[entries[e] as usize].bytes.len() as u64);
+            out.push_str("}");
+        }
+        out.push_str("]\n");
+    }
 }

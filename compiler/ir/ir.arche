@@ -196,6 +196,9 @@ pub type Function = struct {
     pub no_frame: bool,
     /// The section the code goes in, or empty for the default.
     pub section: alloc.String,
+    /// A placeholder that keeps the numbering, never called: a test block
+    /// of another module, an interface's method. It is not written out.
+    pub stub: bool,
 }
 
 pub type External = struct {
@@ -353,6 +356,7 @@ pub fn new_function(name: str, ret: Ty, a: alloc.Allocator) -> Function {
         internal: true,
         no_frame: false,
         section: alloc.String.init(a),
+        stub: false,
     };
     f.blocks.push(Block { insts: alloc.List(u32).init(a) });
     return f;

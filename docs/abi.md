@@ -38,13 +38,17 @@ Sizes and alignments are in bytes. A composite value is laid out in memory at it
 
 ## Symbols
 
-A function's symbol is `a0` followed by each segment of its module path and then its name, each written as `_<length><text>`: `syntax.lexer.lex` is `a0_6syntax_5lexer_3lex`. A method adds its type's name before its own: `a0_4main_3Ast_4eval`. A method of an `impl` (spec/arche.md §5.1) adds `_X<n>` after its name, `n` the impl's number in the program, since two interfaces of a type may have methods of one name. The method table of impl `n` is `a0vt_<n>`.
+A function's symbol is `a0` followed by each segment of its module path and then its name, each written as `_<length><text>`: `syntax.lexer.lex` is `a0_6syntax_5lexer_3lex`. A method adds its type's name before its own: `a0_4main_3Ast_4eval`. A method of an `impl` (spec/arche.md §5.1) adds `_X<n>` after its name, `n` the number of the impl's syntax node in its module, since two interfaces of a type may have methods of one name. A closure is `closure` with `_C<n>`, `n` its expression's node. An instance of a generic function or type, a method of one, or a closure in one adds `_I<h>`, `h` sixteen hex digits of the FNV-1a hash of its comptime arguments written as types that name their module. So a symbol depends only on its own module's text and its arguments, not on the rest of the program, and a module compiled on its own (`arche units`, below) keeps its symbols when other modules change. The test block numbered `n` among the root module's is `a0_test_<n>`. The method table of impl `n` is `a0vt_<n>`, of closure `n` `a0vc_<n>`; they are private to the module that uses them.
 
 A call through a `&dyn I` loads the method's address from the table and passes the `data` address as `self`; the other parameters and the result follow the rules above. The root module whose file name is not a module path has the empty name, written `_0`. Runtime symbols start with `a0rt_`.
 
+## Units
+
+`arche units <file> <dir>` writes the program as one LLVM module for each of its modules, `<dir>/<n>.ll` in load order, the root module's first, for the build driver (`driver/`), which compiles each to an object kept under the SHA-256 of its text. A unit defines its module's functions, and declares those of other modules it calls; a function another unit calls, or reaches through a method table, is not `internal`. Each unit has its own copies of the strings and method tables it uses, numbered by first use, and names its module in `source_filename`, so its text, and the object made from it, depend on its module alone. The root unit also defines `a0_error_names` and, in a test build, `a0_tests`. Objects are compiled with `-ffunction-sections -fdata-sections` and linked with `--gc-sections`, which drops the functions nothing reaches.
+
 ## The runtime
 
-The runtime (`compiler/runtime/rt.c`) has its own entry point and calls no C library. It talks to Linux through system calls only. It owns `_start`, builds `std.System` from the arguments, calls `a0_entry` (the program's `main`), and exits:
+The runtime (`compiler/runtime/rt.c`) has its own entry point and calls no C library. The float functions LLVM calls when the processor has no instruction for an operation, `floor`, `ceil`, `trunc`, `fmod`, `fma` and their `f` forms, are its own too (`compiler/runtime/math.inc`, shared with the freestanding runtime). It talks to Linux through system calls only. It owns `_start`, builds `std.System` from the arguments, calls `a0_entry` (the program's `main`), and exits:
 
 - with 0 when `main` returns;
 - with 1 after writing `error: <name>` when `main` returns an error, using the table `a0_error_names` that the program defines;

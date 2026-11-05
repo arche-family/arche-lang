@@ -52,6 +52,8 @@ enum { ENOENT = 2, EACCES = 13, ENOTDIR = 20, EISDIR = 21, EPERM = 1 };
 
 // The C compiler may turn loops into calls to these, and LLVM's memcpy and
 // memset intrinsics call them.
+#include "math.inc"
+
 void *memcpy(void *dst, const void *src, u64 n) {
     u8 *d = dst;
     const u8 *s = src;

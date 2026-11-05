@@ -636,24 +636,142 @@ pub fn mangle(c: &ck.Checker, d: u32, a: alloc.Allocator) -> alloc.String {
         segment(&mut out, c.names.text(c.decls[c.impls[decl.impl_index as usize].iface as usize].name));
     }
     segment(&mut out, c.names.text(decl.name));
-    // A closure: one per expression, numbered by its function.
+    // Names depend only on the module's own text and the comptime
+    // arguments, so a module's code does not change when another module
+    // does (an incremental build reuses it, arche-driver).
+    // A closure: one per expression, named by its node in the module.
     if ck.kind_of_in(c, decl.module, decl.node) == cst.Kind.ClosureExpr {
         out.push_str("_C");
-        ir.write_number(&mut out, decl.fn_index as u64);
+        ir.write_number(&mut out, decl.node.index as u64);
     }
-    // A method of an impl: two interfaces may both have one of its name.
+    // A method of an impl: two interfaces may both have one of its name;
+    // the impl's node tells them apart.
     if decl.impl_index != ck.NONE {
         out.push_str("_X");
-        ir.write_number(&mut out, decl.impl_index as u64);
+        ir.write_number(&mut out, c.impls[decl.impl_index as usize].node.index as u64);
     }
-    // An instance, or a method of one: its declaration number tells it
-    // from the template's other instances (spec/arche.md §4).
-    let is_instance = decl.template != ck.NONE or (decl.owner != ck.NONE and c.decls[decl.owner as usize].template != ck.NONE);
-    if is_instance {
+    // An instance, a method of one, or a closure in one: a hash of the
+    // comptime arguments tells it from the template's other instances
+    // (spec/arche.md §4).
+    if decl.env_len > 0 {
+        var key = alloc.String.init(a);
+        var e = decl.env_start;
+        while e < decl.env_start + decl.env_len : (e += 1) {
+            type_key(c, &mut key, c.env[e as usize].type_id, 0);
+            if not c.env[e as usize].is_type {
+                key.push_str("=");
+                ir.write_number(&mut key, c.env[e as usize].value);
+            }
+            key.push_str(";");
+        }
         out.push_str("_I");
-        ir.write_number(&mut out, d as u64);
+        hex64(&mut out, fnv(key.view()));
     }
     return out;
+}
+
+/// FNV-1a, 64 bits.
+fn fnv(text: str) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    var i: usize = 0;
+    while i < text.len() : (i += 1) {
+        h = (h ^ text[i] as u64) *% 0x100000001b3;
+    }
+    return h;
+}
+
+fn hex64(out: &mut alloc.String, v: u64) {
+    let digits = "0123456789abcdef";
+    var shift: u32 = 64;
+    while shift > 0 : (shift -= 4) {
+        out.push_ascii(digits[((v >> (shift - 4)) & 15) as usize]);
+    }
+}
+
+/// A type as text that names it in the whole program: a declared type by
+/// its module and name, and its comptime arguments when it is an instance.
+fn type_key(c: &ck.Checker, out: &mut alloc.String, t: ty.TypeId, depth: u32) {
+    let info = c.t.get(t);
+    if depth > 16 {
+        out.push_str("...");
+        return;
+    }
+    out.push_str("(");
+    let k = info.kind;
+    // A tag for each kind that is made of others; the rest by their name.
+    if k == ty.Kind.Ref {
+        out.push_str("ref");
+    } else if k == ty.Kind.Slice {
+        out.push_str("slice");
+    } else if k == ty.Kind.Array {
+        out.push_str("array ");
+        ir.write_number(out, info.len);
+    } else if k == ty.Kind.List {
+        out.push_str("list");
+    } else if k == ty.Kind.Map {
+        out.push_str("map");
+    } else if k == ty.Kind.Optional {
+        out.push_str("optional");
+    } else if k == ty.Kind.ErrorUnion {
+        out.push_str("result");
+    } else if k == ty.Kind.Ptr {
+        out.push_str("ptr");
+    } else if k == ty.Kind.Struct {
+        out.push_str("struct");
+    } else if k == ty.Kind.Enum {
+        out.push_str("enum");
+    } else if k == ty.Kind.ErrorSet {
+        out.push_str("errors");
+    } else if k == ty.Kind.Interface {
+        out.push_str("interface");
+    } else if k == ty.Kind.Dyn {
+        out.push_str("dyn");
+    } else if k == ty.Kind.Closure {
+        out.push_str("closure");
+    } else {
+        ck.write_type(c, out, t);
+    }
+    if info.mutable {
+        out.push_str(",mut");
+    }
+    if k == ty.Kind.Struct or k == ty.Kind.Enum or k == ty.Kind.ErrorSet or k == ty.Kind.Interface or k == ty.Kind.Dyn {
+        if info.decl != ty.NO_DECL and info.decl != ck.NONE {
+            let d = c.decls[info.decl as usize];
+            out.push_str(",");
+            out.push_str(c.p.modules[d.module as usize].name.view());
+            out.push_str(".");
+            out.push_str(c.names.text(d.name));
+            var e = d.env_start;
+            while e < d.env_start + d.env_len : (e += 1) {
+                out.push_str(",");
+                type_key(c, out, c.env[e as usize].type_id, depth + 1);
+                if not c.env[e as usize].is_type {
+                    out.push_str("=");
+                    ir.write_number(out, c.env[e as usize].value);
+                }
+            }
+        }
+    } else if k == ty.Kind.Closure {
+        let fd = c.fns[c.closures[info.decl as usize].fn_index as usize].decl;
+        out.push_str(",closure ");
+        out.push_str(c.p.modules[c.decls[fd as usize].module as usize].name.view());
+        out.push_str(" ");
+        ir.write_number(out, c.decls[fd as usize].node.index as u64);
+    } else if k == ty.Kind.ErrorUnion and info.decl != ty.NO_DECL and info.decl != ck.NONE {
+        out.push_str(",");
+        out.push_str(c.names.text(c.decls[info.decl as usize].name));
+    }
+    let elem_kinds = k == ty.Kind.Ref or k == ty.Kind.Slice or k == ty.Kind.Array or k == ty.Kind.List or
+        k == ty.Kind.Map or k == ty.Kind.Optional or k == ty.Kind.ErrorUnion or k == ty.Kind.Ptr;
+    if elem_kinds {
+        out.push_str(",");
+        type_key(c, out, info.elem, depth + 1);
+    }
+    if k == ty.Kind.Map {
+        out.push_str(",");
+        type_key(c, out, info.key, depth + 1);
+    }
+    out.push_str(")");
 }
 
 // ---- functions -------------------------------------------------------------------
@@ -795,14 +913,15 @@ fn root_test(c: &ck.Checker, f: u32) -> u32 {
     return ck.NONE;
 }
 
-/// A test block as a function of the runner: a0_test_<n>, taking the
-/// runner's Test when the block does (std.testing).
+/// A test block as a function of the runner: a0_test_<n>, n its number
+/// among the tests, taking the runner's Test when the block does
+/// (std.testing).
 fn lower_test(l: &mut Lower, i: u32) {
     let t = l.c.tests[i as usize];
     let info = l.c.fns[t.fn_index as usize];
     var name = alloc.String.init(l.a);
     name.push_str("a0_test_");
-    ir.write_number(&mut name, t.fn_index as u64);
+    ir.write_number(&mut name, i as u64);
     l.f = ir.new_function(name.view(), ir.Ty.Void, l.a);
     l.block = 0;
     l.fn_index = t.fn_index;
@@ -934,6 +1053,7 @@ pub fn lower(c: ck.Checker) -> ir.Module {
             name.push_str("a0_test_");
             ir.write_number(&mut name, f as u64);
             var stub = ir.new_function(name.view(), ir.Ty.Void, a);
+            stub.stub = true;
             var u = ir.inst(ir.Op.Unreachable, ir.Ty.Void);
             u.a = 0;
             stub.insts.push(u);

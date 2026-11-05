@@ -1,0 +1,442 @@
+/// arche-driver: arche build and arche run (docs/sprints.md S24). The
+/// compiler stays in Arche-0, which has no Proc, so this program, in full
+/// Arche, drives it and clang.
+///
+///     arche-driver build [dir]               every program build.arche lists
+///     arche-driver run [dir] [name] [-- args] build, then run one
+///     arche-driver clean [dir]               forget the cache
+///
+/// A package's build.arche lists its programs:
+///
+///     import std.build;
+///
+///     const BUILD: build.Build = build.Build {
+///         programs: [build.program("webd", "main.arche")],
+///     };
+///
+/// The compiler writes a program as one LLVM module per module of it
+/// (arche units). Each is compiled to an object kept in dir/build/cache
+/// under the SHA-256 of its text, the compiler's flags and clang's version,
+/// so a module whose code did not change is not compiled again; the objects
+/// and the runtime are linked into dir/build/<name>. A build with the cache
+/// gives the same bytes as one without.
+import alloc;
+import core.mem;
+import crypto.sha2;
+import std;
+
+const COMPILE_FLAGS: str = "-c -O1 -fno-pie -ffunction-sections -fdata-sections -Wno-override-module";
+const RUNTIME_FLAGS: str = "-c -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -fno-pie -ffunction-sections -fdata-sections";
+
+fn join(dir: str, name: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str(dir);
+    if dir.len() > 0 and dir.bytes()[dir.len() - 1] != '/' {
+        s.push_str("/");
+    }
+    s.push_str(name);
+    return s;
+}
+
+fn parent(path: str) -> str {
+    let b = path.bytes();
+    var cut: usize = 0;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        if b[i] == '/' {
+            cut = i;
+        }
+    }
+    if cut == 0 {
+        if b.len() > 0 and b[0] == '/' {
+            return "/";
+        }
+        return ".";
+    }
+    return path[0..cut];
+}
+
+/// Makes dir and the directories above it that are missing.
+fn make_dirs(fs: &std.Fs, dir: str, a: alloc.Allocator) {
+    if dir.len() == 0 or fs.exists(dir) {
+        return;
+    }
+    let up = parent(dir);
+    if not up.eq(dir) {
+        make_dirs(fs, dir: up, a: a);
+    }
+    _ = fs.make_dir(dir);
+}
+
+fn hex(digest: [32]u8, a: alloc.Allocator) -> alloc.String {
+    let digits = "0123456789abcdef".bytes();
+    var s = alloc.String.init(a);
+    for b in digest[0..32] {
+        s.push_ascii(digits[(b.* >> 4) as usize]);
+        s.push_ascii(digits[(b.* & 15) as usize]);
+    }
+    return s;
+}
+
+fn text_of(b: []u8, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    unsafe {
+        // SAFETY: the bytes come from a str, cut at ASCII bytes.
+        s.push_str(mem.str_from(b));
+    }
+    return s;
+}
+
+/// The lines of a file's text.
+fn lines(text: str, a: alloc.Allocator) -> alloc.List(alloc.String) {
+    var out = alloc.List(alloc.String).init(a);
+    let b = text.bytes();
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= b.len() : (i += 1) {
+        if i == b.len() or b[i] == '\n' {
+            if i > start {
+                out.push(text_of(b[start..i], a));
+            }
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+/// Where the tools are, and how they are called.
+type Tools = struct {
+    arche: alloc.String,
+    runtime: alloc.String,
+    clang: alloc.String,
+    /// clang --version's first line: part of every cache key.
+    version: alloc.String,
+}
+
+type Failed = error { Failed }
+
+fn say(out: &mut std.Output, a: str, b: str, c: str) {
+    out.write(a);
+    out.write(b);
+    out.write(c);
+    out.write("\n");
+}
+
+/// Runs a command; its output goes to out_path, or to ours when empty.
+fn run(sys: &mut std.System, argv: &alloc.List(alloc.String), out_path: str, a: alloc.Allocator) -> Failed!u8 {
+    var cmd = std.Command.init(a);
+    let words = argv.items();
+    for x in words {
+        cmd.arg(x.view(), a);
+    }
+    cmd.stdout_path.push_str(out_path);
+    cmd.stderr_path.push_str(out_path);
+    match sys.proc.spawn(&cmd, env: &sys.env, clock: &sys.clock, a) {
+        ok(ending) => {
+            match ending {
+                .Exited { status } => { return status; }
+                .Signaled { signal } => {
+                    _ = signal;
+                    return 128;
+                }
+                .TimedOut => { return 124; }
+            }
+        }
+        err(_) => {
+            say(&mut sys.stderr, a: "arche-driver: cannot run ", b: words[0].view(), c: "");
+            return Failed.Failed;
+        }
+    }
+}
+
+fn args_of(words: str, a: alloc.Allocator) -> alloc.List(alloc.String) {
+    var out = alloc.List(alloc.String).init(a);
+    let b = words.bytes();
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= b.len() : (i += 1) {
+        if i == b.len() or b[i] == ' ' {
+            if i > start {
+                out.push(text_of(b[start..i], a));
+            }
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+fn find_tools(sys: &mut std.System, work: str, a: alloc.Allocator) -> Failed!Tools {
+    // The compiler: ARCHE, or the repository's, beside this program's
+    // directory (driver/build/arche-driver, compiler/build/arche).
+    var arche = alloc.String.init(a);
+    match sys.env.get("ARCHE", a) {
+        some(v) => { arche.push_str(v.view()); }
+        none => {
+            let here = parent(sys.args.get(0));
+            arche.push_str(here);
+            arche.push_str("/../../compiler/build/arche");
+        }
+    }
+    let runtime = join(dir: parent(parent(arche.view())), name: "runtime/rt.c", a);
+    var clang = alloc.String.init(a);
+    match sys.env.get("CLANG", a) {
+        some(v) => { clang.push_str(v.view()); }
+        none => { clang.push_str("clang"); }
+    }
+    if not sys.fs.exists(arche.view()) {
+        say(&mut sys.stderr, a: "arche-driver: there is no compiler at ", b: arche.view(), c: "; set ARCHE");
+        return Failed.Failed;
+    }
+    let version_file = join(dir: work, name: "clang-version", a);
+    var argv = alloc.List(alloc.String).init(a);
+    argv.push(text_of(clang.view().bytes(), a));
+    argv.push(text_of("--version".bytes(), a));
+    if try run(sys, argv: &argv, out_path: version_file.view(), a) != 0 {
+        say(&mut sys.stderr, a: "arche-driver: ", b: clang.view(), c: " --version failed");
+        return Failed.Failed;
+    }
+    let text = sys.fs.read_file(version_file.view(), a) catch alloc.String.init(a);
+    let ls = lines(text.view(), a);
+    var version = alloc.String.init(a);
+    if ls.len() > 0 {
+        version.push_str(ls[0].view());
+    }
+    return Tools { arche: arche, runtime: runtime, clang: clang, version: version };
+}
+
+/// The object for some source text, from the cache or made now: what is
+/// compiled, with which flags, by which clang, decides its name.
+fn object(sys: &mut std.System, tools: &Tools, source: str, flags: str, cache: str, hits: &mut u32, a: alloc.Allocator) -> Failed!alloc.String {
+    return object_with(sys, tools: tools, source: source, also: "", flags: flags, cache: cache, hits: hits, a: a);
+}
+
+/// object, with a file the source includes as part of the key.
+fn object_with(sys: &mut std.System, tools: &Tools, source: str, also: str, flags: str, cache: str, hits: &mut u32, a: alloc.Allocator) -> Failed!alloc.String {
+    var text = alloc.List(u8).init(a);
+    match sys.fs.read_bytes(source, a) {
+        ok(t) => { text = t; }
+        err(_) => {
+            say(&mut sys.stderr, a: "arche-driver: cannot read ", b: source, c: "");
+            return Failed.Failed;
+        }
+    }
+    var h = sha2.Sha256.init();
+    h.update(tools.version.view().bytes());
+    h.update("\n".bytes());
+    h.update(flags.bytes());
+    h.update("\n".bytes());
+    h.update(text.items());
+    if also.len() > 0 {
+        let more = sys.fs.read_bytes(also, a) catch alloc.List(u8).init(a);
+        h.update("\n".bytes());
+        h.update(more.items());
+    }
+    let name = hex(h.finish(), a);
+    var file = join(dir: cache, name: name.view(), a);
+    file.push_str(".o");
+    if sys.fs.exists(file.view()) {
+        hits.* += 1;
+        return file;
+    }
+    var tmp = alloc.String.init(a);
+    tmp.push_str(file.view());
+    tmp.push_str(".tmp");
+    var argv = alloc.List(alloc.String).init(a);
+    argv.push(text_of(tools.clang.view().bytes(), a));
+    for f in args_of(flags, a).items() {
+        argv.push(text_of(f.view().bytes(), a));
+    }
+    argv.push(text_of("-o".bytes(), a));
+    argv.push(text_of(tmp.view().bytes(), a));
+    argv.push(text_of(source.bytes(), a));
+    let log = join(dir: cache, name: "clang.log", a);
+    if try run(sys, argv: &argv, out_path: log.view(), a) != 0 {
+        say(&mut sys.stderr, a: "arche-driver: clang failed on ", b: source, c: ":");
+        let msg = sys.fs.read_file(log.view(), a) catch alloc.String.init(a);
+        sys.stderr.write(msg.view());
+        return Failed.Failed;
+    }
+    _ = sys.fs.rename(from: tmp.view(), to: file.view());
+    return file;
+}
+
+/// Builds one program; its path.
+fn build_program(sys: &mut std.System, tools: &Tools, dir: str, name: str, root: str, a: alloc.Allocator) -> Failed!alloc.String {
+    let out_dir = join(dir: dir, name: "build", a);
+    let cache = join(dir: out_dir.view(), name: "cache", a);
+    let units_dir = join(dir: join(dir: out_dir.view(), name: "units", a).view(), name: name, a);
+    make_dirs(&sys.fs, dir: cache.view(), a: a);
+    make_dirs(&sys.fs, dir: units_dir.view(), a: a);
+    // No unit left from an earlier build.
+    let old = sys.fs.list(units_dir.view(), a) catch alloc.List(alloc.String).init(a);
+    for f in old.items() {
+        _ = sys.fs.remove(join(dir: units_dir.view(), name: f.view(), a).view());
+    }
+    var list_name = alloc.String.init(a);
+    list_name.push_str(name);
+    list_name.push_str(".units");
+    let list_file = join(dir: out_dir.view(), name: list_name.view(), a);
+    var argv = alloc.List(alloc.String).init(a);
+    argv.push(text_of(tools.arche.view().bytes(), a));
+    argv.push(text_of("units".bytes(), a));
+    argv.push(join(dir: dir, name: root, a));
+    argv.push(text_of(units_dir.view().bytes(), a));
+    if try run(sys, argv: &argv, out_path: list_file.view(), a) != 0 {
+        let msg = sys.fs.read_file(list_file.view(), a) catch alloc.String.init(a);
+        sys.stderr.write(msg.view());
+        return Failed.Failed;
+    }
+    let listed = sys.fs.read_file(list_file.view(), a) catch alloc.String.init(a);
+    let units = lines(listed.view(), a);
+    var objects = alloc.List(alloc.String).init(a);
+    var hits: u32 = 0;
+    for u in units.items() {
+        objects.push(try object(sys, tools: tools, source: u.view(), flags: COMPILE_FLAGS, cache: cache.view(), hits: &mut hits, a: a));
+    }
+    var rt_hits: u32 = 0;
+    let math = join(dir: parent(tools.runtime.view()), name: "math.inc", a);
+    let rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: math.view(), flags: RUNTIME_FLAGS, cache: cache.view(), hits: &mut rt_hits, a: a);
+    // Linked to a file of its own, then moved into place.
+    let program = join(dir: out_dir.view(), name: name, a);
+    var tmp = alloc.String.init(a);
+    tmp.push_str(program.view());
+    tmp.push_str(".tmp");
+    var link = alloc.List(alloc.String).init(a);
+    link.push(text_of(tools.clang.view().bytes(), a));
+    for f in args_of("-nostdlib -static -fno-pie -Wl,--gc-sections -o", a).items() {
+        link.push(text_of(f.view().bytes(), a));
+    }
+    link.push(text_of(tmp.view().bytes(), a));
+    for o in objects.items() {
+        link.push(text_of(o.view().bytes(), a));
+    }
+    link.push(text_of(rt.view().bytes(), a));
+    let log = join(dir: out_dir.view(), name: "link.log", a);
+    if try run(sys, argv: &link, out_path: log.view(), a) != 0 {
+        sys.stderr.write("arche-driver: the link failed:\n");
+        let msg = sys.fs.read_file(log.view(), a) catch alloc.String.init(a);
+        sys.stderr.write(msg.view());
+        return Failed.Failed;
+    }
+    _ = sys.fs.rename(from: tmp.view(), to: program.view());
+    sys.stdout.write(name);
+    sys.stdout.write(": ");
+    sys.stdout.write_u64(units.len() as u64);
+    sys.stdout.write(" modules, ");
+    sys.stdout.write_u64(hits as u64);
+    sys.stdout.write(" from the cache\n");
+    return program;
+}
+
+/// The programs of dir/build.arche, as name and root.
+fn plan(sys: &mut std.System, tools: &Tools, dir: str, work: str, a: alloc.Allocator) -> Failed!alloc.List(alloc.String) {
+    let build_file = join(dir: dir, name: "build.arche", a);
+    if not sys.fs.exists(build_file.view()) {
+        say(&mut sys.stderr, a: "arche-driver: there is no ", b: build_file.view(), c: "");
+        return Failed.Failed;
+    }
+    let out = join(dir: work, name: "plan", a);
+    var argv = alloc.List(alloc.String).init(a);
+    argv.push(text_of(tools.arche.view().bytes(), a));
+    argv.push(text_of("build-plan".bytes(), a));
+    argv.push(text_of(build_file.view().bytes(), a));
+    let status = try run(sys, argv: &argv, out_path: out.view(), a);
+    let text = sys.fs.read_file(out.view(), a) catch alloc.String.init(a);
+    if status != 0 {
+        sys.stderr.write(text.view());
+        return Failed.Failed;
+    }
+    // name TAB root, a line each: as a flat list of names and roots.
+    var flat = alloc.List(alloc.String).init(a);
+    for l in lines(text.view(), a).items() {
+        let b = l.view().bytes();
+        var tab: usize = 0;
+        while tab < b.len() and b[tab] != '\t' : (tab += 1) {
+        }
+        if tab < b.len() {
+            flat.push(text_of(b[0..tab], a));
+            flat.push(text_of(b[tab + 1..b.len()], a));
+        }
+    }
+    return flat;
+}
+
+fn usage(out: &mut std.Output) {
+    out.write("usage: arche-driver build [dir]\n");
+    out.write("       arche-driver run [dir] [program] [-- arguments]\n");
+    out.write("       arche-driver clean [dir]\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    if sys.args.len() < 2 {
+        usage(&mut sys.stderr);
+        sys.proc.exit(2);
+    }
+    let command = text_of(sys.args.get(1).bytes(), a);
+    var dir = alloc.String.init(a);
+    dir.push_str(".");
+    var program_name = alloc.String.init(a);
+    var program_args = alloc.List(alloc.String).init(a);
+    var i: usize = 2;
+    var dir_given = false;
+    while i < sys.args.len() : (i += 1) {
+        let arg = sys.args.get(i);
+        if arg.eq("--") {
+            i += 1;
+            while i < sys.args.len() : (i += 1) {
+                program_args.push(text_of(sys.args.get(i).bytes(), a));
+            }
+            break;
+        }
+        if not dir_given {
+            dir = text_of(arg.bytes(), a);
+            dir_given = true;
+        } else {
+            program_name.push_str(arg);
+        }
+    }
+    let work = join(dir: dir.view(), name: "build", a);
+    make_dirs(&sys.fs, dir: work.view(), a: a);
+    if command.view().eq("clean") {
+        let cache = join(dir: work.view(), name: "cache", a);
+        let old = sys.fs.list(cache.view(), a) catch alloc.List(alloc.String).init(a);
+        for f in old.items() {
+            _ = sys.fs.remove(join(dir: cache.view(), name: f.view(), a).view());
+        }
+        return;
+    }
+    if not command.view().eq("build") and not command.view().eq("run") {
+        usage(&mut sys.stderr);
+        sys.proc.exit(2);
+    }
+    let tools = find_tools(sys, work: work.view(), a: a) catch sys.proc.exit(1);
+    let programs = plan(sys, tools: &tools, dir: dir.view(), work: work.view(), a: a) catch sys.proc.exit(1);
+    var chosen = alloc.String.init(a);
+    var k: usize = 0;
+    while k + 1 < programs.len() : (k += 2) {
+        let name = programs[k].view();
+        if command.view().eq("run") and program_name.len() > 0 and not program_name.view().eq(name) {
+            continue;
+        }
+        let path = build_program(sys, tools: &tools, dir: dir.view(), name: name, root: programs[k + 1].view(), a: a) catch sys.proc.exit(1);
+        if chosen.len() == 0 {
+            chosen.push_str(path.view());
+        }
+    }
+    if command.view().eq("build") {
+        return;
+    }
+    if chosen.len() == 0 {
+        say(&mut sys.stderr, a: "arche-driver: build.arche has no program ", b: program_name.view(), c: "");
+        sys.proc.exit(1);
+    }
+    // Run it, its output ours, and end as it does.
+    var argv = alloc.List(alloc.String).init(a);
+    argv.push(chosen);
+    for x in program_args.items() {
+        argv.push(text_of(x.view().bytes(), a));
+    }
+    let status = run(sys, argv: &argv, out_path: "", a: a) catch sys.proc.exit(1);
+    sys.proc.exit(status);
+}

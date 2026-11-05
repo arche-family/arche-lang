@@ -37,7 +37,7 @@ for f in fmt/*.arche; do
     "$arche" fmt --check "$work/case.arche" || status=1
 done
 for f in ../*.arche ../syntax/*.arche ../sema/*.arche ../lower/*.arche ../ir/*.arche ../../lib/*.arche ../../lib/*/*.arche ../../lib/*/*/*.arche \
-    ../../interop/*.arche ../../fuzz/*.arche ../../ctcheck/*.arche ../../freestanding/*.arche ../../conformance/runner/*.arche; do
+    ../../interop/*.arche ../../fuzz/*.arche ../../ctcheck/*.arche ../../freestanding/*.arche ../../conformance/runner/*.arche ../../driver/*.arche; do
     [ -f "$f" ] || continue
     "$arche" fmt --check "$f" || status=1
 done
