@@ -7,7 +7,7 @@
 
 BUILD := build
 LIB := $(wildcard ../lib/*.arche ../lib/*/*.arche ../lib/*/*/*.arche)
-RUNTIME := ../compiler/runtime/rt.c ../compiler/runtime/math.inc
+RUNTIME := $(wildcard ../compiler/runtime/rt.c ../compiler/runtime/*.inc)
 
 all: $(BUILD)/arche-driver $(BUILD)/arche-registry
 
@@ -22,6 +22,7 @@ $(BUILD)/arche-registry: registry.arche $(LIB) $(RUNTIME)
 	../compiler/arche-build registry.arche $@
 
 check: $(BUILD)/arche-driver $(BUILD)/arche-registry
+	sh ../compiler/arche-test pkg.arche
 	sh ./check.sh $(BUILD)/arche-driver
 	sh ./pkg-check.sh $(BUILD)/arche-driver $(BUILD)/arche-registry
 

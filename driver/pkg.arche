@@ -233,24 +233,86 @@ fn less(x: []u8, than: []u8) -> bool {
     return x.len() < than.len();
 }
 
+/// Whether a part of a path names a device on Windows, whatever follows it
+/// after a dot: CON, PRN, AUX, NUL, COM1 or LPT1.
+fn device_name(part: []u8) -> bool {
+    var n: usize = 0;
+    while n < part.len() and part[n] != '.' : (n += 1) {
+    }
+    if n != 3 and n != 4 {
+        return false;
+    }
+    var name: [4]u8 = [0; 4];
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        let c = part[i];
+        name[i] = if c >= 'A' and c <= 'Z' { c + 32 } else { c };
+    }
+    if n == 4 {
+        let port = (name[0] == 'c' and name[1] == 'o' and name[2] == 'm') or (name[0] == 'l' and name[1] == 'p' and name[2] == 't');
+        return port and name[3] >= '0' and name[3] <= '9';
+    }
+    let head = name[0..3];
+    return same(a: head, b: "con".bytes()) or same(a: head, b: "prn".bytes()) or same(a: head, b: "aux".bytes()) or same(a: head, b: "nul".bytes());
+}
+
 /// Whether a path from an archive stays inside the directory it is
-/// unpacked into: relative, without empty, "." or ".." parts.
-fn safe_path(p: []u8) -> bool {
+/// unpacked into, on every system: relative, '/' between its parts, none of
+/// them empty, "." or "..". An archive is the same for everyone, so what
+/// means something on Windows alone is refused everywhere: '\\' separates
+/// parts there, ':' names a drive or a stream, the dots and spaces that end
+/// a part are dropped (".. " is ".."), and some names are devices.
+pub fn safe_path(p: []u8) -> bool {
     if p.len() == 0 or p[0] == '/' {
         return false;
+    }
+    for c in p {
+        if c.* == '\\' or c.* == ':' or c.* < 0x20 {
+            return false;
+        }
     }
     var start: usize = 0;
     var i: usize = 0;
     while i <= p.len() : (i += 1) {
         if i == p.len() or p[i] == '/' {
             let part = p[start..i];
-            if part.len() == 0 or (part.len() == 1 and part[0] == '.') or (part.len() == 2 and part[0] == '.' and part[1] == '.') or part[0] == '\\' {
+            if part.len() == 0 or part[part.len() - 1] == '.' or part[part.len() - 1] == ' ' or device_name(part) {
                 return false;
             }
             start = i + 1;
         }
     }
     return true;
+}
+
+test "safe_path keeps an archive's files inside its directory" {
+    assert(safe_path("a.arche".bytes()));
+    assert(safe_path("a/b c/d.arche".bytes()));
+    assert(safe_path(".hidden/console.txt".bytes()));
+    assert(safe_path("comb.txt/lpt.txt/auxiliary".bytes()));
+    assert(not safe_path("".bytes()));
+    assert(not safe_path("/etc/passwd".bytes()));
+    assert(not safe_path("../evil".bytes()));
+    assert(not safe_path("a/../../evil".bytes()));
+    assert(not safe_path("a//b".bytes()));
+    assert(not safe_path("./a".bytes()));
+    assert(not safe_path("a/".bytes()));
+    // What only Windows reads as a way out, or as something else.
+    assert(not safe_path("..\\..\\evil.exe".bytes()));
+    assert(not safe_path("a\\..\\..\\evil.exe".bytes()));
+    assert(not safe_path("\\\\server\\share\\evil".bytes()));
+    assert(not safe_path("C:/Windows/evil".bytes()));
+    assert(not safe_path("C:evil".bytes()));
+    assert(not safe_path("a.txt:stream".bytes()));
+    assert(not safe_path(".. /evil".bytes()));
+    assert(not safe_path("../ /evil".bytes()));
+    assert(not safe_path("a./b".bytes()));
+    assert(not safe_path("a /b".bytes()));
+    assert(not safe_path("NUL".bytes()));
+    assert(not safe_path("a/con.txt".bytes()));
+    assert(not safe_path("Com1".bytes()));
+    assert(not safe_path("lpt9.log".bytes()));
+    assert(not safe_path("a\nb".bytes()));
 }
 
 fn make_dirs(fs: &std.Fs, dir: str, a: alloc.Allocator) {
@@ -663,6 +725,14 @@ pub fn publish(sys: &mut std.System, dir: str, m: &Manifest, registry_dir: str, 
     var seed: [32]u8 = [0; 32];
     if kl.len() != 1 or not unhex(kl[0].view(), out: seed[0..32]) {
         return fail(&mut sys.stderr, a: "a key file holds 64 hex digits: ", b: key_file);
+    }
+    // What nobody could unpack is not published.
+    var files = alloc.List(alloc.String).init(a);
+    collect(&sys.fs, root: dir, rel: "", out: &mut files, a: a);
+    for f in files.items() {
+        if not safe_path(f.view().bytes()) {
+            return fail(&mut sys.stderr, a: "a package's file names must mean the same on every system: ", b: f.view());
+        }
     }
     let data = pack(&sys.fs, dir: dir, a: a);
     let hash = sha256_hex(data.items(), a);

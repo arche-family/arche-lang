@@ -5,6 +5,11 @@
 
 CFLAGS ?= -O2 -g
 WARN := -std=c11 -Wall -Wextra -Werror
+# On Windows the C library's own headers deprecate fopen and strerror,
+# which C11 keeps; the warning would be an error here (docs/sprints.md S19).
+ifeq ($(OS),Windows_NT)
+WARN += -D_CRT_SECURE_NO_WARNINGS
+endif
 BUILD := build
 
 SRC := $(wildcard src/*.c)

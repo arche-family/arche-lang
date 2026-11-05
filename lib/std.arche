@@ -25,6 +25,10 @@ pub type System = struct {
     pub stdin: Input,
 }
 
+/// The system this std is for (spec/arche.md §10.3): a program that must
+/// tell them apart, such as a test runner, asks for this.
+pub const SYSTEM: str = "linux";
+
 /// Arche-0's errors of reading and writing files (spec/arche-0.md §11).
 pub type IoError = error { NotFound, AccessDenied, IsDirectory, InvalidUtf8, IoFailed }
 
@@ -231,6 +235,29 @@ pub type Fs = struct {
         unsafe {
             // SAFETY: checked just now.
             s.push_str(mem.str_from(buf[0..(n - 1) as usize]));
+        }
+        return s;
+    }
+
+    /// A directory for files that need not outlive the program: TMPDIR
+    /// when the environment names one, and /tmp otherwise, without a
+    /// separator at its end. Windows has its own (lib/std-windows.arche),
+    /// so a program that wants one is the same on both.
+    pub fn temp_dir(self: &Fs, env: &Env, a: alloc.Allocator) -> FsError!alloc.String {
+        let named = env.get("TMPDIR", a) orelse alloc.String.init(a);
+        var text = named.view();
+        if text.len() == 0 {
+            text = "/tmp";
+        }
+        let b = text.bytes();
+        var n = b.len();
+        while n > 1 and b[n - 1] == '/' : (n -= 1) {
+        }
+        var s = alloc.String.init(a);
+        unsafe {
+            // SAFETY: the separators dropped at the end are ASCII, so what
+            // is left is still UTF-8.
+            s.push_str(mem.str_from(b[0..n]));
         }
         return s;
     }

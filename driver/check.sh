@@ -6,7 +6,8 @@
 #   2. one module changed, and built again: only it is compiled;
 #   3. the change undone and built again, all from the cache: the program
 #      is byte for byte the one of step 1;
-#   4. a clean build in another directory: the same bytes again.
+#   4. a clean build in another directory: the same bytes again;
+#   5. a change in any file the runtime includes builds the runtime again.
 # Usage: check.sh <arche-driver>
 set -eu
 driver=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -45,6 +46,23 @@ cmp -s "$work/clean" "$work/b/build/greeter" || fail "two clean builds differ"
 
 out=$("$driver" run "$work/b" greeter -- ignored 2>&1 | tail -1)
 [ "$out" = "hello, world: 55" ] || fail "arche-driver run printed '$out'"
+
+# A compiler of its own, with a runtime that can be changed, where the
+# compiler finds the library (find_lib).
+mkdir -p "$work/tools/build"
+cp "$here/../compiler/build/arche"* "$work/tools/build/"
+cp -r "$here/../compiler/runtime" "$work/tools/runtime"
+cp -r "$here/../lib" "$work/lib"
+cp -r "$here/example" "$work/c"
+ARCHE="$work/tools/build/arche" "$driver" build "$work/c" > /dev/null
+before=$(ls "$work/c/build/cache" | wc -l)
+for part in rt.c math.inc linux.inc windows.inc; do
+    echo "// a change" >> "$work/tools/runtime/$part"
+    ARCHE="$work/tools/build/arche" "$driver" build "$work/c" > /dev/null
+    after=$(ls "$work/c/build/cache" | wc -l)
+    [ "$after" -eq $((before + 1)) ] || fail "a change in $part did not build the runtime again"
+    before=$after
+done
 
 [ "$status" -eq 0 ] && echo "driver: clean and cached builds are bit-identical; one change compiles one module"
 exit "$status"

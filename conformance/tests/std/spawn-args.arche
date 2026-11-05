@@ -1,0 +1,67 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: spawn: 0
+// stdout: run: 0
+import alloc;
+import std;
+
+const COUNT: usize = 6;
+
+// What a child is given is what it reads, whatever is in it: on Windows the
+// arguments go through one command line and back (docs/sprints.md S19). A
+// non-ASCII character in a part that needs quotes, quotes and backslashes,
+// an empty one, and one longer than any path.
+fn given(i: usize, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    if i == 0 {
+        s.push_str("Ó with space 𝐱");
+    } else if i == 1 {
+        s.push_str("a \"quote\" inside");
+    } else if i == 2 {
+        s.push_str("ends with \\ a backslash\\");
+    } else if i == 4 {
+        s.push_str("back\\\\slashes \\\" ó\\\\\"");
+    } else if i == 5 {
+        var k: usize = 0;
+        while k < 20000 : (k += 1) {
+            s.push_str("x");
+        }
+    }
+    return s;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() > 1 and sys.args.get(1).eq("child") {
+        if sys.args.len() != 2 + COUNT {
+            sys.proc.exit(20);
+        }
+        var i: usize = 0;
+        while i < COUNT : (i += 1) {
+            if not sys.args.get(2 + i).eq(given(i, sys.alloc).view()) {
+                sys.proc.exit(10 + i as u8);
+            }
+        }
+        return;
+    }
+    var cmd = std.Command.init(sys.alloc);
+    cmd.arg(sys.args.get(0), sys.alloc);
+    cmd.arg("child", sys.alloc);
+    var i: usize = 0;
+    while i < COUNT : (i += 1) {
+        cmd.arg(given(i, sys.alloc).view(), sys.alloc);
+    }
+    match try sys.proc.spawn(&cmd, env: &sys.env, clock: &sys.clock, sys.alloc) {
+        .Exited { status } => {
+            sys.stdout.write("spawn: ");
+            sys.stdout.write_u64(status as u64);
+            sys.stdout.write("\n");
+        }
+        .Signaled { signal } => { sys.proc.exit(signal); }
+        .TimedOut => { sys.proc.exit(21); }
+    }
+    let status = try sys.proc.run(&cmd.argv, env: &sys.env, sys.alloc);
+    sys.stdout.write("run: ");
+    sys.stdout.write_u64(status as u64);
+    sys.stdout.write("\n");
+}

@@ -1,0 +1,1059 @@
+/// std for a Windows host (docs/sprints.md S19): the same capabilities a
+/// program reaches through std.System as on Linux (lib/std.arche), over
+/// Win32 instead of system calls. The compiler reads this file as the
+/// module std when it builds for windows-x86_64 (program.std_file), so a
+/// program that imports std needs no word about the system it runs on.
+///
+/// Output's buffers, the file reads and the tasks are the runtime's
+/// (compiler/runtime/rt.c, windows.inc); the rest is Win32 from std.win32.
+import alloc;
+import core;
+import core.mem;
+import std.win32 as win;
+
+/// What main is given: every capability the program has. Its layout is the
+/// runtime's, and the same on every system (docs/abi.md); env is 0 here,
+/// since Windows keeps no array of the environment for a program to read.
+pub type System = struct {
+    pub fs: Fs,
+    pub stdout: Output,
+    pub stderr: Output,
+    pub args: Args,
+    pub alloc: alloc.Allocator,
+    pub clock: Clock,
+    pub env: Env,
+    pub proc: Proc,
+    pub net: Net,
+    pub rand: Rand,
+    pub stdin: Input,
+}
+
+/// The system this std is for (spec/arche.md §10.3): a program that must
+/// tell them apart, such as a test runner, asks for this.
+pub const SYSTEM: str = "windows";
+
+/// Arche-0's errors of reading and writing files (spec/arche-0.md §11).
+pub type IoError = error { NotFound, AccessDenied, IsDirectory, InvalidUtf8, IoFailed }
+
+/// The errors of the other file operations.
+pub type FsError = error { NotFound, AccessDenied, IsDirectory, IoFailed, AlreadyExists, NotEmpty }
+
+/// The runtime's functions std calls (compiler/runtime/rt.c).
+extern "c" fn a0rt_write(output: *i64, p: *u8, n: u64);
+extern "c" fn a0rt_write_byte(output: *i64, c: u8);
+extern "c" fn a0rt_write_u64(output: *i64, v: u64);
+extern "c" fn a0rt_write_i64(output: *i64, v: i64);
+extern "c" fn a0rt_write_f64(output: *i64, x: f64);
+extern "c" fn a0rt_write_f32(output: *i64, x: f32);
+extern "c" fn a0rt_fs_read(path: *u8, path_len: u64, out: *mut u8, utf8: bool) -> u16;
+extern "c" fn a0rt_write_file(fs: *u8, path: *u8, path_len: u64, data: *u8, len: u64) -> u16;
+extern "c" fn a0rt_flush_all();
+extern "c" fn a0rt_io_wait(fd: i64, events: u32);
+extern "c" fn a0rt_exit(status: u8) -> noreturn;
+
+/// The runtime's error numbers, 1 to 5 in IoError's order.
+fn io_error(code: u16) -> IoError {
+    match code {
+        1 => { return IoError.NotFound; }
+        2 => { return IoError.AccessDenied; }
+        3 => { return IoError.IsDirectory; }
+        4 => { return IoError.InvalidUtf8; }
+        _ => { return IoError.IoFailed; }
+    }
+}
+
+/// What Win32's last error means for a file operation.
+fn last_fs_error() -> FsError {
+    let e = win.last_error();
+    if e == win.ERROR_FILE_NOT_FOUND or e == win.ERROR_PATH_NOT_FOUND or e == win.ERROR_INVALID_NAME {
+        return FsError.NotFound;
+    }
+    if e == win.ERROR_ACCESS_DENIED {
+        return FsError.AccessDenied;
+    }
+    if e == win.ERROR_ALREADY_EXISTS or e == win.ERROR_FILE_EXISTS {
+        return FsError.AlreadyExists;
+    }
+    if e == win.ERROR_DIR_NOT_EMPTY {
+        return FsError.NotEmpty;
+    }
+    if e == win.ERROR_DIRECTORY {
+        return FsError.IsDirectory;
+    }
+    return FsError.IoFailed;
+}
+
+/// How long a path may be here, in UTF-16 units: more than any Win32 call
+/// takes, and small enough for a task's stack.
+const PATH_UNITS: usize = 4096;
+
+// ---- Output -----------------------------------------------------------------------
+
+/// stdout or stderr, buffered; flushed when the program exits.
+pub type Output = struct {
+    fd: i64,
+    unique: core.Unique,
+
+    fn raw(self: &Output) -> *i64 {
+        unsafe {
+            // SAFETY: the runtime reads only fd, the first field.
+            return self as *Output as *i64;
+        }
+    }
+
+    pub fn write(self: &mut Output, text: str) {
+        unsafe {
+            // SAFETY: text's bytes, read as long as the call lasts.
+            a0rt_write(self.raw(), mem.str_data(text), text.len() as u64);
+        }
+    }
+
+    pub fn write_byte(self: &mut Output, byte: u8) {
+        unsafe {
+            // SAFETY: as write.
+            a0rt_write_byte(self.raw(), byte);
+        }
+    }
+
+    pub fn write_u64(self: &mut Output, n: u64) {
+        unsafe {
+            // SAFETY: as write.
+            a0rt_write_u64(self.raw(), n);
+        }
+    }
+
+    pub fn write_i64(self: &mut Output, n: i64) {
+        unsafe {
+            // SAFETY: as write.
+            a0rt_write_i64(self.raw(), n);
+        }
+    }
+
+    pub fn write_f64(self: &mut Output, x: f64) {
+        unsafe {
+            // SAFETY: as write.
+            a0rt_write_f64(self.raw(), x);
+        }
+    }
+
+    pub fn write_f32(self: &mut Output, x: f32) {
+        unsafe {
+            // SAFETY: as write.
+            a0rt_write_f32(self.raw(), x);
+        }
+    }
+
+    /// Writes out what is buffered now, for both outputs.
+    pub fn flush(self: &mut Output) {
+        unsafe {
+            // SAFETY: the runtime's buffers only.
+            a0rt_flush_all();
+        }
+    }
+}
+
+// ---- Args -------------------------------------------------------------------------
+
+/// The arguments the program was started with; the first is the program
+/// itself. The runtime split the command line and made each UTF-8.
+pub type Args = struct {
+    items: *str,
+    count: usize,
+    unique: core.Unique,
+
+    pub fn len(self: &Args) -> usize {
+        return self.count;
+    }
+
+    pub fn get(self: &Args, i: usize) -> str {
+        if i >= self.count {
+            panic("argument index out of range");
+        }
+        unsafe {
+            // SAFETY: the runtime made count of them, valid UTF-8, for the
+            // whole run.
+            return self.items.add(i).*;
+        }
+    }
+}
+
+// ---- Fs ---------------------------------------------------------------------------
+
+/// The file system, from the directory the program started in. Windows
+/// keeps that directory for the whole process, so dir holds nothing.
+pub type Fs = struct {
+    dir: i64,
+    unique: core.Unique,
+
+    pub fn read_file(self: &Fs, path: str, a: alloc.Allocator) -> IoError!alloc.String {
+        var text = alloc.String.init(a);
+        var code: u16 = 0;
+        unsafe {
+            // SAFETY: the runtime fills text as a String, with its allocator.
+            code = a0rt_fs_read(mem.str_data(path), path.len() as u64, &mut text as *mut alloc.String as *mut u8, true);
+        }
+        if code != 0 {
+            return io_error(code);
+        }
+        return text;
+    }
+
+    pub fn read_bytes(self: &Fs, path: str, a: alloc.Allocator) -> IoError!alloc.List(u8) {
+        var bytes = alloc.List(u8).init(a);
+        var code: u16 = 0;
+        unsafe {
+            // SAFETY: as read_file, for a List(u8).
+            code = a0rt_fs_read(mem.str_data(path), path.len() as u64, &mut bytes as *mut alloc.List(u8) as *mut u8, false);
+        }
+        if code != 0 {
+            return io_error(code);
+        }
+        return bytes;
+    }
+
+    /// Writes bytes, which need not be text, to a file, made or emptied.
+    pub fn write_bytes(self: &Fs, path: str, data: []u8) -> IoError!void {
+        var code: u16 = 0;
+        unsafe {
+            // SAFETY: both are read during the call only.
+            let fs = mem.null(u8) as *u8;
+            code = a0rt_write_file(fs: fs, path: mem.str_data(path), path_len: path.len() as u64, data: mem.slice_data(u8, data) as *u8, len: data.len() as u64);
+        }
+        if code != 0 {
+            return io_error(code);
+        }
+    }
+
+    pub fn write_file(self: &Fs, path: str, data: str) -> IoError!void {
+        var code: u16 = 0;
+        unsafe {
+            // SAFETY: both texts are read during the call only.
+            let fs = mem.null(u8) as *u8;
+            code = a0rt_write_file(fs: fs, path: mem.str_data(path), path_len: path.len() as u64, data: mem.str_data(data), len: data.len() as u64);
+        }
+        if code != 0 {
+            return io_error(code);
+        }
+    }
+
+    /// The directory that relative paths start from.
+    pub fn current_dir(self: &Fs, a: alloc.Allocator) -> FsError!alloc.String {
+        var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        let n = win.current_directory(buf[0..PATH_UNITS]);
+        if n == 0 or n >= PATH_UNITS {
+            return FsError.IoFailed;
+        }
+        var s = alloc.String.init(a);
+        win.push_utf8(&mut s, buf[0..n]);
+        return s;
+    }
+
+    /// A directory for files that need not outlive the program: the one
+    /// the system keeps for them (TEMP), without a separator at its end.
+    pub fn temp_dir(self: &Fs, env: &Env, a: alloc.Allocator) -> FsError!alloc.String {
+        var dir = env.get("TEMP", a) orelse (env.get("TMP", a) orelse alloc.String.init(a));
+        if dir.len() == 0 {
+            return FsError.NotFound;
+        }
+        var s = alloc.String.init(a);
+        let b = dir.view().bytes();
+        var n = b.len();
+        while n > 0 and (b[n - 1] == '\\' or b[n - 1] == '/') : (n -= 1) {
+        }
+        unsafe {
+            // SAFETY: the separators at the end are ASCII, so what is left
+            // is still UTF-8.
+            s.push_str(mem.str_from(b[0..n]));
+        }
+        return s;
+    }
+
+    /// Whether something is at path.
+    pub fn exists(self: &Fs, path: str) -> bool {
+        var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if not win.wide(path, buf[0..PATH_UNITS]) {
+            return false;
+        }
+        return win.file_attributes(buf[0..PATH_UNITS]) != win.INVALID_FILE_ATTRIBUTES;
+    }
+
+    pub fn make_dir(self: &Fs, path: str) -> FsError!void {
+        var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if not win.wide(path, buf[0..PATH_UNITS]) {
+            return FsError.NotFound;
+        }
+        if not win.make_directory(buf[0..PATH_UNITS]) {
+            return last_fs_error();
+        }
+    }
+
+    /// Removes a file, or an empty directory.
+    pub fn remove(self: &Fs, path: str) -> FsError!void {
+        var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if not win.wide(path, buf[0..PATH_UNITS]) {
+            return FsError.NotFound;
+        }
+        let attributes = win.file_attributes(buf[0..PATH_UNITS]);
+        if attributes == win.INVALID_FILE_ATTRIBUTES {
+            return last_fs_error();
+        }
+        // Windows removes a directory with a call of its own, and refuses
+        // to delete one as a file.
+        if (attributes & win.FILE_ATTRIBUTE_DIRECTORY) != 0 {
+            if not win.remove_directory(buf[0..PATH_UNITS]) {
+                return last_fs_error();
+            }
+            return;
+        }
+        if not win.delete_file(buf[0..PATH_UNITS]) {
+            return last_fs_error();
+        }
+    }
+
+    pub fn rename(self: &Fs, from: str, to: str) -> FsError!void {
+        var a: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        var b: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if not win.wide(from, a[0..PATH_UNITS]) or not win.wide(to, b[0..PATH_UNITS]) {
+            return FsError.NotFound;
+        }
+        if not win.move_file(from: a[0..PATH_UNITS], to: b[0..PATH_UNITS]) {
+            return last_fs_error();
+        }
+    }
+
+    /// The names in a directory, without . and .., sorted by byte order so
+    /// the result is the same on every run (docs/plan.md, determinism).
+    pub fn list(self: &Fs, path: str, a: alloc.Allocator) -> FsError!alloc.List(alloc.String) {
+        // Win32 walks what matches a pattern, so every name under path.
+        var pattern = alloc.String.init(a);
+        pattern.push_str(path);
+        if path.len() > 0 {
+            let last = path.bytes()[path.len() - 1];
+            if last != '/' and last != '\\' {
+                pattern.push_str("/");
+            }
+        }
+        pattern.push_str("*");
+        var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if not win.wide(pattern.view(), buf[0..PATH_UNITS]) {
+            return FsError.NotFound;
+        }
+        var data: [win.FIND_DATA_SIZE]u8 = [0; win.FIND_DATA_SIZE];
+        let search = win.find_first(buf[0..PATH_UNITS], data[0..win.FIND_DATA_SIZE]);
+        if search == win.INVALID_HANDLE {
+            if win.last_error() == win.ERROR_NO_MORE_FILES {
+                return alloc.List(alloc.String).init(a);
+            }
+            return last_fs_error();
+        }
+        var names = alloc.List(alloc.String).init(a);
+        var more = true;
+        while more {
+            // WIN32_FIND_DATAW keeps the name as UTF-16 at its own offset.
+            var units: [260]u16 = [0; 260];
+            var i: usize = 0;
+            while i < 260 : (i += 1) {
+                let at = win.FIND_DATA_NAME + i * 2;
+                units[i] = (data[at] as u16) | ((data[at + 1] as u16) << 8);
+            }
+            let n = win.wide_len(units[0..260], 260);
+            var name = alloc.String.init(a);
+            win.push_utf8(&mut name, units[0..n]);
+            let text = name.view();
+            let dot = text.eq(".");
+            let dotdot = text.eq("..");
+            if not dot and not dotdot {
+                names.push(name);
+            }
+            more = win.find_next(search, data[0..win.FIND_DATA_SIZE]);
+        }
+        win.find_close(search);
+        sort_names(&mut names);
+        return names;
+    }
+}
+
+fn bytes_less(a: []u8, than: []u8) -> bool {
+    var i: usize = 0;
+    while i < a.len() and i < than.len() : (i += 1) {
+        if a[i] != than[i] {
+            return a[i] < than[i];
+        }
+    }
+    return a.len() < than.len();
+}
+
+/// Insertion sort by byte order: directories are small.
+fn sort_names(names: &mut alloc.List(alloc.String)) {
+    let items = names.items_mut();
+    var i: usize = 1;
+    while i < items.len() : (i += 1) {
+        var j = i;
+        while j > 0 and bytes_less(a: items[j].view().bytes(), than: items[j - 1].view().bytes()) : (j -= 1) {
+            unsafe {
+                // SAFETY: j and j - 1 are inside items; the two values
+                // trade places, so each is still owned once.
+                let base = mem.slice_data(alloc.String, items) as *mut alloc.String;
+                let t = base.add(j).*;
+                base.add(j).* = base.add(j - 1).*;
+                base.add(j - 1).* = t;
+            }
+        }
+    }
+}
+
+// ---- Clock ------------------------------------------------------------------------
+
+/// Time: a clock that only goes forward, the wall clock, and sleeping.
+pub type Clock = struct {
+    unique: core.Unique,
+
+    /// Nanoseconds since the system started; never goes back.
+    pub fn monotonic_ns(self: &Clock) -> u64 {
+        let ticks = win.performance_counter();
+        let hz = win.performance_frequency();
+        // Ticks times a billion would overflow after half an hour, so the
+        // seconds and what is left of them are counted apart.
+        return (ticks / hz) * 1000000000 + ((ticks % hz) * 1000000000) / hz;
+    }
+
+    /// Nanoseconds since 1970-01-01 00:00 UTC.
+    pub fn unix_ns(self: &Clock) -> u64 {
+        // Windows counts hundreds of nanoseconds since 1601-01-01.
+        let ticks = win.file_time();
+        let epoch: u64 = 116444736000000000;
+        if ticks < epoch {
+            return 0;
+        }
+        return (ticks - epoch) * 100;
+    }
+
+    pub fn sleep_ns(self: &Clock, ns: u64) {
+        // Windows waits in whole milliseconds, and never less than asked.
+        let ms = (ns + 999999) / 1000000;
+        win.sleep_ms(if ms > 0xFFFFFFFE { 0xFFFFFFFE } else { ms as u32 });
+    }
+}
+
+// ---- Env --------------------------------------------------------------------------
+
+/// The environment variables the program started with. Windows keeps them
+/// in the system, not in an array of the program's, so vars stays 0 and
+/// every name is asked for when it is wanted.
+pub type Env = struct {
+    vars: **u8,
+    unique: core.Unique,
+
+    /// The value of the variable name, copied.
+    pub fn get(self: &Env, name: str, a: alloc.Allocator) -> ?alloc.String {
+        var wname: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if not win.wide(name, wname[0..PATH_UNITS]) {
+            return none;
+        }
+        var value: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        let n = win.environment_variable(wname[0..PATH_UNITS], value[0..PATH_UNITS]);
+        if n == 0 {
+            // A variable that is not there, or one whose value is empty.
+            if win.last_error() == win.ERROR_ENVVAR_NOT_FOUND {
+                return none;
+            }
+            return alloc.String.init(a);
+        }
+        var s = alloc.String.init(a);
+        if n >= PATH_UNITS {
+            // Too long for this room, and n says how much it needs, a PATH
+            // can be. The value may have changed by the second call only if
+            // something else in this process changed it, and nothing does.
+            var room = alloc.List(u16).init(a);
+            var i: usize = 0;
+            while i < n : (i += 1) {
+                room.push(0);
+            }
+            let m = win.environment_variable(wname[0..PATH_UNITS], room.items_mut());
+            if m == 0 or m >= n {
+                return none;
+            }
+            win.push_utf8(&mut s, room.items()[0..m]);
+            return s;
+        }
+        win.push_utf8(&mut s, value[0..n]);
+        return s;
+    }
+}
+
+// ---- Proc -------------------------------------------------------------------------
+
+pub type ProcError = error { NotFound, AccessDenied, Killed, ProcFailed }
+
+/// Adds an argument to a command line the way every program on Windows
+/// reads it back (the runtime's own split_command): quotes around a part
+/// that holds a space, and a backslash before a quote.
+fn push_arg(line: &mut alloc.String, text: str) {
+    if line.len() > 0 {
+        line.push_str(" ");
+    }
+    let b = text.bytes();
+    var plain = b.len() > 0;
+    for c in b {
+        if c.* == ' ' or c.* == '\t' or c.* == '"' {
+            plain = false;
+        }
+    }
+    if plain {
+        line.push_str(text);
+        return;
+    }
+    line.push_str("\"");
+    var i: usize = 0;
+    while i < b.len() {
+        var slashes: usize = 0;
+        while i < b.len() and b[i] == '\\' : (i += 1) {
+            slashes += 1;
+        }
+        // Backslashes count double before a quote, the one that ends the
+        // part included, and only there.
+        var written = slashes;
+        if i == b.len() or b[i] == '"' {
+            written = slashes * 2;
+        }
+        var k: usize = 0;
+        while k < written : (k += 1) {
+            line.push_str("\\");
+        }
+        if i < b.len() and b[i] == '"' {
+            line.push_str("\\\"");
+            i += 1;
+        }
+        // What is left up to the next of those two, whole characters.
+        let start = i;
+        while i < b.len() and b[i] != '\\' and b[i] != '"' : (i += 1) {
+        }
+        line.push_str(text[start..i]);
+    }
+    line.push_str("\"");
+}
+
+/// Room for a command line as UTF-16, which takes at most a unit for each
+/// of its bytes. A path has PATH_UNITS; Windows takes up to 32767 units
+/// here, and a link with an object for each module needs them.
+fn command_room(line: str, a: alloc.Allocator) -> alloc.List(u16) {
+    var room = alloc.List(u16).init(a);
+    var i: usize = 0;
+    while i <= line.len() : (i += 1) {
+        room.push(0);
+    }
+    return room;
+}
+
+/// The file a child reads as its standard input when it is given none.
+const NULL_DEVICE: str = "NUL";
+
+/// This process, and the ones it starts.
+pub type Proc = struct {
+    unique: core.Unique,
+
+    pub fn pid(self: &Proc) -> u32 {
+        return win.process_id();
+    }
+
+    /// Ends the program with this status, after writing out stdout and
+    /// stderr.
+    pub fn exit(self: &Proc, status: u8) -> noreturn {
+        unsafe {
+            // SAFETY: the runtime flushes and exits.
+            a0rt_exit(status);
+        }
+    }
+
+    /// Runs argv[0], a path, with argv and this environment, and waits for
+    /// it: its exit status.
+    pub fn run(self: &Proc, argv: &alloc.List(alloc.String), env: &Env, a: alloc.Allocator) -> ProcError!u8 {
+        if argv.len() == 0 {
+            return ProcError.NotFound;
+        }
+        var program: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if not win.wide(argv.items()[0].view(), program[0..PATH_UNITS]) {
+            return ProcError.NotFound;
+        }
+        var line = alloc.String.init(a);
+        for s in argv.items() {
+            push_arg(&mut line, s.view());
+        }
+        var command = command_room(line.view(), a);
+        if not win.wide(line.view(), command.items_mut()) {
+            return ProcError.ProcFailed;
+        }
+        var startup = win.new_startup();
+        startup.flags = 0; // the child shares this program's own handles
+        var made = win.new_made();
+        var empty: [1]u16 = [0; 1];
+        unsafe {
+            // SAFETY: what is buffered is written before the child, which
+            // shares this program's output, writes anything of its own.
+            a0rt_flush_all();
+        }
+        if not win.create_process(program: program[0..PATH_UNITS], command: command.items_mut(), flags: 0,
+            directory: empty[0..1], startup: &startup, made: &mut made) {
+            let e = win.last_error();
+            if e == win.ERROR_FILE_NOT_FOUND or e == win.ERROR_PATH_NOT_FOUND or e == win.ERROR_INVALID_NAME {
+                return ProcError.NotFound;
+            }
+            if e == win.ERROR_ACCESS_DENIED {
+                return ProcError.AccessDenied;
+            }
+            return ProcError.ProcFailed;
+        }
+        _ = win.wait_for(it: made.process, milliseconds: win.INFINITE);
+        let status = win.exit_status(made.process);
+        win.close(made.thread);
+        win.close(made.process);
+        // Windows has no signals: a program that was ended still has a
+        // status, which is the one that ended it.
+        return (status & 0xFF) as u8;
+    }
+
+    /// Starts cmd with no input of its own, in a job of its own, and waits
+    /// for it, or until its time is up; then the whole job is ended, so
+    /// nothing it started outlives it. A program without a separator in
+    /// its name is looked for in PATH, as Windows looks for it.
+    pub fn spawn(self: &Proc, cmd: &Command, env: &Env, clock: &Clock, a: alloc.Allocator) -> ProcError!Ending {
+        if cmd.argv.len() == 0 {
+            return ProcError.NotFound;
+        }
+        let name = cmd.argv[0].view();
+        var has_separator = false;
+        for c in name.bytes() {
+            if c.* == '/' or c.* == '\\' {
+                has_separator = true;
+            }
+        }
+        var program: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if has_separator {
+            if not win.wide(name, program[0..PATH_UNITS]) {
+                return ProcError.NotFound;
+            }
+        }
+        var line = alloc.String.init(a);
+        for s in cmd.argv.items() {
+            push_arg(&mut line, s.view());
+        }
+        var command = command_room(line.view(), a);
+        if not win.wide(line.view(), command.items_mut()) {
+            return ProcError.ProcFailed;
+        }
+        var directory: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if cmd.dir.len() > 0 {
+            if not win.wide(cmd.dir.view(), directory[0..PATH_UNITS]) {
+                return ProcError.NotFound;
+            }
+        }
+
+        // The handles the child is to have: a file for each of its outputs,
+        // and nothing to read. They are the child's to inherit.
+        var startup = win.new_startup();
+        var null_path: [8]u16 = [0; 8];
+        _ = win.wide(NULL_DEVICE, null_path[0..8]);
+        startup.std_input = win.open_file(path: null_path[0..8], access: win.GENERIC_READ, share: win.FILE_SHARE_ALL,
+            disposition: win.OPEN_EXISTING, inherit: true);
+        startup.std_output = out_handle(cmd.stdout_path.view(), win.STD_OUTPUT);
+        // A path for both outputs puts them in one file; an empty one
+        // leaves that output as this program's own.
+        if cmd.stderr_path.len() > 0 and cmd.stderr_path.view().eq(cmd.stdout_path.view()) {
+            startup.std_error = startup.std_output;
+        } else {
+            startup.std_error = out_handle(cmd.stderr_path.view(), win.STD_ERROR);
+        }
+        if startup.std_output == win.INVALID_HANDLE or startup.std_error == win.INVALID_HANDLE {
+            close_child_handles(&startup);
+            return ProcError.ProcFailed;
+        }
+
+        unsafe {
+            // SAFETY: a child that shares this program's output must not
+            // write before what is buffered here does.
+            a0rt_flush_all();
+        }
+        // A job holds the child and everything it starts, so that one call
+        // ends the whole tree when its time is up.
+        let job = win.create_job();
+        var made = win.new_made();
+        // A name left empty means Windows looks for the program itself,
+        // and so does a directory: both buffers are still all zero then.
+        let started = win.create_process(program: program[0..PATH_UNITS], command: command.items_mut(),
+            flags: win.CREATE_SUSPENDED, directory: directory[0..PATH_UNITS],
+            startup: &startup, made: &mut made);
+        close_child_handles(&startup);
+        if not started {
+            if job != win.INVALID_HANDLE and job != 0 {
+                win.close(job);
+            }
+            let e = win.last_error();
+            if e == win.ERROR_FILE_NOT_FOUND or e == win.ERROR_PATH_NOT_FOUND or e == win.ERROR_INVALID_NAME {
+                return ProcError.NotFound;
+            }
+            if e == win.ERROR_ACCESS_DENIED {
+                return ProcError.AccessDenied;
+            }
+            return ProcError.ProcFailed;
+        }
+        if job != win.INVALID_HANDLE and job != 0 {
+            _ = win.assign_job(job: job, process: made.process);
+        }
+        win.resume_thread(made.thread);
+        var ms = win.INFINITE;
+        if cmd.timeout_ms > 0 {
+            let most: u64 = 0xFFFFFFFE;
+            ms = if cmd.timeout_ms > most { most as u32 } else { cmd.timeout_ms as u32 };
+        }
+        let waited = win.wait_for(it: made.process, milliseconds: ms);
+        var ending = Ending.TimedOut;
+        if waited == win.WAIT_OBJECT {
+            ending = Ending.Exited { status: (win.exit_status(made.process) & 0xFF) as u8 };
+        }
+        if job != win.INVALID_HANDLE and job != 0 {
+            win.terminate_job(job: job, status: 1);
+            win.close(job);
+        } else {
+            win.terminate(process: made.process, status: 1);
+        }
+        win.close(made.thread);
+        win.close(made.process);
+        return ending;
+    }
+}
+
+/// A file for one of a child's outputs, made or emptied; this program's
+/// own handle, the one named here, when the path is empty.
+fn out_handle(path: str, own: u32) -> i64 {
+    if path.len() == 0 {
+        return win.std_handle(own);
+    }
+    var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
+    if not win.wide(path, buf[0..PATH_UNITS]) {
+        return win.INVALID_HANDLE;
+    }
+    return win.open_file(path: buf[0..PATH_UNITS], access: win.GENERIC_WRITE, share: win.FILE_SHARE_ALL,
+        disposition: win.CREATE_ALWAYS, inherit: true);
+}
+
+/// Gives up the files a child inherited: it has handles of its own now.
+/// This program's own handles are not among them.
+fn close_child_handles(startup: &win.Startup) {
+    if startup.std_input != win.INVALID_HANDLE {
+        win.close(startup.std_input);
+    }
+    if is_file_of_the_child(startup.std_output) {
+        win.close(startup.std_output);
+    }
+    if is_file_of_the_child(startup.std_error) and startup.std_error != startup.std_output {
+        win.close(startup.std_error);
+    }
+}
+
+fn is_file_of_the_child(handle: i64) -> bool {
+    return handle != win.INVALID_HANDLE and handle != win.std_handle(win.STD_OUTPUT) and
+        handle != win.std_handle(win.STD_ERROR);
+}
+
+/// A program to start: its arguments, the directory it runs in, and where
+/// its output goes (Proc.spawn).
+pub type Command = struct {
+    pub argv: alloc.List(alloc.String),
+    /// The directory to run in; empty for this program's.
+    pub dir: alloc.String,
+    /// Files for its stdout and stderr, made or emptied; empty to share
+    /// this program's. The same path for both puts them in one file.
+    pub stdout_path: alloc.String,
+    pub stderr_path: alloc.String,
+    /// How long it may run, in milliseconds; 0 for as long as it takes.
+    pub timeout_ms: u64,
+
+    pub fn init(a: alloc.Allocator) -> Command {
+        return Command {
+            argv: alloc.List(alloc.String).init(a),
+            dir: alloc.String.init(a),
+            stdout_path: alloc.String.init(a),
+            stderr_path: alloc.String.init(a),
+            timeout_ms: 0,
+        };
+    }
+
+    /// Adds an argument; the first is the program.
+    pub fn arg(self: &mut Command, text: str, a: alloc.Allocator) {
+        var s = alloc.String.init(a);
+        s.push_str(text);
+        self.argv.push(s);
+    }
+}
+
+/// How a started program ended. Windows has no signals, so Signaled is
+/// never the answer here.
+pub type Ending = enum {
+    Exited { status: u8 },
+    Signaled { signal: u8 },
+    TimedOut,
+}
+
+// ---- Rand -------------------------------------------------------------------------
+
+/// Randomness from the system. For repeatable randomness, use a seeded
+/// generator: core.rand.
+pub type Rand = struct {
+    unique: core.Unique,
+
+    pub fn fill(self: &mut Rand, into: []mut u8) {
+        if not win.random(into) {
+            panic("the system gave no randomness");
+        }
+    }
+
+    pub fn next_u64(self: &mut Rand) -> u64 {
+        var b: [8]u8 = [0; 8];
+        self.fill(b[0..8]);
+        var v: u64 = 0;
+        var i: usize = 0;
+        while i < 8 : (i += 1) {
+            v = (v << 8) | b[i] as u64;
+        }
+        return v;
+    }
+}
+
+// ---- Net --------------------------------------------------------------------------
+
+pub type NetError = error { Refused, AddressInUse, NetFailed }
+
+/// An IPv4 address and port.
+pub type Address = struct {
+    pub ip: [4]u8,
+    pub port: u16,
+}
+
+/// struct sockaddr_in: the port in network byte order.
+type SockAddr = extern struct {
+    family: u16,
+    port: u16,
+    ip: [4]u8,
+    zero: u64,
+}
+
+fn sock_addr(at: Address) -> SockAddr {
+    return SockAddr { family: 2, port: (at.port >> 8) | (at.port << 8), ip: at.ip, zero: 0 };
+}
+
+fn net_error(e: i32) -> NetError {
+    if e == win.WSAECONNREFUSED { return NetError.Refused; }
+    if e == win.WSAEADDRINUSE { return NetError.AddressInUse; }
+    return NetError.NetFailed;
+}
+
+/// The bytes of a sockaddr_in, which is what the sockets take.
+fn addr_bytes(sa: &SockAddr) -> []u8 {
+    return mem.bytes_of(SockAddr, sa);
+}
+
+/// poll(2)'s events, which the runtime translates for the sockets here:
+/// the socket can be read, or written.
+const POLLIN: u32 = 1;
+const POLLOUT: u32 = 4;
+
+/// AF_INET, SOCK_STREAM.
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+
+/// Waits until the socket is ready; other tasks run meanwhile (rt.c).
+fn io_wait(s: i64, events: u32) {
+    unsafe {
+        // SAFETY: the runtime only polls the socket.
+        a0rt_io_wait(s, events);
+    }
+}
+
+/// What the program is given to read: its standard input. Unlike on Linux,
+/// a read here waits for the whole program, since Windows polls sockets
+/// alone (docs/sprints.md S19).
+pub type Input = struct {
+    unique: core.Unique,
+
+    /// Up to into.len() bytes; 0 at the end of the input.
+    pub fn read(self: &mut Input, into: []mut u8) -> IoError!usize {
+        let r = win.read(file: win.std_handle(win.STD_INPUT), into: into);
+        if r < 0 {
+            return IoError.IoFailed;
+        }
+        return r as usize;
+    }
+
+    /// Whether a read would not wait, after waiting at most this long for
+    /// it to be so. The end of the input counts: the read gives 0.
+    pub fn ready(self: &Input, timeout_ms: u32) -> bool {
+        let h = win.std_handle(win.STD_INPUT);
+        // A pipe or a file says how much is waiting; a console is waited
+        // for, and says it is ready when anything happens at the keyboard.
+        var left = timeout_ms;
+        while true {
+            let waiting = win.pipe_waiting(h);
+            if waiting > 0 {
+                return true;
+            }
+            if waiting == 0 {
+                // Nothing waiting, or a pipe that has ended; an ended one
+                // gives a read of 0 at once, which counts as ready.
+                if win.last_error() == win.ERROR_BROKEN_PIPE {
+                    return true;
+                }
+            }
+            if waiting < 0 {
+                // Not a pipe: a console is waited for, and a file or the
+                // empty device is ready from the start.
+                if win.is_console(h) {
+                    return win.wait_for(it: h, milliseconds: timeout_ms) == win.WAIT_OBJECT;
+                }
+                return true;
+            }
+            if left == 0 {
+                return false;
+            }
+            let step: u32 = if left > 5 { 5 } else { left };
+            win.sleep_ms(step);
+            left -= step;
+        }
+        return false;
+    }
+}
+
+/// TCP over IPv4. Sockets do not block the program: a task that waits for
+/// one lets the others run.
+pub type Net = struct {
+    unique: core.Unique,
+
+    pub fn connect(self: &Net, to: Address) -> NetError!Socket {
+        let sa = sock_addr(to);
+        let s = win.new_socket(family: AF_INET, kind: SOCK_STREAM, protocol: 0);
+        if s == win.INVALID_SOCKET {
+            return net_error(win.socket_error());
+        }
+        if not win.no_block(s) {
+            win.close_socket(s);
+            return NetError.NetFailed;
+        }
+        if win.socket_connect(s: s, address: addr_bytes(&sa)) != 0 {
+            let e = win.socket_error();
+            if e != win.WSAEWOULDBLOCK and e != win.WSAEINPROGRESS {
+                win.close_socket(s);
+                return net_error(e);
+            }
+            // It is being made: the socket is ready to write when it is.
+            io_wait(s, events: POLLOUT);
+            let kept = win.pending_error(s);
+            if kept != 0 {
+                win.close_socket(s);
+                return net_error(kept);
+            }
+        }
+        return Socket { fd: s, unique: core.Unique { } };
+    }
+
+    /// Listens at the address; port 0 lets the system choose one, which
+    /// Listener.port says.
+    pub fn listen(self: &Net, at: Address) -> NetError!Listener {
+        let sa = sock_addr(at);
+        let s = win.new_socket(family: AF_INET, kind: SOCK_STREAM, protocol: 0);
+        if s == win.INVALID_SOCKET {
+            return net_error(win.socket_error());
+        }
+        if not win.no_block(s) {
+            win.close_socket(s);
+            return NetError.NetFailed;
+        }
+        if win.socket_bind(s: s, address: addr_bytes(&sa)) != 0 or win.socket_listen(s: s, backlog: 128) != 0 {
+            let e = win.socket_error();
+            win.close_socket(s);
+            return net_error(e);
+        }
+        return Listener { fd: s, unique: core.Unique { } };
+    }
+}
+
+pub type Listener = struct {
+    fd: i64,
+    unique: core.Unique,
+
+    pub fn port(self: &Listener) -> u16 {
+        // sockaddr_in keeps the port in network byte order, after the
+        // family: the two bytes at offset 2.
+        var bytes: [16]u8 = [0; 16];
+        if not win.socket_name(s: self.fd, address: bytes[0..16]) {
+            return 0;
+        }
+        return (bytes[2] as u16) << 8 | (bytes[3] as u16);
+    }
+
+    pub fn accept(self: &Listener) -> NetError!Socket {
+        while true {
+            let s = win.socket_accept(self.fd);
+            if s != win.INVALID_SOCKET {
+                if not win.no_block(s) {
+                    win.close_socket(s);
+                    return NetError.NetFailed;
+                }
+                return Socket { fd: s, unique: core.Unique { } };
+            }
+            let e = win.socket_error();
+            if e != win.WSAEWOULDBLOCK {
+                return net_error(e);
+            }
+            io_wait(self.fd, events: POLLIN);
+        }
+        return NetError.NetFailed;
+    }
+
+    pub fn close(self: &mut Listener) {
+        win.close_socket(self.fd);
+        self.fd = -1;
+    }
+}
+
+/// A TCP connection.
+pub type Socket = struct {
+    fd: i64,
+    unique: core.Unique,
+
+    /// Up to into.len() bytes; 0 when the peer has closed.
+    pub fn read(self: &mut Socket, into: []mut u8) -> NetError!usize {
+        while true {
+            let r = win.socket_read(s: self.fd, into: into);
+            if r >= 0 {
+                return r as usize;
+            }
+            let e = win.socket_error();
+            if e != win.WSAEWOULDBLOCK {
+                return net_error(e);
+            }
+            io_wait(self.fd, events: POLLIN);
+        }
+        return 0;
+    }
+
+    /// All of data.
+    pub fn write(self: &mut Socket, data: []u8) -> NetError!void {
+        var done: usize = 0;
+        while done < data.len() {
+            let r = win.socket_write(s: self.fd, data: data[done..data.len()]);
+            if r >= 0 {
+                done += r as usize;
+                continue;
+            }
+            let e = win.socket_error();
+            if e != win.WSAEWOULDBLOCK {
+                return net_error(e);
+            }
+            io_wait(self.fd, events: POLLOUT);
+        }
+    }
+
+    pub fn close(self: &mut Socket) {
+        win.close_socket(self.fd);
+        self.fd = -1;
+    }
+}

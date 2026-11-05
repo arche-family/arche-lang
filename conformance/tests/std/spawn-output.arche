@@ -1,0 +1,50 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: exited 0
+// stdout: file: child out
+// stderr: child err
+import std;
+import alloc;
+import core.fmt;
+
+// Proc.spawn writes an output to a file when Command names one, and leaves
+// it as this program's when it does not: here the child's stdout goes to a
+// file and its stderr comes out with the test's own. The child is this
+// program again, as in proc.arche.
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() > 1 and sys.args.get(1).eq("child") {
+        sys.stdout.write("child out\n");
+        sys.stderr.write("child err\n");
+        return;
+    }
+    var cmd = std.Command.init(sys.alloc);
+    cmd.arg(sys.args.get(0), sys.alloc);
+    cmd.arg("child", sys.alloc);
+    var out = try sys.fs.temp_dir(env: &sys.env, sys.alloc);
+    out.push_str("/arche-spawn-");
+    var digits: [20]u8 = [0; 20];
+    let n = fmt.decimal(sys.proc.pid() as u64, digits[0..20]);
+    for d in digits[0..n] {
+        out.push_ascii(d.*);
+    }
+    out.push_str(".txt");
+    cmd.stdout_path.push_str(out.view());
+    match try sys.proc.spawn(&cmd, env: &sys.env, clock: &sys.clock, sys.alloc) {
+        .Exited { status } => {
+            sys.stdout.write("exited ");
+            sys.stdout.write_u64(status as u64);
+            sys.stdout.write("\n");
+        }
+        .Signaled { signal } => {
+            sys.stdout.write("signaled ");
+            sys.stdout.write_u64(signal as u64);
+            sys.stdout.write("\n");
+        }
+        .TimedOut => { sys.stdout.write("timed out\n"); }
+    }
+    let text = try sys.fs.read_file(out.view(), sys.alloc);
+    sys.stdout.write("file: ");
+    sys.stdout.write(text.view());
+    try sys.fs.remove(out.view());
+}

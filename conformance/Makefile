@@ -9,14 +9,20 @@
 BUILD := runner/build
 RUNNER := $(BUILD)/runner
 
+# Windows starts no script of its own: the command is a shell and the
+# script to run in it (docs/sprints.md S19).
+ifeq ($(OS),Windows_NT)
+COMPILER ?= sh ../stage0/arche0-build
+else
 COMPILER ?= ../stage0/arche0-build
+endif
 RUNNER_FLAGS ?= --stage0
 
 all: $(RUNNER)
 
 LIB := $(wildcard ../lib/*.arche ../lib/*/*.arche ../lib/*/*/*.arche)
 
-$(RUNNER): runner/runner.arche $(LIB) ../compiler/runtime/rt.c ../compiler/runtime/math.inc | $(BUILD)
+$(RUNNER): runner/runner.arche $(LIB) ../compiler/runtime/rt.c $(wildcard ../compiler/runtime/*.inc) | $(BUILD)
 	$(MAKE) -C ../compiler
 	../compiler/arche-build runner/runner.arche $@
 
@@ -29,7 +35,7 @@ selftest: $(RUNNER)
 check: $(RUNNER)
 	$(MAKE) -C ../stage0
 	@if [ -d tests ]; then \
-		CC="$(CC)" $(RUNNER) $(RUNNER_FLAGS) --compiler $(COMPILER) tests; \
+		CC="$(CC)" $(RUNNER) $(RUNNER_FLAGS) --compiler "$(COMPILER)" tests; \
 	else \
 		echo "no tests yet"; \
 	fi

@@ -4,6 +4,11 @@
 /// usage: runner --compiler <command> [--stage0] [--codes <prefixes>]
 ///               [--timeout <seconds>] [--filter <text>] <path>...
 ///
+/// The command is a program's path, which may hold spaces, or, when no such
+/// file is there, a program with arguments of its own, so that a system
+/// which starts no script gets a shell and the script to run in it
+/// ("sh ./arche-build", docs/sprints.md S19).
+///
 /// In Arche since S23 (docs/sprints.md), built by the Arche compiler; the
 /// C11 runner it replaces was there for before Arche could be.
 import alloc;
@@ -78,9 +83,11 @@ fn text_of(b: []u8, a: alloc.Allocator) -> alloc.String {
 type Kind = enum { Run, CompileError }
 
 type Test = struct {
-    seen: [9]bool,
+    seen: [KEYS]bool,
     kind: Kind,
     stage0_skip: bool,
+    /// The system the test is only for, empty when it is for every one.
+    system: alloc.String,
     exit_code: u8,
     stdout_text: alloc.List(u8),
     stderr_parts: alloc.List(alloc.String),
@@ -98,6 +105,9 @@ const K_STDERR: usize = 5;
 const K_ARGS: usize = 6;
 const K_LINE: usize = 7;
 const K_CODE: usize = 8;
+const K_SYSTEM: usize = 9;
+/// How many keys a header may hold.
+const KEYS: usize = 10;
 
 fn key_name(k: usize) -> str {
     if k == K_TEST { return "test"; }
@@ -108,6 +118,7 @@ fn key_name(k: usize) -> str {
     if k == K_STDERR { return "stderr"; }
     if k == K_ARGS { return "args"; }
     if k == K_LINE { return "line"; }
+    if k == K_SYSTEM { return "system"; }
     return "code";
 }
 
@@ -173,6 +184,15 @@ fn apply_key(t: &mut Test, key: usize, v: []u8, a: alloc.Allocator) -> bool {
         }
         return t.args.len() > before;
     }
+    if key == K_SYSTEM {
+        // The system std is built for (std.SYSTEM): a test that asks for
+        // one is skipped on the others (conformance/README.md).
+        if not mem_eq(a: v, b: "linux".bytes()) and not mem_eq(a: v, b: "windows".bytes()) {
+            return false;
+        }
+        t.system.push_str(text_of(v, a).view());
+        return true;
+    }
     if key == K_LINE {
         match parse_uint(v, max: 9223372036854775807) {
             some(n) => {
@@ -232,14 +252,14 @@ fn parse_header(src: []u8, t: &mut Test, problem: &mut alloc.String, a: alloc.Al
         if v < n and line[v] == ' ' {
             v += 1;
         }
-        var key: usize = 9;
+        var key = KEYS;
         var i: usize = 0;
-        while i < 9 : (i += 1) {
+        while i < KEYS : (i += 1) {
             if mem_eq(a: key_name(i).bytes(), b: name) {
                 key = i;
             }
         }
-        if key == 9 {
+        if key == KEYS {
             problem.push_str("line ");
             put_number(problem, n: lineno);
             problem.push_str(": unknown key '");
@@ -609,9 +629,10 @@ fn run_test(sys: &mut std.System, path: str, o: &Options, tmp: str, a: alloc.All
     let exe = temp_path(tmp: tmp, name: "prog", a);
     let diag_path = temp_path(tmp: tmp, name: "compile", a);
     var t = Test {
-        seen: [false; 9],
+        seen: [false; KEYS],
         kind: Kind.Run,
         stage0_skip: false,
+        system: alloc.String.init(a),
         exit_code: 0,
         stdout_text: alloc.List(u8).init(a),
         stderr_parts: alloc.List(alloc.String).init(a),
@@ -628,7 +649,8 @@ fn run_test(sys: &mut std.System, path: str, o: &Options, tmp: str, a: alloc.All
                 m.push_str("bad header: ");
                 m.push_str(problem.view());
                 verdict(&mut sys.stdout, word: "FAIL", path: path, detail: m.view());
-            } else if (o.stage0 and t.stage0_skip) or not code_selected(o, t: &t) {
+            } else if (o.stage0 and t.stage0_skip) or not code_selected(o, t: &t) or
+                (t.system.len() > 0 and not t.system.view().eq(std.SYSTEM)) {
                 verdict(&mut sys.stdout, word: "SKIP", path: path, detail: "");
                 result = Result.Skip;
             } else {
@@ -643,9 +665,30 @@ fn run_test(sys: &mut std.System, path: str, o: &Options, tmp: str, a: alloc.All
     return result;
 }
 
+/// Adds the compiler command: a file by that name is the program, spaces
+/// and all; otherwise it is a program with arguments of its own, for a
+/// system where a script is started through a shell ("sh ./arche-build",
+/// docs/sprints.md S19).
+fn add_command(cmd: &mut std.Command, fs: &std.Fs, text: str, a: alloc.Allocator) {
+    if fs.exists(text) {
+        cmd.arg(text, a);
+        return;
+    }
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= text.len() : (i += 1) {
+        if i == text.len() or text[i] == ' ' {
+            if i > start {
+                cmd.arg(text[start..i], a);
+            }
+            start = i + 1;
+        }
+    }
+}
+
 fn compile_and_check(sys: &mut std.System, path: str, t: &Test, o: &Options, tmp: str, exe: str, diag_path: str, a: alloc.Allocator) -> Result {
     var cmd = std.Command.init(a);
-    cmd.arg(o.compiler.view(), a);
+    add_command(&mut cmd, &sys.fs, text: o.compiler.view(), a);
     cmd.arg(path, a);
     cmd.arg(exe, a);
     cmd.stdout_path.push_str(diag_path);
@@ -838,16 +881,9 @@ fn main(sys: &mut std.System) -> !void {
         }
     }
     // A directory of its own for the files each test makes.
-    var tmp = alloc.String.init(a);
-    match sys.env.get("TMPDIR", a) {
-        some(t) => {
-            if t.len() > 0 {
-                tmp.push_str(t.view());
-            } else {
-                tmp.push_str("/tmp");
-            }
-        }
-        none => { tmp.push_str("/tmp"); }
+    var tmp = sys.fs.temp_dir(env: &sys.env, a) catch alloc.String.init(a);
+    if tmp.len() == 0 {
+        die(&mut sys.stderr, proc: &sys.proc, message: "cannot find a directory for temporary files", what: "");
     }
     tmp.push_str("/arche-runner-");
     put_number(&mut tmp, n: sys.proc.pid() as u64);

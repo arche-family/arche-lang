@@ -13,12 +13,18 @@
 # The TLS certificate is made by openssl and thrown away.
 # Usage: pkg-check.sh <arche-driver> <arche-registry>
 set -eu
+# A shell of MSYS on Windows reads an argument that begins with a
+# separator as a path and rewrites it; this leaves the certificate's
+# subject alone, and means nothing on the other systems.
+export MSYS2_ARG_CONV_EXCL='/CN='
 driver=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 registry_server=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 work=$(mktemp -d)
 cleanup() {
     jobs -p | xargs -r kill 2>/dev/null || true
-    rm -rf "$work"
+    # A server that is ending may hold its directory for a moment longer,
+    # and tidying up must not change what the check said.
+    rm -rf "$work" 2>/dev/null || { sleep 1; rm -rf "$work" 2>/dev/null || true; }
 }
 trap cleanup EXIT
 status=0
@@ -27,6 +33,10 @@ fail() {
     status=1
 }
 cd "$work"
+# The registry's path goes into a manifest, which the compiler reads
+# itself: it has to be a path the system understands, and on Windows
+# that is this directory's Windows form (docs/sprints.md S19).
+work=$(pwd -W 2>/dev/null || pwd)
 
 # A registry and its signing key.
 mkdir registry
@@ -61,6 +71,21 @@ pub fn greeting(name: str) -> str {
 EOF
 "$driver" pkg publish "$work/registry" signing.key --dir words > out || fail "publishing words failed: $(cat out)"
 "$driver" pkg publish "$work/registry" signing.key --dir textkit > out || fail "publishing textkit failed: $(cat out)"
+# A file name that means something else on another system is not published;
+# unpacking refuses one too (safe_path's own tests, make check). Windows
+# cannot make such a file, which is the point.
+case $(uname -s) in
+MINGW* | MSYS* | CYGWIN*) ;;
+*)
+    mkdir oddname
+    manifest oddname 1.0.0 "" "" "$work/registry" > oddname/package.arche
+    : > 'oddname/sub\evil.arche'
+    if "$driver" pkg publish "$work/registry" signing.key --dir oddname > out 2>&1; then
+        fail "a file name with a backslash was published"
+    fi
+    grep -q "must mean the same on every system" out || fail "the refusal does not say why: $(cat out)"
+    ;;
+esac
 if "$driver" pkg publish "$work/registry" signing.key --dir words > out 2>&1; then
     fail "a version was published twice"
 fi

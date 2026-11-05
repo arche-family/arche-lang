@@ -3,7 +3,8 @@
 # This is the compiler command the conformance runner calls.
 #
 # Usage: arche0-build <source.arche> <output>
-# CC selects the C compiler (default: cc).
+# CC selects the C compiler (default: cc, and clang on Windows, which has
+# no cc).
 
 set -eu
 
@@ -12,8 +13,15 @@ if [ $# -ne 2 ]; then
     exit 2
 fi
 
+case $(uname -s) in
+MINGW* | MSYS* | CYGWIN*) : "${CC:=clang}" ;;
+*) : "${CC:=cc}" ;;
+esac
+
 here=$(cd "$(dirname "$0")" && pwd)
 c_file="$2.c"
 
 "$here/build/arche0" "$1" -o "$c_file"
-${CC:-cc} -std=c11 ${A0_CFLAGS:--O2} -I"$here/runtime" -o "$2" "$c_file" "$here/runtime/arche0_rt.c"
+# The C library of Windows deprecates fopen and strerror, which C11 keeps;
+# the macro says so, and means nothing to the other systems.
+$CC -std=c11 ${A0_CFLAGS:--O2} -D_CRT_SECURE_NO_WARNINGS -I"$here/runtime" -o "$2" "$c_file" "$here/runtime/arche0_rt.c"

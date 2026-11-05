@@ -60,8 +60,9 @@ fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("       arche manifest <package.arche>  its fields, one a line, for arche-driver\n");
     err_out.write("       arche test <file> <out.ll>     the test blocks of <file>, run by std.testing\n");
     err_out.write("options, before the command: --overlay <file> <text-file>, --package <dir>, --no-main, --release, --lib-alloc, --lib-std,\n");
-    err_out.write("       --target <linux-x86_64 | freestanding-x86_64 |\n");
-    err_out.write("       freestanding-riscv64>, --panic-handler <module.function>\n");
+    err_out.write("       --target <linux-x86_64 | windows-x86_64 |\n");
+    err_out.write("       freestanding-x86_64 | freestanding-riscv64>,\n");
+    err_out.write("       --panic-handler <module.function>\n");
     return Failure.BadUsage;
 }
 
@@ -1002,7 +1003,9 @@ fn find_lib(fs: &std.Fs, argv0: str, a: alloc.Allocator) -> alloc.String {
     var cut: usize = 0;
     var i: usize = 0;
     while i < argv0.len() : (i += 1) {
-        if argv0[i] == '/' {
+        // Windows names the program with backslashes, whatever the
+        // separator the paths of the build use (docs/sprints.md S19).
+        if argv0[i] == '/' or argv0[i] == '\\' {
             cut = i + 1;
         }
     }
@@ -1074,7 +1077,7 @@ fn main(sys: &mut std.System) -> !void {
             match program.target_by_name(sys.args.get(first)) {
                 some(t) => { opts.target = t; }
                 none => {
-                    sys.stderr.write("arche: unknown target; the targets are linux-x86_64, freestanding-x86_64 and freestanding-riscv64\n");
+                    sys.stderr.write("arche: unknown target; the targets are linux-x86_64, windows-x86_64, freestanding-x86_64 and freestanding-riscv64\n");
                     return Failure.BadUsage;
                 }
             }

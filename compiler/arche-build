@@ -2,20 +2,23 @@
 # Builds an Arche program with the Arche compiler: Arche -> LLVM IR -> clang,
 # linked with the runtime and no C library (docs/abi.md). This is the compiler
 # command the conformance runner calls: arche-build <source.arche> <output>.
-# CC selects clang (default: clang); the runtime object is built once.
+# CLANG selects clang (default: clang) and ARCHE_TARGET what to build for
+# (default: this system; target.sh); the runtime object is built once.
 set -eu
 if [ $# -ne 2 ]; then
     echo "usage: arche-build <source.arche> <output>" >&2
     exit 2
 fi
 here=$(cd "$(dirname "$0")" && pwd)
-cc=${CLANG:-clang}
-rt="$here/build/rt.o"
-if [ ! -f "$rt" ] || [ "$here/runtime/rt.c" -nt "$rt" ] || [ "$here/runtime/math.inc" -nt "$rt" ]; then
-    $cc -c -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector -fno-pie -Wall -Wextra -Werror \
+. "$here/target.sh"
+cc=$CLANG
+rt="$here/build/rt-$ARCHE_TARGET.o"
+if [ ! -f "$rt" ] || [ "$here/runtime/rt.c" -nt "$rt" ] || [ "$here/runtime/math.inc" -nt "$rt" ] ||
+    [ "$here/runtime/linux.inc" -nt "$rt" ] || [ "$here/runtime/windows.inc" -nt "$rt" ]; then
+    $cc -c -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector $RT_FLAGS -Wall -Wextra -Werror \
         -o "$rt.tmp.$$" "$here/runtime/rt.c"
     mv "$rt.tmp.$$" "$rt"
 fi
 # ARCHE selects the compiler binary, so later bootstrap stages can be tested.
-"${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} build "$1" "$2.ll"
-$cc -O1 -nostdlib -static -fno-pie -Wno-override-module -o "$2" "$2.ll" "$rt"
+"${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG build "$1" "$2.ll"
+$cc -O1 $LINK_FLAGS -Wno-override-module -o "$2" "$2.ll" "$rt"
