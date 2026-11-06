@@ -909,15 +909,9 @@ pub type Input = struct {
         var left = timeout_ms;
         while true {
             let waiting = win.pipe_waiting(h);
-            if waiting > 0 {
+            // A pipe that has ended gives a read of 0 at once, which counts.
+            if waiting > 0 or waiting == win.PIPE_ENDED {
                 return true;
-            }
-            if waiting == 0 {
-                // Nothing waiting, or a pipe that has ended; an ended one
-                // gives a read of 0 at once, which counts as ready.
-                if win.last_error() == win.ERROR_BROKEN_PIPE {
-                    return true;
-                }
             }
             if waiting < 0 {
                 // Not a pipe: a console is waited for, and a file or the

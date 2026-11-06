@@ -365,6 +365,10 @@ pub fn read(file: i64, into: []mut u8) -> i64 {
 
 /// How many bytes are waiting in a pipe; -1 when it is not a pipe, and 0
 /// with a broken pipe, which has ended.
+pub const PIPE_ENDED: i64 = -2;
+
+/// How many bytes a pipe holds; PIPE_ENDED when its writer is gone and it
+/// holds none, and -1 when it is no pipe.
 pub fn pipe_waiting(pipe: i64) -> i64 {
     var waiting: u32 = 0;
     var worked: i32 = 0;
@@ -375,7 +379,7 @@ pub fn pipe_waiting(pipe: i64) -> i64 {
     }
     if worked == 0 {
         if last_error() == ERROR_BROKEN_PIPE {
-            return 0;
+            return PIPE_ENDED;
         }
         return -1;
     }

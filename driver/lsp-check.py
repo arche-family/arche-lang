@@ -15,15 +15,26 @@ import threading
 import time
 
 
+LOGS = []
+
+
 def fail(what):
     print("lsp-check: FAILED: " + what)
-    sys.exit(1)
+    for log in LOGS:
+        log.flush()
+        log.seek(0)
+        said = log.read().decode(errors="replace")
+        if said:
+            print("the server's log:\n" + said[-4000:])
+    sys.stdout.flush()
+    os._exit(1)
 
 
 class Client:
     def __init__(self, program, env=None):
-        self.p = subprocess.Popen([program], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, env=env)
+        self.log = tempfile.TemporaryFile()
+        LOGS.append(self.log)
+        self.p = subprocess.Popen([program], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, env=env)
         self.buffer = b""
         self.next_id = 0
         self.notes = []

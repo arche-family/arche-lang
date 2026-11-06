@@ -187,17 +187,24 @@ fn run_compiler(sys: &mut std.System, s: &Server, package: str, command: &alloc.
         err(_) => { }
     }
     if not answer.finished {
-        // The compiler itself failed: the editor's log should say so.
-        sys.stderr.write("arche-lsp: the compiler did not finish: ");
-        sys.stderr.write(s.arche.view());
-        sys.stderr.write("\n");
-        match sys.fs.read_file(err_path.view(), a) {
-            ok(t) => { sys.stderr.write(t.view()); }
-            err(_) => { }
-        }
-        sys.stderr.flush();
+        log_compiler(sys, s, what: "the compiler did not finish", a: a);
     }
     return answer;
+}
+
+/// Says in the editor's log what went wrong with the compiler, and what it
+/// wrote on its way.
+fn log_compiler(sys: &mut std.System, s: &Server, what: str, a: alloc.Allocator) {
+    sys.stderr.write("arche-lsp: ");
+    sys.stderr.write(what);
+    sys.stderr.write(": ");
+    sys.stderr.write(s.arche.view());
+    sys.stderr.write("\n");
+    match sys.fs.read_file(join(dir: s.work.view(), name: "err", a).view(), a) {
+        ok(t) => { sys.stderr.write(t.view()); }
+        err(_) => { }
+    }
+    sys.stderr.flush();
 }
 
 /// A command's first words.
@@ -371,7 +378,10 @@ fn check_doc(sys: &mut std.System, s: &mut Server, index: usize, a: alloc.Alloca
     var f = proto.Flat.init(a);
     match proto.flatten(answer.stdout.view().bytes(), a) {
         some(parsed) => { f = parsed; }
-        none => { return; }
+        none => {
+            log_compiler(sys, s, what: "the compiler's answer to check is not JSON", a: a);
+            return;
+        }
     }
     let count = f.count("");
     var seen = alloc.List(alloc.String).init(a);
