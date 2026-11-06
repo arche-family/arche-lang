@@ -35,6 +35,7 @@ import syntax.parser;
 import syntax.cst;
 import syntax.fmt;
 import ir.ir;
+import x64.gen as x64;
 import ir.llvm;
 import ir.opt;
 import lower.lower;
@@ -801,6 +802,31 @@ fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, o
             err_out.write("\n");
             return Failure.BadIr;
         }
+    }
+    // An object is this compiler's own backend's work; text is for LLVM.
+    if out_path.len() > 2 and out_path[out_path.len() - 2..out_path.len()].eq(".o") {
+        if opts.target != program.Target.LinuxX86_64 or opts.release {
+            err_out.write("arche: this compiler writes objects for a debug build on linux-x86_64; for the others, give it a .ll file\n");
+            return Failure.BadUsage;
+        }
+        var problem = alloc.String.init(a);
+        let object = x64.object(&m, problem: &mut problem, a: a);
+        if problem.len() > 0 {
+            err_out.write("arche: ");
+            err_out.write(problem.view());
+            err_out.write("\n");
+            return Failure.BadIr;
+        }
+        match fs.write_bytes(out_path, object.items()) {
+            ok(_) => { }
+            err(_) => {
+                err_out.write("arche: cannot write ");
+                err_out.write(out_path);
+                err_out.write("\n");
+                return Failure.CannotWrite;
+            }
+        }
+        return;
     }
     let text = llvm.emit(&m, a);
     match fs.write_file(path: out_path, data: text.view()) {

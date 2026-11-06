@@ -3,11 +3,16 @@
 # target is the system this runs on, unless ARCHE_TARGET names another
 # (docs/sprints.md S19). Sourced, not run.
 #
+# ARCHE_BACKEND=own builds through the compiler's own backend (x64/gen.arche)
+# and lld (LLD names it), with no LLVM between them, for linux-x86_64.
+#
 # It sets CLANG, ARCHE_TARGET, TARGET_FLAG (for the compiler), RT_FLAGS (to
 # compile the runtime), LINK_FLAGS (to link a program with it) and GC_FLAGS
 # (to drop what nothing reaches, for a build of one object per module).
 
 : "${CLANG:=clang}"
+: "${LLD:=ld.lld}"
+: "${ARCHE_BACKEND:=llvm}"
 if [ -z "${ARCHE_TARGET:-}" ]; then
     case $(uname -s) in
     MINGW* | MSYS* | CYGWIN*) ARCHE_TARGET=windows-x86_64 ;;

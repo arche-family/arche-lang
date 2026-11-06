@@ -1,0 +1,310 @@
+/// An ELF64 relocatable object for x86-64: sections, symbols and relocations,
+/// for lld to link (docs/abi.md).
+import alloc;
+import x64.code as cd;
+
+const SHT_PROGBITS: u32 = 1;
+const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
+const SHT_RELA: u32 = 4;
+const SHF_INFO_LINK: u64 = 0x40;
+
+pub const FLAG_WRITE: u64 = 1;
+pub const FLAG_ALLOC: u64 = 2;
+pub const FLAG_EXEC: u64 = 4;
+
+pub const NO_SECTION: u32 = 4294967295;
+
+pub type Section = struct {
+    pub name: alloc.String,
+    pub flags: u64,
+    pub align: u64,
+    pub bytes: alloc.List(u8),
+    pub relocs: alloc.List(cd.Reloc),
+    /// Its section symbol.
+    pub symbol: u32,
+}
+
+pub type Symbol = struct {
+    pub name: alloc.String,
+    pub section: u32,
+    pub value: u64,
+    pub size: u64,
+    /// 0 none, 1 object, 2 function, 3 section.
+    pub kind: u8,
+    pub global: bool,
+}
+
+pub type Object = struct {
+    pub sections: alloc.List(Section),
+    pub symbols: alloc.List(Symbol),
+    a: alloc.Allocator,
+
+    pub fn init(a: alloc.Allocator) -> Object {
+        return Object { sections: alloc.List(Section).init(a), symbols: alloc.List(Symbol).init(a), a: a };
+    }
+
+    pub fn section(self: &mut Object, name: str, flags: u64, align: u64) -> u32 {
+        var n = alloc.String.init(self.a);
+        n.push_str(name);
+        let index = self.sections.len() as u32;
+        let sym = self.symbol("", section: index, value: 0, size: 0, kind: 3, global: false);
+        self.sections.push(Section { name: n, flags: flags, align: align, bytes: alloc.List(u8).init(self.a), relocs: alloc.List(cd.Reloc).init(self.a), symbol: sym });
+        return index;
+    }
+
+    pub fn symbol(self: &mut Object, name: str, section: u32, value: u64, size: u64, kind: u8, global: bool) -> u32 {
+        var n = alloc.String.init(self.a);
+        n.push_str(name);
+        self.symbols.push(Symbol { name: n, section: section, value: value, size: size, kind: kind, global: global });
+        return self.symbols.len() as u32 - 1;
+    }
+
+    /// One the object uses and does not define.
+    pub fn undefined(self: &mut Object, name: str) -> u32 {
+        return self.symbol(name, section: NO_SECTION, value: 0, size: 0, kind: 0, global: true);
+    }
+}
+
+pub fn pad_to(b: &mut alloc.List(u8), align: u64) {
+    while b.len() as u64 % align != 0 {
+        b.push(0);
+    }
+}
+
+pub fn put16(b: &mut alloc.List(u8), v: u32) {
+    b.push((v & 255) as u8);
+    b.push(((v >> 8) & 255) as u8);
+}
+
+pub fn put32(b: &mut alloc.List(u8), v: u32) {
+    var k: u32 = 0;
+    while k < 4 : (k += 1) {
+        b.push(((v >> (k * 8)) & 255) as u8);
+    }
+}
+
+pub fn put64(b: &mut alloc.List(u8), v: u64) {
+    var k: u64 = 0;
+    while k < 8 : (k += 1) {
+        b.push(((v >> (k * 8)) & 255) as u8);
+    }
+}
+
+fn put_text(b: &mut alloc.List(u8), text: str) -> u32 {
+    let at = b.len() as u32;
+    let t = text.bytes();
+    var i: usize = 0;
+    while i < t.len() : (i += 1) {
+        b.push(t[i]);
+    }
+    b.push(0);
+    return at;
+}
+
+/// One entry of the section header table.
+fn header(out: &mut alloc.List(u8), name: u32, kind: u32, flags: u64, offset: u64, size: u64, link: u32, info: u32, align: u64, entsize: u64) {
+    put32(out, name);
+    put32(out, kind);
+    put64(out, flags);
+    put64(out, 0);
+    put64(out, offset);
+    put64(out, size);
+    put32(out, link);
+    put32(out, info);
+    put64(out, align);
+    put64(out, entsize);
+}
+
+/// The object as bytes. Section numbers: 0 is null, then the object's own,
+/// then a .rela for each that has relocations, .symtab, .strtab, .shstrtab.
+pub fn write(o: &Object, a: alloc.Allocator) -> alloc.List(u8) {
+    let sections = o.sections.items();
+    let symbols = o.symbols.items();
+
+    // ELF wants the local symbols first: where each one ends up.
+    var final_index = alloc.List(u32).init(a);
+    var i: usize = 0;
+    while i < symbols.len() : (i += 1) {
+        final_index.push(0);
+    }
+    var count: u32 = 1;
+    let places = final_index.items_mut();
+    i = 0;
+    while i < symbols.len() : (i += 1) {
+        if not symbols[i].global {
+            places[i] = count;
+            count += 1;
+        }
+    }
+    let first_global = count;
+    i = 0;
+    while i < symbols.len() : (i += 1) {
+        if symbols[i].global {
+            places[i] = count;
+            count += 1;
+        }
+    }
+
+    var strtab = alloc.List(u8).init(a);
+    strtab.push(0);
+    var symtab = alloc.List(u8).init(a);
+    var k: u32 = 0;
+    while k < 24 : (k += 1) {
+        symtab.push(0);
+    }
+    var pass: u32 = 0;
+    while pass < 2 : (pass += 1) {
+        i = 0;
+        while i < symbols.len() : (i += 1) {
+            let s = &symbols[i];
+            if s.global != (pass == 1) {
+                continue;
+            }
+            var name_at: u32 = 0;
+            if s.name.len() > 0 {
+                name_at = put_text(&mut strtab, s.name.view());
+            }
+            put32(&mut symtab, name_at);
+            var bind: u8 = 0;
+            if s.global {
+                bind = 1;
+            }
+            symtab.push((bind << 4) | s.kind);
+            symtab.push(0);
+            if s.section == NO_SECTION {
+                put16(&mut symtab, 0);
+            } else {
+                put16(&mut symtab, s.section + 1);
+            }
+            put64(&mut symtab, s.value);
+            put64(&mut symtab, s.size);
+        }
+    }
+
+    var shstr = alloc.List(u8).init(a);
+    shstr.push(0);
+    var name_at = alloc.List(u32).init(a);
+    var rela_name = alloc.List(u32).init(a);
+    i = 0;
+    while i < sections.len() : (i += 1) {
+        // ".rela.x" holds ".x" as its own tail, but plain names are simple.
+        name_at.push(put_text(&mut shstr, sections[i].name.view()));
+        var rn = alloc.String.init(a);
+        rn.push_str(".rela");
+        rn.push_str(sections[i].name.view());
+        if sections[i].relocs.len() > 0 {
+            rela_name.push(put_text(&mut shstr, rn.view()));
+        } else {
+            rela_name.push(0);
+        }
+    }
+    let symtab_name = put_text(&mut shstr, ".symtab");
+    let strtab_name = put_text(&mut shstr, ".strtab");
+    let shstrtab_name = put_text(&mut shstr, ".shstrtab");
+
+    var nrela: u32 = 0;
+    i = 0;
+    while i < sections.len() : (i += 1) {
+        if sections[i].relocs.len() > 0 {
+            nrela += 1;
+        }
+    }
+    let symtab_index = sections.len() as u32 + 1 + nrela;
+
+    var out = alloc.List(u8).init(a);
+    // The ELF header; the section table's place is written at its end.
+    let magic = "\x7FELF".bytes();
+    i = 0;
+    while i < magic.len() : (i += 1) {
+        out.push(magic[i]);
+    }
+    out.push(2);
+    out.push(1);
+    out.push(1);
+    k = 0;
+    while k < 9 : (k += 1) {
+        out.push(0);
+    }
+    put16(&mut out, 1);
+    put16(&mut out, 62);
+    put32(&mut out, 1);
+    put64(&mut out, 0);
+    put64(&mut out, 0);
+    let shoff_at = out.len();
+    put64(&mut out, 0);
+    put32(&mut out, 0);
+    put16(&mut out, 64);
+    put16(&mut out, 0);
+    put16(&mut out, 0);
+    put16(&mut out, 64);
+    put16(&mut out, symtab_index + 3);
+    put16(&mut out, symtab_index + 2);
+
+    var offsets = alloc.List(u64).init(a);
+    i = 0;
+    while i < sections.len() : (i += 1) {
+        pad_to(&mut out, sections[i].align);
+        offsets.push(out.len() as u64);
+        let b = sections[i].bytes.items();
+        var q: usize = 0;
+        while q < b.len() : (q += 1) {
+            out.push(b[q]);
+        }
+    }
+    var rela_offsets = alloc.List(u64).init(a);
+    i = 0;
+    while i < sections.len() : (i += 1) {
+        pad_to(&mut out, 8);
+        rela_offsets.push(out.len() as u64);
+        let rs = sections[i].relocs.items();
+        var q: usize = 0;
+        while q < rs.len() : (q += 1) {
+            put64(&mut out, rs[q].offset);
+            put64(&mut out, ((places[rs[q].symbol as usize] as u64) << 32) | rs[q].kind as u64);
+            put64(&mut out, cd.bits_of_i64(rs[q].addend));
+        }
+    }
+    pad_to(&mut out, 8);
+    let symtab_offset = out.len() as u64;
+    let st = symtab.items();
+    i = 0;
+    while i < st.len() : (i += 1) {
+        out.push(st[i]);
+    }
+    let strtab_offset = out.len() as u64;
+    let sb = strtab.items();
+    i = 0;
+    while i < sb.len() : (i += 1) {
+        out.push(sb[i]);
+    }
+    let shstr_offset = out.len() as u64;
+    let hb = shstr.items();
+    i = 0;
+    while i < hb.len() : (i += 1) {
+        out.push(hb[i]);
+    }
+    pad_to(&mut out, 8);
+    let shoff = out.len() as u64;
+    let bytes = out.items_mut();
+    k = 0;
+    while k < 8 : (k += 1) {
+        bytes[shoff_at + k as usize] = ((shoff >> (k as u64 * 8)) & 255) as u8;
+    }
+
+    header(&mut out, name: 0, kind: 0, flags: 0, offset: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0);
+    i = 0;
+    while i < sections.len() : (i += 1) {
+        header(&mut out, name: name_at[i], kind: SHT_PROGBITS, flags: sections[i].flags, offset: offsets[i], size: sections[i].bytes.len() as u64, link: 0, info: 0, align: sections[i].align, entsize: 0);
+    }
+    i = 0;
+    while i < sections.len() : (i += 1) {
+        if sections[i].relocs.len() > 0 {
+            header(&mut out, name: rela_name[i], kind: SHT_RELA, flags: SHF_INFO_LINK, offset: rela_offsets[i], size: sections[i].relocs.len() as u64 * 24, link: symtab_index, info: i as u32 + 1, align: 8, entsize: 24);
+        }
+    }
+    header(&mut out, name: symtab_name, kind: SHT_SYMTAB, flags: 0, offset: symtab_offset, size: st.len() as u64, link: symtab_index + 1, info: first_global, align: 8, entsize: 24);
+    header(&mut out, name: strtab_name, kind: SHT_STRTAB, flags: 0, offset: strtab_offset, size: sb.len() as u64, link: 0, info: 0, align: 1, entsize: 0);
+    header(&mut out, name: shstrtab_name, kind: SHT_STRTAB, flags: 0, offset: shstr_offset, size: hb.len() as u64, link: 0, info: 0, align: 1, entsize: 0);
+    return out;
+}

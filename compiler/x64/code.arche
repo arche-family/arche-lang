@@ -1,0 +1,563 @@
+/// x86-64 machine code: one function for each form of instruction the backend
+/// writes (x64/gen.arche). Registers go by the processor's numbers, the same
+/// numbers for the general and the vector ones. A size is in bytes.
+import alloc;
+
+pub const RAX: u8 = 0;
+pub const RCX: u8 = 1;
+pub const RDX: u8 = 2;
+pub const RBX: u8 = 3;
+pub const RSP: u8 = 4;
+pub const RBP: u8 = 5;
+pub const RSI: u8 = 6;
+pub const RDI: u8 = 7;
+pub const R8: u8 = 8;
+pub const R9: u8 = 9;
+pub const R10: u8 = 10;
+pub const R11: u8 = 11;
+pub const R12: u8 = 12;
+pub const R13: u8 = 13;
+pub const R14: u8 = 14;
+pub const R15: u8 = 15;
+
+/// The opcodes of the operations "register, register or memory", at sizes
+/// above one byte; a byte's is the one before.
+pub const OP_ADD: u8 = 0x03;
+pub const OP_OR: u8 = 0x0B;
+pub const OP_AND: u8 = 0x23;
+pub const OP_SUB: u8 = 0x2B;
+pub const OP_XOR: u8 = 0x33;
+pub const OP_CMP: u8 = 0x3B;
+pub const OP_MOV: u8 = 0x8B;
+
+/// Their numbers in the forms with an immediate and in the shifts.
+pub const DIGIT_ADD: u8 = 0;
+pub const DIGIT_OR: u8 = 1;
+pub const DIGIT_AND: u8 = 4;
+pub const DIGIT_SUB: u8 = 5;
+pub const DIGIT_XOR: u8 = 6;
+pub const DIGIT_CMP: u8 = 7;
+pub const SHIFT_SHL: u8 = 4;
+pub const SHIFT_SHR: u8 = 5;
+pub const SHIFT_SAR: u8 = 7;
+pub const UNARY_NOT: u8 = 2;
+pub const UNARY_NEG: u8 = 3;
+pub const UNARY_MUL: u8 = 4;
+pub const UNARY_DIV: u8 = 6;
+pub const UNARY_IDIV: u8 = 7;
+
+/// Conditions, as the processor numbers them.
+pub const CC_O: u8 = 0;
+pub const CC_B: u8 = 2;
+pub const CC_AE: u8 = 3;
+pub const CC_E: u8 = 4;
+pub const CC_NE: u8 = 5;
+pub const CC_BE: u8 = 6;
+pub const CC_A: u8 = 7;
+pub const CC_S: u8 = 8;
+pub const CC_P: u8 = 10;
+pub const CC_NP: u8 = 11;
+pub const CC_L: u8 = 12;
+pub const CC_GE: u8 = 13;
+pub const CC_LE: u8 = 14;
+pub const CC_G: u8 = 15;
+
+/// ELF's relocations.
+pub const R_X86_64_64: u32 = 1;
+pub const R_X86_64_PC32: u32 = 2;
+pub const R_X86_64_PLT32: u32 = 4;
+
+pub type Reloc = struct {
+    pub offset: u64,
+    pub symbol: u32,
+    pub kind: u32,
+    pub addend: i64,
+}
+
+/// A function's code, and what the linker is to fill in.
+pub type Code = struct {
+    pub bytes: alloc.List(u8),
+    pub relocs: alloc.List(Reloc),
+}
+
+/// A number's bits as an unsigned one: `as` keeps values, and refuses these.
+pub fn bits_of_i32(v: i32) -> u32 {
+    if v >= 0 {
+        return v as u32;
+    }
+    return 4294967295 - (-(v + 1)) as u32;
+}
+
+pub fn bits_of_i64(v: i64) -> u64 {
+    if v >= 0 {
+        return v as u64;
+    }
+    return 18446744073709551615 - (-(v + 1)) as u64;
+}
+
+pub fn i32_of_bits(v: u32) -> i32 {
+    if v <= 0x7FFFFFFF {
+        return v as i32;
+    }
+    return -((4294967295 - v) as i32) - 1;
+}
+
+pub fn new_code(a: alloc.Allocator) -> Code {
+    return Code { bytes: alloc.List(u8).init(a), relocs: alloc.List(Reloc).init(a) };
+}
+
+/// A place in memory: base + disp, or a symbol's address + addend, reached
+/// from the instruction's own.
+pub type Mem = struct {
+    pub rip: bool,
+    pub base: u8,
+    pub disp: i32,
+    pub symbol: u32,
+    pub addend: i64,
+}
+
+pub fn mem(base: u8, disp: i32) -> Mem {
+    return Mem { rip: false, base: base, disp: disp, symbol: 0, addend: 0 };
+}
+
+pub fn mem_symbol(symbol: u32, addend: i64) -> Mem {
+    return Mem { rip: true, base: 0, disp: 0, symbol: symbol, addend: addend };
+}
+
+pub fn mem_plus(m: Mem, by: i32) -> Mem {
+    return Mem { rip: m.rip, base: m.base, disp: m.disp + by, symbol: m.symbol, addend: m.addend + by as i64 };
+}
+
+pub fn here(c: &Code) -> u64 {
+    return c.bytes.len() as u64;
+}
+
+fn put(c: &mut Code, b: u8) {
+    c.bytes.push(b);
+}
+
+fn put32(c: &mut Code, v: u32) {
+    var k: u32 = 0;
+    while k < 4 : (k += 1) {
+        put(c, ((v >> (k * 8)) & 255) as u8);
+    }
+}
+
+fn put_i32(c: &mut Code, v: i32) {
+    put32(c, bits_of_i32(v));
+}
+
+fn put64(c: &mut Code, v: u64) {
+    var k: u64 = 0;
+    while k < 8 : (k += 1) {
+        put(c, ((v >> (k * 8)) & 255) as u8);
+    }
+}
+
+/// REX, when anything needs it: a 64-bit operand, a register from r8 up, or
+/// a byte of a register from rsp up, which without it would be ah and so on.
+fn rex(c: &mut Code, wide: bool, reg: u8, index: u8, rm: u8, byte_regs: bool) {
+    var b: u8 = 0x40;
+    if wide {
+        b = b | 8;
+    }
+    if reg >= 8 {
+        b = b | 4;
+    }
+    if index >= 8 {
+        b = b | 2;
+    }
+    if rm >= 8 {
+        b = b | 1;
+    }
+    if b != 0x40 or byte_regs {
+        put(c, b);
+    }
+}
+
+fn modrm_reg(c: &mut Code, reg: u8, rm: u8) {
+    put(c, 0xC0 | ((reg & 7) << 3) | (rm & 7));
+}
+
+fn modrm_mem(c: &mut Code, reg: u8, m: Mem) {
+    if m.rip {
+        put(c, ((reg & 7) << 3) | 5);
+        c.relocs.push(Reloc { offset: here(c), symbol: m.symbol, kind: R_X86_64_PC32, addend: m.addend - 4 });
+        put32(c, 0);
+        return;
+    }
+    let low = m.base & 7;
+    var kind: u8 = 2;
+    if m.disp == 0 and low != 5 {
+        kind = 0;
+    } else if m.disp >= -128 and m.disp <= 127 {
+        kind = 1;
+    }
+    put(c, (kind << 6) | ((reg & 7) << 3) | low);
+    if low == 4 {
+        put(c, 0x24);
+    }
+    if kind == 1 {
+        put(c, (bits_of_i32(m.disp) & 255) as u8);
+    } else if kind == 2 {
+        put_i32(c, m.disp);
+    }
+}
+
+fn base_of(m: Mem) -> u8 {
+    if m.rip {
+        return 0;
+    }
+    return m.base;
+}
+
+fn opcode_for(op: u8, size: u32) -> u8 {
+    if size == 1 {
+        return op - 1;
+    }
+    return op;
+}
+
+/// op reg, rm.
+pub fn alu_rr(c: &mut Code, op: u8, size: u32, reg: u8, rm: u8) {
+    if size == 2 {
+        put(c, 0x66);
+    }
+    rex(c, wide: size == 8, reg: reg, index: 0, rm: rm, byte_regs: size == 1 and (reg >= 4 or rm >= 4));
+    put(c, opcode_for(op, size));
+    modrm_reg(c, reg: reg, rm: rm);
+}
+
+/// op reg, [m].
+pub fn alu_rm(c: &mut Code, op: u8, size: u32, reg: u8, m: Mem) {
+    if size == 2 {
+        put(c, 0x66);
+    }
+    rex(c, wide: size == 8, reg: reg, index: 0, rm: base_of(m), byte_regs: size == 1 and reg >= 4);
+    put(c, opcode_for(op, size));
+    modrm_mem(c, reg, m);
+}
+
+/// op rm, imm, at 4 or 8 bytes.
+pub fn alu_ri(c: &mut Code, digit: u8, size: u32, rm: u8, imm: i32) {
+    rex(c, wide: size == 8, reg: 0, index: 0, rm: rm, byte_regs: false);
+    if imm >= -128 and imm <= 127 {
+        put(c, 0x83);
+        modrm_reg(c, reg: digit, rm: rm);
+        put(c, (bits_of_i32(imm) & 255) as u8);
+    } else {
+        put(c, 0x81);
+        modrm_reg(c, reg: digit, rm: rm);
+        put_i32(c, imm);
+    }
+}
+
+pub fn mov_rr(c: &mut Code, dst: u8, src: u8) {
+    alu_rr(c, op: OP_MOV, 8, reg: dst, rm: src);
+}
+
+/// The low four bytes; the upper four become 0.
+pub fn mov32_rr(c: &mut Code, dst: u8, src: u8) {
+    alu_rr(c, op: OP_MOV, 4, reg: dst, rm: src);
+}
+
+pub fn mov_ri(c: &mut Code, dst: u8, v: u64) {
+    if v <= 0xFFFFFFFF {
+        rex(c, wide: false, reg: 0, index: 0, rm: dst, byte_regs: false);
+        put(c, 0xB8 + (dst & 7));
+        put32(c, v as u32);
+    } else if v >= 0xFFFFFFFF80000000 {
+        rex(c, wide: true, reg: 0, index: 0, rm: dst, byte_regs: false);
+        put(c, 0xC7);
+        modrm_reg(c, reg: 0, rm: dst);
+        put32(c, (v & 0xFFFFFFFF) as u32);
+    } else {
+        rex(c, wide: true, reg: 0, index: 0, rm: dst, byte_regs: false);
+        put(c, 0xB8 + (dst & 7));
+        put64(c, v);
+    }
+}
+
+/// A value of 1, 2, 4 or 8 bytes from memory; narrower than 4, zero-extended.
+pub fn load(c: &mut Code, size: u32, dst: u8, m: Mem) {
+    if size == 1 or size == 2 {
+        rex(c, wide: false, reg: dst, index: 0, rm: base_of(m), byte_regs: false);
+        put(c, 0x0F);
+        if size == 1 {
+            put(c, 0xB6);
+        } else {
+            put(c, 0xB7);
+        }
+        modrm_mem(c, dst, m);
+        return;
+    }
+    alu_rm(c, op: OP_MOV, size, reg: dst, m: m);
+}
+
+pub fn store(c: &mut Code, size: u32, m: Mem, src: u8) {
+    alu_rm(c, op: 0x89, size, reg: src, m: m);
+}
+
+/// mov [m], imm: not for a symbol's place, whose reach counts the bytes after it.
+pub fn store_imm(c: &mut Code, size: u32, m: Mem, imm: i32) {
+    if size == 2 {
+        put(c, 0x66);
+    }
+    rex(c, wide: size == 8, reg: 0, index: 0, rm: base_of(m), byte_regs: false);
+    if size == 1 {
+        put(c, 0xC6);
+    } else {
+        put(c, 0xC7);
+    }
+    modrm_mem(c, 0, m);
+    if size == 1 {
+        put(c, (bits_of_i32(imm) & 255) as u8);
+    } else if size == 2 {
+        put(c, (bits_of_i32(imm) & 255) as u8);
+        put(c, ((bits_of_i32(imm) >> 8) & 255) as u8);
+    } else {
+        put_i32(c, imm);
+    }
+}
+
+pub fn lea(c: &mut Code, dst: u8, m: Mem) {
+    rex(c, wide: true, reg: dst, index: 0, rm: base_of(m), byte_regs: false);
+    put(c, 0x8D);
+    modrm_mem(c, dst, m);
+}
+
+/// lea dst, [base + index * 2^scale].
+pub fn lea_index(c: &mut Code, dst: u8, base: u8, index: u8, scale: u8) {
+    rex(c, wide: true, reg: dst, index: index, rm: base, byte_regs: false);
+    put(c, 0x8D);
+    put(c, 0x44 | ((dst & 7) << 3));
+    put(c, (scale << 6) | ((index & 7) << 3) | (base & 7));
+    put(c, 0);
+}
+
+/// dst, 4 bytes wide, from the low 1 or 2 bytes of src.
+pub fn movzx(c: &mut Code, dst: u8, src: u8, from: u32) {
+    rex(c, wide: false, reg: dst, index: 0, rm: src, byte_regs: from == 1 and src >= 4);
+    put(c, 0x0F);
+    if from == 1 {
+        put(c, 0xB6);
+    } else {
+        put(c, 0xB7);
+    }
+    modrm_reg(c, reg: dst, rm: src);
+}
+
+/// dst, 4 or 8 bytes wide, from the low 1, 2 or 4 bytes of src.
+pub fn movsx(c: &mut Code, dst: u8, src: u8, from: u32, to: u32) {
+    if from == 4 {
+        rex(c, wide: true, reg: dst, index: 0, rm: src, byte_regs: false);
+        put(c, 0x63);
+        modrm_reg(c, reg: dst, rm: src);
+        return;
+    }
+    rex(c, wide: to == 8, reg: dst, index: 0, rm: src, byte_regs: from == 1 and src >= 4);
+    put(c, 0x0F);
+    if from == 1 {
+        put(c, 0xBE);
+    } else {
+        put(c, 0xBF);
+    }
+    modrm_reg(c, reg: dst, rm: src);
+}
+
+/// A shift by cl.
+pub fn shift_cl(c: &mut Code, digit: u8, size: u32, r: u8) {
+    rex(c, wide: size == 8, reg: 0, index: 0, rm: r, byte_regs: false);
+    put(c, 0xD3);
+    modrm_reg(c, reg: digit, rm: r);
+}
+
+pub fn shift_i(c: &mut Code, digit: u8, size: u32, r: u8, by: u8) {
+    rex(c, wide: size == 8, reg: 0, index: 0, rm: r, byte_regs: false);
+    put(c, 0xC1);
+    modrm_reg(c, reg: digit, rm: r);
+    put(c, by);
+}
+
+/// imul dst, src, at 2, 4 or 8 bytes.
+pub fn imul_rr(c: &mut Code, size: u32, dst: u8, src: u8) {
+    if size == 2 {
+        put(c, 0x66);
+    }
+    rex(c, wide: size == 8, reg: dst, index: 0, rm: src, byte_regs: false);
+    put(c, 0x0F);
+    put(c, 0xAF);
+    modrm_reg(c, reg: dst, rm: src);
+}
+
+pub fn imul_rri(c: &mut Code, size: u32, dst: u8, src: u8, imm: i32) {
+    rex(c, wide: size == 8, reg: dst, index: 0, rm: src, byte_regs: false);
+    put(c, 0x69);
+    modrm_reg(c, reg: dst, rm: src);
+    put_i32(c, imm);
+}
+
+/// not, neg, mul, div and idiv, at 4 or 8 bytes.
+pub fn unary(c: &mut Code, digit: u8, size: u32, r: u8) {
+    rex(c, wide: size == 8, reg: 0, index: 0, rm: r, byte_regs: false);
+    put(c, 0xF7);
+    modrm_reg(c, reg: digit, rm: r);
+}
+
+/// rax extended into rdx, for a signed division.
+pub fn sign_into_rdx(c: &mut Code, size: u32) {
+    if size == 8 {
+        put(c, 0x48);
+    }
+    put(c, 0x99);
+}
+
+pub fn test_rr(c: &mut Code, size: u32, x: u8, y: u8) {
+    alu_rr(c, op: 0x85, size, reg: x, rm: y);
+}
+
+/// test r's low byte against imm.
+pub fn test_byte(c: &mut Code, r: u8, imm: u8) {
+    rex(c, wide: false, reg: 0, index: 0, rm: r, byte_regs: r >= 4);
+    put(c, 0xF6);
+    modrm_reg(c, reg: 0, rm: r);
+    put(c, imm);
+}
+
+pub fn setcc(c: &mut Code, cc: u8, r: u8) {
+    rex(c, wide: false, reg: 0, index: 0, rm: r, byte_regs: r >= 4);
+    put(c, 0x0F);
+    put(c, 0x90 + cc);
+    modrm_reg(c, reg: 0, rm: r);
+}
+
+/// A jump whose target is patched in later: where to patch.
+pub fn jcc(c: &mut Code, cc: u8) -> u64 {
+    put(c, 0x0F);
+    put(c, 0x80 + cc);
+    let at = here(c);
+    put32(c, 0);
+    return at;
+}
+
+pub fn jmp(c: &mut Code) -> u64 {
+    put(c, 0xE9);
+    let at = here(c);
+    put32(c, 0);
+    return at;
+}
+
+/// The jump whose offset is at at goes to target.
+pub fn patch(c: &mut Code, at: u64, target: u64) {
+    let rel = bits_of_i64(target as i64 - (at as i64 + 4));
+    let b = c.bytes.items_mut();
+    var k: u64 = 0;
+    while k < 4 : (k += 1) {
+        b[(at + k) as usize] = ((rel >> (k * 8)) & 255) as u8;
+    }
+}
+
+pub fn patch_here(c: &mut Code, at: u64) {
+    let target = here(c);
+    patch(c, at: at, target: target);
+}
+
+pub fn call_symbol(c: &mut Code, symbol: u32) {
+    put(c, 0xE8);
+    c.relocs.push(Reloc { offset: here(c), symbol: symbol, kind: R_X86_64_PLT32, addend: -4 });
+    put32(c, 0);
+}
+
+pub fn call_reg(c: &mut Code, r: u8) {
+    rex(c, wide: false, reg: 0, index: 0, rm: r, byte_regs: false);
+    put(c, 0xFF);
+    modrm_reg(c, reg: 2, rm: r);
+}
+
+pub fn push(c: &mut Code, r: u8) {
+    rex(c, wide: false, reg: 0, index: 0, rm: r, byte_regs: false);
+    put(c, 0x50 + (r & 7));
+}
+
+pub fn leave(c: &mut Code) {
+    put(c, 0xC9);
+}
+
+pub fn ret(c: &mut Code) {
+    put(c, 0xC3);
+}
+
+pub fn ud2(c: &mut Code) {
+    put(c, 0x0F);
+    put(c, 0x0B);
+}
+
+/// Raw bytes, for instructions of no operands.
+pub fn raw(c: &mut Code, b: u8) {
+    put(c, b);
+}
+
+pub fn lock(c: &mut Code) {
+    put(c, 0xF0);
+}
+
+pub fn mfence(c: &mut Code) {
+    put(c, 0x0F);
+    put(c, 0xAE);
+    put(c, 0xF0);
+}
+
+pub fn rep_movsb(c: &mut Code) {
+    put(c, 0xF3);
+    put(c, 0xA4);
+}
+
+pub fn rep_stosb(c: &mut Code) {
+    put(c, 0xF3);
+    put(c, 0xAA);
+}
+
+/// xchg [m], r: locked without being asked to.
+pub fn xchg_mem(c: &mut Code, size: u32, m: Mem, r: u8) {
+    alu_rm(c, op: 0x87, size, reg: r, m: m);
+}
+
+/// A two-byte opcode, op reg, [m]; a byte's is the one before.
+fn op0f_mem(c: &mut Code, op: u8, size: u32, reg: u8, m: Mem) {
+    if size == 2 {
+        put(c, 0x66);
+    }
+    rex(c, wide: size == 8, reg: reg, index: 0, rm: base_of(m), byte_regs: size == 1 and reg >= 4);
+    put(c, 0x0F);
+    put(c, opcode_for(op, size));
+    modrm_mem(c, reg, m);
+}
+
+pub fn xadd_mem(c: &mut Code, size: u32, m: Mem, r: u8) {
+    op0f_mem(c, op: 0xC1, size, reg: r, m: m);
+}
+
+pub fn cmpxchg_mem(c: &mut Code, size: u32, m: Mem, r: u8) {
+    op0f_mem(c, op: 0xB1, size, reg: r, m: m);
+}
+
+/// A vector instruction between registers: prefix (0 for none), 0F, op.
+pub fn sse_rr(c: &mut Code, prefix: u8, op: u8, wide: bool, reg: u8, rm: u8) {
+    if prefix != 0 {
+        put(c, prefix);
+    }
+    rex(c, wide: wide, reg: reg, index: 0, rm: rm, byte_regs: false);
+    put(c, 0x0F);
+    put(c, op);
+    modrm_reg(c, reg: reg, rm: rm);
+}
+
+pub fn sse_rm(c: &mut Code, prefix: u8, op: u8, reg: u8, m: Mem) {
+    if prefix != 0 {
+        put(c, prefix);
+    }
+    rex(c, wide: false, reg: reg, index: 0, rm: base_of(m), byte_regs: false);
+    put(c, 0x0F);
+    put(c, op);
+    modrm_mem(c, reg, m);
+}

@@ -431,6 +431,7 @@ type Fs                                           // capability, move-only
     fn read_file(self: &Fs, path: str, a: alloc.Allocator) -> IoError!alloc.String
     fn read_bytes(self: &Fs, path: str, a: alloc.Allocator) -> IoError!alloc.List(u8)
     fn write_file(self: &Fs, path: str, data: str) -> IoError!void
+    fn write_bytes(self: &Fs, path: str, data: []u8) -> IoError!void
 
 type Output                                       // capability, move-only; flushed at exit
     fn write(self: &mut Output, text: str)
@@ -445,7 +446,7 @@ type Args                                         // move-only
 
 `write_file` has two `str` parameters, so its calls are labeled: `sys.fs.write_file(path: out_path, data: text.view())`.
 
-`read_file` gives `InvalidUtf8` when the file is not UTF-8; `read_bytes` gives the bytes whatever they are, so that a program can say where the file is wrong.
+`read_file` gives `InvalidUtf8` when the file is not UTF-8; `read_bytes` gives the bytes whatever they are, so that a program can say where the file is wrong. `write_bytes` writes bytes whatever they are, for the compiler's object files.
 
 `sys.args.get(0)` is the program's own path. If an argument is not valid UTF-8, the program panics before `main` starts.
 

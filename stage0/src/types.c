@@ -416,7 +416,9 @@ void types_init(void) {
     m[2] = (Method){"read_bytes", SELF_REF, 2, {{"path", &str_type}, {"a", &allocator_type}},
                     type_error_union_of(&io_error_decl, type_list(&int_types[U8])), "a0_std_Fs_read_bytes", false,
                     M_RUNTIME};
-    fs_bt.nmethods = 3;
+    m[3] = (Method){"write_bytes", SELF_REF, 2, {{"path", &str_type}, {"data", type_slice(false, &int_types[U8])}},
+                    type_error_union_of(&io_error_decl, &void_type), "a0_std_Fs_write_bytes", false, M_RUNTIME};
+    fs_bt.nmethods = 4;
 }
 
 Type *library_type(const char *library, const char *name) {

@@ -553,6 +553,12 @@ a0_err a0_std_Fs_write_file(a0_std_Fs *self, a0_str path, a0_str data) {
     return 0;
 }
 
+a0_err a0_std_Fs_write_bytes(a0_std_Fs *self, a0_str path, const void *data) {
+    a0_str bytes;
+    memcpy(&bytes, data, sizeof bytes);
+    return a0_std_Fs_write_file(self, path, bytes);
+}
+
 // ---- std.Output -------------------------------------------------------------
 
 void a0_std_Output_write(a0_std_Output *self, a0_str text) {

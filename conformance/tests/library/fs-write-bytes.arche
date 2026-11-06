@@ -1,0 +1,25 @@
+// test: run
+// spec: 11
+// stdout: 4 0 255 10 65; not found
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var bytes = alloc.List(u8).init(sys.alloc);
+    bytes.push(0);
+    bytes.push(255);
+    bytes.push(10);
+    bytes.push(65);
+    try sys.fs.write_bytes("fs-write-bytes.tmp", bytes.items());
+    let back = try sys.fs.read_bytes("fs-write-bytes.tmp", sys.alloc);
+    sys.stdout.write_u64(back.len() as u64);
+    var i: usize = 0;
+    while i < back.len() : (i += 1) {
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(back[i] as u64);
+    }
+    match sys.fs.write_bytes("no-such-dir/out.bin", bytes.items()) {
+        err(.NotFound) => { sys.stdout.write("; not found\n"); }
+        _ => { sys.stdout.write("; ?\n"); }
+    }
+}

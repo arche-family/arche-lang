@@ -20,5 +20,10 @@ if [ ! -f "$rt" ] || [ "$here/runtime/rt.c" -nt "$rt" ] || [ "$here/runtime/math
     mv "$rt.tmp.$$" "$rt"
 fi
 # ARCHE selects the compiler binary, so later bootstrap stages can be tested.
-"${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG build "$1" "$2.ll"
-$cc -O1 $LINK_FLAGS -Wno-override-module -o "$2" "$2.ll" "$rt"
+if [ "$ARCHE_BACKEND" = own ]; then
+    "${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG build "$1" "$2.o"
+    "$LLD" -static -o "$2" "$2.o" "$rt"
+else
+    "${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG build "$1" "$2.ll"
+    $cc -O1 $LINK_FLAGS -Wno-override-module -o "$2" "$2.ll" "$rt"
+fi

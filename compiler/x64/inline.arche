@@ -1,0 +1,405 @@
+/// A small assembler for the text of an asm in AT&T's syntax, as the lowering
+/// leaves it for LLVM: $N an operand, $$ a dollar, \XX a byte. The backend has
+/// no use for more than a program's few instructions; for what it does not
+/// know, a release build goes through LLVM's assembler.
+import alloc;
+import x64.code as cd;
+
+const NO_REG: u8 = 255;
+
+fn register_of(name: str) -> u8 {
+    if name.eq("rax") or name.eq("eax") { return cd.RAX; }
+    if name.eq("rcx") or name.eq("ecx") { return cd.RCX; }
+    if name.eq("rdx") or name.eq("edx") { return cd.RDX; }
+    if name.eq("rbx") or name.eq("ebx") { return cd.RBX; }
+    if name.eq("rsp") or name.eq("esp") { return cd.RSP; }
+    if name.eq("rbp") or name.eq("ebp") { return cd.RBP; }
+    if name.eq("rsi") or name.eq("esi") { return cd.RSI; }
+    if name.eq("rdi") or name.eq("edi") { return cd.RDI; }
+    if name.eq("r8") or name.eq("r8d") { return cd.R8; }
+    if name.eq("r9") or name.eq("r9d") { return cd.R9; }
+    if name.eq("r10") or name.eq("r10d") { return cd.R10; }
+    if name.eq("r11") or name.eq("r11d") { return cd.R11; }
+    if name.eq("r12") or name.eq("r12d") { return cd.R12; }
+    if name.eq("r13") or name.eq("r13d") { return cd.R13; }
+    if name.eq("r14") or name.eq("r14d") { return cd.R14; }
+    if name.eq("r15") or name.eq("r15d") { return cd.R15; }
+    return NO_REG;
+}
+
+/// The bytes of an instruction with no operands; 0 of them when it is none.
+fn plain_instruction(c: &mut cd.Code, name: str) -> bool {
+    if name.eq("nop") {
+        cd.raw(c, 0x90);
+    } else if name.eq("ret") or name.eq("retq") {
+        cd.raw(c, 0xC3);
+    } else if name.eq("pause") {
+        cd.raw(c, 0xF3);
+        cd.raw(c, 0x90);
+    } else if name.eq("syscall") {
+        cd.raw(c, 0x0F);
+        cd.raw(c, 0x05);
+    } else if name.eq("rdtsc") {
+        cd.raw(c, 0x0F);
+        cd.raw(c, 0x31);
+    } else if name.eq("cpuid") {
+        cd.raw(c, 0x0F);
+        cd.raw(c, 0xA2);
+    } else if name.eq("hlt") {
+        cd.raw(c, 0xF4);
+    } else if name.eq("mfence") {
+        cd.mfence(c);
+    } else if name.eq("ud2") {
+        cd.ud2(c);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+fn is_space(c: u8) -> bool {
+    return c == ' ' or c == '\t';
+}
+
+/// Without the spaces around it.
+fn trim(t: str) -> str {
+    var s: usize = 0;
+    var e = t.len();
+    while s < e and is_space(t[s]) : (s += 1) {
+    }
+    while e > s and is_space(t[e - 1]) : (e -= 1) {
+    }
+    return t[s..e];
+}
+
+fn hex_value(c: u8) -> u8 {
+    if c >= '0' and c <= '9' {
+        return c - '0';
+    }
+    return c - 'A' + 10;
+}
+
+fn digit_of_alu(name: str) -> ?u8 {
+    if name.eq("add") { return cd.DIGIT_ADD; }
+    if name.eq("or") { return cd.DIGIT_OR; }
+    if name.eq("and") { return cd.DIGIT_AND; }
+    if name.eq("sub") { return cd.DIGIT_SUB; }
+    if name.eq("xor") { return cd.DIGIT_XOR; }
+    if name.eq("cmp") { return cd.DIGIT_CMP; }
+    return none;
+}
+
+fn opcode_of_alu(name: str) -> u8 {
+    if name.eq("add") { return cd.OP_ADD; }
+    if name.eq("or") { return cd.OP_OR; }
+    if name.eq("and") { return cd.OP_AND; }
+    if name.eq("sub") { return cd.OP_SUB; }
+    if name.eq("xor") { return cd.OP_XOR; }
+    return cd.OP_CMP;
+}
+
+fn condition_of(name: str) -> ?u8 {
+    if name.eq("je") or name.eq("jz") { return cd.CC_E; }
+    if name.eq("jne") or name.eq("jnz") { return cd.CC_NE; }
+    if name.eq("jl") { return cd.CC_L; }
+    if name.eq("jle") { return cd.CC_LE; }
+    if name.eq("jg") { return cd.CC_G; }
+    if name.eq("jge") { return cd.CC_GE; }
+    if name.eq("jb") { return cd.CC_B; }
+    if name.eq("jbe") { return cd.CC_BE; }
+    if name.eq("ja") { return cd.CC_A; }
+    if name.eq("jae") { return cd.CC_AE; }
+    return none;
+}
+
+/// An operand: a register, by name or by number among the asm's; NO_REG for
+/// what is not one.
+fn operand_register(text: str, operands: []u8) -> u8 {
+    if text.len() >= 2 and text[0] == '%' {
+        return register_of(text[1..text.len()]);
+    }
+    if text.len() >= 2 and text[0] == '$' and text[1] >= '0' and text[1] <= '9' {
+        var n: usize = 0;
+        var i: usize = 1;
+        while i < text.len() : (i += 1) {
+            if text[i] < '0' or text[i] > '9' {
+                return NO_REG;
+            }
+            n = n * 10 + (text[i] - '0') as usize;
+        }
+        if n < operands.len() {
+            return operands[n];
+        }
+    }
+    return NO_REG;
+}
+
+fn parse_immediate(text: str) -> ?u64 {
+    // $$5 in the text the lowering leaves.
+    if text.len() < 3 or text[0] != '$' or text[1] != '$' {
+        return none;
+    }
+    var i: usize = 2;
+    var negative = false;
+    if text[i] == '-' {
+        negative = true;
+        i += 1;
+    }
+    var v: u64 = 0;
+    if i + 1 < text.len() and text[i] == '0' and text[i + 1] == 'x' {
+        i += 2;
+        while i < text.len() : (i += 1) {
+            var c = text[i];
+            if c >= 'a' and c <= 'f' {
+                c = c - 32;
+            }
+            if not ((c >= '0' and c <= '9') or (c >= 'A' and c <= 'F')) {
+                return none;
+            }
+            v = v *% 16 +% hex_value(c) as u64;
+        }
+    } else {
+        if i >= text.len() {
+            return none;
+        }
+        while i < text.len() : (i += 1) {
+            if text[i] < '0' or text[i] > '9' {
+                return none;
+            }
+            v = v *% 10 +% (text[i] - '0') as u64;
+        }
+    }
+    if negative {
+        v = ~v +% 1;
+    }
+    return v;
+}
+
+fn fail(problem: &mut alloc.String, what: str, instruction: str) -> bool {
+    problem.push_str(what);
+    problem.push_str(": ");
+    problem.push_str(instruction);
+    problem.push_str(" (a release build's assembler is LLVM's)");
+    return false;
+}
+
+fn two_operand(c: &mut cd.Code, name: str, line: str, rest: str, operands: []u8, problem: &mut alloc.String) -> bool {
+    if name.len() < 2 {
+        return fail(problem, what: "this backend's assembler does not know", instruction: line);
+    }
+    let suffix = name[name.len() - 1];
+    var size: u32 = 0;
+    if suffix == 'q' {
+        size = 8;
+    } else if suffix == 'l' {
+        size = 4;
+    } else {
+        return fail(problem, what: "this backend's assembler does not know", instruction: line);
+    }
+    let base = name[0..name.len() - 1];
+    var comma = rest.len();
+    var i: usize = 0;
+    while i < rest.len() : (i += 1) {
+        if rest[i] == ',' {
+            comma = i;
+            break;
+        }
+    }
+    if comma == rest.len() {
+        return fail(problem, what: "this backend's assembler reads two operands in", instruction: line);
+    }
+    let source = trim(rest[0..comma]);
+    let dest = operand_register(trim(rest[comma + 1..rest.len()]), operands);
+    if dest == NO_REG {
+        return fail(problem, what: "this backend's assembler reads a register as the destination in", instruction: line);
+    }
+    let from = operand_register(source, operands);
+    if base.eq("mov") {
+        if from != NO_REG {
+            cd.alu_rr(c, op: cd.OP_MOV, size, reg: dest, rm: from);
+            return true;
+        }
+        match parse_immediate(source) {
+            some(v) => {
+                var bits = v;
+                if size == 4 {
+                    bits = v & 0xFFFFFFFF;
+                }
+                cd.mov_ri(c, dst: dest, v: bits);
+                return true;
+            }
+            none => { return fail(problem, what: "this backend's assembler does not read the operand in", instruction: line); }
+        }
+    }
+    match digit_of_alu(base) {
+        some(digit) => {
+            if from != NO_REG {
+                cd.alu_rr(c, op: opcode_of_alu(base), size, reg: dest, rm: from);
+                return true;
+            }
+            match parse_immediate(source) {
+                some(v) => {
+                    if v > 0x7FFFFFFF and v < 0xFFFFFFFF80000000 {
+                        return fail(problem, what: "this backend's assembler takes 32-bit immediates in", instruction: line);
+                    }
+                    cd.alu_ri(c, digit: digit, size, rm: dest, imm: cd.i32_of_bits((v & 0xFFFFFFFF) as u32));
+                    return true;
+                }
+                none => { return fail(problem, what: "this backend's assembler does not read the operand in", instruction: line); }
+            }
+        }
+        none => { return fail(problem, what: "this backend's assembler does not know", instruction: line); }
+    }
+}
+
+/// Writes the text's instructions; false, with problem saying why, for one it
+/// does not know. Labels are numbers, as in "1: pause\n jmp 1b".
+pub fn assemble(c: &mut cd.Code, text: str, operands: []u8, problem: &mut alloc.String, a: alloc.Allocator) -> bool {
+    var label_numbers = alloc.List(u32).init(a);
+    var label_places = alloc.List(u64).init(a);
+    var fix_at = alloc.List(u64).init(a);
+    var fix_label = alloc.List(u32).init(a);
+    // The escapes first: a newline comes as \0A.
+    var clean = alloc.List(u8).init(a);
+    let raw_text = text.bytes();
+    var r: usize = 0;
+    while r < raw_text.len() : (r += 1) {
+        if raw_text[r] == '\\' and r + 2 < raw_text.len() {
+            clean.push(hex_value(raw_text[r + 1]) * 16 + hex_value(raw_text[r + 2]));
+            r += 2;
+        } else {
+            clean.push(raw_text[r]);
+        }
+    }
+    let t = clean.items();
+    var start: usize = 0;
+    var at: usize = 0;
+    while at <= t.len() : (at += 1) {
+        if at < t.len() and t[at] != '\n' and t[at] != ';' {
+            continue;
+        }
+        let line_bytes = t[start..at];
+        start = at + 1;
+        var line = "";
+        // ASCII: what the assembler reads is; anything else it does not know.
+        var ascii = true;
+        var q: usize = 0;
+        while q < line_bytes.len() : (q += 1) {
+            if line_bytes[q] > 127 {
+                ascii = false;
+            }
+        }
+        if not ascii {
+            problem.push_str("this backend's assembler reads ASCII");
+            return false;
+        }
+        var owned = alloc.String.init(a);
+        q = 0;
+        while q < line_bytes.len() : (q += 1) {
+            owned.push_ascii(line_bytes[q]);
+        }
+        line = trim(owned.view());
+        // A label before the instruction, or alone.
+        var colon = line.len();
+        q = 0;
+        while q < line.len() : (q += 1) {
+            if line[q] == ':' {
+                colon = q;
+                break;
+            }
+        }
+        if colon < line.len() {
+            var n: u32 = 0;
+            q = 0;
+            while q < colon : (q += 1) {
+                if line[q] < '0' or line[q] > '9' {
+                    return fail(problem, what: "this backend's assembler takes numbered labels in", instruction: line);
+                }
+                n = n * 10 + (line[q] - '0') as u32;
+            }
+            label_numbers.push(n);
+            label_places.push(cd.here(c));
+            // Forward jumps to it land here.
+            var k: usize = 0;
+            while k < fix_at.len() : (k += 1) {
+                if fix_label[k] == n {
+                    cd.patch_here(c, fix_at[k]);
+                    fix_label[k] = 4294967295;
+                }
+            }
+            line = trim(line[colon + 1..line.len()]);
+        }
+        if line.len() == 0 {
+            continue;
+        }
+        var word = line.len();
+        q = 0;
+        while q < line.len() : (q += 1) {
+            if is_space(line[q]) {
+                word = q;
+                break;
+            }
+        }
+        let name = line[0..word];
+        let rest = trim(line[word..line.len()]);
+        if rest.len() == 0 {
+            if not plain_instruction(c, name) {
+                return fail(problem, what: "this backend's assembler does not know", instruction: line);
+            }
+            continue;
+        }
+        // A jump to a numbered label.
+        let cc = condition_of(name);
+        var is_jump = name.eq("jmp");
+        match cc {
+            some(_) => { is_jump = true; }
+            none => { }
+        }
+        if is_jump {
+            let dir = rest[rest.len() - 1];
+            var n: u32 = 0;
+            q = 0;
+            while q + 1 < rest.len() : (q += 1) {
+                if rest[q] < '0' or rest[q] > '9' {
+                    return fail(problem, what: "this backend's assembler takes numbered labels in", instruction: line);
+                }
+                n = n * 10 + (rest[q] - '0') as u32;
+            }
+            var place: u64 = 0;
+            match cc {
+                some(code) => { place = cd.jcc(c, code); }
+                none => { place = cd.jmp(c); }
+            }
+            if dir == 'b' {
+                var found = false;
+                var k = label_numbers.len();
+                while k > 0 and not found : (k -= 1) {
+                    if label_numbers[k - 1] == n {
+                        cd.patch(c, at: place, target: label_places[k - 1]);
+                        found = true;
+                    }
+                }
+                if not found {
+                    return fail(problem, what: "no such label for", instruction: line);
+                }
+            } else if dir == 'f' {
+                fix_at.push(place);
+                fix_label.push(n);
+            } else {
+                return fail(problem, what: "this backend's assembler takes labels like 1b and 1f in", instruction: line);
+            }
+            continue;
+        }
+        if not two_operand(c, name: name, line: line, rest: rest, operands: operands, problem: problem) {
+            return false;
+        }
+    }
+    var k: usize = 0;
+    while k < fix_label.len() : (k += 1) {
+        if fix_label[k] != 4294967295 {
+            problem.push_str("an asm jumps forward to a label it does not have");
+            return false;
+        }
+    }
+    return true;
+}
