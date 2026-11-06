@@ -44,6 +44,7 @@ extern "c" fn a0rt_write_f64(output: *i64, x: f64);
 extern "c" fn a0rt_write_f32(output: *i64, x: f32);
 extern "c" fn a0rt_fs_read(path: *u8, path_len: u64, out: *mut u8, utf8: bool) -> u16;
 extern "c" fn a0rt_write_file(fs: *u8, path: *u8, path_len: u64, data: *u8, len: u64) -> u16;
+extern "c" fn a0rt_write_executable(fs: *u8, path: *u8, path_len: u64, data: *u8, len: u64) -> u16;
 extern "c" fn a0rt_flush_all();
 extern "c" fn a0rt_io_wait(fd: i64, events: u32);
 extern "c" fn a0rt_exit(status: u8) -> noreturn;
@@ -198,6 +199,19 @@ pub type Fs = struct {
             // SAFETY: both are read during the call only.
             let fs = mem.null(u8) as *u8;
             code = a0rt_write_file(fs: fs, path: mem.str_data(path), path_len: path.len() as u64, data: mem.slice_data(u8, data) as *u8, len: data.len() as u64);
+        }
+        if code != 0 {
+            return io_error(code);
+        }
+    }
+
+    /// Writes a program: a new file that the system can run.
+    pub fn write_executable(self: &Fs, path: str, data: []u8) -> IoError!void {
+        var code: u16 = 0;
+        unsafe {
+            // SAFETY: both are read during the call only.
+            let fs = mem.null(u8) as *u8;
+            code = a0rt_write_executable(fs: fs, path: mem.str_data(path), path_len: path.len() as u64, data: mem.slice_data(u8, data) as *u8, len: data.len() as u64);
         }
         if code != 0 {
             return io_error(code);

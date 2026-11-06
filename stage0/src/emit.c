@@ -455,8 +455,10 @@ static const char *emit_call(Emitter *em, const Expr *e) {
         const Expr *arg = VEC_AT(e->args, Arg, i)->value;
         const char *v = emit_expr(em, arg);
         // Slices have C types of the program's: the runtime reads this one's
-        // two fields through its address (a0_std_Fs_write_bytes).
-        if (e->call == CALL_METHOD && e->method->c_name && strcmp(e->method->c_name, "a0_std_Fs_write_bytes") == 0 && i == 1) {
+        // two fields through its address (a0_std_Fs_write_bytes and the like).
+        if (e->call == CALL_METHOD && e->method->c_name && i == 1 &&
+            (strcmp(e->method->c_name, "a0_std_Fs_write_bytes") == 0 ||
+             strcmp(e->method->c_name, "a0_std_Fs_write_executable") == 0)) {
             v = arena_printf("(%s[]){%s}", arg->type->c_name, v);
         }
         sb_printf(&args, "%s%s", args.len > 0 ? ", " : "", v);

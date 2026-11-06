@@ -1,0 +1,205 @@
+/// An ELF64 relocatable file as an object: how the runtime, which clang builds,
+/// and what LLVM builds come to the linker (`arche import`). It keeps what a
+/// program loads. Unwind tables, notes and debug info stay behind: a stack trace
+/// walks frame pointers, and debug info is the own backend's.
+import alloc;
+import native.buffer as nb;
+import native.object as ob;
+
+const SHT_PROGBITS: u32 = 1;
+const SHT_RELA: u32 = 4;
+const SHT_NOBITS: u32 = 8;
+const SHF_WRITE: u64 = 1;
+const SHF_ALLOC: u64 = 2;
+const SHF_EXEC: u64 = 4;
+const SHN_ABS: u32 = 0xFFF1;
+const SHN_COMMON: u32 = 0xFFF2;
+const SECTION_HEADER: u64 = 64;
+const SYMBOL_ENTRY: u64 = 24;
+const RELA_ENTRY: u64 = 24;
+
+fn get16(b: []u8, at: u64) -> u32 {
+    let i = at as usize;
+    return b[i] as u32 | ((b[i + 1] as u32) << 8);
+}
+
+fn get32(b: []u8, at: u64) -> u32 {
+    let i = at as usize;
+    return b[i] as u32 | ((b[i + 1] as u32) << 8) | ((b[i + 2] as u32) << 16) | ((b[i + 3] as u32) << 24);
+}
+
+fn get64(b: []u8, at: u64) -> u64 {
+    return get32(b, at: at) as u64 | ((get32(b, at: at + 4) as u64) << 32);
+}
+
+fn i64_of_bits(v: u64) -> i64 {
+    if v <= 0x7FFFFFFFFFFFFFFF {
+        return v as i64;
+    }
+    return -((18446744073709551615 - v) as i64) - 1;
+}
+
+/// A name at this place in a table inside the file; false when it runs off the
+/// end, or is not ASCII.
+fn take_name(b: []u8, at: u64, into: &mut alloc.String) -> bool {
+    var i = at;
+    while i < b.len() as u64 : (i += 1) {
+        let c = b[i as usize];
+        if c == 0 {
+            return true;
+        }
+        if c > 127 {
+            return false;
+        }
+        into.push_ascii(c);
+    }
+    return false;
+}
+
+fn in_file(b: []u8, at: u64, size: u64) -> bool {
+    let total = b.len() as u64;
+    return at <= total and size <= total - at;
+}
+
+/// The file as an object; if it is not a good one, problem says why.
+pub fn read(b: []u8, problem: &mut alloc.String, a: alloc.Allocator) -> ob.Object {
+    var o = ob.Object.init(machine: 0, flags: 0, a: a);
+    if b.len() < 64 or b[0] != 0x7F or b[1] != 'E' or b[2] != 'L' or b[3] != 'F' or b[4] != 2 or b[5] != 1 or get16(b, at: 16) != 1 {
+        problem.push_str("not a little-endian ELF64 relocatable file");
+        return o;
+    }
+    o.machine = get16(b, at: 18);
+    o.flags = get32(b, at: 48);
+    let shoff = get64(b, at: 40);
+    let shnum = get16(b, at: 60) as u64;
+    let shstrndx = get16(b, at: 62) as u64;
+    if shnum == 0 or shstrndx >= shnum or shnum > 65535 or not in_file(b, at: shoff, size: shnum * SECTION_HEADER) {
+        problem.push_str("an ELF file with a bad section table");
+        return o;
+    }
+    let names_at = get64(b, at: shoff + shstrndx * SECTION_HEADER + 24);
+    // Which of the file's sections are kept, and as what.
+    var kept = alloc.List(u32).init(a);
+    var symtab: u64 = 0;
+    var i: u64 = 0;
+    while i < shnum : (i += 1) {
+        let h = shoff + i * SECTION_HEADER;
+        let kind = get32(b, at: h + 4);
+        let flags = get64(b, at: h + 8);
+        var name = alloc.String.init(a);
+        if not in_file(b, at: names_at, size: get32(b, at: h) as u64) or not take_name(b, at: names_at + get32(b, at: h) as u64, into: &mut name) {
+            problem.push_str("an ELF file with a bad section name");
+            return o;
+        }
+        if kind == 2 {
+            symtab = i;
+        }
+        if flags & SHF_ALLOC == 0 or (kind != SHT_PROGBITS and kind != SHT_NOBITS) or name.view().eq(".eh_frame") {
+            kept.push(ob.NO_SECTION);
+            continue;
+        }
+        var out_flags: u64 = ob.FLAG_ALLOC;
+        if flags & SHF_WRITE != 0 {
+            out_flags = out_flags | ob.FLAG_WRITE;
+        }
+        if flags & SHF_EXEC != 0 {
+            out_flags = out_flags | ob.FLAG_EXEC;
+        }
+        var align = get64(b, at: h + 48);
+        if align == 0 {
+            align = 1;
+        }
+        if align & (align - 1) != 0 {
+            problem.push_str("an ELF file with a bad alignment");
+            return o;
+        }
+        let offset = get64(b, at: h + 24);
+        let size = get64(b, at: h + 32);
+        var bytes = alloc.List(u8).init(a);
+        var bss: u64 = 0;
+        if kind == SHT_NOBITS {
+            bss = size;
+        } else {
+            if not in_file(b, at: offset, size: size) {
+                problem.push_str("an ELF file with a section outside it");
+                return o;
+            }
+            var k = offset;
+            while k < offset + size : (k += 1) {
+                bytes.push(b[k as usize]);
+            }
+        }
+        kept.push(o.sections.len() as u32);
+        o.sections.push(ob.Section { name: name, flags: out_flags, align: align, bytes: bytes, relocs: alloc.List(nb.Reloc).init(a), symbol: ob.NO_SECTION, bss_size: bss });
+    }
+    if symtab == 0 {
+        return o;
+    }
+    let sym_header = shoff + symtab * SECTION_HEADER;
+    let syms_at = get64(b, at: sym_header + 24);
+    let syms_size = get64(b, at: sym_header + 32);
+    let strtab = get32(b, at: sym_header + 40) as u64;
+    if strtab >= shnum or not in_file(b, at: syms_at, size: syms_size) {
+        problem.push_str("an ELF file with a bad symbol table");
+        return o;
+    }
+    let strings_at = get64(b, at: shoff + strtab * SECTION_HEADER + 24);
+    let nsym = syms_size / SYMBOL_ENTRY;
+    i = 1;
+    while i < nsym : (i += 1) {
+        let e = syms_at + i * SYMBOL_ENTRY;
+        var name = alloc.String.init(a);
+        if not in_file(b, at: strings_at, size: get32(b, at: e) as u64) or not take_name(b, at: strings_at + get32(b, at: e) as u64, into: &mut name) {
+            problem.push_str("an ELF file with a symbol name that is not ASCII");
+            return o;
+        }
+        let info = b[(e + 4) as usize] as u32;
+        let bind = info >> 4;
+        let shndx = get16(b, at: e + 6);
+        var section = ob.NO_SECTION;
+        if shndx == SHN_COMMON {
+            problem.push_str("a common symbol: ");
+            problem.push_str(name.view());
+            return o;
+        }
+        if shndx != 0 and shndx != SHN_ABS and (shndx as u64) < shnum {
+            section = kept[shndx as usize];
+        }
+        var kind: u8 = 0;
+        if info & 15 <= 3 {
+            kind = (info & 15) as u8;
+        }
+        o.symbols.push(ob.Symbol { name: name, section: section, value: get64(b, at: e + 8), size: get64(b, at: e + 16), kind: kind, global: bind != 0, weak: bind == 2 });
+    }
+    // Their relocations; a file's symbol 0 is nothing, and ours start at its 1.
+    i = 0;
+    while i < shnum : (i += 1) {
+        let h = shoff + i * SECTION_HEADER;
+        if get32(b, at: h + 4) != SHT_RELA {
+            continue;
+        }
+        let target = get32(b, at: h + 44) as u64;
+        if target >= shnum or kept[target as usize] == ob.NO_SECTION {
+            continue;
+        }
+        let at = get64(b, at: h + 24);
+        let size = get64(b, at: h + 32);
+        if not in_file(b, at: at, size: size) {
+            problem.push_str("an ELF file with relocations outside it");
+            return o;
+        }
+        let section = kept[target as usize] as usize;
+        var k: u64 = 0;
+        while k < size / RELA_ENTRY : (k += 1) {
+            let e = at + k * RELA_ENTRY;
+            let rela_info = get64(b, at: e + 8);
+            let symbol = rela_info >> 32;
+            if symbol == 0 or symbol >= nsym {
+                problem.push_str("an ELF file with a relocation of no symbol");
+                return o;
+            }
+            o.sections[section].relocs.push(nb.Reloc { offset: get64(b, at: e), symbol: (symbol - 1) as u32, kind: (rela_info & 0xFFFFFFFF) as u32, addend: i64_of_bits(get64(b, at: e + 16)) });
+        }
+    }
+    return o;
+}

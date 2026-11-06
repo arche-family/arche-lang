@@ -135,7 +135,7 @@ Compiler bitta `arche` binary'si sifatida chiqadi, hajmi taxminan 60–100k qato
 
 ABI birinchi kundanoq stabil va hujjatlashtirilgan bo'ladi. C yo'q dunyoda keyin paydo bo'ladigan barcha tillar uchun umumiy interfeys aynan shu ABI bo'ladi.
 
-- **Calling convention** har target uchun alohida yoziladi: argument register'lari, callee-saved'lar, stack alignment 16. Slice va `!T` kabi ko'p qiymatlar register'larda qaytariladi.
+- **Calling convention** har target uchun alohida yoziladi: argument register'lari, callee-saved'lar, stack alignment 16. Scalar bo'lmagan natijalar (slice va `!T` ham) chaqiruvchi bergan xotiraga yoziladi: hamma target uchun bitta qoida.
 - **Layout'lar:** slice = `{ptr, len}`; `?T` pointer'da niche (null), boshqa turlarda `{tag, T}`; `!T` = `{error_code: u16, T}`; enum = `{tag, union}`, tag hajmi minimal.
 - **Symbol naming:** `module.path.fn` ko'rinishidagi deterministik mangling.
 - **Object format (`.ao`):** code, data, rodata, bss, relocation, symbol va debug section'lari. Relocation turlari har target uchun belgilangan.
@@ -260,7 +260,7 @@ Bugun bu reja bajarilsa, faqat bootstrap va infratuzilma qismlari mavjud vosital
 | stage0 assembly'da | stage0 C11'da (taxminan 5–8k qator): Arche-0'ni C'ga tarjima qiladi, natijani gcc, clang yoki tcc build qiladi; C'ning hex0'dan boshlanadigan to'liq bootstrap zanjiri Arche'ga ham o'tadi |
 | `std` monitor backend'i | `std` host backend'i (Linux syscall'lari) |
 | O'z release backend'i | o'z IR → LLVM textual `.ll` → `clang` / `llc`; debug va WASM uchun o'z backend'i |
-| O'z linker'i, `.ao` format | host'da ELF/PE + `lld`; Arche OS ichida o'z format'i |
+| O'z linker'i, `.ao` format | `.ao` va o'z linker'i bor; host'da u ELF yozadi, Arche OS uchun `.ax`; freestanding va Windows PE hozircha `lld` bilan |
 | O'z client/server juftligi bilan interop | OpenSSL, curl va brauzerlar bilan interop testlari |
 
 Self-hosting qoidasi o'zgarmaydi: stage1 Arche-0'da yoziladi va stage2 == stage3 talab qilinadi. Mavjud tildagi stage0 faqat bootstrap uchun saqlanadi. LLVM'ga frontend emas, faqat IR'dan `.ll` chiqaradigan backend ulanadi, shuning uchun uni keyin almashtirish frontend'ga tegmaydi.

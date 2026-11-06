@@ -320,16 +320,17 @@ fn runtime_includes(sys: &mut std.System, tools: &Tools, a: alloc.Allocator) -> 
 }
 
 /// Builds one program with the compiler's own backend, as ARCHE_BACKEND=own
-/// asks (docs/sprints.md S27): one object with its debug info and no LLVM, so
-/// quick that a cache of modules would have nothing to save. The runtime is
-/// still C, and has frame pointers for a panic's stack trace to walk.
+/// asks (docs/sprints.md S27, S29): one object with its debug info, linked by
+/// the compiler, with no LLVM and no lld, so quick that a cache of modules
+/// would have nothing to save. The runtime is still C, and has frame pointers
+/// for a panic's stack trace to walk.
 fn build_own(sys: &mut std.System, tools: &Tools, dir: str, name: str, root: str, a: alloc.Allocator) -> Failed!alloc.String {
     let out_dir = join(dir: dir, name: "build", a);
     let cache = join(dir: out_dir.view(), name: "cache", a);
     make_dirs(&sys.fs, dir: cache.view(), a: a);
     var object_name = alloc.String.init(a);
     object_name.push_str(name);
-    object_name.push_str(".o");
+    object_name.push_str(".ao");
     let object_file = join(dir: out_dir.view(), name: object_name.view(), a);
     let log = join(dir: out_dir.view(), name: "link.log", a);
     var argv = alloc.List(alloc.String).init(a);
@@ -347,17 +348,31 @@ fn build_own(sys: &mut std.System, tools: &Tools, dir: str, name: str, root: str
     let includes = runtime_includes(sys, tools: tools, a: a);
     var rt_hits: u32 = 0;
     let rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: &includes, flags: flags.view(), cache: cache.view(), hits: &mut rt_hits, a: a);
-    let lld = sys.env.get("LLD", a) orelse copy_text("ld.lld", a);
     let program = join(dir: out_dir.view(), name: name, a);
     var tmp = copy_text(program.view(), a);
     tmp.push_str(".tmp");
+    // The runtime is still C: its object, as the compiler's own linker reads it.
+    var rt_ao = copy_text(rt.view(), a);
+    rt_ao.push_str(".ao");
+    if not sys.fs.exists(rt_ao.view()) {
+        var convert = alloc.List(alloc.String).init(a);
+        convert.push(text_of(tools.arche.view().bytes(), a));
+        convert.push(text_of("import".bytes(), a));
+        convert.push(text_of(rt.view().bytes(), a));
+        convert.push(text_of(rt_ao.view().bytes(), a));
+        if try run(sys, argv: &convert, out_path: log.view(), a) != 0 {
+            sys.stderr.write("arche-driver: the runtime's object:\n");
+            let msg = sys.fs.read_file(log.view(), a) catch alloc.String.init(a);
+            sys.stderr.write(msg.view());
+            return Failed.Failed;
+        }
+    }
     var link = alloc.List(alloc.String).init(a);
-    link.push(text_of(lld.view().bytes(), a));
-    link.push(text_of("-static".bytes(), a));
-    link.push(text_of("-o".bytes(), a));
+    link.push(text_of(tools.arche.view().bytes(), a));
+    link.push(text_of("link".bytes(), a));
     link.push(text_of(tmp.view().bytes(), a));
     link.push(text_of(object_file.view().bytes(), a));
-    link.push(text_of(rt.view().bytes(), a));
+    link.push(text_of(rt_ao.view().bytes(), a));
     if try run(sys, argv: &link, out_path: log.view(), a) != 0 {
         sys.stderr.write("arche-driver: the link failed:\n");
         let msg = sys.fs.read_file(log.view(), a) catch alloc.String.init(a);

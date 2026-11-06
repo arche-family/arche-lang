@@ -16,6 +16,7 @@ import a64.inline;
 import ir.ir;
 import native.buffer as nb;
 import native.dwarf;
+import native.object as ob;
 import native.ranges as ra;
 import native.unit as uu;
 
@@ -1276,11 +1277,12 @@ fn gen_function(g: &mut Gen, m: &ir.Module, f: &ir.Function, index: usize) {
     uu.place_code(&mut g.u, f, index, &g.code);
 }
 
-/// The program as an ELF object for ARM64, or nothing, with problem saying why.
-pub fn object(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> alloc.List(u8) {
+/// The program, or the part of it scope says, as an object for ARM64.
+/// A problem goes to problem.
+pub fn object(m: &ir.Module, scope: uu.Scope, problem: &mut alloc.String, a: alloc.Allocator) -> ob.Object {
     let arch = dwarf.Arch { abs64: cd.R_ABS64, abs32: cd.R_ABS32, frame_reg: 29, return_reg: 30, is_x64: false, is_a64: true };
     var g = Gen {
-        u: uu.new_unit(m, machine: 183, flags: 0, arch: arch, pad_byte: 0, a: a),
+        u: uu.new_unit(m, scope, machine: 183, flags: 0, arch: arch, pad_byte: 0, a: a),
         r: ra.new_ranges(a),
         code: nb.new_code(a),
         block_offsets: alloc.List(u64).init(a),
@@ -1294,9 +1296,10 @@ pub fn object(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> 
     let fs = m.functions.items();
     var i: usize = 0;
     while i < fs.len() : (i += 1) {
-        if not fs[i].stub {
+        if uu.defines(&g.u, m, i) {
             gen_function(&mut g, m, &fs[i], i);
         }
     }
-    return uu.finish(&mut g.u, m, problem: problem);
+    uu.finish(&mut g.u, m, problem: problem);
+    return g.u.obj;
 }

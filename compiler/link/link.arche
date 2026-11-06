@@ -1,0 +1,551 @@
+/// The static linker (docs/abi.md): objects in, an image of the program out,
+/// with every address known and nothing left to the loader.
+///
+/// Each kind of section goes in one place: read-only data with the headers, code
+/// on pages of its own, then data and bss. Debug sections are put together by
+/// name, and are not loaded.
+import alloc;
+import native.object as ob;
+import link.relocate as rl;
+
+/// Where a program starts: below 2 GB, as RISC-V 64's and x86-64's absolute
+/// addresses need.
+pub const BASE: u64 = 0x400000;
+
+const NONE: u32 = 4294967295;
+
+pub type Input = struct {
+    pub name: alloc.String,
+    pub object: ob.Object,
+}
+
+pub type DebugSection = struct {
+    pub name: alloc.String,
+    pub bytes: alloc.List(u8),
+}
+
+/// Which part of the image a symbol is in: for the symbol table.
+pub type Part = enum { Rodata, Text, Data, Bss }
+
+pub type OutSymbol = struct {
+    pub name: alloc.String,
+    pub address: u64,
+    pub size: u64,
+    pub kind: u8,
+    pub global: bool,
+    pub part: Part,
+}
+
+pub type Image = struct {
+    pub machine: u32,
+    pub flags: u32,
+    pub entry: u64,
+    /// The size of a page: what the loader maps by.
+    pub page: u64,
+    /// The bytes of each part, and the addresses they load at; the read-only
+    /// part's starts after header_room bytes kept for the file's own headers.
+    pub header_room: u64,
+    pub rodata: alloc.List(u8),
+    pub rodata_at: u64,
+    pub text: alloc.List(u8),
+    pub text_at: u64,
+    pub data: alloc.List(u8),
+    pub data_at: u64,
+    pub bss_at: u64,
+    pub bss_size: u64,
+    pub debug: alloc.List(DebugSection),
+    pub symbols: alloc.List(OutSymbol),
+}
+
+/// Where a symbol's definition is: which input, which of its symbols.
+type Target = struct {
+    known: bool,
+    input: u32,
+    symbol: u32,
+}
+
+type Class = enum { Drop, Rodata, Text, Data, Bss, Debug }
+
+fn class_of(s: &ob.Section) -> Class {
+    if s.bss_size > 0 {
+        return Class.Bss;
+    }
+    if s.flags & ob.FLAG_EXEC != 0 {
+        return Class.Text;
+    }
+    if s.flags & ob.FLAG_ALLOC == 0 {
+        if s.name.view().starts_with(".debug_") {
+            return Class.Debug;
+        }
+        return Class.Drop;
+    }
+    if s.flags & ob.FLAG_WRITE != 0 {
+        return Class.Data;
+    }
+    return Class.Rodata;
+}
+
+fn align_up(v: u64, to: u64) -> u64 {
+    let over = v % to;
+    if over == 0 {
+        return v;
+    }
+    return v + to - over;
+}
+
+type Linker = struct {
+    /// Each input's sections' addresses, and each of its symbols' definitions.
+    addresses: alloc.List(alloc.List(u64)),
+    targets: alloc.List(alloc.List(Target)),
+    /// The global offset table: one slot for each symbol that needs one.
+    got_keys: alloc.Map(u64, u32),
+    got_slots: alloc.List(Target),
+    got_at: u64,
+    a: alloc.Allocator,
+}
+
+fn target_key(t: Target) -> u64 {
+    if not t.known {
+        return 18446744073709551615;
+    }
+    return ((t.input as u64) << 32) | t.symbol as u64;
+}
+
+fn say_input(problem: &mut alloc.String, name: str, what: str) {
+    problem.push_str(name);
+    problem.push_str(": ");
+    problem.push_str(what);
+}
+
+/// Finds every global's definition. Two definitions are an error, unless one
+/// is weak: the other goes.
+fn resolve(l: &mut Linker, inputs: []Input, problem: &mut alloc.String) {
+    var names = alloc.Interner.init(l.a);
+    var defined = alloc.Map(alloc.Symbol, u64).init(l.a);
+    var i: usize = 0;
+    while i < inputs.len() : (i += 1) {
+        let symbols = inputs[i].object.symbols.items();
+        var k: usize = 0;
+        while k < symbols.len() : (k += 1) {
+            let s = &symbols[k];
+            if not s.global or s.section == ob.NO_SECTION {
+                continue;
+            }
+            let key = names.intern(s.name.view());
+            let place = ((i as u64) << 32) | k as u64;
+            match defined.get(key) {
+                some(other) => {
+                    let first = &inputs[(other >> 32) as usize].object.symbols[(other & 0xFFFFFFFF) as usize];
+                    if first.weak {
+                        defined.put(key, place);
+                    } else if not s.weak {
+                        problem.push_str("the symbol ");
+                        problem.push_str(s.name.view());
+                        problem.push_str(" is defined in both ");
+                        problem.push_str(inputs[(other >> 32) as usize].name.view());
+                        problem.push_str(" and ");
+                        problem.push_str(inputs[i].name.view());
+                        return;
+                    }
+                }
+                none => { defined.put(key, place); }
+            }
+        }
+    }
+    i = 0;
+    while i < inputs.len() : (i += 1) {
+        let symbols = inputs[i].object.symbols.items();
+        var list = alloc.List(Target).init(l.a);
+        var k: usize = 0;
+        while k < symbols.len() : (k += 1) {
+            let s = &symbols[k];
+            if not s.global {
+                list.push(Target { known: s.section != ob.NO_SECTION, input: i as u32, symbol: k as u32 });
+            } else {
+                match defined.get(names.intern(s.name.view())) {
+                    some(place) => { list.push(Target { known: true, input: (place >> 32) as u32, symbol: (place & 0xFFFFFFFF) as u32 }); }
+                    none => { list.push(Target { known: false, input: i as u32, symbol: k as u32 }); }
+                }
+            }
+        }
+        l.targets.push(list);
+    }
+}
+
+/// Gives each section of this class its address, from start: where it ends.
+fn place_class(l: &mut Linker, inputs: []Input, class: Class, start: u64) -> u64 {
+    var at = start;
+    var i: usize = 0;
+    while i < inputs.len() : (i += 1) {
+        let sections = inputs[i].object.sections.items();
+        var k: usize = 0;
+        while k < sections.len() : (k += 1) {
+            if class_of(&sections[k]) == class {
+                at = align_up(v: at, to: sections[k].align);
+                l.addresses[i][k] = at;
+                if class == Class.Bss {
+                    at += sections[k].bss_size;
+                } else {
+                    at += sections[k].bytes.len() as u64;
+                }
+            }
+        }
+    }
+    return at;
+}
+
+/// A slot for each symbol that a relocation reaches through the table.
+fn find_got_slots(l: &mut Linker, inputs: []Input, machine: u32) {
+    var i: usize = 0;
+    while i < inputs.len() : (i += 1) {
+        let sections = inputs[i].object.sections.items();
+        var k: usize = 0;
+        while k < sections.len() : (k += 1) {
+            if class_of(&sections[k]) == Class.Drop {
+                continue;
+            }
+            let rs = sections[k].relocs.items();
+            var q: usize = 0;
+            while q < rs.len() : (q += 1) {
+                if rl.uses_got(machine: machine, kind: rs[q].kind) {
+                    let t = l.targets[i][rs[q].symbol as usize];
+                    let key = target_key(t);
+                    match l.got_keys.get(key) {
+                        some(_) => { }
+                        none => {
+                            l.got_keys.put(key, l.got_slots.len() as u32);
+                            l.got_slots.push(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn address_of(l: &Linker, inputs: []Input, t: Target) -> u64 {
+    if not t.known {
+        return 0;
+    }
+    let s = &inputs[t.input as usize].object.symbols[t.symbol as usize];
+    return l.addresses[t.input as usize][s.section as usize] + s.value;
+}
+
+fn i64_of(v: u64) -> i64 {
+    return v as i64;
+}
+
+/// The section's bytes in the part they go in, relocated.
+fn copy_section(l: &Linker, inputs: []Input, machine: u32, into: &mut alloc.List(u8), start: u64, i: usize, k: usize, problem: &mut alloc.String) {
+    let section = &inputs[i].object.sections[k];
+    let address = l.addresses[i][k];
+    let offset = (address - start) as usize;
+    while into.len() < offset {
+        into.push(0);
+    }
+    let bytes = section.bytes.items();
+    var q: usize = 0;
+    while q < bytes.len() : (q += 1) {
+        into.push(bytes[q]);
+    }
+    let rs = section.relocs.items();
+    q = 0;
+    while q < rs.len() and problem.len() == 0 : (q += 1) {
+        let r = rs[q];
+        if r.symbol as usize >= l.targets[i].len() {
+            say_input(problem, name: inputs[i].name.view(), what: "a relocation of no symbol");
+            return;
+        }
+        let t = l.targets[i][r.symbol as usize];
+        let s = &inputs[i].object.symbols[r.symbol as usize];
+        if not t.known and not s.weak {
+            say_input(problem, name: inputs[i].name.view(), what: "undefined symbol ");
+            if s.name.len() > 0 {
+                problem.push_str(s.name.view());
+            } else {
+                problem.push_str("(without a name)");
+            }
+            return;
+        }
+        var got: u64 = 0;
+        if rl.uses_got(machine: machine, kind: r.kind) {
+            match l.got_keys.get(target_key(t)) {
+                some(slot) => { got = l.got_at + slot as u64 * 8; }
+                none => { }
+            }
+        }
+        if r.offset > bytes.len() as u64 {
+            say_input(problem, name: inputs[i].name.view(), what: "a relocation outside its section");
+            return;
+        }
+        let site = rl.Site {
+            at: offset + r.offset as usize,
+            place: i64_of(address + r.offset),
+            value: i64_of(address_of(l, inputs, t)) + r.addend,
+            got: i64_of(got),
+        };
+        let done = rl.apply(machine: machine, kind: r.kind, into.items_mut(), site);
+        match done {
+            .Done => { }
+            .OutOfRange => {
+                say_input(problem, name: inputs[i].name.view(), what: "a relocation cannot reach ");
+                problem.push_str(s.name.view());
+            }
+            .Misaligned => {
+                say_input(problem, name: inputs[i].name.view(), what: "a relocation needs an aligned address for ");
+                problem.push_str(s.name.view());
+            }
+            .Unknown => { say_input(problem, name: inputs[i].name.view(), what: "a relocation of a kind this linker does not know (for RISC-V, build with -mno-relax)"); }
+            .OutsideSection => { say_input(problem, name: inputs[i].name.view(), what: "a relocation outside its section"); }
+        }
+    }
+}
+
+fn copy_class(l: &Linker, inputs: []Input, machine: u32, class: Class, into: &mut alloc.List(u8), start: u64, problem: &mut alloc.String) {
+    var i: usize = 0;
+    while i < inputs.len() : (i += 1) {
+        let sections = inputs[i].object.sections.items();
+        var k: usize = 0;
+        while k < sections.len() : (k += 1) {
+            if class_of(&sections[k]) == class {
+                copy_section(l, inputs, machine: machine, into: into, start: start, i: i, k: k, problem: problem);
+            }
+        }
+    }
+}
+
+fn find_debug(list: &alloc.List(DebugSection), name: str) -> ?usize {
+    var i: usize = 0;
+    while i < list.len() : (i += 1) {
+        if list.items()[i].name.view().eq(name) {
+            return i;
+        }
+    }
+    return none;
+}
+
+/// Debug sections of one name, one after another. An address in them is an
+/// offset, which is what debug info wants of them.
+fn link_debug(l: &mut Linker, inputs: []Input, machine: u32, a: alloc.Allocator, problem: &mut alloc.String) -> alloc.List(DebugSection) {
+    var list = alloc.List(DebugSection).init(a);
+    var i: usize = 0;
+    while i < inputs.len() : (i += 1) {
+        let sections = inputs[i].object.sections.items();
+        var k: usize = 0;
+        while k < sections.len() : (k += 1) {
+            if class_of(&sections[k]) != Class.Debug {
+                continue;
+            }
+            match find_debug(&list, sections[k].name.view()) {
+                some(_) => { }
+                none => {
+                    var name = alloc.String.init(a);
+                    name.push_str(sections[k].name.view());
+                    list.push(DebugSection { name: name, bytes: alloc.List(u8).init(a) });
+                }
+            }
+        }
+    }
+    // All addresses first: debug sections refer to each other.
+    var sizes = alloc.List(u64).init(a);
+    var d: usize = 0;
+    while d < list.len() : (d += 1) {
+        sizes.push(0);
+    }
+    i = 0;
+    while i < inputs.len() : (i += 1) {
+        let sections = inputs[i].object.sections.items();
+        var k: usize = 0;
+        while k < sections.len() : (k += 1) {
+            if class_of(&sections[k]) == Class.Debug {
+                let index = find_debug(&list, sections[k].name.view()) orelse 0;
+                let at = align_up(v: sizes[index], to: sections[k].align);
+                l.addresses[i][k] = at;
+                sizes[index] = at + sections[k].bytes.len() as u64;
+            }
+        }
+    }
+    i = 0;
+    while i < inputs.len() : (i += 1) {
+        let sections = inputs[i].object.sections.items();
+        var k: usize = 0;
+        while k < sections.len() : (k += 1) {
+            if class_of(&sections[k]) == Class.Debug {
+                let index = find_debug(&list, sections[k].name.view()) orelse 0;
+                copy_section(l, inputs, machine: machine, into: &mut list[index].bytes, start: 0, i: i, k: k, problem: problem);
+            }
+        }
+    }
+    return list;
+}
+
+fn part_of(class: Class) -> Part {
+    match class {
+        .Text => { return Part.Text; }
+        .Data => { return Part.Data; }
+        .Bss => { return Part.Bss; }
+        _ => { return Part.Rodata; }
+    }
+}
+
+/// The symbols worth a debugger's knowing: those with names, in loaded parts.
+fn out_symbols(l: &Linker, inputs: []Input, a: alloc.Allocator) -> alloc.List(OutSymbol) {
+    var out = alloc.List(OutSymbol).init(a);
+    var i: usize = 0;
+    while i < inputs.len() : (i += 1) {
+        let symbols = inputs[i].object.symbols.items();
+        var k: usize = 0;
+        while k < symbols.len() : (k += 1) {
+            let s = &symbols[k];
+            if s.name.len() == 0 or s.section == ob.NO_SECTION or s.kind == 3 {
+                continue;
+            }
+            let class = class_of(&inputs[i].object.sections[s.section as usize]);
+            if class == Class.Drop or class == Class.Debug {
+                continue;
+            }
+            // A weak definition another went before.
+            let t = l.targets[i][k];
+            if t.input != i as u32 or t.symbol != k as u32 {
+                continue;
+            }
+            var name = alloc.String.init(a);
+            name.push_str(s.name.view());
+            out.push(OutSymbol { name: name, address: address_of(l, inputs, t), size: s.size, kind: s.kind, global: s.global, part: part_of(class) });
+        }
+    }
+    return out;
+}
+
+fn page_of(machine: u32) -> u64 {
+    if machine == rl.AARCH64 {
+        return 0x10000;
+    }
+    return 0x1000;
+}
+
+fn empty_image(a: alloc.Allocator) -> Image {
+    return Image {
+        machine: 0,
+        flags: 0,
+        entry: 0,
+        page: 0,
+        header_room: 0,
+        rodata: alloc.List(u8).init(a),
+        rodata_at: 0,
+        text: alloc.List(u8).init(a),
+        text_at: 0,
+        data: alloc.List(u8).init(a),
+        data_at: 0,
+        bss_at: 0,
+        bss_size: 0,
+        debug: alloc.List(DebugSection).init(a),
+        symbols: alloc.List(OutSymbol).init(a),
+    };
+}
+
+/// Links the objects, with header_room bytes kept for the file's headers. If it
+/// cannot, problem says why.
+pub fn link(inputs: []Input, header_room: u64, problem: &mut alloc.String, a: alloc.Allocator) -> Image {
+    var image = empty_image(a);
+    if inputs.len() == 0 {
+        problem.push_str("nothing to link");
+        return image;
+    }
+    let machine = inputs[0].object.machine;
+    if machine != rl.X86_64 and machine != rl.AARCH64 and machine != rl.RISCV64 {
+        say_input(problem, name: inputs[0].name.view(), what: "an object for a processor this linker does not know");
+        return image;
+    }
+    var flags: u32 = 0;
+    var l = Linker {
+        addresses: alloc.List(alloc.List(u64)).init(a),
+        targets: alloc.List(alloc.List(Target)).init(a),
+        got_keys: alloc.Map(u64, u32).init(a),
+        got_slots: alloc.List(Target).init(a),
+        got_at: 0,
+        a: a,
+    };
+    var i: usize = 0;
+    while i < inputs.len() : (i += 1) {
+        if inputs[i].object.machine != machine {
+            problem.push_str(inputs[i].name.view());
+            problem.push_str(" is for another processor than ");
+            problem.push_str(inputs[0].name.view());
+            return image;
+        }
+        flags = flags | inputs[i].object.flags;
+        var list = alloc.List(u64).init(a);
+        var k: usize = 0;
+        while k < inputs[i].object.sections.len() : (k += 1) {
+            list.push(0);
+        }
+        l.addresses.push(list);
+    }
+    resolve(&mut l, inputs, problem: problem);
+    if problem.len() > 0 {
+        return image;
+    }
+    find_got_slots(&mut l, inputs, machine: machine);
+    let page = page_of(machine);
+    let rodata_at = BASE + header_room;
+    var at = place_class(&mut l, inputs, class: Class.Rodata, start: rodata_at);
+    at = align_up(v: at, to: 8);
+    l.got_at = at;
+    at += l.got_slots.len() as u64 * 8;
+    let text_at = align_up(v: at, to: page);
+    at = place_class(&mut l, inputs, class: Class.Text, start: text_at);
+    let data_at = align_up(v: at, to: page);
+    at = place_class(&mut l, inputs, class: Class.Data, start: data_at);
+    let data_end = at;
+    // Everything of bss comes after all of data, so that the file need not
+    // hold it.
+    let bss_at = at;
+    let bss_end = place_class(&mut l, inputs, class: Class.Bss, start: bss_at);
+    image.debug = link_debug(&mut l, inputs, machine: machine, a: a, problem: problem);
+    copy_class(&l, inputs, machine: machine, class: Class.Rodata, into: &mut image.rodata, start: rodata_at, problem: problem);
+    copy_class(&l, inputs, machine: machine, class: Class.Text, into: &mut image.text, start: text_at, problem: problem);
+    copy_class(&l, inputs, machine: machine, class: Class.Data, into: &mut image.data, start: data_at, problem: problem);
+    if problem.len() > 0 {
+        return image;
+    }
+    while (image.rodata.len() as u64) < l.got_at - rodata_at {
+        image.rodata.push(0);
+    }
+    i = 0;
+    while i < l.got_slots.len() : (i += 1) {
+        ob.put64(&mut image.rodata, address_of(&l, inputs, l.got_slots[i]));
+    }
+    while (image.data.len() as u64) < data_end - data_at {
+        image.data.push(0);
+    }
+    var entry = NONE;
+    var entry_input: usize = 0;
+    i = 0;
+    while i < inputs.len() : (i += 1) {
+        let symbols = inputs[i].object.symbols.items();
+        var k: usize = 0;
+        while k < symbols.len() : (k += 1) {
+            if entry == NONE and symbols[k].global and symbols[k].section != ob.NO_SECTION and symbols[k].name.view().eq("_start") {
+                entry = k as u32;
+                entry_input = i;
+            }
+        }
+    }
+    if entry == NONE {
+        problem.push_str("no _start: the program has no entry point");
+        return image;
+    }
+    image.entry = address_of(&l, inputs, Target { known: true, input: entry_input as u32, symbol: entry });
+    image.machine = machine;
+    image.flags = flags;
+    image.page = page;
+    image.header_room = header_room;
+    image.rodata_at = rodata_at;
+    image.text_at = text_at;
+    image.data_at = data_at;
+    image.bss_at = bss_at;
+    image.bss_size = bss_end - bss_at;
+    image.symbols = out_symbols(&l, inputs, a: a);
+    return image;
+}

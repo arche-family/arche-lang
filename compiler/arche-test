@@ -21,8 +21,8 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 if [ "$ARCHE_BACKEND" = own ]; then
-    "${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG test "$src" "$work/tests.o"
-    "$LLD" -static -o "$work/tests" "$work/tests.o" "$rt"
+    "${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG test "$src" "$work/tests.ao"
+    own_link "$work/tests" "$work/tests.ao" "$rt"
 else
     "${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG test "$src" "$work/tests.ll"
     $cc -O1 $LINK_FLAGS -Wno-override-module -o "$work/tests" "$work/tests.ll" "$rt"

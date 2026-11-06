@@ -1,0 +1,36 @@
+// test: run
+// spec: 11
+// stdout: 3 7 8 9; 2 1 2; not found
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var bytes = alloc.List(u8).init(sys.alloc);
+    bytes.push(7);
+    bytes.push(8);
+    bytes.push(9);
+    try sys.fs.write_executable("fs-write-executable.tmp", bytes.items());
+    let back = try sys.fs.read_bytes("fs-write-executable.tmp", sys.alloc);
+    sys.stdout.write_u64(back.len() as u64);
+    var i: usize = 0;
+    while i < back.len() : (i += 1) {
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(back[i] as u64);
+    }
+    // Over what is there, which goes.
+    var shorter = alloc.List(u8).init(sys.alloc);
+    shorter.push(1);
+    shorter.push(2);
+    try sys.fs.write_executable("fs-write-executable.tmp", shorter.items());
+    let again = try sys.fs.read_bytes("fs-write-executable.tmp", sys.alloc);
+    sys.stdout.write("; ");
+    sys.stdout.write_u64(again.len() as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(again[0] as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(again[1] as u64);
+    match sys.fs.write_executable("no-such-dir/out.bin", bytes.items()) {
+        err(.NotFound) => { sys.stdout.write("; not found\n"); }
+        _ => { sys.stdout.write("; ?\n"); }
+    }
+}

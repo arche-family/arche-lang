@@ -101,6 +101,17 @@ static i64 os_open_write(const u8 *path, u64 path_len) {
     return fd < 0 ? -(i64)io_code(fd) : fd;
 }
 
+static i64 os_open_program(const u8 *path, u64 path_len) {
+    char *p = c_path(path, path_len);
+    if (!p) {
+        return -IO_NOT_FOUND;
+    }
+    // A new file: what was there kept its own mode, and may be running.
+    sys3(SYS_UNLINKAT, AT_FDCWD, (i64)p, 0);
+    i64 fd = sys4(SYS_OPENAT, AT_FDCWD, (i64)p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+    return fd < 0 ? -(i64)io_code(fd) : fd;
+}
+
 static i64 os_read(i64 handle, u8 *p, u64 n) {
     i64 got = sys3(SYS_READ, handle, (i64)p, (i64)n);
     return got < 0 ? -(i64)io_code(got) : got;

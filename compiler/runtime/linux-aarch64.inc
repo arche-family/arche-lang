@@ -26,7 +26,7 @@ static i64 sys4(i64 n, i64 a, i64 b, i64 c, i64 d) {
 }
 
 enum { SYS_READ = 63, SYS_WRITE = 64, SYS_CLOSE = 57, SYS_FSTAT = 80, SYS_MMAP = 222, SYS_MPROTECT = 226, SYS_MUNMAP = 215, SYS_GETPID = 172, SYS_PIPE2 = 59, SYS_SCHED_GETAFFINITY = 123,
-       SYS_EXIT = 93, SYS_WAIT4 = 260, SYS_CLOCK_GETTIME = 113, SYS_EXIT_GROUP = 94, SYS_OPENAT = 56 };
+       SYS_EXIT = 93, SYS_WAIT4 = 260, SYS_CLOCK_GETTIME = 113, SYS_EXIT_GROUP = 94, SYS_OPENAT = 56, SYS_UNLINKAT = 35 };
 
 static i64 sys_poll(PollFd *fds, u64 n) {
     return sys6(73, (i64)fds, (i64)n, 0, 0, 0, 0);

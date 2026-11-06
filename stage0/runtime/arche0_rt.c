@@ -6,6 +6,9 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 #if defined(_WIN32)
 #include <wchar.h>
@@ -557,6 +560,28 @@ a0_err a0_std_Fs_write_bytes(a0_std_Fs *self, a0_str path, const void *data) {
     a0_str bytes;
     memcpy(&bytes, data, sizeof bytes);
     return a0_std_Fs_write_file(self, path, bytes);
+}
+
+// A program: bytes that the system will run. On Windows its name says so.
+a0_err a0_std_Fs_write_executable(a0_std_Fs *self, a0_str path, const void *data) {
+    a0_err e = a0_std_Fs_write_bytes(self, path, data);
+    if (e != 0) {
+        return e;
+    }
+#ifndef _WIN32
+    char *p = malloc((size_t)path.len + 1);
+    if (!p) {
+        return A0_ERR_IO_FAILED;
+    }
+    memcpy(p, path.ptr, (size_t)path.len);
+    p[path.len] = 0;
+    int failed = chmod(p, 0755);
+    free(p);
+    if (failed != 0) {
+        return io_error(errno);
+    }
+#endif
+    return 0;
 }
 
 // ---- std.Output -------------------------------------------------------------

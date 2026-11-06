@@ -38,6 +38,7 @@ static void os_stack_unmap(u8 *p, u64 n);
 // files and output
 static i64 os_open_read(const u8 *path, u64 path_len);
 static i64 os_open_write(const u8 *path, u64 path_len);
+static i64 os_open_program(const u8 *path, u64 path_len);
 static i64 os_read(i64 handle, u8 *p, u64 n);
 static i64 os_write(i64 handle, const u8 *p, u64 n);
 static void os_close(i64 handle);
@@ -1141,9 +1142,19 @@ void a0rt_read_bytes(const void *fs, const u8 *path, u64 path_len, u64 allocator
     *(u16 *)result = read_into(path, path_len, value);
 }
 
+static u16 write_whole(i64 fd, const u8 *data, u64 len);
+
 u16 a0rt_write_file(const void *fs, const u8 *path, u64 path_len, const u8 *data, u64 len) {
     (void)fs;
-    i64 fd = os_open_write(path, path_len);
+    return write_whole(os_open_write(path, path_len), data, len);
+}
+
+u16 a0rt_write_executable(const void *fs, const u8 *path, u64 path_len, const u8 *data, u64 len) {
+    (void)fs;
+    return write_whole(os_open_program(path, path_len), data, len);
+}
+
+static u16 write_whole(i64 fd, const u8 *data, u64 len) {
     if (fd < 0) {
         return io_error(fd);
     }

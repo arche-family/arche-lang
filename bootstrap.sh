@@ -86,18 +86,20 @@ else
     exit 1
 fi
 
-# The compiler's own backend, on Linux (docs/sprints.md S27): objects with no
-# LLVM, with their debug info, plain and on the library's alloc and std. And
-# the compiler it built computes what the others do.
+# The compiler's own backend and linker, on Linux (docs/sprints.md S27, S29):
+# programs with no LLVM and no lld, with their debug info, plain and on the
+# library's alloc and std. And the compiler it built computes what the others
+# do.
 if [ "$ARCHE_TARGET" = linux-x86_64 ]; then
     own_chain() { # directory, flags
         mkdir -p "$work/$1/stage2" "$work/$1/stage3"
         echo "bootstrap: stage2 by the own backend ($1), built by stage1"
-        (cd "$root/compiler" && "$stage1" $2 build main.arche "$work/$1/stage2/arche.o")
-        (cd "$work/$1/stage2" && "$LLD" -static -o arche arche.o "$rt")
+        (cd "$root/compiler" && "$stage1" $2 build main.arche "$work/$1/stage2/arche.ao")
+        "$stage1" import "$rt" "$work/rt.ao"
+        "$stage1" link "$work/$1/stage2/arche" "$work/$1/stage2/arche.ao" "$work/rt.ao"
         echo "bootstrap: stage3 by the own backend ($1), built by stage2"
-        (cd "$root/compiler" && "$work/$1/stage2/arche" $2 build main.arche "$work/$1/stage3/arche.o")
-        (cd "$work/$1/stage3" && "$LLD" -static -o arche arche.o "$rt")
+        (cd "$root/compiler" && "$work/$1/stage2/arche" $2 build main.arche "$work/$1/stage3/arche.ao")
+        "$work/$1/stage2/arche" link "$work/$1/stage3/arche" "$work/$1/stage3/arche.ao" "$work/rt.ao"
         if cmp -s "$work/$1/stage2/arche" "$work/$1/stage3/arche"; then
             echo "bootstrap: with the own backend ($1), stage2 and stage3 are bit-identical"
             sha256sum "$work/$1/stage3/arche"

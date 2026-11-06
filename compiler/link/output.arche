@@ -1,0 +1,235 @@
+/// A linked program as a file: an ELF executable, for Linux and for debuggers,
+/// or an Arche executable, `.ax`, for Arche OS's loader (docs/abi.md).
+import alloc;
+import native.ao;
+import native.object as ob;
+import link.link as ln;
+
+const ELF_HEADER: u64 = 64;
+const PROGRAM_HEADER: u64 = 56;
+const SECTION_HEADER: u64 = 64;
+const SYMBOL_ENTRY: u64 = 24;
+
+/// The room the first segment keeps for the ELF file's own headers.
+pub const ELF_ROOM: u64 = 64 + 56 * 4;
+
+const AX_HEADER: u64 = 40;
+const AX_SEGMENT: u64 = 40;
+
+const READ: u32 = 4;
+const WRITE: u32 = 2;
+const EXEC: u32 = 1;
+
+fn put_bytes(out: &mut alloc.List(u8), b: []u8) {
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        out.push(b[i]);
+    }
+}
+
+fn pad_until(out: &mut alloc.List(u8), size: u64) {
+    while (out.len() as u64) < size {
+        out.push(0);
+    }
+}
+
+fn put_program_header(out: &mut alloc.List(u8), kind: u32, flags: u32, offset: u64, address: u64, file_size: u64, memory_size: u64, align: u64) {
+    ob.put32(out, kind);
+    ob.put32(out, flags);
+    ob.put64(out, offset);
+    ob.put64(out, address);
+    ob.put64(out, address);
+    ob.put64(out, file_size);
+    ob.put64(out, memory_size);
+    ob.put64(out, align);
+}
+
+fn put_section_header(out: &mut alloc.List(u8), name: u32, kind: u32, flags: u64, address: u64, offset: u64, size: u64, link: u32, info: u32, align: u64, entry: u64) {
+    ob.put32(out, name);
+    ob.put32(out, kind);
+    ob.put64(out, flags);
+    ob.put64(out, address);
+    ob.put64(out, offset);
+    ob.put64(out, size);
+    ob.put32(out, link);
+    ob.put32(out, info);
+    ob.put64(out, align);
+    ob.put64(out, entry);
+}
+
+fn put_name(table: &mut alloc.List(u8), name: str) -> u32 {
+    let at = table.len() as u32;
+    put_bytes(table, name.bytes());
+    table.push(0);
+    return at;
+}
+
+fn part_section(part: ln.Part) -> u32 {
+    match part {
+        .Rodata => { return 1; }
+        .Text => { return 2; }
+        .Data => { return 3; }
+        .Bss => { return 4; }
+    }
+}
+
+/// The image's loaded parts, each at its address's distance from the base.
+fn put_loaded(out: &mut alloc.List(u8), im: &ln.Image, start: u64) {
+    pad_until(out, start + (im.rodata_at - ln.BASE));
+    put_bytes(out, im.rodata.items());
+    pad_until(out, start + (im.text_at - ln.BASE));
+    put_bytes(out, im.text.items());
+    pad_until(out, start + (im.data_at - ln.BASE));
+    put_bytes(out, im.data.items());
+}
+
+/// The program as an ELF executable, its symbols and debug info with it.
+pub fn elf_executable(im: &ln.Image, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    let magic = "\x7FELF".bytes();
+    put_bytes(&mut out, magic);
+    out.push(2);
+    out.push(1);
+    out.push(1);
+    var k: u32 = 0;
+    while k < 9 : (k += 1) {
+        out.push(0);
+    }
+    ob.put16(&mut out, 2);
+    ob.put16(&mut out, im.machine);
+    ob.put32(&mut out, 1);
+    ob.put64(&mut out, im.entry);
+    ob.put64(&mut out, ELF_HEADER);
+    let shoff_at = out.len();
+    ob.put64(&mut out, 0);
+    ob.put32(&mut out, im.flags);
+    ob.put16(&mut out, ELF_HEADER as u32);
+    ob.put16(&mut out, PROGRAM_HEADER as u32);
+    ob.put16(&mut out, 4);
+    ob.put16(&mut out, SECTION_HEADER as u32);
+    let section_count = 8 + im.debug.len() as u32;
+    ob.put16(&mut out, section_count);
+    ob.put16(&mut out, section_count - 1);
+    let rodata_end = im.rodata_at + im.rodata.len() as u64;
+    let text_size = im.text.len() as u64;
+    let data_size = im.data.len() as u64;
+    put_program_header(&mut out, kind: 1, flags: READ, offset: 0, address: ln.BASE, file_size: rodata_end - ln.BASE, memory_size: rodata_end - ln.BASE, align: im.page);
+    put_program_header(&mut out, kind: 1, flags: READ | EXEC, offset: im.text_at - ln.BASE, address: im.text_at, file_size: text_size, memory_size: text_size, align: im.page);
+    put_program_header(&mut out, kind: 1, flags: READ | WRITE, offset: im.data_at - ln.BASE, address: im.data_at, file_size: data_size, memory_size: data_size + im.bss_size, align: im.page);
+    // PT_GNU_STACK: a stack that does not run.
+    put_program_header(&mut out, kind: 0x6474E551, flags: READ | WRITE, offset: 0, address: 0, file_size: 0, memory_size: 0, align: 16);
+    put_loaded(&mut out, im, start: 0);
+    let bss_offset = out.len() as u64;
+
+    var names = alloc.List(u8).init(a);
+    names.push(0);
+    let rodata_name = put_name(&mut names, ".rodata");
+    let text_name = put_name(&mut names, ".text");
+    let data_name = put_name(&mut names, ".data");
+    let bss_name = put_name(&mut names, ".bss");
+    var debug_names = alloc.List(u32).init(a);
+    var debug_offsets = alloc.List(u64).init(a);
+    let debug = im.debug.items();
+    var i: usize = 0;
+    while i < debug.len() : (i += 1) {
+        debug_names.push(put_name(&mut names, debug[i].name.view()));
+        debug_offsets.push(out.len() as u64);
+        put_bytes(&mut out, debug[i].bytes.items());
+    }
+    let symtab_name = put_name(&mut names, ".symtab");
+    let strtab_name = put_name(&mut names, ".strtab");
+    let shstrtab_name = put_name(&mut names, ".shstrtab");
+
+    // ELF wants the local symbols first.
+    var strings = alloc.List(u8).init(a);
+    strings.push(0);
+    ob.pad_to(&mut out, 8);
+    let symtab_offset = out.len() as u64;
+    k = 0;
+    while k < SYMBOL_ENTRY as u32 : (k += 1) {
+        out.push(0);
+    }
+    var first_global: u32 = 1;
+    var pass: u32 = 0;
+    while pass < 2 : (pass += 1) {
+        let symbols = im.symbols.items();
+        i = 0;
+        while i < symbols.len() : (i += 1) {
+            let s = &symbols[i];
+            if s.global != (pass == 1) {
+                continue;
+            }
+            ob.put32(&mut out, put_name(&mut strings, s.name.view()));
+            var bind: u8 = 0;
+            if s.global {
+                bind = 1;
+            }
+            out.push((bind << 4) | s.kind);
+            out.push(0);
+            ob.put16(&mut out, part_section(s.part));
+            ob.put64(&mut out, s.address);
+            ob.put64(&mut out, s.size);
+            if pass == 0 {
+                first_global += 1;
+            }
+        }
+    }
+    let symtab_size = out.len() as u64 - symtab_offset;
+    let strtab_offset = out.len() as u64;
+    put_bytes(&mut out, strings.items());
+    let shstrtab_offset = out.len() as u64;
+    put_bytes(&mut out, names.items());
+    ob.pad_to(&mut out, 8);
+    let shoff = out.len() as u64;
+    let bytes = out.items_mut();
+    k = 0;
+    while k < 8 : (k += 1) {
+        bytes[shoff_at + k as usize] = ((shoff >> (k as u64 * 8)) & 255) as u8;
+    }
+    let alloc_flag: u64 = 2;
+    put_section_header(&mut out, name: 0, kind: 0, flags: 0, address: 0, offset: 0, size: 0, link: 0, info: 0, align: 0, entry: 0);
+    put_section_header(&mut out, name: rodata_name, kind: 1, flags: alloc_flag, address: im.rodata_at, offset: im.rodata_at - ln.BASE, size: im.rodata.len() as u64, link: 0, info: 0, align: 8, entry: 0);
+    put_section_header(&mut out, name: text_name, kind: 1, flags: alloc_flag | 4, address: im.text_at, offset: im.text_at - ln.BASE, size: text_size, link: 0, info: 0, align: 16, entry: 0);
+    put_section_header(&mut out, name: data_name, kind: 1, flags: alloc_flag | 1, address: im.data_at, offset: im.data_at - ln.BASE, size: data_size, link: 0, info: 0, align: 8, entry: 0);
+    put_section_header(&mut out, name: bss_name, kind: 8, flags: alloc_flag | 1, address: im.bss_at, offset: bss_offset, size: im.bss_size, link: 0, info: 0, align: 8, entry: 0);
+    i = 0;
+    while i < debug.len() : (i += 1) {
+        put_section_header(&mut out, name: debug_names[i], kind: 1, flags: 0, address: 0, offset: debug_offsets[i], size: debug[i].bytes.len() as u64, link: 0, info: 0, align: 1, entry: 0);
+    }
+    let symtab_index = 5 + debug.len() as u32;
+    put_section_header(&mut out, name: symtab_name, kind: 2, flags: 0, address: 0, offset: symtab_offset, size: symtab_size, link: symtab_index + 1, info: first_global, align: 8, entry: SYMBOL_ENTRY);
+    put_section_header(&mut out, name: strtab_name, kind: 3, flags: 0, address: 0, offset: strtab_offset, size: strings.len() as u64, link: 0, info: 0, align: 1, entry: 0);
+    put_section_header(&mut out, name: shstrtab_name, kind: 3, flags: 0, address: 0, offset: shstrtab_offset, size: names.len() as u64, link: 0, info: 0, align: 1, entry: 0);
+    return out;
+}
+
+fn put_segment(out: &mut alloc.List(u8), flags: u32, offset: u64, address: u64, file_size: u64, memory_size: u64) {
+    ob.put32(out, flags);
+    ob.put32(out, 0);
+    ob.put64(out, address);
+    ob.put64(out, offset);
+    ob.put64(out, file_size);
+    ob.put64(out, memory_size);
+}
+
+/// The program as an Arche executable: a header, its segments, and their bytes
+/// on pages of their own, so that a loader can map them.
+pub fn ax_executable(im: &ln.Image, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    put_bytes(&mut out, "ARCHEAX\n".bytes());
+    ob.put32(&mut out, 1);
+    ob.put32(&mut out, ao.ABI_VERSION);
+    ob.put32(&mut out, im.machine);
+    ob.put32(&mut out, 3);
+    ob.put64(&mut out, im.entry);
+    ob.put64(&mut out, im.page);
+    let start = im.page;
+    let rodata_size = im.rodata.len() as u64;
+    let text_size = im.text.len() as u64;
+    let data_size = im.data.len() as u64;
+    put_segment(&mut out, flags: READ, offset: start + (im.rodata_at - ln.BASE), address: im.rodata_at, file_size: rodata_size, memory_size: rodata_size);
+    put_segment(&mut out, flags: READ | EXEC, offset: start + (im.text_at - ln.BASE), address: im.text_at, file_size: text_size, memory_size: text_size);
+    put_segment(&mut out, flags: READ | WRITE, offset: start + (im.data_at - ln.BASE), address: im.data_at, file_size: data_size, memory_size: data_size + im.bss_size);
+    put_loaded(&mut out, im, start: start);
+    return out;
+}

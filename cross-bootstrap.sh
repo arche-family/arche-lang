@@ -3,7 +3,7 @@
 # machine, builds the compiler for the target; QEMU's user mode runs that
 # stage2, which builds stage3 from the same source. stage2 and stage3 must be
 # bit-identical, through LLVM and by the compiler's own backend.
-# Needs clang, ld.lld and qemu-user.
+# Needs clang and qemu-user.
 # Usage: ./cross-bootstrap.sh <aarch64 | riscv64> [work dir]
 set -eu
 root=$(cd "$(dirname "$0")" && pwd)
@@ -15,7 +15,6 @@ work=${2:-$root/build/cross/$arch}
 rm -rf "$work"
 qemu=${QEMU:-qemu-$arch}
 clang=$CLANG
-LLD=${LLD:-ld.lld}
 
 make -s -C "$root/stage0"
 make -s -C "$root/compiler"
@@ -40,12 +39,13 @@ else
 fi
 
 mkdir -p "$work/own/stage2" "$work/own/stage3"
-echo "cross-bootstrap: $arch: stage2, built by stage1's own backend"
-(cd "$root/compiler" && "$stage1" $TARGET_FLAG build main.arche "$work/own/stage2/arche.o")
-(cd "$work/own/stage2" && "$LLD" -static -o arche arche.o "$rt")
+"$stage1" import "$rt" "$work/rt.ao"
+echo "cross-bootstrap: $arch: stage2, built by stage1's own backend and linker"
+(cd "$root/compiler" && "$stage1" $TARGET_FLAG build main.arche "$work/own/stage2/arche.ao")
+"$stage1" link "$work/own/stage2/arche" "$work/own/stage2/arche.ao" "$work/rt.ao"
 echo "cross-bootstrap: $arch: stage3, built by stage2 under QEMU"
-(cd "$root/compiler" && $qemu "$work/own/stage2/arche" $TARGET_FLAG build main.arche "$work/own/stage3/arche.o")
-(cd "$work/own/stage3" && "$LLD" -static -o arche arche.o "$rt")
+(cd "$root/compiler" && $qemu "$work/own/stage2/arche" $TARGET_FLAG build main.arche "$work/own/stage3/arche.ao")
+$qemu "$work/own/stage2/arche" link "$work/own/stage3/arche" "$work/own/stage3/arche.ao" "$work/rt.ao"
 if cmp -s "$work/own/stage2/arche" "$work/own/stage3/arche"; then
     echo "cross-bootstrap: $arch: by its own backend, stage2 and stage3 are bit-identical"
     sha256sum "$work/own/stage3/arche"

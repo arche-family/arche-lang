@@ -5,7 +5,7 @@ import alloc;
 import ir.ir;
 import native.buffer as nb;
 import native.dwarf;
-import native.elf;
+import native.object as ob;
 import native.ranges as ra;
 
 /// A call, for the runtime's stack trace: where it returns to, in .text.
@@ -15,8 +15,23 @@ pub type SourceCall = struct {
     pub function: u32,
 }
 
+/// What of the program an object is. The whole of it, usually. Or one module's
+/// functions, with the data they use, as `arche units` asks (docs/abi.md).
+pub type Scope = struct {
+    pub whole: bool,
+    pub unit: u32,
+    /// Which unit each function is in, and which are called from another.
+    pub unit_of: alloc.List(u32),
+    pub across: alloc.List(bool),
+}
+
+pub fn whole_program(a: alloc.Allocator) -> Scope {
+    return Scope { whole: true, unit: 0, unit_of: alloc.List(u32).init(a), across: alloc.List(bool).init(a) };
+}
+
 pub type Unit = struct {
-    pub obj: elf.Object,
+    pub obj: ob.Object,
+    scope: Scope,
     pub text: u32,
     pub rodata: u32,
     pub fn_symbols: alloc.List(u32),
@@ -45,13 +60,14 @@ pub type Unit = struct {
 }
 
 /// The sections, the symbols of everything the module has, and its data.
-pub fn new_unit(m: &ir.Module, machine: u32, flags: u32, arch: dwarf.Arch, pad_byte: u8, a: alloc.Allocator) -> Unit {
-    var obj = elf.Object.init(machine: machine, flags: flags, a: a);
-    let text = obj.section(".text", flags: elf.FLAG_ALLOC | elf.FLAG_EXEC, align: 16);
-    let rodata = obj.section(".rodata", flags: elf.FLAG_ALLOC, align: 8);
+pub fn new_unit(m: &ir.Module, scope: Scope, machine: u32, flags: u32, arch: dwarf.Arch, pad_byte: u8, a: alloc.Allocator) -> Unit {
+    var obj = ob.Object.init(machine: machine, flags: flags, a: a);
+    let text = obj.section(".text", flags: ob.FLAG_ALLOC | ob.FLAG_EXEC, align: 16);
+    let rodata = obj.section(".rodata", flags: ob.FLAG_ALLOC, align: 8);
     _ = obj.section(".note.GNU-stack", flags: 0, align: 1);
     var u = Unit {
         obj: obj,
+        scope: scope,
         text: text,
         rodata: rodata,
         fn_symbols: alloc.List(u32).init(a),
@@ -75,23 +91,34 @@ pub fn new_unit(m: &ir.Module, machine: u32, flags: u32, arch: dwarf.Arch, pad_b
         a: a,
     };
     // Symbols first: code and data refer to each other by them.
+    let used = uses_of(&u, m, a: a);
     let fs = m.functions.items();
     var i: usize = 0;
     while i < fs.len() : (i += 1) {
-        if fs[i].stub {
+        if defines(&u, m, i) {
+            var global = not fs[i].internal;
+            if not u.scope.whole and u.scope.across[i] {
+                global = true;
+            }
+            u.fn_symbols.push(u.obj.symbol(fs[i].name.view(), section: u.text, value: 0, size: 0, kind: 2, global: global));
+        } else if used.functions[i] {
             u.fn_symbols.push(u.obj.undefined(fs[i].name.view()));
         } else {
-            u.fn_symbols.push(u.obj.symbol(fs[i].name.view(), section: u.text, value: 0, size: 0, kind: 2, global: not fs[i].internal));
+            u.fn_symbols.push(ra.NONE);
         }
     }
     let es = m.externals.items();
     i = 0;
     while i < es.len() : (i += 1) {
+        if not used.externals[i] {
+            u.ext_symbols.push(ra.NONE);
+            continue;
+        }
         // An extern fn the program also defines, by export: that one.
         var defined = ra.NONE;
         var k: usize = 0;
         while k < fs.len() and defined == ra.NONE : (k += 1) {
-            if not fs[k].stub and fs[k].name.view().eq(es[i].name.view()) {
+            if defines(&u, m, k) and fs[k].name.view().eq(es[i].name.view()) {
                 defined = k as u32;
             }
         }
@@ -101,8 +128,123 @@ pub fn new_unit(m: &ir.Module, machine: u32, flags: u32, arch: dwarf.Arch, pad_b
             u.ext_symbols.push(u.obj.undefined(es[i].name.view()));
         }
     }
-    write_data(&mut u, m);
+    write_data(&mut u, m, used: &used);
     return u;
+}
+
+/// Does this object have the function's code?
+pub fn defines(u: &Unit, m: &ir.Module, f: usize) -> bool {
+    if m.functions[f].stub {
+        return false;
+    }
+    return u.scope.whole or u.scope.unit_of[f] == u.scope.unit;
+}
+
+/// Is there anything of the program in this scope? The first unit always is:
+/// it has the program's tables.
+pub fn has_code(m: &ir.Module, scope: &Scope) -> bool {
+    if scope.whole or scope.unit == 0 {
+        return true;
+    }
+    var f: usize = 0;
+    while f < m.functions.len() : (f += 1) {
+        if not m.functions[f].stub and scope.unit_of[f] == scope.unit {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// What the object's code and data refer to.
+type Uses = struct {
+    functions: alloc.List(bool),
+    externals: alloc.List(bool),
+    globals: alloc.List(bool),
+    vtables: alloc.List(bool),
+}
+
+fn marks(n: usize, a: alloc.Allocator) -> alloc.List(bool) {
+    var l = alloc.List(bool).init(a);
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        l.push(false);
+    }
+    return l;
+}
+
+fn uses_of(u: &Unit, m: &ir.Module, a: alloc.Allocator) -> Uses {
+    var r = Uses {
+        functions: marks(m.functions.len(), a: a),
+        externals: marks(m.externals.len(), a: a),
+        globals: marks(m.globals.len(), a: a),
+        vtables: marks(m.vtables.len(), a: a),
+    };
+    var i: usize = 0;
+    if u.scope.whole {
+        while i < r.functions.len() : (i += 1) {
+            r.functions[i] = true;
+        }
+        i = 0;
+        while i < r.externals.len() : (i += 1) {
+            r.externals[i] = true;
+        }
+        i = 0;
+        while i < r.globals.len() : (i += 1) {
+            r.globals[i] = true;
+        }
+        i = 0;
+        while i < r.vtables.len() : (i += 1) {
+            r.vtables[i] = true;
+        }
+        return r;
+    }
+    let fs = m.functions.items();
+    var f: usize = 0;
+    while f < fs.len() : (f += 1) {
+        if not defines(u, m, f) {
+            continue;
+        }
+        let insts = fs[f].insts.items();
+        var k: usize = 0;
+        while k < insts.len() : (k += 1) {
+            let inst = insts[k];
+            if inst.op == ir.Op.Call {
+                if inst.flag == 1 {
+                    r.externals[inst.imm as usize] = true;
+                } else {
+                    r.functions[inst.imm as usize] = true;
+                }
+            } else if inst.op == ir.Op.Global {
+                r.globals[inst.imm as usize] = true;
+            } else if inst.op == ir.Op.VTable {
+                r.vtables[inst.imm as usize] = true;
+                let table = m.vtables[inst.imm as usize].functions.items();
+                var v: usize = 0;
+                while v < table.len() : (v += 1) {
+                    r.functions[table[v] as usize] = true;
+                }
+            }
+        }
+    }
+    // The first unit has the program's tables.
+    if u.scope.unit == 0 {
+        let tables = m.tables.items();
+        i = 0;
+        while i < tables.len() : (i += 1) {
+            let entries = tables[i].entries.items();
+            var k: usize = 0;
+            while k < entries.len() : (k += 1) {
+                r.globals[entries[k] as usize] = true;
+            }
+        }
+        let ts = m.tests.items();
+        i = 0;
+        while i < ts.len() : (i += 1) {
+            r.globals[ts[i].name as usize] = true;
+            r.functions[ts[i].function as usize] = true;
+        }
+    }
+    return r;
 }
 
 /// The symbol an address's root is reached by.
@@ -198,7 +340,7 @@ pub fn place_code(u: &mut Unit, f: &ir.Function, index: usize, code: &nb.Code) {
             }
         }
         if section == ra.NONE {
-            section = u.obj.section(f.section.view(), flags: elf.FLAG_ALLOC | elf.FLAG_EXEC, align: 16);
+            section = u.obj.section(f.section.view(), flags: ob.FLAG_ALLOC | ob.FLAG_EXEC, align: 16);
         }
     }
     let sec = section as usize;
@@ -239,15 +381,17 @@ pub fn place_code(u: &mut Unit, f: &ir.Function, index: usize, code: &nb.Code) {
     }
 }
 
-/// The object, or nothing, with problem saying why.
-pub fn finish(u: &mut Unit, m: &ir.Module, problem: &mut alloc.String) -> alloc.List(u8) {
+/// The data and debug info that come after the code. A problem found in the
+/// code goes to problem.
+pub fn finish(u: &mut Unit, m: &ir.Module, problem: &mut alloc.String) {
     if u.problem.len() > 0 {
         problem.push_str(u.problem.view());
-        return alloc.List(u8).init(u.a);
+        return;
     }
-    write_source_map(u, m);
+    if u.scope.whole {
+        write_source_map(u, m);
+    }
     dwarf.write(&mut u.obj, u.arch, m, fns: u.functions.items(), rows: u.rows.items(), places: u.places.items(), a: u.a);
-    return elf.write(&u.obj, u.a);
 }
 
 pub fn helper_symbol(u: &mut Unit, name: str) -> u32 {
@@ -287,18 +431,18 @@ fn put_pointer(u: &mut Unit, symbol: u32, addend: i64) {
     let ro = u.rodata as usize;
     let at = u.obj.sections[ro].bytes.len() as u64;
     u.obj.sections[ro].relocs.push(nb.Reloc { offset: at, symbol: symbol, kind: u.arch.abs64, addend: addend });
-    elf.put64(&mut u.obj.sections[ro].bytes, 0);
+    ob.put64(&mut u.obj.sections[ro].bytes, 0);
 }
 
 fn put_str_entry(u: &mut Unit, m: &ir.Module, global: u32) {
     let ro_symbol = u.obj.sections[u.rodata as usize].symbol;
     put_pointer(u, symbol: ro_symbol, addend: u.global_offsets[global as usize] as i64);
-    elf.put64(&mut u.obj.sections[u.rodata as usize].bytes, m.globals[global as usize].bytes.len() as u64);
+    ob.put64(&mut u.obj.sections[u.rodata as usize].bytes, m.globals[global as usize].bytes.len() as u64);
 }
 
 fn begin_data_symbol(u: &mut Unit, name: str) -> u32 {
     let ro = u.rodata as usize;
-    elf.pad_to(&mut u.obj.sections[ro].bytes, 8);
+    ob.pad_to(&mut u.obj.sections[ro].bytes, 8);
     return u.obj.symbol(name, section: u.rodata, value: u.obj.sections[ro].bytes.len() as u64, size: 0, kind: 1, global: true);
 }
 
@@ -307,18 +451,24 @@ fn end_data_symbol(u: &mut Unit, sym: u32) {
     u.obj.symbols[sym as usize].size = end - u.obj.symbols[sym as usize].value;
 }
 
-fn write_data(u: &mut Unit, m: &ir.Module) {
+fn write_data(u: &mut Unit, m: &ir.Module, used: &Uses) {
     let ro = u.rodata as usize;
     let gs = m.globals.items();
     var i: usize = 0;
     while i < gs.len() : (i += 1) {
         u.global_offsets.push(u.obj.sections[ro].bytes.len() as u64);
-        put_bytes(u, gs[i].bytes.items());
+        if used.globals[i] {
+            put_bytes(u, gs[i].bytes.items());
+        }
     }
     let vts = m.vtables.items();
     i = 0;
     while i < vts.len() : (i += 1) {
-        elf.pad_to(&mut u.obj.sections[ro].bytes, 8);
+        if not used.vtables[i] {
+            u.vtable_offsets.push(0);
+            continue;
+        }
+        ob.pad_to(&mut u.obj.sections[ro].bytes, 8);
         u.vtable_offsets.push(u.obj.sections[ro].bytes.len() as u64);
         let fns = vts[i].functions.items();
         var k: usize = 0;
@@ -326,8 +476,11 @@ fn write_data(u: &mut Unit, m: &ir.Module) {
             put_pointer(u, symbol: u.fn_symbols[fns[k] as usize], addend: 0);
         }
         if vts[i].size > 0 {
-            elf.put64(&mut u.obj.sections[ro].bytes, vts[i].size);
+            ob.put64(&mut u.obj.sections[ro].bytes, vts[i].size);
         }
+    }
+    if not u.scope.whole and u.scope.unit != 0 {
+        return;
     }
     let tables = m.tables.items();
     i = 0;
@@ -352,11 +505,11 @@ fn write_data(u: &mut Unit, m: &ir.Module) {
             if ts[k].takes_test {
                 takes = 1;
             }
-            elf.put64(&mut u.obj.sections[ro].bytes, takes);
+            ob.put64(&mut u.obj.sections[ro].bytes, takes);
         }
         end_data_symbol(u, sym);
         let count = begin_data_symbol(u, "a0_test_count");
-        elf.put64(&mut u.obj.sections[ro].bytes, ts.len() as u64);
+        ob.put64(&mut u.obj.sections[ro].bytes, ts.len() as u64);
         end_data_symbol(u, count);
     }
 }
@@ -373,13 +526,13 @@ fn write_source_map(u: &mut Unit, m: &ir.Module) {
         let at = u.obj.sections[ro].bytes.len() as u64;
         let call = u.calls[i];
         u.obj.sections[ro].relocs.push(nb.Reloc { offset: at, symbol: text_symbol, kind: u.arch.abs32, addend: call.pc as i64 });
-        elf.put32(&mut u.obj.sections[ro].bytes, 0);
-        elf.put32(&mut u.obj.sections[ro].bytes, call.line);
-        elf.put32(&mut u.obj.sections[ro].bytes, call.function);
+        ob.put32(&mut u.obj.sections[ro].bytes, 0);
+        ob.put32(&mut u.obj.sections[ro].bytes, call.line);
+        ob.put32(&mut u.obj.sections[ro].bytes, call.function);
     }
     end_data_symbol(u, table);
     let count = begin_data_symbol(u, "a0_source_call_count");
-    elf.put64(&mut u.obj.sections[ro].bytes, u.calls.len() as u64);
+    ob.put64(&mut u.obj.sections[ro].bytes, u.calls.len() as u64);
     end_data_symbol(u, count);
     // Names go first, so that the table of functions is in one piece.
     var names = alloc.List(u64).init(u.a);
@@ -408,13 +561,13 @@ fn write_source_map(u: &mut Unit, m: &ir.Module) {
         if name_len == 0 {
             name_len = fun.name.len() as u64;
         }
-        elf.put64(&mut u.obj.sections[ro].bytes, name_len);
+        ob.put64(&mut u.obj.sections[ro].bytes, name_len);
         if fun.file == ir.NO_FILE {
             put_pointer(u, symbol: ro_symbol, addend: 0);
-            elf.put64(&mut u.obj.sections[ro].bytes, 0);
+            ob.put64(&mut u.obj.sections[ro].bytes, 0);
         } else {
             put_pointer(u, symbol: ro_symbol, addend: files[fun.file as usize] as i64);
-            elf.put64(&mut u.obj.sections[ro].bytes, m.files.items()[fun.file as usize].len() as u64);
+            ob.put64(&mut u.obj.sections[ro].bytes, m.files.items()[fun.file as usize].len() as u64);
         }
     }
     end_data_symbol(u, functions);

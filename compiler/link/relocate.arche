@@ -1,0 +1,289 @@
+/// What each processor's relocations mean (docs/abi.md): the number, the width
+/// and the place the linker's result goes in the bytes.
+import native.buffer as nb;
+
+pub const X86_64: u32 = 62;
+pub const AARCH64: u32 = 183;
+pub const RISCV64: u32 = 243;
+
+pub type Outcome = enum { Done, OutOfRange, Misaligned, Unknown, OutsideSection }
+
+/// A relocation's place: at in the bytes, place as an address; value is the
+/// symbol's address and the addend; got the address of the symbol's slot.
+pub type Site = struct {
+    pub at: usize,
+    pub place: i64,
+    pub value: i64,
+    pub got: i64,
+}
+
+fn get32(b: []mut u8, at: usize) -> u32 {
+    return b[at] as u32 | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24);
+}
+
+fn put32(b: []mut u8, at: usize, v: u32) {
+    var k: u32 = 0;
+    while k < 4 : (k += 1) {
+        b[at + k as usize] = ((v >> (k * 8)) & 255) as u8;
+    }
+}
+
+fn put64(b: []mut u8, at: usize, v: u64) {
+    var k: u64 = 0;
+    while k < 8 : (k += 1) {
+        b[at + k as usize] = ((v >> (k * 8)) & 255) as u8;
+    }
+}
+
+fn low32(v: i64) -> u32 {
+    return (nb.bits_of_i64(v) & 0xFFFFFFFF) as u32;
+}
+
+fn low_bits(v: i64, count: u64) -> u32 {
+    let one: u64 = 1;
+    return (nb.bits_of_i64(v) & ((one << count) - 1)) as u32;
+}
+
+/// Does v fit in this many bits, as a signed number?
+fn fits_signed(v: i64, count: u64) -> bool {
+    let one: i64 = 1;
+    let top = one << (count - 1);
+    return v >= -top and v < top;
+}
+
+fn fits_i32_or_u32(v: i64) -> bool {
+    return v >= -2147483648 and v <= 4294967295;
+}
+
+fn write32(b: []mut u8, at: usize, v: i64) -> Outcome {
+    if not fits_i32_or_u32(v) {
+        return Outcome.OutOfRange;
+    }
+    put32(b, at: at, v: low32(v));
+    return Outcome.Done;
+}
+
+fn write_i32(b: []mut u8, at: usize, v: i64) -> Outcome {
+    if not fits_signed(v, count: 32) {
+        return Outcome.OutOfRange;
+    }
+    put32(b, at: at, v: low32(v));
+    return Outcome.Done;
+}
+
+/// How many bytes a relocation of this kind touches; 0 if there is no such kind.
+fn width_of(machine: u32, kind: u32) -> usize {
+    if machine == X86_64 {
+        if kind == 1 {
+            return 8;
+        }
+        if kind == 2 or kind == 4 or kind == 10 or kind == 11 {
+            return 4;
+        }
+        return 0;
+    }
+    if machine == AARCH64 {
+        if kind == 257 {
+            return 8;
+        }
+        if kind == 258 or kind == 261 or kind == 275 or kind == 277 or kind == 278 or kind == 279 or kind == 280 or kind == 282 or kind == 283 or kind == 284 or kind == 285 or kind == 286 or kind == 299 or kind == 311 or kind == 312 {
+            return 4;
+        }
+        return 0;
+    }
+    if machine == RISCV64 {
+        if kind == 2 or kind == 19 {
+            return 8;
+        }
+        if kind == 1 or kind == 16 or kind == 17 or kind == 26 or kind == 27 or kind == 28 {
+            return 4;
+        }
+    }
+    return 0;
+}
+
+fn apply_x86_64(b: []mut u8, kind: u32, s: Site) -> Outcome {
+    if kind == 1 {
+        put64(b, at: s.at, v: nb.bits_of_i64(s.value));
+        return Outcome.Done;
+    }
+    if kind == 2 or kind == 4 {
+        return write_i32(b, at: s.at, v: s.value - s.place);
+    }
+    if kind == 10 {
+        if s.value < 0 {
+            return Outcome.OutOfRange;
+        }
+        return write32(b, at: s.at, v: s.value);
+    }
+    return write_i32(b, at: s.at, v: s.value);
+}
+
+/// An instruction's field: the bits under mask replaced by these.
+fn patch(b: []mut u8, at: usize, mask: u32, bits: u32) {
+    put32(b, at: at, v: (get32(b, at: at) & ~mask) | (bits & mask));
+}
+
+fn page(v: i64) -> i64 {
+    return (v >> 12) * 4096;
+}
+
+fn adrp(b: []mut u8, at: usize, target: i64, place: i64) -> Outcome {
+    let pages = (page(target) - page(place)) >> 12;
+    if not fits_signed(pages, count: 21) {
+        return Outcome.OutOfRange;
+    }
+    let bits = low_bits(pages, count: 21);
+    patch(b, at: at, mask: 0x60FFFFE0, bits: ((bits & 3) << 29) | ((bits >> 2) << 5));
+    return Outcome.Done;
+}
+
+fn low12_scaled(b: []mut u8, at: usize, v: i64, shift: u64) -> Outcome {
+    let low = low_bits(v, count: 12);
+    let one: u32 = 1;
+    if low & ((one << shift as u32) - 1) != 0 {
+        return Outcome.Misaligned;
+    }
+    patch(b, at: at, mask: 0x003FFC00, bits: (low >> shift as u32) << 10);
+    return Outcome.Done;
+}
+
+fn branch_a64(b: []mut u8, at: usize, distance: i64, count: u64, shift: u32) -> Outcome {
+    if distance % 4 != 0 {
+        return Outcome.Misaligned;
+    }
+    if not fits_signed(distance / 4, count: count) {
+        return Outcome.OutOfRange;
+    }
+    let one: u32 = 1;
+    let field = low_bits(distance / 4, count: count);
+    let mask: u32 = ((one << count as u32) - 1) << shift;
+    patch(b, at: at, mask: mask, bits: field << shift);
+    return Outcome.Done;
+}
+
+fn apply_aarch64(b: []mut u8, kind: u32, s: Site) -> Outcome {
+    let distance = s.value - s.place;
+    if kind == 257 {
+        put64(b, at: s.at, v: nb.bits_of_i64(s.value));
+        return Outcome.Done;
+    }
+    if kind == 258 {
+        return write32(b, at: s.at, v: s.value);
+    }
+    if kind == 261 {
+        return write_i32(b, at: s.at, v: distance);
+    }
+    if kind == 275 {
+        return adrp(b, at: s.at, target: s.value, place: s.place);
+    }
+    if kind == 311 {
+        return adrp(b, at: s.at, target: s.got, place: s.place);
+    }
+    if kind == 277 or kind == 278 {
+        return low12_scaled(b, at: s.at, v: s.value, shift: 0);
+    }
+    if kind == 284 {
+        return low12_scaled(b, at: s.at, v: s.value, shift: 1);
+    }
+    if kind == 285 {
+        return low12_scaled(b, at: s.at, v: s.value, shift: 2);
+    }
+    if kind == 286 {
+        return low12_scaled(b, at: s.at, v: s.value, shift: 3);
+    }
+    if kind == 299 {
+        return low12_scaled(b, at: s.at, v: s.value, shift: 4);
+    }
+    if kind == 312 {
+        return low12_scaled(b, at: s.at, v: s.got, shift: 3);
+    }
+    if kind == 279 {
+        return branch_a64(b, at: s.at, distance: distance, count: 14, shift: 5);
+    }
+    if kind == 280 {
+        return branch_a64(b, at: s.at, distance: distance, count: 19, shift: 5);
+    }
+    return branch_a64(b, at: s.at, distance: distance, count: 26, shift: 0);
+}
+
+/// The upper 20 bits of a number whose lower 12 are added back as signed.
+fn upper20(v: i64) -> u32 {
+    return low_bits((v + 0x800) >> 12, count: 20) << 12;
+}
+
+fn apply_riscv64(b: []mut u8, kind: u32, s: Site) -> Outcome {
+    let distance = s.value - s.place;
+    if kind == 2 {
+        put64(b, at: s.at, v: nb.bits_of_i64(s.value));
+        return Outcome.Done;
+    }
+    if kind == 1 {
+        return write32(b, at: s.at, v: s.value);
+    }
+    if kind == 26 {
+        if not fits_signed(s.value + 0x800, count: 32) {
+            return Outcome.OutOfRange;
+        }
+        patch(b, at: s.at, mask: 0xFFFFF000, bits: upper20(s.value));
+        return Outcome.Done;
+    }
+    if kind == 27 {
+        patch(b, at: s.at, mask: 0xFFF00000, bits: low_bits(s.value, count: 12) << 20);
+        return Outcome.Done;
+    }
+    if kind == 28 {
+        let low = low_bits(s.value, count: 12);
+        patch(b, at: s.at, mask: 0xFE000F80, bits: ((low >> 5) << 25) | ((low & 31) << 7));
+        return Outcome.Done;
+    }
+    if kind == 19 {
+        // auipc, then jalr.
+        if not fits_signed(distance + 0x800, count: 32) {
+            return Outcome.OutOfRange;
+        }
+        patch(b, at: s.at, mask: 0xFFFFF000, bits: upper20(distance));
+        patch(b, at: s.at + 4, mask: 0xFFF00000, bits: low_bits(distance, count: 12) << 20);
+        return Outcome.Done;
+    }
+    if distance % 2 != 0 {
+        return Outcome.Misaligned;
+    }
+    if kind == 16 {
+        if not fits_signed(distance, count: 13) {
+            return Outcome.OutOfRange;
+        }
+        let v = low_bits(distance, count: 13);
+        patch(b, at: s.at, mask: 0xFE000F80, bits: (((v >> 12) & 1) << 31) | (((v >> 5) & 63) << 25) | (((v >> 1) & 15) << 8) | (((v >> 11) & 1) << 7));
+        return Outcome.Done;
+    }
+    if not fits_signed(distance, count: 21) {
+        return Outcome.OutOfRange;
+    }
+    let v = low_bits(distance, count: 21);
+    patch(b, at: s.at, mask: 0xFFFFF000, bits: (((v >> 20) & 1) << 31) | (((v >> 1) & 0x3FF) << 21) | (((v >> 11) & 1) << 20) | (((v >> 12) & 0xFF) << 12));
+    return Outcome.Done;
+}
+
+/// The relocation written into b.
+pub fn apply(machine: u32, kind: u32, b: []mut u8, s: Site) -> Outcome {
+    let width = width_of(machine: machine, kind: kind);
+    if width == 0 {
+        return Outcome.Unknown;
+    }
+    if s.at > b.len() or b.len() - s.at < width {
+        return Outcome.OutsideSection;
+    }
+    if machine == X86_64 {
+        return apply_x86_64(b, kind: kind, s);
+    }
+    if machine == AARCH64 {
+        return apply_aarch64(b, kind: kind, s);
+    }
+    return apply_riscv64(b, kind: kind, s);
+}
+
+/// Does this kind go through a slot of the global offset table?
+pub fn uses_got(machine: u32, kind: u32) -> bool {
+    return machine == AARCH64 and (kind == 311 or kind == 312);
+}

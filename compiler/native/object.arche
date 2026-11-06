@@ -1,0 +1,95 @@
+/// An object in memory, as a backend builds it and as the object formats and
+/// the linker read it: sections, symbols and relocations. Which processor it
+/// is for is its machine's to say, by ELF's numbers.
+import alloc;
+import native.buffer as nb;
+
+pub const FLAG_WRITE: u64 = 1;
+pub const FLAG_ALLOC: u64 = 2;
+pub const FLAG_EXEC: u64 = 4;
+
+pub const NO_SECTION: u32 = 4294967295;
+
+pub type Section = struct {
+    pub name: alloc.String,
+    pub flags: u64,
+    pub align: u64,
+    pub bytes: alloc.List(u8),
+    pub relocs: alloc.List(nb.Reloc),
+    /// Its section symbol, in an object being built.
+    pub symbol: u32,
+    /// How many zero bytes it stands for, when it has none of its own: a bss.
+    pub bss_size: u64,
+}
+
+pub type Symbol = struct {
+    pub name: alloc.String,
+    pub section: u32,
+    pub value: u64,
+    pub size: u64,
+    /// 0 none, 1 object, 2 function, 3 section.
+    pub kind: u8,
+    pub global: bool,
+    /// Another definition goes before this one, and if there is none and this
+    /// is not one either, its address is 0.
+    pub weak: bool,
+}
+
+pub type Object = struct {
+    pub sections: alloc.List(Section),
+    pub symbols: alloc.List(Symbol),
+    /// ELF's e_machine and e_flags.
+    pub machine: u32,
+    pub flags: u32,
+    a: alloc.Allocator,
+
+    pub fn init(machine: u32, flags: u32, a: alloc.Allocator) -> Object {
+        return Object { sections: alloc.List(Section).init(a), symbols: alloc.List(Symbol).init(a), machine: machine, flags: flags, a: a };
+    }
+
+    pub fn section(self: &mut Object, name: str, flags: u64, align: u64) -> u32 {
+        var n = alloc.String.init(self.a);
+        n.push_str(name);
+        let index = self.sections.len() as u32;
+        let sym = self.symbol("", section: index, value: 0, size: 0, kind: 3, global: false);
+        self.sections.push(Section { name: n, flags: flags, align: align, bytes: alloc.List(u8).init(self.a), relocs: alloc.List(nb.Reloc).init(self.a), symbol: sym, bss_size: 0 });
+        return index;
+    }
+
+    pub fn symbol(self: &mut Object, name: str, section: u32, value: u64, size: u64, kind: u8, global: bool) -> u32 {
+        var n = alloc.String.init(self.a);
+        n.push_str(name);
+        self.symbols.push(Symbol { name: n, section: section, value: value, size: size, kind: kind, global: global, weak: false });
+        return self.symbols.len() as u32 - 1;
+    }
+
+    /// One the object uses and does not define.
+    pub fn undefined(self: &mut Object, name: str) -> u32 {
+        return self.symbol(name, section: NO_SECTION, value: 0, size: 0, kind: 0, global: true);
+    }
+}
+
+pub fn pad_to(b: &mut alloc.List(u8), align: u64) {
+    while b.len() as u64 % align != 0 {
+        b.push(0);
+    }
+}
+
+pub fn put16(b: &mut alloc.List(u8), v: u32) {
+    b.push((v & 255) as u8);
+    b.push(((v >> 8) & 255) as u8);
+}
+
+pub fn put32(b: &mut alloc.List(u8), v: u32) {
+    var k: u32 = 0;
+    while k < 4 : (k += 1) {
+        b.push(((v >> (k * 8)) & 255) as u8);
+    }
+}
+
+pub fn put64(b: &mut alloc.List(u8), v: u64) {
+    var k: u64 = 0;
+    while k < 8 : (k += 1) {
+        b.push(((v >> (k * 8)) & 255) as u8);
+    }
+}

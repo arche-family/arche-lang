@@ -6,7 +6,7 @@
 import alloc;
 import ir.ir;
 import native.buffer as nb;
-import native.elf;
+import native.object as ob;
 
 /// What differs by processor.
 pub type Arch = struct {
@@ -142,7 +142,7 @@ fn put_pairs(l: &mut alloc.List(u64), x: u64, y: u64) {
     l.push(y);
 }
 
-fn write_abbreviations(o: &mut elf.Object, section: u32, a: alloc.Allocator) {
+fn write_abbreviations(o: &mut ob.Object, section: u32, a: alloc.Allocator) {
     var p = alloc.List(u64).init(a);
     let b = &mut o.sections[section as usize].bytes;
     put_pairs(&mut p, x: AT_PRODUCER, y: FORM_STRING);
@@ -198,9 +198,9 @@ fn write_abbreviations(o: &mut elf.Object, section: u32, a: alloc.Allocator) {
 fn put_type_ref(b: &mut alloc.List(u8), offsets: []u32, fixes: &mut alloc.List(u64), target: u32) {
     if offsets[target as usize] == 0 {
         fixes.push(((b.len() as u64) << 32) | target as u64);
-        elf.put32(b, 0);
+        ob.put32(b, 0);
     } else {
-        elf.put32(b, offsets[target as usize]);
+        ob.put32(b, offsets[target as usize]);
     }
 }
 
@@ -242,25 +242,25 @@ fn write_types(b: &mut alloc.List(u8), m: &ir.Module, offsets: &mut alloc.List(u
     }
 }
 
-fn write_info(o: &mut elf.Object, arch: Arch, info: u32, abbrev: u32, line: u32, m: &ir.Module, fns: []FnInfo, places: []VarPlace, a: alloc.Allocator) {
+fn write_info(o: &mut ob.Object, arch: Arch, info: u32, abbrev: u32, line: u32, m: &ir.Module, fns: []FnInfo, places: []VarPlace, a: alloc.Allocator) {
     var b = alloc.List(u8).init(a);
     var relocs = alloc.List(nb.Reloc).init(a);
-    elf.put32(&mut b, 0);
-    elf.put16(&mut b, 4);
+    ob.put32(&mut b, 0);
+    ob.put16(&mut b, 4);
     relocs.push(nb.Reloc { offset: b.len() as u64, symbol: o.sections[abbrev as usize].symbol, kind: arch.abs32, addend: 0 });
-    elf.put32(&mut b, 0);
+    ob.put32(&mut b, 0);
     b.push(8);
     uleb(&mut b, ABBREV_UNIT);
     text(&mut b, "arche, its own backend");
     // A language debuggers know how to print values of: Arche's look like C's.
-    elf.put16(&mut b, 0x1D);
+    ob.put16(&mut b, 0x1D);
     if m.files.len() > 0 {
         text(&mut b, m.files.items()[0].view());
     } else {
         text(&mut b, "");
     }
     relocs.push(nb.Reloc { offset: b.len() as u64, symbol: o.sections[line as usize].symbol, kind: arch.abs32, addend: 0 });
-    elf.put32(&mut b, 0);
+    ob.put32(&mut b, 0);
 
     var offsets = alloc.List(u32).init(a);
     var t: usize = 0;
@@ -282,9 +282,9 @@ fn write_info(o: &mut elf.Object, arch: Arch, info: u32, abbrev: u32, line: u32,
         uleb(&mut b, fun.file as u64 + 1);
         uleb(&mut b, fun.line as u64);
         relocs.push(nb.Reloc { offset: b.len() as u64, symbol: info_of.symbol, kind: arch.abs64, addend: 0 });
-        elf.put64(&mut b, 0);
+        ob.put64(&mut b, 0);
         uleb(&mut b, info_of.size);
-        // The frame base is the frame pointer itself.
+        // The frame base is the frame pointer itsob.
         uleb(&mut b, 1);
         b.push(0x50 + arch.frame_reg);
         var k = info_of.places_start;
@@ -333,7 +333,7 @@ fn patch32(b: []mut u8, at: usize, v: u32) {
     }
 }
 
-fn set_section(o: &mut elf.Object, section: u32, bytes: []u8, relocs: []nb.Reloc) {
+fn set_section(o: &mut ob.Object, section: u32, bytes: []u8, relocs: []nb.Reloc) {
     let s = section as usize;
     var i: usize = 0;
     while i < bytes.len() : (i += 1) {
@@ -352,13 +352,13 @@ fn advance_line(b: &mut alloc.List(u8), by: i64) {
     }
 }
 
-fn write_lines(o: &mut elf.Object, arch: Arch, section: u32, m: &ir.Module, fns: []FnInfo, rows: []LineRow, a: alloc.Allocator) {
+fn write_lines(o: &mut ob.Object, arch: Arch, section: u32, m: &ir.Module, fns: []FnInfo, rows: []LineRow, a: alloc.Allocator) {
     var b = alloc.List(u8).init(a);
     var relocs = alloc.List(nb.Reloc).init(a);
-    elf.put32(&mut b, 0);
-    elf.put16(&mut b, 4);
+    ob.put32(&mut b, 0);
+    ob.put16(&mut b, 4);
     let header_length_at = b.len();
-    elf.put32(&mut b, 0);
+    ob.put32(&mut b, 0);
     b.push(1);
     b.push(1);
     b.push(1);
@@ -396,7 +396,7 @@ fn write_lines(o: &mut elf.Object, arch: Arch, section: u32, m: &ir.Module, fns:
         b.push(9);
         b.push(2);
         relocs.push(nb.Reloc { offset: b.len() as u64, symbol: info.symbol, kind: arch.abs64, addend: 0 });
-        elf.put64(&mut b, 0);
+        ob.put64(&mut b, 0);
         var line: i64 = 1;
         var pc: u64 = 0;
         var r = info.rows_start;
@@ -429,11 +429,11 @@ fn write_lines(o: &mut elf.Object, arch: Arch, section: u32, m: &ir.Module, fns:
 
 /// How to find the caller from anywhere in a function: its one prologue, and
 /// the frame pointer after that.
-fn write_frames(o: &mut elf.Object, arch: Arch, section: u32, fns: []FnInfo, a: alloc.Allocator) {
+fn write_frames(o: &mut ob.Object, arch: Arch, section: u32, fns: []FnInfo, a: alloc.Allocator) {
     var b = alloc.List(u8).init(a);
     var relocs = alloc.List(nb.Reloc).init(a);
-    elf.put32(&mut b, 0);
-    elf.put32(&mut b, 0xFFFFFFFF);
+    ob.put32(&mut b, 0);
+    ob.put32(&mut b, 0xFFFFFFFF);
     b.push(1);
     b.push(0);
     // Instructions are counted in bytes on x86-64, in fours on the others.
@@ -469,12 +469,12 @@ fn write_frames(o: &mut elf.Object, arch: Arch, section: u32, fns: []FnInfo, a: 
     var f: usize = 0;
     while f < fns.len() : (f += 1) {
         let length_at = b.len();
-        elf.put32(&mut b, 0);
+        ob.put32(&mut b, 0);
         relocs.push(nb.Reloc { offset: b.len() as u64, symbol: o.sections[section as usize].symbol, kind: arch.abs32, addend: 0 });
-        elf.put32(&mut b, 0);
+        ob.put32(&mut b, 0);
         relocs.push(nb.Reloc { offset: b.len() as u64, symbol: fns[f].symbol, kind: arch.abs64, addend: 0 });
-        elf.put64(&mut b, 0);
-        elf.put64(&mut b, fns[f].size);
+        ob.put64(&mut b, 0);
+        ob.put64(&mut b, fns[f].size);
         if arch.is_x64 {
             // push rbp: one byte. mov rbp, rsp: three.
             b.push(0x40 | 1);
@@ -518,7 +518,7 @@ fn write_frames(o: &mut elf.Object, arch: Arch, section: u32, fns: []FnInfo, a: 
 }
 
 /// The debug sections of the object.
-pub fn write(o: &mut elf.Object, arch: Arch, m: &ir.Module, fns: []FnInfo, rows: []LineRow, places: []VarPlace, a: alloc.Allocator) {
+pub fn write(o: &mut ob.Object, arch: Arch, m: &ir.Module, fns: []FnInfo, rows: []LineRow, places: []VarPlace, a: alloc.Allocator) {
     let abbrev = o.section(".debug_abbrev", flags: 0, align: 1);
     let info = o.section(".debug_info", flags: 0, align: 1);
     let line = o.section(".debug_line", flags: 0, align: 1);

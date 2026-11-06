@@ -1,98 +1,13 @@
-/// An ELF64 relocatable object: sections, symbols and relocations, for lld to
-/// link (docs/abi.md). Which processor it is for is the writer's to say.
+/// An object as an ELF64 relocatable file, for a linker that reads those.
 import alloc;
 import native.buffer as nb;
+import native.object as ob;
 
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
 const SHF_INFO_LINK: u64 = 0x40;
-
-pub const FLAG_WRITE: u64 = 1;
-pub const FLAG_ALLOC: u64 = 2;
-pub const FLAG_EXEC: u64 = 4;
-
-pub const NO_SECTION: u32 = 4294967295;
-
-pub type Section = struct {
-    pub name: alloc.String,
-    pub flags: u64,
-    pub align: u64,
-    pub bytes: alloc.List(u8),
-    pub relocs: alloc.List(nb.Reloc),
-    /// Its section symbol.
-    pub symbol: u32,
-}
-
-pub type Symbol = struct {
-    pub name: alloc.String,
-    pub section: u32,
-    pub value: u64,
-    pub size: u64,
-    /// 0 none, 1 object, 2 function, 3 section.
-    pub kind: u8,
-    pub global: bool,
-}
-
-pub type Object = struct {
-    pub sections: alloc.List(Section),
-    pub symbols: alloc.List(Symbol),
-    /// ELF's e_machine and e_flags.
-    machine: u32,
-    flags: u32,
-    a: alloc.Allocator,
-
-    pub fn init(machine: u32, flags: u32, a: alloc.Allocator) -> Object {
-        return Object { sections: alloc.List(Section).init(a), symbols: alloc.List(Symbol).init(a), machine: machine, flags: flags, a: a };
-    }
-
-    pub fn section(self: &mut Object, name: str, flags: u64, align: u64) -> u32 {
-        var n = alloc.String.init(self.a);
-        n.push_str(name);
-        let index = self.sections.len() as u32;
-        let sym = self.symbol("", section: index, value: 0, size: 0, kind: 3, global: false);
-        self.sections.push(Section { name: n, flags: flags, align: align, bytes: alloc.List(u8).init(self.a), relocs: alloc.List(nb.Reloc).init(self.a), symbol: sym });
-        return index;
-    }
-
-    pub fn symbol(self: &mut Object, name: str, section: u32, value: u64, size: u64, kind: u8, global: bool) -> u32 {
-        var n = alloc.String.init(self.a);
-        n.push_str(name);
-        self.symbols.push(Symbol { name: n, section: section, value: value, size: size, kind: kind, global: global });
-        return self.symbols.len() as u32 - 1;
-    }
-
-    /// One the object uses and does not define.
-    pub fn undefined(self: &mut Object, name: str) -> u32 {
-        return self.symbol(name, section: NO_SECTION, value: 0, size: 0, kind: 0, global: true);
-    }
-}
-
-pub fn pad_to(b: &mut alloc.List(u8), align: u64) {
-    while b.len() as u64 % align != 0 {
-        b.push(0);
-    }
-}
-
-pub fn put16(b: &mut alloc.List(u8), v: u32) {
-    b.push((v & 255) as u8);
-    b.push(((v >> 8) & 255) as u8);
-}
-
-pub fn put32(b: &mut alloc.List(u8), v: u32) {
-    var k: u32 = 0;
-    while k < 4 : (k += 1) {
-        b.push(((v >> (k * 8)) & 255) as u8);
-    }
-}
-
-pub fn put64(b: &mut alloc.List(u8), v: u64) {
-    var k: u64 = 0;
-    while k < 8 : (k += 1) {
-        b.push(((v >> (k * 8)) & 255) as u8);
-    }
-}
 
 fn put_text(b: &mut alloc.List(u8), text: str) -> u32 {
     let at = b.len() as u32;
@@ -107,21 +22,21 @@ fn put_text(b: &mut alloc.List(u8), text: str) -> u32 {
 
 /// One entry of the section header table.
 fn header(out: &mut alloc.List(u8), name: u32, kind: u32, flags: u64, offset: u64, size: u64, link: u32, info: u32, align: u64, entsize: u64) {
-    put32(out, name);
-    put32(out, kind);
-    put64(out, flags);
-    put64(out, 0);
-    put64(out, offset);
-    put64(out, size);
-    put32(out, link);
-    put32(out, info);
-    put64(out, align);
-    put64(out, entsize);
+    ob.put32(out, name);
+    ob.put32(out, kind);
+    ob.put64(out, flags);
+    ob.put64(out, 0);
+    ob.put64(out, offset);
+    ob.put64(out, size);
+    ob.put32(out, link);
+    ob.put32(out, info);
+    ob.put64(out, align);
+    ob.put64(out, entsize);
 }
 
 /// The object as bytes. Section numbers: 0 is null, then the object's own,
 /// then a .rela for each that has relocations, .symtab, .strtab, .shstrtab.
-pub fn write(o: &Object, a: alloc.Allocator) -> alloc.List(u8) {
+pub fn write(o: &ob.Object, a: alloc.Allocator) -> alloc.List(u8) {
     let sections = o.sections.items();
     let symbols = o.symbols.items();
 
@@ -168,20 +83,22 @@ pub fn write(o: &Object, a: alloc.Allocator) -> alloc.List(u8) {
             if s.name.len() > 0 {
                 name_at = put_text(&mut strtab, s.name.view());
             }
-            put32(&mut symtab, name_at);
+            ob.put32(&mut symtab, name_at);
             var bind: u8 = 0;
-            if s.global {
+            if s.weak {
+                bind = 2;
+            } else if s.global {
                 bind = 1;
             }
             symtab.push((bind << 4) | s.kind);
             symtab.push(0);
-            if s.section == NO_SECTION {
-                put16(&mut symtab, 0);
+            if s.section == ob.NO_SECTION {
+                ob.put16(&mut symtab, 0);
             } else {
-                put16(&mut symtab, s.section + 1);
+                ob.put16(&mut symtab, s.section + 1);
             }
-            put64(&mut symtab, s.value);
-            put64(&mut symtab, s.size);
+            ob.put64(&mut symtab, s.value);
+            ob.put64(&mut symtab, s.size);
         }
     }
 
@@ -229,25 +146,25 @@ pub fn write(o: &Object, a: alloc.Allocator) -> alloc.List(u8) {
     while k < 9 : (k += 1) {
         out.push(0);
     }
-    put16(&mut out, 1);
-    put16(&mut out, o.machine);
-    put32(&mut out, 1);
-    put64(&mut out, 0);
-    put64(&mut out, 0);
+    ob.put16(&mut out, 1);
+    ob.put16(&mut out, o.machine);
+    ob.put32(&mut out, 1);
+    ob.put64(&mut out, 0);
+    ob.put64(&mut out, 0);
     let shoff_at = out.len();
-    put64(&mut out, 0);
-    put32(&mut out, o.flags);
-    put16(&mut out, 64);
-    put16(&mut out, 0);
-    put16(&mut out, 0);
-    put16(&mut out, 64);
-    put16(&mut out, symtab_index + 3);
-    put16(&mut out, symtab_index + 2);
+    ob.put64(&mut out, 0);
+    ob.put32(&mut out, o.flags);
+    ob.put16(&mut out, 64);
+    ob.put16(&mut out, 0);
+    ob.put16(&mut out, 0);
+    ob.put16(&mut out, 64);
+    ob.put16(&mut out, symtab_index + 3);
+    ob.put16(&mut out, symtab_index + 2);
 
     var offsets = alloc.List(u64).init(a);
     i = 0;
     while i < sections.len() : (i += 1) {
-        pad_to(&mut out, sections[i].align);
+        ob.pad_to(&mut out, sections[i].align);
         offsets.push(out.len() as u64);
         let b = sections[i].bytes.items();
         var q: usize = 0;
@@ -258,17 +175,17 @@ pub fn write(o: &Object, a: alloc.Allocator) -> alloc.List(u8) {
     var rela_offsets = alloc.List(u64).init(a);
     i = 0;
     while i < sections.len() : (i += 1) {
-        pad_to(&mut out, 8);
+        ob.pad_to(&mut out, 8);
         rela_offsets.push(out.len() as u64);
         let rs = sections[i].relocs.items();
         var q: usize = 0;
         while q < rs.len() : (q += 1) {
-            put64(&mut out, rs[q].offset);
-            put64(&mut out, ((places[rs[q].symbol as usize] as u64) << 32) | rs[q].kind as u64);
-            put64(&mut out, nb.bits_of_i64(rs[q].addend));
+            ob.put64(&mut out, rs[q].offset);
+            ob.put64(&mut out, ((places[rs[q].symbol as usize] as u64) << 32) | rs[q].kind as u64);
+            ob.put64(&mut out, nb.bits_of_i64(rs[q].addend));
         }
     }
-    pad_to(&mut out, 8);
+    ob.pad_to(&mut out, 8);
     let symtab_offset = out.len() as u64;
     let st = symtab.items();
     i = 0;
@@ -287,7 +204,7 @@ pub fn write(o: &Object, a: alloc.Allocator) -> alloc.List(u8) {
     while i < hb.len() : (i += 1) {
         out.push(hb[i]);
     }
-    pad_to(&mut out, 8);
+    ob.pad_to(&mut out, 8);
     let shoff = out.len() as u64;
     let bytes = out.items_mut();
     k = 0;

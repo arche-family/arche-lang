@@ -1,0 +1,285 @@
+// The ABI suite (docs/abi.md, docs/sprints.md S29): every layout crosses from
+// this module to peer, from peer to deep, and back, and through deep to here by
+// a method table and a closure. compiler/abi-check.sh builds each module by
+// each backend, in each mix, and the output must be expected.txt in all.
+import alloc;
+import deep;
+import peer;
+import std;
+
+type Doubler = struct {
+    by: u64,
+}
+
+impl deep.Scale for Doubler {
+    fn scale(self: &Doubler, p: deep.Pair) -> deep.Pair {
+        return deep.Pair { x: p.x * self.by, y: p.y * self.by };
+    }
+    fn bump(self: &mut Doubler, by: u64) -> u64 {
+        self.by += by;
+        return self.by;
+    }
+}
+
+fn num(sys: &mut std.System, name: str, v: u64) {
+    sys.stdout.write(name);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(v);
+    sys.stdout.write("\n");
+}
+
+fn signed(sys: &mut std.System, name: str, v: i64) {
+    sys.stdout.write(name);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(v);
+    sys.stdout.write("\n");
+}
+
+fn real(sys: &mut std.System, name: str, v: f64) {
+    sys.stdout.write(name);
+    sys.stdout.write(" ");
+    sys.stdout.write_f64(v);
+    sys.stdout.write("\n");
+}
+
+fn two(sys: &mut std.System, name: str, p: deep.Pair) {
+    sys.stdout.write(name);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(p.x);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(p.y);
+    sys.stdout.write("\n");
+}
+
+fn show_wide(sys: &mut std.System, name: str, w: deep.Wide) {
+    sys.stdout.write(name);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(w.a);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(w.b);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(w.c);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(w.d);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(w.e as u64);
+    sys.stdout.write("\n");
+}
+
+fn show_value(sys: &mut std.System, name: str, v: deep.Value) {
+    sys.stdout.write(name);
+    match v {
+        .Nothing => { sys.stdout.write(" nothing\n"); }
+        .Byte { v: b } => {
+            sys.stdout.write(" byte ");
+            sys.stdout.write_u64(b as u64);
+            sys.stdout.write("\n");
+        }
+        .Long { v: n } => {
+            sys.stdout.write(" long ");
+            sys.stdout.write_u64(n);
+            sys.stdout.write("\n");
+        }
+        .Two { p: p } => {
+            sys.stdout.write(" two ");
+            sys.stdout.write_u64(p.x);
+            sys.stdout.write(" ");
+            sys.stdout.write_u64(p.y);
+            sys.stdout.write("\n");
+        }
+        .Four { b: b } => {
+            sys.stdout.write(" four ");
+            sys.stdout.write_u64(b[0] as u64);
+            sys.stdout.write(" ");
+            sys.stdout.write_u64(b[1] as u64);
+            sys.stdout.write(" ");
+            sys.stdout.write_u64(b[2] as u64);
+            sys.stdout.write(" ");
+            sys.stdout.write_u64(b[3] as u64);
+            sys.stdout.write("\n");
+        }
+    }
+}
+
+fn show_error(sys: &mut std.System, name: str, e: deep.Fail) {
+    sys.stdout.write(name);
+    if e == deep.Fail.Low {
+        sys.stdout.write(" low\n");
+    } else {
+        sys.stdout.write(" high\n");
+    }
+}
+
+fn scalars(sys: &mut std.System) {
+    num(sys, name: "u8", v: peer.narrow_u8(200) as u64);
+    signed(sys, name: "i8", v: peer.narrow_i8(-100) as i64);
+    num(sys, name: "u16", v: peer.narrow_u16(60000) as u64);
+    signed(sys, name: "i16", v: peer.narrow_i16(-30000) as i64);
+    num(sys, name: "u32", v: peer.narrow_u32(4000000000) as u64);
+    signed(sys, name: "i32", v: peer.narrow_i32(-2000000000) as i64);
+    if peer.flip(true) {
+        num(sys, name: "bool", v: 1);
+    } else {
+        num(sys, name: "bool", v: 0);
+    }
+    real(sys, name: "f32", v: peer.single(1.5) as f64);
+    real(sys, name: "f64", v: peer.double(2.25));
+    signed(sys, name: "ints", v: peer.ints(a: 9, b: -8, c: 7, d: -6, e: 5, f: -4, g: 3, h: -2));
+    real(sys, name: "many", v: peer.many(i0: 1, f0: 0.5, i1: 2, f1: 1.5, i2: 3, f2: 2.5, i3: 4, f3: 3.5, i4: -5, f4: 4.5, i5: -6, f5: 5.5, i6: -7, f6: 6.5, i7: -8, f7: 7.5, i8_: 9, f8: 8.5, i9: 10, f9: 9.5, i10: 11, f10: 10.5));
+    real(sys, name: "floats", v: peer.floats(f0: 0.5, f1: 1.5, f2: 2.5, f3: 3.5, f4: 4.5, f5: 5.5, f6: 6.5, f7: 7.5, f8: 8.5, f9: 9.5, n: 3, g: 0.25));
+}
+
+fn structs(sys: &mut std.System) {
+    let s = peer.small(deep.Small { a: 1, b: 100000 });
+    num(sys, name: "small.a", v: s.a as u64);
+    num(sys, name: "small.b", v: s.b as u64);
+    two(sys, name: "pair", peer.pair(deep.Pair { x: 10, y: 20 }));
+    show_wide(sys, name: "wide", peer.wide(deep.Wide { a: 1, b: 2, c: 3, d: 4, e: 5 }));
+    let m = peer.mixed(deep.Mixed { f: 0.5, n: 6, g: 0.25 });
+    real(sys, name: "mixed.f", v: m.f);
+    num(sys, name: "mixed.n", v: m.n as u64);
+    real(sys, name: "mixed.g", v: m.g as f64);
+    let n = peer.nested(deep.Nested { p: deep.Pair { x: 1, y: 2 }, s: deep.Small { a: 3, b: 4 }, w: [5, 6, 7] });
+    two(sys, name: "nested.p", n.p);
+    num(sys, name: "nested.s", v: n.s.a as u64 + n.s.b as u64);
+    num(sys, name: "nested.w", v: n.w[0] as u64 * 10000 + n.w[1] as u64 * 100 + n.w[2] as u64);
+    let b = peer.bytes([1, 2, 3, 4]);
+    num(sys, name: "bytes", v: b[0] as u64 * 1000 + b[1] as u64 * 100 + b[2] as u64 * 10 + b[3] as u64);
+    let ps = peer.pairs([deep.Pair { x: 1, y: 2 }, deep.Pair { x: 3, y: 4 }, deep.Pair { x: 5, y: 6 }]);
+    two(sys, name: "pairs.0", ps[0]);
+    two(sys, name: "pairs.2", ps[2]);
+    num(sys, name: "structs", v: peer.structs(p: deep.Pair { x: 1, y: 2 }, a: 3, w: deep.Wide { a: 4, b: 0, c: 0, d: 0, e: 0 }, b: 5.0, s: deep.Small { a: 0, b: 6 }, q: deep.Pair { x: 0, y: 7 }, c: 8, m: deep.Mixed { f: 0.0, n: 9, g: 0.0 }, t: deep.Wide { a: 0, b: 0, c: 0, d: 0, e: 10 }));
+    num(sys, name: "method", v: peer.sum_of(deep.Pair { x: 40, y: 1 }));
+    var grown = deep.Pair { x: 1, y: 2 };
+    peer.grow_by(&mut grown, by: 3);
+    two(sys, name: "method.mut", grown);
+    let boxed = peer.boxed_pair(deep.Pair { x: 7, y: 8 });
+    two(sys, name: "generic", boxed.v);
+    let byte_box = deep.wrap(u8, 200);
+    num(sys, name: "generic.u8", v: byte_box.v as u64);
+}
+
+fn enums(sys: &mut std.System) {
+    let c = peer.color(deep.Color.Red);
+    if c == deep.Color.Blue {
+        num(sys, name: "color", v: 2);
+    } else {
+        num(sys, name: "color", v: 0);
+    }
+    show_value(sys, name: "value.nothing", peer.value(deep.Value.Nothing));
+    show_value(sys, name: "value.byte", peer.value(deep.Value.Byte { v: 5 }));
+    show_value(sys, name: "value.long", peer.value(deep.Value.Long { v: 50 }));
+    show_value(sys, name: "value.two", peer.value(deep.Value.Two { p: deep.Pair { x: 1, y: 2 } }));
+    show_value(sys, name: "value.four", peer.value(deep.Value.Four { b: [1, 2, 3, 4] }));
+}
+
+fn lift_u8(v: u8) -> ?u8 { return v; }
+fn lift_u64(v: u64) -> ?u64 { return v; }
+fn lift_pair(v: deep.Pair) -> ?deep.Pair { return v; }
+fn lift_wide(v: deep.Wide) -> ?deep.Wide { return v; }
+
+fn optionals(sys: &mut std.System) {
+    let none_u8: ?u8 = none;
+    let some_u8 = lift_u8(3);
+    num(sys, name: "maybe_u8.none", v: (peer.maybe_u8(none_u8) orelse 0) as u64);
+    num(sys, name: "maybe_u8.some", v: (peer.maybe_u8(some_u8) orelse 0) as u64);
+    let none_u64: ?u64 = none;
+    let some_u64 = lift_u64(500);
+    num(sys, name: "maybe_u64.none", v: peer.maybe_u64(none_u64) orelse 0);
+    num(sys, name: "maybe_u64.big", v: peer.maybe_u64(some_u64) orelse 1234);
+    let none_pair: ?deep.Pair = none;
+    let some_pair = lift_pair(deep.Pair { x: 5, y: 6 });
+    two(sys, name: "maybe_pair.none", peer.maybe_pair(none_pair) orelse deep.Pair { x: 0, y: 0 });
+    two(sys, name: "maybe_pair.some", peer.maybe_pair(some_pair) orelse deep.Pair { x: 0, y: 0 });
+    let none_wide: ?deep.Wide = none;
+    let some_wide = lift_wide(deep.Wide { a: 1, b: 2, c: 3, d: 4, e: 5 });
+    show_wide(sys, name: "maybe_wide.none", peer.maybe_wide(none_wide) orelse deep.Wide { a: 0, b: 0, c: 0, d: 0, e: 0 });
+    show_wide(sys, name: "maybe_wide.some", peer.maybe_wide(some_wide) orelse deep.Wide { a: 0, b: 0, c: 0, d: 0, e: 0 });
+}
+
+fn errors(sys: &mut std.System) {
+    match peer.fail_u8(5) {
+        ok(v) => { num(sys, name: "fail_u8.ok", v: v as u64); }
+        err(e) => { show_error(sys, name: "fail_u8.ok", e); }
+    }
+    match peer.fail_u8(0) {
+        ok(v) => { num(sys, name: "fail_u8.err", v: v as u64); }
+        err(e) => { show_error(sys, name: "fail_u8.err", e); }
+    }
+    match peer.fail_pair(5) {
+        ok(p) => { two(sys, name: "fail_pair.ok", p); }
+        err(e) => { show_error(sys, name: "fail_pair.ok", e); }
+    }
+    match peer.fail_pair(0) {
+        ok(p) => { two(sys, name: "fail_pair.err", p); }
+        err(e) => { show_error(sys, name: "fail_pair.err", e); }
+    }
+    match peer.fail_wide(deep.Wide { a: 1, b: 2, c: 3, d: 4, e: 5 }) {
+        ok(w) => { show_wide(sys, name: "fail_wide.ok", w); }
+        err(e) => { show_error(sys, name: "fail_wide.ok", e); }
+    }
+    match peer.fail_wide(deep.Wide { a: 1, b: 2, c: 3, d: 4, e: 0 }) {
+        ok(w) => { show_wide(sys, name: "fail_wide.err", w); }
+        err(e) => { show_error(sys, name: "fail_wide.err", e); }
+    }
+    match peer.fail_void(1) {
+        ok(_) => { num(sys, name: "fail_void.ok", v: 1); }
+        err(e) => { show_error(sys, name: "fail_void.ok", e); }
+    }
+    match peer.fail_void(0) {
+        ok(_) => { num(sys, name: "fail_void.err", v: 1); }
+        err(e) => { show_error(sys, name: "fail_void.err", e); }
+    }
+}
+
+fn views(sys: &mut std.System) {
+    num(sys, name: "str", v: peer.text_size("arche") as u64);
+    var bytes: [4]u8 = [1, 2, 3, 4];
+    num(sys, name: "slice", v: peer.add_all(bytes[0..4]));
+    var words: [3]u32 = [1, 2, 3];
+    peer.fill(words[0..3], 7);
+    num(sys, name: "slice.mut", v: words[0] as u64 * 100 + words[1] as u64 * 10 + words[2] as u64);
+    num(sys, name: "projection", v: peer.second(words[0..3]).* as u64);
+    var p = deep.Pair { x: 1, y: 2 };
+    num(sys, name: "ref", v: peer.read_pair(&p));
+    peer.write_pair(&mut p);
+    two(sys, name: "ref.mut", p);
+}
+
+fn owned(sys: &mut std.System) {
+    var text = alloc.String.init(sys.alloc);
+    text.push_str("main");
+    let done = peer.own_text(text);
+    sys.stdout.write("string ");
+    sys.stdout.write(done.view());
+    sys.stdout.write("\n");
+    var list = alloc.List(u32).init(sys.alloc);
+    list.push(1);
+    let longer = peer.own_list(list);
+    num(sys, name: "list", v: longer[0] as u64 * 10000 + longer[1] as u64 * 100 + longer[2] as u64);
+}
+
+fn calls_back(sys: &mut std.System) {
+    var d = Doubler { by: 2 };
+    two(sys, name: "dyn", peer.through_dyn(&d, p: deep.Pair { x: 1, y: 2 }));
+    num(sys, name: "dyn.mut", v: peer.through_mut_dyn(&mut d, by: 3));
+    num(sys, name: "dyn.state", v: d.by);
+    let factor: u64 = 3;
+    let times = fn [factor](p: deep.Pair) -> deep.Pair { return deep.Pair { x: p.x * factor, y: p.y * factor }; };
+    two(sys, name: "closure", peer.through_closure(&times, p: deep.Pair { x: 1, y: 2 }));
+    var total: u64 = 0;
+    let add = fn [&mut total](n: u64) { total += n; };
+    peer.through_closure_mut(&add, n: 40);
+    num(sys, name: "closure.mut", v: total);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    scalars(sys);
+    structs(sys);
+    enums(sys);
+    optionals(sys);
+    errors(sys);
+    views(sys);
+    owned(sys);
+    calls_back(sys);
+}

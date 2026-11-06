@@ -271,6 +271,11 @@ static i64 os_open_write(const u8 *path, u64 path_len) {
     return (i64)h;
 }
 
+// On Windows a program is known by its name, not its mode.
+static i64 os_open_program(const u8 *path, u64 path_len) {
+    return os_open_write(path, path_len);
+}
+
 static i64 os_read(i64 handle, u8 *p, u64 n) {
     u32 got = 0;
     u32 want = n > 0x40000000 ? 0x40000000 : (u32)n;

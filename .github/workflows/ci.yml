@@ -31,7 +31,7 @@ jobs:
         run: make -C compiler differential CC=${{ matrix.cc }}
       - name: Install lld and gdb
         run: sudo apt-get update && sudo apt-get install -y lld gdb
-      - name: The compiler's own backend, all the tests, and a session in gdb
+      - name: The compiler's own backend and linker, all the tests, the ABI suite, and a session in gdb
         run: REQUIRE_GDB=1 make -C compiler check-own CC=${{ matrix.cc }}
       - name: Bootstrap, stage2 == stage3
         run: CC=${{ matrix.cc }} ./bootstrap.sh
@@ -76,10 +76,12 @@ jobs:
         run: make -C stage0 && make -C compiler && make -C conformance
       - name: Conformance tests in QEMU
         run: cd compiler && ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
-      - name: Conformance tests in QEMU, by the compiler's own backend
-        run: cd compiler && ARCHE_BACKEND=own ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
+      - name: Conformance tests in QEMU, by the compiler's own backend and linker, with no clang and no lld
+        run: cd compiler && CLANG=false LLD=false ARCHE_BACKEND=own ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
       - name: Conformance tests in QEMU, in a release build
         run: cd compiler && ARCHE_FLAGS=--release ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
+      - name: The ABI suite, each module by each backend
+        run: QEMU=qemu-${{ matrix.arch }}-static sh compiler/abi-check.sh ${{ matrix.arch }}
       - name: Bootstrap on that processor, stage2 == stage3
         run: QEMU=qemu-${{ matrix.arch }}-static ./cross-bootstrap.sh ${{ matrix.arch }}
 

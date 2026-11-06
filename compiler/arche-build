@@ -20,8 +20,8 @@ if rt_stale "$rt"; then
 fi
 # ARCHE selects the compiler binary, so later bootstrap stages can be tested.
 if [ "$ARCHE_BACKEND" = own ]; then
-    "${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG build "$1" "$2.o"
-    "$LLD" -static -o "$2" "$2.o" "$rt"
+    "${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG build "$1" "$2.ao"
+    own_link "$2" "$2.ao" "$rt"
 else
     "${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG build "$1" "$2.ll"
     $cc -O1 $LINK_FLAGS -Wno-override-module -o "$2" "$2.ll" "$rt"

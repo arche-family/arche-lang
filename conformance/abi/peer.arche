@@ -1,0 +1,89 @@
+/// The middle of the ABI suite (docs/abi.md): each layout passes through here on
+/// its way to deep, and on the way back, with one added at each end.
+import alloc;
+import deep;
+
+pub fn narrow_u8(x: u8) -> u8 { return deep.narrow_u8(x + 1) + 1; }
+pub fn narrow_i8(x: i8) -> i8 { return deep.narrow_i8(x + 1) + 1; }
+pub fn narrow_u16(x: u16) -> u16 { return deep.narrow_u16(x + 1) + 1; }
+pub fn narrow_i16(x: i16) -> i16 { return deep.narrow_i16(x + 1) + 1; }
+pub fn narrow_u32(x: u32) -> u32 { return deep.narrow_u32(x + 1) + 1; }
+pub fn narrow_i32(x: i32) -> i32 { return deep.narrow_i32(x + 1) + 1; }
+pub fn flip(x: bool) -> bool { return not deep.flip(x); }
+pub fn single(x: f32) -> f32 { return deep.single(x + 1.0) + 1.0; }
+pub fn double(x: f64) -> f64 { return deep.double(x + 1.0) + 1.0; }
+
+pub fn ints(a: u8, b: i8, c: u16, d: i16, e: u32, f: i32, g: u64, h: i64) -> i64 {
+    return deep.ints(a: a, b: b, c: c, d: d, e: e, f: f, g: g, h: h) + 1;
+}
+
+pub fn many(i0: u64, f0: f64, i1: u32, f1: f32, i2: u16, f2: f64, i3: u8, f3: f32, i4: i64, f4: f64, i5: i32, f5: f32, i6: i16, f6: f64, i7: i8, f7: f32, i8_: u64, f8: f64, i9: u32, f9: f32, i10: u8, f10: f64) -> f64 {
+    return deep.many(i0: i0, f0: f0, i1: i1, f1: f1, i2: i2, f2: f2, i3: i3, f3: f3, i4: i4, f4: f4, i5: i5, f5: f5, i6: i6, f6: f6, i7: i7, f7: f7, i8_: i8_, f8: f8, i9: i9, f9: f9, i10: i10, f10: f10) + 1.0;
+}
+
+pub fn floats(f0: f64, f1: f32, f2: f64, f3: f32, f4: f64, f5: f32, f6: f64, f7: f32, f8: f64, f9: f32, n: u8, g: f64) -> f64 {
+    return deep.floats(f0: f0, f1: f1, f2: f2, f3: f3, f4: f4, f5: f5, f6: f6, f7: f7, f8: f8, f9: f9, n: n, g: g) + 1.0;
+}
+
+pub fn small(s: deep.Small) -> deep.Small { return deep.small(deep.small(s)); }
+pub fn pair(p: deep.Pair) -> deep.Pair { return deep.pair(deep.pair(p)); }
+pub fn wide(w: deep.Wide) -> deep.Wide { return deep.wide(deep.wide(w)); }
+pub fn mixed(m: deep.Mixed) -> deep.Mixed { return deep.mixed(deep.mixed(m)); }
+pub fn nested(n: deep.Nested) -> deep.Nested { return deep.nested(deep.nested(n)); }
+pub fn bytes(b: [4]u8) -> [4]u8 { return deep.bytes(deep.bytes(b)); }
+pub fn pairs(p: [3]deep.Pair) -> [3]deep.Pair { return deep.pairs(deep.pairs(p)); }
+pub fn color(c: deep.Color) -> deep.Color { return deep.color(deep.color(c)); }
+pub fn value(v: deep.Value) -> deep.Value { return deep.value(deep.value(v)); }
+pub fn maybe_u8(x: ?u8) -> ?u8 { return deep.maybe_u8(deep.maybe_u8(x)); }
+pub fn maybe_u64(x: ?u64) -> ?u64 { return deep.maybe_u64(deep.maybe_u64(x)); }
+pub fn maybe_pair(x: ?deep.Pair) -> ?deep.Pair { return deep.maybe_pair(deep.maybe_pair(x)); }
+pub fn maybe_wide(x: ?deep.Wide) -> ?deep.Wide { return deep.maybe_wide(deep.maybe_wide(x)); }
+
+pub fn fail_u8(x: u8) -> deep.Fail!u8 {
+    let v = try deep.fail_u8(x);
+    return try deep.fail_u8(v);
+}
+
+pub fn fail_pair(x: u64) -> deep.Fail!deep.Pair {
+    let p = try deep.fail_pair(x);
+    return deep.pair(p);
+}
+
+pub fn fail_wide(w: deep.Wide) -> deep.Fail!deep.Wide {
+    let v = try deep.fail_wide(w);
+    return try deep.fail_wide(v);
+}
+
+pub fn fail_void(x: u8) -> deep.Fail!void {
+    try deep.fail_void(x);
+}
+
+pub fn text_size(t: str) -> usize { return deep.text_size(deep.tail(t)) + 1; }
+pub fn add_all(xs: []u8) -> u64 { return deep.add_all(xs[1..xs.len()]) + xs[0] as u64; }
+pub fn fill(xs: []mut u32, v: u32) { deep.fill(xs[1..xs.len()], v + 1); }
+pub fn second(xs: []u32) -> &u32 { return deep.second(xs); }
+pub fn read_pair(p: &deep.Pair) -> u64 { return deep.read_pair(p) + 1; }
+pub fn write_pair(p: &mut deep.Pair) {
+    deep.write_pair(p);
+    deep.write_pair(p);
+}
+pub fn own_text(t: alloc.String) -> alloc.String {
+    var s = deep.own_text(t);
+    s.push_str("+peer");
+    return s;
+}
+pub fn own_list(l: alloc.List(u32)) -> alloc.List(u32) {
+    var s = deep.own_list(l);
+    s.push(98);
+    return s;
+}
+pub fn structs(p: deep.Pair, a: u8, w: deep.Wide, b: f64, s: deep.Small, q: deep.Pair, c: u16, m: deep.Mixed, t: deep.Wide) -> u64 {
+    return deep.structs(p: p, a: a, w: w, b: b, s: s, q: q, c: c, m: m, t: t) + 1;
+}
+pub fn through_dyn(s: &dyn deep.Scale, p: deep.Pair) -> deep.Pair { return deep.through_dyn(s, p: deep.pair(p)); }
+pub fn through_mut_dyn(s: &mut dyn deep.Scale, by: u64) -> u64 { return deep.through_mut_dyn(s, by: by) + 1; }
+pub fn through_closure(f: &dyn fn(deep.Pair) -> deep.Pair, p: deep.Pair) -> deep.Pair { return deep.through_closure(f, p: deep.pair(p)); }
+pub fn through_closure_mut(f: &dyn fn(u64), n: u64) { deep.through_closure_mut(f, n: n + 1); }
+pub fn sum_of(p: deep.Pair) -> u64 { return p.sum() + 1; }
+pub fn grow_by(p: &mut deep.Pair, by: u64) { p.grow(by); }
+pub fn boxed_pair(p: deep.Pair) -> deep.Box(deep.Pair) { return deep.wrap(deep.Pair, deep.pair(p)); }

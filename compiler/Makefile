@@ -30,14 +30,17 @@ $(BUILD)/arche: $(SOURCES) $(STAGE0)/runtime/arche0_rt.c $(STAGE0)/runtime/arche
 $(BUILD):
 	mkdir -p $@
 
-# The compiler's own backend (x64/gen.arche): all the tests again, built with
-# no LLVM, and what they do not look at. Needs lld, and gdb for the session.
+# The compiler's own backend and linker: all the tests again, built with no
+# LLVM and no lld, whose absence is enforced once clang has built the runtime,
+# and what they do not look at. Needs lld for the loader, and gdb for the session.
 check-own: $(BUILD)/arche
 	$(MAKE) -C ../conformance
-	ARCHE_BACKEND=own ../conformance/runner/build/runner --timeout 30 --compiler "$(BUILD_CMD)" ../conformance/tests
-	ARCHE_BACKEND=own ../conformance/runner/build/runner --timeout 30 --compiler "$(TESTS_CMD)" ../conformance/testrunner
+	ARCHE_BACKEND=own sh ./arche-build tests/own/sample.arche $(BUILD)/own-sample
+	ARCHE_BACKEND=own CLANG=false LLD=false ../conformance/runner/build/runner --timeout 30 --compiler "$(BUILD_CMD)" ../conformance/tests
+	ARCHE_BACKEND=own CLANG=false LLD=false ../conformance/runner/build/runner --timeout 30 --compiler "$(TESTS_CMD)" ../conformance/testrunner
 	ARCHE_BACKEND=own sh ./differential.sh ../conformance/tests
 	sh ./own-check.sh
+	sh ./abi-check.sh
 
 check: $(BUILD)/arche
 	$(MAKE) -C ../conformance

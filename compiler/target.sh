@@ -4,7 +4,7 @@
 # (docs/sprints.md S19). Sourced, not run.
 #
 # ARCHE_BACKEND=own builds through the compiler's own backend (x64/, a64/,
-# rv64/) and lld (LLD names it), with no LLVM between them, for Linux.
+# rv64/) and its own linker (link/), with no LLVM and no lld, for Linux.
 #
 # It sets CLANG, ARCHE_TARGET, TARGET_FLAG (for the compiler), RT_FLAGS (to
 # compile the runtime), LINK_FLAGS (to link a program with it) and GC_FLAGS
@@ -60,6 +60,18 @@ esac
 
 # Whether the runtime's object is older than anything it is made of. Sourced
 # from a script that set here.
+# Links a program by the compiler's own linker, from its object and the
+# runtime's. The runtime comes from clang, once, as an ELF object; arche import
+# makes it what the linker reads. Usage: own_link <program> <object.ao> <rt.o>.
+own_link() {
+    own_rt=${3%.o}.ao
+    if [ ! -f "$own_rt" ] || [ "$3" -nt "$own_rt" ]; then
+        "${ARCHE:-$here/build/arche}" import "$3" "$own_rt.tmp.$$"
+        mv "$own_rt.tmp.$$" "$own_rt"
+    fi
+    "${ARCHE:-$here/build/arche}" link "$1" "$2" "$own_rt"
+}
+
 rt_stale() {
     [ -f "$1" ] || return 0
     for part in "$here"/runtime/*; do

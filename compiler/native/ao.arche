@@ -1,0 +1,339 @@
+/// The Arche object format, `.ao` (docs/abi.md): what `arche build x.ao` writes
+/// and `arche link` reads. All little-endian: a header, the tables of sections,
+/// symbols and relocations, their names, then the bytes of the sections.
+import alloc;
+import native.buffer as nb;
+import native.object as ob;
+
+/// This file's layout, and what is in it: the ABI of docs/abi.md.
+pub const FORMAT_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 0;
+
+const HEADER_SIZE: u64 = 40;
+const ENTRY_SIZE: u64 = 32;
+
+const KIND_CODE: u32 = 1;
+const KIND_RODATA: u32 = 2;
+const KIND_DATA: u32 = 3;
+const KIND_BSS: u32 = 4;
+const KIND_DEBUG: u32 = 5;
+const KIND_OTHER: u32 = 6;
+
+/// Past this, no number in an object is a real one, and sums of them could not
+/// overflow what is below it.
+const TOO_LARGE: u64 = 0x10000000000;
+
+const BIND_LOCAL: u8 = 0;
+const BIND_GLOBAL: u8 = 1;
+const BIND_WEAK: u8 = 2;
+
+fn put_magic(out: &mut alloc.List(u8)) {
+    let m = "ARCHEAO\n".bytes();
+    var i: usize = 0;
+    while i < m.len() : (i += 1) {
+        out.push(m[i]);
+    }
+}
+
+fn is_debug_name(name: str) -> bool {
+    return name.starts_with(".debug_");
+}
+
+fn kind_of(s: &ob.Section) -> u32 {
+    if s.bss_size > 0 {
+        return KIND_BSS;
+    }
+    if s.flags & ob.FLAG_EXEC != 0 {
+        return KIND_CODE;
+    }
+    if s.flags & ob.FLAG_WRITE != 0 {
+        return KIND_DATA;
+    }
+    if s.flags & ob.FLAG_ALLOC != 0 {
+        return KIND_RODATA;
+    }
+    if is_debug_name(s.name.view()) {
+        return KIND_DEBUG;
+    }
+    return KIND_OTHER;
+}
+
+fn flags_of(kind: u32) -> u64 {
+    if kind == KIND_CODE {
+        return ob.FLAG_ALLOC | ob.FLAG_EXEC;
+    }
+    if kind == KIND_DATA or kind == KIND_BSS {
+        return ob.FLAG_ALLOC | ob.FLAG_WRITE;
+    }
+    if kind == KIND_RODATA {
+        return ob.FLAG_ALLOC;
+    }
+    return 0;
+}
+
+fn put_name(strings: &mut alloc.List(u8), name: str) -> u32 {
+    let at = strings.len() as u32;
+    let b = name.bytes();
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        strings.push(b[i]);
+    }
+    strings.push(0);
+    return at;
+}
+
+/// The object as a file.
+pub fn write(o: &ob.Object, a: alloc.Allocator) -> alloc.List(u8) {
+    let sections = o.sections.items();
+    let symbols = o.symbols.items();
+    var strings = alloc.List(u8).init(a);
+    strings.push(0);
+    var section_names = alloc.List(u32).init(a);
+    var nreloc: u32 = 0;
+    var i: usize = 0;
+    while i < sections.len() : (i += 1) {
+        section_names.push(put_name(&mut strings, sections[i].name.view()));
+        nreloc += sections[i].relocs.len() as u32;
+    }
+    var symbol_names = alloc.List(u32).init(a);
+    i = 0;
+    while i < symbols.len() : (i += 1) {
+        if symbols[i].name.len() == 0 {
+            symbol_names.push(0);
+        } else {
+            symbol_names.push(put_name(&mut strings, symbols[i].name.view()));
+        }
+    }
+    var out = alloc.List(u8).init(a);
+    put_magic(&mut out);
+    ob.put32(&mut out, FORMAT_VERSION);
+    ob.put32(&mut out, ABI_VERSION);
+    ob.put32(&mut out, o.machine);
+    ob.put32(&mut out, o.flags);
+    ob.put32(&mut out, sections.len() as u32);
+    ob.put32(&mut out, symbols.len() as u32);
+    ob.put32(&mut out, nreloc);
+    ob.put32(&mut out, strings.len() as u32);
+    // Where the bytes go: after everything else, each at its alignment.
+    var at = HEADER_SIZE + ENTRY_SIZE * (sections.len() as u64 + symbols.len() as u64 + nreloc as u64) + strings.len() as u64;
+    i = 0;
+    while i < sections.len() : (i += 1) {
+        let s = &sections[i];
+        ob.put32(&mut out, section_names[i]);
+        ob.put32(&mut out, kind_of(s));
+        ob.put32(&mut out, s.align as u32);
+        ob.put32(&mut out, 0);
+        if s.bss_size > 0 {
+            ob.put64(&mut out, 0);
+            ob.put64(&mut out, s.bss_size);
+        } else {
+            while at % s.align != 0 {
+                at += 1;
+            }
+            ob.put64(&mut out, at);
+            ob.put64(&mut out, s.bytes.len() as u64);
+            at += s.bytes.len() as u64;
+        }
+    }
+    i = 0;
+    while i < symbols.len() : (i += 1) {
+        let s = &symbols[i];
+        ob.put32(&mut out, symbol_names[i]);
+        ob.put32(&mut out, s.section);
+        out.push(s.kind);
+        if s.weak {
+            out.push(BIND_WEAK);
+        } else if s.global {
+            out.push(BIND_GLOBAL);
+        } else {
+            out.push(BIND_LOCAL);
+        }
+        ob.put16(&mut out, 0);
+        ob.put32(&mut out, 0);
+        ob.put64(&mut out, s.value);
+        ob.put64(&mut out, s.size);
+    }
+    i = 0;
+    while i < sections.len() : (i += 1) {
+        let rs = sections[i].relocs.items();
+        var k: usize = 0;
+        while k < rs.len() : (k += 1) {
+            ob.put32(&mut out, i as u32);
+            ob.put32(&mut out, rs[k].symbol);
+            ob.put32(&mut out, rs[k].kind);
+            ob.put32(&mut out, 0);
+            ob.put64(&mut out, rs[k].offset);
+            ob.put64(&mut out, nb.bits_of_i64(rs[k].addend));
+        }
+    }
+    let sb = strings.items();
+    i = 0;
+    while i < sb.len() : (i += 1) {
+        out.push(sb[i]);
+    }
+    i = 0;
+    while i < sections.len() : (i += 1) {
+        if sections[i].bss_size == 0 {
+            ob.pad_to(&mut out, sections[i].align);
+            let b = sections[i].bytes.items();
+            var k: usize = 0;
+            while k < b.len() : (k += 1) {
+                out.push(b[k]);
+            }
+        }
+    }
+    return out;
+}
+
+fn get32(b: []u8, at: u64) -> u32 {
+    let i = at as usize;
+    return b[i] as u32 | ((b[i + 1] as u32) << 8) | ((b[i + 2] as u32) << 16) | ((b[i + 3] as u32) << 24);
+}
+
+fn get64(b: []u8, at: u64) -> u64 {
+    return get32(b, at: at) as u64 | ((get32(b, at: at + 4) as u64) << 32);
+}
+
+fn i64_of_bits(v: u64) -> i64 {
+    if v <= 0x7FFFFFFFFFFFFFFF {
+        return v as i64;
+    }
+    return -((18446744073709551615 - v) as i64) - 1;
+}
+
+/// A name from the table; false, with nothing added, when it is no name.
+fn take_name(b: []u8, table: u64, size: u64, at: u64, into: &mut alloc.String) -> bool {
+    if at >= size and size > 0 {
+        return false;
+    }
+    var i = table + at;
+    let end = table + size;
+    while i < end : (i += 1) {
+        let c = b[i as usize];
+        if c == 0 {
+            return true;
+        }
+        if c > 127 {
+            return false;
+        }
+        into.push_ascii(c);
+    }
+    return false;
+}
+
+fn say(problem: &mut alloc.String, what: str) {
+    problem.push_str(what);
+}
+
+/// The file as an object; if it is not a good one, problem says why, and the
+/// object is empty. Nothing in the file is trusted.
+pub fn read(b: []u8, problem: &mut alloc.String, a: alloc.Allocator) -> ob.Object {
+    var o = ob.Object.init(machine: 0, flags: 0, a: a);
+    let want = "ARCHEAO\n".bytes();
+    var q: usize = 0;
+    var same = b.len() as u64 >= HEADER_SIZE;
+    while same and q < want.len() : (q += 1) {
+        same = b[q] == want[q];
+    }
+    if not same {
+        say(problem, "not an Arche object");
+        return o;
+    }
+    if get32(b, at: 8) != FORMAT_VERSION {
+        say(problem, "an Arche object of another format version");
+        return o;
+    }
+    if get32(b, at: 12) != ABI_VERSION {
+        say(problem, "an Arche object of another ABI version");
+        return o;
+    }
+    o.machine = get32(b, at: 16);
+    o.flags = get32(b, at: 20);
+    let nsection = get32(b, at: 24) as u64;
+    let nsymbol = get32(b, at: 28) as u64;
+    let nreloc = get32(b, at: 32) as u64;
+    let nstring = get32(b, at: 36) as u64;
+    let sections_at = HEADER_SIZE;
+    let symbols_at = sections_at + nsection * ENTRY_SIZE;
+    let relocs_at = symbols_at + nsymbol * ENTRY_SIZE;
+    let strings_at = relocs_at + nreloc * ENTRY_SIZE;
+    let total = b.len() as u64;
+    if strings_at + nstring > total {
+        say(problem, "an Arche object that is cut short");
+        return o;
+    }
+    var i: u64 = 0;
+    while i < nsection : (i += 1) {
+        let e = sections_at + i * ENTRY_SIZE;
+        var name = alloc.String.init(a);
+        if not take_name(b, table: strings_at, size: nstring, at: get32(b, at: e) as u64, into: &mut name) {
+            say(problem, "an Arche object with a bad section name");
+            return o;
+        }
+        let kind = get32(b, at: e + 4);
+        let align = get32(b, at: e + 8) as u64;
+        let offset = get64(b, at: e + 16);
+        let size = get64(b, at: e + 24);
+        if kind < KIND_CODE or kind > KIND_OTHER or align == 0 or align & (align - 1) != 0 {
+            say(problem, "an Arche object with a bad section");
+            return o;
+        }
+        var bytes = alloc.List(u8).init(a);
+        var bss: u64 = 0;
+        if kind == KIND_BSS {
+            if size >= TOO_LARGE {
+                say(problem, "an Arche object with a bss beyond reason");
+                return o;
+            }
+            bss = size;
+        } else {
+            if offset > total or size > total - offset {
+                say(problem, "an Arche object with a section outside it");
+                return o;
+            }
+            var k = offset;
+            while k < offset + size : (k += 1) {
+                bytes.push(b[k as usize]);
+            }
+        }
+        o.sections.push(ob.Section { name: name, flags: flags_of(kind), align: align, bytes: bytes, relocs: alloc.List(nb.Reloc).init(a), symbol: ob.NO_SECTION, bss_size: bss });
+    }
+    i = 0;
+    while i < nsymbol : (i += 1) {
+        let e = symbols_at + i * ENTRY_SIZE;
+        var name = alloc.String.init(a);
+        let name_at = get32(b, at: e) as u64;
+        if name_at != 0 and not take_name(b, table: strings_at, size: nstring, at: name_at, into: &mut name) {
+            say(problem, "an Arche object with a bad symbol name");
+            return o;
+        }
+        let section = get32(b, at: e + 4);
+        if section != ob.NO_SECTION and section as u64 >= nsection {
+            say(problem, "an Arche object with a symbol in no section");
+            return o;
+        }
+        if get64(b, at: e + 16) >= TOO_LARGE {
+            say(problem, "an Arche object with a symbol beyond reason");
+            return o;
+        }
+        let bind = b[(e + 9) as usize];
+        o.symbols.push(ob.Symbol { name: name, section: section, value: get64(b, at: e + 16), size: get64(b, at: e + 24), kind: b[(e + 8) as usize], global: bind != BIND_LOCAL, weak: bind == BIND_WEAK });
+    }
+    i = 0;
+    while i < nreloc : (i += 1) {
+        let e = relocs_at + i * ENTRY_SIZE;
+        let section = get32(b, at: e) as u64;
+        let symbol = get32(b, at: e + 4);
+        if section >= nsection or symbol as u64 >= nsymbol {
+            say(problem, "an Arche object with a bad relocation");
+            return o;
+        }
+        let addend = i64_of_bits(get64(b, at: e + 24));
+        if addend >= TOO_LARGE as i64 or addend <= -(TOO_LARGE as i64) {
+            say(problem, "an Arche object with a relocation beyond reason");
+            return o;
+        }
+        o.sections[section as usize].relocs.push(nb.Reloc { offset: get64(b, at: e + 16), symbol: symbol, kind: get32(b, at: e + 8), addend: addend });
+    }
+    return o;
+}

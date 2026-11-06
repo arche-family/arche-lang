@@ -1,0 +1,201 @@
+/// The far end of the ABI suite (docs/abi.md): the layouts, and functions that
+/// take each of them, add one to what they can, and give it back. A module of
+/// its own, so that it can be compiled by another backend than its callers.
+import alloc;
+
+pub type Small = struct { pub a: u8, pub b: u32 }
+pub type Pair = struct {
+    pub x: u64,
+    pub y: u64,
+
+    pub fn sum(self: Pair) -> u64 {
+        return self.x + self.y;
+    }
+
+    pub fn grow(self: &mut Pair, by: u64) {
+        self.x += by;
+        self.y += by;
+    }
+}
+pub type Wide = struct { pub a: u64, pub b: u64, pub c: u64, pub d: u64, pub e: u8 }
+pub type Mixed = struct { pub f: f64, pub n: u8, pub g: f32 }
+pub type Nested = struct { pub p: Pair, pub s: Small, pub w: [3]u16 }
+pub type Color = enum { Red, Green, Blue }
+pub type Value = enum { Nothing, Byte { v: u8 }, Long { v: u64 }, Two { p: Pair }, Four { b: [4]u8 } }
+pub type Fail = error { Low, High }
+pub type Box(comptime T: type) = struct { pub v: T }
+
+pub type Scale = interface {
+    fn scale(self: &Self, p: Pair) -> Pair;
+    fn bump(self: &mut Self, by: u64) -> u64;
+}
+
+pub fn wrap(comptime T: type, v: T) -> Box(T) {
+    return Box(T) { v: v };
+}
+
+pub fn narrow_u8(x: u8) -> u8 { return x + 1; }
+pub fn narrow_i8(x: i8) -> i8 { return x + 1; }
+pub fn narrow_u16(x: u16) -> u16 { return x + 1; }
+pub fn narrow_i16(x: i16) -> i16 { return x + 1; }
+pub fn narrow_u32(x: u32) -> u32 { return x + 1; }
+pub fn narrow_i32(x: i32) -> i32 { return x + 1; }
+pub fn flip(x: bool) -> bool { return not x; }
+pub fn single(x: f32) -> f32 { return x + 1.0; }
+pub fn double(x: f64) -> f64 { return x + 1.0; }
+
+pub fn ints(a: u8, b: i8, c: u16, d: i16, e: u32, f: i32, g: u64, h: i64) -> i64 {
+    return a as i64 + b as i64 * 10 + c as i64 * 100 + d as i64 * 1000 + e as i64 * 10000 + f as i64 * 100000 + g as i64 * 1000000 + h * 10000000;
+}
+
+/// More than any processor's registers hold, of both kinds.
+pub fn many(i0: u64, f0: f64, i1: u32, f1: f32, i2: u16, f2: f64, i3: u8, f3: f32, i4: i64, f4: f64, i5: i32, f5: f32, i6: i16, f6: f64, i7: i8, f7: f32, i8_: u64, f8: f64, i9: u32, f9: f32, i10: u8, f10: f64) -> f64 {
+    let whole = i0 as i64 + i1 as i64 * 2 + i2 as i64 * 3 + i3 as i64 * 4 + i4 * 5 + i5 as i64 * 6 + i6 as i64 * 7 + i7 as i64 * 8 + i8_ as i64 * 9 + i9 as i64 * 10 + i10 as i64 * 11;
+    let part = f0 + f1 as f64 * 2.0 + f2 * 3.0 + f3 as f64 * 4.0 + f4 * 5.0 + f5 as f64 * 6.0 + f6 * 7.0 + f7 as f64 * 8.0 + f8 * 9.0 + f9 as f64 * 10.0 + f10 * 11.0;
+    return whole as f64 + part;
+}
+
+/// More floats than their registers, with integer registers free.
+pub fn floats(f0: f64, f1: f32, f2: f64, f3: f32, f4: f64, f5: f32, f6: f64, f7: f32, f8: f64, f9: f32, n: u8, g: f64) -> f64 {
+    let part = f0 + f1 as f64 * 2.0 + f2 * 3.0 + f3 as f64 * 4.0 + f4 * 5.0 + f5 as f64 * 6.0 + f6 * 7.0 + f7 as f64 * 8.0 + f8 * 9.0 + f9 as f64 * 10.0;
+    return part + n as f64 * 100.0 + g * 1000.0;
+}
+
+pub fn small(s: Small) -> Small { return Small { a: s.a + 1, b: s.b + 1 }; }
+pub fn pair(p: Pair) -> Pair { return Pair { x: p.x + 1, y: p.y + 1 }; }
+pub fn wide(w: Wide) -> Wide { return Wide { a: w.a + 1, b: w.b + 1, c: w.c + 1, d: w.d + 1, e: w.e + 1 }; }
+pub fn mixed(m: Mixed) -> Mixed { return Mixed { f: m.f + 1.0, n: m.n + 1, g: m.g + 1.0 }; }
+pub fn nested(n: Nested) -> Nested {
+    return Nested { p: pair(n.p), s: small(n.s), w: [n.w[0] + 1, n.w[1] + 1, n.w[2] + 1] };
+}
+
+pub fn bytes(b: [4]u8) -> [4]u8 { return [b[0] + 1, b[1] + 1, b[2] + 1, b[3] + 1]; }
+pub fn pairs(p: [3]Pair) -> [3]Pair { return [pair(p[0]), pair(p[1]), pair(p[2])]; }
+
+pub fn color(c: Color) -> Color {
+    match c {
+        .Red => { return Color.Green; }
+        .Green => { return Color.Blue; }
+        .Blue => { return Color.Red; }
+    }
+}
+
+pub fn value(v: Value) -> Value {
+    match v {
+        .Nothing => { return Value.Byte { v: 1 }; }
+        .Byte { v: b } => { return Value.Long { v: b as u64 + 1 }; }
+        .Long { v: n } => { return Value.Two { p: Pair { x: n + 1, y: n + 2 } }; }
+        .Two { p: p } => { return Value.Four { b: [p.x as u8 + 1, p.y as u8 + 1, 3, 4] }; }
+        .Four { b: _ } => { return Value.Nothing; }
+    }
+}
+
+pub fn maybe_u8(x: ?u8) -> ?u8 {
+    match x {
+        some(v) => { return v + 1; }
+        none => { return 7; }
+    }
+}
+
+pub fn maybe_u64(x: ?u64) -> ?u64 {
+    match x {
+        some(v) => {
+            if v > 100 {
+                return none;
+            }
+            return v + 1;
+        }
+        none => { return 8; }
+    }
+}
+
+pub fn maybe_pair(x: ?Pair) -> ?Pair {
+    match x {
+        some(p) => { return pair(p); }
+        none => { return Pair { x: 1, y: 2 }; }
+    }
+}
+
+pub fn maybe_wide(x: ?Wide) -> ?Wide {
+    match x {
+        some(w) => { return wide(w); }
+        none => { return none; }
+    }
+}
+
+pub fn fail_u8(x: u8) -> Fail!u8 {
+    if x == 0 {
+        return Fail.Low;
+    }
+    return x + 1;
+}
+
+pub fn fail_pair(x: u64) -> Fail!Pair {
+    if x == 0 {
+        return Fail.High;
+    }
+    return Pair { x: x, y: x + 1 };
+}
+
+pub fn fail_wide(w: Wide) -> Fail!Wide {
+    if w.e == 0 {
+        return Fail.Low;
+    }
+    return wide(w);
+}
+
+pub fn fail_void(x: u8) -> Fail!void {
+    if x == 0 {
+        return Fail.High;
+    }
+}
+
+pub fn text_size(t: str) -> usize { return t.len(); }
+pub fn tail(t: str) -> str { return t[1..t.len()]; }
+pub fn add_all(xs: []u8) -> u64 {
+    var total: u64 = 0;
+    for x in xs {
+        total += x.* as u64;
+    }
+    return total;
+}
+pub fn fill(xs: []mut u32, v: u32) {
+    for x in xs {
+        x.* = v;
+    }
+}
+pub fn second(xs: []u32) -> &u32 { return &xs[1]; }
+pub fn read_pair(p: &Pair) -> u64 { return p.x * 10 + p.y; }
+pub fn write_pair(p: &mut Pair) {
+    p.x += 1;
+    p.y += 1;
+}
+
+pub fn own_text(t: alloc.String) -> alloc.String {
+    var s = t;
+    s.push_str("+deep");
+    return s;
+}
+pub fn own_list(l: alloc.List(u32)) -> alloc.List(u32) {
+    var s = l;
+    s.push(99);
+    return s;
+}
+
+/// Structs past the registers, between scalars that may be in them.
+pub fn structs(p: Pair, a: u8, w: Wide, b: f64, s: Small, q: Pair, c: u16, m: Mixed, t: Wide) -> u64 {
+    return p.x + a as u64 + w.a + b as u64 + s.b as u64 + q.y + c as u64 + m.n as u64 + t.e as u64;
+}
+
+pub fn through_dyn(s: &dyn Scale, p: Pair) -> Pair {
+    return pair(s.scale(pair(p)));
+}
+pub fn through_mut_dyn(s: &mut dyn Scale, by: u64) -> u64 {
+    return s.bump(by + 1) + 1;
+}
+pub fn through_closure(f: &dyn fn(Pair) -> Pair, p: Pair) -> Pair {
+    return pair(f(pair(p)));
+}
+pub fn through_closure_mut(f: &dyn fn(u64), n: u64) {
+    f(n + 1);
+}

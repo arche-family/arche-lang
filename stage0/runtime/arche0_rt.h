@@ -118,6 +118,7 @@ a0_res_bytes a0_std_Fs_read_bytes(a0_std_Fs *self, a0_str path, a0_alloc_Allocat
 a0_err a0_std_Fs_write_file(a0_std_Fs *self, a0_str path, a0_str data);
 // data: the address of a []u8, {pointer, length}.
 a0_err a0_std_Fs_write_bytes(a0_std_Fs *self, a0_str path, const void *data);
+a0_err a0_std_Fs_write_executable(a0_std_Fs *self, a0_str path, const void *data);
 
 void a0_std_Output_write(a0_std_Output *self, a0_str text);
 void a0_std_Output_write_byte(a0_std_Output *self, uint8_t byte);

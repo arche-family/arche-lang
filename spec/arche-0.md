@@ -432,6 +432,7 @@ type Fs                                           // capability, move-only
     fn read_bytes(self: &Fs, path: str, a: alloc.Allocator) -> IoError!alloc.List(u8)
     fn write_file(self: &Fs, path: str, data: str) -> IoError!void
     fn write_bytes(self: &Fs, path: str, data: []u8) -> IoError!void
+    fn write_executable(self: &Fs, path: str, data: []u8) -> IoError!void
 
 type Output                                       // capability, move-only; flushed at exit
     fn write(self: &mut Output, text: str)

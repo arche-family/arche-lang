@@ -38,6 +38,13 @@ import syntax.cst;
 import syntax.fmt;
 import ir.ir;
 import a64.gen as a64;
+import link.link as ln;
+import link.output as lo;
+import native.ao;
+import native.elf;
+import native.elf_read;
+import native.object as ob;
+import native.unit as uu;
 import rv64.gen as rv64;
 import x64.gen as x64;
 import ir.llvm;
@@ -45,7 +52,7 @@ import ir.opt;
 import lower.lower;
 
 /// What `arche` exits with, besides success (§10: `error: <name>`, status 1).
-type Failure = error { ErrorsFound, BadUsage, CannotRead, CannotWrite, BadIr }
+type Failure = error { ErrorsFound, BadUsage, CannotRead, CannotWrite, BadIr, CannotLink }
 
 fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("usage: arche check [--json] <file>\n");
@@ -61,6 +68,9 @@ fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("       arche cst <file>\n");
     err_out.write("       arche build <file> <out.ll | out.o>   LLVM IR, or an object from the compiler's own backend\n");
     err_out.write("       arche units <file> <dir>       one LLVM module per module, for arche-driver\n");
+    err_out.write("       arche units --ao <file> <dir>  one object per module, by the compiler's own backend\n");
+    err_out.write("       arche link [--ax] <out> <in.ao>...  link objects into a program, with no other tool\n");
+    err_out.write("       arche import <in.o> <out.ao>   an ELF object as an Arche object, for arche link\n");
     err_out.write("       arche build-plan <build.arche>  the programs it lists, as name<TAB>root lines\n");
     err_out.write("       arche manifest <package.arche>  its fields, one a line, for arche-driver\n");
     err_out.write("       arche test <file> <out.ll | out.o>   the test blocks of <file>, run by std.testing\n");
@@ -777,7 +787,30 @@ fn optimize_all(m: &mut ir.Module, a: alloc.Allocator) {
 
 /// An output of this name is an object: the compiler's own backend writes it.
 fn names_object(path: str) -> bool {
-    return path.len() > 2 and path[path.len() - 2..path.len()].eq(".o");
+    return (path.len() > 2 and path[path.len() - 2..path.len()].eq(".o")) or names_ao(path);
+}
+
+fn names_ao(path: str) -> bool {
+    return path.len() > 3 and path[path.len() - 3..path.len()].eq(".ao");
+}
+
+/// The program, or the part of it scope says, by this compiler's own backend.
+fn native_object(opts: &program.Options, m: &ir.Module, scope: uu.Scope, problem: &mut alloc.String, a: alloc.Allocator) -> ob.Object {
+    if opts.target == program.Target.LinuxAarch64 {
+        return a64.object(m, scope, problem: problem, a: a);
+    }
+    if opts.target == program.Target.LinuxRiscv64 {
+        return rv64.object(m, scope, problem: problem, a: a);
+    }
+    return x64.object(m, scope, problem: problem, a: a);
+}
+
+fn has_native_backend(opts: &program.Options) -> bool {
+    if opts.release {
+        return false;
+    }
+    let t = opts.target;
+    return t == program.Target.LinuxX86_64 or t == program.Target.LinuxAarch64 or t == program.Target.LinuxRiscv64;
 }
 
 fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, out_path: str, opts: &program.Options) -> Failure!void {
@@ -814,28 +847,25 @@ fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, o
     }
     // An object is this compiler's own backend's work; text is for LLVM.
     if names_object(out_path) {
-        let on_a64 = opts.target == program.Target.LinuxAarch64;
-        let on_rv64 = opts.target == program.Target.LinuxRiscv64;
-        if not (opts.target == program.Target.LinuxX86_64 or on_a64 or on_rv64) or opts.release {
+        if not has_native_backend(opts) {
             err_out.write("arche: this compiler writes objects for a debug build on Linux; for the others, give it a .ll file\n");
             return Failure.BadUsage;
         }
         var problem = alloc.String.init(a);
-        var object = alloc.List(u8).init(a);
-        if on_a64 {
-            object = a64.object(&m, problem: &mut problem, a: a);
-        } else if on_rv64 {
-            object = rv64.object(&m, problem: &mut problem, a: a);
-        } else {
-            object = x64.object(&m, problem: &mut problem, a: a);
-        }
+        let object = native_object(opts, &m, uu.whole_program(a), problem: &mut problem, a: a);
         if problem.len() > 0 {
             err_out.write("arche: ");
             err_out.write(problem.view());
             err_out.write("\n");
             return Failure.BadIr;
         }
-        match fs.write_bytes(out_path, object.items()) {
+        var file = alloc.List(u8).init(a);
+        if names_ao(out_path) {
+            file = ao.write(&object, a);
+        } else {
+            file = elf.write(&object, a);
+        }
+        match fs.write_bytes(out_path, file.items()) {
             ok(_) => { }
             err(_) => {
                 err_out.write("arche: cannot write ");
@@ -860,7 +890,7 @@ fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, o
 
 /// `arche units`: the program as one LLVM module for each of its modules,
 /// written to dir/<n>.ll; their paths, in order, one a line.
-fn build_units(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, dir: str, opts: &program.Options) -> Failure!void {
+fn build_units(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, dir: str, objects: bool, opts: &program.Options) -> Failure!void {
     let source = try read(fs, err_out, path, a);
     let p = program.load(fs, path: path, source, a, opts);
     if p.diags.count() > 0 {
@@ -911,6 +941,14 @@ fn build_units(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: a
             return Failure.BadIr;
         }
     }
+    if objects {
+        if not has_native_backend(opts) {
+            err_out.write("arche: this compiler writes objects for a debug build on Linux\n");
+            return Failure.BadUsage;
+        }
+        try write_object_units(out: out, err_out: err_out, fs, a, dir: dir, &m, unit_of: &unit_of, count: count, opts: opts);
+        return;
+    }
     let units = llvm.emit_units(&m, unit_of: unit_of.items(), count: count, a: a);
     let us = units.items();
     var k: usize = 0;
@@ -918,23 +956,7 @@ fn build_units(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: a
         if us[k].len() == 0 {
             continue;
         }
-        var name = alloc.String.init(a);
-        name.push_str(dir);
-        name.push_str("/");
-        var digits: [10]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        var n = k;
-        var d: usize = 0;
-        while true {
-            digits[d] = '0' + (n % 10) as u8;
-            d += 1;
-            n = n / 10;
-            if n == 0 {
-                break;
-            }
-        }
-        while d > 0 : (d -= 1) {
-            name.push_ascii(digits[d - 1]);
-        }
+        var name = unit_path(dir, k, a);
         name.push_str(".ll");
         var data = alloc.String.init(a);
         data.push_str("source_filename = \"");
@@ -952,6 +974,160 @@ fn build_units(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: a
         }
         out.write(name.view());
         out.write("\n");
+    }
+}
+
+/// dir/<n>, where unit n's file goes.
+fn unit_path(dir: str, unit: usize, a: alloc.Allocator) -> alloc.String {
+    var name = alloc.String.init(a);
+    name.push_str(dir);
+    name.push_str("/");
+    var digits: [10]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var n = unit;
+    var d: usize = 0;
+    while true {
+        digits[d] = '0' + (n % 10) as u8;
+        d += 1;
+        n = n / 10;
+        if n == 0 {
+            break;
+        }
+    }
+    while d > 0 : (d -= 1) {
+        name.push_ascii(digits[d - 1]);
+    }
+    return name;
+}
+
+/// `arche units --ao`: each module's object, dir/<n>.ao, by the own backend.
+fn write_object_units(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, dir: str, m: &ir.Module, unit_of: &alloc.List(u32), count: u32, opts: &program.Options) -> Failure!void {
+    var unit: u32 = 0;
+    while unit < count : (unit += 1) {
+        var scope = uu.Scope { whole: false, unit: unit, unit_of: alloc.List(u32).init(a), across: llvm.called_across(m, unit_of: unit_of.items(), a: a) };
+        var f: usize = 0;
+        while f < unit_of.len() : (f += 1) {
+            scope.unit_of.push(unit_of.items()[f]);
+        }
+        if not uu.has_code(m, &scope) {
+            continue;
+        }
+        var problem = alloc.String.init(a);
+        let object = native_object(opts, m, scope, problem: &mut problem, a: a);
+        if problem.len() > 0 {
+            err_out.write("arche: ");
+            err_out.write(problem.view());
+            err_out.write("\n");
+            return Failure.BadIr;
+        }
+        var name = unit_path(dir, unit as usize, a);
+        name.push_str(".ao");
+        let file = ao.write(&object, a);
+        match fs.write_bytes(name.view(), file.items()) {
+            ok(_) => { }
+            err(_) => {
+                err_out.write("arche: cannot write ");
+                err_out.write(name.view());
+                err_out.write("\n");
+                return Failure.CannotWrite;
+            }
+        }
+        out.write(name.view());
+        out.write("\n");
+    }
+}
+
+/// `arche import`: an ELF object as an Arche object.
+fn import_object(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, out_path: str) -> Failure!void {
+    let bytes = try read_object_file(err_out, fs, path, a);
+    var problem = alloc.String.init(a);
+    let object = elf_read.read(bytes.items(), problem: &mut problem, a: a);
+    if problem.len() > 0 {
+        err_out.write("arche import: ");
+        err_out.write(path);
+        err_out.write(": ");
+        err_out.write(problem.view());
+        err_out.write("\n");
+        return Failure.CannotLink;
+    }
+    let file = ao.write(&object, a);
+    match fs.write_bytes(out_path, file.items()) {
+        ok(_) => { }
+        err(_) => {
+            err_out.write("arche: cannot write ");
+            err_out.write(out_path);
+            err_out.write("\n");
+            return Failure.CannotWrite;
+        }
+    }
+}
+
+fn read_object_file(err_out: &mut std.Output, fs: &std.Fs, path: str, a: alloc.Allocator) -> Failure!alloc.List(u8) {
+    match fs.read_bytes(path, a) {
+        ok(bytes) => { return bytes; }
+        err(_) => {
+            err_out.write("arche: cannot read ");
+            err_out.write(path);
+            err_out.write("\n");
+            return Failure.CannotRead;
+        }
+    }
+}
+
+/// `arche link`: the objects args[first..] as a program.
+fn link_program(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, args: &std.Args, first: usize, out_path: str, ax: bool) -> Failure!void {
+    var inputs = alloc.List(ln.Input).init(a);
+    var i = first;
+    while i < args.len() : (i += 1) {
+        let path = args.get(i);
+        let bytes = try read_object_file(err_out, fs, path, a);
+        var problem = alloc.String.init(a);
+        let object = ao.read(bytes.items(), problem: &mut problem, a: a);
+        if problem.len() > 0 {
+            err_out.write("arche link: ");
+            err_out.write(path);
+            err_out.write(": ");
+            err_out.write(problem.view());
+            err_out.write("\n");
+            return Failure.CannotLink;
+        }
+        var name = alloc.String.init(a);
+        name.push_str(path);
+        inputs.push(ln.Input { name: name, object: object });
+    }
+    var room: u64 = 0;
+    if not ax {
+        room = lo.ELF_ROOM;
+    }
+    var problem = alloc.String.init(a);
+    let image = ln.link(inputs.items(), header_room: room, problem: &mut problem, a: a);
+    if problem.len() > 0 {
+        err_out.write("arche link: ");
+        err_out.write(problem.view());
+        err_out.write("\n");
+        return Failure.CannotLink;
+    }
+    if ax {
+        let file = lo.ax_executable(&image, a);
+        match fs.write_bytes(out_path, file.items()) {
+            ok(_) => { }
+            err(_) => {
+                err_out.write("arche: cannot write ");
+                err_out.write(out_path);
+                err_out.write("\n");
+                return Failure.CannotWrite;
+            }
+        }
+        return;
+    }
+    let file = lo.elf_executable(&image, a);
+    match fs.write_executable(out_path, file.items()) {
+        ok(_) => { }
+        err(_) => {
+            err_out.write("arche: cannot write ");
+            err_out.write(out_path);
+            err_out.write("\n");
+            return Failure.CannotWrite;
+        }
     }
 }
 
@@ -1162,8 +1338,17 @@ fn main(sys: &mut std.System) -> !void {
         try document(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), module: sys.args.get(3 + k), tests_path: "");
     } else if command.eq("doc") and count == 6 and sys.args.get(2 + k).eq("--tests") {
         try document(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3 + k), module: sys.args.get(4 + k), tests_path: sys.args.get(5 + k));
+    } else if command.eq("units") and count == 5 and sys.args.get(2 + k).eq("--ao") {
+        opts.debug_info = true;
+        try build_units(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(3 + k), dir: sys.args.get(4 + k), objects: true, opts: &opts);
     } else if command.eq("units") and count == 4 {
-        try build_units(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), dir: sys.args.get(3 + k), opts: &opts);
+        try build_units(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), dir: sys.args.get(3 + k), objects: false, opts: &opts);
+    } else if command.eq("link") and count >= 5 and sys.args.get(2 + k).eq("--ax") {
+        try link_program(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, args: &sys.args, first: 4 + k, out_path: sys.args.get(3 + k), ax: true);
+    } else if command.eq("link") and count >= 4 {
+        try link_program(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, args: &sys.args, first: 3 + k, out_path: sys.args.get(2 + k), ax: false);
+    } else if command.eq("import") and count == 4 {
+        try import_object(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), out_path: sys.args.get(3 + k));
     } else if command.eq("build-plan") and count == 3 {
         try build_plan(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));
     } else if command.eq("manifest") and count == 3 {
