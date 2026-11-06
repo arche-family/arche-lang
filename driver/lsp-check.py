@@ -343,8 +343,7 @@ def session(program, root):
         fail("formatting: %r" % (r,))
     edit = r["result"][0]
     expect("edit starts at the top", edit["range"]["start"], {"line": 0, "character": 0})
-    if edit["range"]["end"]["line"] < len(ugly.split("\n")) - 1:
-        fail("the edit does not reach the end: %r" % (edit,))
+    expect("the edit reaches the end", edit["range"]["end"], {"line": len(ugly.split("\n")) - 1, "character": 0})
     if "    return helper.twice(1);\n" not in edit["newText"]:
         fail("formatted text: %r" % (edit["newText"],))
     c.notify("textDocument/didChange", {"textDocument": {"uri": main_uri, "version": 330}, "contentChanges": [{"text": edit["newText"]}]})

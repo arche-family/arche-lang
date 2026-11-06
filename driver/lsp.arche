@@ -636,16 +636,19 @@ fn formatting(sys: &mut std.System, s: &Server, id: str, index: usize, a: alloc.
         respond(&mut sys.stdout, id: id, result: "[]", a: a);
         return;
     }
+    // The whole text: to the end of its last line, which is empty after a
+    // last newline.
     var lines: u32 = 0;
     for c in text.items() {
         if c.* == '\n' {
             lines += 1;
         }
     }
+    let last = proto.line_range(text.items(), line: lines);
     var m = copy("[{\"range\":{\"start\":", a);
     push_position(&mut m, line: 0, character: 0);
     m.push_str(",\"end\":");
-    push_position(&mut m, line: lines + 1, character: 0);
+    push_position(&mut m, line: lines, character: proto.utf16_column(text.items()[last[0]..last[1]], byte: last[1] - last[0]));
     m.push_str("},\"newText\":");
     json.write_string(formatted.view(), out: &mut m);
     m.push_str("}]");

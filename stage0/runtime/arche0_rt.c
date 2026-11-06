@@ -8,6 +8,10 @@
 #include <string.h>
 
 #if defined(_WIN32)
+#include <wchar.h>
+#endif
+
+#if defined(_WIN32)
 // Windows opens the standard output and error in text mode, where the C
 // library writes a carriage return before every newline; what an Arche
 // program writes is bytes (docs/sprints.md S19, main below). The two calls
@@ -16,6 +20,128 @@
 int _fileno(FILE *stream);
 int _setmode(int fd, int mode);
 #define A0_MODE_BINARY 0x8000
+
+// Windows gives a C program its arguments, and takes the paths fopen is given,
+// in the system's code page; Arche's text is UTF-8, and a path may be any
+// user's name. So the runtime asks for UTF-16 and turns it into UTF-8 at the
+// edge, as the Arche compiler's own runtime does (compiler/runtime/windows.inc).
+wchar_t *GetCommandLineW(void);
+int MultiByteToWideChar(unsigned page, unsigned long flags, const char *text, int n, wchar_t *into, int room);
+int WideCharToMultiByte(unsigned page, unsigned long flags, const wchar_t *text, int n, char *into, int room, const char *fallback, int *used);
+FILE *_wfopen(const wchar_t *path, const wchar_t *mode);
+#define A0_UTF8 65001u
+
+// As UTF-16; NULL for what is not UTF-8, which no path is. The caller frees it.
+static wchar_t *wide_of(const char *text) {
+    int n = MultiByteToWideChar(A0_UTF8, 8 /* MB_ERR_INVALID_CHARS */, text, -1, NULL, 0);
+    if (n <= 0) {
+        return NULL;
+    }
+    wchar_t *w = malloc((size_t)n * sizeof(wchar_t));
+    if (w) {
+        MultiByteToWideChar(A0_UTF8, 8, text, -1, w, n);
+    }
+    return w;
+}
+
+// The arguments in a command line, counted with into NULL and written with it.
+// Outside quotes, spaces and tabs separate them; 2n backslashes before a quote
+// are n backslashes and the quote counts, 2n+1 are n and a quote of its own:
+// how every program on the system reads them.
+static int split_command(const wchar_t *line, wchar_t **into) {
+    int count = 0;
+    size_t i = 0;
+    while (line[i]) {
+        while (line[i] == L' ' || line[i] == L'\t') {
+            i++;
+        }
+        if (!line[i]) {
+            break;
+        }
+        wchar_t *arg = into ? into[count] : NULL;
+        size_t at = 0;
+        int quoted = 0;
+        while (line[i] && (quoted || (line[i] != L' ' && line[i] != L'\t'))) {
+            size_t slashes = 0;
+            while (line[i] == L'\\') {
+                slashes++;
+                i++;
+            }
+            if (line[i] == L'"') {
+                for (size_t k = 0; k < slashes / 2; k++) {
+                    if (arg) {
+                        arg[at] = L'\\';
+                    }
+                    at++;
+                }
+                if (slashes % 2 == 1) {
+                    if (arg) {
+                        arg[at] = L'"';
+                    }
+                    at++;
+                } else {
+                    quoted = !quoted;
+                }
+                i++;
+            } else {
+                for (size_t k = 0; k < slashes; k++) {
+                    if (arg) {
+                        arg[at] = L'\\';
+                    }
+                    at++;
+                }
+                if (line[i]) {
+                    if (arg) {
+                        arg[at] = line[i];
+                    }
+                    at++;
+                    i++;
+                }
+            }
+        }
+        if (arg) {
+            arg[at] = 0;
+        }
+        count++;
+    }
+    return count;
+}
+
+// The program's arguments as UTF-8, for as long as it runs.
+static char **utf8_arguments(int *argc) {
+    const wchar_t *line = GetCommandLineW();
+    size_t length = wcslen(line);
+    int count = split_command(line, NULL);
+    wchar_t **wide = malloc((size_t)(count + 1) * sizeof(wchar_t *));
+    char **out = malloc((size_t)(count + 1) * sizeof(char *));
+    if (!wide || !out) {
+        abort();
+    }
+    for (int i = 0; i < count; i++) {
+        // Each fits in the command line, its end included.
+        wide[i] = malloc((length + 1) * sizeof(wchar_t));
+        if (!wide[i]) {
+            abort();
+        }
+    }
+    split_command(line, wide);
+    for (int i = 0; i < count; i++) {
+        int n = WideCharToMultiByte(A0_UTF8, 0, wide[i], -1, NULL, 0, NULL, NULL);
+        out[i] = malloc((size_t)(n > 0 ? n : 1));
+        if (!out[i]) {
+            abort();
+        }
+        out[i][0] = 0;
+        if (n > 0) {
+            WideCharToMultiByte(A0_UTF8, 0, wide[i], -1, out[i], n, NULL, NULL);
+        }
+        free(wide[i]);
+    }
+    free(wide);
+    out[count] = NULL;
+    *argc = count;
+    return out;
+}
 #endif
 
 // ---- exit -------------------------------------------------------------------
@@ -265,17 +391,44 @@ a0_str a0_alloc_Interner_text(a0_alloc_Interner *self, a0_alloc_Symbol sym, a0_l
 // uses for a file one may not read, so the two are told apart by the
 // attributes. The call is declared here to keep windows.h out of a file
 // that every C compiler has to build.
-unsigned long GetFileAttributesA(const char *path);
+unsigned long GetFileAttributesW(const wchar_t *path);
 
 static int is_directory(const char *path) {
-    unsigned long attributes = GetFileAttributesA(path);
+    wchar_t *w = wide_of(path);
+    if (!w) {
+        return 0;
+    }
+    unsigned long attributes = GetFileAttributesW(w);
+    free(w);
     return attributes != 0xFFFFFFFFul && (attributes & 0x10u) != 0;
 }
+
+// fopen, of a path in UTF-8.
+static FILE *open_file(const char *path, const wchar_t *mode) {
+    wchar_t *w = wide_of(path);
+    if (!w) {
+        errno = ENOENT;
+        return NULL;
+    }
+    FILE *f = _wfopen(w, mode);
+    int e = errno;
+    free(w);
+    errno = e;
+    return f;
+}
+#define A0_READ L"rb"
+#define A0_WRITE L"wb"
 #else
 static int is_directory(const char *path) {
     (void)path;
     return 0;
 }
+
+static FILE *open_file(const char *path, const char *mode) {
+    return fopen(path, mode);
+}
+#define A0_READ "rb"
+#define A0_WRITE "wb"
 #endif
 
 static a0_err io_error(int e) {
@@ -317,7 +470,7 @@ a0_res_String a0_std_Fs_read_file(a0_std_Fs *self, a0_str path, a0_alloc_Allocat
         return r;
     }
     errno = 0;
-    FILE *f = fopen(p, "rb");
+    FILE *f = open_file(p, A0_READ);
     if (!f) {
         r.err = is_directory(p) ? A0_ERR_IS_DIRECTORY : io_error(errno);
         free(p);
@@ -349,7 +502,7 @@ a0_res_bytes a0_std_Fs_read_bytes(a0_std_Fs *self, a0_str path, a0_alloc_Allocat
         return r;
     }
     errno = 0;
-    FILE *f = fopen(p, "rb");
+    FILE *f = open_file(p, A0_READ);
     if (!f) {
         r.err = is_directory(p) ? A0_ERR_IS_DIRECTORY : io_error(errno);
         free(p);
@@ -385,7 +538,7 @@ a0_err a0_std_Fs_write_file(a0_std_Fs *self, a0_str path, a0_str data) {
         return A0_ERR_NOT_FOUND;
     }
     errno = 0;
-    FILE *f = fopen(p, "wb");
+    FILE *f = open_file(p, A0_WRITE);
     if (!f) {
         a0_err e = is_directory(p) ? A0_ERR_IS_DIRECTORY : io_error(errno);
         free(p);
@@ -440,6 +593,7 @@ int main(int argc, char **argv) {
     // added to them.
     _setmode(_fileno(stdout), A0_MODE_BINARY);
     _setmode(_fileno(stderr), A0_MODE_BINARY);
+    argv = utf8_arguments(&argc);
 #endif
     sys.out.f = stdout;
     sys.err.f = stderr;
