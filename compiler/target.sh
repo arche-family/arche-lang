@@ -28,6 +28,18 @@ linux-x86_64)
     LINK_FLAGS="-nostdlib -static -fno-pie"
     GC_FLAGS="-Wl,--gc-sections"
     ;;
+linux-aarch64)
+    TARGET_FLAG="--target linux-aarch64"
+    RT_FLAGS="--target=aarch64-linux-gnu -fno-pie -fno-omit-frame-pointer -mno-outline-atomics"
+    LINK_FLAGS="--target=aarch64-linux-gnu -mno-outline-atomics -fuse-ld=lld -nostdlib -static -fno-pie"
+    GC_FLAGS="-Wl,--gc-sections"
+    ;;
+linux-riscv64)
+    TARGET_FLAG="--target linux-riscv64"
+    RT_FLAGS="--target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d -mno-relax -fno-pie -fno-omit-frame-pointer"
+    LINK_FLAGS="--target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d -mno-relax -fuse-ld=lld -nostdlib -static -fno-pie"
+    GC_FLAGS="-Wl,--gc-sections"
+    ;;
 windows-x86_64)
     TARGET_FLAG="--target windows-x86_64"
     RT_FLAGS="--target=x86_64-pc-windows-msvc"
@@ -45,3 +57,23 @@ windows-x86_64)
     exit 2
     ;;
 esac
+
+# Whether the runtime's object is older than anything it is made of. Sourced
+# from a script that set here.
+rt_stale() {
+    [ -f "$1" ] || return 0
+    for part in "$here"/runtime/*; do
+        [ "$part" -nt "$1" ] && return 0
+    done
+    return 1
+}
+
+# ARCHE_QEMU runs a program of another processor where the system will not by
+# itself: the program becomes a script that starts it through QEMU.
+wrap_for_qemu() {
+    if [ -n "${ARCHE_QEMU:-}" ]; then
+        mv "$1" "$1.elf"
+        printf '#!/bin/sh\nexec %s "%s.elf" "$@"\n' "$ARCHE_QEMU" "$1" > "$1"
+        chmod +x "$1"
+    fi
+}

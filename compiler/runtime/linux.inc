@@ -1,43 +1,27 @@
-// The Linux half of the runtime (rt.c): x86-64, no C library, system calls
-// by number through the syscall instruction. A call that fails returns the
-// negated errno in -4095..-1.
+// The Linux half of the runtime (rt.c): no C library, system calls by number.
+// A call that fails returns the negated errno in -4095..-1. What differs by
+// processor is in linux-<processor>.inc: the numbers, how a call is made, the
+// switch between fibers and the entry point.
 //
 // rt.c defines what every system must give it; this file is included at its
 // end, so the types and the helpers above are in scope.
 
-static i64 sys1(i64 n, i64 a) {
-    i64 r;
-    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a) : "rcx", "r11", "memory");
-    return r;
-}
+typedef struct PollFd {
+    int fd;
+    short events;
+    short revents;
+} PollFd;
 
-static i64 sys3(i64 n, i64 a, i64 b, i64 c) {
-    i64 r;
-    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
-    return r;
-}
+#if defined(__x86_64__)
+#include "linux-x86_64.inc"
+#elif defined(__aarch64__)
+#include "linux-aarch64.inc"
+#elif defined(__riscv)
+#include "linux-riscv64.inc"
+#else
+#error "no system calls for this processor"
+#endif
 
-static i64 sys4(i64 n, i64 a, i64 b, i64 c, i64 d) {
-    i64 r;
-    register i64 r10 __asm__("r10") = d;
-    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10) : "rcx", "r11", "memory");
-    return r;
-}
-
-static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
-    i64 r;
-    register i64 r10 __asm__("r10") = d;
-    register i64 r8 __asm__("r8") = e;
-    register i64 r9 __asm__("r9") = f;
-    __asm__ volatile("syscall"
-                     : "=a"(r)
-                     : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9)
-                     : "rcx", "r11", "memory");
-    return r;
-}
-
-enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MPROTECT = 10, SYS_MUNMAP = 11, SYS_GETPID = 39, SYS_FORK = 57, SYS_POLL = 7, SYS_DUP2 = 33, SYS_PIPE2 = 293, SYS_SCHED_GETAFFINITY = 204,
-       SYS_EXIT = 60, SYS_WAIT4 = 61, SYS_CLOCK_GETTIME = 228, SYS_EXIT_GROUP = 231, SYS_OPENAT = 257 };
 enum { AT_FDCWD = -100, O_RDONLY = 0, O_WRONLY = 1, O_CREAT = 0100, O_TRUNC = 01000, O_CLOEXEC = 02000000 };
 enum { ENOENT = 2, EACCES = 13, ENOTDIR = 20, EISDIR = 21, EPERM = 1, EINTR = 4 };
 
@@ -157,55 +141,20 @@ static u64 os_processors(void) {
     i64 n = sys3(SYS_SCHED_GETAFFINITY, 0, sizeof(mask), (i64)mask);
     u64 count = 0;
     for (i64 i = 0; i < n / 8 && i < 16; i++) {
-        count += (u64)__builtin_popcountll(mask[i]);
+        // No popcount: not every processor has one, and no library is here.
+        for (u64 bits = mask[i]; bits; bits &= bits - 1) {
+            count++;
+        }
     }
     return count ? count : 1;
 }
 
 // ---- tasks ------------------------------------------------------------------------
 
-void a0rt_ctx_switch(u64 *save_rsp, u64 load_rsp);
-__asm__(".text\n"
-        ".global a0rt_ctx_switch\n"
-        "a0rt_ctx_switch:\n"
-        "    push %rbp\n"
-        "    push %rbx\n"
-        "    push %r12\n"
-        "    push %r13\n"
-        "    push %r14\n"
-        "    push %r15\n"
-        "    mov %rsp, (%rdi)\n"
-        "    mov %rsi, %rsp\n"
-        "    pop %r15\n"
-        "    pop %r14\n"
-        "    pop %r13\n"
-        "    pop %r12\n"
-        "    pop %rbx\n"
-        "    pop %rbp\n"
-        "    ret\n");
-
 // A fiber's stack needs no telling: the kernel keeps no bounds of its own.
 static void os_stack_switch(const Fiber *next) {
     (void)next;
 }
-
-// How a0rt_ctx_switch leaves a new fiber's stack: the six registers it
-// pops, then where it returns to (rt.c's fiber_entry) and that frame's
-// return address, which is never used. The frame keeps the stack pointer a
-// multiple of sixteen at a call, as the ABI wants.
-static u64 os_fiber_frame(void) {
-    return 8;
-}
-
-static u64 os_fiber_saved(void) {
-    return 6;
-}
-
-typedef struct PollFd {
-    int fd;
-    short events;
-    short revents;
-} PollFd;
 
 static PollFd *poll_entries;
 static u64 poll_entries_cap;
@@ -226,7 +175,7 @@ static void os_poll(const i64 *fds, const short *events, u8 *ready, u64 n) {
     }
     i64 r;
     do {
-        r = sys3(SYS_POLL, (i64)poll_entries, (i64)n, -1);
+        r = sys_poll(poll_entries, n);
     } while (r == -EINTR);
     for (u64 i = 0; i < n; i++) {
         // An error or a hang-up wakes the fiber too: its next call says so.
@@ -250,10 +199,10 @@ static void os_start_test(System *sys, u64 i, u64 seed, Run *r) {
         a0rt_die("cannot make a pipe for a test", 29);
     }
     flush_all();
-    i64 pid = sys1(SYS_FORK, 0);
+    i64 pid = sys_fork();
     if (pid == 0) {
-        sys3(SYS_DUP2, out[1], 1, 0);
-        sys3(SYS_DUP2, err[1], 2, 0);
+        sys_dup2(out[1], 1);
+        sys_dup2(err[1], 2);
         run_test(sys, i, seed);
         os_exit(0);
     }
@@ -292,7 +241,7 @@ static void os_collect(Run *runs, u64 count) {
     if (n > 0) {
         i64 p;
         do {
-            p = sys3(SYS_POLL, (i64)fds, (i64)n, -1);
+            p = sys_poll(fds, n);
         } while (p == -EINTR);
         u8 buf[4096];
         for (u64 j = 0; j < n; j++) {
@@ -367,7 +316,7 @@ static void os_stack_trace(void) {
     }
     const u64 *frame = __builtin_frame_address(0);
     for (int depth = 0; frame && depth < 64; depth++) {
-        const SourceCall *call = source_call_at(frame[1]);
+        const SourceCall *call = source_call_at(frame_return(frame));
         const SourceFunction *f = call ? &a0_source_functions[call->function] : 0;
         // The runtime's own frames are not in the table, nor is a0_entry in a file.
         if (f && f->file_len > 0) {
@@ -380,7 +329,7 @@ static void os_stack_trace(void) {
             a0rt_write(&err_fd, (const u8 *)")\n", 2);
         }
         // A frame's parent is above it; 0 at the bottom of a stack.
-        const u64 *parent = (const u64 *)frame[0];
+        const u64 *parent = frame_parent(frame);
         if (parent <= frame || ((u64)parent & 7) != 0) {
             break;
         }
@@ -398,12 +347,3 @@ _Noreturn void a0rt_start(i64 *sp) {
     }
     run_program(args, (u64)argc, argv + argc + 1);
 }
-
-__asm__(".text\n"
-        ".global _start\n"
-        "_start:\n"
-        "    xor %rbp, %rbp\n"
-        "    mov %rsp, %rdi\n"
-        "    and $-16, %rsp\n"
-        "    call a0rt_start\n"
-        "    hlt\n");

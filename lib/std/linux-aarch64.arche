@@ -1,0 +1,120 @@
+/// Linux on ARM64, without the C library: system calls by number, through svc
+/// with the number in x8 (spec/arche.md §10.2). std is built on these; a
+/// result in -4095..-1 is an errno, negated. The numbers are the generic
+/// table's.
+
+pub const READ: i64 = 63;
+pub const WRITE: i64 = 64;
+pub const RT_SIGACTION: i64 = 134;
+pub const PIPE2: i64 = 59;
+pub const SIGPIPE: i64 = 13;
+pub const CLOSE: i64 = 57;
+pub const NANOSLEEP: i64 = 101;
+pub const GETPID: i64 = 172;
+pub const SOCKET: i64 = 198;
+pub const CONNECT: i64 = 203;
+pub const ACCEPT: i64 = 202;
+pub const SENDTO: i64 = 206;
+pub const BIND: i64 = 200;
+pub const LISTEN: i64 = 201;
+pub const GETSOCKNAME: i64 = 204;
+pub const SETSOCKOPT: i64 = 208;
+pub const GETSOCKOPT: i64 = 209;
+pub const EXECVE: i64 = 221;
+pub const EXIT: i64 = 93;
+pub const WAIT4: i64 = 260;
+pub const KILL: i64 = 129;
+pub const GETCWD: i64 = 17;
+pub const CHDIR: i64 = 49;
+pub const SETPGID: i64 = 154;
+pub const GETDENTS64: i64 = 61;
+pub const WAITID: i64 = 95;
+pub const CLOCK_GETTIME: i64 = 113;
+pub const OPENAT: i64 = 56;
+pub const MKDIRAT: i64 = 34;
+pub const NEWFSTATAT: i64 = 79;
+pub const UNLINKAT: i64 = 35;
+pub const ACCEPT4: i64 = 242;
+pub const GETRANDOM: i64 = 278;
+
+pub const AT_FDCWD: i64 = -100;
+
+pub const ENOENT: i64 = 2;
+pub const EINTR: i64 = 4;
+pub const EAGAIN: i64 = 11;
+pub const EACCES: i64 = 13;
+pub const EEXIST: i64 = 17;
+pub const EISDIR: i64 = 21;
+pub const ENOTEMPTY: i64 = 39;
+pub const EADDRINUSE: i64 = 98;
+pub const ECONNREFUSED: i64 = 111;
+pub const EINPROGRESS: i64 = 115;
+
+/// System call n with up to six arguments; the unused ones are 0.
+pub unsafe fn syscall(n: i64, args: [6]i64) -> i64 {
+    var r = args[0];
+    let b = args[1];
+    let c = args[2];
+    let d = args[3];
+    let e = args[4];
+    let f = args[5];
+    asm("svc #0", inout("x0") r, in("x8") n, in("x1") b, in("x2") c, in("x3") d, in("x4") e, in("x5") f);
+    return r;
+}
+
+pub const O_DIRECTORY: i64 = 0x4000;
+
+pub unsafe fn fork() -> i64 {
+    // clone, with SIGCHLD: the generic table has no fork.
+    return syscall(220, [17, 0, 0, 0, 0, 0]);
+}
+
+pub unsafe fn dup2(from: i64, to: i64) -> i64 {
+    // dup3: nor a dup2. Its source and target are never the same here.
+    return syscall(24, [from, to, 0, 0, 0, 0]);
+}
+
+/// poll, of count entries, waiting at most timeout_ms: ppoll takes a time.
+pub unsafe fn poll(fds: i64, count: i64, timeout_ms: i64) -> i64 {
+    var spec: [2]i64 = [timeout_ms / 1000, (timeout_ms % 1000) * 1000000];
+    return syscall(73, [fds, count, arg(i64, &spec[0] as *i64), 0, 0, 0]);
+}
+
+pub unsafe fn rename_at(dir_from: i64, from: i64, dir_to: i64, to: i64) -> i64 {
+    // renameat2: RISC-V has no renameat, and ARM64 has this too.
+    return syscall(276, [dir_from, from, dir_to, to, 0, 0]);
+}
+
+/// A raw pointer as a system call argument.
+pub fn arg(comptime T: type, p: *T) -> i64 {
+    unsafe {
+        // SAFETY: an address is a number; nothing is read here.
+        return p.addr() as% i64;
+    }
+}
+
+/// The errno of a failed call, or 0 when it succeeded.
+pub fn errno(r: i64) -> i64 {
+    if r < 0 and r > -4096 {
+        return -r;
+    }
+    return 0;
+}
+
+/// A path as the kernel wants it: NUL-terminated, in a buffer of the
+/// caller's. False when it does not fit or holds a NUL itself.
+pub fn c_path(path: str, buf: []mut u8) -> bool {
+    let b = path.bytes();
+    if b.len() + 1 > buf.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        if b[i] == 0 {
+            return false;
+        }
+        buf[i] = b[i];
+    }
+    buf[b.len()] = 0;
+    return true;
+}

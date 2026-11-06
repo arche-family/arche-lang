@@ -305,6 +305,20 @@ fn object_with(sys: &mut std.System, tools: &Tools, source: str, also: &alloc.Li
     return file;
 }
 
+/// What the runtime includes, each part of it a part of its object's key.
+fn runtime_includes(sys: &mut std.System, tools: &Tools, a: alloc.Allocator) -> alloc.List(alloc.String) {
+    let folder = parent(tools.runtime.view());
+    let names = sys.fs.list(folder, a) catch alloc.List(alloc.String).init(a);
+    var includes = alloc.List(alloc.String).init(a);
+    for n in names.items() {
+        let name = n.view();
+        if name.len() > 4 and name[name.len() - 4..name.len()].eq(".inc") {
+            includes.push(join(dir: folder, name: name, a));
+        }
+    }
+    return includes;
+}
+
 /// Builds one program with the compiler's own backend, as ARCHE_BACKEND=own
 /// asks (docs/sprints.md S27): one object with its debug info and no LLVM, so
 /// quick that a cache of modules would have nothing to save. The runtime is
@@ -330,10 +344,7 @@ fn build_own(sys: &mut std.System, tools: &Tools, dir: str, name: str, root: str
     }
     var flags = copy_text(runtime_flags(), a);
     flags.push_str(" -fno-omit-frame-pointer");
-    var includes = alloc.List(alloc.String).init(a);
-    includes.push(join(dir: parent(tools.runtime.view()), name: "math.inc", a));
-    includes.push(join(dir: parent(tools.runtime.view()), name: "linux.inc", a));
-    includes.push(join(dir: parent(tools.runtime.view()), name: "windows.inc", a));
+    let includes = runtime_includes(sys, tools: tools, a: a);
     var rt_hits: u32 = 0;
     let rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: &includes, flags: flags.view(), cache: cache.view(), hits: &mut rt_hits, a: a);
     let lld = sys.env.get("LLD", a) orelse copy_text("ld.lld", a);
@@ -406,10 +417,7 @@ fn build_program(sys: &mut std.System, tools: &Tools, dir: str, name: str, root:
     }
     var rt_hits: u32 = 0;
     // The runtime is rt.c and what it includes, one half for each system.
-    var includes = alloc.List(alloc.String).init(a);
-    includes.push(join(dir: parent(tools.runtime.view()), name: "math.inc", a));
-    includes.push(join(dir: parent(tools.runtime.view()), name: "linux.inc", a));
-    includes.push(join(dir: parent(tools.runtime.view()), name: "windows.inc", a));
+    let includes = runtime_includes(sys, tools: tools, a: a);
     let rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: &includes, flags: runtime_flags(), cache: cache.view(), hits: &mut rt_hits, a: a);
     // Linked to a file of its own, then moved into place.
     let program = join(dir: out_dir.view(), name: name, a);

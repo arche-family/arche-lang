@@ -16,19 +16,22 @@ pub type ModuleId = struct { pub index: u32 }
 /// What the program is built for (spec/arche.md §10.3): a host with std,
 /// Linux or Windows, or a machine without an operating system, with core
 /// and alloc only.
-pub type Target = enum { LinuxX86_64, WindowsX86_64, FreestandingX86_64, FreestandingRiscv64 }
+pub type Target = enum { LinuxX86_64, LinuxAarch64, LinuxRiscv64, WindowsX86_64, FreestandingX86_64, FreestandingRiscv64, FreestandingAarch64 }
 
 pub fn target_by_name(name: str) -> ?Target {
     if name.eq("linux-x86_64") { return Target.LinuxX86_64; }
+    if name.eq("linux-aarch64") { return Target.LinuxAarch64; }
+    if name.eq("linux-riscv64") { return Target.LinuxRiscv64; }
     if name.eq("windows-x86_64") { return Target.WindowsX86_64; }
     if name.eq("freestanding-x86_64") { return Target.FreestandingX86_64; }
     if name.eq("freestanding-riscv64") { return Target.FreestandingRiscv64; }
+    if name.eq("freestanding-aarch64") { return Target.FreestandingAarch64; }
     return none;
 }
 
 /// Whether the target has an operating system under it, and so std.
 pub fn hosted(t: Target) -> bool {
-    return t == Target.LinuxX86_64 or t == Target.WindowsX86_64;
+    return t == Target.LinuxX86_64 or t == Target.LinuxAarch64 or t == Target.LinuxRiscv64 or t == Target.WindowsX86_64;
 }
 
 /// The file of the library's std for a target: each host has its own
@@ -38,6 +41,18 @@ pub fn std_file(t: Target) -> str {
         return "std-windows.arche";
     }
     return "std.arche";
+}
+
+/// The file of the library's std.linux for a target: its numbers and how a
+/// system call is made differ by processor.
+pub fn linux_file(t: Target) -> str {
+    if t == Target.LinuxAarch64 {
+        return "std/linux-aarch64.arche";
+    }
+    if t == Target.LinuxRiscv64 {
+        return "std/linux-riscv64.arche";
+    }
+    return "std/linux.arche";
 }
 
 /// The options of one compilation, from the command line.
@@ -604,6 +619,8 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
                     // Each host has its own std; the module is std for all
                     // of them (std_file, docs/abi.md).
                     r.file.push_str(std_file(p.target));
+                } else if written.eq("std.linux") {
+                    r.file.push_str(linux_file(p.target));
                 } else {
                     r.file.push_str(ip.file.view());
                 }

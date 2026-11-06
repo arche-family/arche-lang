@@ -13,8 +13,7 @@ src=$1
 shift
 cc=$CLANG
 rt="$here/build/rt-$ARCHE_TARGET.o"
-if [ ! -f "$rt" ] || [ "$here/runtime/rt.c" -nt "$rt" ] || [ "$here/runtime/math.inc" -nt "$rt" ] ||
-    [ "$here/runtime/linux.inc" -nt "$rt" ] || [ "$here/runtime/windows.inc" -nt "$rt" ]; then
+if rt_stale "$rt"; then
     $cc -c -O2 -ffreestanding -fno-builtin -nostdlib -fno-stack-protector $RT_FLAGS -Wall -Wextra -Werror \
         -o "$rt.tmp.$$" "$here/runtime/rt.c"
     mv "$rt.tmp.$$" "$rt"
@@ -28,4 +27,5 @@ else
     "${ARCHE:-$here/build/arche}" ${ARCHE_FLAGS:-} $TARGET_FLAG test "$src" "$work/tests.ll"
     $cc -O1 $LINK_FLAGS -Wno-override-module -o "$work/tests" "$work/tests.ll" "$rt"
 fi
+wrap_for_qemu "$work/tests"
 "$work/tests" "$@"

@@ -67,6 +67,26 @@ pub unsafe fn syscall(n: i64, args: [6]i64) -> i64 {
     return r;
 }
 
+/// What the generic table of the other processors does differently.
+pub const O_DIRECTORY: i64 = 0x10000;
+
+pub unsafe fn fork() -> i64 {
+    return syscall(FORK, [0, 0, 0, 0, 0, 0]);
+}
+
+pub unsafe fn dup2(from: i64, to: i64) -> i64 {
+    return syscall(DUP2, [from, to, 0, 0, 0, 0]);
+}
+
+/// poll, of count entries, waiting at most timeout_ms.
+pub unsafe fn poll(fds: i64, count: i64, timeout_ms: i64) -> i64 {
+    return syscall(POLL, [fds, count, timeout_ms, 0, 0, 0]);
+}
+
+pub unsafe fn rename_at(dir_from: i64, from: i64, dir_to: i64, to: i64) -> i64 {
+    return syscall(RENAMEAT, [dir_from, from, dir_to, to, 0, 0]);
+}
+
 /// A raw pointer as a system call argument.
 pub fn arg(comptime T: type, p: *T) -> i64 {
     unsafe {

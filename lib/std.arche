@@ -329,7 +329,7 @@ pub type Fs = struct {
         var r: i64 = 0;
         unsafe {
             // SAFETY: both paths are NUL-terminated.
-            r = linux.syscall(linux.RENAMEAT, [self.dir, linux.arg(u8, &a[0] as *u8), self.dir, linux.arg(u8, &b[0] as *u8), 0, 0]);
+            r = linux.rename_at(dir_from: self.dir, from: linux.arg(u8, &a[0] as *u8), dir_to: self.dir, to: linux.arg(u8, &b[0] as *u8));
         }
         if linux.errno(r) != 0 {
             return errno_error(linux.errno(r));
@@ -346,7 +346,7 @@ pub type Fs = struct {
         var fd: i64 = 0;
         unsafe {
             // SAFETY: O_RDONLY | O_DIRECTORY | O_CLOEXEC.
-            fd = linux.syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x90000, 0, 0, 0]);
+            fd = linux.syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80000 | linux.O_DIRECTORY, 0, 0, 0]);
         }
         if linux.errno(fd) != 0 {
             return errno_error(linux.errno(fd));
@@ -586,7 +586,7 @@ pub type Proc = struct {
         unsafe {
             // SAFETY: what is buffered is written once, by the parent.
             a0rt_flush_all();
-            pid = linux.syscall(linux.FORK, [0, 0, 0, 0, 0, 0]);
+            pid = linux.fork();
         }
         if linux.errno(pid) != 0 {
             return ProcError.ProcFailed;
@@ -680,7 +680,7 @@ pub type Proc = struct {
         unsafe {
             // SAFETY: what is buffered is written once, by the parent.
             a0rt_flush_all();
-            pid = linux.syscall(linux.FORK, [0, 0, 0, 0, 0, 0]);
+            pid = linux.fork();
         }
         if linux.errno(pid) != 0 {
             return ProcError.ProcFailed;
@@ -694,7 +694,7 @@ pub type Proc = struct {
                 _ = linux.syscall(linux.SETPGID, [0, 0, 0, 0, 0, 0]);
                 let f = linux.syscall(linux.OPENAT, [linux.AT_FDCWD, linux.arg(u8, mem.slice_data(u8, null.items())), 0, 0, 0, 0]);
                 if linux.errno(f) == 0 {
-                    _ = linux.syscall(linux.DUP2, [f, 0, 0, 0, 0, 0]);
+                    _ = linux.dup2(from: f, to: 0);
                 }
             }
             if cmd.stdout_path.len() > 0 {
@@ -704,7 +704,7 @@ pub type Proc = struct {
                 if cmd.stderr_path.view().eq(cmd.stdout_path.view()) {
                     unsafe {
                         // SAFETY: both go to the file opened as stdout.
-                        _ = linux.syscall(linux.DUP2, [1, 2, 0, 0, 0, 0]);
+                        _ = linux.dup2(from: 1, to: 2);
                     }
                 } else {
                     redirect(&err_file, fd: 2);
@@ -828,7 +828,7 @@ fn redirect(path: &alloc.List(u8), fd: i64) {
         if linux.errno(f) != 0 {
             _ = linux.syscall(linux.EXIT, [126, 0, 0, 0, 0, 0]);
         }
-        _ = linux.syscall(linux.DUP2, [f, fd, 0, 0, 0, 0]);
+        _ = linux.dup2(from: f, to: fd);
     }
 }
 
@@ -936,7 +936,7 @@ pub type Input = struct {
         while linux.errno(r) == linux.EINTR {
             unsafe {
                 // SAFETY: poll reads one pollfd and writes its revents.
-                r = linux.syscall(linux.POLL, [linux.arg(u8, &fds[0] as *u8), 1, timeout_ms as i64, 0, 0, 0]);
+                r = linux.poll(fds: linux.arg(u8, &fds[0] as *u8), count: 1, timeout_ms: timeout_ms as i64);
             }
         }
         return r > 0;

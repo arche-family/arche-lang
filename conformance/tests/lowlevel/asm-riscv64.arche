@@ -1,0 +1,36 @@
+// test: run
+// spec: arche/10.2
+// stage0: skip
+// arch: riscv64
+// stdout: raw
+// stdout: 42
+import std;
+
+// RISC-V's own instructions: a system call written out by hand, and an operand
+// of any register.
+fn write_raw(text: str) -> i64 {
+    var r: i64 = 1; // stdout
+    let number: i64 = 64; // write(2)
+    let b = text.bytes();
+    unsafe {
+        // SAFETY: write(fd, p, len) reads len bytes at p, which b holds.
+        let p = &b[0] as *u8;
+        asm("ecall", inout("a0") r, in("a7") number, in("a1") p, in("a2") b.len());
+    }
+    return r;
+}
+
+fn add_asm(a: u64, b: u64) -> u64 {
+    var x = a;
+    unsafe {
+        // SAFETY: only registers.
+        asm("add %0, %0, %1", inout(reg) x, in(reg) b);
+    }
+    return x;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    _ = write_raw("raw\n");
+    sys.stdout.write_u64(add_asm(a: 40, b: 2));
+    sys.stdout.write("\n");
+}

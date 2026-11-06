@@ -60,6 +60,25 @@ jobs:
       - name: Bootstrap, stage2 == stage3
         run: CC=clang ./bootstrap.sh
 
+  # docs/sprints.md S28: ARM64 and RISC-V 64, in QEMU's user mode. binfmt runs
+  # a program of another processor as the kernel would, so a test that starts
+  # itself again works too.
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [aarch64, riscv64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lld and QEMU's user mode
+        run: sudo apt-get update && sudo apt-get install -y lld qemu-user-static binfmt-support
+      - name: Build stage0, the compiler and the runner
+        run: make -C stage0 && make -C compiler && make -C conformance
+      - name: Conformance tests in QEMU
+        run: cd compiler && ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
+      - name: Bootstrap on that processor, stage2 == stage3
+        run: QEMU=qemu-${{ matrix.arch }}-static ./cross-bootstrap.sh ${{ matrix.arch }}
+
   # docs/sprints.md S16: freestanding binaries, built with core and alloc
   # only, boot in QEMU on x86-64 and RISC-V 64 and write over serial.
   freestanding:
@@ -69,7 +88,7 @@ jobs:
       - name: Install QEMU and lld
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-system-misc lld
+          sudo apt-get install -y qemu-system-x86 qemu-system-misc qemu-system-arm lld
           which qemu-system-riscv64 || sudo apt-get install -y qemu-system-riscv
       - name: Build the Arche compiler
         run: make -C stage0 && make -C compiler

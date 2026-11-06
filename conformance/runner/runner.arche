@@ -2,7 +2,8 @@
 /// conformance/README.md.
 ///
 /// usage: runner --compiler <command> [--stage0] [--codes <prefixes>]
-///               [--timeout <seconds>] [--filter <text>] <path>...
+///               [--timeout <seconds>] [--filter <text>] [--arch <processor>]
+///               <path>...
 ///
 /// The command is a program's path, which may hold spaces, or, when no such
 /// file is there, a program with arguments of its own, so that a system
@@ -88,6 +89,8 @@ type Test = struct {
     stage0_skip: bool,
     /// The system the test is only for, empty when it is for every one.
     system: alloc.String,
+    /// The processor, likewise.
+    arch: alloc.String,
     exit_code: u8,
     stdout_text: alloc.List(u8),
     stderr_parts: alloc.List(alloc.String),
@@ -106,8 +109,9 @@ const K_ARGS: usize = 6;
 const K_LINE: usize = 7;
 const K_CODE: usize = 8;
 const K_SYSTEM: usize = 9;
+const K_ARCH: usize = 10;
 /// How many keys a header may hold.
-const KEYS: usize = 10;
+const KEYS: usize = 11;
 
 fn key_name(k: usize) -> str {
     if k == K_TEST { return "test"; }
@@ -119,6 +123,7 @@ fn key_name(k: usize) -> str {
     if k == K_ARGS { return "args"; }
     if k == K_LINE { return "line"; }
     if k == K_SYSTEM { return "system"; }
+    if k == K_ARCH { return "arch"; }
     return "code";
 }
 
@@ -191,6 +196,15 @@ fn apply_key(t: &mut Test, key: usize, v: []u8, a: alloc.Allocator) -> bool {
             return false;
         }
         t.system.push_str(text_of(v, a).view());
+        return true;
+    }
+    if key == K_ARCH {
+        // The processor the programs are built for (--arch): a test of
+        // another one's instructions is skipped.
+        if not mem_eq(a: v, b: "x86_64".bytes()) and not mem_eq(a: v, b: "aarch64".bytes()) and not mem_eq(a: v, b: "riscv64".bytes()) {
+            return false;
+        }
+        t.arch.push_str(text_of(v, a).view());
         return true;
     }
     if key == K_LINE {
@@ -439,6 +453,8 @@ type Options = struct {
     filter: alloc.String,
     codes: alloc.String,
     has_codes: bool,
+    /// The processor the compiler builds for: x86_64, or what --arch says.
+    arch: alloc.String,
 }
 
 /// With --codes, only compile-error tests whose code starts with one of
@@ -633,6 +649,7 @@ fn run_test(sys: &mut std.System, path: str, o: &Options, tmp: str, a: alloc.All
         kind: Kind.Run,
         stage0_skip: false,
         system: alloc.String.init(a),
+        arch: alloc.String.init(a),
         exit_code: 0,
         stdout_text: alloc.List(u8).init(a),
         stderr_parts: alloc.List(alloc.String).init(a),
@@ -650,7 +667,8 @@ fn run_test(sys: &mut std.System, path: str, o: &Options, tmp: str, a: alloc.All
                 m.push_str(problem.view());
                 verdict(&mut sys.stdout, word: "FAIL", path: path, detail: m.view());
             } else if (o.stage0 and t.stage0_skip) or not code_selected(o, t: &t) or
-                (t.system.len() > 0 and not t.system.view().eq(std.SYSTEM)) {
+                (t.system.len() > 0 and not t.system.view().eq(std.SYSTEM)) or
+                (t.arch.len() > 0 and not t.arch.view().eq(o.arch.view())) {
                 verdict(&mut sys.stdout, word: "SKIP", path: path, detail: "");
                 result = Result.Skip;
             } else {
@@ -823,7 +841,9 @@ fn main(sys: &mut std.System) -> !void {
         filter: alloc.String.init(a),
         codes: alloc.String.init(a),
         has_codes: false,
+        arch: alloc.String.init(a),
     };
+    o.arch.push_str("x86_64");
     var files = alloc.List(alloc.String).init(a);
     var path_args: u32 = 0;
     var has_compiler = false;
@@ -847,6 +867,10 @@ fn main(sys: &mut std.System) -> !void {
                 }
                 none => { die(&mut sys.stderr, proc: &sys.proc, message: "invalid --timeout: ", what: sys.args.get(i)); }
             }
+        } else if arg.eq("--arch") and has_value {
+            i += 1;
+            o.arch = alloc.String.init(a);
+            o.arch.push_str(sys.args.get(i));
         } else if arg.eq("--filter") and has_value {
             i += 1;
             o.filter.push_str(sys.args.get(i));

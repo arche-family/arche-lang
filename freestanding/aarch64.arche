@@ -1,0 +1,140 @@
+/// QEMU's ARM64 virt machine (qemu-system-aarch64 -machine virt -cpu
+/// cortex-a57 -semihosting): the core starts at the ELF's entry point at
+/// EL1, a PL011 UART is at 0x09000000, and semihosting ends QEMU with a
+/// status. System registers and the exception vectors are reached through asm
+/// (spec/arche.md §10.2). Build: freestanding/run.sh.
+import core.ptr;
+import kernel;
+
+type Virt = struct {
+}
+
+impl kernel.Machine for Virt {
+    fn put(self: &Virt, byte: u8) {
+        unsafe {
+            // SAFETY: the PL011's registers: flags at 0x18, data at 0.
+            let flags = ptr.from_addr(u32, 0x09000018);
+            while (flags.read_volatile() & 0x20) != 0 {
+            }
+            let data = ptr.from_addr(u32, 0x09000000);
+            data.write_volatile(byte as u32);
+        }
+    }
+
+    /// Semihosting's exit: a block of a reason and a status, whose address
+    /// goes in x1 with SYS_EXIT in x0.
+    fn off(self: &Virt, success: bool) -> noreturn {
+        var block: [2]u64 = [0x20026, 1];
+        if success {
+            block[1] = 0;
+        }
+        var operation: u64 = 0x18;
+        unsafe {
+            // SAFETY: the block is read during the call, which does not return.
+            let at = &block[0] as *u64;
+            asm("hlt #0xF000", inout("x0") operation, in("x1") at);
+        }
+        while true {
+            unsafe {
+                // SAFETY: waits for an interrupt, and none are enabled.
+                asm("wfi");
+            }
+        }
+    }
+}
+
+/// The first code the core runs: a stack, the floating-point unit on, the
+/// exception vectors, and kernel_main.
+export("_start") section(".text.boot") naked fn start() {
+    asm(
+        ".pushsection .bss\n"
+        ".balign 16\n"
+        "boot_stack: .skip 65536\n"
+        "boot_stack_top:\n"
+        ".popsection\n"
+        "ldr x0, =boot_stack_top\n"
+        "mov sp, x0\n"
+        "mov x0, #(3 << 20)\n"
+        "msr cpacr_el1, x0\n"
+        "isb\n"
+        "ldr x0, =vectors\n"
+        "msr vbar_el1, x0\n"
+        "isb\n"
+        "bl kernel_main\n"
+        "1:\n"
+        "wfi\n"
+        "b 1b\n"
+    );
+}
+
+/// The table the core jumps into on an exception: sixteen entries of 128
+/// bytes, by where it came from and what it is. Taken with SP_EL1 at EL1 is
+/// the fifth, 0x200 in. It keeps the caller's registers, tells on_exception
+/// the syndrome, and goes on after the instruction.
+export("vectors") section(".text.vectors") naked fn vectors() {
+    asm(
+        ".balign 2048\n"
+        ".rept 4\n"
+        ".balign 128\n"
+        "b .\n"
+        ".endr\n"
+        ".balign 128\n"
+        "stp x29, x30, [sp, #-16]!\n"
+        "stp x0, x1, [sp, #-16]!\n"
+        "stp x2, x3, [sp, #-16]!\n"
+        "stp x4, x5, [sp, #-16]!\n"
+        "stp x6, x7, [sp, #-16]!\n"
+        "stp x8, x9, [sp, #-16]!\n"
+        "stp x10, x11, [sp, #-16]!\n"
+        "stp x12, x13, [sp, #-16]!\n"
+        "stp x14, x15, [sp, #-16]!\n"
+        "stp x16, x17, [sp, #-16]!\n"
+        "mrs x0, esr_el1\n"
+        "bl on_exception\n"
+        "mrs x0, elr_el1\n"
+        "add x0, x0, #4\n"
+        "msr elr_el1, x0\n"
+        "ldp x16, x17, [sp], #16\n"
+        "ldp x14, x15, [sp], #16\n"
+        "ldp x12, x13, [sp], #16\n"
+        "ldp x10, x11, [sp], #16\n"
+        "ldp x8, x9, [sp], #16\n"
+        "ldp x6, x7, [sp], #16\n"
+        "ldp x4, x5, [sp], #16\n"
+        "ldp x2, x3, [sp], #16\n"
+        "ldp x0, x1, [sp], #16\n"
+        "ldp x29, x30, [sp], #16\n"
+        "eret\n"
+        ".rept 11\n"
+        ".balign 128\n"
+        "b .\n"
+        ".endr\n"
+    );
+}
+
+/// What on_exception was told, for kernel_main to say.
+fn say_exception(m: &dyn kernel.Machine, class: u64) {
+    kernel.say(m, "exception: class ");
+    kernel.number(m, class);
+    kernel.say(m, " came and went\n");
+}
+
+export("on_exception") fn on_exception(syndrome: u64) {
+    let virt = Virt { };
+    say_exception(&virt, class: syndrome >> 26);
+}
+
+export("kernel_main") fn kernel_main() -> noreturn {
+    let virt = Virt { };
+    unsafe {
+        // SAFETY: a breakpoint, which the table above comes back from.
+        asm("brk #0");
+    }
+    kernel.run(&virt, "ARM64");
+}
+
+/// The panic handler: run.sh passes --panic-handler aarch64.halt.
+fn halt(message: str, file: str, line: u32, column: u32) -> noreturn {
+    let virt = Virt { };
+    kernel.report_panic(&virt, message: message, file: file, line: line, column: column);
+}

@@ -83,6 +83,18 @@ fn typed(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, v: u32) {
     operand(out, m, f, v);
 }
 
+/// What a C function expects of a narrow argument: extended as its ABI says.
+/// C sees these as unsigned, and RISC-V sign-extends 32 bits all the same.
+fn extension_of(t: ir.Ty) -> str {
+    if t == ir.Ty.I1 or t == ir.Ty.I8 or t == ir.Ty.I16 {
+        return " zeroext";
+    }
+    if t == ir.Ty.I32 {
+        return " signext";
+    }
+    return "";
+}
+
 fn bin_text(k: u32) -> str {
     match k {
         0 => { return "add"; }
@@ -623,7 +635,13 @@ fn emit_inst(out: &mut alloc.String, m: &ir.Module, f: &ir.Function, id: u32) {
                 if k > i.args_start {
                     out.push_str(", ");
                 }
-                typed(out, m, f, f.args[k as usize]);
+                let arg = f.args[k as usize];
+                out.push_str(ty_text(f.insts[arg as usize].ty));
+                if i.flag == 1 {
+                    out.push_str(extension_of(f.insts[arg as usize].ty));
+                }
+                out.push_str(" ");
+                operand(out, m, f, arg);
             }
             out.push_str(")\n");
         }
@@ -961,6 +979,7 @@ pub fn emit(m: &ir.Module, a: alloc.Allocator) -> alloc.String {
                 out.push_str(", ");
             }
             out.push_str(ty_text(es[x].params[p]));
+            out.push_str(extension_of(es[x].params[p]));
         }
         out.push_str(")");
         if es[x].noreturn {
@@ -1147,6 +1166,7 @@ fn emit_unit(m: &ir.Module, unit_of: []u32, across: []bool, unit: u32, a: alloc.
                 body.push_str(", ");
             }
             body.push_str(ty_text(es[x].params[p]));
+            body.push_str(extension_of(es[x].params[p]));
         }
         body.push_str(")");
         if es[x].noreturn {

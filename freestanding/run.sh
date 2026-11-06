@@ -3,8 +3,8 @@
 # QEMU (docs/sprints.md S16): each writes over its serial port, then panics
 # on purpose, and its panic handler reports it and powers the machine off.
 # The serial output and QEMU's exit status must be the expected ones.
-# Needs clang, ld.lld and qemu-system-x86_64 / qemu-system-riscv64.
-# Usage: freestanding/run.sh [x86_64] [riscv64]
+# Needs clang, ld.lld and qemu-system-x86_64 / -riscv64 / -aarch64.
+# Usage: freestanding/run.sh [x86_64] [riscv64] [aarch64]
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
@@ -12,10 +12,11 @@ arche=${ARCHE:-$root/compiler/build/arche}
 clang=${CLANG:-clang}
 lld=${LLD:-ld.lld}
 work=${WORK:-$root/build/freestanding}
-targets=${*:-x86_64 riscv64}
+targets=${*:-x86_64 riscv64 aarch64}
 failed=0
 
 for arch in $targets; do
+    first=''
     out="$work/$arch"
     mkdir -p "$out"
     case $arch in
@@ -31,6 +32,14 @@ for arch in $targets; do
             qemu="qemu-system-riscv64 -machine virt -bios none -kernel $out/kernel.elf"
             arch_name="RISC-V 64"
             status=1 ;;   # the SiFive test device: 0x3333 | 1 << 16
+        aarch64)
+            triple=aarch64-unknown-none-elf
+            # With the MMU off all memory is device memory, where an unaligned access faults.
+            flags="-mstrict-align -mno-outline-atomics -fno-pic"
+            qemu="qemu-system-aarch64 -machine virt -cpu cortex-a57 -semihosting -nic none -kernel $out/kernel.elf"
+            arch_name=ARM64
+            first='exception: class 60 came and went\n'   # brk, in its table
+            status=1 ;;   # semihosting's exit, with the status it was told
         *)
             echo "freestanding: unknown target $arch" >&2
             exit 2 ;;
@@ -47,8 +56,9 @@ for arch in $targets; do
     timeout 60 $qemu ${QEMU_FLAGS:-} -display none -serial stdio -monitor none -no-reboot > "$out/serial.txt" 2> "$out/qemu.txt"
     got=$?
     set -e
+    printf "$first" > "$out/expected.txt"
     printf 'Arche, freestanding on %s\ncore and alloc: the squares of 1..10 add up to 385\npanic: index out of range\n  at kernel.arche:55:23\n' \
-        "$arch_name" > "$out/expected.txt"
+        "$arch_name" >> "$out/expected.txt"
     tr -d '\r' < "$out/serial.txt" > "$out/serial.clean"
     if cmp -s "$out/expected.txt" "$out/serial.clean" && [ "$got" -eq "$status" ]; then
         echo "freestanding: $arch runs and writes over its serial port"
