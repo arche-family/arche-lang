@@ -1,0 +1,227 @@
+/// WebAssembly's binary encoding: numbers, and the instructions by name
+/// (wasm/gen.arche). https://webassembly.github.io/spec/core/binary/
+import alloc;
+import native.buffer as nb;
+
+pub const TYPE_I32: u8 = 0x7F;
+pub const TYPE_I64: u8 = 0x7E;
+pub const TYPE_F32: u8 = 0x7D;
+pub const TYPE_F64: u8 = 0x7C;
+pub const BLOCK_EMPTY: u8 = 0x40;
+
+pub const UNREACHABLE: u8 = 0x00;
+pub const BLOCK: u8 = 0x02;
+pub const LOOP: u8 = 0x03;
+pub const IF: u8 = 0x04;
+pub const ELSE: u8 = 0x05;
+pub const END: u8 = 0x0B;
+pub const BR: u8 = 0x0C;
+pub const BR_IF: u8 = 0x0D;
+pub const BR_TABLE: u8 = 0x0E;
+pub const RETURN: u8 = 0x0F;
+pub const CALL: u8 = 0x10;
+pub const CALL_INDIRECT: u8 = 0x11;
+pub const DROP: u8 = 0x1A;
+pub const SELECT: u8 = 0x1B;
+pub const LOCAL_GET: u8 = 0x20;
+pub const LOCAL_SET: u8 = 0x21;
+pub const LOCAL_TEE: u8 = 0x22;
+pub const GLOBAL_GET: u8 = 0x23;
+pub const GLOBAL_SET: u8 = 0x24;
+
+pub const I64_LOAD: u8 = 0x29;
+pub const F32_LOAD: u8 = 0x2A;
+pub const F64_LOAD: u8 = 0x2B;
+pub const I64_LOAD8_U: u8 = 0x31;
+pub const I64_LOAD16_U: u8 = 0x33;
+pub const I64_LOAD32_U: u8 = 0x35;
+pub const I64_STORE: u8 = 0x37;
+pub const F32_STORE: u8 = 0x38;
+pub const F64_STORE: u8 = 0x39;
+pub const I64_STORE8: u8 = 0x3C;
+pub const I64_STORE16: u8 = 0x3D;
+pub const I64_STORE32: u8 = 0x3E;
+pub const MEMORY_SIZE: u8 = 0x3F;
+pub const MEMORY_GROW: u8 = 0x40;
+pub const I32_CONST: u8 = 0x41;
+pub const I64_CONST: u8 = 0x42;
+pub const F64_CONST: u8 = 0x44;
+
+pub const I32_EQZ: u8 = 0x45;
+pub const I64_EQZ: u8 = 0x50;
+pub const I64_EQ: u8 = 0x51;
+pub const I64_NE: u8 = 0x52;
+pub const I64_LT_S: u8 = 0x53;
+pub const I64_LT_U: u8 = 0x54;
+pub const I64_GT_S: u8 = 0x55;
+pub const I64_GT_U: u8 = 0x56;
+pub const I64_LE_S: u8 = 0x57;
+pub const I64_LE_U: u8 = 0x58;
+pub const I64_GE_S: u8 = 0x59;
+pub const I64_GE_U: u8 = 0x5A;
+
+pub const F32_EQ: u8 = 0x5B;
+pub const F64_EQ: u8 = 0x61;
+
+pub const I64_ADD: u8 = 0x7C;
+pub const I64_SUB: u8 = 0x7D;
+pub const I64_MUL: u8 = 0x7E;
+pub const I64_DIV_S: u8 = 0x7F;
+pub const I64_DIV_U: u8 = 0x80;
+pub const I64_REM_S: u8 = 0x81;
+pub const I64_REM_U: u8 = 0x82;
+pub const I64_AND: u8 = 0x83;
+pub const I64_OR: u8 = 0x84;
+pub const I64_XOR: u8 = 0x85;
+pub const I64_SHL: u8 = 0x86;
+pub const I64_SHR_S: u8 = 0x87;
+pub const I64_SHR_U: u8 = 0x88;
+
+/// The f32 unary and binary operations, in the order of f64's, 0x0E below.
+pub const F64_ABS: u8 = 0x99;
+pub const F64_NEG: u8 = 0x9A;
+pub const F64_CEIL: u8 = 0x9B;
+pub const F64_FLOOR: u8 = 0x9C;
+pub const F64_TRUNC: u8 = 0x9D;
+pub const F64_SQRT: u8 = 0x9F;
+pub const F64_ADD: u8 = 0xA0;
+pub const F64_SUB: u8 = 0xA1;
+pub const F64_MUL: u8 = 0xA2;
+pub const F64_DIV: u8 = 0xA3;
+
+pub const I32_WRAP_I64: u8 = 0xA7;
+pub const I64_EXTEND_I32_S: u8 = 0xAC;
+pub const I64_EXTEND_I32_U: u8 = 0xAD;
+pub const F32_CONVERT_I64_S: u8 = 0xB4;
+pub const F32_CONVERT_I64_U: u8 = 0xB5;
+pub const F32_DEMOTE_F64: u8 = 0xB6;
+pub const F64_CONVERT_I64_S: u8 = 0xB9;
+pub const F64_CONVERT_I64_U: u8 = 0xBA;
+pub const F64_PROMOTE_F32: u8 = 0xBB;
+pub const I32_REINTERPRET_F32: u8 = 0xBC;
+pub const I64_REINTERPRET_F64: u8 = 0xBD;
+pub const F32_REINTERPRET_I32: u8 = 0xBE;
+pub const F64_REINTERPRET_I64: u8 = 0xBF;
+pub const I64_EXTEND8_S: u8 = 0xC2;
+pub const I64_EXTEND16_S: u8 = 0xC3;
+pub const I64_EXTEND32_S: u8 = 0xC4;
+pub const PREFIX_FC: u8 = 0xFC;
+
+/// A number, unsigned: seven bits at a time, the low ones first.
+pub fn uleb(out: &mut alloc.List(u8), value: u64) {
+    var v = value;
+    while true {
+        let low = (v & 0x7F) as u8;
+        v = v >> 7;
+        if v == 0 {
+            out.push(low);
+            return;
+        }
+        out.push(low | 0x80);
+    }
+}
+
+/// A number's 64 bits, as a signed one.
+pub fn sleb(out: &mut alloc.List(u8), bits: u64) {
+    var v = bits;
+    let negative = v >> 63 == 1;
+    while true {
+        let low = (v & 0x7F) as u8;
+        v = v >> 7;
+        if negative {
+            v = v | 0xFE00000000000000;
+        }
+        let sign_clear = low & 0x40 == 0;
+        if (v == 0 and sign_clear) or (v == 18446744073709551615 and not sign_clear) {
+            out.push(low);
+            return;
+        }
+        out.push(low | 0x80);
+    }
+}
+
+pub fn op(out: &mut alloc.List(u8), code: u8) {
+    out.push(code);
+}
+
+/// An instruction with one unsigned number: a local, a label, a function...
+pub fn op_u(out: &mut alloc.List(u8), code: u8, n: u32) {
+    out.push(code);
+    uleb(out, n as u64);
+}
+
+pub fn i64_const(out: &mut alloc.List(u8), bits: u64) {
+    out.push(I64_CONST);
+    sleb(out, bits);
+}
+
+pub fn i32_const(out: &mut alloc.List(u8), v: i32) {
+    out.push(I32_CONST);
+    if v >= 0 {
+        sleb(out, v as u64);
+    } else {
+        sleb(out, nb.bits_of_i64(v as i64));
+    }
+}
+
+pub fn f64_const(out: &mut alloc.List(u8), bits: u64) {
+    out.push(F64_CONST);
+    var k: u64 = 0;
+    while k < 8 : (k += 1) {
+        out.push(((bits >> (k * 8)) & 255) as u8);
+    }
+}
+
+/// A load or store: its alignment is a hint, and Arche's own is not always one
+/// that holds, so it says none; no offset.
+pub fn memory_op(out: &mut alloc.List(u8), code: u8) {
+    out.push(code);
+    out.push(0);
+    out.push(0);
+}
+
+pub fn memory_copy(out: &mut alloc.List(u8)) {
+    out.push(PREFIX_FC);
+    out.push(10);
+    out.push(0);
+    out.push(0);
+}
+
+pub fn memory_fill(out: &mut alloc.List(u8)) {
+    out.push(PREFIX_FC);
+    out.push(11);
+    out.push(0);
+}
+
+/// i64.trunc_sat from a float of this size: what does not fit is the nearest
+/// end of the range, and a NaN is 0.
+pub fn trunc_sat(out: &mut alloc.List(u8), signed: bool, float_size: u32) {
+    out.push(PREFIX_FC);
+    var code: u8 = 7;
+    if float_size == 4 {
+        code = 5;
+    }
+    if signed {
+        code -= 1;
+    }
+    out.push(code);
+}
+
+pub fn put_bytes(out: &mut alloc.List(u8), b: []u8) {
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        out.push(b[i]);
+    }
+}
+
+pub fn put_name(out: &mut alloc.List(u8), name: str) {
+    uleb(out, name.len() as u64);
+    put_bytes(out, name.bytes());
+}
+
+/// A section: its number, its size, its contents.
+pub fn section(out: &mut alloc.List(u8), id: u8, contents: &alloc.List(u8)) {
+    out.push(id);
+    uleb(out, contents.len() as u64);
+    put_bytes(out, contents.items());
+}

@@ -34,6 +34,12 @@ linux-aarch64)
     LINK_FLAGS="--target=aarch64-linux-gnu -mno-outline-atomics -fuse-ld=lld -nostdlib -static -fno-pie"
     GC_FLAGS="-Wl,--gc-sections"
     ;;
+wasm32-wasi)
+    # Nothing to link and no runtime in C: the compiler writes the whole module.
+    TARGET_FLAG="--target wasm32-wasi"
+    RT_FLAGS=
+    LINK_FLAGS=
+    ;;
 linux-riscv64)
     TARGET_FLAG="--target linux-riscv64"
     RT_FLAGS="--target=riscv64-linux-gnu -march=rv64gc -mabi=lp64d -mno-relax -fno-pie -fno-omit-frame-pointer"
@@ -82,6 +88,12 @@ rt_stale() {
 
 # ARCHE_QEMU runs a program of another processor where the system will not by
 # itself: the program becomes a script that starts it through QEMU.
+# A WebAssembly program, as a command: ARCHE_WASM says how to run one.
+wrap_for_wasm() {
+    printf '#!/bin/sh\nexec %s "%s.wasm" "$@"\n' "${ARCHE_WASM:-wasmtime run --dir=. --dir=/tmp -S inherit-env}" "$1" > "$1"
+    chmod +x "$1"
+}
+
 wrap_for_qemu() {
     if [ -n "${ARCHE_QEMU:-}" ]; then
         mv "$1" "$1.elf"

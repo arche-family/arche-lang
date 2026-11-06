@@ -87,6 +87,8 @@ type Test = struct {
     seen: [KEYS]bool,
     kind: Kind,
     stage0_skip: bool,
+    /// What it needs is what WebAssembly's system does not have.
+    wasm_skip: bool,
     /// The system the test is only for, empty when it is for every one.
     system: alloc.String,
     /// The processor, likewise.
@@ -110,8 +112,9 @@ const K_LINE: usize = 7;
 const K_CODE: usize = 8;
 const K_SYSTEM: usize = 9;
 const K_ARCH: usize = 10;
+const K_WASM: usize = 11;
 /// How many keys a header may hold.
-const KEYS: usize = 11;
+const KEYS: usize = 12;
 
 fn key_name(k: usize) -> str {
     if k == K_TEST { return "test"; }
@@ -124,6 +127,7 @@ fn key_name(k: usize) -> str {
     if k == K_LINE { return "line"; }
     if k == K_SYSTEM { return "system"; }
     if k == K_ARCH { return "arch"; }
+    if k == K_WASM { return "wasm"; }
     return "code";
 }
 
@@ -150,6 +154,10 @@ fn apply_key(t: &mut Test, key: usize, v: []u8, a: alloc.Allocator) -> bool {
     if key == K_STAGE0 {
         t.stage0_skip = mem_eq(a: v, b: "skip".bytes());
         return t.stage0_skip;
+    }
+    if key == K_WASM {
+        t.wasm_skip = mem_eq(a: v, b: "skip".bytes());
+        return t.wasm_skip;
     }
     if key == K_EXIT {
         match parse_uint(v, max: 255) {
@@ -648,6 +656,7 @@ fn run_test(sys: &mut std.System, path: str, o: &Options, tmp: str, a: alloc.All
         seen: [false; KEYS],
         kind: Kind.Run,
         stage0_skip: false,
+        wasm_skip: false,
         system: alloc.String.init(a),
         arch: alloc.String.init(a),
         exit_code: 0,
@@ -661,14 +670,16 @@ fn run_test(sys: &mut std.System, path: str, o: &Options, tmp: str, a: alloc.All
     match sys.fs.read_bytes(path, a) {
         ok(src) => {
             var problem = alloc.String.init(a);
+            let on_wasm = o.arch.view().eq("wasm32");
             if not parse_header(src.items(), t: &mut t, problem: &mut problem, a) {
                 var m = alloc.String.init(a);
                 m.push_str("bad header: ");
                 m.push_str(problem.view());
                 verdict(&mut sys.stdout, word: "FAIL", path: path, detail: m.view());
             } else if (o.stage0 and t.stage0_skip) or not code_selected(o, t: &t) or
-                (t.system.len() > 0 and not t.system.view().eq(std.SYSTEM)) or
-                (t.arch.len() > 0 and not t.arch.view().eq(o.arch.view())) {
+                (t.system.len() > 0 and (on_wasm or not t.system.view().eq(std.SYSTEM))) or
+                (t.arch.len() > 0 and not t.arch.view().eq(o.arch.view())) or
+                (on_wasm and t.wasm_skip) {
                 verdict(&mut sys.stdout, word: "SKIP", path: path, detail: "");
                 result = Result.Skip;
             } else {

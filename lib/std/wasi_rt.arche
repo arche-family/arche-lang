@@ -1,0 +1,1244 @@
+/// The runtime of a WebAssembly program: what compiler/runtime/rt.c is on other
+/// systems, in Arche, for what the compiled code and std need. The compiled code
+/// calls these by their a0rt_ names, which their exports give them.
+///
+/// Its state sits at the start of the heap, a place the compiler tells it
+/// (compiler/wasm/gen.arche): a language with no module-level variables does not
+/// give it one any other way. Memory beyond it comes from memory.grow, and is
+/// handed out by bumping a pointer. As on other systems, it is zero when handed
+/// out, the program's own allocator frees nothing, and a region is an arena whose
+/// chunks are made zero again and kept for another.
+import core.mem;
+import core.ptr;
+import std.wasi;
+
+extern "c" fn a0rt_wasm_memory_grow(pages: u64) -> i64;
+extern "c" fn a0rt_wasm_memory_size() -> u64;
+extern "c" fn a0rt_wasm_heap_base() -> u64;
+extern "c" fn a0rt_wasm_error_names() -> u64;
+
+const PAGE: u64 = 65536;
+const BUFFER_SIZE: u64 = 65536;
+const TRACE_SIZE: u32 = 32;
+const CHUNK_HEADER: u64 = 16;
+const MAX_PREOPENS: u32 = 16;
+
+type TraceEntry = struct {
+    file: *u8,
+    file_len: u64,
+    line: u32,
+    col: u32,
+}
+
+type Buffer = struct {
+    used: u64,
+    bytes: [65536]u8,
+}
+
+/// {previous chunk's address, its size}; its memory follows.
+type Chunk = struct {
+    prev: u64,
+    size: u64,
+}
+
+type Arena = struct {
+    next: u64,
+    left: u64,
+    last: u64,
+    free_next: u64,
+}
+
+pub type Preopen = struct {
+    pub fd: u32,
+    pub name: *u8,
+    pub name_len: u64,
+}
+
+type State = struct {
+    heap_next: u64,
+    /// Where memory ends.
+    heap_end: u64,
+    free_arenas: u64,
+    free_chunks: u64,
+    trace_len: u32,
+    trace: [32]TraceEntry,
+    out: Buffer,
+    failure: Buffer,
+    preopen_count: u32,
+    preopens: [16]Preopen,
+}
+
+fn state() -> &mut State {
+    unsafe {
+        // SAFETY: the compiler keeps this place for the runtime; only this
+        // module uses it, on the program's one thread.
+        return ptr.from_addr(State, a0rt_wasm_heap_base() as usize).as_mut();
+    }
+}
+
+fn align16(n: u64) -> u64 {
+    return (n + 15) / 16 * 16;
+}
+
+/// Bytes from the top of the heap, zero as memory.grow gives them.
+fn take(n: u64) -> u64 {
+    let st = state();
+    let at = st.heap_next;
+    let end = at + n;
+    if end > st.heap_end {
+        let pages = (end - st.heap_end + PAGE - 1) / PAGE;
+        var got: i64 = -1;
+        unsafe {
+            // SAFETY: only adds memory.
+            got = a0rt_wasm_memory_grow(pages);
+        }
+        if got < 0 {
+            die("out of memory");
+        }
+        st.heap_end += pages * PAGE;
+    }
+    st.heap_next = end;
+    return at;
+}
+
+/// Memory for the rest of the run, zero, at an address.
+pub fn take_zeroed(n: u64) -> u64 {
+    return take(align16(n));
+}
+
+/// Before anything else the program does.
+pub fn start() {
+    var base: u64 = 0;
+    var size: u64 = 0;
+    unsafe {
+        // SAFETY: only numbers.
+        base = a0rt_wasm_heap_base();
+        size = a0rt_wasm_memory_size();
+    }
+    let room = base + mem.size_of(State) as u64;
+    if room > size * PAGE {
+        unsafe {
+            // SAFETY: only adds memory. If it cannot, nothing can run.
+            if a0rt_wasm_memory_grow((room - size * PAGE + PAGE - 1) / PAGE) < 0 {
+                wasi.proc_exit(101);
+            }
+            size = a0rt_wasm_memory_size();
+        }
+    }
+    let st = state();
+    st.heap_next = align16(room);
+    st.heap_end = size * PAGE;
+    find_preopens();
+}
+
+// ---- memory -----------------------------------------------------------------------
+
+fn arena_alloc(a: &mut Arena, wanted: u64) -> u64 {
+    let n = align16(wanted);
+    if n > a.left {
+        var size = n + CHUNK_HEADER;
+        if size < 65536 {
+            size = 65536;
+        }
+        size = (size + 4095) / 4096 * 4096;
+        let at = take_chunk(size);
+        unsafe {
+            // SAFETY: take_chunk gave at least size bytes there.
+            let c = ptr.from_addr(Chunk, at as usize).as_mut();
+            c.prev = a.last;
+            c.size = size;
+        }
+        a.last = at;
+        a.next = at + CHUNK_HEADER;
+        a.left = size - CHUNK_HEADER;
+    }
+    let r = a.next;
+    a.next += n;
+    a.left -= n;
+    return r;
+}
+
+/// A chunk of at least size bytes, zero: one a region left, or a new one.
+fn take_chunk(size: u64) -> u64 {
+    let st = state();
+    var previous: u64 = 0;
+    var at = st.free_chunks;
+    while at != 0 {
+        unsafe {
+            // SAFETY: free_chunks lists chunks region_end kept.
+            let c = ptr.from_addr(Chunk, at as usize).as_mut();
+            if c.size >= size {
+                if previous == 0 {
+                    st.free_chunks = c.prev;
+                } else {
+                    ptr.from_addr(Chunk, previous as usize).as_mut().prev = c.prev;
+                }
+                c.prev = 0;
+                c.size = 0;
+                return at;
+            }
+            previous = at;
+            at = c.prev;
+        }
+    }
+    return take(size);
+}
+
+fn alloc_in(allocator: u64, wanted: u64) -> u64 {
+    var n = wanted;
+    if n == 0 {
+        n = 1;
+    }
+    if allocator == 0 {
+        return take(align16(n));
+    }
+    unsafe {
+        // SAFETY: a handle other than 0 is the address region_begin gave.
+        return arena_alloc(ptr.from_addr(Arena, allocator as usize).as_mut(), n);
+    }
+}
+
+export("a0rt_alloc_in") fn export_alloc_in(allocator: u64, n: u64) -> u64 {
+    return alloc_in(allocator: allocator, wanted: n);
+}
+
+export("a0rt_memmove") fn export_memmove(dst: *mut u8, src: *u8, n: u64) {
+    unsafe {
+        // SAFETY: the caller's: n bytes at each.
+        var i: usize = 0;
+        if dst.addr() < src.addr() {
+            while i < n as usize : (i += 1) {
+                dst.add(i).* = src.add(i).*;
+            }
+        } else {
+            i = n as usize;
+            while i > 0 : (i -= 1) {
+                dst.add(i - 1).* = src.add(i - 1).*;
+            }
+        }
+    }
+}
+
+export("a0rt_region_begin") fn export_region_begin() -> u64 {
+    let st = state();
+    var at = st.free_arenas;
+    unsafe {
+        // SAFETY: free_arenas lists arenas region_end kept, and take is
+        // memory that nothing else uses.
+        if at != 0 {
+            st.free_arenas = ptr.from_addr(Arena, at as usize).as_mut().free_next;
+        } else {
+            at = take(align16(mem.size_of(Arena) as u64));
+        }
+        let a = ptr.from_addr(Arena, at as usize).as_mut();
+        a.next = 0;
+        a.left = 0;
+        a.last = 0;
+        a.free_next = 0;
+    }
+    return at;
+}
+
+export("a0rt_region_end") fn export_region_end(handle: u64) {
+    let st = state();
+    unsafe {
+        // SAFETY: the handle region_begin gave; nothing uses its memory now.
+        let a = ptr.from_addr(Arena, handle as usize).as_mut();
+        var c = a.last;
+        while c != 0 {
+            let chunk = ptr.from_addr(Chunk, c as usize).as_mut();
+            let prev = chunk.prev;
+            let size = chunk.size;
+            let bytes = mem.slice_mut(u8, ptr.from_addr(u8, c as usize), size as usize);
+            var i: usize = 0;
+            while i < bytes.len() : (i += 1) {
+                bytes[i] = 0;
+            }
+            chunk.prev = st.free_chunks;
+            chunk.size = size;
+            st.free_chunks = c;
+            c = prev;
+        }
+        a.free_next = st.free_arenas;
+        st.free_arenas = handle;
+    }
+}
+
+// ---- str --------------------------------------------------------------------------
+
+export("a0rt_str_boundary") fn export_str_boundary(p: *u8, n: u64, i: u64) -> u8 {
+    if i == 0 or i >= n {
+        return 1;
+    }
+    unsafe {
+        // SAFETY: i is below n, the str's size.
+        if p.add(i as usize).* & 0xC0 != 0x80 {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn same_bytes(a: *u8, b: *u8, n: u64) -> bool {
+    unsafe {
+        // SAFETY: the callers': n bytes at each.
+        var i: usize = 0;
+        while i < n as usize : (i += 1) {
+            if a.add(i).* != b.add(i).* {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+export("a0rt_str_eq") fn export_str_eq(a: *u8, an: u64, b: *u8, bn: u64) -> u8 {
+    if an == bn and same_bytes(a: a, b: b, n: an) {
+        return 1;
+    }
+    return 0;
+}
+
+export("a0rt_str_starts_with") fn export_str_starts_with(a: *u8, an: u64, b: *u8, bn: u64) -> u8 {
+    if an >= bn and same_bytes(a: a, b: b, n: bn) {
+        return 1;
+    }
+    return 0;
+}
+
+// ---- output -----------------------------------------------------------------------
+
+fn flush_fd(fd: u32, b: &mut Buffer) {
+    var at: u64 = 0;
+    while at < b.used {
+        var iov: [2]u32 = [0, 0];
+        var written: u32 = 0;
+        iov[0] = wasi.of(u8, &b.bytes[0]) + at as u32;
+        iov[1] = (b.used - at) as u32;
+        let e = wasi.fd_write(fd: fd, iovs: wasi.of(u32, &iov[0]), count: 1, written: wasi.of(u32, &written));
+        if e != 0 or written == 0 {
+            break;
+        }
+        at += written as u64;
+    }
+    b.used = 0;
+}
+
+pub fn flush_all() {
+    let st = state();
+    flush_fd(1, &mut st.out);
+    flush_fd(2, &mut st.failure);
+}
+
+pub fn write_bytes(fd: i64, p: *u8, n: u64) {
+    let st = state();
+    var i: usize = 0;
+    while i < n as usize : (i += 1) {
+        var b = &mut st.out;
+        var target: u32 = 1;
+        if fd == 2 {
+            b = &mut st.failure;
+            target = 2;
+        }
+        if b.used == BUFFER_SIZE {
+            flush_fd(target, b);
+        }
+        unsafe {
+            // SAFETY: the caller's: n bytes at p.
+            b.bytes[b.used as usize] = p.add(i).*;
+        }
+        b.used += 1;
+    }
+}
+
+pub fn write_text(fd: i64, text: str) {
+    unsafe {
+        // SAFETY: the text's bytes, read during the call.
+        write_bytes(fd, mem.str_data(text), text.len() as u64);
+    }
+}
+
+pub fn write_byte(fd: i64, c: u8) {
+    var b = c;
+    unsafe {
+        // SAFETY: one byte, read during the call.
+        write_bytes(fd, &b as *u8, 1);
+    }
+}
+
+pub fn write_u64(fd: i64, value: u64) {
+    var digits: [20]u8 = [0; 20];
+    var v = value;
+    var n: usize = 0;
+    while true {
+        digits[19 - n] = '0' + (v % 10) as u8;
+        n += 1;
+        v = v / 10;
+        if v == 0 {
+            break;
+        }
+    }
+    unsafe {
+        // SAFETY: the digits, read during the call.
+        write_bytes(fd, &digits[20 - n] as *u8, n as u64);
+    }
+}
+
+pub fn write_i64(fd: i64, v: i64) {
+    if v < 0 {
+        write_byte(fd, '-');
+        write_u64(fd, ((v + 1) * -1) as u64 + 1);
+    } else {
+        write_u64(fd, v as u64);
+    }
+}
+
+// ---- floats (spec/arche.md §2.4): compiler/runtime/rt.c's, the same digits ---------
+
+const BIG_LIMBS: usize = 44;
+
+type Big = struct {
+    limb: [44]u32,
+    len: usize,
+}
+
+fn big_of(v: u64) -> Big {
+    var x = Big { limb: [0; 44], len: 0 };
+    var left = v;
+    while left != 0 {
+        x.limb[x.len] = (left & 0xFFFFFFFF) as u32;
+        x.len += 1;
+        left = left >> 32;
+    }
+    return x;
+}
+
+fn big_mul_small(x: &mut Big, m: u32) {
+    var carry: u64 = 0;
+    var i: usize = 0;
+    while i < x.len : (i += 1) {
+        let v = x.limb[i] as u64 * m as u64 + carry;
+        x.limb[i] = (v & 0xFFFFFFFF) as u32;
+        carry = v >> 32;
+    }
+    if carry != 0 {
+        x.limb[x.len] = carry as u32;
+        x.len += 1;
+    }
+}
+
+fn big_shl(x: &mut Big, k: u32) {
+    if x.len == 0 {
+        return;
+    }
+    let words = (k / 32) as usize;
+    let bits = k % 32;
+    var i = x.len;
+    while i > 0 : (i -= 1) {
+        x.limb[i - 1 + words] = x.limb[i - 1];
+    }
+    i = 0;
+    while i < words : (i += 1) {
+        x.limb[i] = 0;
+    }
+    x.len += words;
+    if bits != 0 {
+        var carry: u32 = 0;
+        i = words;
+        while i < x.len : (i += 1) {
+            let v = x.limb[i];
+            x.limb[i] = (v << bits) | carry;
+            carry = v >> (32 - bits);
+        }
+        if carry != 0 {
+            x.limb[x.len] = carry;
+            x.len += 1;
+        }
+    }
+}
+
+fn big_cmp(a: &Big, b: &Big) -> i32 {
+    if a.len != b.len {
+        if a.len < b.len {
+            return -1;
+        }
+        return 1;
+    }
+    var i = a.len;
+    while i > 0 : (i -= 1) {
+        if a.limb[i - 1] != b.limb[i - 1] {
+            if a.limb[i - 1] < b.limb[i - 1] {
+                return -1;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn big_add(a: &Big, b: &Big) -> Big {
+    var out = Big { limb: [0; 44], len: 0 };
+    var carry: u64 = 0;
+    var n = a.len;
+    if b.len > n {
+        n = b.len;
+    }
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        var v = carry;
+        if i < a.len {
+            v += a.limb[i] as u64;
+        }
+        if i < b.len {
+            v += b.limb[i] as u64;
+        }
+        out.limb[i] = (v & 0xFFFFFFFF) as u32;
+        carry = v >> 32;
+    }
+    out.len = n;
+    if carry != 0 {
+        out.limb[out.len] = carry as u32;
+        out.len += 1;
+    }
+    return out;
+}
+
+/// a -= b, for a >= b.
+fn big_sub(a: &mut Big, b: &Big) {
+    var borrow: u64 = 0;
+    var i: usize = 0;
+    while i < a.len : (i += 1) {
+        var bv = borrow;
+        if i < b.len {
+            bv += b.limb[i] as u64;
+        }
+        let av = a.limb[i] as u64;
+        if av >= bv {
+            a.limb[i] = (av - bv) as u32;
+            borrow = 0;
+        } else {
+            a.limb[i] = (0x100000000 + av - bv) as u32;
+            borrow = 1;
+        }
+    }
+    while a.len > 0 and a.limb[a.len - 1] == 0 {
+        a.len -= 1;
+    }
+}
+
+/// The shortest digits of f * 2^e for a format of p bits whose smallest
+/// exponent is min_e: how many, with their place in k: 0.ddd * 10^k.
+fn shortest(f: u64, e: i32, p: u32, min_e: i32, digits: []mut u8, k_out: &mut i32) -> usize {
+    let even = f & 1 == 0;
+    let one: u64 = 1;
+    let hidden = one << (p - 1) as u64;
+    var r = big_of(f);
+    var s = big_of(1);
+    var mp = big_of(1);
+    var mm = big_of(1);
+    if e >= 0 {
+        big_shl(&mut mp, e as u32);
+        big_shl(&mut mm, e as u32);
+        if f != hidden {
+            big_shl(&mut r, (e + 1) as u32);
+            s = big_of(2);
+        } else {
+            big_shl(&mut r, (e + 2) as u32);
+            s = big_of(4);
+            big_shl(&mut mp, 1);
+        }
+    } else if e == min_e or f != hidden {
+        big_shl(&mut r, 1);
+        big_shl(&mut s, (1 - e) as u32);
+    } else {
+        big_shl(&mut r, 2);
+        big_shl(&mut s, (2 - e) as u32);
+        mp = big_of(2);
+    }
+    // k = ceil(log10 v), estimated low from the bit length, then fixed.
+    var bits: i32 = 0;
+    var x = f;
+    while x != 0 {
+        bits += 1;
+        x = x >> 1;
+    }
+    let lg = e + bits - 1;
+    var k: i32 = 0;
+    if lg >= 0 {
+        k = (lg * 1233) / 4096;
+    } else {
+        k = -((-lg * 1233 + 4095) / 4096);
+    }
+    var i: i32 = 0;
+    if k >= 0 {
+        while i < k : (i += 1) {
+            big_mul_small(&mut s, 10);
+        }
+    } else {
+        while i < -k : (i += 1) {
+            big_mul_small(&mut r, 10);
+            big_mul_small(&mut mp, 10);
+            big_mul_small(&mut mm, 10);
+        }
+    }
+    while true {
+        let t = big_add(a: &r, b: &mp);
+        let c = big_cmp(a: &t, b: &s);
+        if c > 0 or (even and c == 0) {
+            big_mul_small(&mut s, 10);
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    var n: usize = 0;
+    while true {
+        big_mul_small(&mut r, 10);
+        big_mul_small(&mut mp, 10);
+        big_mul_small(&mut mm, 10);
+        var d: u8 = 0;
+        while big_cmp(a: &r, b: &s) >= 0 {
+            big_sub(&mut r, &s);
+            d += 1;
+        }
+        let c1 = big_cmp(a: &r, b: &mm);
+        let low = c1 < 0 or (even and c1 == 0);
+        let t = big_add(a: &r, b: &mp);
+        let c2 = big_cmp(a: &t, b: &s);
+        let high = c2 > 0 or (even and c2 == 0);
+        if not low and not high {
+            digits[n] = d;
+            n += 1;
+            continue;
+        }
+        if low and high {
+            let twice = big_add(a: &r, b: &r);
+            let c3 = big_cmp(a: &twice, b: &s);
+            if c3 > 0 or (c3 == 0 and d & 1 == 1) {
+                d += 1;
+            }
+        } else if high {
+            d += 1;
+        }
+        digits[n] = d;
+        n += 1;
+        break;
+    }
+    k_out.* = k;
+    return n;
+}
+
+fn write_finite(fd: i64, negative: bool, f: u64, e: i32, p: u32, min_e: i32) {
+    if negative {
+        write_byte(fd, '-');
+    }
+    if f == 0 {
+        write_text(fd, "0.0");
+        return;
+    }
+    var d: [32]u8 = [0; 32];
+    var k: i32 = 0;
+    let n = shortest(f, e: e, p: p, min_e: min_e, digits: d[0..32], k_out: &mut k);
+    var i: usize = 0;
+    if k > 21 or k < -5 {
+        write_byte(fd, '0' + d[0]);
+        if n > 1 {
+            write_byte(fd, '.');
+            i = 1;
+            while i < n : (i += 1) {
+                write_byte(fd, '0' + d[i]);
+            }
+        }
+        write_byte(fd, 'e');
+        var x = k - 1;
+        if x < 0 {
+            write_byte(fd, '-');
+            x = -x;
+        }
+        write_u64(fd, x as u64);
+    } else if k <= 0 {
+        write_text(fd, "0.");
+        var z: i32 = 0;
+        while z < -k : (z += 1) {
+            write_byte(fd, '0');
+        }
+        while i < n : (i += 1) {
+            write_byte(fd, '0' + d[i]);
+        }
+    } else if k as usize >= n {
+        while i < n : (i += 1) {
+            write_byte(fd, '0' + d[i]);
+        }
+        var z = n;
+        while z < k as usize : (z += 1) {
+            write_byte(fd, '0');
+        }
+        write_text(fd, ".0");
+    } else {
+        while i < n : (i += 1) {
+            if i == k as usize {
+                write_byte(fd, '.');
+            }
+            write_byte(fd, '0' + d[i]);
+        }
+    }
+}
+
+fn bits_of_f64(x: f64) -> u64 {
+    unsafe {
+        // SAFETY: both are 8 bytes, of any bits.
+        return (&x as *f64 as *u64).*;
+    }
+}
+
+fn bits_of_f32(x: f32) -> u32 {
+    unsafe {
+        // SAFETY: both are 4 bytes, of any bits.
+        return (&x as *f32 as *u32).*;
+    }
+}
+
+fn f64_of_bits(b: u64) -> f64 {
+    unsafe {
+        // SAFETY: both are 8 bytes, of any bits.
+        return (&b as *u64 as *f64).*;
+    }
+}
+
+fn f32_of_bits(b: u32) -> f32 {
+    unsafe {
+        // SAFETY: both are 4 bytes, of any bits.
+        return (&b as *u32 as *f32).*;
+    }
+}
+
+pub fn write_f64(fd: i64, x: f64) {
+    let b = bits_of_f64(x);
+    let negative = b >> 63 == 1;
+    let be = ((b >> 52) & 0x7FF) as i32;
+    let one: u64 = 1;
+    let m = b & ((one << 52) - 1);
+    if be == 0x7FF {
+        if m != 0 {
+            write_text(fd, "nan");
+            return;
+        }
+        if negative {
+            write_byte(fd, '-');
+        }
+        write_text(fd, "inf");
+    } else if be == 0 {
+        write_finite(fd, negative: negative, m, e: -1074, p: 53, min_e: -1074);
+    } else {
+        write_finite(fd, negative: negative, m | (one << 52), e: be - 1075, p: 53, min_e: -1074);
+    }
+}
+
+pub fn write_f32(fd: i64, x: f32) {
+    let b = bits_of_f32(x);
+    let negative = b >> 31 == 1;
+    let be = ((b >> 23) & 0xFF) as i32;
+    let m = (b & 0x7FFFFF) as u64;
+    let one: u64 = 1;
+    if be == 0xFF {
+        if m != 0 {
+            write_text(fd, "nan");
+            return;
+        }
+        if negative {
+            write_byte(fd, '-');
+        }
+        write_text(fd, "inf");
+    } else if be == 0 {
+        write_finite(fd, negative: negative, m, e: -149, p: 24, min_e: -149);
+    } else {
+        write_finite(fd, negative: negative, m | (one << 23), e: be - 150, p: 24, min_e: -149);
+    }
+}
+
+// ---- traces and exit ---------------------------------------------------------------
+
+export("a0rt_trace_push") fn export_trace_push(file: *u8, file_len: u64, line: u32, col: u32) {
+    let st = state();
+    if st.trace_len < TRACE_SIZE {
+        st.trace[st.trace_len as usize] = TraceEntry { file: file, file_len: file_len, line: line, col: col };
+        st.trace_len += 1;
+    }
+}
+
+export("a0rt_trace_start") fn export_trace_start(file: *u8, file_len: u64, line: u32, col: u32) {
+    state().trace_len = 0;
+    export_trace_push(file, file_len: file_len, line: line, col: col);
+}
+
+pub fn exit_with(status: u32) -> noreturn {
+    flush_all();
+    wasi.proc_exit(status);
+}
+
+/// The runtime's own failure.
+pub fn die(message: str) -> noreturn {
+    flush_all();
+    write_text(2, "panic: ");
+    write_text(2, message);
+    write_text(2, "\n");
+    exit_with(101);
+}
+
+/// panic and every trap: the message, then where it happened.
+export("a0rt_trap") fn export_trap(message: *u8, len: u64, file: *u8, file_len: u64, line: u32, col: u32) -> noreturn {
+    flush_all();
+    write_text(2, "panic: ");
+    write_bytes(2, message, len);
+    write_text(2, "\n  at ");
+    write_bytes(2, file, file_len);
+    write_byte(2, ':');
+    write_u64(2, line as u64);
+    write_byte(2, ':');
+    write_u64(2, col as u64);
+    write_byte(2, '\n');
+    exit_with(101);
+}
+
+/// What main's error comes to: its name and where it went, as elsewhere.
+pub fn report_error(failure: u16) -> noreturn {
+    flush_all();
+    write_text(2, "error: ");
+    unsafe {
+        // SAFETY: the compiler's table of names has one for each error, as
+        // {address, size}.
+        let entry = ptr.from_addr(u64, a0rt_wasm_error_names() as usize + failure as usize * 16);
+        write_bytes(2, ptr.from_addr(u8, entry.* as usize) as *u8, entry.add(1).*);
+    }
+    write_byte(2, '\n');
+    let st = state();
+    var i: usize = 0;
+    while i < st.trace_len as usize : (i += 1) {
+        write_text(2, "  at ");
+        write_bytes(2, st.trace[i].file, st.trace[i].file_len);
+        write_byte(2, ':');
+        write_u64(2, st.trace[i].line as u64);
+        write_byte(2, ':');
+        write_u64(2, st.trace[i].col as u64);
+        write_byte(2, '\n');
+    }
+    exit_with(1);
+}
+
+// ---- the directories a program may reach -------------------------------------------
+
+fn find_preopens() {
+    let st = state();
+    var fd: u32 = 3;
+    while st.preopen_count < MAX_PREOPENS : (fd += 1) {
+        var info: [2]u32 = [0, 0];
+        if wasi.fd_prestat_get(fd: fd, out: wasi.of(u32, &info[0])) != 0 {
+            return;
+        }
+        let size = info[1] as u64;
+        let name = take(align16(size + 1));
+        unsafe {
+            // SAFETY: take gave size + 1 bytes.
+            _ = wasi.fd_prestat_dir_name(fd: fd, path: name as u32, size: size as u32);
+            let p = ptr.from_addr(u8, name as usize);
+            // Some systems count a final zero byte.
+            var n = size;
+            while n > 0 and p.add(n as usize - 1).* == 0 : (n -= 1) {
+            }
+            st.preopens[st.preopen_count as usize] = Preopen { fd: fd, name: p as *u8, name_len: n };
+        }
+        st.preopen_count += 1;
+    }
+}
+
+/// The directory this path starts from, by its fd, and where in the path what
+/// is below it starts. No such directory: fd 0.
+pub type Base = struct {
+    pub fd: u32,
+    pub skip: usize,
+}
+
+pub fn base_of(path: str) -> Base {
+    let st = state();
+    let b = path.bytes();
+    let absolute = b.len() > 0 and b[0] == '/';
+    var best = Base { fd: 0, skip: 0 };
+    var best_len: u64 = 0;
+    var i: usize = 0;
+    while i < st.preopen_count as usize : (i += 1) {
+        let p = st.preopens[i];
+        var name_absolute = false;
+        var name_len = p.name_len;
+        unsafe {
+            // SAFETY: find_preopens read name_len bytes there.
+            name_absolute = name_len > 0 and p.name.* == '/';
+            if not absolute and not name_absolute {
+                // The directory the program was started in: "." or "".
+                if best.fd == 0 {
+                    best = Base { fd: p.fd, skip: 0 };
+                }
+            } else if absolute and name_absolute {
+                while name_len > 1 and p.name.add(name_len as usize - 1).* == '/' : (name_len -= 1) {
+                }
+                var same = name_len as usize <= b.len();
+                var k: usize = 0;
+                while same and k < name_len as usize : (k += 1) {
+                    same = b[k] == p.name.add(k).*;
+                }
+                let at_end = name_len as usize == b.len() or name_len == 1 or b[name_len as usize] == '/';
+                if same and at_end and (best.fd == 0 or name_len > best_len) {
+                    best = Base { fd: p.fd, skip: name_len as usize };
+                    best_len = name_len;
+                }
+            }
+        }
+    }
+    if absolute {
+        while best.skip < b.len() and b[best.skip] == '/' : (best.skip += 1) {
+        }
+    }
+    return best;
+}
+
+// ---- float helpers: compiler/runtime/math.inc's, the same results --------------------
+
+const FMOD_NAN: u64 = 0xFFE0000000000000;
+
+fn nan_like(x: f64, y: f64) -> f64 {
+    return (x * y) / (x * y);
+}
+
+export("fmod") fn fmod(x: f64, y: f64) -> f64 {
+    let bx = bits_of_f64(x);
+    var uy = bits_of_f64(y);
+    var uxi = bx;
+    var ex = ((bx >> 52) & 0x7FF) as i32;
+    var ey = ((uy >> 52) & 0x7FF) as i32;
+    let sx = bx >> 63;
+    if uy << 1 == 0 or (uy << 1) > FMOD_NAN or ex == 0x7FF {
+        return nan_like(x: x, y: y);
+    }
+    if uxi << 1 <= uy << 1 {
+        if uxi << 1 == uy << 1 {
+            return 0.0 * x;
+        }
+        return x;
+    }
+    let one: u64 = 1;
+    let frac = (one << 52) - 1;
+    if ex == 0 {
+        var i = uxi << 12;
+        while i >> 63 == 0 {
+            ex -= 1;
+            i = i << 1;
+        }
+        uxi = uxi << (1 - ex) as u64;
+    } else {
+        uxi = (uxi & frac) | (one << 52);
+    }
+    if ey == 0 {
+        var i = uy << 12;
+        while i >> 63 == 0 {
+            ey -= 1;
+            i = i << 1;
+        }
+        uy = uy << (1 - ey) as u64;
+    } else {
+        uy = (uy & frac) | (one << 52);
+    }
+    while ex > ey : (ex -= 1) {
+        if uxi >= uy {
+            if uxi == uy {
+                return 0.0 * x;
+            }
+            uxi -= uy;
+        }
+        uxi = uxi << 1;
+    }
+    if uxi >= uy {
+        if uxi == uy {
+            return 0.0 * x;
+        }
+        uxi -= uy;
+    }
+    while uxi >> 52 == 0 {
+        uxi = uxi << 1;
+        ex -= 1;
+    }
+    if ex > 0 {
+        uxi = (uxi - (one << 52)) | ((ex as u64) << 52);
+    } else {
+        uxi = uxi >> (1 - ex) as u64;
+    }
+    return f64_of_bits(uxi | (sx << 63));
+}
+
+export("fmodf") fn fmodf(x: f32, y: f32) -> f32 {
+    // A double holds both exactly, and their remainder too.
+    return fmod(x: x as f64, y: y as f64) as% f32;
+}
+
+/// A number of 128 bits.
+type Wide = struct {
+    hi: u64,
+    lo: u64,
+}
+
+fn wide_mul(a: u64, b: u64) -> Wide {
+    let a0 = a & 0xFFFFFFFF;
+    let a1 = a >> 32;
+    let b0 = b & 0xFFFFFFFF;
+    let b1 = b >> 32;
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let mid = (p00 >> 32) + (p01 & 0xFFFFFFFF) + (p10 & 0xFFFFFFFF);
+    return Wide { hi: p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32), lo: (mid << 32) | (p00 & 0xFFFFFFFF) };
+}
+
+fn wide_is_zero(a: Wide) -> bool {
+    return a.hi == 0 and a.lo == 0;
+}
+
+fn wide_msb(a: Wide) -> i32 {
+    var v = a.lo;
+    var base: i32 = 0;
+    if a.hi != 0 {
+        v = a.hi;
+        base = 64;
+    }
+    var n: i32 = -1;
+    while v != 0 {
+        n += 1;
+        v = v >> 1;
+    }
+    return base + n;
+}
+
+fn wide_shl(a: Wide, by: i32) -> Wide {
+    if by == 0 {
+        return a;
+    }
+    if by >= 64 {
+        return Wide { hi: a.lo << (by - 64) as u64, lo: 0 };
+    }
+    let k = by as u64;
+    return Wide { hi: (a.hi << k) | (a.lo >> (64 - k)), lo: a.lo << k };
+}
+
+fn wide_shr(a: Wide, by: i32) -> Wide {
+    if by == 0 {
+        return a;
+    }
+    if by >= 64 {
+        return Wide { hi: 0, lo: a.hi >> (by - 64) as u64 };
+    }
+    let k = by as u64;
+    return Wide { hi: a.hi >> k, lo: (a.lo >> k) | (a.hi << (64 - k)) };
+}
+
+fn wide_lt(a: Wide, b: Wide) -> bool {
+    return a.hi < b.hi or (a.hi == b.hi and a.lo < b.lo);
+}
+
+fn wide_add(a: Wide, b: Wide) -> Wide {
+    let room = 18446744073709551615 - a.lo;
+    if b.lo > room {
+        return Wide { hi: a.hi + b.hi + 1, lo: b.lo - room - 1 };
+    }
+    return Wide { hi: a.hi + b.hi, lo: a.lo + b.lo };
+}
+
+/// a - b, for a >= b.
+fn wide_sub(a: Wide, b: Wide) -> Wide {
+    if a.lo < b.lo {
+        return Wide { hi: a.hi - b.hi - 1, lo: 18446744073709551615 - b.lo + a.lo + 1 };
+    }
+    return Wide { hi: a.hi - b.hi, lo: a.lo - b.lo };
+}
+
+fn shift_sticky(v: Wide, d: i32) -> Wide {
+    if d <= 0 {
+        return v;
+    }
+    if d >= 128 {
+        var bit: u64 = 0;
+        if not wide_is_zero(v) {
+            bit = 1;
+        }
+        return Wide { hi: 0, lo: bit };
+    }
+    let kept = wide_shr(v, by: d);
+    let back = wide_shl(kept, by: d);
+    if back.hi != v.hi or back.lo != v.lo {
+        return Wide { hi: kept.hi, lo: kept.lo | 1 };
+    }
+    return kept;
+}
+
+type Rounded = struct {
+    m: u64,
+    e: i32,
+    sign: u64,
+}
+
+/// The exact value (-1)^s * (mx 2^ex * my 2^ey) + (-1)^t * mz 2^ez, rounded to
+/// nearest even with prec bits and the least exponent emin.
+fn fma_exact(mx: u64, ex: i32, my: u64, ey: i32, s: u64, mz: u64, z_exp: i32, t: u64, prec: i32, emin: i32) -> Rounded {
+    var p = wide_mul(a: mx, b: my);
+    var ep = ex + ey;
+    let shift_p = 125 - wide_msb(p);
+    p = wide_shl(p, by: shift_p);
+    ep -= shift_p;
+    var z = Wide { hi: 0, lo: mz };
+    let shift_z = 125 - wide_msb(z);
+    z = wide_shl(z, by: shift_z);
+    let ez = z_exp - shift_z;
+    var er = ep;
+    if ep >= ez {
+        z = shift_sticky(z, d: ep - ez);
+    } else {
+        p = shift_sticky(p, d: ez - ep);
+        er = ez;
+    }
+    var r = Wide { hi: 0, lo: 0 };
+    var sign = s;
+    if s == t {
+        r = wide_add(a: p, b: z);
+    } else if not wide_lt(a: p, b: z) {
+        r = wide_sub(a: p, b: z);
+    } else {
+        r = wide_sub(a: z, b: p);
+        sign = t;
+    }
+    if wide_is_zero(r) {
+        return Rounded { m: 0, e: 0, sign: 0 };
+    }
+    let k = wide_msb(r);
+    var sh = k - (prec - 1);
+    var e = er + sh;
+    if e < emin {
+        sh += emin - e;
+        e = emin;
+    }
+    var m: u64 = 0;
+    if sh <= 0 {
+        m = wide_shl(r, by: -sh).lo;
+    } else if sh <= 128 {
+        var kept = Wide { hi: 0, lo: 0 };
+        if sh < 128 {
+            kept = wide_shr(r, by: sh);
+        }
+        let guard = wide_shr(r, by: sh - 1).lo & 1 == 1;
+        var sticky = false;
+        if sh >= 2 {
+            let above = wide_shl(wide_shr(r, by: sh - 1), by: sh - 1);
+            sticky = above.hi != r.hi or above.lo != r.lo;
+        }
+        m = kept.lo;
+        if guard and (sticky or m & 1 == 1) {
+            m += 1;
+        }
+        let one: u64 = 1;
+        if m == one << prec as u64 {
+            m = m >> 1;
+            e += 1;
+        }
+    }
+    return Rounded { m: m, e: e, sign: sign };
+}
+
+fn least_one(field: u64) -> i32 {
+    if field == 0 {
+        return 1;
+    }
+    return field as i32;
+}
+
+export("fma") fn fma(x: f64, y: f64, z: f64) -> f64 {
+    let ux = bits_of_f64(x);
+    let uy = bits_of_f64(y);
+    let uz = bits_of_f64(z);
+    let fx = (ux >> 52) & 0x7FF;
+    let fy = (uy >> 52) & 0x7FF;
+    let fz = (uz >> 52) & 0x7FF;
+    if fz == 0x7FF and fx != 0x7FF and fy != 0x7FF {
+        return z;
+    }
+    if fx == 0x7FF or fy == 0x7FF or fz == 0x7FF or x == 0.0 or y == 0.0 {
+        return x * y + z;
+    }
+    if z == 0.0 {
+        return x * y;
+    }
+    let one: u64 = 1;
+    let frac = (one << 52) - 1;
+    var mx = ux & frac;
+    if fx != 0 {
+        mx = mx | (one << 52);
+    }
+    var my = uy & frac;
+    if fy != 0 {
+        my = my | (one << 52);
+    }
+    var mz = uz & frac;
+    if fz != 0 {
+        mz = mz | (one << 52);
+    }
+    let r = fma_exact(mx: mx, ex: least_one(fx) - 1075, my: my, ey: least_one(fy) - 1075, s: (ux ^ uy) >> 63, mz: mz, z_exp: least_one(fz) - 1075, t: uz >> 63, prec: 53, emin: -1074);
+    if r.m == 0 {
+        return f64_of_bits(r.sign << 63);
+    }
+    if r.e > 971 {
+        return f64_of_bits((r.sign << 63) | 0x7FF0000000000000);
+    }
+    if r.m >= one << 52 {
+        return f64_of_bits((r.sign << 63) | (((r.e + 1075) as u64) << 52) | (r.m & frac));
+    }
+    return f64_of_bits((r.sign << 63) | r.m);
+}
+
+export("fmaf") fn fmaf(x: f32, y: f32, z: f32) -> f32 {
+    let ux = bits_of_f32(x);
+    let uy = bits_of_f32(y);
+    let uz = bits_of_f32(z);
+    let fx = ((ux >> 23) & 0xFF) as u64;
+    let fy = ((uy >> 23) & 0xFF) as u64;
+    let fz = ((uz >> 23) & 0xFF) as u64;
+    if fz == 0xFF and fx != 0xFF and fy != 0xFF {
+        return z;
+    }
+    if fx == 0xFF or fy == 0xFF or fz == 0xFF or x == 0.0 or y == 0.0 {
+        return x * y + z;
+    }
+    if z == 0.0 {
+        return x * y;
+    }
+    let one: u64 = 1;
+    let frac = (one << 23) - 1;
+    var mx = ux as u64 & frac;
+    if fx != 0 {
+        mx = mx | (one << 23);
+    }
+    var my = uy as u64 & frac;
+    if fy != 0 {
+        my = my | (one << 23);
+    }
+    var mz = uz as u64 & frac;
+    if fz != 0 {
+        mz = mz | (one << 23);
+    }
+    let r = fma_exact(mx: mx, ex: least_one(fx) - 150, my: my, ey: least_one(fy) - 150, s: ((ux ^ uy) >> 31) as u64, mz: mz, z_exp: least_one(fz) - 150, t: (uz >> 31) as u64, prec: 24, emin: -149);
+    let sign = (r.sign as u32) << 31;
+    if r.m == 0 {
+        return f32_of_bits(sign);
+    }
+    if r.e > 104 {
+        return f32_of_bits(sign | 0x7F800000);
+    }
+    if r.m >= one << 23 {
+        return f32_of_bits(sign | ((r.e + 150) as u32 << 23) | (r.m & frac) as u32);
+    }
+    return f32_of_bits(sign | r.m as u32);
+}

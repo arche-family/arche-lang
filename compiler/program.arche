@@ -16,7 +16,7 @@ pub type ModuleId = struct { pub index: u32 }
 /// What the program is built for (spec/arche.md §10.3): a host with std,
 /// Linux or Windows, or a machine without an operating system, with core
 /// and alloc only.
-pub type Target = enum { LinuxX86_64, LinuxAarch64, LinuxRiscv64, WindowsX86_64, FreestandingX86_64, FreestandingRiscv64, FreestandingAarch64 }
+pub type Target = enum { LinuxX86_64, LinuxAarch64, LinuxRiscv64, WindowsX86_64, FreestandingX86_64, FreestandingRiscv64, FreestandingAarch64, WasiWasm32 }
 
 pub fn target_by_name(name: str) -> ?Target {
     if name.eq("linux-x86_64") { return Target.LinuxX86_64; }
@@ -26,19 +26,23 @@ pub fn target_by_name(name: str) -> ?Target {
     if name.eq("freestanding-x86_64") { return Target.FreestandingX86_64; }
     if name.eq("freestanding-riscv64") { return Target.FreestandingRiscv64; }
     if name.eq("freestanding-aarch64") { return Target.FreestandingAarch64; }
+    if name.eq("wasm32-wasi") { return Target.WasiWasm32; }
     return none;
 }
 
 /// Whether the target has an operating system under it, and so std.
 pub fn hosted(t: Target) -> bool {
-    return t == Target.LinuxX86_64 or t == Target.LinuxAarch64 or t == Target.LinuxRiscv64 or t == Target.WindowsX86_64;
+    return t == Target.LinuxX86_64 or t == Target.LinuxAarch64 or t == Target.LinuxRiscv64 or t == Target.WindowsX86_64 or t == Target.WasiWasm32;
 }
 
 /// The file of the library's std for a target: each host has its own
-/// (lib/std.arche, lib/std-windows.arche; docs/abi.md).
+/// (lib/std.arche, lib/std-windows.arche, lib/std-wasi.arche; docs/abi.md).
 pub fn std_file(t: Target) -> str {
     if t == Target.WindowsX86_64 {
         return "std-windows.arche";
+    }
+    if t == Target.WasiWasm32 {
+        return "std-wasi.arche";
     }
     return "std.arche";
 }
@@ -496,8 +500,8 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         diags: diag.Diagnostics.init(a),
         a: a,
         full: false,
-        lib_alloc: opts.lib_alloc or opts.lib_std or not hosted(opts.target),
-        lib_std: opts.lib_std and hosted(opts.target),
+        lib_alloc: opts.lib_alloc or opts.lib_std or not hosted(opts.target) or opts.target == Target.WasiWasm32,
+        lib_std: (opts.lib_std and hosted(opts.target)) or opts.target == Target.WasiWasm32,
         target: opts.target,
         panic_handler: handler,
         tests: opts.tests,

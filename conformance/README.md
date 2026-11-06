@@ -51,6 +51,7 @@ fn f() {
 | `test` | both | `run` or `compile-error`; required |
 | `spec` | both | the spec section the test covers, e.g. `7.2`; required |
 | `stage0` | both | `skip`: the rule is in spec §12, and stage0 may accept the program |
+| `wasm` | both | `skip`: the test needs what WebAssembly's system does not have, such as processes, sockets or tasks, and is skipped with `--arch wasm32` |
 | `system` | both | `linux` or `windows`: the test is only for that system, and is skipped on the others. For what one system alone has, such as its own system calls; a rule that holds everywhere gets a test without this key |
 | `arch` | both | `x86_64`, `aarch64` or `riscv64`: the test is only for that processor, and is skipped on the others (the runner's `--arch`, x86_64 unless given). For a processor's own instructions |
 | `exit` | `run` | expected exit status; default 0 |

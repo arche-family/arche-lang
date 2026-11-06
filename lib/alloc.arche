@@ -276,7 +276,12 @@ pub type Map(comptime K: type, comptime V: type) = struct {
         let at = self.find(&key);
         let s = self.slots[at];
         if s != 0 {
-            self.values[(s - 1) as usize] = value;
+            let entry = (s - 1) as usize;
+            self.values[entry] = value;
+            if not self.live[entry] {
+                self.live[entry] = true;
+                self.count += 1;
+            }
             return;
         }
         self.keys.push(key);
@@ -291,7 +296,7 @@ pub type Map(comptime K: type, comptime V: type) = struct {
             return none;
         }
         let s = self.slots[self.find(&key)];
-        if s == 0 {
+        if s == 0 or not self.live[(s - 1) as usize] {
             return none;
         }
         return self.values[(s - 1) as usize];

@@ -38,6 +38,7 @@ import syntax.cst;
 import syntax.fmt;
 import ir.ir;
 import a64.gen as a64;
+import wasm.gen as wasm_gen;
 import link.link as ln;
 import link.output as lo;
 import native.ao;
@@ -845,6 +846,31 @@ fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, o
             return Failure.BadIr;
         }
     }
+    // WebAssembly is this compiler's own backend's alone.
+    if opts.target == program.Target.WasiWasm32 {
+        if opts.release {
+            err_out.write("arche: release builds are not for WebAssembly yet\n");
+            return Failure.BadUsage;
+        }
+        var problem = alloc.String.init(a);
+        let bytes = wasm_gen.module(&m, problem: &mut problem, a: a);
+        if problem.len() > 0 {
+            err_out.write("arche: ");
+            err_out.write(problem.view());
+            err_out.write("\n");
+            return Failure.BadIr;
+        }
+        match fs.write_bytes(out_path, bytes.items()) {
+            ok(_) => { }
+            err(_) => {
+                err_out.write("arche: cannot write ");
+                err_out.write(out_path);
+                err_out.write("\n");
+                return Failure.CannotWrite;
+            }
+        }
+        return;
+    }
     // An object is this compiler's own backend's work; text is for LLVM.
     if names_object(out_path) {
         if not has_native_backend(opts) {
@@ -1298,7 +1324,7 @@ fn main(sys: &mut std.System) -> !void {
             match program.target_by_name(sys.args.get(first)) {
                 some(t) => { opts.target = t; }
                 none => {
-                    sys.stderr.write("arche: unknown target; the targets are linux-x86_64, linux-aarch64, linux-riscv64, windows-x86_64, freestanding-x86_64, freestanding-riscv64 and freestanding-aarch64\n");
+                    sys.stderr.write("arche: unknown target; the targets are linux-x86_64, linux-aarch64, linux-riscv64, wasm32-wasi, windows-x86_64, freestanding-x86_64, freestanding-riscv64 and freestanding-aarch64\n");
                     return Failure.BadUsage;
                 }
             }

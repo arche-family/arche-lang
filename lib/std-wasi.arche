@@ -1,0 +1,692 @@
+/// std on WebAssembly with WASI (docs/sprints.md S30): the capabilities a
+/// program reaches only through std.System (spec/arche.md §1.3), the ones such a
+/// system has. It has no processes, no sockets and no way to switch stacks, so
+/// there is no Proc, no Net and no std.task. The runtime is in Arche too
+/// (std.wasi_rt), and this file holds where a program starts.
+import alloc;
+import core;
+import core.mem;
+import core.ptr;
+import core.utf8;
+import std.wasi;
+import std.wasi_rt as rt;
+
+/// What main is given: every capability the program has.
+pub type System = struct {
+    pub fs: Fs,
+    pub stdout: Output,
+    pub stderr: Output,
+    pub args: Args,
+    pub alloc: alloc.Allocator,
+    pub clock: Clock,
+    pub env: Env,
+    pub rand: Rand,
+    pub stdin: Input,
+}
+
+/// The system this std is for (spec/arche.md §10.3): a program that must
+/// tell them apart, such as a test runner, asks for this.
+pub const SYSTEM: str = "wasi";
+
+/// Arche-0's errors of reading and writing files (spec/arche-0.md §11).
+pub type IoError = error { NotFound, AccessDenied, IsDirectory, InvalidUtf8, IoFailed }
+
+/// The errors of the other file operations.
+pub type FsError = error { NotFound, AccessDenied, IsDirectory, IoFailed, AlreadyExists, NotEmpty }
+
+extern "c" fn a0_entry(sys: *mut System) -> u16;
+
+fn io_error(e: u32) -> IoError {
+    if e == wasi.ENOENT or e == wasi.ENOTCAPABLE {
+        return IoError.NotFound;
+    }
+    if e == wasi.EACCES or e == wasi.EPERM {
+        return IoError.AccessDenied;
+    }
+    if e == wasi.EISDIR {
+        return IoError.IsDirectory;
+    }
+    return IoError.IoFailed;
+}
+
+fn fs_error(e: u32) -> FsError {
+    if e == wasi.ENOENT or e == wasi.ENOTCAPABLE {
+        return FsError.NotFound;
+    }
+    if e == wasi.EACCES or e == wasi.EPERM {
+        return FsError.AccessDenied;
+    }
+    if e == wasi.EISDIR {
+        return FsError.IsDirectory;
+    }
+    if e == wasi.EEXIST {
+        return FsError.AlreadyExists;
+    }
+    if e == wasi.ENOTEMPTY {
+        return FsError.NotEmpty;
+    }
+    return FsError.IoFailed;
+}
+
+// ---- the start ---------------------------------------------------------------------
+
+/// A zero-ended text the system gave, as a str's two words.
+fn c_size(p: u64) -> u64 {
+    var n: u64 = 0;
+    unsafe {
+        // SAFETY: the system ends these with a zero byte.
+        while ptr.from_addr(u8, (p + n) as usize).* != 0 : (n += 1) {
+        }
+    }
+    return n;
+}
+
+fn read_args() -> Args {
+    var count: u32 = 0;
+    var size: u32 = 0;
+    _ = wasi.args_sizes_get(count: wasi.of(u32, &count), size: wasi.of(u32, &size));
+    let table = rt.take_zeroed(count as u64 * 4 + 16);
+    let buf = rt.take_zeroed(size as u64 + 16);
+    _ = wasi.args_get(argv: table as u32, buf: buf as u32);
+    let items = rt.take_zeroed(count as u64 * 16 + 16);
+    unsafe {
+        // SAFETY: the memory above, of count entries; a str is its address and
+        // its size, for the whole run.
+        var i: u64 = 0;
+        while i < count as u64 : (i += 1) {
+            let at = ptr.from_addr(u32, (table + i * 4) as usize).* as u64;
+            let n = c_size(at);
+            if not utf8.valid(mem.slice(u8, ptr.from_addr(u8, at as usize) as *u8, n as usize)) {
+                rt.die("an argument is not valid UTF-8");
+            }
+            ptr.from_addr(u64, (items + i * 16) as usize).* = at;
+            ptr.from_addr(u64, (items + i * 16 + 8) as usize).* = n;
+        }
+        return Args { items: ptr.from_addr(str, items as usize) as *str, count: count as usize, unique: core.Unique { } };
+    }
+}
+
+fn read_env() -> Env {
+    var count: u32 = 0;
+    var size: u32 = 0;
+    _ = wasi.environ_sizes_get(count: wasi.of(u32, &count), size: wasi.of(u32, &size));
+    let table = rt.take_zeroed(count as u64 * 4 + 16);
+    let buf = rt.take_zeroed(size as u64 + 16);
+    _ = wasi.environ_get(environ: table as u32, buf: buf as u32);
+    unsafe {
+        // SAFETY: the memory above, for the whole run.
+        return Env { vars: ptr.from_addr(u32, table as usize) as *u32, count: count, unique: core.Unique { } };
+    }
+}
+
+/// The program's start: as the runtime of other systems builds System, calls
+/// main and ends the program.
+export("_start") fn start() {
+    rt.start();
+    let at = rt.take_zeroed(mem.size_of(System) as u64);
+    var failure: u16 = 0;
+    unsafe {
+        // SAFETY: memory just taken, of System's size, whose fields are this
+        // module's. Zero bytes are right for all it does not set: for the
+        // allocator, they are the program's own. a0_entry is the compiler's.
+        let p = ptr.from_addr(System, at as usize);
+        let sys = p.as_mut();
+        sys.stdout.fd = 1;
+        sys.stderr.fd = 2;
+        sys.args = read_args();
+        sys.env = read_env();
+        failure = a0_entry(p);
+    }
+    if failure != 0 {
+        rt.report_error(failure);
+    }
+    rt.exit_with(0);
+}
+
+// ---- Output -----------------------------------------------------------------------
+
+/// stdout or stderr, buffered; flushed when the program exits.
+pub type Output = struct {
+    fd: i64,
+    unique: core.Unique,
+
+    pub fn write(self: &mut Output, text: str) {
+        rt.write_text(self.fd, text);
+    }
+
+    pub fn write_byte(self: &mut Output, byte: u8) {
+        rt.write_byte(self.fd, byte);
+    }
+
+    pub fn write_u64(self: &mut Output, n: u64) {
+        rt.write_u64(self.fd, n);
+    }
+
+    pub fn write_i64(self: &mut Output, n: i64) {
+        rt.write_i64(fd: self.fd, v: n);
+    }
+
+    pub fn write_f64(self: &mut Output, x: f64) {
+        rt.write_f64(self.fd, x);
+    }
+
+    pub fn write_f32(self: &mut Output, x: f32) {
+        rt.write_f32(self.fd, x);
+    }
+
+    /// Writes out what is buffered now, for both outputs.
+    pub fn flush(self: &mut Output) {
+        rt.flush_all();
+    }
+}
+
+// ---- Args -------------------------------------------------------------------------
+
+/// The program's arguments, its own path first.
+pub type Args = struct {
+    items: *str,
+    count: usize,
+    unique: core.Unique,
+
+    pub fn len(self: &Args) -> usize {
+        return self.count;
+    }
+
+    pub fn get(self: &Args, i: usize) -> str {
+        if i >= self.count {
+            panic("argument index out of range");
+        }
+        unsafe {
+            // SAFETY: read_args made count of them, valid UTF-8, for the whole
+            // run.
+            return self.items.add(i).*;
+        }
+    }
+}
+
+// ---- Fs ---------------------------------------------------------------------------
+
+/// A path below the directory rt.base_of found. Its own name when it is that
+/// directory.
+fn below(path: str, skip: usize) -> str {
+    if skip >= path.len() {
+        return ".";
+    }
+    return path[skip..path.len()];
+}
+
+fn text_at(t: str) -> u32 {
+    unsafe {
+        // SAFETY: an address is a number.
+        return wasi.at(u8, mem.str_data(t));
+    }
+}
+
+/// Opens a path; an errno, or 0 with fd set.
+fn open_path(path: str, oflags: u32, fd: &mut u32) -> u32 {
+    let base = rt.base_of(path);
+    if base.fd == 0 {
+        return wasi.ENOENT;
+    }
+    let rest = below(path, skip: base.skip);
+    return wasi.path_open(dir: base.fd, path: text_at(rest), size: rest.len() as u32, oflags: oflags, out: wasi.of(u32, fd));
+}
+
+/// A path's kind, by WASI's numbers: 3 a directory, 4 a file. An errno, or 0.
+fn kind_of(path: str, kind: &mut u8) -> u32 {
+    let base = rt.base_of(path);
+    if base.fd == 0 {
+        return wasi.ENOENT;
+    }
+    let rest = below(path, skip: base.skip);
+    // A filestat: device, inode, the kind in the low byte of the third word.
+    var stat: [8]u64 = [0; 8];
+    let e = wasi.path_filestat_get(dir: base.fd, path: text_at(rest), size: rest.len() as u32, out: wasi.of(u64, &stat[0]));
+    kind.* = (stat[2] & 255) as u8;
+    return e;
+}
+
+fn read_all(path: str, into: &mut alloc.List(u8)) -> u32 {
+    var kind: u8 = 0;
+    let found = kind_of(path, kind: &mut kind);
+    if found != 0 {
+        return found;
+    }
+    if kind == 3 {
+        return wasi.EISDIR;
+    }
+    var fd: u32 = 0;
+    let opened = open_path(path, oflags: 0, fd: &mut fd);
+    if opened != 0 {
+        return opened;
+    }
+    var chunk: [65536]u8 = [0; 65536];
+    while true {
+        var iov: [2]u32 = [wasi.of(u8, &chunk[0]), 65536];
+        var got: u32 = 0;
+        let e = wasi.fd_read(fd: fd, iovs: wasi.of(u32, &iov[0]), count: 1, read: wasi.of(u32, &got));
+        if e != 0 {
+            _ = wasi.fd_close(fd);
+            return e;
+        }
+        if got == 0 {
+            break;
+        }
+        var i: usize = 0;
+        while i < got as usize : (i += 1) {
+            into.push(chunk[i]);
+        }
+    }
+    _ = wasi.fd_close(fd);
+    return 0;
+}
+
+fn write_all(path: str, data: []u8) -> u32 {
+    var fd: u32 = 0;
+    let opened = open_path(path, oflags: wasi.OFLAG_CREATE | wasi.OFLAG_TRUNCATE, fd: &mut fd);
+    if opened != 0 {
+        return opened;
+    }
+    var done: usize = 0;
+    while done < data.len() {
+        var iov: [2]u32 = [0, 0];
+        unsafe {
+            // SAFETY: the bytes left in data.
+            iov[0] = wasi.at(u8, mem.slice_data(u8, data)) + done as u32;
+        }
+        iov[1] = (data.len() - done) as u32;
+        var wrote: u32 = 0;
+        let e = wasi.fd_write(fd: fd, iovs: wasi.of(u32, &iov[0]), count: 1, written: wasi.of(u32, &wrote));
+        if e != 0 {
+            _ = wasi.fd_close(fd);
+            return e;
+        }
+        done += wrote as usize;
+    }
+    _ = wasi.fd_close(fd);
+    return 0;
+}
+
+/// The file system: the directories the host gave the program.
+pub type Fs = struct {
+    dir: i64,
+    unique: core.Unique,
+
+    pub fn read_file(self: &Fs, path: str, a: alloc.Allocator) -> IoError!alloc.String {
+        var bytes = alloc.List(u8).init(a);
+        let e = read_all(path, into: &mut bytes);
+        if e != 0 {
+            return io_error(e);
+        }
+        if not utf8.valid(bytes.items()) {
+            return IoError.InvalidUtf8;
+        }
+        var text = alloc.String.init(a);
+        unsafe {
+            // SAFETY: checked just now.
+            text.push_str(mem.str_from(bytes.items()));
+        }
+        return text;
+    }
+
+    pub fn read_bytes(self: &Fs, path: str, a: alloc.Allocator) -> IoError!alloc.List(u8) {
+        var bytes = alloc.List(u8).init(a);
+        let e = read_all(path, into: &mut bytes);
+        if e != 0 {
+            return io_error(e);
+        }
+        return bytes;
+    }
+
+    /// Writes bytes, which need not be text, to a file, made or emptied.
+    pub fn write_bytes(self: &Fs, path: str, data: []u8) -> IoError!void {
+        let e = write_all(path, data: data);
+        if e != 0 {
+            return io_error(e);
+        }
+    }
+
+    /// Writes a program. Running one is the host's to say, here: what a file
+    /// may do is not WASI's.
+    pub fn write_executable(self: &Fs, path: str, data: []u8) -> IoError!void {
+        let e = write_all(path, data: data);
+        if e != 0 {
+            return io_error(e);
+        }
+    }
+
+    pub fn write_file(self: &Fs, path: str, data: str) -> IoError!void {
+        let e = write_all(path, data: data.bytes());
+        if e != 0 {
+            return io_error(e);
+        }
+    }
+
+    /// The directory that relative paths start from, which has no other name
+    /// here.
+    pub fn current_dir(self: &Fs, a: alloc.Allocator) -> FsError!alloc.String {
+        var s = alloc.String.init(a);
+        s.push_str(".");
+        return s;
+    }
+
+    /// A directory for files that need not outlive the program: TMPDIR when the
+    /// environment names one, and /tmp otherwise, without a separator at its
+    /// end.
+    pub fn temp_dir(self: &Fs, env: &Env, a: alloc.Allocator) -> FsError!alloc.String {
+        let named = env.get("TMPDIR", a) orelse alloc.String.init(a);
+        var text = named.view();
+        if text.len() == 0 {
+            text = "/tmp";
+        }
+        let b = text.bytes();
+        var n = b.len();
+        while n > 1 and b[n - 1] == '/' : (n -= 1) {
+        }
+        var s = alloc.String.init(a);
+        unsafe {
+            // SAFETY: the separators dropped at the end are ASCII, so what
+            // is left is still UTF-8.
+            s.push_str(mem.str_from(b[0..n]));
+        }
+        return s;
+    }
+
+    /// Whether something is at path.
+    pub fn exists(self: &Fs, path: str) -> bool {
+        var kind: u8 = 0;
+        return kind_of(path, kind: &mut kind) == 0;
+    }
+
+    pub fn make_dir(self: &Fs, path: str) -> FsError!void {
+        let base = rt.base_of(path);
+        if base.fd == 0 {
+            return FsError.NotFound;
+        }
+        let rest = below(path, skip: base.skip);
+        let e = wasi.path_create_directory(dir: base.fd, path: text_at(rest), size: rest.len() as u32);
+        if e != 0 {
+            return fs_error(e);
+        }
+    }
+
+    /// As make_dir: who may enter it is not WASI's to say.
+    pub fn make_private_dir(self: &Fs, path: str) -> FsError!void {
+        try self.make_dir(path);
+    }
+
+    /// Removes a file, or an empty directory.
+    pub fn remove(self: &Fs, path: str) -> FsError!void {
+        var kind: u8 = 0;
+        let found = kind_of(path, kind: &mut kind);
+        if found != 0 {
+            return fs_error(found);
+        }
+        let base = rt.base_of(path);
+        let rest = below(path, skip: base.skip);
+        var e: u32 = 0;
+        if kind == 3 {
+            e = wasi.path_remove_directory(dir: base.fd, path: text_at(rest), size: rest.len() as u32);
+        } else {
+            e = wasi.path_unlink_file(dir: base.fd, path: text_at(rest), size: rest.len() as u32);
+        }
+        if e != 0 {
+            return fs_error(e);
+        }
+    }
+
+    pub fn rename(self: &Fs, from: str, to: str) -> FsError!void {
+        let from_base = rt.base_of(from);
+        let to_base = rt.base_of(to);
+        if from_base.fd == 0 or to_base.fd == 0 {
+            return FsError.NotFound;
+        }
+        let a = below(from, skip: from_base.skip);
+        let b = below(to, skip: to_base.skip);
+        let e = wasi.path_rename(from_dir: from_base.fd, from: text_at(a), from_size: a.len() as u32, to_dir: to_base.fd, to: text_at(b), to_size: b.len() as u32);
+        if e != 0 {
+            return fs_error(e);
+        }
+    }
+
+    /// The names in a directory, without . and .., sorted by byte order so
+    /// the result is the same on every run (docs/plan.md, determinism).
+    pub fn list(self: &Fs, path: str, a: alloc.Allocator) -> FsError!alloc.List(alloc.String) {
+        var fd: u32 = 0;
+        let opened = open_path(path, oflags: wasi.OFLAG_DIRECTORY, fd: &mut fd);
+        if opened != 0 {
+            return fs_error(opened);
+        }
+        var names = alloc.List(alloc.String).init(a);
+        var entries: [65536]u8 = [0; 65536];
+        var cookie: u64 = 0;
+        while true {
+            var used: u32 = 0;
+            let e = wasi.fd_readdir(fd: fd, buf: wasi.of(u8, &entries[0]), size: 65536, cookie: cookie, used: wasi.of(u32, &used));
+            if e != 0 {
+                _ = wasi.fd_close(fd);
+                return fs_error(e);
+            }
+            // An entry: next's cookie (8), inode (8), the name's size (4), its
+            // kind (1), 3 of nothing, the name. The last may be cut short.
+            var at: usize = 0;
+            var whole = false;
+            while at + 24 <= used as usize {
+                var next: u64 = 0;
+                var k: usize = 8;
+                while k > 0 : (k -= 1) {
+                    next = (next << 8) | entries[at + k - 1] as u64;
+                }
+                let size = entries[at + 16] as usize | ((entries[at + 17] as usize) << 8) | ((entries[at + 18] as usize) << 16);
+                if at + 24 + size > used as usize {
+                    break;
+                }
+                let name = entries[at + 24..at + 24 + size];
+                let dot = name.len() == 1 and name[0] == '.';
+                let dotdot = name.len() == 2 and name[0] == '.' and name[1] == '.';
+                if not dot and not dotdot and utf8.valid(name) {
+                    var s = alloc.String.init(a);
+                    unsafe {
+                        // SAFETY: checked just now.
+                        s.push_str(mem.str_from(name));
+                    }
+                    names.push(s);
+                }
+                cookie = next;
+                whole = true;
+                at += 24 + size;
+            }
+            if used < 65536 or not whole {
+                break;
+            }
+        }
+        _ = wasi.fd_close(fd);
+        sort_names(&mut names);
+        return names;
+    }
+}
+
+fn bytes_less(a: []u8, than: []u8) -> bool {
+    var i: usize = 0;
+    while i < a.len() and i < than.len() : (i += 1) {
+        if a[i] != than[i] {
+            return a[i] < than[i];
+        }
+    }
+    return a.len() < than.len();
+}
+
+/// Insertion sort by byte order: directories are small.
+fn sort_names(names: &mut alloc.List(alloc.String)) {
+    let items = names.items_mut();
+    var i: usize = 1;
+    while i < items.len() : (i += 1) {
+        var j = i;
+        while j > 0 and bytes_less(a: items[j].view().bytes(), than: items[j - 1].view().bytes()) : (j -= 1) {
+            unsafe {
+                // SAFETY: j and j - 1 are inside items; the two values
+                // trade places, so each is still owned once.
+                let base = mem.slice_data(alloc.String, items) as *mut alloc.String;
+                let t = base.add(j).*;
+                base.add(j).* = base.add(j - 1).*;
+                base.add(j - 1).* = t;
+            }
+        }
+    }
+}
+
+// ---- Clock ------------------------------------------------------------------------
+
+/// A subscription of poll_oneoff to a clock, in its six words: userdata, the
+/// kind (0), the clock (0, its real time), the time, its precision, flags (0,
+/// a time from now).
+fn clock_subscription(into: []mut u64, ns: u64) {
+    var k: usize = 0;
+    while k < 6 : (k += 1) {
+        into[k] = 0;
+    }
+    into[2] = 1;
+    into[3] = ns;
+}
+
+/// Time: a clock that only goes forward, the wall clock, and sleeping.
+pub type Clock = struct {
+    unique: core.Unique,
+
+    fn read(self: &Clock, id: u32) -> u64 {
+        var time: u64 = 0;
+        _ = wasi.clock_time_get(id: id, out: wasi.of(u64, &time));
+        return time;
+    }
+
+    /// Nanoseconds since some moment in the past; never goes back.
+    pub fn monotonic_ns(self: &Clock) -> u64 {
+        return self.read(1);
+    }
+
+    /// Nanoseconds since 1970-01-01 00:00 UTC.
+    pub fn unix_ns(self: &Clock) -> u64 {
+        return self.read(0);
+    }
+
+    pub fn sleep_ns(self: &Clock, ns: u64) {
+        var sub: [6]u64 = [0; 6];
+        clock_subscription(sub[0..6], ns: ns);
+        var event: [4]u64 = [0; 4];
+        var done: u32 = 0;
+        _ = wasi.poll_oneoff(subscriptions: wasi.of(u64, &sub[0]), events: wasi.of(u64, &event[0]), count: 1, done: wasi.of(u32, &done));
+    }
+}
+
+// ---- Env --------------------------------------------------------------------------
+
+/// The environment variables the host gave the program.
+pub type Env = struct {
+    vars: *u32,
+    count: u32,
+    unique: core.Unique,
+
+    /// The value of the variable name, copied.
+    pub fn get(self: &Env, name: str, a: alloc.Allocator) -> ?alloc.String {
+        let want = name.bytes();
+        var i: u32 = 0;
+        while i < self.count : (i += 1) {
+            var value = alloc.List(u8).init(a);
+            var found = false;
+            unsafe {
+                // SAFETY: read_env's table of zero-ended entries; an entry is
+                // read only up to its zero.
+                let entry = ptr.from_addr(u8, self.vars.add(i as usize).* as usize) as *u8;
+                var k: usize = 0;
+                while k < want.len() and entry.add(k).* == want[k] : (k += 1) {
+                }
+                if k == want.len() and entry.add(k).* == '=' {
+                    var j = k + 1;
+                    while entry.add(j).* != 0 : (j += 1) {
+                        value.push(entry.add(j).*);
+                    }
+                    found = true;
+                }
+            }
+            if found {
+                var s = alloc.String.init(a);
+                if utf8.valid(value.items()) {
+                    unsafe {
+                        // SAFETY: checked just now.
+                        s.push_str(mem.str_from(value.items()));
+                    }
+                }
+                return s;
+            }
+        }
+        return none;
+    }
+}
+
+// ---- Rand -------------------------------------------------------------------------
+
+pub type Rand = struct {
+    unique: core.Unique,
+
+    pub fn fill(self: &mut Rand, into: []mut u8) {
+        if into.len() > 0 {
+            unsafe {
+                // SAFETY: random_get writes into.len() bytes at into.
+                _ = wasi.random_get(buf: wasi.at(u8, mem.slice_data(u8, into) as *u8), size: into.len() as u32);
+            }
+        }
+    }
+
+    pub fn next_u64(self: &mut Rand) -> u64 {
+        var b: [8]u8 = [0; 8];
+        self.fill(b[0..8]);
+        var v: u64 = 0;
+        var i: usize = 0;
+        while i < 8 : (i += 1) {
+            v = (v << 8) | b[i] as u64;
+        }
+        return v;
+    }
+}
+
+// ---- Input ------------------------------------------------------------------------
+
+pub type Input = struct {
+    unique: core.Unique,
+
+    /// Up to into.len() bytes; 0 at the end of the input.
+    pub fn read(self: &mut Input, into: []mut u8) -> IoError!usize {
+        var iov: [2]u32 = [0, into.len() as u32];
+        unsafe {
+            // SAFETY: fd_read writes at most into.len() bytes.
+            iov[0] = wasi.at(u8, mem.slice_data(u8, into) as *u8);
+        }
+        var got: u32 = 0;
+        let e = wasi.fd_read(fd: 0, iovs: wasi.of(u32, &iov[0]), count: 1, read: wasi.of(u32, &got));
+        if e != 0 {
+            return IoError.IoFailed;
+        }
+        return got as usize;
+    }
+
+    /// Whether a read would not wait, after waiting at most this long for
+    /// it to be so. The end of the input counts: the read gives 0.
+    pub fn ready(self: &Input, timeout_ms: u32) -> bool {
+        // Two subscriptions: the input, with userdata 1 and kind 1 (a read of
+        // fd 0), and the clock.
+        var subs: [12]u64 = [0; 12];
+        subs[0] = 1;
+        subs[1] = 1;
+        clock_subscription(subs[6..12], ns: timeout_ms as u64 * 1000000);
+        var events: [8]u64 = [0; 8];
+        var done: u32 = 0;
+        _ = wasi.poll_oneoff(subscriptions: wasi.of(u64, &subs[0]), events: wasi.of(u64, &events[0]), count: 2, done: wasi.of(u32, &done));
+        var i: usize = 0;
+        while i < done as usize : (i += 1) {
+            if events[i * 4] == 1 {
+                return true;
+            }
+        }
+        return false;
+    }
+}

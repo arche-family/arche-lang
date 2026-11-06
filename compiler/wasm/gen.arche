@@ -1,0 +1,1406 @@
+/// The compiler's WebAssembly backend (docs/sprints.md S30): an IR module as a
+/// whole module, for WASI, with no LLVM. A stack machine, so that codegen is
+/// close to the IR.
+///
+/// Pointers stay 8 bytes, so that layouts and usize are what they are on every
+/// other target (docs/abi.md), and each is wrapped to 32 bits where it reaches
+/// memory: a wasm32 module, which every runtime runs, whose addresses are all
+/// below 4 GB. Every integer is an i64 in a local, its upper bits undefined when
+/// it is narrower, as on the other backends: what reads one extends it if it
+/// must. An import from the system has its own types, at the call.
+///
+/// Values are locals. What must have an address is on a stack of its own in
+/// linear memory, from the top down, below which memory ends: running out of it
+/// is a trap. The stack pointer is a global; a frame's base is a local.
+///
+/// A function's blocks are nested so that each one's code comes after the end
+/// of the WebAssembly block with its number, and a jump forward is a br out of
+/// those. A jump back sets the number of the block, goes to the loop around
+/// them all, and goes down a br_table. So any flow of control has its form.
+import alloc;
+import ir.ir;
+import native.buffer as nb;
+import native.ranges as ra;
+import wasm.code as wc;
+
+/// Where things are in linear memory: nothing, then the stack, the data and the
+/// heap. A stack that runs out wraps round to where there is no memory.
+const STACK_BOTTOM: u64 = 1024;
+const STACK_SIZE: u64 = 0x1000000;
+const DATA_BASE: u64 = STACK_BOTTOM + STACK_SIZE;
+const PAGE: u64 = 65536;
+
+const NONE: u32 = 4294967295;
+/// What runtimes take, wasmtime and V8 alike; the fixed ones are few.
+const MAX_LOCALS: u32 = 49000;
+
+const WASI_PREFIX: str = "wasi_";
+const WASI_MODULE: str = "wasi_snapshot_preview1";
+
+/// What the runtime in Arche (lib/std/wasi_rt.arche) asks of the module itself.
+const ASK_MEMORY_GROW: str = "a0rt_wasm_memory_grow";
+const ASK_MEMORY_SIZE: str = "a0rt_wasm_memory_size";
+const ASK_HEAP_BASE: str = "a0rt_wasm_heap_base";
+const ASK_ERROR_NAMES: str = "a0rt_wasm_error_names";
+
+/// How an extern fn is reached.
+type Reach = enum { Function, Import, MemoryGrow, MemorySize, HeapBase, ErrorNames, Missing }
+
+type Gen = struct {
+    r: ra.Ranges,
+    code: alloc.List(u8),
+    /// Each IR function's number in the module, and each extern's.
+    fn_index: alloc.List(u32),
+    ext_reach: alloc.List(Reach),
+    ext_index: alloc.List(u32),
+    /// Signatures, as the bytes of the type section's entries.
+    types: alloc.List(alloc.List(u8)),
+    import_count: u32,
+    /// The current function: each value's local, its frame's and its block
+    /// number's locals, and four for an instruction to use.
+    locals: alloc.List(u32),
+    fp: u32,
+    pc: u32,
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    /// How far down the blocks the code being written is.
+    current: u32,
+    block_count: u32,
+    has_frame: bool,
+    global_at: alloc.List(u64),
+    vtable_at: alloc.List(u64),
+    table_at: alloc.List(u64),
+    heap_base: u64,
+    problem: alloc.String,
+    a: alloc.Allocator,
+}
+
+fn wasm_type(t: ir.Ty) -> u8 {
+    if t == ir.Ty.F32 {
+        return wc.TYPE_F32;
+    }
+    if t == ir.Ty.F64 {
+        return wc.TYPE_F64;
+    }
+    return wc.TYPE_I64;
+}
+
+/// A system's own type for an argument or result.
+fn import_type(t: ir.Ty) -> u8 {
+    if t == ir.Ty.F32 {
+        return wc.TYPE_F32;
+    }
+    if t == ir.Ty.F64 {
+        return wc.TYPE_F64;
+    }
+    if t == ir.Ty.I64 or t == ir.Ty.Ptr {
+        return wc.TYPE_I64;
+    }
+    return wc.TYPE_I32;
+}
+
+fn say_problem(g: &mut Gen, f: &ir.Function, what: str) {
+    if g.problem.len() == 0 {
+        g.problem.push_str("in ");
+        g.problem.push_str(f.name.view());
+        g.problem.push_str(": ");
+        g.problem.push_str(what);
+    }
+}
+
+fn same_bytes(a: []u8, b: []u8) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < a.len() : (i += 1) {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn type_index(g: &mut Gen, entry: alloc.List(u8)) -> u32 {
+    var i: usize = 0;
+    while i < g.types.len() : (i += 1) {
+        if same_bytes(a: g.types.items()[i].items(), b: entry.items()) {
+            return i as u32;
+        }
+    }
+    g.types.push(entry);
+    return g.types.len() as u32 - 1;
+}
+
+fn begin_type(g: &Gen, count: usize) -> alloc.List(u8) {
+    var e = alloc.List(u8).init(g.a);
+    e.push(0x60);
+    wc.uleb(&mut e, count as u64);
+    return e;
+}
+
+fn end_type(e: &mut alloc.List(u8), ret: u8, has_ret: bool) {
+    if has_ret {
+        e.push(1);
+        e.push(ret);
+    } else {
+        e.push(0);
+    }
+}
+
+fn function_type(g: &mut Gen, params: []ir.Ty, ret: ir.Ty) -> u32 {
+    var e = begin_type(g, count: params.len());
+    var i: usize = 0;
+    while i < params.len() : (i += 1) {
+        e.push(wasm_type(params[i]));
+    }
+    end_type(&mut e, ret: wasm_type(ret), has_ret: ret != ir.Ty.Void);
+    return type_index(g, e);
+}
+
+fn import_function_type(g: &mut Gen, params: []ir.Ty, ret: ir.Ty) -> u32 {
+    var e = begin_type(g, count: params.len());
+    var i: usize = 0;
+    while i < params.len() : (i += 1) {
+        e.push(import_type(params[i]));
+    }
+    end_type(&mut e, ret: import_type(ret), has_ret: ret != ir.Ty.Void);
+    return type_index(g, e);
+}
+
+fn const_bits(f: &ir.Function, v: u32) -> u64 {
+    let i = f.insts[v as usize];
+    if i.ty == ir.Ty.Ptr {
+        return 0;
+    }
+    let n = ir.bits(i.ty);
+    if n >= 64 {
+        return i.imm;
+    }
+    let one: u64 = 1;
+    return i.imm & ((one << n as u64) - 1);
+}
+
+fn frame_address(g: &mut Gen, disp: i64) {
+    wc.op_u(&mut g.code, wc.LOCAL_GET, g.fp);
+    wc.i64_const(&mut g.code, nb.bits_of_i64(disp));
+    wc.op(&mut g.code, wc.I64_ADD);
+}
+
+/// Its value on the stack.
+fn push(g: &mut Gen, f: &ir.Function, v: u32) {
+    let kind = g.r.kinds[v as usize];
+    let i = f.insts[v as usize];
+    if kind == ra.V_REG {
+        wc.op_u(&mut g.code, wc.LOCAL_GET, g.locals[v as usize]);
+    } else if kind == ra.V_CONST {
+        if i.ty == ir.Ty.F64 {
+            wc.f64_const(&mut g.code, i.imm);
+        } else if i.ty == ir.Ty.F32 {
+            // An f32's constant is the double of its value (ir/llvm.arche).
+            wc.f64_const(&mut g.code, i.imm);
+            wc.op(&mut g.code, wc.F32_DEMOTE_F64);
+        } else {
+            wc.i64_const(&mut g.code, const_bits(f, v));
+        }
+    } else if kind == ra.V_ADDR {
+        let root = g.r.addr_root[v as usize];
+        let off = g.r.addr_off[v as usize];
+        let r = f.insts[root as usize];
+        if r.op == ir.Op.Alloca {
+            frame_address(g, disp: g.r.disps[root as usize] as i64);
+            if r.flag > 16 {
+                wc.i64_const(&mut g.code, nb.bits_of_i64(-(r.flag as i64)));
+                wc.op(&mut g.code, wc.I64_AND);
+            }
+            wc.i64_const(&mut g.code, nb.bits_of_i64(off));
+            wc.op(&mut g.code, wc.I64_ADD);
+        } else if r.op == ir.Op.Global {
+            wc.i64_const(&mut g.code, nb.bits_of_i64(g.global_at[r.imm as usize] as i64 + off));
+        } else {
+            wc.i64_const(&mut g.code, nb.bits_of_i64(g.vtable_at[r.imm as usize] as i64 + off));
+        }
+    } else if kind == ra.V_PARAM {
+        wc.op_u(&mut g.code, wc.LOCAL_GET, i.imm as u32);
+    } else {
+        panic("the WebAssembly backend reads a value that has no place");
+    }
+}
+
+/// What is on the stack, from size bytes to all 8.
+fn extend(g: &mut Gen, size: u32, signed: bool) {
+    if size == 8 {
+        return;
+    }
+    if signed {
+        if size == 1 {
+            wc.op(&mut g.code, wc.I64_EXTEND8_S);
+        } else if size == 2 {
+            wc.op(&mut g.code, wc.I64_EXTEND16_S);
+        } else {
+            wc.op(&mut g.code, wc.I64_EXTEND32_S);
+        }
+        return;
+    }
+    let one: u64 = 1;
+    wc.i64_const(&mut g.code, (one << (size as u64 * 8)) - 1);
+    wc.op(&mut g.code, wc.I64_AND);
+}
+
+fn push_extended(g: &mut Gen, f: &ir.Function, v: u32, signed: bool) {
+    push(g, f, v);
+    extend(g, size: ra.size_of(f.insts[v as usize].ty), signed: signed);
+}
+
+/// The instruction's result, on the stack, goes where its uses find it.
+fn finish(g: &mut Gen, id: u32) {
+    if g.r.kinds[id as usize] == ra.V_REG {
+        wc.op_u(&mut g.code, wc.LOCAL_SET, g.locals[id as usize]);
+    } else {
+        wc.op(&mut g.code, wc.DROP);
+    }
+}
+
+/// An address, as memory instructions take it.
+fn push_address(g: &mut Gen, f: &ir.Function, v: u32) {
+    push(g, f, v);
+    wc.op(&mut g.code, wc.I32_WRAP_I64);
+}
+
+fn load_op(t: ir.Ty) -> u8 {
+    if t == ir.Ty.F32 {
+        return wc.F32_LOAD;
+    }
+    if t == ir.Ty.F64 {
+        return wc.F64_LOAD;
+    }
+    let size = ra.size_of(t);
+    if size == 1 {
+        return wc.I64_LOAD8_U;
+    }
+    if size == 2 {
+        return wc.I64_LOAD16_U;
+    }
+    if size == 4 {
+        return wc.I64_LOAD32_U;
+    }
+    return wc.I64_LOAD;
+}
+
+fn store_op(t: ir.Ty) -> u8 {
+    if t == ir.Ty.F32 {
+        return wc.F32_STORE;
+    }
+    if t == ir.Ty.F64 {
+        return wc.F64_STORE;
+    }
+    let size = ra.size_of(t);
+    if size == 1 {
+        return wc.I64_STORE8;
+    }
+    if size == 2 {
+        return wc.I64_STORE16;
+    }
+    if size == 4 {
+        return wc.I64_STORE32;
+    }
+    return wc.I64_STORE;
+}
+
+fn gen_bin(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let k = i.flag;
+    if k >= 3 and k <= 6 {
+        let signed = k == 3 or k == 5;
+        push_extended(g, f, i.a, signed: signed);
+        push_extended(g, f, i.b, signed: signed);
+        var code = wc.I64_DIV_U;
+        if k == 3 {
+            code = wc.I64_DIV_S;
+        } else if k == 5 {
+            code = wc.I64_REM_S;
+        } else if k == 6 {
+            code = wc.I64_REM_U;
+        }
+        wc.op(&mut g.code, code);
+        finish(g, id);
+        return;
+    }
+    if k >= 10 {
+        if k == 10 {
+            push(g, f, i.a);
+        } else {
+            push_extended(g, f, i.a, signed: k == 12);
+        }
+        push(g, f, i.b);
+        var code = wc.I64_SHL;
+        if k == 11 {
+            code = wc.I64_SHR_U;
+        } else if k == 12 {
+            code = wc.I64_SHR_S;
+        }
+        wc.op(&mut g.code, code);
+        finish(g, id);
+        return;
+    }
+    push(g, f, i.a);
+    push(g, f, i.b);
+    var code = wc.I64_XOR;
+    if k == 0 {
+        code = wc.I64_ADD;
+    } else if k == 1 {
+        code = wc.I64_SUB;
+    } else if k == 2 {
+        code = wc.I64_MUL;
+    } else if k == 7 {
+        code = wc.I64_AND;
+    } else if k == 8 {
+        code = wc.I64_OR;
+    }
+    wc.op(&mut g.code, code);
+    finish(g, id);
+}
+
+fn get(g: &mut Gen, local: u32) {
+    wc.op_u(&mut g.code, wc.LOCAL_GET, local);
+}
+
+fn set(g: &mut Gen, local: u32) {
+    wc.op_u(&mut g.code, wc.LOCAL_SET, local);
+}
+
+/// Narrower than 8 bytes, the whole result fits, and overflowed when its low
+/// part extended back is something else. At 8 bytes, by the signs and by
+/// dividing back: there is no flag and no upper half here.
+fn gen_overflow(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let t = f.insts[i.a as usize].ty;
+    let size = ra.size_of(t);
+    let k = i.flag;
+    let signed = k == 0 or k == 2 or k == 4;
+    push_extended(g, f, i.a, signed: signed);
+    set(g, g.t2);
+    push_extended(g, f, i.b, signed: signed);
+    set(g, g.t3);
+    get(g, g.t2);
+    get(g, g.t3);
+    var code = wc.I64_MUL;
+    if k <= 1 {
+        code = wc.I64_ADD;
+    } else if k <= 3 {
+        code = wc.I64_SUB;
+    }
+    wc.op(&mut g.code, code);
+    set(g, g.t0);
+    if size < 8 {
+        get(g, g.t0);
+        extend(g, size: size, signed: signed);
+        get(g, g.t0);
+        wc.op(&mut g.code, wc.I64_NE);
+    } else if k == 0 {
+        get(g, g.t2);
+        get(g, g.t0);
+        wc.op(&mut g.code, wc.I64_XOR);
+        get(g, g.t3);
+        get(g, g.t0);
+        wc.op(&mut g.code, wc.I64_XOR);
+        wc.op(&mut g.code, wc.I64_AND);
+        wc.i64_const(&mut g.code, 0);
+        wc.op(&mut g.code, wc.I64_LT_S);
+    } else if k == 1 {
+        get(g, g.t0);
+        get(g, g.t2);
+        wc.op(&mut g.code, wc.I64_LT_U);
+    } else if k == 2 {
+        get(g, g.t2);
+        get(g, g.t3);
+        wc.op(&mut g.code, wc.I64_XOR);
+        get(g, g.t2);
+        get(g, g.t0);
+        wc.op(&mut g.code, wc.I64_XOR);
+        wc.op(&mut g.code, wc.I64_AND);
+        wc.i64_const(&mut g.code, 0);
+        wc.op(&mut g.code, wc.I64_LT_S);
+    } else if k == 3 {
+        get(g, g.t2);
+        get(g, g.t3);
+        wc.op(&mut g.code, wc.I64_LT_U);
+    } else if k == 4 {
+        // No overflow from 0; -1 only with the least number, which division
+        // would trap on; others by dividing back.
+        get(g, g.t2);
+        wc.op(&mut g.code, wc.I64_EQZ);
+        g.code.push(wc.IF);
+        g.code.push(wc.TYPE_I32);
+        wc.i32_const(&mut g.code, 0);
+        g.code.push(wc.ELSE);
+        get(g, g.t2);
+        wc.i64_const(&mut g.code, 18446744073709551615);
+        wc.op(&mut g.code, wc.I64_EQ);
+        g.code.push(wc.IF);
+        g.code.push(wc.TYPE_I32);
+        get(g, g.t3);
+        wc.i64_const(&mut g.code, 0x8000000000000000);
+        wc.op(&mut g.code, wc.I64_EQ);
+        g.code.push(wc.ELSE);
+        get(g, g.t0);
+        get(g, g.t2);
+        wc.op(&mut g.code, wc.I64_DIV_S);
+        get(g, g.t3);
+        wc.op(&mut g.code, wc.I64_NE);
+        g.code.push(wc.END);
+        g.code.push(wc.END);
+    } else {
+        get(g, g.t2);
+        wc.op(&mut g.code, wc.I64_EQZ);
+        g.code.push(wc.IF);
+        g.code.push(wc.TYPE_I32);
+        wc.i32_const(&mut g.code, 0);
+        g.code.push(wc.ELSE);
+        get(g, g.t0);
+        get(g, g.t2);
+        wc.op(&mut g.code, wc.I64_DIV_U);
+        get(g, g.t3);
+        wc.op(&mut g.code, wc.I64_NE);
+        g.code.push(wc.END);
+    }
+    wc.op(&mut g.code, wc.I64_EXTEND_I32_U);
+    let bit = g.r.overflow_bit[id as usize];
+    if bit != ra.NONE {
+        finish(g, bit);
+    } else {
+        wc.op(&mut g.code, wc.DROP);
+    }
+    get(g, g.t0);
+    finish(g, id);
+}
+
+/// A comparison: an i32 on the stack.
+fn push_compare(g: &mut Gen, f: &ir.Function, i: ir.Inst) {
+    let signed = i.flag >= 2 and i.flag <= 5;
+    push_extended(g, f, i.a, signed: signed);
+    push_extended(g, f, i.b, signed: signed);
+    var code = wc.I64_GE_U;
+    match i.flag {
+        0 => { code = wc.I64_EQ; }
+        1 => { code = wc.I64_NE; }
+        2 => { code = wc.I64_LT_S; }
+        3 => { code = wc.I64_LE_S; }
+        4 => { code = wc.I64_GT_S; }
+        5 => { code = wc.I64_GE_S; }
+        6 => { code = wc.I64_LT_U; }
+        7 => { code = wc.I64_LE_U; }
+        8 => { code = wc.I64_GT_U; }
+        _ => { }
+    }
+    wc.op(&mut g.code, code);
+}
+
+fn gen_ext(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let from = f.insts[i.a as usize].ty;
+    let to = i.ty;
+    push(g, f, i.a);
+    if (from == ir.Ty.F32 and to == ir.Ty.F32) or (from == ir.Ty.F64 and to == ir.Ty.F64) {
+        finish(g, id);
+        return;
+    }
+    if ra.is_float(to) {
+        if to == ir.Ty.F64 {
+            wc.op(&mut g.code, wc.F64_REINTERPRET_I64);
+        } else {
+            wc.op(&mut g.code, wc.I32_WRAP_I64);
+            wc.op(&mut g.code, wc.F32_REINTERPRET_I32);
+        }
+        finish(g, id);
+        return;
+    }
+    if ra.is_float(from) {
+        if from == ir.Ty.F64 {
+            wc.op(&mut g.code, wc.I64_REINTERPRET_F64);
+        } else {
+            wc.op(&mut g.code, wc.I32_REINTERPRET_F32);
+            wc.op(&mut g.code, wc.I64_EXTEND_I32_U);
+        }
+        finish(g, id);
+        return;
+    }
+    if i.op == ir.Op.Trunc {
+        if to == ir.Ty.I1 {
+            wc.i64_const(&mut g.code, 1);
+            wc.op(&mut g.code, wc.I64_AND);
+        }
+        finish(g, id);
+        return;
+    }
+    let signed = i.flag == 1;
+    if ir.bits(from) != ir.bits(to) {
+        if from == ir.Ty.I1 {
+            wc.i64_const(&mut g.code, 255);
+            wc.op(&mut g.code, wc.I64_AND);
+            if signed {
+                set(g, g.t0);
+                wc.i64_const(&mut g.code, 0);
+                get(g, g.t0);
+                wc.op(&mut g.code, wc.I64_SUB);
+            }
+        } else {
+            extend(g, size: ra.size_of(from), signed: signed);
+        }
+    }
+    finish(g, id);
+}
+
+fn gen_call(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, i: ir.Inst) {
+    var reach = Reach.Function;
+    if i.op == ir.Op.Call and i.flag == 1 {
+        reach = g.ext_reach[i.imm as usize];
+    }
+    if reach == Reach.Missing {
+        say_problem(g, f, what: "this program uses what WebAssembly's runtime does not have: ");
+        g.problem.push_str(m.externals[i.imm as usize].name.view());
+        return;
+    }
+    var q = i.args_start;
+    while q < i.args_start + i.args_len : (q += 1) {
+        let v = f.args[q as usize];
+        push(g, f, v);
+        if reach == Reach.Import or reach == Reach.MemoryGrow {
+            var want = wc.TYPE_I32;
+            if reach == Reach.Import {
+                want = import_type(f.insts[v as usize].ty);
+            }
+            if want == wc.TYPE_I32 {
+                wc.op(&mut g.code, wc.I32_WRAP_I64);
+            }
+        }
+    }
+    if i.op == ir.Op.CallIndirect {
+        var params = alloc.List(ir.Ty).init(g.a);
+        q = i.args_start;
+        while q < i.args_start + i.args_len : (q += 1) {
+            params.push(f.insts[f.args[q as usize] as usize].ty);
+        }
+        let ty_index = function_type(g, params.items(), ret: i.ty);
+        push_address(g, f, i.a);
+        wc.op_u(&mut g.code, wc.CALL_INDIRECT, ty_index);
+        g.code.push(0);
+    } else if i.flag == 1 {
+        match reach {
+            .Function => { wc.op_u(&mut g.code, wc.CALL, g.ext_index[i.imm as usize]); }
+            .Import => {
+                wc.op_u(&mut g.code, wc.CALL, g.ext_index[i.imm as usize]);
+                if i.ty != ir.Ty.Void and import_type(i.ty) == wc.TYPE_I32 {
+                    wc.op(&mut g.code, wc.I64_EXTEND_I32_U);
+                }
+            }
+            .MemoryGrow => {
+                g.code.push(wc.MEMORY_GROW);
+                g.code.push(0);
+                wc.op(&mut g.code, wc.I64_EXTEND_I32_S);
+            }
+            .MemorySize => {
+                g.code.push(wc.MEMORY_SIZE);
+                g.code.push(0);
+                wc.op(&mut g.code, wc.I64_EXTEND_I32_U);
+            }
+            .HeapBase => { wc.i64_const(&mut g.code, g.heap_base); }
+            .ErrorNames => {
+                var at: u64 = 0;
+                if g.table_at.len() > 0 {
+                    at = g.table_at[0];
+                }
+                wc.i64_const(&mut g.code, at);
+            }
+            .Missing => { }
+        }
+    } else {
+        wc.op_u(&mut g.code, wc.CALL, g.fn_index[i.imm as usize]);
+    }
+    if i.ty != ir.Ty.Void {
+        finish(g, id);
+    }
+}
+
+fn fbin_code(k: u32, t: ir.Ty) -> u8 {
+    var code = wc.F64_DIV;
+    if k == 0 {
+        code = wc.F64_ADD;
+    } else if k == 1 {
+        code = wc.F64_SUB;
+    } else if k == 2 {
+        code = wc.F64_MUL;
+    }
+    if t == ir.Ty.F32 {
+        return code - 0x0E;
+    }
+    return code;
+}
+
+/// A unary operation, at the type's width.
+fn funary(g: &mut Gen, code: u8, t: ir.Ty) {
+    if t == ir.Ty.F32 {
+        g.code.push(code - 0x0E);
+    } else {
+        g.code.push(code);
+    }
+}
+
+fn gen_fcmp(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let t = f.insts[i.a as usize].ty;
+    push(g, f, i.a);
+    push(g, f, i.b);
+    // eq, ne, lt, gt, le, ge in the processor's order; the IR's is eq, ne, lt,
+    // le, gt, ge. Each is false on a NaN, and ne is true on one.
+    var at: u8 = 0;
+    if i.flag == 1 {
+        at = 1;
+    } else if i.flag == 2 {
+        at = 2;
+    } else if i.flag == 3 {
+        at = 4;
+    } else if i.flag == 4 {
+        at = 3;
+    } else if i.flag == 5 {
+        at = 5;
+    }
+    if t == ir.Ty.F32 {
+        g.code.push(wc.F32_EQ + at);
+    } else {
+        g.code.push(wc.F64_EQ + at);
+    }
+    wc.op(&mut g.code, wc.I64_EXTEND_I32_U);
+    finish(g, id);
+}
+
+/// What is on the stack, held to what it may be; t0 is free.
+fn hold_to(g: &mut Gen, limit: u64, compare: u8) {
+    set(g, g.t0);
+    wc.i64_const(&mut g.code, limit);
+    get(g, g.t0);
+    get(g, g.t0);
+    wc.i64_const(&mut g.code, limit);
+    g.code.push(compare);
+    g.code.push(wc.SELECT);
+}
+
+fn gen_fconv(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let from = f.insts[i.a as usize].ty;
+    let k = i.flag;
+    if k == 0 or k == 1 {
+        // 8 bytes hold all narrower integers, of either sign.
+        push_extended(g, f, i.a, signed: k == 0);
+        var code = wc.F64_CONVERT_I64_U;
+        if i.ty == ir.Ty.F32 {
+            code = wc.F32_CONVERT_I64_U;
+        }
+        if k == 0 {
+            code -= 1;
+        }
+        wc.op(&mut g.code, code);
+        finish(g, id);
+        return;
+    }
+    if k == 4 or k == 5 {
+        push(g, f, i.a);
+        if from == ir.Ty.F32 {
+            wc.op(&mut g.code, wc.F64_PROMOTE_F32);
+        } else {
+            wc.op(&mut g.code, wc.F32_DEMOTE_F64);
+        }
+        finish(g, id);
+        return;
+    }
+    let signed = k == 2 or k == 6;
+    push(g, f, i.a);
+    wc.trunc_sat(&mut g.code, signed: signed, float_size: ra.size_of(from));
+    let width = ir.bits(i.ty) as u64;
+    if k >= 6 and width < 64 {
+        let one: u64 = 1;
+        if signed {
+            hold_to(g, limit: (one << (width - 1)) - 1, compare: wc.I64_GT_S);
+            hold_to(g, limit: ~((one << (width - 1)) - 1), compare: wc.I64_LT_S);
+        } else {
+            hold_to(g, limit: (one << width) - 1, compare: wc.I64_GT_U);
+        }
+    }
+    finish(g, id);
+}
+
+fn helper_index(g: &Gen, m: &ir.Module, name: str) -> u32 {
+    var k: usize = 0;
+    while k < m.functions.len() : (k += 1) {
+        if not m.functions[k].stub and m.functions[k].name.view().eq(name) {
+            return g.fn_index[k];
+        }
+    }
+    return NONE;
+}
+
+fn gen_fmath(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, i: ir.Inst) {
+    let t = i.ty;
+    let is_single = t == ir.Ty.F32;
+    if i.flag <= 4 {
+        push(g, f, i.a);
+        var code = wc.F64_SQRT;
+        if i.flag == 1 {
+            code = wc.F64_ABS;
+        } else if i.flag == 2 {
+            code = wc.F64_FLOOR;
+        } else if i.flag == 3 {
+            code = wc.F64_CEIL;
+        } else if i.flag == 4 {
+            code = wc.F64_TRUNC;
+        }
+        funary(g, code, t);
+        finish(g, id);
+        return;
+    }
+    // What the runtime computes (lib/std/wasi_rt.arche).
+    var name = "fmod";
+    if i.flag == 5 and is_single {
+        name = "fmodf";
+    } else if i.flag == 6 and is_single {
+        name = "fmaf";
+    } else if i.flag == 6 {
+        name = "fma";
+    }
+    let helper = helper_index(g, m, name);
+    if helper == NONE {
+        say_problem(g, f, what: "the runtime has no helper for this float operation");
+        return;
+    }
+    push(g, f, i.a);
+    push(g, f, i.b);
+    if i.flag == 6 {
+        push(g, f, i.c);
+    }
+    wc.op_u(&mut g.code, wc.CALL, helper);
+    finish(g, id);
+}
+
+fn gen_atomic_rmw(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    // One thread, so the plain instructions are atomic.
+    let k = i.flag >> 8;
+    push(g, f, i.a);
+    set(g, g.t0);
+    push(g, f, i.b);
+    set(g, g.t1);
+    get(g, g.t0);
+    wc.op(&mut g.code, wc.I32_WRAP_I64);
+    wc.memory_op(&mut g.code, load_op(i.ty));
+    set(g, g.t2);
+    get(g, g.t0);
+    wc.op(&mut g.code, wc.I32_WRAP_I64);
+    if k == ir.RMW_XCHG {
+        get(g, g.t1);
+    } else {
+        get(g, g.t2);
+        get(g, g.t1);
+        if k == ir.RMW_ADD {
+            wc.op(&mut g.code, wc.I64_ADD);
+        } else if k == ir.RMW_SUB {
+            wc.op(&mut g.code, wc.I64_SUB);
+        } else if k == ir.RMW_AND {
+            wc.op(&mut g.code, wc.I64_AND);
+        } else {
+            wc.op(&mut g.code, wc.I64_OR);
+        }
+    }
+    wc.memory_op(&mut g.code, store_op(i.ty));
+    get(g, g.t2);
+    finish(g, id);
+}
+
+fn gen_cmpxchg(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    push(g, f, i.a);
+    set(g, g.t0);
+    get(g, g.t0);
+    wc.op(&mut g.code, wc.I32_WRAP_I64);
+    wc.memory_op(&mut g.code, load_op(i.ty));
+    set(g, g.t2);
+    get(g, g.t2);
+    push_extended(g, f, i.b, signed: false);
+    wc.op(&mut g.code, wc.I64_EQ);
+    g.code.push(wc.IF);
+    g.code.push(wc.BLOCK_EMPTY);
+    get(g, g.t0);
+    wc.op(&mut g.code, wc.I32_WRAP_I64);
+    push(g, f, i.c);
+    wc.memory_op(&mut g.code, store_op(i.ty));
+    g.code.push(wc.END);
+    get(g, g.t2);
+    finish(g, id);
+}
+
+fn leave_frame(g: &mut Gen) {
+    if g.has_frame {
+        get(g, g.fp);
+        wc.op_u(&mut g.code, wc.GLOBAL_SET, 0);
+    }
+}
+
+/// Goes to a block: down the labels if it is ahead, by the loop if not.
+fn jump(g: &mut Gen, block: u32) {
+    if block > g.current {
+        wc.op_u(&mut g.code, wc.BR, block - g.current - 1);
+        return;
+    }
+    wc.i32_const(&mut g.code, block as i32);
+    set(g, g.pc);
+    wc.op_u(&mut g.code, wc.BR, g.block_count - 1 - g.current);
+}
+
+fn gen_terminator(g: &mut Gen, f: &ir.Function, i: ir.Inst, next: u32) {
+    match i.op {
+        .Br => {
+            if i.a != next {
+                jump(g, i.a);
+            }
+        }
+        .CondBr => {
+            if g.r.kinds[i.a as usize] == ra.V_CONST {
+                var target = i.c;
+                if const_bits(f, i.a) & 1 == 1 {
+                    target = i.b;
+                }
+                if target != next {
+                    jump(g, target);
+                }
+                return;
+            }
+            if g.r.kinds[i.a as usize] == ra.V_FUSED {
+                push_compare(g, f, f.insts[i.a as usize]);
+            } else {
+                push(g, f, i.a);
+                wc.i64_const(&mut g.code, 1);
+                wc.op(&mut g.code, wc.I64_AND);
+                wc.op(&mut g.code, wc.I32_WRAP_I64);
+            }
+            g.code.push(wc.IF);
+            g.code.push(wc.BLOCK_EMPTY);
+            jump_from_if(g, i.b);
+            g.code.push(wc.END);
+            if i.c != next {
+                jump(g, i.c);
+            }
+        }
+        .Ret => {
+            push(g, f, i.a);
+            leave_frame(g);
+            g.code.push(wc.RETURN);
+        }
+        .RetVoid => {
+            leave_frame(g);
+            g.code.push(wc.RETURN);
+        }
+        .Unreachable => { g.code.push(wc.UNREACHABLE); }
+        _ => { }
+    }
+}
+
+/// As jump, from inside the if of a conditional branch: every label is one
+/// further out.
+fn jump_from_if(g: &mut Gen, block: u32) {
+    let at = g.current;
+    if block > at {
+        wc.op_u(&mut g.code, wc.BR, block - at);
+        return;
+    }
+    wc.i32_const(&mut g.code, block as i32);
+    set(g, g.pc);
+    wc.op_u(&mut g.code, wc.BR, g.block_count - at);
+}
+
+fn gen_inst(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, next: u32) {
+    let i = f.insts[id as usize];
+    match i.op {
+        .Const | .Param | .Alloca | .Global | .VTable | .OverflowBit | .AsmOut => { }
+        .Gep => {
+            if g.r.kinds[id as usize] == ra.V_REG {
+                push(g, f, i.a);
+                wc.i64_const(&mut g.code, nb.bits_of_i64(i.imm as i64));
+                wc.op(&mut g.code, wc.I64_ADD);
+                finish(g, id);
+            }
+        }
+        .GepIndex => {
+            push(g, f, i.a);
+            push(g, f, i.b);
+            wc.i64_const(&mut g.code, i.imm);
+            wc.op(&mut g.code, wc.I64_MUL);
+            wc.op(&mut g.code, wc.I64_ADD);
+            finish(g, id);
+        }
+        .Load => {
+            push_address(g, f, i.a);
+            wc.memory_op(&mut g.code, load_op(i.ty));
+            finish(g, id);
+        }
+        .Store => {
+            push_address(g, f, i.b);
+            push(g, f, i.a);
+            wc.memory_op(&mut g.code, store_op(f.insts[i.a as usize].ty));
+        }
+        .Memcpy => {
+            push_address(g, f, i.a);
+            push_address(g, f, i.b);
+            wc.i32_const(&mut g.code, i.imm as i32);
+            wc.memory_copy(&mut g.code);
+        }
+        .Memzero => {
+            push_address(g, f, i.a);
+            wc.i32_const(&mut g.code, 0);
+            wc.i32_const(&mut g.code, i.imm as i32);
+            wc.memory_fill(&mut g.code);
+        }
+        .Bin => { gen_bin(g, f, id, i); }
+        .Overflow => { gen_overflow(g, f, id, i); }
+        .Cmp => {
+            if g.r.kinds[id as usize] != ra.V_FUSED {
+                push_compare(g, f, i);
+                wc.op(&mut g.code, wc.I64_EXTEND_I32_U);
+                finish(g, id);
+            }
+        }
+        .Ext | .Trunc => { gen_ext(g, f, id, i); }
+        .IntToPtr | .PtrToInt => {
+            push(g, f, i.a);
+            finish(g, id);
+        }
+        .Call | .CallIndirect => { gen_call(g, m, f, id, i); }
+        .FBin => {
+            push(g, f, i.a);
+            push(g, f, i.b);
+            g.code.push(fbin_code(i.flag, i.ty));
+            finish(g, id);
+        }
+        .FNeg => {
+            push(g, f, i.a);
+            funary(g, wc.F64_NEG, i.ty);
+            finish(g, id);
+        }
+        .FCmp => { gen_fcmp(g, f, id, i); }
+        .FConv => { gen_fconv(g, f, id, i); }
+        .FMath => { gen_fmath(g, m, f, id, i); }
+        .Asm => { say_problem(g, f, what: "asm: a WebAssembly module has none"); }
+        .AtomicLoad => {
+            push_address(g, f, i.a);
+            wc.memory_op(&mut g.code, load_op(i.ty));
+            finish(g, id);
+        }
+        .AtomicStore => {
+            push_address(g, f, i.b);
+            push(g, f, i.a);
+            wc.memory_op(&mut g.code, store_op(f.insts[i.a as usize].ty));
+        }
+        .AtomicRmw => { gen_atomic_rmw(g, f, id, i); }
+        .CmpXchg => { gen_cmpxchg(g, f, id, i); }
+        .Fence => { }
+        .Phi => { say_problem(g, f, what: "an optimized function: release builds are not for WebAssembly yet"); }
+        .Br | .CondBr | .Ret | .RetVoid | .Unreachable => { gen_terminator(g, f, i, next: next); }
+    }
+}
+
+/// Is any jump a jump back? If none is, the blocks need no loop.
+fn has_back_edge(f: &ir.Function) -> bool {
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        let ids = f.blocks[b].insts.items();
+        var k: usize = 0;
+        while k < ids.len() : (k += 1) {
+            let i = f.insts[ids[k] as usize];
+            if i.op == ir.Op.Br and i.a as usize <= b {
+                return true;
+            }
+            if i.op == ir.Op.CondBr and (i.b as usize <= b or i.c as usize <= b) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn put_local_group(out: &mut alloc.List(u8), count: u32, ty: u8) {
+    wc.uleb(out, count as u64);
+    out.push(ty);
+}
+
+/// One function's body: its locals, and its blocks.
+fn gen_function(g: &mut Gen, m: &ir.Module, f: &ir.Function) -> alloc.List(u8) {
+    g.code.clear();
+    ra.plan(&mut g.r, f);
+    g.r.frame = 0;
+    ra.place_allocas(&mut g.r, f);
+    // Locals: the parameters, then these, then a local for each value.
+    let np = f.params.len() as u32;
+    g.fp = np;
+    g.t0 = np + 1;
+    g.t1 = np + 2;
+    g.t2 = np + 3;
+    g.t3 = np + 4;
+    g.pc = np + 5;
+    let first_value = np + 6;
+    g.locals.clear();
+    var ints: u32 = 0;
+    var singles: u32 = 0;
+    var doubles: u32 = 0;
+    var id: usize = 0;
+    while id < f.insts.len() : (id += 1) {
+        g.locals.push(NONE);
+        if g.r.kinds[id] == ra.V_REG {
+            let t = f.insts[id].ty;
+            if t == ir.Ty.F32 {
+                singles += 1;
+            } else if t == ir.Ty.F64 {
+                doubles += 1;
+            } else {
+                ints += 1;
+            }
+        }
+    }
+    var next_int = first_value;
+    var next_single = first_value + ints;
+    var next_double = next_single + singles;
+    id = 0;
+    while id < f.insts.len() : (id += 1) {
+        if g.r.kinds[id] == ra.V_REG {
+            let t = f.insts[id].ty;
+            if t == ir.Ty.F32 {
+                g.locals[id] = next_single;
+                next_single += 1;
+            } else if t == ir.Ty.F64 {
+                g.locals[id] = next_double;
+                next_double += 1;
+            } else {
+                g.locals[id] = next_int;
+                next_int += 1;
+            }
+        }
+    }
+    if ints + singles + doubles > MAX_LOCALS {
+        say_problem(g, f, what: "a function with more values than WebAssembly's runtimes take in locals");
+    }
+    let size = (g.r.frame + 15) / 16 * 16;
+    g.has_frame = size > 0;
+    if g.has_frame {
+        wc.op_u(&mut g.code, wc.GLOBAL_GET, 0);
+        wc.op_u(&mut g.code, wc.LOCAL_TEE, g.fp);
+        wc.i64_const(&mut g.code, size as u64);
+        wc.op(&mut g.code, wc.I64_SUB);
+        wc.op_u(&mut g.code, wc.GLOBAL_SET, 0);
+    }
+    let nblocks = f.blocks.len() as u32;
+    g.block_count = nblocks;
+    let back = has_back_edge(f);
+    if back {
+        g.code.push(wc.LOOP);
+        g.code.push(wc.BLOCK_EMPTY);
+    }
+    var b: u32 = 0;
+    while b < nblocks : (b += 1) {
+        g.code.push(wc.BLOCK);
+        g.code.push(wc.BLOCK_EMPTY);
+    }
+    if back {
+        get(g, g.pc);
+        wc.op_u(&mut g.code, wc.BR_TABLE, nblocks - 1);
+        b = 0;
+        while b < nblocks - 1 : (b += 1) {
+            wc.uleb(&mut g.code, b as u64);
+        }
+        wc.uleb(&mut g.code, nblocks as u64 - 1);
+    }
+    g.code.push(wc.END);
+    b = 0;
+    while b < nblocks : (b += 1) {
+        g.current = b;
+        var next = NONE;
+        if b + 1 < nblocks {
+            next = b + 1;
+        }
+        let ids = f.blocks[b as usize].insts.items();
+        var k: usize = 0;
+        while k < ids.len() : (k += 1) {
+            gen_inst(g, m, f, id: ids[k], next: next);
+        }
+        if b + 1 < nblocks {
+            g.code.push(wc.END);
+        }
+    }
+    if back {
+        g.code.push(wc.UNREACHABLE);
+        g.code.push(wc.END);
+    }
+    g.code.push(wc.UNREACHABLE);
+    g.code.push(wc.END);
+    // Now the header: the fixed locals, and the values'.
+    var body = alloc.List(u8).init(g.a);
+    wc.uleb(&mut body, 6);
+    put_local_group(&mut body, 5, wc.TYPE_I64);
+    put_local_group(&mut body, 1, wc.TYPE_I32);
+    put_local_group(&mut body, ints, wc.TYPE_I64);
+    put_local_group(&mut body, singles, wc.TYPE_F32);
+    put_local_group(&mut body, doubles, wc.TYPE_F64);
+    put_local_group(&mut body, 0, wc.TYPE_I32);
+    wc.put_bytes(&mut body, g.code.items());
+    return body;
+}
+
+fn put_u64(out: &mut alloc.List(u8), v: u64) {
+    var k: u64 = 0;
+    while k < 8 : (k += 1) {
+        out.push(((v >> (k * 8)) & 255) as u8);
+    }
+}
+
+fn pad_to(out: &mut alloc.List(u8), to: u64) {
+    while out.len() as u64 % to != 0 {
+        out.push(0);
+    }
+}
+
+/// The module's data, all addresses known; where each piece went, in g.
+fn build_data(g: &mut Gen, m: &ir.Module) -> alloc.List(u8) {
+    var data = alloc.List(u8).init(g.a);
+    let gs = m.globals.items();
+    var i: usize = 0;
+    while i < gs.len() : (i += 1) {
+        g.global_at.push(DATA_BASE + data.len() as u64);
+        wc.put_bytes(&mut data, gs[i].bytes.items());
+    }
+    let vts = m.vtables.items();
+    i = 0;
+    while i < vts.len() : (i += 1) {
+        pad_to(&mut data, 8);
+        g.vtable_at.push(DATA_BASE + data.len() as u64);
+        let fns = vts[i].functions.items();
+        var k: usize = 0;
+        while k < fns.len() : (k += 1) {
+            // A function's address is its place in the table.
+            put_u64(&mut data, g.fn_index[fns[k] as usize] as u64 + 1);
+        }
+        if vts[i].size > 0 {
+            put_u64(&mut data, vts[i].size);
+        }
+    }
+    let tables = m.tables.items();
+    i = 0;
+    while i < tables.len() : (i += 1) {
+        pad_to(&mut data, 8);
+        g.table_at.push(DATA_BASE + data.len() as u64);
+        let entries = tables[i].entries.items();
+        var k: usize = 0;
+        while k < entries.len() : (k += 1) {
+            put_u64(&mut data, g.global_at[entries[k] as usize]);
+            put_u64(&mut data, gs[entries[k] as usize].bytes.len() as u64);
+        }
+    }
+    pad_to(&mut data, 16);
+    g.heap_base = DATA_BASE + data.len() as u64;
+    return data;
+}
+
+/// How each extern is reached, and the imports they make.
+fn resolve_externals(g: &mut Gen, m: &ir.Module, imports: &mut alloc.List(u8)) {
+    let es = m.externals.items();
+    let fs = m.functions.items();
+    var x: usize = 0;
+    while x < es.len() : (x += 1) {
+        let name = es[x].name.view();
+        var reach = Reach.Missing;
+        var index = NONE;
+        var f: usize = 0;
+        while f < fs.len() and reach == Reach.Missing : (f += 1) {
+            if not fs[f].stub and fs[f].name.view().eq(name) {
+                reach = Reach.Function;
+            }
+        }
+        if reach == Reach.Function {
+            // Its index is known once all the imports are: filled in below.
+        } else if name.starts_with(WASI_PREFIX) {
+            reach = Reach.Import;
+            index = g.import_count;
+            g.import_count += 1;
+            let ty_index = import_function_type(g, es[x].params.items(), ret: es[x].ret);
+            wc.put_name(imports, WASI_MODULE);
+            wc.put_name(imports, name[WASI_PREFIX.len()..name.len()]);
+            imports.push(0);
+            wc.uleb(imports, ty_index as u64);
+        } else if name.eq(ASK_MEMORY_GROW) {
+            reach = Reach.MemoryGrow;
+        } else if name.eq(ASK_MEMORY_SIZE) {
+            reach = Reach.MemorySize;
+        } else if name.eq(ASK_HEAP_BASE) {
+            reach = Reach.HeapBase;
+        } else if name.eq(ASK_ERROR_NAMES) {
+            reach = Reach.ErrorNames;
+        }
+        g.ext_reach.push(reach);
+        g.ext_index.push(index);
+    }
+}
+
+/// The program as a WebAssembly module, or nothing, with problem saying why.
+pub fn module(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> alloc.List(u8) {
+    var g = Gen {
+        r: ra.new_ranges(a),
+        code: alloc.List(u8).init(a),
+        fn_index: alloc.List(u32).init(a),
+        ext_reach: alloc.List(Reach).init(a),
+        ext_index: alloc.List(u32).init(a),
+        types: alloc.List(alloc.List(u8)).init(a),
+        import_count: 0,
+        locals: alloc.List(u32).init(a),
+        fp: 0,
+        pc: 0,
+        t0: 0,
+        t1: 0,
+        t2: 0,
+        t3: 0,
+        current: 0,
+        block_count: 0,
+        has_frame: false,
+        global_at: alloc.List(u64).init(a),
+        vtable_at: alloc.List(u64).init(a),
+        table_at: alloc.List(u64).init(a),
+        heap_base: 0,
+        problem: alloc.String.init(a),
+        a: a,
+    };
+    var imports = alloc.List(u8).init(a);
+    resolve_externals(&mut g, m, imports: &mut imports);
+    // Functions are numbered after the imports. Stubs have no code: their
+    // numbers stay unused, for no call reaches them.
+    let fs = m.functions.items();
+    var defined: u32 = 0;
+    var i: usize = 0;
+    while i < fs.len() : (i += 1) {
+        if fs[i].stub {
+            g.fn_index.push(NONE);
+        } else {
+            g.fn_index.push(g.import_count + defined);
+            defined += 1;
+        }
+    }
+    i = 0;
+    while i < m.externals.len() : (i += 1) {
+        if g.ext_reach[i] == Reach.Function {
+            let name = m.externals[i].name.view();
+            var k: usize = 0;
+            while k < fs.len() : (k += 1) {
+                if not fs[k].stub and fs[k].name.view().eq(name) {
+                    g.ext_index[i] = g.fn_index[k];
+                }
+            }
+        }
+    }
+    let data = build_data(&mut g, m);
+
+    var functions = alloc.List(u8).init(a);
+    var codes = alloc.List(u8).init(a);
+    var names = alloc.List(u8).init(a);
+    var start_index = NONE;
+    wc.uleb(&mut functions, defined as u64);
+    wc.uleb(&mut codes, defined as u64);
+    wc.uleb(&mut names, defined as u64);
+    i = 0;
+    while i < fs.len() : (i += 1) {
+        if fs[i].stub {
+            continue;
+        }
+        wc.uleb(&mut functions, function_type(&mut g, fs[i].params.items(), ret: fs[i].ret) as u64);
+        let body = gen_function(&mut g, m, &fs[i]);
+        wc.uleb(&mut codes, body.len() as u64);
+        wc.put_bytes(&mut codes, body.items());
+        wc.uleb(&mut names, g.fn_index[i] as u64);
+        wc.put_name(&mut names, fs[i].name.view());
+        if fs[i].name.view().eq("_start") {
+            start_index = g.fn_index[i];
+        }
+    }
+    if g.problem.len() == 0 and start_index == NONE {
+        g.problem.push_str("no _start: this program does not import std");
+    }
+    if g.problem.len() > 0 {
+        problem.push_str(g.problem.view());
+        return alloc.List(u8).init(a);
+    }
+
+    var out = alloc.List(u8).init(a);
+    wc.put_bytes(&mut out, "\x00asm".bytes());
+    out.push(1);
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    var types = alloc.List(u8).init(a);
+    wc.uleb(&mut types, g.types.len() as u64);
+    i = 0;
+    while i < g.types.len() : (i += 1) {
+        wc.put_bytes(&mut types, g.types.items()[i].items());
+    }
+    wc.section(&mut out, 1, &types);
+    var import_section = alloc.List(u8).init(a);
+    wc.uleb(&mut import_section, g.import_count as u64);
+    wc.put_bytes(&mut import_section, imports.items());
+    wc.section(&mut out, 2, &import_section);
+    wc.section(&mut out, 3, &functions);
+    // The table: slot n + 1 holds function n; slot 0 is a null pointer's trap.
+    let total = g.import_count + defined;
+    var table = alloc.List(u8).init(a);
+    table.push(1);
+    table.push(0x70);
+    table.push(0);
+    wc.uleb(&mut table, total as u64 + 1);
+    wc.section(&mut out, 4, &table);
+    let pages = (g.heap_base + PAGE - 1) / PAGE;
+    var memory = alloc.List(u8).init(a);
+    memory.push(1);
+    memory.push(0);
+    wc.uleb(&mut memory, pages);
+    wc.section(&mut out, 5, &memory);
+    // Global 0 is the stack pointer.
+    var globals = alloc.List(u8).init(a);
+    globals.push(1);
+    globals.push(wc.TYPE_I64);
+    globals.push(1);
+    wc.i64_const(&mut globals, DATA_BASE);
+    globals.push(wc.END);
+    wc.section(&mut out, 6, &globals);
+    var exports = alloc.List(u8).init(a);
+    exports.push(2);
+    wc.put_name(&mut exports, "_start");
+    exports.push(0);
+    wc.uleb(&mut exports, start_index as u64);
+    wc.put_name(&mut exports, "memory");
+    exports.push(2);
+    exports.push(0);
+    wc.section(&mut out, 7, &exports);
+    var elements = alloc.List(u8).init(a);
+    elements.push(1);
+    elements.push(0);
+    wc.i32_const(&mut elements, 1);
+    elements.push(wc.END);
+    wc.uleb(&mut elements, total as u64);
+    var e: u32 = 0;
+    while e < total : (e += 1) {
+        wc.uleb(&mut elements, e as u64);
+    }
+    wc.section(&mut out, 9, &elements);
+    wc.section(&mut out, 10, &codes);
+    var data_section = alloc.List(u8).init(a);
+    data_section.push(1);
+    data_section.push(0);
+    wc.i32_const(&mut data_section, DATA_BASE as i32);
+    data_section.push(wc.END);
+    wc.uleb(&mut data_section, data.len() as u64);
+    wc.put_bytes(&mut data_section, data.items());
+    wc.section(&mut out, 11, &data_section);
+    // The name section, so that a trap says where.
+    var name_section = alloc.List(u8).init(a);
+    wc.put_name(&mut name_section, "name");
+    name_section.push(1);
+    wc.uleb(&mut name_section, names.len() as u64);
+    wc.put_bytes(&mut name_section, names.items());
+    wc.section(&mut out, 0, &name_section);
+    return out;
+}

@@ -1,0 +1,36 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 21 none none 1 77 2 none
+import alloc;
+import std;
+
+// The library's Map, which a package uses: what is removed is gone, and comes
+// back with a put.
+fn say(sys: &mut std.System, v: ?u64) {
+    match v {
+        some(n) => { sys.stdout.write_u64(n); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write(" ");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var m = alloc.Map(u64, u64).init(sys.alloc);
+    m.put(1, 21);
+    m.put(2, 22);
+    say(sys, m.remove(1));
+    say(sys, m.get(1));
+    say(sys, m.remove(1));
+    sys.stdout.write_u64(m.len() as u64);
+    sys.stdout.write(" ");
+    m.put(1, 77);
+    say(sys, m.get(1));
+    sys.stdout.write_u64(m.len() as u64);
+    sys.stdout.write(" ");
+    let gone = m.remove(5);
+    match gone {
+        some(_) => { sys.stdout.write("some\n"); }
+        none => { sys.stdout.write("none\n"); }
+    }
+}

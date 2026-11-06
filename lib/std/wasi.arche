@@ -1,0 +1,197 @@
+/// WASI's first version (`wasi_snapshot_preview1`), as std reaches it on
+/// WebAssembly. Each of these is an import of the module: the compiler's
+/// backend makes any extern fn named `wasi_<name>` the import of `<name>`
+/// (compiler/wasm/gen.arche). A pointer is its 32-bit address.
+pub const ENOENT: u32 = 44;
+pub const EACCES: u32 = 2;
+pub const EISDIR: u32 = 31;
+pub const EEXIST: u32 = 20;
+pub const ENOTEMPTY: u32 = 55;
+pub const ENOTDIR: u32 = 54;
+pub const EPERM: u32 = 63;
+pub const ENOTCAPABLE: u32 = 76;
+
+pub const OFLAG_CREATE: u32 = 1;
+pub const OFLAG_DIRECTORY: u32 = 2;
+pub const OFLAG_EXCLUSIVE: u32 = 4;
+pub const OFLAG_TRUNCATE: u32 = 8;
+pub const LOOKUP_FOLLOW: u32 = 1;
+/// Every right: what a file may do is the system's to say, not the program's.
+pub const ALL_RIGHTS: u64 = 0x1FFFFFFF;
+
+extern "c" fn wasi_fd_write(fd: u32, iovs: u32, count: u32, written: u32) -> u32;
+extern "c" fn wasi_fd_read(fd: u32, iovs: u32, count: u32, read: u32) -> u32;
+extern "c" fn wasi_fd_close(fd: u32) -> u32;
+extern "c" fn wasi_fd_readdir(fd: u32, buf: u32, size: u32, cookie: u64, used: u32) -> u32;
+extern "c" fn wasi_fd_prestat_get(fd: u32, out: u32) -> u32;
+extern "c" fn wasi_fd_prestat_dir_name(fd: u32, path: u32, size: u32) -> u32;
+extern "c" fn wasi_path_open(dir: u32, lookup: u32, path: u32, size: u32, oflags: u32, base: u64, inheriting: u64, fdflags: u32, out: u32) -> u32;
+extern "c" fn wasi_path_filestat_get(dir: u32, lookup: u32, path: u32, size: u32, out: u32) -> u32;
+extern "c" fn wasi_path_create_directory(dir: u32, path: u32, size: u32) -> u32;
+extern "c" fn wasi_path_remove_directory(dir: u32, path: u32, size: u32) -> u32;
+extern "c" fn wasi_path_unlink_file(dir: u32, path: u32, size: u32) -> u32;
+extern "c" fn wasi_path_rename(from_dir: u32, from: u32, from_size: u32, to_dir: u32, to: u32, to_size: u32) -> u32;
+extern "c" fn wasi_args_sizes_get(count: u32, size: u32) -> u32;
+extern "c" fn wasi_args_get(argv: u32, buf: u32) -> u32;
+extern "c" fn wasi_environ_sizes_get(count: u32, size: u32) -> u32;
+extern "c" fn wasi_environ_get(environ: u32, buf: u32) -> u32;
+extern "c" fn wasi_clock_time_get(id: u32, precision: u64, out: u32) -> u32;
+extern "c" fn wasi_random_get(buf: u32, size: u32) -> u32;
+extern "c" fn wasi_poll_oneoff(subscriptions: u32, events: u32, count: u32, done: u32) -> u32;
+extern "c" fn wasi_proc_exit(status: u32) -> noreturn;
+
+/// Where a value is, as WASI takes it.
+pub fn of(comptime T: type, r: &T) -> u32 {
+    unsafe {
+        // SAFETY: an address is a number, and all are below 4 GB here.
+        return (r as *T).addr() as u32;
+    }
+}
+
+/// A pointer as WASI takes it.
+pub fn at(comptime T: type, p: *T) -> u32 {
+    unsafe {
+        // SAFETY: an address is a number, and all are below 4 GB here.
+        return p.addr() as u32;
+    }
+}
+
+pub fn fd_write(fd: u32, iovs: u32, count: u32, written: u32) -> u32 {
+    unsafe {
+        // SAFETY: the callers' memory, as WASI says it must be.
+        return wasi_fd_write(fd: fd, iovs: iovs, count: count, written: written);
+    }
+}
+
+pub fn fd_read(fd: u32, iovs: u32, count: u32, read: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_fd_read(fd: fd, iovs: iovs, count: count, read: read);
+    }
+}
+
+pub fn fd_close(fd: u32) -> u32 {
+    unsafe {
+        // SAFETY: only a number.
+        return wasi_fd_close(fd);
+    }
+}
+
+pub fn fd_readdir(fd: u32, buf: u32, size: u32, cookie: u64, used: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_fd_readdir(fd: fd, buf: buf, size: size, cookie: cookie, used: used);
+    }
+}
+
+pub fn fd_prestat_get(fd: u32, out: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_fd_prestat_get(fd: fd, out: out);
+    }
+}
+
+pub fn fd_prestat_dir_name(fd: u32, path: u32, size: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_fd_prestat_dir_name(fd: fd, path: path, size: size);
+    }
+}
+
+pub fn path_open(dir: u32, path: u32, size: u32, oflags: u32, out: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_path_open(dir: dir, lookup: LOOKUP_FOLLOW, path: path, size: size, oflags: oflags, base: ALL_RIGHTS, inheriting: ALL_RIGHTS, fdflags: 0, out: out);
+    }
+}
+
+pub fn path_filestat_get(dir: u32, path: u32, size: u32, out: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_path_filestat_get(dir: dir, lookup: LOOKUP_FOLLOW, path: path, size: size, out: out);
+    }
+}
+
+pub fn path_create_directory(dir: u32, path: u32, size: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_path_create_directory(dir: dir, path: path, size: size);
+    }
+}
+
+pub fn path_remove_directory(dir: u32, path: u32, size: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_path_remove_directory(dir: dir, path: path, size: size);
+    }
+}
+
+pub fn path_unlink_file(dir: u32, path: u32, size: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_path_unlink_file(dir: dir, path: path, size: size);
+    }
+}
+
+pub fn path_rename(from_dir: u32, from: u32, from_size: u32, to_dir: u32, to: u32, to_size: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_path_rename(from_dir: from_dir, from: from, from_size: from_size, to_dir: to_dir, to: to, to_size: to_size);
+    }
+}
+
+pub fn args_sizes_get(count: u32, size: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_args_sizes_get(count: count, size: size);
+    }
+}
+
+pub fn args_get(argv: u32, buf: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_args_get(argv: argv, buf: buf);
+    }
+}
+
+pub fn environ_sizes_get(count: u32, size: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_environ_sizes_get(count: count, size: size);
+    }
+}
+
+pub fn environ_get(environ: u32, buf: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_environ_get(environ: environ, buf: buf);
+    }
+}
+
+pub fn clock_time_get(id: u32, out: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_clock_time_get(id: id, precision: 1, out: out);
+    }
+}
+
+pub fn random_get(buf: u32, size: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_random_get(buf: buf, size: size);
+    }
+}
+
+pub fn poll_oneoff(subscriptions: u32, events: u32, count: u32, done: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_poll_oneoff(subscriptions: subscriptions, events: events, count: count, done: done);
+    }
+}
+
+pub fn proc_exit(status: u32) -> noreturn {
+    unsafe {
+        // SAFETY: only a number.
+        wasi_proc_exit(status);
+    }
+}

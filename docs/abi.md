@@ -1,6 +1,6 @@
 # Arche ABI, version 0
 
-This is the binary interface of code the Arche compiler builds: layouts, calling convention, symbol names and the runtime it calls. Version 0 covers Arche-0 on x86-64, ARM64 and RISC-V 64 (S28), built through LLVM (sprint S8) or by the compiler's own backend (S27), for Linux, and on x86-64 for Windows too (S19). It changes only with a major release, and an object says which version it was built to ("Object files").
+This is the binary interface of code the Arche compiler builds: layouts, calling convention, symbol names and the runtime it calls. Version 0 covers Arche-0 on x86-64, ARM64 and RISC-V 64 (S28), built through LLVM (sprint S8) or by the compiler's own backend (S27), for Linux, and on x86-64 for Windows too (S19), and WebAssembly with WASI (S30). It changes only with a major release, and an object says which version it was built to ("Object files").
 
 Layouts, the calling convention and symbol names are the same on both systems; what differs is the runtime underneath and the file the library's `std` comes from, which are named where it matters below.
 
@@ -152,9 +152,23 @@ Then for each segment 40 bytes: what it allows (4: 4 read, 2 write, 1 execute), 
 
 `compiler/abi-check.sh` is the suite, on each processor (`conformance/abi/`). Every layout above crosses between three modules and back: all the integers, floats, more arguments than registers, structs small and large, arrays, enums with and without payloads, optionals, error unions, slices, `str`, references, values that own memory, generic instances, methods, and calls back through method tables and closures. Each module, with the library's, is built separately by LLVM and by the compiler's own backend, and linked by the compiler's linker in four mixes, the program printing `conformance/abi/expected.txt` in all. An Arche executable of it prints the same.
 
+## WebAssembly
+
+`arche --target wasm32-wasi build <file> <out>.wasm` writes a whole module, by the compiler's own backend (`compiler/wasm/`), with no runtime in C and nothing to link. It is WebAssembly 1.0 with sign extension, saturating conversions and bulk memory, which every runtime has, and imports WASI's first version, `wasi_snapshot_preview1`.
+
+The layouts and calling convention above hold, with pointers 8 bytes as everywhere, so a `usize` and a slice are the same size on every target: a pointer is an `i64` that is wrapped to 32 bits where it reaches memory, and a function's address is its place in the table, plus one, 0 being a null pointer's trap. Every integer is an `i64` parameter or local, its upper bits undefined when it is narrower. A float is an `f32` or `f64`. Non-scalar results stay in memory the caller provides. An `extern "c"` function named `wasi_<name>` is the import `<name>`, whose narrow integers are `i32`.
+
+Memory starts with 1 KB of nothing, then 16 MB of stack that grows down, so that running out of it wraps around to where there is no memory and traps. Then come the data and the heap, which the runtime grows with `memory.grow`. Values that must have an address live on that stack, by a global stack pointer.
+
+The runtime is in Arche too (`lib/std/wasi_rt.arche`), behind the `a0rt_` names the compiled code calls. Its state is at the start of the heap, which the backend tells it through `a0rt_wasm_heap_base`, with `a0rt_wasm_memory_grow`, `a0rt_wasm_memory_size` and `a0rt_wasm_error_names`, which are instructions and constants rather than calls. A panic exits with 101, as elsewhere, and an error from `main` with 1.
+
+A program imports `std`, which on this target is `lib/std-wasi.arche`; every program uses the library's `alloc` and `std`, as `--lib-std` asks elsewhere. A host names what files a program may reach by the directories it gives it: an absolute path goes under the one that is its prefix, and a relative path under the one named `.`.
+
+There are no tasks, processes or sockets on this target, so no `std.task`, `Proc` or `Net`, no `asm`, and an atomic is an ordinary load or store, on the one thread. Release builds and `arche test` are not available yet.
+
 ## Systems
 
-A program is built for one system, which the compiler is told with `--target` (`linux-x86_64`, `linux-aarch64`, `linux-riscv64`, `windows-x86_64`) and which picks three things:
+A program is built for one system, which the compiler is told with `--target` (`linux-x86_64`, `linux-aarch64`, `linux-riscv64`, `windows-x86_64`, or `wasm32-wasi`, above) and which picks three things:
 
 - The target triple of the LLVM module: `x86_64-pc-linux-gnu`, `aarch64-unknown-linux-gnu`, `riscv64-unknown-linux-gnu` or `x86_64-pc-windows-msvc`.
 - The file the library's `std` is read from: `lib/std.arche` for Linux, whose system calls are numbered in `lib/std/linux-<processor>.arche`, `lib/std-windows.arche` for Windows. The module is `std` either way, so a program that imports it says nothing about the system; `std.SYSTEM` names the system when a program must tell them apart. Each reaches its system through a module of its own, `std.linux` or `std.win32`.
