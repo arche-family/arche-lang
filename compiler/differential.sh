@@ -26,6 +26,8 @@ for f in $(grep -rl '^// test: run' "$tests" --include='*.arche' | grep -v '/_' 
     fi
     (cd "$dir" && "$tmp/a" $args > "$tmp/a.out" 2> "$tmp/a.err"; echo "exit $?" >> "$tmp/a.out")
     (cd "$dir" && "$tmp/b" $args > "$tmp/b.out" 2> "$tmp/b.err"; echo "exit $?" >> "$tmp/b.out")
+    # The own backend's programs also say how a panic got there.
+    sed -i '/^  in /d' "$tmp/b.err"
     if ! cmp -s "$tmp/a.out" "$tmp/b.out" || ! cmp -s "$tmp/a.err" "$tmp/b.err"; then
         echo "differential: $f differs between stage0 and the Arche compiler"
         diff "$tmp/a.out" "$tmp/b.out" | head -5

@@ -7,7 +7,8 @@
 #   3. the change undone and built again, all from the cache: the program
 #      is byte for byte the one of step 1;
 #   4. a clean build in another directory: the same bytes again;
-#   5. a change in any file the runtime includes builds the runtime again.
+#   5. a change in any file the runtime includes builds the runtime again;
+#   6. on Linux, ARCHE_BACKEND=own gives the same program, with no LLVM.
 # Usage: check.sh <arche-driver>
 set -eu
 driver=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -63,6 +64,16 @@ for part in rt.c math.inc linux.inc windows.inc; do
     [ "$after" -eq $((before + 1)) ] || fail "a change in $part did not build the runtime again"
     before=$after
 done
+
+case $(uname -s) in
+MINGW* | MSYS* | CYGWIN*) ;;
+*)
+    cp -r "$here/example" "$work/d"
+    ARCHE_BACKEND=own "$driver" build "$work/d" > "$work/out4" || fail "the own backend's build failed: $(cat "$work/out4")"
+    grep -q "own backend" "$work/out4" || fail "the build did not say the own backend made it"
+    [ "$("$work/d/build/greeter")" = "hello, world: 55" ] || fail "the own backend's program does not print what it should"
+    ;;
+esac
 
 [ "$status" -eq 0 ] && echo "driver: clean and cached builds are bit-identical; one change compiles one module"
 exit "$status"

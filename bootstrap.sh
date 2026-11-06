@@ -2,8 +2,9 @@
 # The bootstrap (docs/plan.md): stage0, written in C11, builds stage1, the
 # Arche compiler; stage1 builds stage2 and stage2 builds stage3, both from the
 # same source. stage2 and stage3 must be bit-identical.
-# Needs a C compiler (CC, default cc) and clang for LLVM IR. It builds for
-# the system it runs on, Linux or Windows (compiler/target.sh).
+# Needs a C compiler (CC, default cc), clang for LLVM IR, and on Linux lld for
+# the compiler's own backend. It builds for the system it runs on, Linux or
+# Windows (compiler/target.sh).
 # Usage: ./bootstrap.sh [work dir]
 set -eu
 root=$(cd "$(dirname "$0")" && pwd)
@@ -83,4 +84,36 @@ if cmp -s "$work/release/check/arche.ll" "$work/stage3/arche.ll"; then
 else
     echo "bootstrap: the release compiler builds something else than the debug one"
     exit 1
+fi
+
+# The compiler's own backend, on Linux (docs/sprints.md S27): objects with no
+# LLVM, with their debug info, plain and on the library's alloc and std. And
+# the compiler it built computes what the others do.
+if [ "$ARCHE_TARGET" = linux-x86_64 ]; then
+    own_chain() { # directory, flags
+        mkdir -p "$work/$1/stage2" "$work/$1/stage3"
+        echo "bootstrap: stage2 by the own backend ($1), built by stage1"
+        (cd "$root/compiler" && "$stage1" $2 build main.arche "$work/$1/stage2/arche.o")
+        (cd "$work/$1/stage2" && "$LLD" -static -o arche arche.o "$rt")
+        echo "bootstrap: stage3 by the own backend ($1), built by stage2"
+        (cd "$root/compiler" && "$work/$1/stage2/arche" $2 build main.arche "$work/$1/stage3/arche.o")
+        (cd "$work/$1/stage3" && "$LLD" -static -o arche arche.o "$rt")
+        if cmp -s "$work/$1/stage2/arche" "$work/$1/stage3/arche"; then
+            echo "bootstrap: with the own backend ($1), stage2 and stage3 are bit-identical"
+            sha256sum "$work/$1/stage3/arche"
+        else
+            echo "bootstrap: with the own backend ($1), stage2 and stage3 differ"
+            exit 1
+        fi
+    }
+    own_chain own ""
+    own_chain own-lib --lib-std
+    mkdir -p "$work/own/check"
+    (cd "$root/compiler" && "$work/own/stage3/arche" build main.arche "$work/own/check/arche.ll")
+    if cmp -s "$work/own/check/arche.ll" "$work/stage3/arche.ll"; then
+        echo "bootstrap: the compiler the own backend built builds what the others do"
+    else
+        echo "bootstrap: the compiler the own backend built writes other LLVM IR"
+        exit 1
+    fi
 fi

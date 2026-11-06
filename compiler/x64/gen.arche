@@ -21,6 +21,7 @@
 import alloc;
 import ir.ir;
 import x64.code as cd;
+import x64.dwarf;
 import x64.elf;
 import x64.inline;
 
@@ -86,8 +87,25 @@ pub type Gen = struct {
     used_saved: alloc.List(bool),
     frame: i32,
     outgoing: u32,
+    /// For debug info: the rows of the line table and the variables' places,
+    /// of all functions, and what each call returns to, for a stack trace.
+    rows: alloc.List(dwarf.LineRow),
+    places: alloc.List(dwarf.VarPlace),
+    functions: alloc.List(dwarf.FnInfo),
+    current_line: u32,
+    body_begun: bool,
+    rows_start: usize,
+    fn_calls: alloc.List(dwarf.LineRow),
+    calls: alloc.List(SourceCall),
     pub problem: alloc.String,
     a: alloc.Allocator,
+}
+
+/// A call, for the runtime's stack trace: where it returns to, in .text.
+pub type SourceCall = struct {
+    pub pc: u64,
+    pub line: u32,
+    pub function: u32,
 }
 
 fn saved_reg(k: usize) -> u8 {
@@ -1255,6 +1273,7 @@ fn gen_call(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, i: ir.Inst) {
     } else {
         cd.call_symbol(&mut g.code, g.fn_symbols[i.imm as usize]);
     }
+    g.fn_calls.push(dwarf.LineRow { offset: cd.here(&g.code) as u32, line: i.line });
     if i.ty == ir.Ty.Void {
         return;
     }
@@ -1759,8 +1778,43 @@ fn gen_terminator(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst, next: u32) 
     }
 }
 
+/// The code from here on comes from this line.
+fn note_line(g: &mut Gen, line: u32) {
+    if line == 0 or line == g.current_line {
+        return;
+    }
+    place_row(g, line);
+}
+
+fn place_row(g: &mut Gen, line: u32) {
+    g.current_line = line;
+    let at = cd.here(&g.code) as u32;
+    let n = g.rows.len();
+    if n > g.rows_start + 1 and g.rows[n - 1].offset == at {
+        g.rows[n - 1].line = line;
+    } else {
+        g.rows.push(dwarf.LineRow { offset: at, line: line });
+    }
+}
+
 fn gen_inst(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, next: u32) {
     let i = f.insts[id as usize];
+    match i.op {
+        .Const | .Param | .Alloca | .Global | .VTable | .OverflowBit | .AsmOut => { }
+        _ => {
+            // The body starts a row of its own, even on the function's line.
+            if id >= f.body_start and not g.body_begun {
+                g.body_begun = true;
+                var first = i.line;
+                if first == 0 {
+                    first = g.current_line;
+                }
+                place_row(g, first);
+            } else {
+                note_line(g, i.line);
+            }
+        }
+    }
     match i.op {
         .Const | .Param | .Alloca | .Global | .VTable | .OverflowBit | .AsmOut => { }
         .Gep => {
@@ -1903,11 +1957,15 @@ fn gen_function(g: &mut Gen, m: &ir.Module, f: &ir.Function, index: usize) {
     g.code.relocs.clear();
     g.fix_at.clear();
     g.fix_block.clear();
+    g.fn_calls.clear();
+    g.rows_start = g.rows.len();
+    let places_start = g.places.len() as u32;
     plan(g, f);
     // The registers kept for the caller have the first places in the frame.
     g.frame = 40;
     allocate(g, f);
     layout(g, f);
+    note_places(g, f);
     if f.no_frame {
         // naked: its asm and nothing else.
         var b: usize = 0;
@@ -1922,7 +1980,16 @@ fn gen_function(g: &mut Gen, m: &ir.Module, f: &ir.Function, index: usize) {
             }
         }
     } else {
+        // The first row is the function's own line; the second, where its
+        // frame is ready, is where a debugger stops when told to stop in it.
+        var first_line = f.line;
+        if first_line == 0 and f.insts.len() > 0 {
+            first_line = f.insts[0].line;
+        }
+        g.rows.push(dwarf.LineRow { offset: 0, line: first_line });
         prologue(g, f);
+        g.current_line = first_line;
+        g.body_begun = false;
         var b: usize = 0;
         while b < f.blocks.len() : (b += 1) {
             g.block_offsets[b] = cd.here(&g.code);
@@ -1942,6 +2009,35 @@ fn gen_function(g: &mut Gen, m: &ir.Module, f: &ir.Function, index: usize) {
         }
     }
     place_code(g, f, index);
+    if not f.no_frame {
+        g.functions.push(dwarf.FnInfo {
+            index: index as u32,
+            symbol: g.fn_symbols[index],
+            size: g.code.bytes.len() as u64,
+            rows_start: g.rows_start as u32,
+            rows_len: (g.rows.len() - g.rows_start) as u32,
+            places_start: places_start,
+            places_len: g.places.len() as u32 - places_start,
+        });
+    }
+}
+
+/// Where the function's variables are, as far as the debugger can be told:
+/// in the frame, or behind a pointer that came as a parameter.
+fn note_places(g: &mut Gen, f: &ir.Function) {
+    var k: usize = 0;
+    while k < f.vars.len() : (k += 1) {
+        let addr = f.vars[k].addr;
+        let kind = g.kinds[addr as usize];
+        if kind == V_ADDR {
+            let root = g.addr_root[addr as usize];
+            if f.insts[root as usize].op == ir.Op.Alloca and f.insts[root as usize].flag <= 16 {
+                g.places.push(dwarf.VarPlace { index: k as u32, disp: g.disps[root as usize] + g.addr_off[addr as usize] as i32, deref: false });
+            }
+        } else if kind == V_PARAM {
+            g.places.push(dwarf.VarPlace { index: k as u32, disp: g.homes[f.insts[addr as usize].imm as usize], deref: true });
+        }
+    }
 }
 
 /// The function's code into its section, and its symbol at it.
@@ -1973,6 +2069,12 @@ fn place_code(g: &mut Gen, f: &ir.Function, index: usize) {
     i = 0;
     while i < rs.len() : (i += 1) {
         g.obj.sections[sec].relocs.push(cd.Reloc { offset: start + rs[i].offset, symbol: rs[i].symbol, kind: rs[i].kind, addend: rs[i].addend });
+    }
+    if section == g.text and not f.no_frame {
+        var q: usize = 0;
+        while q < g.fn_calls.len() : (q += 1) {
+            g.calls.push(SourceCall { pc: start + g.fn_calls[q].offset as u64, line: g.fn_calls[q].line, function: g.functions.len() as u32 });
+        }
     }
     let sym = g.fn_symbols[index] as usize;
     g.obj.symbols[sym].section = section;
@@ -2069,6 +2171,65 @@ fn write_data(g: &mut Gen, m: &ir.Module) {
     }
 }
 
+/// The tables a panic's stack trace reads (compiler/runtime/linux.inc): the
+/// calls, by the address each returns to, and the functions they are in.
+fn write_source_map(g: &mut Gen, m: &ir.Module) {
+    let ro = g.rodata as usize;
+    let text_symbol = g.obj.sections[g.text as usize].symbol;
+    let ro_symbol = g.obj.sections[ro].symbol;
+    let table = begin_data_symbol(g, "a0_source_calls");
+    var i: usize = 0;
+    while i < g.calls.len() : (i += 1) {
+        let at = g.obj.sections[ro].bytes.len() as u64;
+        let call = g.calls[i];
+        g.obj.sections[ro].relocs.push(cd.Reloc { offset: at, symbol: text_symbol, kind: cd.R_X86_64_32, addend: call.pc as i64 });
+        elf.put32(&mut g.obj.sections[ro].bytes, 0);
+        elf.put32(&mut g.obj.sections[ro].bytes, call.line);
+        elf.put32(&mut g.obj.sections[ro].bytes, call.function);
+    }
+    end_data_symbol(g, table);
+    let count = begin_data_symbol(g, "a0_source_call_count");
+    elf.put64(&mut g.obj.sections[ro].bytes, g.calls.len() as u64);
+    end_data_symbol(g, count);
+    // Names go first, so that the table of functions is in one piece.
+    var names = alloc.List(u64).init(g.a);
+    var files = alloc.List(u64).init(g.a);
+    i = 0;
+    while i < m.files.len() : (i += 1) {
+        files.push(g.obj.sections[ro].bytes.len() as u64);
+        put_bytes(g, m.files.items()[i].view().bytes());
+    }
+    i = 0;
+    while i < g.functions.len() : (i += 1) {
+        names.push(g.obj.sections[ro].bytes.len() as u64);
+        let fun = &m.functions[g.functions[i].index as usize];
+        if fun.source_name.len() > 0 {
+            put_bytes(g, fun.source_name.view().bytes());
+        } else {
+            put_bytes(g, fun.name.view().bytes());
+        }
+    }
+    let functions = begin_data_symbol(g, "a0_source_functions");
+    i = 0;
+    while i < g.functions.len() : (i += 1) {
+        let fun = &m.functions[g.functions[i].index as usize];
+        put_pointer(g, symbol: ro_symbol, addend: names[i] as i64);
+        var name_len = fun.source_name.len() as u64;
+        if name_len == 0 {
+            name_len = fun.name.len() as u64;
+        }
+        elf.put64(&mut g.obj.sections[ro].bytes, name_len);
+        if fun.file == ir.NO_FILE {
+            put_pointer(g, symbol: ro_symbol, addend: 0);
+            elf.put64(&mut g.obj.sections[ro].bytes, 0);
+        } else {
+            put_pointer(g, symbol: ro_symbol, addend: files[fun.file as usize] as i64);
+            elf.put64(&mut g.obj.sections[ro].bytes, m.files.items()[fun.file as usize].len() as u64);
+        }
+    }
+    end_data_symbol(g, functions);
+}
+
 /// The program as an ELF object, or nothing, with g.problem saying why.
 pub fn object(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> alloc.List(u8) {
     var obj = elf.Object.init(a);
@@ -2117,6 +2278,14 @@ pub fn object(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> 
         used_saved: alloc.List(bool).init(a),
         frame: 0,
         outgoing: 0,
+        rows: alloc.List(dwarf.LineRow).init(a),
+        places: alloc.List(dwarf.VarPlace).init(a),
+        functions: alloc.List(dwarf.FnInfo).init(a),
+        current_line: 0,
+        body_begun: false,
+        rows_start: 0,
+        fn_calls: alloc.List(dwarf.LineRow).init(a),
+        calls: alloc.List(SourceCall).init(a),
         problem: alloc.String.init(a),
         a: a,
     };
@@ -2158,5 +2327,7 @@ pub fn object(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> 
         problem.push_str(g.problem.view());
         return alloc.List(u8).init(a);
     }
+    write_source_map(&mut g, m);
+    dwarf.write(&mut g.obj, m, fns: g.functions.items(), rows: g.rows.items(), places: g.places.items(), a: a);
     return elf.write(&g.obj, a);
 }

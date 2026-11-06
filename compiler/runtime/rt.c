@@ -54,6 +54,9 @@ static u64 os_fiber_saved(void);   // which of them a0rt_ctx_switch returns thro
 static void os_poll(const i64 *handles, const short *events, u8 *ready, u64 n);
 // the test runner: a child process for each test
 static void os_test_child(System *sys);
+// a panic: how it got there, when the program knows (the own backend's table)
+static void os_stack_trace(void);
+static int stack_trace_off;
 static void os_start_test(System *sys, u64 i, u64 seed, Run *r);
 static void os_collect(Run *runs, u64 count);
 
@@ -704,6 +707,7 @@ void a0rt_die(const char *message, u64 len) {
     a0rt_write(&err_fd, (const u8 *)"panic: ", 7);
     a0rt_write(&err_fd, (const u8 *)message, len);
     a0rt_write(&err_fd, (const u8 *)"\n", 1);
+    os_stack_trace();
     exit_with(101);
 }
 
@@ -1018,6 +1022,7 @@ _Noreturn void a0rt_trap(const u8 *message, u64 len, const u8 *file, u64 file_le
     a0rt_write_byte(&err_fd, ':');
     a0rt_write_u64(&err_fd, col);
     a0rt_write_byte(&err_fd, '\n');
+    os_stack_trace();
     if (current_fiber != &main_fiber) {
         // A task's panic ends the task; its scope reports it (spec §9).
         flush_all();
@@ -1519,6 +1524,8 @@ struct Run {
 // Runs the test numbered i with the run's seed, in the child process the
 // system made for it (os_start_test).
 static void run_test(System *sys, u64 i, u64 seed) {
+    // A test says where it failed; what a run reports is the same for every backend.
+    stack_trace_off = 1;
     const TestEntry *t = &a0_tests[i];
     // std.testing.Test: {seed, system}.
     u64 test[2] = {mix(seed ^ mix(i)), (u64)sys};

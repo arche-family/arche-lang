@@ -673,6 +673,10 @@ static void os_collect(Run *runs, u64 count) {
     r->state = 2;
 }
 
+// Windows's builds go through LLVM, whose code keeps no frame pointers.
+static void os_stack_trace(void) {
+}
+
 // ---- entry ------------------------------------------------------------------------
 //
 // Windows starts the program here, with no arguments: the command line is

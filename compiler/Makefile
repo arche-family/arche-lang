@@ -30,6 +30,15 @@ $(BUILD)/arche: $(SOURCES) $(STAGE0)/runtime/arche0_rt.c $(STAGE0)/runtime/arche
 $(BUILD):
 	mkdir -p $@
 
+# The compiler's own backend (x64/gen.arche): all the tests again, built with
+# no LLVM, and what they do not look at. Needs lld, and gdb for the session.
+check-own: $(BUILD)/arche
+	$(MAKE) -C ../conformance
+	ARCHE_BACKEND=own ../conformance/runner/build/runner --timeout 30 --compiler "$(BUILD_CMD)" ../conformance/tests
+	ARCHE_BACKEND=own ../conformance/runner/build/runner --timeout 30 --compiler "$(TESTS_CMD)" ../conformance/testrunner
+	ARCHE_BACKEND=own sh ./differential.sh ../conformance/tests
+	sh ./own-check.sh
+
 check: $(BUILD)/arche
 	$(MAKE) -C ../conformance
 	../conformance/runner/build/runner --timeout 30 --compiler "$(BUILD_CMD)" ../conformance/tests
@@ -47,4 +56,4 @@ clean:
 differential: $(BUILD)/arche
 	sh ./differential.sh ../conformance/tests
 
-.PHONY: all check differential clean
+.PHONY: all check differential clean check-own

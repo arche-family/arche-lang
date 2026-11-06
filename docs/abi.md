@@ -1,6 +1,6 @@
 # Arche ABI, version 0
 
-This is the binary interface of code the Arche compiler builds: layouts, calling convention, symbol names and the runtime it calls. Version 0 covers Arche-0 on x86-64, built through LLVM (sprint S8), for Linux and for Windows (S19). It changes only with a major release once it is stable (S29).
+This is the binary interface of code the Arche compiler builds: layouts, calling convention, symbol names and the runtime it calls. Version 0 covers Arche-0 on x86-64, built through LLVM (sprint S8) or by the compiler's own backend (S27), for Linux and for Windows (S19). It changes only with a major release once it is stable (S29).
 
 Layouts, the calling convention and symbol names are the same on both systems; what differs is the runtime underneath and the file the library's `std` comes from, which are named where it matters below.
 
@@ -47,6 +47,14 @@ A call through a `&dyn I` loads the method's address from the table and passes t
 ## Units
 
 `arche units <file> <dir>` writes the program as one LLVM module for each of its modules, `<dir>/<n>.ll` in load order, the root module's first, for the build driver (`driver/`), which compiles each to an object kept under the SHA-256 of its text. A unit defines its module's functions, and declares those of other modules it calls; a function another unit calls, or reaches through a method table, is not `internal`. Each unit has its own copies of the strings and method tables it uses, numbered by first use, and names its module in `source_filename`, so its text, and the object made from it, depend on its module alone. The root unit also defines `a0_error_names` and, in a test build, `a0_tests`. Objects are compiled with `-ffunction-sections -fdata-sections` and linked with `--gc-sections`, which drops the functions nothing reaches.
+
+## The own backend
+
+`arche build <file> <out>.o` writes an ELF object with no LLVM (`compiler/x64/`), for a debug build on Linux, for `lld` to link with the runtime; `ARCHE_BACKEND=own` makes the build scripts and `arche-driver` do so. Layouts, the calling convention and symbols are the ones above: it is the System V ABI for the scalars the IR has, so its code and the runtime's C call each other, and an argument narrower than 4 bytes is zero-extended, as C expects.
+
+Its frames are rbp-based. A value lives in rbx or r12 to r15, a float in xmm8 to xmm13 or memory across a call; the other registers belong to the instruction being written. The object has DWARF 4: lines, functions, parameters and local variables, their types, and `.debug_frame`. A variable is known in its whole function, since scopes are not told.
+
+It also defines `a0_source_calls` (`{pc: u32, line: u32, function: u32}`, by the address each call returns to), `a0_source_call_count` and `a0_source_functions` (`{name: str, file: str}`). A panic's stack trace reads them, walking the frame pointers through the runtime too, which is built with them for this: each frame adds a line `  in <function> (<file>:<line>)` after the panic's place. A test does not, so that what a run reports is the same for every backend. Other programs have no tables, and nothing is added.
 
 ## Systems
 

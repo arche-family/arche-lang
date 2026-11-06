@@ -53,6 +53,9 @@ pub type Options = struct {
     pub tests: bool,
     /// A release build: the IR is optimized (ir/opt.arche).
     pub release: bool,
+    /// An object from the compiler's own backend: lines, variables and types
+    /// are kept for its debug info.
+    pub debug_info: bool,
     /// Files whose text is elsewhere: an editor's unsaved buffers.
     pub overlays: alloc.List(Overlay),
     /// The package's root, when the file is not at it; empty: its directory.
@@ -170,6 +173,7 @@ pub type Program = struct {
     pub target: Target,
     pub panic_handler: alloc.String,
     pub tests: bool,
+    pub debug_info: bool,
     /// Whether the checker keeps where each name is used (arche query).
     pub record_uses: bool,
     /// The root file need not have a main (Options.no_main).
@@ -482,6 +486,7 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
         target: opts.target,
         panic_handler: handler,
         tests: opts.tests,
+        debug_info: opts.debug_info,
         record_uses: false,
         no_main: opts.no_main,
         manifest: manifest.defaults(a),

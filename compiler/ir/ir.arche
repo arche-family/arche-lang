@@ -180,7 +180,45 @@ pub type Inst = struct {
     pub flag: u32,
     pub args_start: u32,
     pub args_len: u32,
+    /// The source line it comes from, for debug info; 0 for none.
+    pub line: u32,
 }
+
+/// A local variable or a parameter, for debug info: addr is the value that
+/// holds its address.
+pub type DebugVar = struct {
+    pub name: alloc.String,
+    pub addr: u32,
+    pub type_index: u32,
+    pub line: u32,
+    pub is_param: bool,
+}
+
+pub const DEBUG_BASE: u8 = 0;
+pub const DEBUG_POINTER: u8 = 1;
+pub const DEBUG_STRUCT: u8 = 2;
+pub const DEBUG_ARRAY: u8 = 3;
+
+pub type DebugMember = struct {
+    pub name: alloc.String,
+    pub type_index: u32,
+    pub offset: u64,
+}
+
+/// A type as a debugger is told of it.
+pub type DebugType = struct {
+    pub kind: u8,
+    pub name: alloc.String,
+    pub size: u64,
+    /// A base type's: DWARF's DW_ATE number.
+    pub encoding: u8,
+    /// What a pointer points to, and an array's elements.
+    pub target: u32,
+    pub count: u64,
+    pub members: alloc.List(DebugMember),
+}
+
+pub const NO_FILE: u32 = 4294967295;
 
 pub type Block = struct {
     pub insts: alloc.List(u32),
@@ -205,6 +243,15 @@ pub type Function = struct {
     /// Optimized (opt.arche): it has phis, and an operand may be numbered
     /// after its user, as long as its definition dominates the use.
     pub ssa: bool,
+    /// For debug info: its file (in the module's files, or NO_FILE), the
+    /// line it is declared on, its name in the source, and its variables.
+    pub file: u32,
+    pub line: u32,
+    pub source_name: alloc.String,
+    pub vars: alloc.List(DebugVar),
+    /// The first instruction after its parameters are in place: where a
+    /// debugger stops when told to stop in it.
+    pub body_start: u32,
 }
 
 pub type External = struct {
@@ -265,6 +312,9 @@ pub type Module = struct {
     /// A test build: the table a0_tests of the runner, one entry a test.
     pub test_mode: bool,
     pub tests: alloc.List(TestEntry),
+    /// For debug info.
+    pub files: alloc.List(alloc.String),
+    pub debug_types: alloc.List(DebugType),
     a: alloc.Allocator,
 
     pub fn init(a: alloc.Allocator) -> Module {
@@ -278,6 +328,8 @@ pub type Module = struct {
             triple: alloc.String.init(a),
             test_mode: false,
             tests: alloc.List(TestEntry).init(a),
+            files: alloc.List(alloc.String).init(a),
+            debug_types: alloc.List(DebugType).init(a),
             a: a,
         };
     }
@@ -364,13 +416,18 @@ pub fn new_function(name: str, ret: Ty, a: alloc.Allocator) -> Function {
         section: alloc.String.init(a),
         stub: false,
         ssa: false,
+        file: NO_FILE,
+        line: 0,
+        source_name: alloc.String.init(a),
+        vars: alloc.List(DebugVar).init(a),
+        body_start: 0,
     };
     f.blocks.push(Block { insts: alloc.List(u32).init(a) });
     return f;
 }
 
 pub fn inst(op: Op, ty: Ty) -> Inst {
-    return Inst { op: op, ty: ty, a: 0, b: 0, c: 0, imm: 0, flag: 0, args_start: 0, args_len: 0 };
+    return Inst { op: op, ty: ty, a: 0, b: 0, c: 0, imm: 0, flag: 0, args_start: 0, args_len: 0, line: 0 };
 }
 
 pub fn is_terminator(op: Op) -> bool {

@@ -1,0 +1,36 @@
+// What own-check.sh asks gdb about, and a panic's stack trace. Its lines are
+// counted there.
+import std;
+
+type Point = struct {
+    x: i32,
+    y: i32,
+}
+
+fn add(a: i32, b: i32) -> i32 {
+    let sum = a + b;
+    return sum;
+}
+
+fn norm(p: Point, label: str) -> i32 {
+    let square = p.x * p.x + p.y * p.y;
+    return square;
+}
+
+fn boom(n: u32) -> u32 {
+    let zero: u32 = n - n;
+    return n / zero;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var total: i32 = 0;
+    var i: i32 = 0;
+    while i < 3 : (i += 1) {
+        total = add(a: total, b: i);
+    }
+    let p = Point { x: 3, y: 4 };
+    total = total + norm(p, label: "here");
+    sys.stdout.write_i64(total as i64);
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(boom(7) as u64);
+}

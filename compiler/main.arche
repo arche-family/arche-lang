@@ -12,6 +12,8 @@
 ///     arche complete <file> <line>:<column>   what may be written there, as JSON
 ///     arche doc <file> <module>     its public items and their comments, as Markdown
 ///     arche build <file> <out.ll>   compile it to LLVM IR (arche-build links it)
+///     arche build <file> <out.o>    compile it to an object, with no LLVM
+///                                   (x64/gen.arche, for a debug build on Linux)
 ///     arche units <file> <dir>      the same, one LLVM module per module (arche-driver)
 ///     arche build-plan <build.arche>   the programs a build file lists
 ///     arche manifest <package.arche>   what a manifest says, a field a line
@@ -55,11 +57,11 @@ fn usage(err_out: &mut std.Output) -> Failure!void {
     err_out.write("       arche doc --tests <file> <module> <out.arche>   its examples, as tests\n");
     err_out.write("       arche tokens <file>\n");
     err_out.write("       arche cst <file>\n");
-    err_out.write("       arche build <file> <out.ll>\n");
+    err_out.write("       arche build <file> <out.ll | out.o>   LLVM IR, or an object from the compiler's own backend\n");
     err_out.write("       arche units <file> <dir>       one LLVM module per module, for arche-driver\n");
     err_out.write("       arche build-plan <build.arche>  the programs it lists, as name<TAB>root lines\n");
     err_out.write("       arche manifest <package.arche>  its fields, one a line, for arche-driver\n");
-    err_out.write("       arche test <file> <out.ll>     the test blocks of <file>, run by std.testing\n");
+    err_out.write("       arche test <file> <out.ll | out.o>   the test blocks of <file>, run by std.testing\n");
     err_out.write("options, before the command: --overlay <file> <text-file>, --package <dir>, --no-main, --release, --lib-alloc, --lib-std,\n");
     err_out.write("       --target <linux-x86_64 | windows-x86_64 |\n");
     err_out.write("       freestanding-x86_64 | freestanding-riscv64>,\n");
@@ -771,6 +773,11 @@ fn optimize_all(m: &mut ir.Module, a: alloc.Allocator) {
     }
 }
 
+/// An output of this name is an object: the compiler's own backend writes it.
+fn names_object(path: str) -> bool {
+    return path.len() > 2 and path[path.len() - 2..path.len()].eq(".o");
+}
+
 fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, out_path: str, opts: &program.Options) -> Failure!void {
     let source = try read(fs, err_out, path, a);
     let p = program.load(fs, path: path, source, a, opts);
@@ -804,7 +811,7 @@ fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, o
         }
     }
     // An object is this compiler's own backend's work; text is for LLVM.
-    if out_path.len() > 2 and out_path[out_path.len() - 2..out_path.len()].eq(".o") {
+    if names_object(out_path) {
         if opts.target != program.Target.LinuxX86_64 or opts.release {
             err_out.write("arche: this compiler writes objects for a debug build on linux-x86_64; for the others, give it a .ll file\n");
             return Failure.BadUsage;
@@ -1073,6 +1080,7 @@ fn main(sys: &mut std.System) -> !void {
         panic_handler: alloc.String.init(sys.alloc),
         tests: false,
         release: false,
+        debug_info: false,
         overlays: alloc.List(program.Overlay).init(sys.alloc),
         package: alloc.String.init(sys.alloc),
         no_main: false,
@@ -1152,10 +1160,12 @@ fn main(sys: &mut std.System) -> !void {
     } else if command.eq("tokens") and count == 3 {
         try dump_tokens(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));
     } else if command.eq("build") and count == 4 {
+        opts.debug_info = names_object(sys.args.get(3 + k));
         try build(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), out_path: sys.args.get(3 + k), opts: &opts);
     } else if command.eq("test") and count == 4 {
         // The root module's test blocks and a runner (std.testing).
         opts.tests = true;
+        opts.debug_info = names_object(sys.args.get(3 + k));
         try build(err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k), out_path: sys.args.get(3 + k), opts: &opts);
     } else if command.eq("cst") and count == 3 {
         try print_cst(out: &mut sys.stdout, err_out: &mut sys.stderr, fs: &sys.fs, a: sys.alloc, path: sys.args.get(2 + k));

@@ -322,6 +322,72 @@ static void os_collect(Run *runs, u64 count) {
 // ---- entry ------------------------------------------------------------------------
 
 // The kernel starts the program here, with argc at the top of the stack.
+// ---- a panic's stack trace -----------------------------------------------------------
+//
+// A program from the compiler's own backend has a table of its calls, by the
+// address each returns to, and keeps frame pointers. Others have no table, and
+// these names are then 0.
+typedef struct {
+    u32 pc;
+    u32 line;
+    u32 function;
+} SourceCall;
+
+typedef struct {
+    const u8 *name;
+    u64 name_len;
+    const u8 *file;
+    u64 file_len;
+} SourceFunction;
+
+extern const SourceCall a0_source_calls[] __attribute__((weak));
+extern const u64 a0_source_call_count __attribute__((weak));
+extern const SourceFunction a0_source_functions[] __attribute__((weak));
+
+static const SourceCall *source_call_at(u64 pc) {
+    u64 lo = 0;
+    u64 hi = a0_source_call_count;
+    while (lo < hi) {
+        u64 mid = (lo + hi) / 2;
+        if (a0_source_calls[mid].pc == pc) {
+            return &a0_source_calls[mid];
+        }
+        if (a0_source_calls[mid].pc < pc) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return 0;
+}
+
+static void os_stack_trace(void) {
+    if (!a0_source_calls || stack_trace_off) {
+        return;
+    }
+    const u64 *frame = __builtin_frame_address(0);
+    for (int depth = 0; frame && depth < 64; depth++) {
+        const SourceCall *call = source_call_at(frame[1]);
+        const SourceFunction *f = call ? &a0_source_functions[call->function] : 0;
+        // The runtime's own frames are not in the table, nor is a0_entry in a file.
+        if (f && f->file_len > 0) {
+            a0rt_write(&err_fd, (const u8 *)"  in ", 5);
+            a0rt_write(&err_fd, f->name, f->name_len);
+            a0rt_write(&err_fd, (const u8 *)" (", 2);
+            a0rt_write(&err_fd, f->file, f->file_len);
+            a0rt_write_byte(&err_fd, ':');
+            a0rt_write_u64(&err_fd, call->line);
+            a0rt_write(&err_fd, (const u8 *)")\n", 2);
+        }
+        // A frame's parent is above it; 0 at the bottom of a stack.
+        const u64 *parent = (const u64 *)frame[0];
+        if (parent <= frame || ((u64)parent & 7) != 0) {
+            break;
+        }
+        frame = parent;
+    }
+}
+
 _Noreturn void a0rt_start(i64 *sp) {
     i64 argc = sp[0];
     char **argv = (char **)(sp + 1);

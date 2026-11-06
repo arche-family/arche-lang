@@ -305,8 +305,72 @@ fn object_with(sys: &mut std.System, tools: &Tools, source: str, also: &alloc.Li
     return file;
 }
 
+/// Builds one program with the compiler's own backend, as ARCHE_BACKEND=own
+/// asks (docs/sprints.md S27): one object with its debug info and no LLVM, so
+/// quick that a cache of modules would have nothing to save. The runtime is
+/// still C, and has frame pointers for a panic's stack trace to walk.
+fn build_own(sys: &mut std.System, tools: &Tools, dir: str, name: str, root: str, a: alloc.Allocator) -> Failed!alloc.String {
+    let out_dir = join(dir: dir, name: "build", a);
+    let cache = join(dir: out_dir.view(), name: "cache", a);
+    make_dirs(&sys.fs, dir: cache.view(), a: a);
+    var object_name = alloc.String.init(a);
+    object_name.push_str(name);
+    object_name.push_str(".o");
+    let object_file = join(dir: out_dir.view(), name: object_name.view(), a);
+    let log = join(dir: out_dir.view(), name: "link.log", a);
+    var argv = alloc.List(alloc.String).init(a);
+    argv.push(text_of(tools.arche.view().bytes(), a));
+    argv.push(text_of("build".bytes(), a));
+    argv.push(join(dir: dir, name: root, a));
+    argv.push(text_of(object_file.view().bytes(), a));
+    if try run(sys, argv: &argv, out_path: log.view(), a) != 0 {
+        let msg = sys.fs.read_file(log.view(), a) catch alloc.String.init(a);
+        sys.stderr.write(msg.view());
+        return Failed.Failed;
+    }
+    var flags = copy_text(runtime_flags(), a);
+    flags.push_str(" -fno-omit-frame-pointer");
+    var includes = alloc.List(alloc.String).init(a);
+    includes.push(join(dir: parent(tools.runtime.view()), name: "math.inc", a));
+    includes.push(join(dir: parent(tools.runtime.view()), name: "linux.inc", a));
+    includes.push(join(dir: parent(tools.runtime.view()), name: "windows.inc", a));
+    var rt_hits: u32 = 0;
+    let rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: &includes, flags: flags.view(), cache: cache.view(), hits: &mut rt_hits, a: a);
+    let lld = sys.env.get("LLD", a) orelse copy_text("ld.lld", a);
+    let program = join(dir: out_dir.view(), name: name, a);
+    var tmp = copy_text(program.view(), a);
+    tmp.push_str(".tmp");
+    var link = alloc.List(alloc.String).init(a);
+    link.push(text_of(lld.view().bytes(), a));
+    link.push(text_of("-static".bytes(), a));
+    link.push(text_of("-o".bytes(), a));
+    link.push(text_of(tmp.view().bytes(), a));
+    link.push(text_of(object_file.view().bytes(), a));
+    link.push(text_of(rt.view().bytes(), a));
+    if try run(sys, argv: &link, out_path: log.view(), a) != 0 {
+        sys.stderr.write("arche-driver: the link failed:\n");
+        let msg = sys.fs.read_file(log.view(), a) catch alloc.String.init(a);
+        sys.stderr.write(msg.view());
+        return Failed.Failed;
+    }
+    _ = sys.fs.rename(from: tmp.view(), to: program.view());
+    sys.stdout.write(name);
+    sys.stdout.write(": built by the compiler's own backend\n");
+    return program;
+}
+
+fn copy_text(t: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str(t);
+    return s;
+}
+
 /// Builds one program; its path.
 fn build_program(sys: &mut std.System, tools: &Tools, dir: str, name: str, root: str, a: alloc.Allocator) -> Failed!alloc.String {
+    let backend = sys.env.get("ARCHE_BACKEND", a) orelse alloc.String.init(a);
+    if backend.view().eq("own") {
+        return build_own(sys, tools: tools, dir: dir, name: name, root: root, a: a);
+    }
     let out_dir = join(dir: dir, name: "build", a);
     let cache = join(dir: out_dir.view(), name: "cache", a);
     let units_dir = join(dir: join(dir: out_dir.view(), name: "units", a).view(), name: name, a);

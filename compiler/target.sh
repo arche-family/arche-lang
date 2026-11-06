@@ -23,7 +23,8 @@ fi
 case $ARCHE_TARGET in
 linux-x86_64)
     TARGET_FLAG=
-    RT_FLAGS="-fno-pie"
+    # With frame pointers, so that a panic's stack trace walks through it.
+    RT_FLAGS="-fno-pie -fno-omit-frame-pointer"
     LINK_FLAGS="-nostdlib -static -fno-pie"
     GC_FLAGS="-Wl,--gc-sections"
     ;;

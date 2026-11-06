@@ -665,7 +665,10 @@ fn value_of(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
             return lw.load_val(l, t, p);
         }
         .RefExpr => { return scalar_val(address(l, child(l, e, 0))); }
-        .CallExpr => { return call(l, e); }
+        .CallExpr => {
+            lw.at_line(l, e);
+            return call(l, e);
+        }
         .StructLit => { return struct_lit(l, e); }
         .ArrayRepeat => {
             // The slot starts zeroed (alloca); other values are stored in a loop.

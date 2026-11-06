@@ -29,6 +29,10 @@ jobs:
         run: cd /tmp && python3 -I $GITHUB_WORKSPACE/compiler/fuzz.py $GITHUB_WORKSPACE/compiler/build/arche 60
       - name: Differential, stage0 against the Arche compiler
         run: make -C compiler differential CC=${{ matrix.cc }}
+      - name: Install lld and gdb
+        run: sudo apt-get update && sudo apt-get install -y lld gdb
+      - name: The compiler's own backend, all the tests, and a session in gdb
+        run: REQUIRE_GDB=1 make -C compiler check-own CC=${{ matrix.cc }}
       - name: Bootstrap, stage2 == stage3
         run: CC=${{ matrix.cc }} ./bootstrap.sh
 
@@ -109,6 +113,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install lld
+        run: sudo apt-get update && sudo apt-get install -y lld
       - name: Build the Arche compiler and the driver
         run: make -C stage0 && make -C compiler && make -C conformance && make -C driver
       - name: Cached builds, signed packages over HTTPS, a language server session

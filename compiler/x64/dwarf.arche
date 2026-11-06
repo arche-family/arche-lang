@@ -1,0 +1,477 @@
+/// Debug info for the compiler's own backend, DWARF 4: lines (.debug_line),
+/// functions, variables and types (.debug_info, .debug_abbrev), and how to
+/// walk the stack (.debug_frame). Every frame is rbp-based, and a variable
+/// lives in the frame, or behind a pointer that does: there is no optimizer
+/// to follow. Scopes are not told: a variable is known in its whole function.
+import alloc;
+import ir.ir;
+import x64.code as cd;
+import x64.elf;
+
+pub type LineRow = struct {
+    pub offset: u32,
+    pub line: u32,
+}
+
+/// A variable's place: disp from rbp, and whether a pointer is there.
+pub type VarPlace = struct {
+    pub index: u32,
+    pub disp: i32,
+    pub deref: bool,
+}
+
+/// What the backend wrote of a function.
+pub type FnInfo = struct {
+    pub index: u32,
+    pub symbol: u32,
+    pub size: u64,
+    pub rows_start: u32,
+    pub rows_len: u32,
+    pub places_start: u32,
+    pub places_len: u32,
+}
+
+fn uleb(b: &mut alloc.List(u8), v: u64) {
+    var rest = v;
+    while true {
+        let low = (rest & 0x7F) as u8;
+        rest = rest >> 7;
+        if rest == 0 {
+            b.push(low);
+            return;
+        }
+        b.push(low | 0x80);
+    }
+}
+
+fn sleb(b: &mut alloc.List(u8), v: i64) {
+    var rest = v;
+    while true {
+        // The low seven bits, in the two's complement of what is left.
+        var low: i64 = rest % 128;
+        if low < 0 {
+            low += 128;
+        }
+        // Rounding down, so that a negative number ends in -1.
+        rest = (rest - low) / 128;
+        let sign = low >= 64;
+        if (rest == 0 and not sign) or (rest == -1 and sign) {
+            b.push(low as u8);
+            return;
+        }
+        b.push(low as u8 | 0x80);
+    }
+}
+
+fn text(b: &mut alloc.List(u8), t: str) {
+    let bytes = t.bytes();
+    var i: usize = 0;
+    while i < bytes.len() : (i += 1) {
+        b.push(bytes[i]);
+    }
+    b.push(0);
+}
+
+fn abbreviation(b: &mut alloc.List(u8), code: u64, tag: u64, children: bool, pairs: []u64) {
+    uleb(b, code);
+    uleb(b, tag);
+    if children {
+        b.push(1);
+    } else {
+        b.push(0);
+    }
+    var i: usize = 0;
+    while i < pairs.len() : (i += 1) {
+        uleb(b, pairs[i]);
+    }
+    b.push(0);
+    b.push(0);
+}
+
+const ABBREV_UNIT: u64 = 1;
+const ABBREV_FUNCTION: u64 = 2;
+const ABBREV_VARIABLE: u64 = 3;
+const ABBREV_PARAMETER: u64 = 4;
+const ABBREV_BASE: u64 = 5;
+const ABBREV_POINTER: u64 = 6;
+const ABBREV_STRUCT: u64 = 7;
+const ABBREV_MEMBER: u64 = 8;
+const ABBREV_ARRAY: u64 = 9;
+const ABBREV_RANGE: u64 = 10;
+
+const AT_LOCATION: u64 = 0x02;
+const AT_NAME: u64 = 0x03;
+const AT_BYTE_SIZE: u64 = 0x0B;
+const AT_STMT_LIST: u64 = 0x10;
+const AT_LOW_PC: u64 = 0x11;
+const AT_HIGH_PC: u64 = 0x12;
+const AT_LANGUAGE: u64 = 0x13;
+const AT_PRODUCER: u64 = 0x25;
+const AT_COUNT: u64 = 0x37;
+const AT_MEMBER_LOCATION: u64 = 0x38;
+const AT_DECL_FILE: u64 = 0x3A;
+const AT_DECL_LINE: u64 = 0x3B;
+const AT_ENCODING: u64 = 0x3E;
+const AT_FRAME_BASE: u64 = 0x40;
+const AT_TYPE: u64 = 0x49;
+
+const FORM_ADDR: u64 = 0x01;
+const FORM_DATA1: u64 = 0x0B;
+const FORM_DATA2: u64 = 0x05;
+const FORM_STRING: u64 = 0x08;
+const FORM_UDATA: u64 = 0x0F;
+const FORM_REF4: u64 = 0x13;
+const FORM_SEC_OFFSET: u64 = 0x17;
+const FORM_EXPRLOC: u64 = 0x18;
+
+fn put_pairs(l: &mut alloc.List(u64), x: u64, y: u64) {
+    l.push(x);
+    l.push(y);
+}
+
+fn write_abbreviations(o: &mut elf.Object, section: u32, a: alloc.Allocator) {
+    var p = alloc.List(u64).init(a);
+    let b = &mut o.sections[section as usize].bytes;
+    put_pairs(&mut p, x: AT_PRODUCER, y: FORM_STRING);
+    put_pairs(&mut p, x: AT_LANGUAGE, y: FORM_DATA2);
+    put_pairs(&mut p, x: AT_NAME, y: FORM_STRING);
+    put_pairs(&mut p, x: AT_STMT_LIST, y: FORM_SEC_OFFSET);
+    abbreviation(b, code: ABBREV_UNIT, tag: 0x11, children: true, pairs: p.items());
+    p.clear();
+    put_pairs(&mut p, x: AT_NAME, y: FORM_STRING);
+    put_pairs(&mut p, x: AT_DECL_FILE, y: FORM_UDATA);
+    put_pairs(&mut p, x: AT_DECL_LINE, y: FORM_UDATA);
+    put_pairs(&mut p, x: AT_LOW_PC, y: FORM_ADDR);
+    put_pairs(&mut p, x: AT_HIGH_PC, y: FORM_UDATA);
+    put_pairs(&mut p, x: AT_FRAME_BASE, y: FORM_EXPRLOC);
+    abbreviation(b, code: ABBREV_FUNCTION, tag: 0x2E, children: true, pairs: p.items());
+    p.clear();
+    put_pairs(&mut p, x: AT_NAME, y: FORM_STRING);
+    put_pairs(&mut p, x: AT_DECL_FILE, y: FORM_UDATA);
+    put_pairs(&mut p, x: AT_DECL_LINE, y: FORM_UDATA);
+    put_pairs(&mut p, x: AT_TYPE, y: FORM_REF4);
+    put_pairs(&mut p, x: AT_LOCATION, y: FORM_EXPRLOC);
+    abbreviation(b, code: ABBREV_VARIABLE, tag: 0x34, children: false, pairs: p.items());
+    abbreviation(b, code: ABBREV_PARAMETER, tag: 0x05, children: false, pairs: p.items());
+    p.clear();
+    put_pairs(&mut p, x: AT_NAME, y: FORM_STRING);
+    put_pairs(&mut p, x: AT_BYTE_SIZE, y: FORM_UDATA);
+    put_pairs(&mut p, x: AT_ENCODING, y: FORM_DATA1);
+    abbreviation(b, code: ABBREV_BASE, tag: 0x24, children: false, pairs: p.items());
+    p.clear();
+    put_pairs(&mut p, x: AT_BYTE_SIZE, y: FORM_UDATA);
+    put_pairs(&mut p, x: AT_TYPE, y: FORM_REF4);
+    abbreviation(b, code: ABBREV_POINTER, tag: 0x0F, children: false, pairs: p.items());
+    p.clear();
+    put_pairs(&mut p, x: AT_NAME, y: FORM_STRING);
+    put_pairs(&mut p, x: AT_BYTE_SIZE, y: FORM_UDATA);
+    abbreviation(b, code: ABBREV_STRUCT, tag: 0x13, children: true, pairs: p.items());
+    p.clear();
+    put_pairs(&mut p, x: AT_NAME, y: FORM_STRING);
+    put_pairs(&mut p, x: AT_TYPE, y: FORM_REF4);
+    put_pairs(&mut p, x: AT_MEMBER_LOCATION, y: FORM_UDATA);
+    abbreviation(b, code: ABBREV_MEMBER, tag: 0x0D, children: false, pairs: p.items());
+    p.clear();
+    put_pairs(&mut p, x: AT_TYPE, y: FORM_REF4);
+    abbreviation(b, code: ABBREV_ARRAY, tag: 0x01, children: true, pairs: p.items());
+    p.clear();
+    put_pairs(&mut p, x: AT_COUNT, y: FORM_UDATA);
+    abbreviation(b, code: ABBREV_RANGE, tag: 0x21, children: false, pairs: p.items());
+    b.push(0);
+}
+
+/// Writes a reference to a type: its place when it is written, later if it
+/// is not yet.
+fn put_type_ref(b: &mut alloc.List(u8), offsets: []u32, fixes: &mut alloc.List(u64), target: u32) {
+    if offsets[target as usize] == 0 {
+        fixes.push(((b.len() as u64) << 32) | target as u64);
+        elf.put32(b, 0);
+    } else {
+        elf.put32(b, offsets[target as usize]);
+    }
+}
+
+fn write_types(b: &mut alloc.List(u8), m: &ir.Module, offsets: &mut alloc.List(u32), fixes: &mut alloc.List(u64)) {
+    let types = m.debug_types.items();
+    var t: usize = 0;
+    while t < types.len() : (t += 1) {
+        offsets.items_mut()[t] = b.len() as u32;
+        let d = &types[t];
+        if d.kind == ir.DEBUG_BASE {
+            uleb(b, ABBREV_BASE);
+            text(b, d.name.view());
+            uleb(b, d.size);
+            b.push(d.encoding);
+        } else if d.kind == ir.DEBUG_POINTER {
+            uleb(b, ABBREV_POINTER);
+            uleb(b, 8);
+            put_type_ref(b, offsets: offsets.items(), fixes: fixes, target: d.target);
+        } else if d.kind == ir.DEBUG_ARRAY {
+            uleb(b, ABBREV_ARRAY);
+            put_type_ref(b, offsets: offsets.items(), fixes: fixes, target: d.target);
+            uleb(b, ABBREV_RANGE);
+            uleb(b, d.count);
+            b.push(0);
+        } else {
+            uleb(b, ABBREV_STRUCT);
+            text(b, d.name.view());
+            uleb(b, d.size);
+            let ms = d.members.items();
+            var k: usize = 0;
+            while k < ms.len() : (k += 1) {
+                uleb(b, ABBREV_MEMBER);
+                text(b, ms[k].name.view());
+                put_type_ref(b, offsets: offsets.items(), fixes: fixes, target: ms[k].type_index);
+                uleb(b, ms[k].offset);
+            }
+            b.push(0);
+        }
+    }
+}
+
+fn write_info(o: &mut elf.Object, info: u32, abbrev: u32, line: u32, m: &ir.Module, fns: []FnInfo, places: []VarPlace, a: alloc.Allocator) {
+    var b = alloc.List(u8).init(a);
+    var relocs = alloc.List(cd.Reloc).init(a);
+    elf.put32(&mut b, 0);
+    elf.put16(&mut b, 4);
+    relocs.push(cd.Reloc { offset: b.len() as u64, symbol: o.sections[abbrev as usize].symbol, kind: cd.R_X86_64_32, addend: 0 });
+    elf.put32(&mut b, 0);
+    b.push(8);
+    uleb(&mut b, ABBREV_UNIT);
+    text(&mut b, "arche, its own backend");
+    // A language debuggers know how to print values of: Arche's look like C's.
+    elf.put16(&mut b, 0x1D);
+    if m.files.len() > 0 {
+        text(&mut b, m.files.items()[0].view());
+    } else {
+        text(&mut b, "");
+    }
+    relocs.push(cd.Reloc { offset: b.len() as u64, symbol: o.sections[line as usize].symbol, kind: cd.R_X86_64_32, addend: 0 });
+    elf.put32(&mut b, 0);
+
+    var offsets = alloc.List(u32).init(a);
+    var t: usize = 0;
+    while t < m.debug_types.len() : (t += 1) {
+        offsets.push(0);
+    }
+    var fixes = alloc.List(u64).init(a);
+    write_types(&mut b, m, offsets: &mut offsets, fixes: &mut fixes);
+
+    var f: usize = 0;
+    while f < fns.len() : (f += 1) {
+        let info_of = &fns[f];
+        let fun = &m.functions[info_of.index as usize];
+        if fun.file == ir.NO_FILE {
+            continue;
+        }
+        uleb(&mut b, ABBREV_FUNCTION);
+        text(&mut b, fun.source_name.view());
+        uleb(&mut b, fun.file as u64 + 1);
+        uleb(&mut b, fun.line as u64);
+        relocs.push(cd.Reloc { offset: b.len() as u64, symbol: info_of.symbol, kind: cd.R_X86_64_64, addend: 0 });
+        elf.put64(&mut b, 0);
+        uleb(&mut b, info_of.size);
+        // The frame base is rbp itself.
+        uleb(&mut b, 1);
+        b.push(0x56);
+        var k = info_of.places_start;
+        while k < info_of.places_start + info_of.places_len : (k += 1) {
+            let place = places[k as usize];
+            let v = &fun.vars[place.index as usize];
+            if v.is_param {
+                uleb(&mut b, ABBREV_PARAMETER);
+            } else {
+                uleb(&mut b, ABBREV_VARIABLE);
+            }
+            text(&mut b, v.name.view());
+            uleb(&mut b, fun.file as u64 + 1);
+            uleb(&mut b, v.line as u64);
+            put_type_ref(&mut b, offsets: offsets.items(), fixes: &mut fixes, target: v.type_index);
+            var expr = alloc.List(u8).init(a);
+            expr.push(0x91);
+            sleb(&mut expr, place.disp as i64);
+            if place.deref {
+                expr.push(0x06);
+            }
+            uleb(&mut b, expr.len() as u64);
+            let eb = expr.items();
+            var q: usize = 0;
+            while q < eb.len() : (q += 1) {
+                b.push(eb[q]);
+            }
+        }
+        b.push(0);
+    }
+    b.push(0);
+    let bytes = b.items_mut();
+    let fx = fixes.items();
+    var i: usize = 0;
+    while i < fx.len() : (i += 1) {
+        patch32(bytes, at: (fx[i] >> 32) as usize, v: offsets[(fx[i] & 0xFFFFFFFF) as usize]);
+    }
+    patch32(bytes, at: 0, v: bytes.len() as u32 - 4);
+    set_section(o, section: info, bytes: bytes, relocs: relocs.items());
+}
+
+fn patch32(b: []mut u8, at: usize, v: u32) {
+    var k: usize = 0;
+    while k < 4 : (k += 1) {
+        b[at + k] = ((v >> (k as u32 * 8)) & 255) as u8;
+    }
+}
+
+fn set_section(o: &mut elf.Object, section: u32, bytes: []u8, relocs: []cd.Reloc) {
+    let s = section as usize;
+    var i: usize = 0;
+    while i < bytes.len() : (i += 1) {
+        o.sections[s].bytes.push(bytes[i]);
+    }
+    i = 0;
+    while i < relocs.len() : (i += 1) {
+        o.sections[s].relocs.push(relocs[i]);
+    }
+}
+
+fn advance_line(b: &mut alloc.List(u8), by: i64) {
+    if by != 0 {
+        b.push(3);
+        sleb(b, by);
+    }
+}
+
+fn write_lines(o: &mut elf.Object, section: u32, m: &ir.Module, fns: []FnInfo, rows: []LineRow, a: alloc.Allocator) {
+    var b = alloc.List(u8).init(a);
+    var relocs = alloc.List(cd.Reloc).init(a);
+    elf.put32(&mut b, 0);
+    elf.put16(&mut b, 4);
+    let header_length_at = b.len();
+    elf.put32(&mut b, 0);
+    b.push(1);
+    b.push(1);
+    b.push(1);
+    // line_base -5, line_range 14, opcode_base 13: unused, but said as usual.
+    b.push(0xFB);
+    b.push(14);
+    b.push(13);
+    let lengths: [12]u8 = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
+    var i: usize = 0;
+    while i < 12 : (i += 1) {
+        b.push(lengths[i]);
+    }
+    b.push(0);
+    let files = m.files.items();
+    i = 0;
+    while i < files.len() : (i += 1) {
+        text(&mut b, files[i].view());
+        b.push(0);
+        b.push(0);
+        b.push(0);
+    }
+    b.push(0);
+    let program_at = b.len();
+    var f: usize = 0;
+    while f < fns.len() : (f += 1) {
+        let info = &fns[f];
+        let fun = &m.functions[info.index as usize];
+        if fun.file == ir.NO_FILE or info.rows_len == 0 {
+            continue;
+        }
+        // The file, then the function's address, from the linker.
+        b.push(4);
+        uleb(&mut b, fun.file as u64 + 1);
+        b.push(0);
+        b.push(9);
+        b.push(2);
+        relocs.push(cd.Reloc { offset: b.len() as u64, symbol: info.symbol, kind: cd.R_X86_64_64, addend: 0 });
+        elf.put64(&mut b, 0);
+        var line: i64 = 1;
+        var pc: u64 = 0;
+        var r = info.rows_start;
+        while r < info.rows_start + info.rows_len : (r += 1) {
+            let row = rows[r as usize];
+            advance_line(&mut b, by: row.line as i64 - line);
+            line = row.line as i64;
+            if row.offset as u64 > pc {
+                b.push(2);
+                uleb(&mut b, row.offset as u64 - pc);
+                pc = row.offset as u64;
+            }
+            // The second row is where the frame is ready.
+            if r == info.rows_start + 1 {
+                b.push(10);
+            }
+            b.push(1);
+        }
+        b.push(2);
+        uleb(&mut b, info.size - pc);
+        b.push(0);
+        b.push(1);
+        b.push(1);
+    }
+    let bytes = b.items_mut();
+    patch32(bytes, at: header_length_at, v: (program_at - header_length_at - 4) as u32);
+    patch32(bytes, at: 0, v: bytes.len() as u32 - 4);
+    set_section(o, section: section, bytes: bytes, relocs: relocs.items());
+}
+
+/// How to find the caller from anywhere in a function: its one prologue, and
+/// rbp after that.
+fn write_frames(o: &mut elf.Object, section: u32, fns: []FnInfo, a: alloc.Allocator) {
+    var b = alloc.List(u8).init(a);
+    var relocs = alloc.List(cd.Reloc).init(a);
+    elf.put32(&mut b, 16 - 4 + 4);
+    elf.put32(&mut b, 0xFFFFFFFF);
+    b.push(1);
+    b.push(0);
+    uleb(&mut b, 1);
+    sleb(&mut b, -8);
+    b.push(16);
+    b.push(0x0C);
+    b.push(7);
+    b.push(8);
+    b.push(0x80 | 16);
+    b.push(1);
+    while b.len() % 8 != 4 {
+        b.push(0);
+    }
+    let cie_size = (b.len() - 4) as u32;
+    let start = b.items_mut();
+    patch32(start, at: 0, v: cie_size);
+    var f: usize = 0;
+    while f < fns.len() : (f += 1) {
+        let length_at = b.len();
+        elf.put32(&mut b, 0);
+        relocs.push(cd.Reloc { offset: b.len() as u64, symbol: o.sections[section as usize].symbol, kind: cd.R_X86_64_32, addend: 0 });
+        elf.put32(&mut b, 0);
+        relocs.push(cd.Reloc { offset: b.len() as u64, symbol: fns[f].symbol, kind: cd.R_X86_64_64, addend: 0 });
+        elf.put64(&mut b, 0);
+        elf.put64(&mut b, fns[f].size);
+        // push rbp: one byte. mov rbp, rsp: three.
+        b.push(0x40 | 1);
+        b.push(0x0E);
+        b.push(16);
+        b.push(0x80 | 6);
+        b.push(2);
+        b.push(0x40 | 3);
+        b.push(0x0D);
+        b.push(6);
+        while b.len() % 8 != 4 {
+            b.push(0);
+        }
+        let all = b.items_mut();
+        patch32(all, at: length_at, v: (all.len() - length_at - 4) as u32);
+    }
+    set_section(o, section: section, bytes: b.items(), relocs: relocs.items());
+}
+
+/// The debug sections of the object.
+pub fn write(o: &mut elf.Object, m: &ir.Module, fns: []FnInfo, rows: []LineRow, places: []VarPlace, a: alloc.Allocator) {
+    let abbrev = o.section(".debug_abbrev", flags: 0, align: 1);
+    let info = o.section(".debug_info", flags: 0, align: 1);
+    let line = o.section(".debug_line", flags: 0, align: 1);
+    let frame = o.section(".debug_frame", flags: 0, align: 8);
+    write_abbreviations(o, section: abbrev, a: a);
+    write_info(o, info: info, abbrev: abbrev, line: line, m, fns: fns, places: places, a: a);
+    write_lines(o, section: line, m, fns: fns, rows: rows, a: a);
+    write_frames(o, section: frame, fns: fns, a: a);
+}

@@ -8,6 +8,7 @@
 /// argument cannot change it (§7.3).
 import alloc;
 import diag;
+import program;
 import syntax.cst;
 import syntax.token as tk;
 import ir.ir;
@@ -57,6 +58,15 @@ pub type Lower = struct {
     pub vtables: alloc.Map(u32, u32),
     /// The ensures conditions of the function being lowered (§8.1).
     pub post_conditions: alloc.List(cst.NodeId),
+    /// For debug info (the compiler's own backend): the line being lowered,
+    /// each module's file in m.files and where its lines start, the types
+    /// told of so far, and whether a binding is a parameter.
+    pub debug: bool,
+    pub line: u32,
+    pub module_files: alloc.List(u32),
+    pub line_starts: alloc.List(alloc.List(u32)),
+    pub debug_types: alloc.Map(ty.TypeId, u32),
+    pub binding_param: bool,
     pub a: alloc.Allocator,
 }
 
@@ -64,7 +74,9 @@ pub type Lower = struct {
 
 pub fn emit(l: &mut Lower, i: ir.Inst) -> u32 {
     let id = l.f.insts.len() as u32;
-    l.f.insts.push(i);
+    var placed = i;
+    placed.line = l.line;
+    l.f.insts.push(placed);
     l.f.blocks[l.block as usize].insts.push(id);
     return id;
 }
@@ -588,6 +600,219 @@ pub fn find_var(l: &Lower, name: alloc.Symbol) -> ?Var {
 
 pub fn bind(l: &mut Lower, name: alloc.Symbol, addr: u32, t: ty.TypeId) {
     l.vars.push(Var { name: name, addr: addr, type_id: t });
+    if l.debug {
+        var n = alloc.String.init(l.a);
+        n.push_str(l.c.names.text(name));
+        let index = debug_type(l, t);
+        l.f.vars.push(ir.DebugVar { name: n, addr: addr, type_index: index, line: l.line, is_param: l.binding_param });
+    }
+}
+
+// ---- debug info --------------------------------------------------------------------
+
+/// The line of a byte of the current module's text.
+fn line_at(l: &mut Lower, offset: u32) -> u32 {
+    let module = l.c.module as usize;
+    while l.line_starts.len() <= module {
+        l.line_starts.push(alloc.List(u32).init(l.a));
+    }
+    if l.line_starts[module].len() == 0 {
+        l.line_starts[module].push(0);
+        let text = l.c.p.modules[module].text.view();
+        var i: usize = 0;
+        while i < text.len() : (i += 1) {
+            if text[i] == '\n' {
+                l.line_starts[module].push(i as u32 + 1);
+            }
+        }
+    }
+    let starts = l.line_starts[module].items();
+    var lo: usize = 0;
+    var hi = starts.len();
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if starts[mid] <= offset {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo as u32 + 1;
+}
+
+/// What is lowered from here on comes from n's line.
+pub fn at_line(l: &mut Lower, n: cst.NodeId) {
+    if l.debug {
+        let tok = ck.tree(&l.c).first_token(n);
+        let at = l.c.p.modules[l.c.module as usize].tree.token(tok).start;
+        l.line = line_at(l, offset: at);
+    }
+}
+
+/// The current module's file, in the module's list of them.
+fn file_of_module(l: &mut Lower) -> u32 {
+    let module = l.c.module as usize;
+    while l.module_files.len() <= module {
+        l.module_files.push(ir.NO_FILE);
+    }
+    if l.module_files[module] == ir.NO_FILE {
+        // A file as it was opened. The library's is by its own name: where
+        // the library is depends on where the compiler is, and a build is
+        // to be the same wherever that is.
+        var path = alloc.String.init(l.a);
+        if l.c.p.modules[module].package == program.NO_PACKAGE {
+            path.push_str(l.c.p.modules[module].display.view());
+        } else {
+            path.push_str(l.c.p.modules[module].path.view());
+        }
+        l.m.files.push(path);
+        l.module_files[module] = l.m.files.len() as u32 - 1;
+    }
+    return l.module_files[module];
+}
+
+/// The function being lowered, for its debug info.
+fn debug_function(l: &mut Lower, name: str, name_token: u32) {
+    if not l.debug {
+        return;
+    }
+    l.f.file = file_of_module(l);
+    l.f.source_name.push_str(name);
+    if name_token != ck.NONE {
+        let at = l.c.p.modules[l.c.module as usize].tree.token(name_token).start;
+        l.f.line = line_at(l, offset: at);
+        l.line = l.f.line;
+    }
+}
+
+fn debug_base(l: &mut Lower, name: str, size: u64, encoding: u8) -> u32 {
+    var n = alloc.String.init(l.a);
+    n.push_str(name);
+    l.m.debug_types.push(ir.DebugType { kind: ir.DEBUG_BASE, name: n, size: size, encoding: encoding, target: 0, count: 0, members: alloc.List(ir.DebugMember).init(l.a) });
+    return l.m.debug_types.len() as u32 - 1;
+}
+
+fn debug_pointer_to(l: &mut Lower, target: u32) -> u32 {
+    l.m.debug_types.push(ir.DebugType { kind: ir.DEBUG_POINTER, name: alloc.String.init(l.a), size: 8, encoding: 0, target: target, count: 0, members: alloc.List(ir.DebugMember).init(l.a) });
+    return l.m.debug_types.len() as u32 - 1;
+}
+
+fn debug_member(l: &mut Lower, of: u32, name: str, type_index: u32, offset: u64) {
+    var n = alloc.String.init(l.a);
+    n.push_str(name);
+    l.m.debug_types[of as usize].members.push(ir.DebugMember { name: n, type_index: type_index, offset: offset });
+}
+
+const ATE_BOOLEAN: u8 = 2;
+const ATE_FLOAT: u8 = 4;
+const ATE_SIGNED: u8 = 5;
+const ATE_UNSIGNED: u8 = 7;
+const ATE_UNSIGNED_CHAR: u8 = 8;
+
+/// The type as a debugger is told of it, each once. A type is listed before
+/// what it is made of, since through a pointer it may be made of itself.
+fn debug_type(l: &mut Lower, t: ty.TypeId) -> u32 {
+    match l.debug_types.get(t) {
+        some(known) => { return known; }
+        none => { }
+    }
+    let info = l.c.t.get(t);
+    let lay = layout.layout(&l.c, t);
+    var name = alloc.String.init(l.a);
+    ck.write_type(&l.c, &mut name, t);
+    let index = l.m.debug_types.len() as u32;
+    l.m.debug_types.push(ir.DebugType { kind: ir.DEBUG_STRUCT, name: name, size: lay.size, encoding: 0, target: 0, count: 0, members: alloc.List(ir.DebugMember).init(l.a) });
+    l.debug_types.put(t, index);
+    match info.kind {
+        .Bool => {
+            l.m.debug_types[index as usize].kind = ir.DEBUG_BASE;
+            l.m.debug_types[index as usize].encoding = ATE_BOOLEAN;
+        }
+        .Int => {
+            l.m.debug_types[index as usize].kind = ir.DEBUG_BASE;
+            if ty.is_signed(info.int_kind) {
+                l.m.debug_types[index as usize].encoding = ATE_SIGNED;
+            } else if lay.size == 1 {
+                l.m.debug_types[index as usize].encoding = ATE_UNSIGNED_CHAR;
+            } else {
+                l.m.debug_types[index as usize].encoding = ATE_UNSIGNED;
+            }
+        }
+        .Float => {
+            l.m.debug_types[index as usize].kind = ir.DEBUG_BASE;
+            l.m.debug_types[index as usize].encoding = ATE_FLOAT;
+        }
+        .ErrorSet => {
+            l.m.debug_types[index as usize].kind = ir.DEBUG_BASE;
+            l.m.debug_types[index as usize].encoding = ATE_UNSIGNED;
+        }
+        .Ref | .Ptr => {
+            let target = debug_type(l, info.elem);
+            l.m.debug_types[index as usize].kind = ir.DEBUG_POINTER;
+            l.m.debug_types[index as usize].target = target;
+        }
+        .Array => {
+            let target = debug_type(l, info.elem);
+            l.m.debug_types[index as usize].kind = ir.DEBUG_ARRAY;
+            l.m.debug_types[index as usize].target = target;
+            l.m.debug_types[index as usize].count = info.len;
+        }
+        .Str => {
+            let byte = debug_base(l, "u8", 1, ATE_UNSIGNED_CHAR);
+            let word = debug_base(l, "u64", 8, ATE_UNSIGNED);
+            let p = debug_pointer_to(l, target: byte);
+            debug_member(l, of: index, name: "ptr", type_index: p, offset: 0);
+            debug_member(l, of: index, name: "len", type_index: word, offset: 8);
+        }
+        .Slice => {
+            let target = debug_type(l, info.elem);
+            let word = debug_base(l, "u64", 8, ATE_UNSIGNED);
+            let p = debug_pointer_to(l, target: target);
+            debug_member(l, of: index, name: "ptr", type_index: p, offset: 0);
+            debug_member(l, of: index, name: "len", type_index: word, offset: 8);
+        }
+        .List => {
+            let target = debug_type(l, info.elem);
+            let word = debug_base(l, "u64", 8, ATE_UNSIGNED);
+            let p = debug_pointer_to(l, target: target);
+            debug_member(l, of: index, name: "data", type_index: p, offset: 0);
+            debug_member(l, of: index, name: "len", type_index: word, offset: 8);
+            debug_member(l, of: index, name: "cap", type_index: word, offset: 16);
+        }
+        .Optional => {
+            let has = debug_base(l, "u8", 1, ATE_UNSIGNED_CHAR);
+            debug_member(l, of: index, name: "has", type_index: has, offset: 0);
+            if not layout.is_nothing(&l.c, info.elem) {
+                let target = debug_type(l, info.elem);
+                debug_member(l, of: index, name: "value", type_index: target, offset: layout.value_offset(&l.c, t));
+            }
+        }
+        .ErrorUnion => {
+            let code = debug_base(l, "u16", 2, ATE_UNSIGNED);
+            debug_member(l, of: index, name: "error", type_index: code, offset: 0);
+            if not layout.is_nothing(&l.c, info.elem) {
+                let target = debug_type(l, info.elem);
+                debug_member(l, of: index, name: "value", type_index: target, offset: layout.value_offset(&l.c, t));
+            }
+        }
+        .Struct => {
+            let d = l.c.decls[info.decl as usize];
+            var k: u32 = 0;
+            while k < d.members_len : (k += 1) {
+                let field = l.c.fields[(d.members_start + k) as usize];
+                let target = debug_type(l, field.type_id);
+                var field_name = alloc.String.init(l.a);
+                field_name.push_str(l.c.names.text(field.name));
+                debug_member(l, of: index, name: field_name.view(), type_index: target, offset: layout.field_offset(&l.c, start: d.members_start, i: d.members_start + k));
+            }
+        }
+        .Enum => {
+            let tag = debug_base(l, "u32", 4, ATE_UNSIGNED);
+            debug_member(l, of: index, name: "tag", type_index: tag, offset: 0);
+        }
+        _ => { }
+    }
+    return index;
 }
 
 // ---- names -----------------------------------------------------------------------
@@ -805,6 +1030,9 @@ fn lower_fn(l: &mut Lower, f: u32) {
     ck.enter_decl(&mut l.c, info.decl);
     l.c.cur_table = info.table;
     l.c.fn_index = f;
+    var source_name = alloc.String.init(l.a);
+    source_name.push_str(l.c.names.text(decl.name));
+    debug_function(l, name: source_name.view(), name_token: decl.name_token);
     if ck.fn_attribute(&l.c, info.decl, "export").len() > 0 or info.decl == l.c.panic_handler {
         l.f.internal = false; // others call it by its name
     }
@@ -840,6 +1068,7 @@ fn lower_fn(l: &mut Lower, f: u32) {
             bind(l, cap.name, addr, cap.type_id);
         }
     }
+    l.binding_param = true;
     var i = info.params_start;
     while i < info.params_start + info.params_len : (i += 1) {
         let pi = l.c.params[i as usize];
@@ -856,6 +1085,8 @@ fn lower_fn(l: &mut Lower, f: u32) {
             bind(l, pi.name, v, pi.type_id);
         }
     }
+    l.binding_param = false;
+    l.f.body_start = l.f.insts.len() as u32;
     let n = decl.node;
     // requires before the body; ensures at every return (spec/arche.md §8.1).
     l.post_conditions = alloc.List(cst.NodeId).init(l.a);
@@ -930,6 +1161,7 @@ fn lower_test(l: &mut Lower, i: u32) {
     l.c.env_len = 0;
     l.c.cur_table = ck.NONE;
     l.c.fn_index = t.fn_index;
+    debug_function(l, name: name.view(), name_token: ck.NONE);
     l.vars = alloc.List(Var).init(l.a);
     l.defers = alloc.List(cst.NodeId).init(l.a);
     l.loops = alloc.List(LoopCtx).init(l.a);
@@ -1019,6 +1251,7 @@ fn error_names(l: &mut Lower) {
 /// Lowers the whole program. Every function is verified as it is made.
 pub fn lower(c: ck.Checker) -> ir.Module {
     let a = c.a;
+    let c_debug = c.p.debug_info;
     var l = Lower {
         c: c,
         m: ir.Module.init(a),
@@ -1032,6 +1265,12 @@ pub fn lower(c: ck.Checker) -> ir.Module {
         ret: ty.void_type(),
         vtables: alloc.Map(u32, u32).init(a),
         post_conditions: alloc.List(cst.NodeId).init(a),
+        debug: c_debug,
+        line: 0,
+        module_files: alloc.List(u32).init(a),
+        line_starts: alloc.List(alloc.List(u32)).init(a),
+        debug_types: alloc.Map(ty.TypeId, u32).init(a),
+        binding_param: false,
         a: a,
     };
     l.m.test_mode = l.c.p.tests;
