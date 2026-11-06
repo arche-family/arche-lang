@@ -1,12 +1,25 @@
-/// Debug info for the compiler's own backend, DWARF 4: lines (.debug_line),
+/// Debug info for the compiler's own backends, DWARF 4: lines (.debug_line),
 /// functions, variables and types (.debug_info, .debug_abbrev), and how to
-/// walk the stack (.debug_frame). Every frame is rbp-based, and a variable
+/// walk the stack (.debug_frame). Every frame has a frame pointer, and a variable
 /// lives in the frame, or behind a pointer that does: there is no optimizer
 /// to follow. Scopes are not told: a variable is known in its whole function.
 import alloc;
 import ir.ir;
-import x64.code as cd;
-import x64.elf;
+import native.buffer as nb;
+import native.elf;
+
+/// What differs by processor.
+pub type Arch = struct {
+    /// Its relocations for an address and for a 32-bit offset.
+    pub abs64: u32,
+    pub abs32: u32,
+    /// DWARF's number of the frame pointer and of the return address.
+    pub frame_reg: u8,
+    pub return_reg: u8,
+    /// Which prologue its functions have (write_frames).
+    pub is_x64: bool,
+    pub is_a64: bool,
+}
 
 pub type LineRow = struct {
     pub offset: u32,
@@ -229,12 +242,12 @@ fn write_types(b: &mut alloc.List(u8), m: &ir.Module, offsets: &mut alloc.List(u
     }
 }
 
-fn write_info(o: &mut elf.Object, info: u32, abbrev: u32, line: u32, m: &ir.Module, fns: []FnInfo, places: []VarPlace, a: alloc.Allocator) {
+fn write_info(o: &mut elf.Object, arch: Arch, info: u32, abbrev: u32, line: u32, m: &ir.Module, fns: []FnInfo, places: []VarPlace, a: alloc.Allocator) {
     var b = alloc.List(u8).init(a);
-    var relocs = alloc.List(cd.Reloc).init(a);
+    var relocs = alloc.List(nb.Reloc).init(a);
     elf.put32(&mut b, 0);
     elf.put16(&mut b, 4);
-    relocs.push(cd.Reloc { offset: b.len() as u64, symbol: o.sections[abbrev as usize].symbol, kind: cd.R_X86_64_32, addend: 0 });
+    relocs.push(nb.Reloc { offset: b.len() as u64, symbol: o.sections[abbrev as usize].symbol, kind: arch.abs32, addend: 0 });
     elf.put32(&mut b, 0);
     b.push(8);
     uleb(&mut b, ABBREV_UNIT);
@@ -246,7 +259,7 @@ fn write_info(o: &mut elf.Object, info: u32, abbrev: u32, line: u32, m: &ir.Modu
     } else {
         text(&mut b, "");
     }
-    relocs.push(cd.Reloc { offset: b.len() as u64, symbol: o.sections[line as usize].symbol, kind: cd.R_X86_64_32, addend: 0 });
+    relocs.push(nb.Reloc { offset: b.len() as u64, symbol: o.sections[line as usize].symbol, kind: arch.abs32, addend: 0 });
     elf.put32(&mut b, 0);
 
     var offsets = alloc.List(u32).init(a);
@@ -268,12 +281,12 @@ fn write_info(o: &mut elf.Object, info: u32, abbrev: u32, line: u32, m: &ir.Modu
         text(&mut b, fun.source_name.view());
         uleb(&mut b, fun.file as u64 + 1);
         uleb(&mut b, fun.line as u64);
-        relocs.push(cd.Reloc { offset: b.len() as u64, symbol: info_of.symbol, kind: cd.R_X86_64_64, addend: 0 });
+        relocs.push(nb.Reloc { offset: b.len() as u64, symbol: info_of.symbol, kind: arch.abs64, addend: 0 });
         elf.put64(&mut b, 0);
         uleb(&mut b, info_of.size);
-        // The frame base is rbp itself.
+        // The frame base is the frame pointer itself.
         uleb(&mut b, 1);
-        b.push(0x56);
+        b.push(0x50 + arch.frame_reg);
         var k = info_of.places_start;
         while k < info_of.places_start + info_of.places_len : (k += 1) {
             let place = places[k as usize];
@@ -320,7 +333,7 @@ fn patch32(b: []mut u8, at: usize, v: u32) {
     }
 }
 
-fn set_section(o: &mut elf.Object, section: u32, bytes: []u8, relocs: []cd.Reloc) {
+fn set_section(o: &mut elf.Object, section: u32, bytes: []u8, relocs: []nb.Reloc) {
     let s = section as usize;
     var i: usize = 0;
     while i < bytes.len() : (i += 1) {
@@ -339,9 +352,9 @@ fn advance_line(b: &mut alloc.List(u8), by: i64) {
     }
 }
 
-fn write_lines(o: &mut elf.Object, section: u32, m: &ir.Module, fns: []FnInfo, rows: []LineRow, a: alloc.Allocator) {
+fn write_lines(o: &mut elf.Object, arch: Arch, section: u32, m: &ir.Module, fns: []FnInfo, rows: []LineRow, a: alloc.Allocator) {
     var b = alloc.List(u8).init(a);
-    var relocs = alloc.List(cd.Reloc).init(a);
+    var relocs = alloc.List(nb.Reloc).init(a);
     elf.put32(&mut b, 0);
     elf.put16(&mut b, 4);
     let header_length_at = b.len();
@@ -382,7 +395,7 @@ fn write_lines(o: &mut elf.Object, section: u32, m: &ir.Module, fns: []FnInfo, r
         b.push(0);
         b.push(9);
         b.push(2);
-        relocs.push(cd.Reloc { offset: b.len() as u64, symbol: info.symbol, kind: cd.R_X86_64_64, addend: 0 });
+        relocs.push(nb.Reloc { offset: b.len() as u64, symbol: info.symbol, kind: arch.abs64, addend: 0 });
         elf.put64(&mut b, 0);
         var line: i64 = 1;
         var pc: u64 = 0;
@@ -415,22 +428,38 @@ fn write_lines(o: &mut elf.Object, section: u32, m: &ir.Module, fns: []FnInfo, r
 }
 
 /// How to find the caller from anywhere in a function: its one prologue, and
-/// rbp after that.
-fn write_frames(o: &mut elf.Object, section: u32, fns: []FnInfo, a: alloc.Allocator) {
+/// the frame pointer after that.
+fn write_frames(o: &mut elf.Object, arch: Arch, section: u32, fns: []FnInfo, a: alloc.Allocator) {
     var b = alloc.List(u8).init(a);
-    var relocs = alloc.List(cd.Reloc).init(a);
-    elf.put32(&mut b, 16 - 4 + 4);
+    var relocs = alloc.List(nb.Reloc).init(a);
+    elf.put32(&mut b, 0);
     elf.put32(&mut b, 0xFFFFFFFF);
     b.push(1);
     b.push(0);
-    uleb(&mut b, 1);
+    // Instructions are counted in bytes on x86-64, in fours on the others.
+    if arch.is_x64 {
+        uleb(&mut b, 1);
+    } else {
+        uleb(&mut b, 4);
+    }
     sleb(&mut b, -8);
-    b.push(16);
-    b.push(0x0C);
-    b.push(7);
-    b.push(8);
-    b.push(0x80 | 16);
-    b.push(1);
+    b.push(arch.return_reg);
+    if arch.is_x64 {
+        // On entry the return address is on the stack.
+        b.push(0x0C);
+        b.push(7);
+        b.push(8);
+        b.push(0x80 | 16);
+        b.push(1);
+    } else if arch.is_a64 {
+        b.push(0x0C);
+        b.push(31);
+        b.push(0);
+    } else {
+        b.push(0x0C);
+        b.push(2);
+        b.push(0);
+    }
     while b.len() % 8 != 4 {
         b.push(0);
     }
@@ -441,20 +470,44 @@ fn write_frames(o: &mut elf.Object, section: u32, fns: []FnInfo, a: alloc.Alloca
     while f < fns.len() : (f += 1) {
         let length_at = b.len();
         elf.put32(&mut b, 0);
-        relocs.push(cd.Reloc { offset: b.len() as u64, symbol: o.sections[section as usize].symbol, kind: cd.R_X86_64_32, addend: 0 });
+        relocs.push(nb.Reloc { offset: b.len() as u64, symbol: o.sections[section as usize].symbol, kind: arch.abs32, addend: 0 });
         elf.put32(&mut b, 0);
-        relocs.push(cd.Reloc { offset: b.len() as u64, symbol: fns[f].symbol, kind: cd.R_X86_64_64, addend: 0 });
+        relocs.push(nb.Reloc { offset: b.len() as u64, symbol: fns[f].symbol, kind: arch.abs64, addend: 0 });
         elf.put64(&mut b, 0);
         elf.put64(&mut b, fns[f].size);
-        // push rbp: one byte. mov rbp, rsp: three.
-        b.push(0x40 | 1);
-        b.push(0x0E);
-        b.push(16);
-        b.push(0x80 | 6);
-        b.push(2);
-        b.push(0x40 | 3);
-        b.push(0x0D);
-        b.push(6);
+        if arch.is_x64 {
+            // push rbp: one byte. mov rbp, rsp: three.
+            b.push(0x40 | 1);
+            b.push(0x0E);
+            b.push(16);
+            b.push(0x80 | 6);
+            b.push(2);
+            b.push(0x40 | 3);
+            b.push(0x0D);
+            b.push(6);
+        } else if arch.is_a64 {
+            // stp x29, x30, [sp, #-16]!, then mov x29, sp.
+            b.push(0x40 | 1);
+            b.push(0x0E);
+            b.push(16);
+            b.push(0x80 | 29);
+            b.push(2);
+            b.push(0x80 | 30);
+            b.push(1);
+            b.push(0x40 | 1);
+            b.push(0x0D);
+            b.push(29);
+        } else {
+            // addi sp, sp, -16; sd ra, 8(sp); sd s0, 0(sp); addi s0, sp, 16.
+            b.push(0x40 | 4);
+            b.push(0x0C);
+            b.push(8);
+            b.push(0);
+            b.push(0x80 | 1);
+            b.push(1);
+            b.push(0x80 | 8);
+            b.push(2);
+        }
         while b.len() % 8 != 4 {
             b.push(0);
         }
@@ -465,13 +518,13 @@ fn write_frames(o: &mut elf.Object, section: u32, fns: []FnInfo, a: alloc.Alloca
 }
 
 /// The debug sections of the object.
-pub fn write(o: &mut elf.Object, m: &ir.Module, fns: []FnInfo, rows: []LineRow, places: []VarPlace, a: alloc.Allocator) {
+pub fn write(o: &mut elf.Object, arch: Arch, m: &ir.Module, fns: []FnInfo, rows: []LineRow, places: []VarPlace, a: alloc.Allocator) {
     let abbrev = o.section(".debug_abbrev", flags: 0, align: 1);
     let info = o.section(".debug_info", flags: 0, align: 1);
     let line = o.section(".debug_line", flags: 0, align: 1);
     let frame = o.section(".debug_frame", flags: 0, align: 8);
     write_abbreviations(o, section: abbrev, a: a);
-    write_info(o, info: info, abbrev: abbrev, line: line, m, fns: fns, places: places, a: a);
-    write_lines(o, section: line, m, fns: fns, rows: rows, a: a);
-    write_frames(o, section: frame, fns: fns, a: a);
+    write_info(o, arch, info: info, abbrev: abbrev, line: line, m, fns: fns, places: places, a: a);
+    write_lines(o, arch, section: line, m, fns: fns, rows: rows, a: a);
+    write_frames(o, arch, section: frame, fns: fns, a: a);
 }

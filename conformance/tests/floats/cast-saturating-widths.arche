@@ -1,0 +1,73 @@
+// test: run
+// spec: arche/2.3
+// stage0: skip
+// stdout: 127 -128 0 -3
+// stdout: 255 0 0 3
+// stdout: 32767 -32768 0
+// stdout: 65535 0 0
+// stdout: 2147483647 -2147483648 0
+// stdout: 4294967295 0 0
+// stdout: 9223372036854775807 -9223372036854775808 0
+// stdout: 18446744073709551615 0 0
+// stdout: 127 0 255 4294967295
+import std;
+
+fn i(sys: &mut std.System, v: i64, last: bool) {
+    sys.stdout.write_i64(v);
+    if last {
+        sys.stdout.write("\n");
+    } else {
+        sys.stdout.write(" ");
+    }
+}
+
+fn u(sys: &mut std.System, v: u64, last: bool) {
+    sys.stdout.write_u64(v);
+    if last {
+        sys.stdout.write("\n");
+    } else {
+        sys.stdout.write(" ");
+    }
+}
+
+// `as%` holds a float to the range of each width, and takes a NaN to 0.
+fn main(sys: &mut std.System) -> !void {
+    let big: f64 = 1.0e30;
+    let small: f64 = -1.0e30;
+    let zero: f64 = 0.0;
+    let nan = zero / zero;
+    let three: f64 = 3.5;
+    let minus_three: f64 = -3.5;
+    i(sys, (big as% i8) as i64, last: false);
+    i(sys, (small as% i8) as i64, last: false);
+    i(sys, (nan as% i8) as i64, last: false);
+    i(sys, (minus_three as% i8) as i64, last: true);
+    u(sys, (big as% u8) as u64, last: false);
+    u(sys, (small as% u8) as u64, last: false);
+    u(sys, (nan as% u8) as u64, last: false);
+    u(sys, (three as% u8) as u64, last: true);
+    i(sys, (big as% i16) as i64, last: false);
+    i(sys, (small as% i16) as i64, last: false);
+    i(sys, (nan as% i16) as i64, last: true);
+    u(sys, (big as% u16) as u64, last: false);
+    u(sys, (small as% u16) as u64, last: false);
+    u(sys, (nan as% u16) as u64, last: true);
+    i(sys, (big as% i32) as i64, last: false);
+    i(sys, (small as% i32) as i64, last: false);
+    i(sys, (nan as% i32) as i64, last: true);
+    u(sys, (big as% u32) as u64, last: false);
+    u(sys, (small as% u32) as u64, last: false);
+    u(sys, (nan as% u32) as u64, last: true);
+    i(sys, big as% i64, last: false);
+    i(sys, small as% i64, last: false);
+    i(sys, nan as% i64, last: true);
+    u(sys, big as% u64, last: false);
+    u(sys, small as% u64, last: false);
+    u(sys, nan as% u64, last: true);
+    let single: f32 = 300.5;
+    let huge: f32 = 1.0e30;
+    i(sys, (single as% i8) as i64, last: false);
+    u(sys, ((-single) as% u8) as u64, last: false);
+    u(sys, (single as% u8) as u64, last: false);
+    u(sys, (huge as% u32) as u64, last: true);
+}

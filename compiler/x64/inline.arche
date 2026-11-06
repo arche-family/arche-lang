@@ -3,6 +3,7 @@
 /// no use for more than a program's few instructions; for what it does not
 /// know, a release build goes through LLVM's assembler.
 import alloc;
+import native.buffer as nb;
 import x64.code as cd;
 
 const NO_REG: u8 = 255;
@@ -28,7 +29,7 @@ fn register_of(name: str) -> u8 {
 }
 
 /// The bytes of an instruction with no operands; 0 of them when it is none.
-fn plain_instruction(c: &mut cd.Code, name: str) -> bool {
+fn plain_instruction(c: &mut nb.Code, name: str) -> bool {
     if name.eq("nop") {
         cd.raw(c, 0x90);
     } else if name.eq("ret") or name.eq("retq") {
@@ -183,7 +184,7 @@ fn fail(problem: &mut alloc.String, what: str, instruction: str) -> bool {
     return false;
 }
 
-fn two_operand(c: &mut cd.Code, name: str, line: str, rest: str, operands: []u8, problem: &mut alloc.String) -> bool {
+fn two_operand(c: &mut nb.Code, name: str, line: str, rest: str, operands: []u8, problem: &mut alloc.String) -> bool {
     if name.len() < 2 {
         return fail(problem, what: "this backend's assembler does not know", instruction: line);
     }
@@ -242,7 +243,7 @@ fn two_operand(c: &mut cd.Code, name: str, line: str, rest: str, operands: []u8,
                     if v > 0x7FFFFFFF and v < 0xFFFFFFFF80000000 {
                         return fail(problem, what: "this backend's assembler takes 32-bit immediates in", instruction: line);
                     }
-                    cd.alu_ri(c, digit: digit, size, rm: dest, imm: cd.i32_of_bits((v & 0xFFFFFFFF) as u32));
+                    cd.alu_ri(c, digit: digit, size, rm: dest, imm: nb.i32_of_bits((v & 0xFFFFFFFF) as u32));
                     return true;
                 }
                 none => { return fail(problem, what: "this backend's assembler does not read the operand in", instruction: line); }
@@ -254,7 +255,7 @@ fn two_operand(c: &mut cd.Code, name: str, line: str, rest: str, operands: []u8,
 
 /// Writes the text's instructions; false, with problem saying why, for one it
 /// does not know. Labels are numbers, as in "1: pause\n jmp 1b".
-pub fn assemble(c: &mut cd.Code, text: str, operands: []u8, problem: &mut alloc.String, a: alloc.Allocator) -> bool {
+pub fn assemble(c: &mut nb.Code, text: str, operands: []u8, problem: &mut alloc.String, a: alloc.Allocator) -> bool {
     var label_numbers = alloc.List(u32).init(a);
     var label_places = alloc.List(u64).init(a);
     var fix_at = alloc.List(u64).init(a);

@@ -3,8 +3,8 @@
 # target is the system this runs on, unless ARCHE_TARGET names another
 # (docs/sprints.md S19). Sourced, not run.
 #
-# ARCHE_BACKEND=own builds through the compiler's own backend (x64/gen.arche)
-# and lld (LLD names it), with no LLVM between them, for linux-x86_64.
+# ARCHE_BACKEND=own builds through the compiler's own backend (x64/, a64/,
+# rv64/) and lld (LLD names it), with no LLVM between them, for Linux.
 #
 # It sets CLANG, ARCHE_TARGET, TARGET_FLAG (for the compiler), RT_FLAGS (to
 # compile the runtime), LINK_FLAGS (to link a program with it) and GC_FLAGS

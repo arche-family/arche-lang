@@ -1,0 +1,581 @@
+/// What every processor's backend does the same way: how each value of a
+/// function lives, its live range, and which register it gets.
+///
+/// Constants, stack addresses and parameters are read where they are used and
+/// take no register; the others are numbered by position, and their ranges come
+/// from a liveness pass over the blocks. Then linear scan, over the registers a
+/// processor offers (spec: x64/gen.arche, a64/gen.arche, rv64/gen.arche).
+import alloc;
+import ir.ir;
+
+pub const V_NONE: u8 = 0;
+pub const V_REG: u8 = 1;
+pub const V_CONST: u8 = 2;
+pub const V_ADDR: u8 = 3;
+pub const V_PARAM: u8 = 4;
+pub const V_FUSED: u8 = 5;
+
+pub const NO_REG: u8 = 255;
+pub const NONE: u32 = 4294967295;
+
+/// Everything about the function being written, kept between functions so
+/// that the compiler's one arena does not grow with each.
+pub type Ranges = struct {
+    /// By instruction.
+    pub kinds: alloc.List(u8),
+    pub regs: alloc.List(u8),
+    pub slots: alloc.List(i32),
+    pub starts: alloc.List(u32),
+    pub ends: alloc.List(u32),
+    def_block: alloc.List(u32),
+    pub uses: alloc.List(u32),
+    pub addr_root: alloc.List(u32),
+    pub addr_off: alloc.List(i64),
+    pub disps: alloc.List(i32),
+    global_index: alloc.List(u32),
+    pub overflow_bit: alloc.List(u32),
+    /// By block.
+    block_starts: alloc.List(u32),
+    block_ends: alloc.List(u32),
+    live_in: alloc.List(u64),
+    live_out: alloc.List(u64),
+    gen_bits: alloc.List(u64),
+    kill_bits: alloc.List(u64),
+    globals: alloc.List(u32),
+    /// By position.
+    call_positions: alloc.List(u32),
+    order: alloc.List(u32),
+    operands: alloc.List(u32),
+    /// The registers' current values, for linear scan: who, and until when.
+    /// The general registers' places first, the vector ones' from 32.
+    holder: alloc.List(u32),
+    holder_end: alloc.List(u32),
+    /// Which registers were given out, the same way.
+    used: alloc.List(bool),
+    /// Those a function must keep for its caller: general ones, then vector.
+    pub saved_ints: alloc.List(u8),
+    pub saved_floats: alloc.List(u8),
+    /// The bytes of the frame below the frame pointer so far.
+    pub frame: i32,
+}
+
+pub fn new_ranges(a: alloc.Allocator) -> Ranges {
+    return Ranges {
+        kinds: alloc.List(u8).init(a),
+        regs: alloc.List(u8).init(a),
+        slots: alloc.List(i32).init(a),
+        starts: alloc.List(u32).init(a),
+        ends: alloc.List(u32).init(a),
+        def_block: alloc.List(u32).init(a),
+        uses: alloc.List(u32).init(a),
+        addr_root: alloc.List(u32).init(a),
+        addr_off: alloc.List(i64).init(a),
+        disps: alloc.List(i32).init(a),
+        global_index: alloc.List(u32).init(a),
+        overflow_bit: alloc.List(u32).init(a),
+        block_starts: alloc.List(u32).init(a),
+        block_ends: alloc.List(u32).init(a),
+        live_in: alloc.List(u64).init(a),
+        live_out: alloc.List(u64).init(a),
+        gen_bits: alloc.List(u64).init(a),
+        kill_bits: alloc.List(u64).init(a),
+        globals: alloc.List(u32).init(a),
+        call_positions: alloc.List(u32).init(a),
+        order: alloc.List(u32).init(a),
+        operands: alloc.List(u32).init(a),
+        holder: alloc.List(u32).init(a),
+        holder_end: alloc.List(u32).init(a),
+        used: alloc.List(bool).init(a),
+        saved_ints: alloc.List(u8).init(a),
+        saved_floats: alloc.List(u8).init(a),
+        frame: 0,
+    };
+}
+
+pub fn is_float(t: ir.Ty) -> bool {
+    return t == ir.Ty.F32 or t == ir.Ty.F64;
+}
+
+/// A type's width in memory.
+pub fn size_of(t: ir.Ty) -> u32 {
+    match t {
+        .I1 | .I8 => { return 1; }
+        .I16 => { return 2; }
+        .I32 | .F32 => { return 4; }
+        _ => { return 8; }
+    }
+}
+
+/// The width the operations on a type work at.
+pub fn work_size(t: ir.Ty) -> u32 {
+    if size_of(t) == 8 {
+        return 8;
+    }
+    return 4;
+}
+
+fn fill_u8(l: &mut alloc.List(u8), n: usize, v: u8) {
+    l.clear();
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        l.push(v);
+    }
+}
+
+fn fill_u32(l: &mut alloc.List(u32), n: usize, v: u32) {
+    l.clear();
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        l.push(v);
+    }
+}
+
+fn fill_u64(l: &mut alloc.List(u64), n: usize, v: u64) {
+    l.clear();
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        l.push(v);
+    }
+}
+
+fn fill_i32(l: &mut alloc.List(i32), n: usize, v: i32) {
+    l.clear();
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        l.push(v);
+    }
+}
+
+fn fill_i64(l: &mut alloc.List(i64), n: usize, v: i64) {
+    l.clear();
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        l.push(v);
+    }
+}
+
+/// The values an instruction reads, into r.operands.
+pub fn collect_operands(r: &mut Ranges, f: &ir.Function, id: u32) {
+    r.operands.clear();
+    let i = f.insts[id as usize];
+    match i.op {
+        .Load | .Gep | .Memzero | .Ext | .Trunc | .FNeg | .FConv | .IntToPtr | .PtrToInt | .AtomicLoad | .CondBr | .Ret | .CallIndirect => {
+            r.operands.push(i.a);
+        }
+        .Store | .GepIndex | .Memcpy | .Bin | .Overflow | .Cmp | .FBin | .FCmp | .AtomicStore | .AtomicRmw => {
+            r.operands.push(i.a);
+            r.operands.push(i.b);
+        }
+        .CmpXchg => {
+            r.operands.push(i.a);
+            r.operands.push(i.b);
+            r.operands.push(i.c);
+        }
+        .FMath => {
+            r.operands.push(i.a);
+            if i.flag == 5 or i.flag == 6 {
+                r.operands.push(i.b);
+            }
+            if i.flag == 6 {
+                r.operands.push(i.c);
+            }
+        }
+        _ => { }
+    }
+    if i.op == ir.Op.Call or i.op == ir.Op.CallIndirect or i.op == ir.Op.Asm {
+        var k = i.args_start;
+        while k < i.args_start + i.args_len : (k += 1) {
+            r.operands.push(f.args[k as usize]);
+        }
+    }
+}
+
+/// Whether the operation calls a function of the runtime, which does not
+/// keep the vector registers.
+pub fn calls_out(i: ir.Inst) -> bool {
+    return i.op == ir.Op.Call or i.op == ir.Op.CallIndirect or (i.op == ir.Op.FMath and i.flag >= 2);
+}
+
+pub fn plan(r: &mut Ranges, f: &ir.Function) {
+    let n = f.insts.len();
+    fill_u8(&mut r.kinds, n, V_NONE);
+    fill_u8(&mut r.regs, n, NO_REG);
+    fill_i32(&mut r.slots, n, 0);
+    fill_u32(&mut r.starts, n, 0);
+    fill_u32(&mut r.ends, n, 0);
+    fill_u32(&mut r.def_block, n, NONE);
+    fill_u32(&mut r.uses, n, 0);
+    fill_u32(&mut r.addr_root, n, NONE);
+    fill_i64(&mut r.addr_off, n, 0);
+    fill_i32(&mut r.disps, n, 0);
+    fill_u32(&mut r.global_index, n, NONE);
+    fill_u32(&mut r.overflow_bit, n, NONE);
+    let nblocks = f.blocks.len();
+    fill_u32(&mut r.block_starts, nblocks, 0);
+    fill_u32(&mut r.block_ends, nblocks, 0);
+    r.call_positions.clear();
+    r.globals.clear();
+
+    // How each value lives. Numbers go up with definitions, so an address's
+    // root is known by the time its offset is.
+    var id: u32 = 0;
+    while id < n as u32 : (id += 1) {
+        let i = f.insts[id as usize];
+        match i.op {
+            .Const => { r.kinds[id as usize] = V_CONST; }
+            .Param => { r.kinds[id as usize] = V_PARAM; }
+            .Alloca | .Global | .VTable => {
+                r.kinds[id as usize] = V_ADDR;
+                r.addr_root[id as usize] = id;
+            }
+            .Gep => {
+                if r.kinds[i.a as usize] == V_ADDR {
+                    r.kinds[id as usize] = V_ADDR;
+                    r.addr_root[id as usize] = r.addr_root[i.a as usize];
+                    r.addr_off[id as usize] = r.addr_off[i.a as usize] + i.imm as i64;
+                } else {
+                    r.kinds[id as usize] = V_REG;
+                }
+            }
+            .OverflowBit => {
+                r.kinds[id as usize] = V_REG;
+                r.overflow_bit[i.a as usize] = id;
+            }
+            _ => {
+                if ir.has_value(i) {
+                    r.kinds[id as usize] = V_REG;
+                }
+            }
+        }
+    }
+
+    // Positions, definitions and uses, in the order of the blocks.
+    var pos: u32 = 2;
+    var b: usize = 0;
+    while b < nblocks : (b += 1) {
+        r.block_starts[b] = pos;
+        let ids = f.blocks[b].insts.items();
+        var k: usize = 0;
+        while k < ids.len() : (k += 1) {
+            let this = ids[k];
+            let i = f.insts[this as usize];
+            collect_operands(r, f, this);
+            var o: usize = 0;
+            while o < r.operands.len() : (o += 1) {
+                let u = r.operands[o] as usize;
+                r.uses[u] += 1;
+                if r.kinds[u] == V_REG {
+                    if r.ends[u] < pos {
+                        r.ends[u] = pos;
+                    }
+                }
+            }
+            if calls_out(i) {
+                r.call_positions.push(pos);
+            }
+            if r.kinds[this as usize] == V_REG {
+                r.def_block[this as usize] = b as u32;
+                var at = pos;
+                if i.op == ir.Op.OverflowBit or i.op == ir.Op.AsmOut {
+                    at = r.starts[i.a as usize];
+                }
+                r.starts[this as usize] = at;
+                if r.ends[this as usize] < at + 1 {
+                    r.ends[this as usize] = at + 1;
+                }
+            }
+            pos += 2;
+        }
+        r.block_ends[b] = pos;
+    }
+
+    // A comparison its branch reads alone is done by the branch.
+    b = 0;
+    while b < nblocks : (b += 1) {
+        let ids = f.blocks[b].insts.items();
+        if ids.len() >= 2 {
+            let last = f.insts[ids[ids.len() - 1] as usize];
+            let before = ids[ids.len() - 2];
+            if last.op == ir.Op.CondBr and last.a == before and f.insts[before as usize].op == ir.Op.Cmp and r.uses[before as usize] == 1 {
+                r.kinds[before as usize] = V_FUSED;
+            }
+        }
+    }
+    liveness(r, f);
+}
+
+fn successors_into(r: &mut Ranges, i: ir.Inst) {
+    r.operands.clear();
+    if i.op == ir.Op.Br {
+        r.operands.push(i.a);
+    } else if i.op == ir.Op.CondBr {
+        r.operands.push(i.b);
+        r.operands.push(i.c);
+    }
+}
+
+/// Ranges of the values used outside the block that defines them: most stay
+/// in one, and only these take a place in the bit sets.
+fn liveness(r: &mut Ranges, f: &ir.Function) {
+    let nblocks = f.blocks.len();
+    var b: usize = 0;
+    while b < nblocks : (b += 1) {
+        let ids = f.blocks[b].insts.items();
+        var k: usize = 0;
+        while k < ids.len() : (k += 1) {
+            collect_operands(r, f, ids[k]);
+            var o: usize = 0;
+            while o < r.operands.len() : (o += 1) {
+                let u = r.operands[o];
+                if r.kinds[u as usize] == V_REG and r.def_block[u as usize] != b as u32 and r.global_index[u as usize] == NONE {
+                    r.global_index[u as usize] = r.globals.len() as u32;
+                    r.globals.push(u);
+                }
+            }
+        }
+    }
+    if r.globals.len() == 0 {
+        return;
+    }
+    let words = (r.globals.len() + 63) / 64;
+    fill_u64(&mut r.live_in, nblocks * words, 0);
+    fill_u64(&mut r.live_out, nblocks * words, 0);
+    fill_u64(&mut r.gen_bits, nblocks * words, 0);
+    fill_u64(&mut r.kill_bits, nblocks * words, 0);
+    let one: u64 = 1;
+    b = 0;
+    while b < nblocks : (b += 1) {
+        let ids = f.blocks[b].insts.items();
+        var k: usize = 0;
+        while k < ids.len() : (k += 1) {
+            collect_operands(r, f, ids[k]);
+            var o: usize = 0;
+            while o < r.operands.len() : (o += 1) {
+                let gi = r.global_index[r.operands[o] as usize];
+                if gi != NONE {
+                    let word = b * words + gi as usize / 64;
+                    let bit = one << (gi as u64 % 64);
+                    if r.kill_bits[word] & bit == 0 {
+                        r.gen_bits[word] = r.gen_bits[word] | bit;
+                    }
+                }
+            }
+            let gd = r.global_index[ids[k] as usize];
+            if gd != NONE {
+                let word = b * words + gd as usize / 64;
+                r.kill_bits[word] = r.kill_bits[word] | (one << (gd as u64 % 64));
+            }
+        }
+    }
+    var changed = true;
+    while changed {
+        changed = false;
+        var left = nblocks;
+        while left > 0 : (left -= 1) {
+            let this = left - 1;
+            let ids = f.blocks[this].insts.items();
+            successors_into(r, f.insts[ids[ids.len() - 1] as usize]);
+            var w: usize = 0;
+            while w < words : (w += 1) {
+                var out: u64 = 0;
+                var s: usize = 0;
+                while s < r.operands.len() : (s += 1) {
+                    out = out | r.live_in[r.operands[s] as usize * words + w];
+                }
+                let at = this * words + w;
+                r.live_out[at] = out;
+                let live = r.gen_bits[at] | (out & ~r.kill_bits[at]);
+                if live != r.live_in[at] {
+                    r.live_in[at] = live;
+                    changed = true;
+                }
+            }
+        }
+    }
+    b = 0;
+    while b < nblocks : (b += 1) {
+        var gi: usize = 0;
+        while gi < r.globals.len() : (gi += 1) {
+            let word = b * words + gi / 64;
+            let bit = one << (gi as u64 % 64);
+            let v = r.globals[gi] as usize;
+            if r.live_in[word] & bit != 0 {
+                if r.starts[v] > r.block_starts[b] {
+                    r.starts[v] = r.block_starts[b];
+                }
+                if r.ends[v] < r.block_starts[b] {
+                    r.ends[v] = r.block_starts[b];
+                }
+            }
+            if r.live_out[word] & bit != 0 {
+                if r.ends[v] < r.block_ends[b] {
+                    r.ends[v] = r.block_ends[b];
+                }
+                if r.starts[v] > r.block_ends[b] {
+                    r.starts[v] = r.block_ends[b];
+                }
+            }
+        }
+    }
+}
+
+fn crosses_call(r: &Ranges, start: u32, end: u32) -> bool {
+    let calls = r.call_positions.items();
+    var lo: usize = 0;
+    var hi = calls.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if calls[mid] <= start {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < calls.len() and calls[lo] < end;
+}
+
+fn new_slot(r: &mut Ranges) -> i32 {
+    r.frame += 8;
+    return -r.frame;
+}
+
+fn spill(r: &mut Ranges, v: u32) {
+    r.regs[v as usize] = NO_REG;
+    r.slots[v as usize] = new_slot(r);
+}
+
+/// Linear scan over one class of registers: holders' places from first, with
+/// the register of each from regs.
+fn take_register(r: &mut Ranges, v: u32, regs: []u8, first: usize) {
+    let start = r.starts[v as usize];
+    let end = r.ends[v as usize];
+    var k: usize = 0;
+    var worst = first;
+    while k < regs.len() : (k += 1) {
+        let place = first + k;
+        if r.holder_end[place] <= start {
+            r.holder[place] = v;
+            r.holder_end[place] = end;
+            r.regs[v as usize] = regs[k];
+            r.used[first + regs[k] as usize] = true;
+            return;
+        }
+        if r.holder_end[place] > r.holder_end[worst] {
+            worst = place;
+        }
+    }
+    // None free: what lives longest goes to memory, for the whole of its life.
+    if r.holder_end[worst] > end {
+        let old = r.holder[worst];
+        r.regs[v as usize] = r.regs[old as usize];
+        spill(r, old);
+        r.holder[worst] = v;
+        r.holder_end[worst] = end;
+    } else {
+        spill(r, v);
+    }
+}
+
+/// Registers for the function's values. reserved is what the frame already
+/// holds below the frame pointer. A float in a register a call does not keep
+/// goes to memory when it lives across a call: floats_kept says they all are.
+pub fn allocate(r: &mut Ranges, f: &ir.Function, ints: []u8, floats: []u8, floats_kept: bool, reserved: i32) {
+    r.frame = 0;
+    r.order.clear();
+    var id: u32 = 0;
+    while id < f.insts.len() as u32 : (id += 1) {
+        if r.kinds[id as usize] == V_REG {
+            r.order.push(id);
+        }
+    }
+    // By where each starts: nearly in order already.
+    let order = r.order.items_mut();
+    var i: usize = 1;
+    while i < order.len() : (i += 1) {
+        let v = order[i];
+        let s = r.starts[v as usize];
+        var j = i;
+        while j > 0 and r.starts[order[j - 1] as usize] > s : (j -= 1) {
+            order[j] = order[j - 1];
+        }
+        order[j] = v;
+    }
+    fill_u32(&mut r.holder, 64, NONE);
+    fill_u32(&mut r.holder_end, 64, 0);
+    r.used.clear();
+    i = 0;
+    while i < 64 : (i += 1) {
+        r.used.push(false);
+    }
+    i = 0;
+    while i < r.order.len() : (i += 1) {
+        let v = r.order[i];
+        if is_float(f.insts[v as usize].ty) {
+            if not floats_kept and crosses_call(r, start: r.starts[v as usize], end: r.ends[v as usize]) {
+                spill(r, v);
+            } else {
+                take_register(r, v, regs: floats, first: 32);
+            }
+        } else {
+            take_register(r, v, regs: ints, first: 0);
+        }
+    }
+    // What is to be kept takes the first places below what is reserved, and
+    // the spilled values move down below that.
+    r.saved_ints.clear();
+    r.saved_floats.clear();
+    i = 0;
+    while i < ints.len() : (i += 1) {
+        if r.used[ints[i] as usize] {
+            r.saved_ints.push(ints[i]);
+        }
+    }
+    if floats_kept {
+        i = 0;
+        while i < floats.len() : (i += 1) {
+            if r.used[32 + floats[i] as usize] {
+                r.saved_floats.push(floats[i]);
+            }
+        }
+    }
+    let above = reserved + (r.saved_ints.len() + r.saved_floats.len()) as i32 * 8;
+    i = 0;
+    while i < r.order.len() : (i += 1) {
+        let v = r.order[i] as usize;
+        if r.regs[v] == NO_REG {
+            r.slots[v] -= above;
+        }
+    }
+    r.frame += above;
+}
+
+/// Where the n-th register kept for the caller goes, below reserved.
+pub fn saved_place(n: usize, reserved: i32) -> i32 {
+    return -(reserved + (n as i32 + 1) * 8);
+}
+
+fn align_up(v: i32, to: i32) -> i32 {
+    return (v + to - 1) / to * to;
+}
+
+/// The stack slots, below what the frame holds so far. Past 16 bytes of
+/// alignment the frame cannot promise it: room to round the address.
+pub fn place_allocas(r: &mut Ranges, f: &ir.Function) {
+    var id: u32 = 0;
+    while id < f.insts.len() as u32 : (id += 1) {
+        let i = f.insts[id as usize];
+        if i.op == ir.Op.Alloca {
+            var al = i.flag as i32;
+            if al < 1 {
+                al = 1;
+            }
+            var size = i.imm as i32;
+            if al > 16 {
+                size += al;
+                al = 16;
+            }
+            r.frame = align_up(v: r.frame + size, to: al);
+            r.disps[id as usize] = -r.frame;
+        }
+    }
+}

@@ -1,0 +1,421 @@
+/// What every processor's backend writes the same way: the object's sections
+/// and symbols, the data, code in its place, line rows and call sites for the
+/// debug info and a panic's stack trace.
+import alloc;
+import ir.ir;
+import native.buffer as nb;
+import native.dwarf;
+import native.elf;
+import native.ranges as ra;
+
+/// A call, for the runtime's stack trace: where it returns to, in .text.
+pub type SourceCall = struct {
+    pub pc: u64,
+    pub line: u32,
+    pub function: u32,
+}
+
+pub type Unit = struct {
+    pub obj: elf.Object,
+    pub text: u32,
+    pub rodata: u32,
+    pub fn_symbols: alloc.List(u32),
+    pub ext_symbols: alloc.List(u32),
+    global_offsets: alloc.List(u64),
+    vtable_offsets: alloc.List(u64),
+    /// Symbols by name for what a backend itself calls (floor, fmod...).
+    helper_names: alloc.List(alloc.String),
+    helper_symbols: alloc.List(u32),
+    /// For debug info: the rows of the line table and the variables' places,
+    /// of all functions, and what each call returns to, for a stack trace.
+    rows: alloc.List(dwarf.LineRow),
+    places: alloc.List(dwarf.VarPlace),
+    functions: alloc.List(dwarf.FnInfo),
+    current_line: u32,
+    body_begun: bool,
+    rows_start: usize,
+    places_start: u32,
+    fn_calls: alloc.List(dwarf.LineRow),
+    calls: alloc.List(SourceCall),
+    pub problem: alloc.String,
+    arch: dwarf.Arch,
+    /// What fills the gap between two functions.
+    pad_byte: u8,
+    a: alloc.Allocator,
+}
+
+/// The sections, the symbols of everything the module has, and its data.
+pub fn new_unit(m: &ir.Module, machine: u32, flags: u32, arch: dwarf.Arch, pad_byte: u8, a: alloc.Allocator) -> Unit {
+    var obj = elf.Object.init(machine: machine, flags: flags, a: a);
+    let text = obj.section(".text", flags: elf.FLAG_ALLOC | elf.FLAG_EXEC, align: 16);
+    let rodata = obj.section(".rodata", flags: elf.FLAG_ALLOC, align: 8);
+    _ = obj.section(".note.GNU-stack", flags: 0, align: 1);
+    var u = Unit {
+        obj: obj,
+        text: text,
+        rodata: rodata,
+        fn_symbols: alloc.List(u32).init(a),
+        ext_symbols: alloc.List(u32).init(a),
+        global_offsets: alloc.List(u64).init(a),
+        vtable_offsets: alloc.List(u64).init(a),
+        helper_names: alloc.List(alloc.String).init(a),
+        helper_symbols: alloc.List(u32).init(a),
+        rows: alloc.List(dwarf.LineRow).init(a),
+        places: alloc.List(dwarf.VarPlace).init(a),
+        functions: alloc.List(dwarf.FnInfo).init(a),
+        current_line: 0,
+        body_begun: false,
+        rows_start: 0,
+        places_start: 0,
+        fn_calls: alloc.List(dwarf.LineRow).init(a),
+        calls: alloc.List(SourceCall).init(a),
+        problem: alloc.String.init(a),
+        arch: arch,
+        pad_byte: pad_byte,
+        a: a,
+    };
+    // Symbols first: code and data refer to each other by them.
+    let fs = m.functions.items();
+    var i: usize = 0;
+    while i < fs.len() : (i += 1) {
+        if fs[i].stub {
+            u.fn_symbols.push(u.obj.undefined(fs[i].name.view()));
+        } else {
+            u.fn_symbols.push(u.obj.symbol(fs[i].name.view(), section: u.text, value: 0, size: 0, kind: 2, global: not fs[i].internal));
+        }
+    }
+    let es = m.externals.items();
+    i = 0;
+    while i < es.len() : (i += 1) {
+        // An extern fn the program also defines, by export: that one.
+        var defined = ra.NONE;
+        var k: usize = 0;
+        while k < fs.len() and defined == ra.NONE : (k += 1) {
+            if not fs[k].stub and fs[k].name.view().eq(es[i].name.view()) {
+                defined = k as u32;
+            }
+        }
+        if defined != ra.NONE {
+            u.ext_symbols.push(u.fn_symbols[defined as usize]);
+        } else {
+            u.ext_symbols.push(u.obj.undefined(es[i].name.view()));
+        }
+    }
+    write_data(&mut u, m);
+    return u;
+}
+
+/// The symbol an address's root is reached by.
+pub fn root_symbol(u: &Unit) -> u32 {
+    return u.obj.sections[u.rodata as usize].symbol;
+}
+
+/// Where the root is from that symbol: a global's or a table's place.
+pub fn root_addend(u: &Unit, f: &ir.Function, root: u32) -> i64 {
+    let i = f.insts[root as usize];
+    if i.op == ir.Op.Global {
+        return u.global_offsets[i.imm as usize] as i64;
+    }
+    return u.vtable_offsets[i.imm as usize] as i64;
+}
+
+/// A function begins: its rows and call sites from here.
+pub fn begin_function(u: &mut Unit) {
+    u.fn_calls.clear();
+    u.rows_start = u.rows.len();
+    u.places_start = u.places.len() as u32;
+}
+
+/// The first row, the function's own line, at its first byte.
+pub fn first_row(u: &mut Unit, f: &ir.Function) {
+    var first_line = f.line;
+    if first_line == 0 and f.insts.len() > 0 {
+        first_line = f.insts[0].line;
+    }
+    u.rows.push(dwarf.LineRow { offset: 0, line: first_line });
+    u.current_line = first_line;
+    u.body_begun = false;
+}
+
+fn place_row(u: &mut Unit, line: u32, at: u32) {
+    u.current_line = line;
+    let n = u.rows.len();
+    if n > u.rows_start + 1 and u.rows[n - 1].offset == at {
+        u.rows[n - 1].line = line;
+    } else {
+        u.rows.push(dwarf.LineRow { offset: at, line: line });
+    }
+}
+
+/// The code from at on comes from this instruction. The body starts a row of
+/// its own, even on the function's line: where a debugger stops.
+pub fn note_inst(u: &mut Unit, f: &ir.Function, id: u32, line: u32, at: u32) {
+    if id >= f.body_start and not u.body_begun {
+        u.body_begun = true;
+        var first = line;
+        if first == 0 {
+            first = u.current_line;
+        }
+        place_row(u, line: first, at: at);
+    } else if line != 0 and line != u.current_line {
+        place_row(u, line: line, at: at);
+    }
+}
+
+/// A call returning to at, for the stack trace.
+pub fn note_call(u: &mut Unit, line: u32, at: u32) {
+    u.fn_calls.push(dwarf.LineRow { offset: at, line: line });
+}
+
+/// Where the function's variables are, as far as the debugger can be told:
+/// in the frame, or behind a pointer that came as a parameter.
+pub fn note_places(u: &mut Unit, r: &ra.Ranges, f: &ir.Function, homes: []i32) {
+    var k: usize = 0;
+    while k < f.vars.len() : (k += 1) {
+        let addr = f.vars[k].addr;
+        let kind = r.kinds[addr as usize];
+        if kind == ra.V_ADDR {
+            let root = r.addr_root[addr as usize];
+            if f.insts[root as usize].op == ir.Op.Alloca and f.insts[root as usize].flag <= 16 {
+                u.places.push(dwarf.VarPlace { index: k as u32, disp: r.disps[root as usize] + r.addr_off[addr as usize] as i32, deref: false });
+            }
+        } else if kind == ra.V_PARAM {
+            u.places.push(dwarf.VarPlace { index: k as u32, disp: homes[f.insts[addr as usize].imm as usize], deref: true });
+        }
+    }
+}
+
+/// The function's code into its section, its symbol at it, and what is known
+/// of it for the debug info.
+pub fn place_code(u: &mut Unit, f: &ir.Function, index: usize, code: &nb.Code) {
+    var section = u.text;
+    if f.section.len() > 0 {
+        section = ra.NONE;
+        var s: usize = 0;
+        while s < u.obj.sections.len() : (s += 1) {
+            if u.obj.sections.items()[s].name.view().eq(f.section.view()) {
+                section = s as u32;
+            }
+        }
+        if section == ra.NONE {
+            section = u.obj.section(f.section.view(), flags: elf.FLAG_ALLOC | elf.FLAG_EXEC, align: 16);
+        }
+    }
+    let sec = section as usize;
+    while u.obj.sections[sec].bytes.len() % 16 != 0 {
+        u.obj.sections[sec].bytes.push(u.pad_byte);
+    }
+    let start = u.obj.sections[sec].bytes.len() as u64;
+    let bytes = code.bytes.items();
+    var i: usize = 0;
+    while i < bytes.len() : (i += 1) {
+        u.obj.sections[sec].bytes.push(bytes[i]);
+    }
+    let rs = code.relocs.items();
+    i = 0;
+    while i < rs.len() : (i += 1) {
+        u.obj.sections[sec].relocs.push(nb.Reloc { offset: start + rs[i].offset, symbol: rs[i].symbol, kind: rs[i].kind, addend: rs[i].addend });
+    }
+    if section == u.text and not f.no_frame {
+        var q: usize = 0;
+        while q < u.fn_calls.len() : (q += 1) {
+            u.calls.push(SourceCall { pc: start + u.fn_calls[q].offset as u64, line: u.fn_calls[q].line, function: u.functions.len() as u32 });
+        }
+    }
+    let sym = u.fn_symbols[index] as usize;
+    u.obj.symbols[sym].section = section;
+    u.obj.symbols[sym].value = start;
+    u.obj.symbols[sym].size = bytes.len() as u64;
+    if not f.no_frame {
+        u.functions.push(dwarf.FnInfo {
+            index: index as u32,
+            symbol: u.fn_symbols[index],
+            size: bytes.len() as u64,
+            rows_start: u.rows_start as u32,
+            rows_len: (u.rows.len() - u.rows_start) as u32,
+            places_start: u.places_start,
+            places_len: u.places.len() as u32 - u.places_start,
+        });
+    }
+}
+
+/// The object, or nothing, with problem saying why.
+pub fn finish(u: &mut Unit, m: &ir.Module, problem: &mut alloc.String) -> alloc.List(u8) {
+    if u.problem.len() > 0 {
+        problem.push_str(u.problem.view());
+        return alloc.List(u8).init(u.a);
+    }
+    write_source_map(u, m);
+    dwarf.write(&mut u.obj, u.arch, m, fns: u.functions.items(), rows: u.rows.items(), places: u.places.items(), a: u.a);
+    return elf.write(&u.obj, u.a);
+}
+
+pub fn helper_symbol(u: &mut Unit, name: str) -> u32 {
+    var k: usize = 0;
+    while k < u.helper_names.len() : (k += 1) {
+        if u.helper_names.items()[k].view().eq(name) {
+            return u.helper_symbols[k];
+        }
+    }
+    var n = alloc.String.init(u.a);
+    n.push_str(name);
+    u.helper_names.push(n);
+    let sym = u.obj.undefined(name);
+    u.helper_symbols.push(sym);
+    return sym;
+}
+
+pub fn say_problem(u: &mut Unit, f: &ir.Function, what: str) {
+    if u.problem.len() == 0 {
+        u.problem.push_str("in ");
+        u.problem.push_str(f.name.view());
+        u.problem.push_str(": ");
+        u.problem.push_str(what);
+    }
+}
+
+fn put_bytes(u: &mut Unit, b: []u8) {
+    let ro = u.rodata as usize;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        u.obj.sections[ro].bytes.push(b[i]);
+    }
+}
+
+/// A pointer in .rodata to where the linker puts this symbol.
+fn put_pointer(u: &mut Unit, symbol: u32, addend: i64) {
+    let ro = u.rodata as usize;
+    let at = u.obj.sections[ro].bytes.len() as u64;
+    u.obj.sections[ro].relocs.push(nb.Reloc { offset: at, symbol: symbol, kind: u.arch.abs64, addend: addend });
+    elf.put64(&mut u.obj.sections[ro].bytes, 0);
+}
+
+fn put_str_entry(u: &mut Unit, m: &ir.Module, global: u32) {
+    let ro_symbol = u.obj.sections[u.rodata as usize].symbol;
+    put_pointer(u, symbol: ro_symbol, addend: u.global_offsets[global as usize] as i64);
+    elf.put64(&mut u.obj.sections[u.rodata as usize].bytes, m.globals[global as usize].bytes.len() as u64);
+}
+
+fn begin_data_symbol(u: &mut Unit, name: str) -> u32 {
+    let ro = u.rodata as usize;
+    elf.pad_to(&mut u.obj.sections[ro].bytes, 8);
+    return u.obj.symbol(name, section: u.rodata, value: u.obj.sections[ro].bytes.len() as u64, size: 0, kind: 1, global: true);
+}
+
+fn end_data_symbol(u: &mut Unit, sym: u32) {
+    let end = u.obj.sections[u.rodata as usize].bytes.len() as u64;
+    u.obj.symbols[sym as usize].size = end - u.obj.symbols[sym as usize].value;
+}
+
+fn write_data(u: &mut Unit, m: &ir.Module) {
+    let ro = u.rodata as usize;
+    let gs = m.globals.items();
+    var i: usize = 0;
+    while i < gs.len() : (i += 1) {
+        u.global_offsets.push(u.obj.sections[ro].bytes.len() as u64);
+        put_bytes(u, gs[i].bytes.items());
+    }
+    let vts = m.vtables.items();
+    i = 0;
+    while i < vts.len() : (i += 1) {
+        elf.pad_to(&mut u.obj.sections[ro].bytes, 8);
+        u.vtable_offsets.push(u.obj.sections[ro].bytes.len() as u64);
+        let fns = vts[i].functions.items();
+        var k: usize = 0;
+        while k < fns.len() : (k += 1) {
+            put_pointer(u, symbol: u.fn_symbols[fns[k] as usize], addend: 0);
+        }
+        if vts[i].size > 0 {
+            elf.put64(&mut u.obj.sections[ro].bytes, vts[i].size);
+        }
+    }
+    let tables = m.tables.items();
+    i = 0;
+    while i < tables.len() : (i += 1) {
+        let sym = begin_data_symbol(u, tables[i].name.view());
+        let entries = tables[i].entries.items();
+        var k: usize = 0;
+        while k < entries.len() : (k += 1) {
+            put_str_entry(u, m, entries[k]);
+        }
+        end_data_symbol(u, sym);
+    }
+    if m.test_mode {
+        // {name, length, function, takes a Test}: compiler/runtime/rt.c.
+        let sym = begin_data_symbol(u, "a0_tests");
+        let ts = m.tests.items();
+        var k: usize = 0;
+        while k < ts.len() : (k += 1) {
+            put_str_entry(u, m, ts[k].name);
+            put_pointer(u, symbol: u.fn_symbols[ts[k].function as usize], addend: 0);
+            var takes: u64 = 0;
+            if ts[k].takes_test {
+                takes = 1;
+            }
+            elf.put64(&mut u.obj.sections[ro].bytes, takes);
+        }
+        end_data_symbol(u, sym);
+        let count = begin_data_symbol(u, "a0_test_count");
+        elf.put64(&mut u.obj.sections[ro].bytes, ts.len() as u64);
+        end_data_symbol(u, count);
+    }
+}
+
+/// The tables a panic's stack trace reads (compiler/runtime/linux.inc): the
+/// calls, by the address each returns to, and the functions they are in.
+fn write_source_map(u: &mut Unit, m: &ir.Module) {
+    let ro = u.rodata as usize;
+    let text_symbol = u.obj.sections[u.text as usize].symbol;
+    let ro_symbol = u.obj.sections[ro].symbol;
+    let table = begin_data_symbol(u, "a0_source_calls");
+    var i: usize = 0;
+    while i < u.calls.len() : (i += 1) {
+        let at = u.obj.sections[ro].bytes.len() as u64;
+        let call = u.calls[i];
+        u.obj.sections[ro].relocs.push(nb.Reloc { offset: at, symbol: text_symbol, kind: u.arch.abs32, addend: call.pc as i64 });
+        elf.put32(&mut u.obj.sections[ro].bytes, 0);
+        elf.put32(&mut u.obj.sections[ro].bytes, call.line);
+        elf.put32(&mut u.obj.sections[ro].bytes, call.function);
+    }
+    end_data_symbol(u, table);
+    let count = begin_data_symbol(u, "a0_source_call_count");
+    elf.put64(&mut u.obj.sections[ro].bytes, u.calls.len() as u64);
+    end_data_symbol(u, count);
+    // Names go first, so that the table of functions is in one piece.
+    var names = alloc.List(u64).init(u.a);
+    var files = alloc.List(u64).init(u.a);
+    i = 0;
+    while i < m.files.len() : (i += 1) {
+        files.push(u.obj.sections[ro].bytes.len() as u64);
+        put_bytes(u, m.files.items()[i].view().bytes());
+    }
+    i = 0;
+    while i < u.functions.len() : (i += 1) {
+        names.push(u.obj.sections[ro].bytes.len() as u64);
+        let fun = &m.functions[u.functions[i].index as usize];
+        if fun.source_name.len() > 0 {
+            put_bytes(u, fun.source_name.view().bytes());
+        } else {
+            put_bytes(u, fun.name.view().bytes());
+        }
+    }
+    let functions = begin_data_symbol(u, "a0_source_functions");
+    i = 0;
+    while i < u.functions.len() : (i += 1) {
+        let fun = &m.functions[u.functions[i].index as usize];
+        put_pointer(u, symbol: ro_symbol, addend: names[i] as i64);
+        var name_len = fun.source_name.len() as u64;
+        if name_len == 0 {
+            name_len = fun.name.len() as u64;
+        }
+        elf.put64(&mut u.obj.sections[ro].bytes, name_len);
+        if fun.file == ir.NO_FILE {
+            put_pointer(u, symbol: ro_symbol, addend: 0);
+            elf.put64(&mut u.obj.sections[ro].bytes, 0);
+        } else {
+            put_pointer(u, symbol: ro_symbol, addend: files[fun.file as usize] as i64);
+            elf.put64(&mut u.obj.sections[ro].bytes, m.files.items()[fun.file as usize].len() as u64);
+        }
+    }
+    end_data_symbol(u, functions);
+}

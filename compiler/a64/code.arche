@@ -1,0 +1,462 @@
+/// ARM64 machine code: one function for each form of instruction the backend
+/// writes (a64/gen.arche). Every instruction is one 32-bit word. Registers go
+/// by number; 31 is the zero register or sp, as the instruction reads it. A
+/// size is in bytes.
+import native.buffer as nb;
+
+pub const X0: u8 = 0;
+pub const X16: u8 = 16;
+pub const X17: u8 = 17;
+pub const FP: u8 = 29;
+pub const LR: u8 = 30;
+pub const ZR: u8 = 31;
+pub const SP: u8 = 31;
+
+/// Conditions, as the processor numbers them; the low bit turns one into its
+/// opposite.
+pub const EQ: u8 = 0;
+pub const NE: u8 = 1;
+pub const HS: u8 = 2;
+pub const LO: u8 = 3;
+pub const MI: u8 = 4;
+pub const VS: u8 = 6;
+pub const HI: u8 = 8;
+pub const LS: u8 = 9;
+pub const GE: u8 = 10;
+pub const LT: u8 = 11;
+pub const GT: u8 = 12;
+pub const LE: u8 = 13;
+
+/// ELF's relocations.
+pub const R_ABS64: u32 = 257;
+pub const R_ABS32: u32 = 258;
+pub const R_ADR_PAGE: u32 = 275;
+pub const R_ADD_LO12: u32 = 277;
+pub const R_CALL26: u32 = 283;
+
+/// The three-register operations, at 32 bits; wide adds bit 31.
+pub const OP_ADD: u32 = 0x0B000000;
+pub const OP_ADDS: u32 = 0x2B000000;
+pub const OP_SUB: u32 = 0x4B000000;
+pub const OP_SUBS: u32 = 0x6B000000;
+pub const OP_AND: u32 = 0x0A000000;
+pub const OP_ORR: u32 = 0x2A000000;
+pub const OP_EOR: u32 = 0x4A000000;
+pub const OP_SDIV: u32 = 0x1AC00C00;
+pub const OP_UDIV: u32 = 0x1AC00800;
+pub const OP_LSL: u32 = 0x1AC02000;
+pub const OP_LSR: u32 = 0x1AC02400;
+pub const OP_ASR: u32 = 0x1AC02800;
+pub const OP_MUL: u32 = 0x1B007C00;
+
+pub fn here(c: &nb.Code) -> u64 {
+    return c.bytes.len() as u64;
+}
+
+pub fn word(c: &mut nb.Code, w: u32) {
+    var k: u32 = 0;
+    while k < 4 : (k += 1) {
+        c.bytes.push(((w >> (k * 8)) & 255) as u8);
+    }
+}
+
+fn wide_bit(size: u32) -> u32 {
+    if size == 8 {
+        return 0x80000000;
+    }
+    return 0;
+}
+
+/// op rd, rn, rm.
+pub fn op3(c: &mut nb.Code, op: u32, size: u32, rd: u8, rn: u8, rm: u8) {
+    word(c, op | wide_bit(size) | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// cmp rn, rm.
+pub fn cmp(c: &mut nb.Code, size: u32, rn: u8, rm: u8) {
+    op3(c, op: OP_SUBS, size: size, rd: ZR, rn: rn, rm: rm);
+}
+
+/// add, sub, adds, subs with a 12-bit immediate: op is the register form's.
+pub fn op_imm(c: &mut nb.Code, op: u32, size: u32, rd: u8, rn: u8, imm: u32) {
+    // In these, the immediate form has bits 24 and 28 changed.
+    let form = (op & 0x60000000) | 0x11000000;
+    word(c, form | wide_bit(size) | (imm << 10) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// mov rd, rm.
+pub fn mov(c: &mut nb.Code, rd: u8, rm: u8) {
+    op3(c, op: OP_ORR, size: 8, rd: rd, rn: ZR, rm: rm);
+}
+
+/// The low four bytes; the upper four become 0.
+pub fn mov32(c: &mut nb.Code, rd: u8, rm: u8) {
+    op3(c, op: OP_ORR, size: 4, rd: rd, rn: ZR, rm: rm);
+}
+
+/// rd holds this number, in as few words as it takes.
+pub fn mov_imm(c: &mut nb.Code, rd: u8, v: u64) {
+    var first = true;
+    var k: u64 = 0;
+    while k < 4 : (k += 1) {
+        let part = ((v >> (k * 16)) & 0xFFFF) as u32;
+        if part != 0 {
+            if first {
+                word(c, 0xD2800000 | ((k as u32) << 21) | (part << 5) | rd as u32);
+                first = false;
+            } else {
+                word(c, 0xF2800000 | ((k as u32) << 21) | (part << 5) | rd as u32);
+            }
+        }
+    }
+    if first {
+        word(c, 0xD2800000 | rd as u32);
+    }
+}
+
+/// rd = the address of a symbol + addend.
+pub fn adr_symbol(c: &mut nb.Code, rd: u8, symbol: u32, addend: i64) {
+    c.relocs.push(nb.Reloc { offset: here(c), symbol: symbol, kind: R_ADR_PAGE, addend: addend });
+    word(c, 0x90000000 | rd as u32);
+    c.relocs.push(nb.Reloc { offset: here(c), symbol: symbol, kind: R_ADD_LO12, addend: addend });
+    word(c, 0x91000000 | ((rd as u32) << 5) | rd as u32);
+}
+
+/// rd, 4 bytes wide, from the low 1 or 2 bytes of rn, zero-extended.
+pub fn uxt(c: &mut nb.Code, rd: u8, rn: u8, from: u32) {
+    var w: u32 = 0x53001C00;
+    if from == 2 {
+        w = 0x53003C00;
+    }
+    word(c, w | ((rn as u32) << 5) | rd as u32);
+}
+
+/// rd, 8 bytes wide, from the low 1, 2 or 4 bytes of rn, sign-extended.
+pub fn sxt(c: &mut nb.Code, rd: u8, rn: u8, from: u32) {
+    var w: u32 = 0x93401C00;
+    if from == 2 {
+        w = 0x93403C00;
+    } else if from == 4 {
+        w = 0x93407C00;
+    }
+    word(c, w | ((rn as u32) << 5) | rd as u32);
+}
+
+/// A shift by a constant.
+pub fn lsr_imm(c: &mut nb.Code, size: u32, rd: u8, rn: u8, by: u32) {
+    if size == 8 {
+        word(c, 0xD340FC00 | (by << 16) | ((rn as u32) << 5) | rd as u32);
+    } else {
+        word(c, 0x53007C00 | (by << 16) | ((rn as u32) << 5) | rd as u32);
+    }
+}
+
+/// and rd, rn, #1.
+pub fn and_one(c: &mut nb.Code, rd: u8, rn: u8) {
+    word(c, 0x12000000 | ((rn as u32) << 5) | rd as u32);
+}
+
+/// tst rn, #1.
+pub fn test_one(c: &mut nb.Code, rn: u8) {
+    word(c, 0x7200001F | ((rn as u32) << 5));
+}
+
+/// rd = 1 when the condition holds, else 0.
+pub fn cset(c: &mut nb.Code, cc: u8, rd: u8) {
+    word(c, 0x1A9F07E0 | (((cc ^ 1) as u32) << 12) | rd as u32);
+}
+
+/// rd = rn when the condition holds, else rm.
+pub fn csel(c: &mut nb.Code, cc: u8, rd: u8, rn: u8, rm: u8) {
+    word(c, 0x9A800000 | ((rm as u32) << 16) | ((cc as u32) << 12) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// rd = ra - rn * rm, for a remainder.
+pub fn msub(c: &mut nb.Code, size: u32, rd: u8, rn: u8, rm: u8, ra: u8) {
+    word(c, 0x1B008000 | wide_bit(size) | ((rm as u32) << 16) | ((ra as u32) << 10) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// rd = ra + rn * rm.
+pub fn madd(c: &mut nb.Code, rd: u8, rn: u8, rm: u8, ra: u8) {
+    word(c, 0x9B000000 | ((rm as u32) << 16) | ((ra as u32) << 10) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// add rd, rn, rm, lsl #by.
+pub fn add_shifted(c: &mut nb.Code, rd: u8, rn: u8, rm: u8, by: u32) {
+    word(c, 0x8B000000 | ((rm as u32) << 16) | (by << 10) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// The product of two 4-byte numbers, 8 bytes wide.
+pub fn smull(c: &mut nb.Code, rd: u8, rn: u8, rm: u8) {
+    word(c, 0x9B207C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+}
+
+pub fn umull(c: &mut nb.Code, rd: u8, rn: u8, rm: u8) {
+    word(c, 0x9BA07C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// The upper half of the product of two 8-byte numbers.
+pub fn smulh(c: &mut nb.Code, rd: u8, rn: u8, rm: u8) {
+    word(c, 0x9B407C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+}
+
+pub fn umulh(c: &mut nb.Code, rd: u8, rn: u8, rm: u8) {
+    word(c, 0x9BC07C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// cmp rn, rm, asr #63.
+pub fn cmp_sign_of(c: &mut nb.Code, rn: u8, rm: u8) {
+    word(c, 0xEB80FC1F | ((rm as u32) << 16) | ((rn as u32) << 5));
+}
+
+fn scaled_load(size: u32) -> u32 {
+    if size == 1 {
+        return 0x39400000;
+    }
+    if size == 2 {
+        return 0x79400000;
+    }
+    if size == 4 {
+        return 0xB9400000;
+    }
+    return 0xF9400000;
+}
+
+fn log2_size(size: u32) -> u32 {
+    if size == 1 {
+        return 0;
+    }
+    if size == 2 {
+        return 1;
+    }
+    if size == 4 {
+        return 2;
+    }
+    return 3;
+}
+
+/// A load or store of a general or vector register at base + disp: its
+/// scaled form, its unscaled one, or through x17 for what neither reaches.
+/// load_word is the scaled load's; the store's has bit 22 clear, the unscaled
+/// ones have bit 24 clear too.
+fn access(c: &mut nb.Code, scaled: u32, size: u32, rt: u8, base: u8, disp: i32) {
+    if disp >= 0 and disp as u32 % size == 0 and disp as u32 / size < 4096 {
+        word(c, scaled | ((disp as u32 / size) << 10) | ((base as u32) << 5) | rt as u32);
+        return;
+    }
+    if disp >= -256 and disp < 256 {
+        let unscaled = scaled & 0xFEFFFFFF;
+        word(c, unscaled | ((nb.bits_of_i32(disp) & 0x1FF) << 12) | ((base as u32) << 5) | rt as u32);
+        return;
+    }
+    if disp >= 0 {
+        mov_imm(c, X17, disp as u64);
+    } else {
+        mov_imm(c, X17, (-(disp as i64)) as u64);
+    }
+    if disp >= 0 {
+        op3(c, op: OP_ADD, size: 8, rd: X17, rn: base, rm: X17);
+    } else {
+        op3(c, op: OP_SUB, size: 8, rd: X17, rn: base, rm: X17);
+    }
+    word(c, scaled | ((X17 as u32) << 5) | rt as u32);
+}
+
+/// A value of 1, 2, 4 or 8 bytes from memory; narrower than 8, zero-extended.
+pub fn load(c: &mut nb.Code, size: u32, rt: u8, base: u8, disp: i32) {
+    access(c, scaled: scaled_load(size), size: size, rt: rt, base: base, disp: disp);
+}
+
+pub fn store(c: &mut nb.Code, size: u32, rt: u8, base: u8, disp: i32) {
+    access(c, scaled: scaled_load(size) & 0xFFBFFFFF, size: size, rt: rt, base: base, disp: disp);
+}
+
+pub fn load_float(c: &mut nb.Code, size: u32, rt: u8, base: u8, disp: i32) {
+    var w: u32 = 0xFD400000;
+    if size == 4 {
+        w = 0xBD400000;
+    }
+    access(c, scaled: w, size: size, rt: rt, base: base, disp: disp);
+}
+
+pub fn store_float(c: &mut nb.Code, size: u32, rt: u8, base: u8, disp: i32) {
+    var w: u32 = 0xFD000000;
+    if size == 4 {
+        w = 0xBD000000;
+    }
+    access(c, scaled: w, size: size, rt: rt, base: base, disp: disp);
+}
+
+/// A branch whose target is patched in later: where to patch.
+pub fn b_cond(c: &mut nb.Code, cc: u8) -> u64 {
+    let at = here(c);
+    word(c, 0x54000000 | cc as u32);
+    return at;
+}
+
+pub fn b(c: &mut nb.Code) -> u64 {
+    let at = here(c);
+    word(c, 0x14000000);
+    return at;
+}
+
+fn get_word(c: &nb.Code, at: u64) -> u32 {
+    let bytes = c.bytes.items();
+    let i = at as usize;
+    return bytes[i] as u32 | ((bytes[i + 1] as u32) << 8) | ((bytes[i + 2] as u32) << 16) | ((bytes[i + 3] as u32) << 24);
+}
+
+/// The branch at at goes to target; false when it cannot reach so far.
+pub fn patch(c: &mut nb.Code, at: u64, target: u64) -> bool {
+    let distance = (target as i64 - at as i64) / 4;
+    var w = get_word(c, at);
+    let bits = nb.bits_of_i64(distance);
+    if w & 0xFF000000 == 0x54000000 {
+        if distance < -262144 or distance >= 262144 {
+            return false;
+        }
+        w = (w & 0xFF00001F) | (((bits & 0x7FFFF) as u32) << 5);
+    } else {
+        if distance < -33554432 or distance >= 33554432 {
+            return false;
+        }
+        w = (w & 0xFC000000) | (bits & 0x3FFFFFF) as u32;
+    }
+    let bytes = c.bytes.items_mut();
+    var k: u32 = 0;
+    while k < 4 : (k += 1) {
+        bytes[at as usize + k as usize] = ((w >> (k * 8)) & 255) as u8;
+    }
+    return true;
+}
+
+pub fn patch_here(c: &mut nb.Code, at: u64) {
+    let target = here(c);
+    _ = patch(c, at: at, target: target);
+}
+
+pub fn bl_symbol(c: &mut nb.Code, symbol: u32) {
+    c.relocs.push(nb.Reloc { offset: here(c), symbol: symbol, kind: R_CALL26, addend: 0 });
+    word(c, 0x94000000);
+}
+
+pub fn blr(c: &mut nb.Code, rn: u8) {
+    word(c, 0xD63F0000 | ((rn as u32) << 5));
+}
+
+pub fn ret(c: &mut nb.Code) {
+    word(c, 0xD65F03C0);
+}
+
+pub fn brk(c: &mut nb.Code) {
+    word(c, 0xD4200020);
+}
+
+/// The vector registers. Each form below is at 4 bytes; double makes it 8.
+fn double_bit(size: u32) -> u32 {
+    if size == 8 {
+        return 0x00400000;
+    }
+    return 0;
+}
+
+pub fn fmov(c: &mut nb.Code, size: u32, rd: u8, rn: u8) {
+    word(c, 0x1E204000 | double_bit(size) | ((rn as u32) << 5) | rd as u32);
+}
+
+pub fn fmov_from_int(c: &mut nb.Code, size: u32, rd: u8, rn: u8) {
+    if size == 8 {
+        word(c, 0x9E670000 | ((rn as u32) << 5) | rd as u32);
+    } else {
+        word(c, 0x1E270000 | ((rn as u32) << 5) | rd as u32);
+    }
+}
+
+pub fn fmov_to_int(c: &mut nb.Code, size: u32, rd: u8, rn: u8) {
+    if size == 8 {
+        word(c, 0x9E660000 | ((rn as u32) << 5) | rd as u32);
+    } else {
+        word(c, 0x1E260000 | ((rn as u32) << 5) | rd as u32);
+    }
+}
+
+/// fadd 0x2800, fsub 0x3800, fmul 0x0800, fdiv 0x1800.
+pub fn fbin(c: &mut nb.Code, low: u32, size: u32, rd: u8, rn: u8, rm: u8) {
+    word(c, 0x1E200000 | low | double_bit(size) | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// fneg 0x14000, fabs 0xC000, fsqrt 0x1C000.
+pub fn funary(c: &mut nb.Code, low: u32, size: u32, rd: u8, rn: u8) {
+    word(c, 0x1E200000 | low | double_bit(size) | ((rn as u32) << 5) | rd as u32);
+}
+
+pub fn fcmp(c: &mut nb.Code, size: u32, rn: u8, rm: u8) {
+    word(c, 0x1E202000 | double_bit(size) | ((rm as u32) << 16) | ((rn as u32) << 5));
+}
+
+/// From a float of this size to the other.
+pub fn fcvt(c: &mut nb.Code, from: u32, rd: u8, rn: u8) {
+    if from == 4 {
+        word(c, 0x1E22C000 | ((rn as u32) << 5) | rd as u32);
+    } else {
+        word(c, 0x1E624000 | ((rn as u32) << 5) | rd as u32);
+    }
+}
+
+/// A float of this size from an 8-byte integer.
+pub fn int_to_float(c: &mut nb.Code, signed: bool, size: u32, rd: u8, rn: u8) {
+    var w: u32 = 0x9E230000;
+    if signed {
+        w = 0x9E220000;
+    }
+    word(c, w | double_bit(size) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// A 4- or 8-byte integer from a float, rounding to zero; what is out of
+/// range is the nearest end of it, and a NaN is 0.
+pub fn float_to_int(c: &mut nb.Code, signed: bool, int_size: u32, float_size: u32, rd: u8, rn: u8) {
+    var w: u32 = 0x1E390000;
+    if signed {
+        w = 0x1E380000;
+    }
+    word(c, w | wide_bit(int_size) | double_bit(float_size) | ((rn as u32) << 5) | rd as u32);
+}
+
+fn exclusive_bits(size: u32) -> u32 {
+    if size == 1 {
+        return 0x08000000;
+    }
+    if size == 2 {
+        return 0x48000000;
+    }
+    if size == 4 {
+        return 0x88000000;
+    }
+    return 0xC8000000;
+}
+
+pub fn ldar(c: &mut nb.Code, size: u32, rt: u8, rn: u8) {
+    word(c, exclusive_bits(size) | 0x00DFFC00 | ((rn as u32) << 5) | rt as u32);
+}
+
+pub fn stlr(c: &mut nb.Code, size: u32, rt: u8, rn: u8) {
+    word(c, exclusive_bits(size) | 0x009FFC00 | ((rn as u32) << 5) | rt as u32);
+}
+
+pub fn ldaxr(c: &mut nb.Code, size: u32, rt: u8, rn: u8) {
+    word(c, exclusive_bits(size) | 0x005FFC00 | ((rn as u32) << 5) | rt as u32);
+}
+
+pub fn stlxr(c: &mut nb.Code, size: u32, status: u8, rt: u8, rn: u8) {
+    word(c, exclusive_bits(size) | 0x0000FC00 | ((status as u32) << 16) | ((rn as u32) << 5) | rt as u32);
+}
+
+/// cbnz, at 4 bytes, back to target.
+pub fn cbnz_back(c: &mut nb.Code, rt: u8, target: u64) {
+    let distance = (target as i64 - here(c) as i64) / 4;
+    word(c, 0x35000000 | (((nb.bits_of_i64(distance) & 0x7FFFF) as u32) << 5) | rt as u32);
+}
+
+pub fn dmb(c: &mut nb.Code) {
+    word(c, 0xD5033BBF);
+}

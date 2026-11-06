@@ -1,0 +1,43 @@
+/// Machine code on its way into an object: a function's bytes, and what the
+/// linker is to fill in. Each processor writes its own instructions into this
+/// (x64/code.arche, a64/code.arche, rv64/code.arche).
+import alloc;
+
+pub type Reloc = struct {
+    pub offset: u64,
+    pub symbol: u32,
+    pub kind: u32,
+    pub addend: i64,
+}
+
+/// A function's code, and what the linker is to fill in.
+pub type Code = struct {
+    pub bytes: alloc.List(u8),
+    pub relocs: alloc.List(Reloc),
+}
+
+pub fn new_code(a: alloc.Allocator) -> Code {
+    return Code { bytes: alloc.List(u8).init(a), relocs: alloc.List(Reloc).init(a) };
+}
+
+/// A number's bits as an unsigned one: `as` keeps values, and refuses these.
+pub fn bits_of_i32(v: i32) -> u32 {
+    if v >= 0 {
+        return v as u32;
+    }
+    return 4294967295 - (-(v + 1)) as u32;
+}
+
+pub fn bits_of_i64(v: i64) -> u64 {
+    if v >= 0 {
+        return v as u64;
+    }
+    return 18446744073709551615 - (-(v + 1)) as u64;
+}
+
+pub fn i32_of_bits(v: u32) -> i32 {
+    if v <= 0x7FFFFFFF {
+        return v as i32;
+    }
+    return -((4294967295 - v) as i32) - 1;
+}

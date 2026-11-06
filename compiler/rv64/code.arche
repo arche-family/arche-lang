@@ -1,0 +1,448 @@
+/// RISC-V 64 machine code: one function for each form of instruction the
+/// backend writes (rv64/gen.arche). Every instruction is one 32-bit word, of
+/// the G set: no compressed ones. Registers go by number. A size is in bytes.
+import native.buffer as nb;
+
+pub const ZERO: u8 = 0;
+pub const RA: u8 = 1;
+pub const SP: u8 = 2;
+pub const FP: u8 = 8;
+pub const A0: u8 = 10;
+/// Reaching far memory, for the functions below.
+pub const FAR: u8 = 31;
+
+/// ELF's relocations.
+pub const R_32: u32 = 1;
+pub const R_64: u32 = 2;
+pub const R_CALL_PLT: u32 = 19;
+pub const R_HI20: u32 = 26;
+pub const R_LO12_I: u32 = 27;
+
+/// A branch's funct3; the low bit turns one into its opposite.
+pub const BEQ: u32 = 0;
+pub const BNE: u32 = 1;
+pub const BLT: u32 = 4;
+pub const BGE: u32 = 5;
+pub const BLTU: u32 = 6;
+pub const BGEU: u32 = 7;
+
+/// R-type operations: funct7 << 25 | funct3 << 12.
+pub const OP_ADD: u32 = 0x00000000;
+pub const OP_SUB: u32 = 0x40000000;
+pub const OP_SLL: u32 = 0x00001000;
+pub const OP_SLT: u32 = 0x00002000;
+pub const OP_SLTU: u32 = 0x00003000;
+pub const OP_XOR: u32 = 0x00004000;
+pub const OP_SRL: u32 = 0x00005000;
+pub const OP_SRA: u32 = 0x40005000;
+pub const OP_OR: u32 = 0x00006000;
+pub const OP_AND: u32 = 0x00007000;
+pub const OP_MUL: u32 = 0x02000000;
+pub const OP_MULH: u32 = 0x02001000;
+pub const OP_MULHU: u32 = 0x02003000;
+pub const OP_DIV: u32 = 0x02004000;
+pub const OP_DIVU: u32 = 0x02005000;
+pub const OP_REM: u32 = 0x02006000;
+pub const OP_REMU: u32 = 0x02007000;
+
+/// Atomic memory operations: funct5.
+pub const AMO_ADD: u32 = 0;
+pub const AMO_SWAP: u32 = 1;
+pub const AMO_LR: u32 = 2;
+pub const AMO_SC: u32 = 3;
+pub const AMO_OR: u32 = 8;
+pub const AMO_AND: u32 = 12;
+
+pub fn here(c: &nb.Code) -> u64 {
+    return c.bytes.len() as u64;
+}
+
+pub fn word(c: &mut nb.Code, w: u32) {
+    var k: u32 = 0;
+    while k < 4 : (k += 1) {
+        c.bytes.push(((w >> (k * 8)) & 255) as u8);
+    }
+}
+
+/// op rd, rs1, rs2.
+pub fn op3(c: &mut nb.Code, op: u32, rd: u8, rs1: u8, rs2: u8) {
+    word(c, 0x33 | op | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7));
+}
+
+fn i_type(opcode: u32, funct3: u32, rd: u8, rs1: u8, imm: i32) -> u32 {
+    return opcode | (funct3 << 12) | ((rd as u32) << 7) | ((rs1 as u32) << 15) | ((nb.bits_of_i32(imm) & 0xFFF) << 20);
+}
+
+pub fn addi(c: &mut nb.Code, rd: u8, rs1: u8, imm: i32) {
+    word(c, i_type(opcode: 0x13, funct3: 0, rd: rd, rs1: rs1, imm: imm));
+}
+
+pub fn andi(c: &mut nb.Code, rd: u8, rs1: u8, imm: i32) {
+    word(c, i_type(opcode: 0x13, funct3: 7, rd: rd, rs1: rs1, imm: imm));
+}
+
+pub fn xori(c: &mut nb.Code, rd: u8, rs1: u8, imm: i32) {
+    word(c, i_type(opcode: 0x13, funct3: 4, rd: rd, rs1: rs1, imm: imm));
+}
+
+/// rd = 1 when rs1, as a whole, is below imm.
+pub fn sltiu(c: &mut nb.Code, rd: u8, rs1: u8, imm: i32) {
+    word(c, i_type(opcode: 0x13, funct3: 3, rd: rd, rs1: rs1, imm: imm));
+}
+
+/// rd = rs1's low 4 bytes, sign-extended.
+pub fn sext_w(c: &mut nb.Code, rd: u8, rs1: u8) {
+    word(c, i_type(opcode: 0x1B, funct3: 0, rd: rd, rs1: rs1, imm: 0));
+}
+
+pub fn slli(c: &mut nb.Code, rd: u8, rs1: u8, by: u32) {
+    word(c, 0x13 | (1 << 12) | ((rd as u32) << 7) | ((rs1 as u32) << 15) | (by << 20));
+}
+
+pub fn srli(c: &mut nb.Code, rd: u8, rs1: u8, by: u32) {
+    word(c, 0x13 | (5 << 12) | ((rd as u32) << 7) | ((rs1 as u32) << 15) | (by << 20));
+}
+
+pub fn srai(c: &mut nb.Code, rd: u8, rs1: u8, by: u32) {
+    word(c, 0x40000013 | (5 << 12) | ((rd as u32) << 7) | ((rs1 as u32) << 15) | (by << 20));
+}
+
+pub fn srlw(c: &mut nb.Code, rd: u8, rs1: u8, rs2: u8) {
+    word(c, 0x3B | (5 << 12) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7));
+}
+
+pub fn mv(c: &mut nb.Code, rd: u8, rs1: u8) {
+    addi(c, rd: rd, rs1: rs1, imm: 0);
+}
+
+fn fits_i32(v: u64) -> bool {
+    let top = v >> 31;
+    return top == 0 or top == 0x1FFFFFFFF;
+}
+
+/// rd holds this number, in as few words as this takes: the low 12 bits are a
+/// signed addition to what the rest makes.
+pub fn li(c: &mut nb.Code, rd: u8, v: u64) {
+    let low = (v & 0xFFF) as u32;
+    var imm = low as i32;
+    if low >= 0x800 {
+        imm = low as i32 - 0x1000;
+    }
+    if fits_i32(v) {
+        // The upper 20 bits, rounded up when the low part is negative.
+        var upper = v >> 12;
+        if low >= 0x800 {
+            upper += 1;
+        }
+        upper = upper & 0xFFFFF;
+        if upper == 0 {
+            addi(c, rd: rd, rs1: ZERO, imm: imm);
+            return;
+        }
+        word(c, 0x37 | ((rd as u32) << 7) | ((upper as u32) << 12));
+        if imm != 0 {
+            word(c, i_type(opcode: 0x1B, funct3: 0, rd: rd, rs1: rd, imm: imm));
+        }
+        return;
+    }
+    var rest = v >> 12;
+    if low >= 0x800 {
+        rest += 1;
+    }
+    rest = rest & 0xFFFFFFFFFFFFF;
+    if rest & 0x8000000000000 != 0 {
+        rest = rest | 0xFFF0000000000000;
+    }
+    li(c, rd: rd, v: rest);
+    slli(c, rd: rd, rs1: rd, by: 12);
+    if imm != 0 {
+        addi(c, rd: rd, rs1: rd, imm: imm);
+    }
+}
+
+/// rd = the address of a symbol + addend: a static program's is below 2 GB.
+pub fn la_symbol(c: &mut nb.Code, rd: u8, symbol: u32, addend: i64) {
+    c.relocs.push(nb.Reloc { offset: here(c), symbol: symbol, kind: R_HI20, addend: addend });
+    word(c, 0x37 | ((rd as u32) << 7));
+    c.relocs.push(nb.Reloc { offset: here(c), symbol: symbol, kind: R_LO12_I, addend: addend });
+    addi(c, rd: rd, rs1: rd, imm: 0);
+}
+
+/// rd, whole, from the low 1, 2 or 4 bytes of rs1, zero-extended.
+pub fn zext(c: &mut nb.Code, rd: u8, rs1: u8, from: u32) {
+    if from == 1 {
+        andi(c, rd: rd, rs1: rs1, imm: 255);
+        return;
+    }
+    let by = 64 - from * 8;
+    slli(c, rd: rd, rs1: rs1, by: by);
+    srli(c, rd: rd, rs1: rd, by: by);
+}
+
+/// rd, whole, from the low 1, 2 or 4 bytes of rs1, sign-extended.
+pub fn sext(c: &mut nb.Code, rd: u8, rs1: u8, from: u32) {
+    if from == 4 {
+        sext_w(c, rd: rd, rs1: rs1);
+        return;
+    }
+    let by = 64 - from * 8;
+    slli(c, rd: rd, rs1: rs1, by: by);
+    srai(c, rd: rd, rs1: rd, by: by);
+}
+
+/// rd = 1 when rs1 is not zero, else 0.
+pub fn snez(c: &mut nb.Code, rd: u8, rs1: u8) {
+    op3(c, OP_SLTU, rd: rd, rs1: ZERO, rs2: rs1);
+}
+
+fn size_funct3(size: u32) -> u32 {
+    if size == 1 {
+        return 0;
+    }
+    if size == 2 {
+        return 1;
+    }
+    if size == 4 {
+        return 2;
+    }
+    return 3;
+}
+
+fn s_type(opcode: u32, funct3: u32, rs2: u8, rs1: u8, imm: i32) -> u32 {
+    let bits = nb.bits_of_i32(imm) & 0xFFF;
+    return opcode | (funct3 << 12) | ((rs1 as u32) << 15) | ((rs2 as u32) << 20) | ((bits & 31) << 7) | ((bits >> 5) << 25);
+}
+
+fn reaches(disp: i32) -> bool {
+    return disp >= -2048 and disp < 2048;
+}
+
+/// far = base + disp, for the memory an instruction's 12 bits do not reach.
+fn far_address(c: &mut nb.Code, base: u8, disp: i32) {
+    if disp >= 0 {
+        li(c, rd: FAR, v: disp as u64);
+    } else {
+        li(c, rd: FAR, v: nb.bits_of_i64(disp as i64));
+    }
+    op3(c, OP_ADD, rd: FAR, rs1: base, rs2: FAR);
+}
+
+/// A value of 1, 2, 4 or 8 bytes from memory, zero-extended.
+pub fn load(c: &mut nb.Code, size: u32, rd: u8, base: u8, disp: i32) {
+    var funct3: u32 = 3;
+    if size < 8 {
+        funct3 = size_funct3(size) | 4;
+    }
+    if reaches(disp) {
+        word(c, i_type(opcode: 0x03, funct3: funct3, rd: rd, rs1: base, imm: disp));
+        return;
+    }
+    far_address(c, base: base, disp: disp);
+    word(c, i_type(opcode: 0x03, funct3: funct3, rd: rd, rs1: FAR, imm: 0));
+}
+
+pub fn store(c: &mut nb.Code, size: u32, rs2: u8, base: u8, disp: i32) {
+    if reaches(disp) {
+        word(c, s_type(opcode: 0x23, funct3: size_funct3(size), rs2: rs2, rs1: base, imm: disp));
+        return;
+    }
+    far_address(c, base: base, disp: disp);
+    word(c, s_type(opcode: 0x23, funct3: size_funct3(size), rs2: rs2, rs1: FAR, imm: 0));
+}
+
+pub fn load_float(c: &mut nb.Code, size: u32, rd: u8, base: u8, disp: i32) {
+    if reaches(disp) {
+        word(c, i_type(opcode: 0x07, funct3: size_funct3(size), rd: rd, rs1: base, imm: disp));
+        return;
+    }
+    far_address(c, base: base, disp: disp);
+    word(c, i_type(opcode: 0x07, funct3: size_funct3(size), rd: rd, rs1: FAR, imm: 0));
+}
+
+pub fn store_float(c: &mut nb.Code, size: u32, rs2: u8, base: u8, disp: i32) {
+    if reaches(disp) {
+        word(c, s_type(opcode: 0x27, funct3: size_funct3(size), rs2: rs2, rs1: base, imm: disp));
+        return;
+    }
+    far_address(c, base: base, disp: disp);
+    word(c, s_type(opcode: 0x27, funct3: size_funct3(size), rs2: rs2, rs1: FAR, imm: 0));
+}
+
+fn b_bits(distance: i32) -> u32 {
+    let bits = nb.bits_of_i32(distance);
+    return (((bits >> 12) & 1) << 31) | (((bits >> 5) & 63) << 25) | (((bits >> 1) & 15) << 8) | (((bits >> 11) & 1) << 7);
+}
+
+/// A branch over the next instruction, or as far as distance says.
+pub fn branch(c: &mut nb.Code, funct3: u32, rs1: u8, rs2: u8, distance: i32) {
+    word(c, 0x63 | (funct3 << 12) | ((rs1 as u32) << 15) | ((rs2 as u32) << 20) | b_bits(distance));
+}
+
+/// A short forward branch whose target is patched in later: where to patch.
+pub fn branch_forward(c: &mut nb.Code, funct3: u32, rs1: u8, rs2: u8) -> u64 {
+    let at = here(c);
+    branch(c, funct3, rs1: rs1, rs2: rs2, distance: 0);
+    return at;
+}
+
+fn put_word(c: &mut nb.Code, at: u64, w: u32) {
+    let bytes = c.bytes.items_mut();
+    var k: u32 = 0;
+    while k < 4 : (k += 1) {
+        bytes[at as usize + k as usize] = ((w >> (k * 8)) & 255) as u8;
+    }
+}
+
+fn get_word(c: &nb.Code, at: u64) -> u32 {
+    let bytes = c.bytes.items();
+    let i = at as usize;
+    return bytes[i] as u32 | ((bytes[i + 1] as u32) << 8) | ((bytes[i + 2] as u32) << 16) | ((bytes[i + 3] as u32) << 24);
+}
+
+/// The short branch at at goes here.
+pub fn patch_branch_here(c: &mut nb.Code, at: u64) {
+    let distance = (here(c) - at) as i32;
+    let w = get_word(c, at);
+    put_word(c, at: at, w: w | b_bits(distance));
+}
+
+/// A jump whose target is patched in later: where to patch.
+pub fn jal_forward(c: &mut nb.Code) -> u64 {
+    let at = here(c);
+    word(c, 0x6F);
+    return at;
+}
+
+/// The jump at at goes to target; false when it cannot reach so far.
+pub fn patch_jump(c: &mut nb.Code, at: u64, target: u64) -> bool {
+    let distance = target as i64 - at as i64;
+    if distance < -1048576 or distance >= 1048576 {
+        return false;
+    }
+    let bits = nb.bits_of_i64(distance);
+    let w = 0x6F | ((((bits >> 20) & 1) as u32) << 31) | ((((bits >> 1) & 0x3FF) as u32) << 21) | ((((bits >> 11) & 1) as u32) << 20) | ((((bits >> 12) & 0xFF) as u32) << 12);
+    put_word(c, at: at, w: w);
+    return true;
+}
+
+pub fn call_symbol(c: &mut nb.Code, symbol: u32) {
+    c.relocs.push(nb.Reloc { offset: here(c), symbol: symbol, kind: R_CALL_PLT, addend: 0 });
+    // auipc ra, 0; jalr ra, 0(ra).
+    word(c, 0x00000097);
+    word(c, 0x000080E7);
+}
+
+pub fn jalr(c: &mut nb.Code, rs1: u8) {
+    word(c, 0x000000E7 | ((rs1 as u32) << 15));
+}
+
+pub fn ret(c: &mut nb.Code) {
+    word(c, 0x00008067);
+}
+
+pub fn ebreak(c: &mut nb.Code) {
+    word(c, 0x00100073);
+}
+
+/// A float operation of two registers: funct7's bit 0 says double, funct3 is
+/// its rounding or its kind.
+fn float_word(funct7: u32, size: u32, funct3: u32, rd: u8, rs1: u8, rs2: u32) -> u32 {
+    var width: u32 = 0;
+    if size == 8 {
+        width = 1;
+    }
+    return 0x53 | ((funct7 | width) << 25) | (rs2 << 20) | ((rs1 as u32) << 15) | (funct3 << 12) | ((rd as u32) << 7);
+}
+
+/// fadd 0x00, fsub 0x04, fmul 0x08, fdiv 0x0C.
+pub fn fbin(c: &mut nb.Code, funct7: u32, size: u32, rd: u8, rs1: u8, rs2: u8) {
+    word(c, float_word(funct7: funct7, size: size, funct3: 7, rd: rd, rs1: rs1, rs2: rs2 as u32));
+}
+
+pub fn fsqrt(c: &mut nb.Code, size: u32, rd: u8, rs1: u8) {
+    word(c, float_word(funct7: 0x2C, size: size, funct3: 7, rd: rd, rs1: rs1, rs2: 0));
+}
+
+pub fn fmv(c: &mut nb.Code, size: u32, rd: u8, rs1: u8) {
+    word(c, float_word(funct7: 0x10, size: size, funct3: 0, rd: rd, rs1: rs1, rs2: rs1 as u32));
+}
+
+pub fn fneg(c: &mut nb.Code, size: u32, rd: u8, rs1: u8) {
+    word(c, float_word(funct7: 0x10, size: size, funct3: 1, rd: rd, rs1: rs1, rs2: rs1 as u32));
+}
+
+pub fn fabs(c: &mut nb.Code, size: u32, rd: u8, rs1: u8) {
+    word(c, float_word(funct7: 0x10, size: size, funct3: 2, rd: rd, rs1: rs1, rs2: rs1 as u32));
+}
+
+/// An integer register's bits in a float register.
+pub fn fmv_from_int(c: &mut nb.Code, size: u32, rd: u8, rs1: u8) {
+    word(c, float_word(funct7: 0x78, size: size, funct3: 0, rd: rd, rs1: rs1, rs2: 0));
+}
+
+pub fn fmv_to_int(c: &mut nb.Code, size: u32, rd: u8, rs1: u8) {
+    word(c, float_word(funct7: 0x70, size: size, funct3: 0, rd: rd, rs1: rs1, rs2: 0));
+}
+
+pub fn feq(c: &mut nb.Code, size: u32, rd: u8, rs1: u8, rs2: u8) {
+    word(c, float_word(funct7: 0x50, size: size, funct3: 2, rd: rd, rs1: rs1, rs2: rs2 as u32));
+}
+
+pub fn flt(c: &mut nb.Code, size: u32, rd: u8, rs1: u8, rs2: u8) {
+    word(c, float_word(funct7: 0x50, size: size, funct3: 1, rd: rd, rs1: rs1, rs2: rs2 as u32));
+}
+
+pub fn fle(c: &mut nb.Code, size: u32, rd: u8, rs1: u8, rs2: u8) {
+    word(c, float_word(funct7: 0x50, size: size, funct3: 0, rd: rd, rs1: rs1, rs2: rs2 as u32));
+}
+
+/// From a float of this size to the other.
+pub fn fcvt(c: &mut nb.Code, from: u32, rd: u8, rs1: u8) {
+    if from == 4 {
+        word(c, float_word(funct7: 0x20, size: 8, funct3: 0, rd: rd, rs1: rs1, rs2: 0));
+    } else {
+        word(c, float_word(funct7: 0x20, size: 4, funct3: 7, rd: rd, rs1: rs1, rs2: 1));
+    }
+}
+
+/// A float of this size from an 8-byte integer.
+pub fn int_to_float(c: &mut nb.Code, signed: bool, size: u32, rd: u8, rs1: u8) {
+    var kind: u32 = 3;
+    if signed {
+        kind = 2;
+    }
+    word(c, float_word(funct7: 0x68, size: size, funct3: 7, rd: rd, rs1: rs1, rs2: kind));
+}
+
+/// A 4- or 8-byte integer from a float, rounding to zero; what is out of
+/// range is the nearest end of it, and a NaN is the top of the range.
+pub fn float_to_int(c: &mut nb.Code, signed: bool, int_size: u32, float_size: u32, rd: u8, rs1: u8) {
+    var kind: u32 = 0;
+    if int_size == 8 {
+        kind = 2;
+    }
+    if not signed {
+        kind += 1;
+    }
+    word(c, float_word(funct7: 0x60, size: float_size, funct3: 1, rd: rd, rs1: rs1, rs2: kind));
+}
+
+/// Both orderings at once, the strongest there is.
+pub fn amo(c: &mut nb.Code, funct5: u32, size: u32, rd: u8, rs1: u8, rs2: u8) {
+    word(c, 0x2F | (funct5 << 27) | (3 << 25) | (size_funct3(size) << 12) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | ((rd as u32) << 7));
+}
+
+/// fence rw, rw.
+pub fn fence(c: &mut nb.Code) {
+    word(c, 0x0330000F);
+}
+
+/// fence r, rw: after a load.
+pub fn fence_acquire(c: &mut nb.Code) {
+    word(c, 0x0230000F);
+}
+
+/// fence rw, w: before a store.
+pub fn fence_release(c: &mut nb.Code) {
+    word(c, 0x0310000F);
+}

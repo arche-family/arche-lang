@@ -1,0 +1,1302 @@
+/// The compiler's own ARM64 backend (docs/sprints.md S28): an IR module as an
+/// ELF object, with no LLVM between them. How values live and which registers
+/// they get is every backend's (native/ranges.arche); this file is what is
+/// ARM64's.
+///
+/// Registers: x19 to x28 hold values and d8 to d15 floats, and a callee keeps
+/// them all, so a value may live across a call in one. x0 to x15 and d0 to d7,
+/// d16 and up belong to the instruction being written, x16 and x17 to reaching
+/// memory. A frame: x29 and x30 at the frame pointer, everything else below it.
+///
+/// A value narrower than 8 bytes has its upper bits undefined in a register;
+/// whatever reads it reads its own width. An i1 is 0 or 1 in its low byte.
+import alloc;
+import a64.code as cd;
+import a64.inline;
+import ir.ir;
+import native.buffer as nb;
+import native.dwarf;
+import native.ranges as ra;
+import native.unit as uu;
+
+const S0: u8 = 9;
+const S1: u8 = 10;
+const S2: u8 = 11;
+const S3: u8 = 12;
+const FS0: u8 = 16;
+const FS1: u8 = 17;
+
+const NOTHING_RESERVED: i32 = 0;
+
+pub type Gen = struct {
+    u: uu.Unit,
+    r: ra.Ranges,
+    code: nb.Code,
+    block_offsets: alloc.List(u64),
+    fix_at: alloc.List(u64),
+    fix_block: alloc.List(u32),
+    homes: alloc.List(i32),
+    outgoing: u32,
+    /// What place_of found beside its base register.
+    place_disp: i32,
+    a: alloc.Allocator,
+}
+
+fn const_bits(f: &ir.Function, v: u32) -> u64 {
+    let i = f.insts[v as usize];
+    if i.ty == ir.Ty.Ptr {
+        return 0;
+    }
+    let n = ir.bits(i.ty);
+    if n >= 64 {
+        return i.imm;
+    }
+    let one: u64 = 1;
+    return i.imm & ((one << n as u64) - 1);
+}
+
+/// The base register and the displacement of a constant address.
+fn addr_place(g: &mut Gen, f: &ir.Function, v: u32, scratch: u8) -> i32 {
+    let root = g.r.addr_root[v as usize];
+    let off = g.r.addr_off[v as usize];
+    let i = f.insts[root as usize];
+    if i.op == ir.Op.Alloca {
+        if i.flag > 16 {
+            load_alloca_rounded(g, root: root, align: i.flag, scratch: scratch);
+            return off as i32;
+        }
+        return g.r.disps[root as usize] + off as i32;
+    }
+    cd.adr_symbol(&mut g.code, scratch, symbol: uu.root_symbol(&g.u), addend: uu.root_addend(&g.u, f, root) + off);
+    return 0;
+}
+
+fn addr_base(g: &Gen, f: &ir.Function, v: u32, scratch: u8) -> u8 {
+    let root = g.r.addr_root[v as usize];
+    let i = f.insts[root as usize];
+    if i.op == ir.Op.Alloca and i.flag <= 16 {
+        return cd.FP;
+    }
+    return scratch;
+}
+
+fn load_alloca_rounded(g: &mut Gen, root: u32, align: u32, scratch: u8) {
+    add_constant(g, rd: scratch, rn: cd.FP, g.r.disps[root as usize] as i64);
+    cd.mov_imm(&mut g.code, cd.X17, nb.bits_of_i64(-(align as i64)));
+    cd.op3(&mut g.code, op: cd.OP_AND, size: 8, rd: scratch, rn: scratch, rm: cd.X17);
+}
+
+/// rd = rn + by.
+fn add_constant(g: &mut Gen, rd: u8, rn: u8, by: i64) {
+    if by >= 0 and by < 4096 {
+        cd.op_imm(&mut g.code, op: cd.OP_ADD, size: 8, rd: rd, rn: rn, imm: by as u32);
+    } else if by < 0 and by > -4096 {
+        cd.op_imm(&mut g.code, op: cd.OP_SUB, size: 8, rd: rd, rn: rn, imm: (-by) as u32);
+    } else {
+        cd.mov_imm(&mut g.code, cd.X17, nb.bits_of_i64(by));
+        cd.op3(&mut g.code, op: cd.OP_ADD, size: 8, rd: rd, rn: rn, rm: cd.X17);
+    }
+}
+
+/// The value in a register: its own, or scratch.
+fn use_int(g: &mut Gen, f: &ir.Function, v: u32, scratch: u8) -> u8 {
+    let kind = g.r.kinds[v as usize];
+    if kind == ra.V_REG {
+        let r = g.r.regs[v as usize];
+        if r != ra.NO_REG {
+            return r;
+        }
+        cd.load(&mut g.code, 8, rt: scratch, base: cd.FP, disp: g.r.slots[v as usize]);
+        return scratch;
+    }
+    if kind == ra.V_CONST {
+        let bits = const_bits(f, v);
+        if bits == 0 {
+            return cd.ZR;
+        }
+        cd.mov_imm(&mut g.code, scratch, bits);
+        return scratch;
+    }
+    if kind == ra.V_ADDR {
+        let base = addr_base(g, f, v, scratch: scratch);
+        let disp = addr_place(g, f, v, scratch: scratch);
+        add_constant(g, rd: scratch, rn: base, disp as i64);
+        return scratch;
+    }
+    if kind == ra.V_PARAM {
+        let i = f.insts[v as usize];
+        cd.load(&mut g.code, ra.size_of(i.ty), rt: scratch, base: cd.FP, disp: g.homes[i.imm as usize]);
+        return scratch;
+    }
+    panic("the backend reads a value that has no place");
+}
+
+/// The value in a register an immediate form or an address can name: there,
+/// number 31 is sp, not zero.
+fn use_named(g: &mut Gen, f: &ir.Function, v: u32, scratch: u8) -> u8 {
+    let r = use_int(g, f, v, scratch: scratch);
+    if r == cd.ZR {
+        cd.mov_imm(&mut g.code, scratch, 0);
+        return scratch;
+    }
+    return r;
+}
+
+fn to_int(g: &mut Gen, f: &ir.Function, v: u32, target: u8) {
+    let r = use_int(g, f, v, scratch: target);
+    if r != target {
+        cd.mov(&mut g.code, rd: target, rm: r);
+    }
+}
+
+/// The value in a scratch register, extended from its width to at least 4
+/// bytes; 8 when wide is asked for and it is signed.
+fn use_extended(g: &mut Gen, f: &ir.Function, v: u32, scratch: u8, signed: bool) -> u8 {
+    let r = use_int(g, f, v, scratch: scratch);
+    let size = ra.size_of(f.insts[v as usize].ty);
+    if size == 1 or size == 2 {
+        if signed {
+            cd.sxt(&mut g.code, rd: scratch, rn: r, from: size);
+        } else {
+            cd.uxt(&mut g.code, rd: scratch, rn: r, from: size);
+        }
+        return scratch;
+    }
+    return r;
+}
+
+fn int_dest(g: &Gen, id: u32, fallback: u8) -> u8 {
+    let r = g.r.regs[id as usize];
+    if r != ra.NO_REG {
+        return r;
+    }
+    return fallback;
+}
+
+fn end_int(g: &mut Gen, id: u32, r: u8) {
+    if g.r.kinds[id as usize] != ra.V_REG {
+        return;
+    }
+    let home = g.r.regs[id as usize];
+    if home != ra.NO_REG {
+        if home != r {
+            cd.mov(&mut g.code, rd: home, rm: r);
+        }
+    } else {
+        cd.store(&mut g.code, 8, rt: r, base: cd.FP, disp: g.r.slots[id as usize]);
+    }
+}
+
+fn use_float(g: &mut Gen, f: &ir.Function, v: u32, scratch: u8) -> u8 {
+    let kind = g.r.kinds[v as usize];
+    let t = f.insts[v as usize].ty;
+    let size = ra.size_of(t);
+    if kind == ra.V_REG {
+        let r = g.r.regs[v as usize];
+        if r != ra.NO_REG {
+            return r;
+        }
+        cd.load_float(&mut g.code, size, rt: scratch, base: cd.FP, disp: g.r.slots[v as usize]);
+        return scratch;
+    }
+    if kind == ra.V_CONST {
+        // An f32's constant is the double of its value (ir/llvm.arche).
+        cd.mov_imm(&mut g.code, S3, f.insts[v as usize].imm);
+        cd.fmov_from_int(&mut g.code, 8, rd: scratch, rn: S3);
+        if t == ir.Ty.F32 {
+            cd.fcvt(&mut g.code, from: 8, rd: scratch, rn: scratch);
+        }
+        return scratch;
+    }
+    if kind == ra.V_PARAM {
+        let i = f.insts[v as usize];
+        cd.load_float(&mut g.code, size, rt: scratch, base: cd.FP, disp: g.homes[i.imm as usize]);
+        return scratch;
+    }
+    panic("the backend reads a float that has no place");
+}
+
+fn to_float(g: &mut Gen, f: &ir.Function, v: u32, target: u8) {
+    let r = use_float(g, f, v, scratch: target);
+    if r != target {
+        cd.fmov(&mut g.code, ra.size_of(f.insts[v as usize].ty), rd: target, rn: r);
+    }
+}
+
+fn end_float(g: &mut Gen, f: &ir.Function, id: u32, x: u8) {
+    if g.r.kinds[id as usize] != ra.V_REG {
+        return;
+    }
+    let size = ra.size_of(f.insts[id as usize].ty);
+    let home = g.r.regs[id as usize];
+    if home != ra.NO_REG {
+        if home != x {
+            cd.fmov(&mut g.code, size, rd: home, rn: x);
+        }
+    } else {
+        cd.store_float(&mut g.code, size, rt: x, base: cd.FP, disp: g.r.slots[id as usize]);
+    }
+}
+
+fn float_dest(g: &Gen, id: u32) -> u8 {
+    let r = g.r.regs[id as usize];
+    if r != ra.NO_REG {
+        return r;
+    }
+    return FS0;
+}
+
+/// A place the value's address names: base and displacement. A constant
+/// address is folded; scratch holds what is not in a register.
+fn place_of(g: &mut Gen, f: &ir.Function, v: u32, scratch: u8) -> u8 {
+    g.place_disp = 0;
+    if g.r.kinds[v as usize] == ra.V_ADDR {
+        let base = addr_base(g, f, v, scratch: scratch);
+        g.place_disp = addr_place(g, f, v, scratch: scratch);
+        return base;
+    }
+    return use_named(g, f, v, scratch: scratch);
+}
+
+fn small_imm(g: &Gen, f: &ir.Function, v: u32) -> ?u32 {
+    if g.r.kinds[v as usize] != ra.V_CONST {
+        return none;
+    }
+    let bits = const_bits(f, v);
+    if bits < 4096 {
+        return bits as u32;
+    }
+    return none;
+}
+
+fn gen_bin(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let k = i.flag;
+    let t = f.insts[i.a as usize].ty;
+    let size = ra.work_size(t);
+    let work = int_dest(g, id, S0);
+    if k >= 3 and k <= 6 {
+        let signed = k == 3 or k == 5;
+        let x = use_extended(g, f, i.a, scratch: S0, signed: signed);
+        let y = use_extended(g, f, i.b, scratch: S1, signed: signed);
+        var op = cd.OP_UDIV;
+        if signed {
+            op = cd.OP_SDIV;
+        }
+        if k <= 4 {
+            cd.op3(&mut g.code, op: op, size: size, rd: work, rn: x, rm: y);
+        } else {
+            cd.op3(&mut g.code, op: op, size: size, rd: S2, rn: x, rm: y);
+            cd.msub(&mut g.code, size, rd: work, rn: S2, rm: y, ra: x);
+        }
+        end_int(g, id, work);
+        return;
+    }
+    if k >= 10 {
+        var op = cd.OP_LSL;
+        var x = S0;
+        if k == 10 {
+            x = use_int(g, f, i.a, scratch: S0);
+        } else if k == 11 {
+            op = cd.OP_LSR;
+            x = use_extended(g, f, i.a, scratch: S0, signed: false);
+        } else {
+            op = cd.OP_ASR;
+            x = use_extended(g, f, i.a, scratch: S0, signed: true);
+        }
+        let y = use_int(g, f, i.b, scratch: S1);
+        cd.op3(&mut g.code, op: op, size: size, rd: work, rn: x, rm: y);
+        end_int(g, id, work);
+        return;
+    }
+    let x = use_named(g, f, i.a, scratch: S0);
+    if k == 0 or k == 1 {
+        match small_imm(g, f, i.b) {
+            some(imm) => {
+                var op = cd.OP_ADD;
+                if k == 1 {
+                    op = cd.OP_SUB;
+                }
+                cd.op_imm(&mut g.code, op: op, size: size, rd: work, rn: x, imm: imm);
+                end_int(g, id, work);
+                return;
+            }
+            none => { }
+        }
+    }
+    let y = use_int(g, f, i.b, scratch: S1);
+    var op = cd.OP_EOR;
+    if k == 0 {
+        op = cd.OP_ADD;
+    } else if k == 1 {
+        op = cd.OP_SUB;
+    } else if k == 2 {
+        op = cd.OP_MUL;
+    } else if k == 7 {
+        op = cd.OP_AND;
+    } else if k == 8 {
+        op = cd.OP_ORR;
+    }
+    cd.op3(&mut g.code, op: op, size: size, rd: work, rn: x, rm: y);
+    end_int(g, id, work);
+}
+
+fn gen_overflow(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let t = f.insts[i.a as usize].ty;
+    let size = ra.size_of(t);
+    let k = i.flag;
+    let bit = g.r.overflow_bit[id as usize];
+    let signed = k == 0 or k == 2 or k == 4;
+    if size >= 4 and k <= 3 {
+        let x = use_int(g, f, i.a, scratch: S0);
+        let y = use_int(g, f, i.b, scratch: S1);
+        var op = cd.OP_ADDS;
+        if k >= 2 {
+            op = cd.OP_SUBS;
+        }
+        cd.op3(&mut g.code, op: op, size: size, rd: S0, rn: x, rm: y);
+        // A subtraction borrows when the carry is clear.
+        var cc = cd.VS;
+        if k == 1 {
+            cc = cd.HS;
+        } else if k == 3 {
+            cc = cd.LO;
+        }
+        cd.cset(&mut g.code, cc: cc, rd: S1);
+    } else if size == 8 {
+        let x = use_int(g, f, i.a, scratch: S0);
+        let y = use_int(g, f, i.b, scratch: S1);
+        if signed {
+            cd.smulh(&mut g.code, rd: S2, rn: x, rm: y);
+        } else {
+            cd.umulh(&mut g.code, rd: S2, rn: x, rm: y);
+        }
+        cd.op3(&mut g.code, op: cd.OP_MUL, size: 8, rd: S0, rn: x, rm: y);
+        if signed {
+            cd.cmp_sign_of(&mut g.code, rn: S2, rm: S0);
+        } else {
+            cd.cmp(&mut g.code, 8, rn: S2, rm: cd.ZR);
+        }
+        cd.cset(&mut g.code, cc: cd.NE, rd: S1);
+    } else if size == 4 {
+        let x = use_int(g, f, i.a, scratch: S0);
+        let y = use_int(g, f, i.b, scratch: S1);
+        if signed {
+            cd.smull(&mut g.code, rd: S0, rn: x, rm: y);
+            cd.sxt(&mut g.code, rd: S2, rn: S0, from: 4);
+        } else {
+            cd.umull(&mut g.code, rd: S0, rn: x, rm: y);
+            cd.mov32(&mut g.code, rd: S2, rm: S0);
+        }
+        cd.cmp(&mut g.code, 8, rn: S2, rm: S0);
+        cd.cset(&mut g.code, cc: cd.NE, rd: S1);
+    } else {
+        // Bytes and halves: the whole result, compared with its low part.
+        let x = use_extended(g, f, i.a, scratch: S0, signed: signed);
+        let y = use_extended(g, f, i.b, scratch: S1, signed: signed);
+        var op = cd.OP_MUL;
+        if k == 0 or k == 1 {
+            op = cd.OP_ADD;
+        } else if k == 2 or k == 3 {
+            op = cd.OP_SUB;
+        }
+        cd.op3(&mut g.code, op: op, size: 4, rd: S0, rn: x, rm: y);
+        if signed {
+            cd.sxt(&mut g.code, rd: S2, rn: S0, from: size);
+        } else {
+            cd.uxt(&mut g.code, rd: S2, rn: S0, from: size);
+        }
+        cd.cmp(&mut g.code, 4, rn: S2, rm: S0);
+        cd.cset(&mut g.code, cc: cd.NE, rd: S1);
+    }
+    end_int(g, id, S0);
+    if bit != ra.NONE {
+        end_int(g, bit, S1);
+    }
+}
+
+fn cmp_condition(k: u32) -> u8 {
+    match k {
+        0 => { return cd.EQ; }
+        1 => { return cd.NE; }
+        2 => { return cd.LT; }
+        3 => { return cd.LE; }
+        4 => { return cd.GT; }
+        5 => { return cd.GE; }
+        6 => { return cd.LO; }
+        7 => { return cd.LS; }
+        8 => { return cd.HI; }
+        _ => { return cd.HS; }
+    }
+}
+
+/// Sets the flags for a comparison: the condition to read them by.
+fn compare(g: &mut Gen, f: &ir.Function, i: ir.Inst) -> u8 {
+    let t = f.insts[i.a as usize].ty;
+    let size = ra.size_of(t);
+    let signed = i.flag >= 2 and i.flag <= 5;
+    if size < 4 {
+        let x = use_extended(g, f, i.a, scratch: S0, signed: signed);
+        let y = use_extended(g, f, i.b, scratch: S1, signed: signed);
+        cd.cmp(&mut g.code, 4, rn: x, rm: y);
+        return cmp_condition(i.flag);
+    }
+    let x = use_named(g, f, i.a, scratch: S0);
+    match small_imm(g, f, i.b) {
+        some(imm) => { cd.op_imm(&mut g.code, op: cd.OP_SUBS, size: size, rd: cd.ZR, rn: x, imm: imm); }
+        none => {
+            let y = use_int(g, f, i.b, scratch: S1);
+            cd.cmp(&mut g.code, size, rn: x, rm: y);
+        }
+    }
+    return cmp_condition(i.flag);
+}
+
+fn gen_ext(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let from = f.insts[i.a as usize].ty;
+    let to = i.ty;
+    if ra.is_float(from) or ra.is_float(to) {
+        // The same bits as another type.
+        if ra.is_float(from) and ra.is_float(to) {
+            let x = use_float(g, f, i.a, scratch: FS0);
+            end_float(g, f, id, x);
+        } else if ra.is_float(to) {
+            let r = use_int(g, f, i.a, scratch: S0);
+            let d = float_dest(g, id);
+            cd.fmov_from_int(&mut g.code, ra.size_of(to), rd: d, rn: r);
+            end_float(g, f, id, d);
+        } else {
+            let x = use_float(g, f, i.a, scratch: FS0);
+            let d = int_dest(g, id, S0);
+            cd.fmov_to_int(&mut g.code, ra.size_of(from), rd: d, rn: x);
+            end_int(g, id, d);
+        }
+        return;
+    }
+    let work = int_dest(g, id, S0);
+    let source = use_int(g, f, i.a, scratch: S0);
+    let size = ra.size_of(from);
+    if i.op == ir.Op.Trunc {
+        if to == ir.Ty.I1 {
+            cd.and_one(&mut g.code, rd: work, rn: source);
+        } else if work != source {
+            cd.mov(&mut g.code, rd: work, rm: source);
+        }
+        end_int(g, id, work);
+        return;
+    }
+    let signed = i.flag == 1;
+    if ir.bits(from) == ir.bits(to) {
+        if work != source {
+            cd.mov(&mut g.code, rd: work, rm: source);
+        }
+    } else if from == ir.Ty.I1 {
+        cd.uxt(&mut g.code, rd: work, rn: source, from: 1);
+        if signed {
+            cd.op3(&mut g.code, op: cd.OP_SUB, size: 8, rd: work, rn: cd.ZR, rm: work);
+        }
+    } else if signed {
+        cd.sxt(&mut g.code, rd: work, rn: source, from: size);
+    } else if size == 4 {
+        cd.mov32(&mut g.code, rd: work, rm: source);
+    } else {
+        cd.uxt(&mut g.code, rd: work, rn: source, from: size);
+    }
+    end_int(g, id, work);
+}
+
+fn gen_load(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let base = place_of(g, f, i.a, scratch: cd.X16);
+    let disp = g.place_disp;
+    if ra.is_float(i.ty) {
+        let d = float_dest(g, id);
+        cd.load_float(&mut g.code, ra.size_of(i.ty), rt: d, base: base, disp: disp);
+        end_float(g, f, id, d);
+        return;
+    }
+    let work = int_dest(g, id, S0);
+    cd.load(&mut g.code, ra.size_of(i.ty), rt: work, base: base, disp: disp);
+    end_int(g, id, work);
+}
+
+fn gen_store(g: &mut Gen, f: &ir.Function, i: ir.Inst) {
+    let t = f.insts[i.a as usize].ty;
+    let base = place_of(g, f, i.b, scratch: cd.X16);
+    let disp = g.place_disp;
+    if ra.is_float(t) {
+        let x = use_float(g, f, i.a, scratch: FS0);
+        cd.store_float(&mut g.code, ra.size_of(t), rt: x, base: base, disp: disp);
+        return;
+    }
+    let r = use_int(g, f, i.a, scratch: S0);
+    cd.store(&mut g.code, ra.size_of(t), rt: r, base: base, disp: disp);
+}
+
+const INLINE_COPY: u64 = 64;
+
+fn gen_memcpy(g: &mut Gen, f: &ir.Function, i: ir.Inst) {
+    let n = i.imm;
+    if n <= INLINE_COPY {
+        let dst = place_of(g, f, i.a, scratch: cd.X16);
+        let dst_disp = g.place_disp;
+        let src = place_of(g, f, i.b, scratch: S2);
+        let src_disp = g.place_disp;
+        var at: u64 = 0;
+        while at < n {
+            var step: u32 = 1;
+            if n - at >= 8 {
+                step = 8;
+            } else if n - at >= 4 {
+                step = 4;
+            } else if n - at >= 2 {
+                step = 2;
+            }
+            cd.load(&mut g.code, step, rt: S0, base: src, disp: src_disp + at as i32);
+            cd.store(&mut g.code, step, rt: S0, base: dst, disp: dst_disp + at as i32);
+            at += step as u64;
+        }
+        return;
+    }
+    to_int(g, f, i.a, target: 0);
+    to_int(g, f, i.b, target: 1);
+    cd.mov_imm(&mut g.code, 2, n);
+    let sym = uu.helper_symbol(&mut g.u, "memcpy");
+    cd.bl_symbol(&mut g.code, sym);
+}
+
+fn gen_memzero(g: &mut Gen, f: &ir.Function, i: ir.Inst) {
+    let n = i.imm;
+    if n <= INLINE_COPY {
+        let dst = place_of(g, f, i.a, scratch: cd.X16);
+        let disp = g.place_disp;
+        var at: u64 = 0;
+        while at < n {
+            var step: u32 = 1;
+            if n - at >= 8 {
+                step = 8;
+            } else if n - at >= 4 {
+                step = 4;
+            } else if n - at >= 2 {
+                step = 2;
+            }
+            cd.store(&mut g.code, step, rt: cd.ZR, base: dst, disp: disp + at as i32);
+            at += step as u64;
+        }
+        return;
+    }
+    to_int(g, f, i.a, target: 0);
+    cd.mov_imm(&mut g.code, 1, 0);
+    cd.mov_imm(&mut g.code, 2, n);
+    let sym = uu.helper_symbol(&mut g.u, "memset");
+    cd.bl_symbol(&mut g.code, sym);
+}
+
+fn gen_gep_index(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let work = int_dest(g, id, S0);
+    let base = use_int(g, f, i.a, scratch: S0);
+    let index = use_int(g, f, i.b, scratch: S1);
+    var by: u32 = 64;
+    if i.imm == 1 {
+        by = 0;
+    } else if i.imm == 2 {
+        by = 1;
+    } else if i.imm == 4 {
+        by = 2;
+    } else if i.imm == 8 {
+        by = 3;
+    }
+    if by != 64 {
+        cd.add_shifted(&mut g.code, rd: work, rn: base, rm: index, by: by);
+    } else {
+        cd.mov_imm(&mut g.code, S2, i.imm);
+        cd.madd(&mut g.code, rd: work, rn: index, rm: S2, ra: base);
+    }
+    end_int(g, id, work);
+}
+
+fn gen_call(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    if i.op == ir.Op.CallIndirect {
+        to_int(g, f, i.a, target: cd.X16);
+    }
+    var ints: u32 = 0;
+    var floats: u32 = 0;
+    var on_stack: u32 = 0;
+    var q = i.args_start;
+    while q < i.args_start + i.args_len : (q += 1) {
+        let v = f.args[q as usize];
+        let t = f.insts[v as usize].ty;
+        if ra.is_float(t) {
+            if floats < 8 {
+                to_float(g, f, v, target: floats as u8);
+            } else {
+                let x = use_float(g, f, v, scratch: FS0);
+                cd.store_float(&mut g.code, ra.size_of(t), rt: x, base: cd.SP, disp: on_stack as i32 * 8);
+                on_stack += 1;
+            }
+            floats += 1;
+        } else {
+            if ints < 8 {
+                let r = ints as u8;
+                to_int(g, f, v, target: r);
+                let size = ra.size_of(t);
+                if size < 4 {
+                    cd.uxt(&mut g.code, rd: r, rn: r, from: size);
+                }
+            } else {
+                let r = use_int(g, f, v, scratch: S0);
+                cd.store(&mut g.code, 8, rt: r, base: cd.SP, disp: on_stack as i32 * 8);
+                on_stack += 1;
+            }
+            ints += 1;
+        }
+    }
+    if i.op == ir.Op.CallIndirect {
+        cd.blr(&mut g.code, cd.X16);
+    } else if i.flag == 1 {
+        cd.bl_symbol(&mut g.code, g.u.ext_symbols[i.imm as usize]);
+    } else {
+        cd.bl_symbol(&mut g.code, g.u.fn_symbols[i.imm as usize]);
+    }
+    uu.note_call(&mut g.u, line: i.line, at: cd.here(&g.code) as u32);
+    if i.ty == ir.Ty.Void {
+        return;
+    }
+    if ra.is_float(i.ty) {
+        end_float(g, f, id, 0);
+    } else {
+        end_int(g, id, 0);
+    }
+}
+
+fn gen_fbin(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    var low: u32 = 0x2800;
+    if i.flag == 1 {
+        low = 0x3800;
+    } else if i.flag == 2 {
+        low = 0x0800;
+    } else if i.flag == 3 {
+        low = 0x1800;
+    }
+    let x = use_float(g, f, i.a, scratch: FS0);
+    let y = use_float(g, f, i.b, scratch: FS1);
+    let d = float_dest(g, id);
+    cd.fbin(&mut g.code, low: low, size: ra.size_of(i.ty), rd: d, rn: x, rm: y);
+    end_float(g, f, id, d);
+}
+
+fn gen_fcmp(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let t = f.insts[i.a as usize].ty;
+    let x = use_float(g, f, i.a, scratch: FS0);
+    let y = use_float(g, f, i.b, scratch: FS1);
+    cd.fcmp(&mut g.code, ra.size_of(t), rn: x, rm: y);
+    // An unordered result sets C and V: these read false, and NE true.
+    var cc = cd.EQ;
+    if i.flag == 1 {
+        cc = cd.NE;
+    } else if i.flag == 2 {
+        cc = cd.MI;
+    } else if i.flag == 3 {
+        cc = cd.LS;
+    } else if i.flag == 4 {
+        cc = cd.GT;
+    } else if i.flag == 5 {
+        cc = cd.GE;
+    }
+    let work = int_dest(g, id, S0);
+    cd.cset(&mut g.code, cc: cc, rd: work);
+    end_int(g, id, work);
+}
+
+fn gen_fconv(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let from = f.insts[i.a as usize].ty;
+    let k = i.flag;
+    if k == 0 or k == 1 {
+        // Integer to float: 8 bytes hold all narrower ones, of either sign.
+        let size = ra.size_of(from);
+        var r = use_int(g, f, i.a, scratch: S0);
+        if size < 8 {
+            if k == 0 {
+                cd.sxt(&mut g.code, rd: S0, rn: r, from: size);
+            } else if size == 4 {
+                cd.mov32(&mut g.code, rd: S0, rm: r);
+            } else {
+                cd.uxt(&mut g.code, rd: S0, rn: r, from: size);
+            }
+            r = S0;
+        }
+        let d = float_dest(g, id);
+        cd.int_to_float(&mut g.code, signed: k == 0, ra.size_of(i.ty), rd: d, rn: r);
+        end_float(g, f, id, d);
+        return;
+    }
+    if k == 4 or k == 5 {
+        let x = use_float(g, f, i.a, scratch: FS0);
+        let d = float_dest(g, id);
+        cd.fcvt(&mut g.code, from: ra.size_of(from), rd: d, rn: x);
+        end_float(g, f, id, d);
+        return;
+    }
+    // To an integer: the processor's conversion saturates and takes a NaN to
+    // 0, at 4 and 8 bytes. Narrower ones go through 8, and are held to range.
+    let signed = k == 2 or k == 6;
+    let x = use_float(g, f, i.a, scratch: FS0);
+    let width = ir.bits(i.ty) as u64;
+    let float_size = ra.size_of(from);
+    if width >= 32 {
+        cd.float_to_int(&mut g.code, signed: signed, int_size: (width / 8) as u32, float_size: float_size, rd: S0, rn: x);
+    } else {
+        cd.float_to_int(&mut g.code, signed: signed, int_size: 8, float_size: float_size, rd: S0, rn: x);
+        if k >= 6 {
+            let one: u64 = 1;
+            if signed {
+                cd.mov_imm(&mut g.code, S1, (one << (width - 1)) - 1);
+                cd.cmp(&mut g.code, 8, rn: S0, rm: S1);
+                cd.csel(&mut g.code, cc: cd.GT, rd: S0, rn: S1, rm: S0);
+                cd.mov_imm(&mut g.code, S1, ~((one << (width - 1)) - 1));
+                cd.cmp(&mut g.code, 8, rn: S0, rm: S1);
+                cd.csel(&mut g.code, cc: cd.LT, rd: S0, rn: S1, rm: S0);
+            } else {
+                cd.mov_imm(&mut g.code, S1, (one << width) - 1);
+                cd.cmp(&mut g.code, 8, rn: S0, rm: S1);
+                cd.csel(&mut g.code, cc: cd.HI, rd: S0, rn: S1, rm: S0);
+            }
+        }
+    }
+    end_int(g, id, S0);
+}
+
+fn gen_fmath(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let t = i.ty;
+    let size = ra.size_of(t);
+    if i.flag == 0 or i.flag == 1 {
+        let x = use_float(g, f, i.a, scratch: FS0);
+        let d = float_dest(g, id);
+        if i.flag == 0 {
+            cd.funary(&mut g.code, low: 0x1C000, size: size, rd: d, rn: x);
+        } else {
+            cd.funary(&mut g.code, low: 0xC000, size: size, rd: d, rn: x);
+        }
+        end_float(g, f, id, d);
+        return;
+    }
+    // What the runtime computes (compiler/runtime/math.inc).
+    var name = "floor";
+    if t == ir.Ty.F32 {
+        name = "floorf";
+    }
+    if i.flag == 3 {
+        name = "ceil";
+        if t == ir.Ty.F32 {
+            name = "ceilf";
+        }
+    } else if i.flag == 4 {
+        name = "trunc";
+        if t == ir.Ty.F32 {
+            name = "truncf";
+        }
+    } else if i.flag == 5 {
+        name = "fmod";
+        if t == ir.Ty.F32 {
+            name = "fmodf";
+        }
+    } else if i.flag == 6 {
+        name = "fma";
+        if t == ir.Ty.F32 {
+            name = "fmaf";
+        }
+    }
+    to_float(g, f, i.a, target: 0);
+    if i.flag >= 5 {
+        to_float(g, f, i.b, target: 1);
+    }
+    if i.flag == 6 {
+        to_float(g, f, i.c, target: 2);
+    }
+    let sym = uu.helper_symbol(&mut g.u, name);
+    cd.bl_symbol(&mut g.code, sym);
+    end_float(g, f, id, 0);
+}
+
+/// x16 holds the address.
+fn address_in_x16(g: &mut Gen, f: &ir.Function, v: u32) {
+    to_int(g, f, v, target: cd.X16);
+}
+
+fn gen_atomic_rmw(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let size = ra.size_of(i.ty);
+    let k = i.flag >> 8;
+    address_in_x16(g, f, i.a);
+    let value = use_int(g, f, i.b, scratch: S2);
+    let again = cd.here(&g.code);
+    cd.ldaxr(&mut g.code, size, rt: S0, rn: cd.X16);
+    if k == ir.RMW_XCHG {
+        cd.mov(&mut g.code, rd: S1, rm: value);
+    } else if k == ir.RMW_ADD {
+        cd.op3(&mut g.code, op: cd.OP_ADD, size: 8, rd: S1, rn: S0, rm: value);
+    } else if k == ir.RMW_SUB {
+        cd.op3(&mut g.code, op: cd.OP_SUB, size: 8, rd: S1, rn: S0, rm: value);
+    } else if k == ir.RMW_AND {
+        cd.op3(&mut g.code, op: cd.OP_AND, size: 8, rd: S1, rn: S0, rm: value);
+    } else {
+        cd.op3(&mut g.code, op: cd.OP_ORR, size: 8, rd: S1, rn: S0, rm: value);
+    }
+    cd.stlxr(&mut g.code, size, status: S3, rt: S1, rn: cd.X16);
+    cd.cbnz_back(&mut g.code, S3, target: again);
+    end_int(g, id, S0);
+}
+
+fn gen_cmpxchg(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
+    let size = ra.size_of(i.ty);
+    address_in_x16(g, f, i.a);
+    let expected = use_extended(g, f, i.b, scratch: S2, signed: false);
+    let new_value = use_int(g, f, i.c, scratch: S1);
+    let again = cd.here(&g.code);
+    cd.ldaxr(&mut g.code, size, rt: S0, rn: cd.X16);
+    var compare_size: u32 = 4;
+    if size == 8 {
+        compare_size = 8;
+    }
+    cd.cmp(&mut g.code, compare_size, rn: S0, rm: expected);
+    let different = cd.b_cond(&mut g.code, cd.NE);
+    cd.stlxr(&mut g.code, size, status: S3, rt: new_value, rn: cd.X16);
+    cd.cbnz_back(&mut g.code, S3, target: again);
+    cd.patch_here(&mut g.code, different);
+    end_int(g, id, S0);
+}
+
+fn register_named(name: str) -> u8 {
+    if name.len() >= 2 and (name[0] == 'x' or name[0] == 'w') {
+        var n: u32 = 0;
+        var i: usize = 1;
+        while i < name.len() : (i += 1) {
+            if name[i] < '0' or name[i] > '9' {
+                return ra.NO_REG;
+            }
+            n = n * 10 + (name[i] - '0') as u32;
+        }
+        if n <= 30 {
+            return n as u8;
+        }
+    }
+    return ra.NO_REG;
+}
+
+/// asm: its operands in the registers its constraints name, or in those the
+/// instruction may use, then its text through the small assembler.
+fn gen_asm(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, i: ir.Inst) {
+    let at = &m.asms[i.imm as usize];
+    let cons = at.constraints.view();
+    var operand_regs = alloc.List(u8).init(g.a);
+    var taken = alloc.List(bool).init(g.a);
+    var q: usize = 0;
+    while q < 32 : (q += 1) {
+        taken.push(false);
+    }
+    var pieces = alloc.List(alloc.String).init(g.a);
+    var start: usize = 0;
+    q = 0;
+    while q <= cons.len() : (q += 1) {
+        if q == cons.len() or cons[q] == ',' {
+            var one = alloc.String.init(g.a);
+            one.push_str(cons[start..q]);
+            pieces.push(one);
+            start = q + 1;
+        }
+    }
+    q = 0;
+    while q < pieces.len() : (q += 1) {
+        let text = pieces.items()[q].view();
+        var open: usize = 0;
+        while open < text.len() and text[open] != '{' : (open += 1) {
+        }
+        if open < text.len() and text.len() > open + 1 {
+            let r = register_named(text[open + 1..text.len() - 1]);
+            if r != ra.NO_REG {
+                if r >= 19 {
+                    uu.say_problem(&mut g.u, f, what: "this backend's asm can use x0 to x18");
+                    return;
+                }
+                taken[r as usize] = true;
+            }
+        }
+    }
+    q = 0;
+    while q < pieces.len() : (q += 1) {
+        let text = pieces.items()[q].view();
+        if text.len() == 0 or text[0] == '~' {
+            continue;
+        }
+        var body = text;
+        if text[0] == '=' {
+            body = text[1..text.len()];
+        }
+        var r = ra.NO_REG;
+        if body[0] == '{' {
+            r = register_named(body[1..body.len() - 1]);
+        } else if body[0] >= '0' and body[0] <= '9' {
+            r = operand_regs[(body[0] - '0') as usize];
+        } else {
+            var free: u8 = 0;
+            while free < 16 and taken[free as usize] : (free += 1) {
+            }
+            if free >= 16 {
+                uu.say_problem(&mut g.u, f, what: "an asm with too many operands");
+                return;
+            }
+            taken[free as usize] = true;
+            r = free;
+        }
+        operand_regs.push(r);
+    }
+    let nout = at.outputs.len() as u32;
+    q = 0;
+    while q < i.args_len as usize : (q += 1) {
+        to_int(g, f, f.args[i.args_start as usize + q], target: operand_regs[nout as usize + q]);
+    }
+    if not inline.assemble(&mut g.code, text: at.template.view(), operands: operand_regs.items(), problem: &mut g.u.problem, a: g.a) {
+        return;
+    }
+    if nout == 1 {
+        end_int(g, id, operand_regs[0]);
+    } else if nout > 1 {
+        var other: u32 = id + 1;
+        while other < f.insts.len() as u32 : (other += 1) {
+            let o = f.insts[other as usize];
+            if o.op == ir.Op.AsmOut and o.a == id {
+                end_int(g, other, operand_regs[o.imm as usize]);
+            }
+        }
+    }
+}
+
+fn jump_to(g: &mut Gen, at: u64, block: u32) {
+    g.fix_at.push(at);
+    g.fix_block.push(block);
+}
+
+fn prologue(g: &mut Gen, f: &ir.Function) {
+    // stp x29, x30, [sp, #-16]!; mov x29, sp.
+    cd.word(&mut g.code, 0xA9BF7BFD);
+    cd.word(&mut g.code, 0x910003FD);
+    let size = (g.r.frame + g.outgoing as i32 * 8 + 15) / 16 * 16;
+    if size > 0 {
+        if size < 4096 {
+            cd.op_imm(&mut g.code, op: cd.OP_SUB, size: 8, rd: cd.SP, rn: cd.SP, imm: size as u32);
+        } else {
+            // sub sp, sp, x16: its extended form, which can name sp.
+            cd.mov_imm(&mut g.code, cd.X16, size as u64);
+            cd.word(&mut g.code, 0xCB3063FF | ((cd.X16 as u32) << 16));
+        }
+    }
+    var n: usize = 0;
+    while n < g.r.saved_ints.len() : (n += 1) {
+        cd.store(&mut g.code, 8, rt: g.r.saved_ints[n], base: cd.FP, disp: ra.saved_place(n, NOTHING_RESERVED));
+    }
+    var k: usize = 0;
+    while k < g.r.saved_floats.len() : (k += 1) {
+        cd.store_float(&mut g.code, 8, rt: g.r.saved_floats[k], base: cd.FP, disp: ra.saved_place(n + k, NOTHING_RESERVED));
+    }
+    // Parameters go home, where everything reads them.
+    var ints: u32 = 0;
+    var floats: u32 = 0;
+    var p: usize = 0;
+    while p < f.params.len() : (p += 1) {
+        let t = f.params[p];
+        if ra.is_float(t) {
+            if floats < 8 {
+                cd.store_float(&mut g.code, ra.size_of(t), rt: floats as u8, base: cd.FP, disp: g.homes[p]);
+            }
+            floats += 1;
+        } else {
+            if ints < 8 {
+                cd.store(&mut g.code, 8, rt: ints as u8, base: cd.FP, disp: g.homes[p]);
+            }
+            ints += 1;
+        }
+    }
+}
+
+fn epilogue(g: &mut Gen) {
+    var n: usize = 0;
+    while n < g.r.saved_ints.len() : (n += 1) {
+        cd.load(&mut g.code, 8, rt: g.r.saved_ints[n], base: cd.FP, disp: ra.saved_place(n, NOTHING_RESERVED));
+    }
+    var k: usize = 0;
+    while k < g.r.saved_floats.len() : (k += 1) {
+        cd.load_float(&mut g.code, 8, rt: g.r.saved_floats[k], base: cd.FP, disp: ra.saved_place(n + k, NOTHING_RESERVED));
+    }
+    // mov sp, x29; ldp x29, x30, [sp], #16.
+    cd.word(&mut g.code, 0x910003BF);
+    cd.word(&mut g.code, 0xA8C17BFD);
+    cd.ret(&mut g.code);
+}
+
+fn gen_terminator(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst, next: u32) {
+    match i.op {
+        .Br => {
+            if i.a != next {
+                let at = cd.b(&mut g.code);
+                jump_to(g, at: at, block: i.a);
+            }
+        }
+        .CondBr => {
+            if g.r.kinds[i.a as usize] == ra.V_CONST {
+                var target = i.c;
+                if const_bits(f, i.a) & 1 == 1 {
+                    target = i.b;
+                }
+                if target != next {
+                    let at = cd.b(&mut g.code);
+                    jump_to(g, at: at, block: target);
+                }
+                return;
+            }
+            var cc = cd.NE;
+            if g.r.kinds[i.a as usize] == ra.V_FUSED {
+                cc = compare(g, f, f.insts[i.a as usize]);
+            } else {
+                let r = use_int(g, f, i.a, scratch: S0);
+                cd.test_one(&mut g.code, r);
+            }
+            if i.b == next {
+                let at = cd.b_cond(&mut g.code, cc ^ 1);
+                jump_to(g, at: at, block: i.c);
+            } else {
+                let at = cd.b_cond(&mut g.code, cc);
+                jump_to(g, at: at, block: i.b);
+                if i.c != next {
+                    let other = cd.b(&mut g.code);
+                    jump_to(g, at: other, block: i.c);
+                }
+            }
+        }
+        .Ret => {
+            if ra.is_float(f.ret) {
+                to_float(g, f, i.a, target: 0);
+            } else {
+                to_int(g, f, i.a, target: 0);
+            }
+            epilogue(g);
+        }
+        .RetVoid => { epilogue(g); }
+        .Unreachable => { cd.brk(&mut g.code); }
+        _ => { }
+    }
+}
+
+fn gen_inst(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, next: u32) {
+    let i = f.insts[id as usize];
+    match i.op {
+        .Const | .Param | .Alloca | .Global | .VTable | .OverflowBit | .AsmOut => { }
+        _ => { uu.note_inst(&mut g.u, f, id: id, line: i.line, at: cd.here(&g.code) as u32); }
+    }
+    match i.op {
+        .Const | .Param | .Alloca | .Global | .VTable | .OverflowBit | .AsmOut => { }
+        .Gep => {
+            if g.r.kinds[id as usize] == ra.V_REG {
+                let work = int_dest(g, id, S0);
+                let base = use_named(g, f, i.a, scratch: S0);
+                add_constant(g, rd: work, rn: base, i.imm as i64);
+                end_int(g, id, work);
+            }
+        }
+        .GepIndex => { gen_gep_index(g, f, id, i); }
+        .Load => { gen_load(g, f, id, i); }
+        .Store => { gen_store(g, f, i); }
+        .Memcpy => { gen_memcpy(g, f, i); }
+        .Memzero => { gen_memzero(g, f, i); }
+        .Bin => { gen_bin(g, f, id, i); }
+        .Overflow => { gen_overflow(g, f, id, i); }
+        .Cmp => {
+            if g.r.kinds[id as usize] != ra.V_FUSED {
+                let cc = compare(g, f, i);
+                let work = int_dest(g, id, S0);
+                cd.cset(&mut g.code, cc: cc, rd: work);
+                end_int(g, id, work);
+            }
+        }
+        .Ext | .Trunc => { gen_ext(g, f, id, i); }
+        .IntToPtr | .PtrToInt => {
+            let work = int_dest(g, id, S0);
+            to_int(g, f, i.a, target: work);
+            end_int(g, id, work);
+        }
+        .Call | .CallIndirect => { gen_call(g, f, id, i); }
+        .FBin => { gen_fbin(g, f, id, i); }
+        .FNeg => {
+            let x = use_float(g, f, i.a, scratch: FS0);
+            let d = float_dest(g, id);
+            cd.funary(&mut g.code, low: 0x14000, size: ra.size_of(i.ty), rd: d, rn: x);
+            end_float(g, f, id, d);
+        }
+        .FCmp => { gen_fcmp(g, f, id, i); }
+        .FConv => { gen_fconv(g, f, id, i); }
+        .FMath => { gen_fmath(g, f, id, i); }
+        .Asm => { gen_asm(g, m, f, id, i); }
+        .AtomicLoad => {
+            address_in_x16(g, f, i.a);
+            let work = int_dest(g, id, S0);
+            cd.ldar(&mut g.code, ra.size_of(i.ty), rt: work, rn: cd.X16);
+            end_int(g, id, work);
+        }
+        .AtomicStore => {
+            let t = f.insts[i.a as usize].ty;
+            address_in_x16(g, f, i.b);
+            let r = use_int(g, f, i.a, scratch: S0);
+            cd.stlr(&mut g.code, ra.size_of(t), rt: r, rn: cd.X16);
+        }
+        .AtomicRmw => { gen_atomic_rmw(g, f, id, i); }
+        .CmpXchg => { gen_cmpxchg(g, f, id, i); }
+        .Fence => {
+            if i.flag & 255 != 0 {
+                cd.dmb(&mut g.code);
+            }
+        }
+        .Phi => { uu.say_problem(&mut g.u, f, what: "an optimized function: a release build goes through LLVM"); }
+        .Br | .CondBr | .Ret | .RetVoid | .Unreachable => { gen_terminator(g, f, id: id, i, next: next); }
+    }
+}
+
+/// The frame's other parts: parameters that came in registers, then stack
+/// slots. What a call passes on the stack sits at the frame's bottom.
+fn layout(g: &mut Gen, f: &ir.Function) {
+    g.homes.clear();
+    var ints: u32 = 0;
+    var floats: u32 = 0;
+    var on_stack: i32 = 0;
+    var p: usize = 0;
+    while p < f.params.len() : (p += 1) {
+        var in_reg = false;
+        if ra.is_float(f.params[p]) {
+            in_reg = floats < 8;
+            floats += 1;
+        } else {
+            in_reg = ints < 8;
+            ints += 1;
+        }
+        if in_reg {
+            g.r.frame += 8;
+            g.homes.push(-g.r.frame);
+        } else {
+            g.homes.push(16 + on_stack * 8);
+            on_stack += 1;
+        }
+    }
+    ra.place_allocas(&mut g.r, f);
+    g.outgoing = 0;
+    let nblocks = f.blocks.len();
+    var b: usize = 0;
+    while b < nblocks : (b += 1) {
+        let ids = f.blocks[b].insts.items();
+        var k: usize = 0;
+        while k < ids.len() : (k += 1) {
+            let i = f.insts[ids[k] as usize];
+            if i.op == ir.Op.Call or i.op == ir.Op.CallIndirect {
+                var ni: u32 = 0;
+                var nf: u32 = 0;
+                var ns: u32 = 0;
+                var q = i.args_start;
+                while q < i.args_start + i.args_len : (q += 1) {
+                    if ra.is_float(f.insts[f.args[q as usize] as usize].ty) {
+                        if nf >= 8 {
+                            ns += 1;
+                        }
+                        nf += 1;
+                    } else {
+                        if ni >= 8 {
+                            ns += 1;
+                        }
+                        ni += 1;
+                    }
+                }
+                if ns > g.outgoing {
+                    g.outgoing = ns;
+                }
+            }
+        }
+    }
+}
+
+fn fill_offsets(g: &mut Gen, n: usize) {
+    g.block_offsets.clear();
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        g.block_offsets.push(0);
+    }
+}
+
+fn gen_function(g: &mut Gen, m: &ir.Module, f: &ir.Function, index: usize) {
+    g.code.bytes.clear();
+    g.code.relocs.clear();
+    g.fix_at.clear();
+    g.fix_block.clear();
+    uu.begin_function(&mut g.u);
+    ra.plan(&mut g.r, f);
+    var ints: [10]u8 = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
+    var floats: [8]u8 = [8, 9, 10, 11, 12, 13, 14, 15];
+    ra.allocate(&mut g.r, f, ints: ints[0..10], floats: floats[0..8], floats_kept: true, reserved: NOTHING_RESERVED);
+    layout(g, f);
+    uu.note_places(&mut g.u, &g.r, f, homes: g.homes.items());
+    if f.no_frame {
+        // naked: its asm and nothing else.
+        var b: usize = 0;
+        while b < f.blocks.len() : (b += 1) {
+            let ids = f.blocks[b].insts.items();
+            var k: usize = 0;
+            while k < ids.len() : (k += 1) {
+                let i = f.insts[ids[k] as usize];
+                if i.op == ir.Op.Asm {
+                    gen_asm(g, m, f, ids[k], i);
+                }
+            }
+        }
+    } else {
+        uu.first_row(&mut g.u, f);
+        prologue(g, f);
+        fill_offsets(g, f.blocks.len());
+        var b: usize = 0;
+        while b < f.blocks.len() : (b += 1) {
+            g.block_offsets[b] = cd.here(&g.code);
+            var next = ra.NONE;
+            if b + 1 < f.blocks.len() {
+                next = b as u32 + 1;
+            }
+            let ids = f.blocks[b].insts.items();
+            var k: usize = 0;
+            while k < ids.len() : (k += 1) {
+                gen_inst(g, m, f, id: ids[k], next: next);
+            }
+        }
+        var q: usize = 0;
+        while q < g.fix_at.len() : (q += 1) {
+            if not cd.patch(&mut g.code, at: g.fix_at[q], target: g.block_offsets[g.fix_block[q] as usize]) {
+                uu.say_problem(&mut g.u, f, what: "a branch further than ARM64's can reach");
+            }
+        }
+    }
+    uu.place_code(&mut g.u, f, index, &g.code);
+}
+
+/// The program as an ELF object for ARM64, or nothing, with problem saying why.
+pub fn object(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> alloc.List(u8) {
+    let arch = dwarf.Arch { abs64: cd.R_ABS64, abs32: cd.R_ABS32, frame_reg: 29, return_reg: 30, is_x64: false, is_a64: true };
+    var g = Gen {
+        u: uu.new_unit(m, machine: 183, flags: 0, arch: arch, pad_byte: 0, a: a),
+        r: ra.new_ranges(a),
+        code: nb.new_code(a),
+        block_offsets: alloc.List(u64).init(a),
+        fix_at: alloc.List(u64).init(a),
+        fix_block: alloc.List(u32).init(a),
+        homes: alloc.List(i32).init(a),
+        outgoing: 0,
+        place_disp: 0,
+        a: a,
+    };
+    let fs = m.functions.items();
+    var i: usize = 0;
+    while i < fs.len() : (i += 1) {
+        if not fs[i].stub {
+            gen_function(&mut g, m, &fs[i], i);
+        }
+    }
+    return uu.finish(&mut g.u, m, problem: problem);
+}

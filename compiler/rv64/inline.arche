@@ -1,0 +1,266 @@
+/// A small assembler for the text of an asm, as the lowering leaves it for
+/// LLVM: $N an operand, \XX a byte. The backend has no use for more than a
+/// program's few instructions; for what it does not know, a release build goes
+/// through LLVM's assembler.
+import alloc;
+import rv64.code as cd;
+import native.buffer as nb;
+
+const NO_REG: u8 = 255;
+
+fn number(t: str, from: usize) -> ?u32 {
+    if from >= t.len() {
+        return none;
+    }
+    var n: u32 = 0;
+    var i = from;
+    while i < t.len() : (i += 1) {
+        if t[i] < '0' or t[i] > '9' {
+            return none;
+        }
+        n = n * 10 + (t[i] - '0') as u32;
+    }
+    return n;
+}
+
+/// A register by its name: x5, t0, a7, s1, ra, sp, gp, tp, zero.
+pub fn register_named(t: str) -> u8 {
+    if t.eq("zero") {
+        return 0;
+    }
+    if t.eq("ra") {
+        return 1;
+    }
+    if t.eq("sp") {
+        return 2;
+    }
+    if t.eq("gp") {
+        return 3;
+    }
+    if t.eq("tp") {
+        return 4;
+    }
+    if t.eq("fp") {
+        return 8;
+    }
+    if t.len() < 2 {
+        return NO_REG;
+    }
+    var n: u32 = 0;
+    match number(t, from: 1) {
+        some(v) => { n = v; }
+        none => { return NO_REG; }
+    }
+    if t[0] == 'x' and n <= 31 {
+        return n as u8;
+    }
+    if t[0] == 'a' and n <= 7 {
+        return n as u8 + 10;
+    }
+    if t[0] == 't' and n <= 2 {
+        return n as u8 + 5;
+    }
+    if t[0] == 't' and n <= 6 {
+        return n as u8 + 25;
+    }
+    if t[0] == 's' and n <= 1 {
+        return n as u8 + 8;
+    }
+    if t[0] == 's' and n <= 11 {
+        return n as u8 + 16;
+    }
+    return NO_REG;
+}
+
+fn operand_register(text: str, operands: []u8) -> u8 {
+    if text.len() >= 2 and text[0] == '$' {
+        match number(text, from: 1) {
+            some(n) => {
+                if (n as usize) < operands.len() {
+                    return operands[n as usize];
+                }
+            }
+            none => { }
+        }
+        return NO_REG;
+    }
+    return register_named(text);
+}
+
+fn is_space(c: u8) -> bool {
+    return c == ' ' or c == '\t';
+}
+
+fn trim(t: str) -> str {
+    var s: usize = 0;
+    var e = t.len();
+    while s < e and is_space(t[s]) : (s += 1) {
+    }
+    while e > s and is_space(t[e - 1]) : (e -= 1) {
+    }
+    return t[s..e];
+}
+
+fn hex_value(c: u8) -> u8 {
+    if c >= '0' and c <= '9' {
+        return c - '0';
+    }
+    return c - 'A' + 10;
+}
+
+fn fail(problem: &mut alloc.String, what: str, instruction: str) -> bool {
+    problem.push_str(what);
+    problem.push_str(": ");
+    problem.push_str(instruction);
+    problem.push_str(" (a release build's assembler is LLVM's)");
+    return false;
+}
+
+fn plain_instruction(c: &mut nb.Code, name: str) -> bool {
+    if name.eq("ecall") {
+        cd.word(c, 0x00000073);
+    } else if name.eq("ebreak") {
+        cd.ebreak(c);
+    } else if name.eq("nop") {
+        cd.word(c, 0x00000013);
+    } else if name.eq("ret") {
+        cd.ret(c);
+    } else if name.eq("wfi") {
+        cd.word(c, 0x10500073);
+    } else if name.eq("fence") {
+        cd.word(c, 0x0FF0000F);
+    } else if name.eq("sret") {
+        cd.word(c, 0x10200073);
+    } else if name.eq("mret") {
+        cd.word(c, 0x30200073);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/// A signed decimal number; none when it is not one.
+fn signed_number(t: str) -> ?i64 {
+    if t.len() >= 2 and t[0] == '-' {
+        match number(t, from: 1) {
+            some(n) => { return -(n as i64); }
+            none => { return none; }
+        }
+    }
+    match number(t, from: 0) {
+        some(n) => { return n as i64; }
+        none => { return none; }
+    }
+}
+
+/// Writes the text's instructions; false, with problem saying why, for one it
+/// does not know.
+pub fn assemble(c: &mut nb.Code, text: str, operands: []u8, problem: &mut alloc.String, a: alloc.Allocator) -> bool {
+    var clean = alloc.String.init(a);
+    let raw_text = text.bytes();
+    var r: usize = 0;
+    while r < raw_text.len() : (r += 1) {
+        if raw_text[r] == '\\' and r + 2 < raw_text.len() {
+            clean.push_ascii(hex_value(raw_text[r + 1]) * 16 + hex_value(raw_text[r + 2]));
+            r += 2;
+        } else if raw_text[r] <= 127 {
+            clean.push_ascii(raw_text[r]);
+        }
+    }
+    let t = clean.view();
+    var start: usize = 0;
+    var at: usize = 0;
+    while at <= t.len() : (at += 1) {
+        if at < t.len() and t[at] != '\n' and t[at] != ';' {
+            continue;
+        }
+        let line = trim(t[start..at]);
+        start = at + 1;
+        if line.len() == 0 {
+            continue;
+        }
+        var word_end = line.len();
+        var q: usize = 0;
+        while q < line.len() : (q += 1) {
+            if is_space(line[q]) {
+                word_end = q;
+                break;
+            }
+        }
+        let name = line[0..word_end];
+        let rest = trim(line[word_end..line.len()]);
+        if rest.len() == 0 {
+            if not plain_instruction(c, name) {
+                return fail(problem, what: "this backend's assembler does not know", instruction: line);
+            }
+            continue;
+        }
+        // Up to three parts between commas; the last of li and addi is a number.
+        var parts: [3]u8 = [NO_REG, NO_REG, NO_REG];
+        var value: i64 = 0;
+        var count: usize = 0;
+        var part_start: usize = 0;
+        q = 0;
+        while q <= rest.len() : (q += 1) {
+            if q == rest.len() or rest[q] == ',' {
+                if count == 3 {
+                    return fail(problem, what: "this backend's assembler reads up to three parts in", instruction: line);
+                }
+                let part = trim(rest[part_start..q]);
+                var number_at: usize = 2;
+                if name.eq("li") {
+                    number_at = 1;
+                }
+                if (name.eq("li") or name.eq("addi")) and count == number_at {
+                    match signed_number(part) {
+                        some(n) => { value = n; }
+                        none => { return fail(problem, what: "this backend's assembler reads a number in", instruction: line); }
+                    }
+                } else {
+                    parts[count] = operand_register(part, operands);
+                    if parts[count] == NO_REG {
+                        return fail(problem, what: "this backend's assembler reads registers in", instruction: line);
+                    }
+                }
+                count += 1;
+                part_start = q + 1;
+            }
+        }
+        if name.eq("mv") and count == 2 {
+            cd.mv(c, rd: parts[0], rs1: parts[1]);
+            continue;
+        }
+        if name.eq("li") and count == 2 {
+            cd.li(c, rd: parts[0], v: nb.bits_of_i64(value));
+            continue;
+        }
+        if name.eq("addi") and count == 3 {
+            if value < -2048 or value > 2047 {
+                return fail(problem, what: "this backend's assembler reads 12 bits in", instruction: line);
+            }
+            cd.addi(c, rd: parts[0], rs1: parts[1], imm: value as i32);
+            continue;
+        }
+        if count != 3 {
+            return fail(problem, what: "this backend's assembler does not know", instruction: line);
+        }
+        var op: u32 = 0;
+        if name.eq("add") {
+            op = cd.OP_ADD;
+        } else if name.eq("sub") {
+            op = cd.OP_SUB;
+        } else if name.eq("and") {
+            op = cd.OP_AND;
+        } else if name.eq("or") {
+            op = cd.OP_OR;
+        } else if name.eq("xor") {
+            op = cd.OP_XOR;
+        } else if name.eq("mul") {
+            op = cd.OP_MUL;
+        } else {
+            return fail(problem, what: "this backend's assembler does not know", instruction: line);
+        }
+        cd.op3(c, op, rd: parts[0], rs1: parts[1], rs2: parts[2]);
+    }
+    return true;
+}

@@ -37,6 +37,8 @@ import syntax.parser;
 import syntax.cst;
 import syntax.fmt;
 import ir.ir;
+import a64.gen as a64;
+import rv64.gen as rv64;
 import x64.gen as x64;
 import ir.llvm;
 import ir.opt;
@@ -812,12 +814,21 @@ fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, o
     }
     // An object is this compiler's own backend's work; text is for LLVM.
     if names_object(out_path) {
-        if opts.target != program.Target.LinuxX86_64 or opts.release {
-            err_out.write("arche: this compiler writes objects for a debug build on linux-x86_64; for the others, give it a .ll file\n");
+        let on_a64 = opts.target == program.Target.LinuxAarch64;
+        let on_rv64 = opts.target == program.Target.LinuxRiscv64;
+        if not (opts.target == program.Target.LinuxX86_64 or on_a64 or on_rv64) or opts.release {
+            err_out.write("arche: this compiler writes objects for a debug build on Linux; for the others, give it a .ll file\n");
             return Failure.BadUsage;
         }
         var problem = alloc.String.init(a);
-        let object = x64.object(&m, problem: &mut problem, a: a);
+        var object = alloc.List(u8).init(a);
+        if on_a64 {
+            object = a64.object(&m, problem: &mut problem, a: a);
+        } else if on_rv64 {
+            object = rv64.object(&m, problem: &mut problem, a: a);
+        } else {
+            object = x64.object(&m, problem: &mut problem, a: a);
+        }
         if problem.len() > 0 {
             err_out.write("arche: ");
             err_out.write(problem.view());

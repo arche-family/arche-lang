@@ -1,7 +1,7 @@
-/// An ELF64 relocatable object for x86-64: sections, symbols and relocations,
-/// for lld to link (docs/abi.md).
+/// An ELF64 relocatable object: sections, symbols and relocations, for lld to
+/// link (docs/abi.md). Which processor it is for is the writer's to say.
 import alloc;
-import x64.code as cd;
+import native.buffer as nb;
 
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
@@ -20,7 +20,7 @@ pub type Section = struct {
     pub flags: u64,
     pub align: u64,
     pub bytes: alloc.List(u8),
-    pub relocs: alloc.List(cd.Reloc),
+    pub relocs: alloc.List(nb.Reloc),
     /// Its section symbol.
     pub symbol: u32,
 }
@@ -38,10 +38,13 @@ pub type Symbol = struct {
 pub type Object = struct {
     pub sections: alloc.List(Section),
     pub symbols: alloc.List(Symbol),
+    /// ELF's e_machine and e_flags.
+    machine: u32,
+    flags: u32,
     a: alloc.Allocator,
 
-    pub fn init(a: alloc.Allocator) -> Object {
-        return Object { sections: alloc.List(Section).init(a), symbols: alloc.List(Symbol).init(a), a: a };
+    pub fn init(machine: u32, flags: u32, a: alloc.Allocator) -> Object {
+        return Object { sections: alloc.List(Section).init(a), symbols: alloc.List(Symbol).init(a), machine: machine, flags: flags, a: a };
     }
 
     pub fn section(self: &mut Object, name: str, flags: u64, align: u64) -> u32 {
@@ -49,7 +52,7 @@ pub type Object = struct {
         n.push_str(name);
         let index = self.sections.len() as u32;
         let sym = self.symbol("", section: index, value: 0, size: 0, kind: 3, global: false);
-        self.sections.push(Section { name: n, flags: flags, align: align, bytes: alloc.List(u8).init(self.a), relocs: alloc.List(cd.Reloc).init(self.a), symbol: sym });
+        self.sections.push(Section { name: n, flags: flags, align: align, bytes: alloc.List(u8).init(self.a), relocs: alloc.List(nb.Reloc).init(self.a), symbol: sym });
         return index;
     }
 
@@ -227,13 +230,13 @@ pub fn write(o: &Object, a: alloc.Allocator) -> alloc.List(u8) {
         out.push(0);
     }
     put16(&mut out, 1);
-    put16(&mut out, 62);
+    put16(&mut out, o.machine);
     put32(&mut out, 1);
     put64(&mut out, 0);
     put64(&mut out, 0);
     let shoff_at = out.len();
     put64(&mut out, 0);
-    put32(&mut out, 0);
+    put32(&mut out, o.flags);
     put16(&mut out, 64);
     put16(&mut out, 0);
     put16(&mut out, 0);
@@ -262,7 +265,7 @@ pub fn write(o: &Object, a: alloc.Allocator) -> alloc.List(u8) {
         while q < rs.len() : (q += 1) {
             put64(&mut out, rs[q].offset);
             put64(&mut out, ((places[rs[q].symbol as usize] as u64) << 32) | rs[q].kind as u64);
-            put64(&mut out, cd.bits_of_i64(rs[q].addend));
+            put64(&mut out, nb.bits_of_i64(rs[q].addend));
         }
     }
     pad_to(&mut out, 8);

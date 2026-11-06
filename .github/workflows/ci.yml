@@ -76,11 +76,15 @@ jobs:
         run: make -C stage0 && make -C compiler && make -C conformance
       - name: Conformance tests in QEMU
         run: cd compiler && ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
+      - name: Conformance tests in QEMU, by the compiler's own backend
+        run: cd compiler && ARCHE_BACKEND=own ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
+      - name: Conformance tests in QEMU, in a release build
+        run: cd compiler && ARCHE_FLAGS=--release ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
       - name: Bootstrap on that processor, stage2 == stage3
         run: QEMU=qemu-${{ matrix.arch }}-static ./cross-bootstrap.sh ${{ matrix.arch }}
 
-  # docs/sprints.md S16: freestanding binaries, built with core and alloc
-  # only, boot in QEMU on x86-64 and RISC-V 64 and write over serial.
+  # docs/sprints.md S16, S28: freestanding binaries, built with core and alloc
+  # only, boot in QEMU on x86-64, RISC-V 64 and ARM64 and write over serial.
   freestanding:
     runs-on: ubuntu-latest
     steps:
@@ -93,7 +97,7 @@ jobs:
       - name: Build the Arche compiler
         run: make -C stage0 && make -C compiler
       - name: Boot the freestanding examples
-        run: ./freestanding/run.sh x86_64 riscv64
+        run: ./freestanding/run.sh x86_64 riscv64 aarch64
 
   # docs/sprints.md S20: the crypto library runs in the same time whatever
   # its secrets are (dudect: Welch's t-test on two classes of inputs), and a

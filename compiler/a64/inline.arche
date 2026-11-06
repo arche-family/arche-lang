@@ -1,0 +1,203 @@
+/// A small assembler for the text of an asm, as the lowering leaves it for
+/// LLVM: $N an operand, \XX a byte. The backend has no use for more than a
+/// program's few instructions; for what it does not know, a release build goes
+/// through LLVM's assembler.
+import alloc;
+import a64.code as cd;
+import native.buffer as nb;
+
+const NO_REG: u8 = 255;
+
+fn number(t: str, from: usize) -> ?u32 {
+    if from >= t.len() {
+        return none;
+    }
+    var n: u32 = 0;
+    var i = from;
+    while i < t.len() : (i += 1) {
+        if t[i] < '0' or t[i] > '9' {
+            return none;
+        }
+        n = n * 10 + (t[i] - '0') as u32;
+    }
+    return n;
+}
+
+/// x0 to x30, w0 to w30, xzr, sp or an operand of the asm.
+fn operand_register(text: str, operands: []u8) -> u8 {
+    if text.eq("sp") or text.eq("xzr") or text.eq("wzr") {
+        return cd.ZR;
+    }
+    if text.len() >= 2 and (text[0] == 'x' or text[0] == 'w') {
+        match number(text, from: 1) {
+            some(n) => {
+                if n <= 30 {
+                    return n as u8;
+                }
+            }
+            none => { }
+        }
+    }
+    if text.len() >= 2 and text[0] == '$' {
+        match number(text, from: 1) {
+            some(n) => {
+                if (n as usize) < operands.len() {
+                    return operands[n as usize];
+                }
+            }
+            none => { }
+        }
+    }
+    return NO_REG;
+}
+
+fn is_space(c: u8) -> bool {
+    return c == ' ' or c == '\t';
+}
+
+fn trim(t: str) -> str {
+    var s: usize = 0;
+    var e = t.len();
+    while s < e and is_space(t[s]) : (s += 1) {
+    }
+    while e > s and is_space(t[e - 1]) : (e -= 1) {
+    }
+    return t[s..e];
+}
+
+fn hex_value(c: u8) -> u8 {
+    if c >= '0' and c <= '9' {
+        return c - '0';
+    }
+    return c - 'A' + 10;
+}
+
+fn fail(problem: &mut alloc.String, what: str, instruction: str) -> bool {
+    problem.push_str(what);
+    problem.push_str(": ");
+    problem.push_str(instruction);
+    problem.push_str(" (a release build's assembler is LLVM's)");
+    return false;
+}
+
+fn plain_instruction(c: &mut nb.Code, name: str) -> bool {
+    if name.eq("nop") {
+        cd.word(c, 0xD503201F);
+    } else if name.eq("ret") {
+        cd.ret(c);
+    } else if name.eq("wfi") {
+        cd.word(c, 0xD503207F);
+    } else if name.eq("isb") {
+        cd.word(c, 0xD5033FDF);
+    } else if name.eq("eret") {
+        cd.word(c, 0xD69F03E0);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/// Writes the text's instructions; false, with problem saying why, for one it
+/// does not know.
+pub fn assemble(c: &mut nb.Code, text: str, operands: []u8, problem: &mut alloc.String, a: alloc.Allocator) -> bool {
+    var clean = alloc.String.init(a);
+    let raw_text = text.bytes();
+    var r: usize = 0;
+    while r < raw_text.len() : (r += 1) {
+        if raw_text[r] == '\\' and r + 2 < raw_text.len() {
+            clean.push_ascii(hex_value(raw_text[r + 1]) * 16 + hex_value(raw_text[r + 2]));
+            r += 2;
+        } else if raw_text[r] <= 127 {
+            clean.push_ascii(raw_text[r]);
+        }
+    }
+    let t = clean.view();
+    var start: usize = 0;
+    var at: usize = 0;
+    while at <= t.len() : (at += 1) {
+        if at < t.len() and t[at] != '\n' and t[at] != ';' {
+            continue;
+        }
+        let line = trim(t[start..at]);
+        start = at + 1;
+        if line.len() == 0 {
+            continue;
+        }
+        var word_end = line.len();
+        var q: usize = 0;
+        while q < line.len() : (q += 1) {
+            if is_space(line[q]) {
+                word_end = q;
+                break;
+            }
+        }
+        let name = line[0..word_end];
+        let rest = trim(line[word_end..line.len()]);
+        if rest.len() == 0 {
+            if not plain_instruction(c, name) {
+                return fail(problem, what: "this backend's assembler does not know", instruction: line);
+            }
+            continue;
+        }
+        if name.eq("svc") or name.eq("brk") or name.eq("hlt") {
+            var code: u32 = 0;
+            if rest.len() >= 2 and rest[0] == '#' {
+                match number(rest, from: 1) {
+                    some(n) => { code = n; }
+                    none => { return fail(problem, what: "this backend's assembler reads a number in", instruction: line); }
+                }
+            }
+            if name.eq("svc") {
+                cd.word(c, 0xD4000001 | (code << 5));
+            } else if name.eq("brk") {
+                cd.word(c, 0xD4200000 | (code << 5));
+            } else {
+                cd.word(c, 0xD4400000 | (code << 5));
+            }
+            continue;
+        }
+        // rd, rn, rm or rd, rm.
+        var parts: [3]u8 = [NO_REG, NO_REG, NO_REG];
+        var count: usize = 0;
+        var part_start: usize = 0;
+        q = 0;
+        while q <= rest.len() : (q += 1) {
+            if q == rest.len() or rest[q] == ',' {
+                if count == 3 {
+                    return fail(problem, what: "this backend's assembler reads up to three registers in", instruction: line);
+                }
+                parts[count] = operand_register(trim(rest[part_start..q]), operands);
+                if parts[count] == NO_REG {
+                    return fail(problem, what: "this backend's assembler reads registers in", instruction: line);
+                }
+                count += 1;
+                part_start = q + 1;
+            }
+        }
+        if name.eq("mov") and count == 2 {
+            cd.mov(c, rd: parts[0], rm: parts[1]);
+            continue;
+        }
+        if count != 3 {
+            return fail(problem, what: "this backend's assembler does not know", instruction: line);
+        }
+        var op: u32 = 0;
+        if name.eq("add") {
+            op = cd.OP_ADD;
+        } else if name.eq("sub") {
+            op = cd.OP_SUB;
+        } else if name.eq("and") {
+            op = cd.OP_AND;
+        } else if name.eq("orr") {
+            op = cd.OP_ORR;
+        } else if name.eq("eor") {
+            op = cd.OP_EOR;
+        } else if name.eq("mul") {
+            op = cd.OP_MUL;
+        } else {
+            return fail(problem, what: "this backend's assembler does not know", instruction: line);
+        }
+        cd.op3(c, op: op, size: 8, rd: parts[0], rn: parts[1], rm: parts[2]);
+    }
+    return true;
+}

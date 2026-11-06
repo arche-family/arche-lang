@@ -1,0 +1,70 @@
+// test: run
+// spec: arche/10.2
+// stage0: skip
+// stdout: 10 11 20 23 30 7 40 44
+// stdout: 77 255 255 255 2
+// stdout: 55 66 1 88
+// stdout: 1000 700 1200 3000 4 8 2000
+import std;
+import core.atomic;
+
+fn say(sys: &mut std.System, v: u64) {
+    sys.stdout.write_u64(v);
+    sys.stdout.write(" ");
+}
+
+fn last(sys: &mut std.System, v: u64) {
+    sys.stdout.write_u64(v);
+    sys.stdout.write("\n");
+}
+
+// Atomics on bytes and halves, of which a processor may only reserve whole
+// words. Each works on one place, wraps at its width, and leaves the places
+// beside it as they were.
+fn main(sys: &mut std.System) -> !void {
+    var bytes: [4]u8 = [55, 10, 66, 77];
+    var other: [4]u8 = [20, 30, 40, 88];
+    var halves: [4]u16 = [1000, 2000, 3000, 9];
+    unsafe {
+        // SAFETY: all of these live through the block, and nothing else reaches
+        // them.
+        let b = &mut bytes[1] as *mut u8;
+        say(sys, atomic.fetch_add(u8, b, 1, order: atomic.Ordering.SeqCst) as u64);
+        say(sys, atomic.load(u8, b as *u8, order: atomic.Ordering.Acquire) as u64);
+        let c = &mut other[0] as *mut u8;
+        say(sys, atomic.fetch_or(u8, c, 3, order: atomic.Ordering.Relaxed) as u64);
+        say(sys, atomic.load(u8, c as *u8, order: atomic.Ordering.Relaxed) as u64);
+        let d = &mut other[1] as *mut u8;
+        say(sys, atomic.compare_exchange(u8, d, expected: 30, new: 7, order: atomic.Ordering.SeqCst) as u64);
+        say(sys, atomic.compare_exchange(u8, d, expected: 30, new: 8, order: atomic.Ordering.SeqCst) as u64);
+        let e = &mut other[2] as *mut u8;
+        say(sys, atomic.swap(u8, e, 44, order: atomic.Ordering.SeqCst) as u64);
+        last(sys, atomic.load(u8, e as *u8, order: atomic.Ordering.SeqCst) as u64);
+        let top = &mut bytes[3] as *mut u8;
+        say(sys, atomic.fetch_sub(u8, top, 78, order: atomic.Ordering.AcqRel) as u64);
+        say(sys, atomic.load(u8, top as *u8, order: atomic.Ordering.Acquire) as u64);
+        say(sys, atomic.compare_exchange(u8, top, expected: 255, new: 1, order: atomic.Ordering.SeqCst) as u64);
+        atomic.store(u8, b, 255, order: atomic.Ordering.Release);
+        say(sys, atomic.fetch_add(u8, b, 3, order: atomic.Ordering.AcqRel) as u64);
+        last(sys, atomic.load(u8, b as *u8, order: atomic.Ordering.Acquire) as u64);
+    }
+    say(sys, bytes[0] as u64);
+    say(sys, bytes[2] as u64);
+    say(sys, bytes[3] as u64);
+    last(sys, other[3] as u64);
+    unsafe {
+        // SAFETY: as above.
+        let h = &mut halves[0] as *mut u16;
+        say(sys, atomic.fetch_sub(u16, h, 300, order: atomic.Ordering.SeqCst) as u64);
+        say(sys, atomic.load(u16, h as *u16, order: atomic.Ordering.SeqCst) as u64);
+        _ = atomic.fetch_add(u16, h, 500, order: atomic.Ordering.SeqCst);
+        say(sys, atomic.load(u16, h as *u16, order: atomic.Ordering.SeqCst) as u64);
+        let i = &mut halves[2] as *mut u16;
+        say(sys, atomic.compare_exchange(u16, i, expected: 3000, new: 4, order: atomic.Ordering.SeqCst) as u64);
+        say(sys, atomic.load(u16, i as *u16, order: atomic.Ordering.SeqCst) as u64);
+        let j = &mut halves[3] as *mut u16;
+        _ = atomic.fetch_and(u16, j, 8, order: atomic.Ordering.Relaxed);
+        say(sys, atomic.load(u16, j as *u16, order: atomic.Ordering.Relaxed) as u64);
+    }
+    last(sys, halves[1] as u64);
+}

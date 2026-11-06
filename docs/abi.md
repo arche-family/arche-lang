@@ -1,6 +1,6 @@
 # Arche ABI, version 0
 
-This is the binary interface of code the Arche compiler builds: layouts, calling convention, symbol names and the runtime it calls. Version 0 covers Arche-0 on x86-64, built through LLVM (sprint S8) or by the compiler's own backend (S27), for Linux and for Windows (S19). It changes only with a major release once it is stable (S29).
+This is the binary interface of code the Arche compiler builds: layouts, calling convention, symbol names and the runtime it calls. Version 0 covers Arche-0 on x86-64, ARM64 and RISC-V 64 (S28), built through LLVM (sprint S8) or by the compiler's own backend (S27), for Linux, and on x86-64 for Windows too (S19). It changes only with a major release once it is stable (S29).
 
 Layouts, the calling convention and symbol names are the same on both systems; what differs is the runtime underneath and the file the library's `std` comes from, which are named where it matters below.
 
@@ -38,6 +38,17 @@ Sizes and alignments are in bytes. A composite value is laid out in memory at it
 - A scalar result is returned as that scalar. Any other result is written to memory the caller provides, whose address is passed before the parameters.
 - `void` and `noreturn` functions return nothing.
 
+Those scalars go as the processor's C convention has them, so Arche code and the runtime's C call each other:
+
+| Target | Integers, addresses | Floats | Past those | Result | A narrow integer, as an argument |
+| --- | --- | --- | --- | --- | --- |
+| `linux-x86_64` (System V) | rdi, rsi, rdx, rcx, r8, r9 | xmm0 to xmm7 | the stack, 8 bytes each, the first lowest | rax, xmm0 | below 4 bytes, zero-extended |
+| `windows-x86_64` | rcx, rdx, r8, r9 | xmm0 to xmm3, in the same four positions | the stack, above 32 bytes kept for the callee | rax, xmm0 | below 4 bytes, zero-extended |
+| `linux-aarch64` (AAPCS64) | x0 to x7 | d0 to d7, s0 to s7 | the stack, 8 bytes each, the first lowest | x0, d0 | below 4 bytes, zero-extended |
+| `linux-riscv64` (LP64D) | a0 to a7 | fa0 to fa7, then a free a-register, its bits as they are | the stack, 8 bytes each, the first lowest | a0, fa0 | 4 bytes, sign-extended whatever the type's sign; below that, zero-extended |
+
+The IR does not know a narrow integer's sign, so an `i8` or `i16` goes zero-extended too. A C function taking `signed char` or `short` that trusts its caller, as clang's code does on x86-64 and RISC-V 64, sees a negative one as a large positive number; until the IR knows, pass such a value to C as `i32` and `int`. Arche code never relies on an argument's upper bits, on any target.
+
 ## Symbols
 
 A function's symbol is `a0` followed by each segment of its module path and then its name, each written as `_<length><text>`: `syntax.lexer.lex` is `a0_6syntax_5lexer_3lex`. A method adds its type's name before its own: `a0_4main_3Ast_4eval`. A method of an `impl` (spec/arche.md §5.1) adds `_X<n>` after its name, `n` the number of the impl's syntax node in its module, since two interfaces of a type may have methods of one name. A closure is `closure` with `_C<n>`, `n` its expression's node. An instance of a generic function or type, a method of one, or a closure in one adds `_I<h>`, `h` sixteen hex digits of the FNV-1a hash of its comptime arguments written as types that name their module. So a symbol depends only on its own module's text and its arguments, not on the rest of the program, and a module compiled on its own (`arche units`, below) keeps its symbols when other modules change. The test block numbered `n` among the root module's is `a0_test_<n>`. The method table of impl `n` is `a0vt_<n>`, of closure `n` `a0vc_<n>`; they are private to the module that uses them.
@@ -50,18 +61,28 @@ A call through a `&dyn I` loads the method's address from the table and passes t
 
 ## The own backend
 
-`arche build <file> <out>.o` writes an ELF object with no LLVM (`compiler/x64/`), for a debug build on Linux, for `lld` to link with the runtime; `ARCHE_BACKEND=own` makes the build scripts and `arche-driver` do so. Layouts, the calling convention and symbols are the ones above: it is the System V ABI for the scalars the IR has, so its code and the runtime's C call each other, and an argument narrower than 4 bytes is zero-extended, as C expects.
+`arche build <file> <out>.o` writes an ELF object with no LLVM, for a debug build on Linux, for `lld` to link with the runtime; `ARCHE_BACKEND=own` makes the build scripts and `arche-driver` do so. What every processor shares is in `compiler/native/` (the ELF and DWARF writers, how long values live and where) and what is its own in `compiler/x64/`, `compiler/a64/` and `compiler/rv64/`. Layouts, the calling convention and symbols are the ones above.
 
-Its frames are rbp-based. A value lives in rbx or r12 to r15, a float in xmm8 to xmm13 or memory across a call; the other registers belong to the instruction being written. The object has DWARF 4: lines, functions, parameters and local variables, their types, and `.debug_frame`. A variable is known in its whole function, since scopes are not told.
+Frames go by a frame pointer. A value lives in a register a callee keeps, or in the frame; the other registers belong to the instruction being written:
+
+| Target | Frame pointer and return address | Integer values | Float values |
+| --- | --- | --- | --- |
+| `linux-x86_64` | rbp; on the stack above it | rbx, r12 to r15 | xmm8 to xmm13, in memory across a call |
+| `linux-aarch64` | x29; x29 and x30 at x29 | x19 to x28 | d8 to d15 |
+| `linux-riscv64` | s0, the caller's sp; ra at s0-8 and the caller's s0 at s0-16 | s1 to s11 | fs0 to fs11 |
+
+A static program's data is reached by its absolute address on RISC-V 64 (`lui` and `addi`), so it stays below 2 GB. A branch that cannot reach (±1 MB, for ARM64's conditional ones and RISC-V's jumps) is an error of the compiler's, not bad code. ARM64's atomics are those of ARMv8.0; RISC-V's on bytes and halves use a reservation of the word around them.
+
+The object has DWARF 4: lines, functions, parameters and local variables, their types, and `.debug_frame`. A variable is known in its whole function, since scopes are not told.
 
 It also defines `a0_source_calls` (`{pc: u32, line: u32, function: u32}`, by the address each call returns to), `a0_source_call_count` and `a0_source_functions` (`{name: str, file: str}`). A panic's stack trace reads them, walking the frame pointers through the runtime too, which is built with them for this: each frame adds a line `  in <function> (<file>:<line>)` after the panic's place. A test does not, so that what a run reports is the same for every backend. Other programs have no tables, and nothing is added.
 
 ## Systems
 
-A program is built for one system, which the compiler is told with `--target` (`linux-x86_64`, `windows-x86_64`) and which picks three things:
+A program is built for one system, which the compiler is told with `--target` (`linux-x86_64`, `linux-aarch64`, `linux-riscv64`, `windows-x86_64`) and which picks three things:
 
-- The target triple of the LLVM module: `x86_64-pc-linux-gnu` or `x86_64-pc-windows-msvc`.
-- The file the library's `std` is read from: `lib/std.arche` for Linux, `lib/std-windows.arche` for Windows. The module is `std` either way, so a program that imports it says nothing about the system; `std.SYSTEM` names the system when a program must tell them apart. Each reaches its system through a module of its own, `std.linux` or `std.win32`.
+- The target triple of the LLVM module: `x86_64-pc-linux-gnu`, `aarch64-unknown-linux-gnu`, `riscv64-unknown-linux-gnu` or `x86_64-pc-windows-msvc`.
+- The file the library's `std` is read from: `lib/std.arche` for Linux, whose system calls are numbered in `lib/std/linux-<processor>.arche`, `lib/std-windows.arche` for Windows. The module is `std` either way, so a program that imports it says nothing about the system; `std.SYSTEM` names the system when a program must tell them apart. Each reaches its system through a module of its own, `std.linux` or `std.win32`.
 - The half of the runtime that is compiled in, and how the program is linked (`compiler/target.sh`): `-nostdlib -static` on Linux, and on Windows `-nostdlib` with the entry point `a0rt_entry`, the console subsystem, `kernel32`, `ws2_32` and `advapi32`, and `-Brepro`, which leaves the time of the link out of the file so that the same input gives the same bytes.
 
 ## The runtime
