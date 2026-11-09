@@ -2,9 +2,9 @@
 
 > 2026-11-05 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S31.
+**Joriy sprint:** S32.
 
-**Yopilgan:** S0–S4, S6–S30 va S36.
+**Yopilgan:** S0–S4, S6–S31 va S36.
 
 - Compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da; full-Arche paketlarida generics (monomorphization), comptime interpreter, interface'lar (`impl`, `where`, `&dyn`), `for`, closure'lar (`&dyn fn(P) -> R`), `region` (arena, E0901), `unsafe` va raw pointer'lar, `if`/`match` ifoda sifatida, labeled loop'lar, `f32`/`f64`, `requires`/`ensures`, `nopanic` va error return trace ishlaydi.
 - Manifest (`package.arche`) o'qiladi: `needs` (E0801), `strict_unsafe` (E0920), `panic_handler`, xato manifest E0802/E0803.
@@ -47,8 +47,15 @@
 - Pointer'lar 8 bayt qoladi va xotiraga borishda 32 bitga o'raladi, shuning uchun layout'lar boshqa target'lar bilan bir xil.
 - Conformance `wasmtime`da o'tadi, Proc, Net va task kerak bo'lgan testlar `// wasm: skip` bilan o'tkaziladi; compiler'ning o'zi WASM'da ishlaydi, o'zini build qiladi (stage2 == stage3) va Linux dasturini ham chiqaradi.
 - Shu sprintda `lib/alloc`'dagi `Map` xatosi topildi: `remove`dan keyingi `get` eski qiymatni qaytarardi, tuzatildi.
+- S31'da WASM runtime Arche'da (`wasm/`, alohida paket): decoder, validator (body'ni yo'l-yo'lakay interpreter kodiga kompilyatsiya qiladi), store, instantiate va interpreter; dvigatel modullari faqat `core` va `alloc`'ga tayanadi. WebAssembly 2.0 spec testsuite'i (`wg-2.0`, SIMD'siz, wabt 1.0.36'ning `wast2json`i bilan) interpreter'da ham, JIT bilan ham o'tadi: 27416 tekshiruv, matn formatidagi 581 ta `assert_malformed` binar dvigatelniki emas.
+- Baseline JIT x86-64 uchun (`wasm/jit.arche`): instruksiyalar o'sha qiymat stekida mashina kodi bo'ladi; kompilyatsiya qilinmaganini, chaqiruv, qaytish va soatga qarashni bittadan interpreter'ga qaytaradi, shuning uchun frame'lar bitta va trap har doim interpreter'niki. Spec testlarida mashina kodi 368884 marta ishladi va interpreter'ga 135562 instruksiya qaytardi; sikl va rekursiya JIT bilan taxminan 11 marta tez.
+- Component Model (`wasm/component.arche`): bo'limlar tartibi bilan o'qiladi va instantiate qilinadi, canonical ABI string, list, record, tuple, variant, enum, option, result va flags'ni ikki tomonga, flat va xotira orqali o'tkazadi (realloc va post-return bilan). Import qilingan instance'ning har funksiyasi host'da bo'lishi shart, aks holda component rad etiladi.
+- Nimadir host'i oynasiz (`wasm/nimadir.arche`, `arche-wasm nimadir`): `nimadir:shell@1.2.0`'ning `host-api` va `dom` interfeyslari (markup, entity va descendant selector'li element daraxti) va shell chegaralari: frame'ga 1 s, init'ga 10 s, 512 MiB xotira, frame'da 16 MiB va 65536 widget, 1 MiB storage. `counter`, `hello` va `store` qayta build qilinmasdan ishlaydi; `runaway` deadline'da (1,00 s), 512 MiB'da va host chegarasida to'xtatiladi; `nimadir-check.sh` buni interpreter'da ham, JIT bilan ham tekshiradi. Deadline'ning soatini embedder closure sifatida beradi, dvigatel o'zi soat o'qimaydi.
+- Yo'l-yo'lakay: `core.float` (`bits64`, `from_bits64` va 32 bitlik juftlari: float bitlari, NaN payload'i bilan), `alloc.List.with_capacity`/`grow_zeroed`, `String.push_utf8`; `-2^63 as i64` noto'g'ri trap berardi (f64'da `-2^63 - 1` yo'q), tuzatildi. CI bootstrap'ni clang 20 bilan qiladi: LLVM 18'ning SCCP'si bir xil IR'dan ba'zan boshqa kod chiqarardi (llvm/llvm-project#105758).
 
 **Ochiq qolganlar:**
+
+- S31'da Component Model'ning resource'lari, ichma-ich component'lar va UTF-16 string'lar hali yo'q (C# va Python component'lariga kerak); core modullar uchun WASI host'i (capability'lar WASI import sifatida) va JIT'ning ARM64/RISC-V varianti keyinroq; JIT hozircha `div`, float→int, float min/max, jadvallar va `call_indirect`ni interpreter'ga qaytaradi.
 
 - S5'da parser'ni 24 soat fuzz qilish (CI har commit'da 60 soniya fuzz qiladi).
 - S11'dagi comptime interpreter hozircha faqat integer va `bool` kodni bajaradi.
@@ -413,6 +420,8 @@ Bosqich natijasi: to'liq spec bor va compiler concurrency hamda past darajadan t
 - Resurs chegaralari: har chaqiruvga vaqt deadline'i va linear memory uchun yuqori chegara.
 
 **Qabul:** WASM spec testsuite'i interpreter'da ham, JIT'da ham o'tadi. Berilmagan import'ga murojaat rad etiladi. Nimadir'ning `counter`, `hello` va `store` component'lari qayta build qilinmasdan ishlaydi; `runaway` vaqt va xotira chegarasida to'xtatiladi.
+
+Bajarildi: `make -C wasm check` spec testsuite'ini (27416 tekshiruv) interpreter'da va JIT bilan, Nimadir'ning to'rt component'ini ikkala rejimda o'tkazadi; host bermagan import'li component va modul rad etiladi; CI'da `wasm-runtime` job'i.
 
 ### S32. Web server va framework
 

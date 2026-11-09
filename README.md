@@ -46,12 +46,13 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 | Path | Contents | Status |
 | --- | --- | --- |
 | [`docs/plan.md`](docs/plan.md) | the full plan (Uzbek) | snapshot, 2026-11-05 |
-| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language, S35 for the libraries the Arche OS phone needs, S36–S37 for editors and macOS (Uzbek) | current sprint: S31 |
+| [`docs/sprints.md`](docs/sprints.md) | sprints S0–S34 to finish the language, S35 for the libraries the Arche OS phone needs, S36–S37 for editors and macOS (Uzbek) | current sprint: S32 |
 | [`spec/arche-0.md`](spec/arche-0.md) | the bootstrap subset | draft 0.1 |
 | [`spec/arche.md`](spec/arche.md) | the full language, built on Arche-0 | draft 0.1 |
 | [`conformance/`](conformance/README.md) | specification tests | 461 tests, on Linux and Windows |
 | `stage0/` | bootstrap compiler, C11 | complete: compiles all of Arche-0 |
 | [`compiler/`](compiler/) | the Arche compiler, Arche-0, through LLVM, or with no LLVM and no lld by its own backends for x86-64, ARM64, RISC-V 64 (`build x.arche x.ao`: DWARF, linear scan) and WebAssembly (`--target wasm32-wasi`), and its own linker (`link`: ELF, or `.ax` for Arche OS); `--release` runs its own optimizer; `--target` picks the system | self-hosting: stage2 == stage3, by its own backends too, in release builds, on Windows, on ARM64 and RISC-V 64, and on WebAssembly |
+| [`wasm/`](wasm/) | the WASM runtime, in Arche: a decoder, a validator, an interpreter and a baseline JIT for x86-64, the Component Model with the canonical ABI, and a windowless shell for [Nimadir](https://github.com/Nodirbek-Abdulaxadov/nimadir)'s mini-apps, with time and memory limits | the WebAssembly 2.0 spec tests pass in the interpreter and with the JIT; Nimadir's components run unrebuilt |
 | [`bench/`](bench/) | compile-time and run-time benchmarks | [baseline](bench/baseline.md) |
 | [`driver/`](driver/) | `arche-driver build`/`run`: packages from `build.arche`, one object per module, cached by SHA-256; `pkg add/lock/vendor/publish` and `arche-registry`: signed, content-addressed packages over HTTPS; `arche-lsp`: a language server that runs the compiler per request | a cached build is bit-identical to a clean one; tampered packages are refused; a real editor session passes, with diagnostics under a second on the compiler's source |
 | [`editors/`](editors/README.md) | TextMate grammar and how to use `arche-lsp` | the grammar's keywords are compared with the lexer's |
