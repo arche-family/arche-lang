@@ -1,0 +1,75 @@
+// test: run
+// spec: web (docs/sprints.md S32)
+// stage0: skip
+// stdout: 0 /users
+// stdout: 1 id=42
+// stdout: 2 id=7 file=a b/c.txt
+// stdout: 405 404 404
+// stdout: 3 path=
+// stdout: head takes get: 0
+import alloc;
+import http;
+import std;
+import web;
+
+fn request(method: str, target: str, a: alloc.Allocator) -> http.Request {
+    var req = http.Request.init(a);
+    req.method.push_str(method);
+    req.target.push_str(target);
+    return req;
+}
+
+fn show(sys: &mut std.System, found: web.Found, params: &web.Params) {
+    match found {
+        .Route { route } => {
+            sys.stdout.write_u64(route as u64);
+            var i: usize = 0;
+            while i < params.len() : (i += 1) {
+                sys.stdout.write(" ");
+                sys.stdout.write(params.names_at(i));
+                sys.stdout.write("=");
+                sys.stdout.write(params.value(i));
+            }
+        }
+        .WrongMethod => { sys.stdout.write("405"); }
+        .NotFound => { sys.stdout.write("404"); }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var r = web.Router.init(sys.alloc);
+    _ = r.add(method: "GET", pattern: "/users");
+    _ = r.add(method: "GET", pattern: "/users/:id");
+    _ = r.add(method: "GET", pattern: "/users/:id/files/*file");
+    _ = r.add(method: "GET", pattern: "/static/*path");
+    var p = web.Params.init(sys.alloc);
+    let a = sys.alloc;
+    let first = request(method: "GET", target: "/users?sort=name", a);
+    show(sys, found: r.find(&first, params: &mut p), params: &p);
+    sys.stdout.write(" ");
+    sys.stdout.write(first.path());
+    sys.stdout.write("\n");
+    let second = request(method: "GET", target: "/users/42", a);
+    show(sys, found: r.find(&second, params: &mut p), params: &p);
+    sys.stdout.write("\n");
+    // Percent-decoded, and the rest of the path whole.
+    let third = request(method: "GET", target: "/users/7/files/a%20b/c.txt", a);
+    show(sys, found: r.find(&third, params: &mut p), params: &p);
+    sys.stdout.write("\n");
+    let wrong = request(method: "POST", target: "/users", a);
+    show(sys, found: r.find(&wrong, params: &mut p), params: &p);
+    sys.stdout.write(" ");
+    let empty = request(method: "GET", target: "/users/", a);
+    show(sys, found: r.find(&empty, params: &mut p), params: &p);
+    sys.stdout.write(" ");
+    let other = request(method: "GET", target: "/nothing", a);
+    show(sys, found: r.find(&other, params: &mut p), params: &p);
+    sys.stdout.write("\n");
+    let all = request(method: "GET", target: "/static/", a);
+    show(sys, found: r.find(&all, params: &mut p), params: &p);
+    sys.stdout.write("\n");
+    let head = request(method: "HEAD", target: "/users", a);
+    sys.stdout.write("head takes get: ");
+    show(sys, found: r.find(&head, params: &mut p), params: &p);
+    sys.stdout.write("\n");
+}

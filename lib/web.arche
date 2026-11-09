@@ -1,0 +1,445 @@
+/// Web applications over http.server (docs/sprints.md S32). A request lives
+/// in a region of its own from parse to response (http.server); here is
+/// what an application does with it:
+///
+/// - Router: methods and path patterns, `/users/:id` and `/files/*path`. It
+///   says which route a request takes and with what parameters; what runs
+///   for it is the application's own code, a match on the route, so that a
+///   reader sees every handler where the routes are.
+/// - Middleware: something that runs before the handler, and may answer
+///   instead of it, and after it. They nest, each around the next (around).
+///   Gzip compresses what the client accepts compressed; Security adds the
+///   headers every response should have.
+/// - Static files: a directory served as it is, GET and HEAD, with a
+///   content type by extension and no way out of it.
+/// - JSON bodies (std.json), and web.json for typed values (S32's comptime
+///   encoding lives in web.json).
+import alloc;
+import core.deflate;
+import http;
+import std;
+
+// ---- the router ----------------------------------------------------------------------
+
+/// A route's number, as Router.add gave it.
+pub type Route = u32;
+
+/// What a request finds: a route, a path some route has but not for this
+/// method (405), or nothing (404).
+pub type Found = enum { Route { route: u32 }, WrongMethod, NotFound }
+
+/// The parameters a route's pattern took from the path, by name.
+pub type Params = struct {
+    names: alloc.List(alloc.String),
+    values: alloc.List(alloc.String),
+    a: alloc.Allocator,
+
+    pub fn init(a: alloc.Allocator) -> Params {
+        return Params { names: alloc.List(alloc.String).init(a), values: alloc.List(alloc.String).init(a), a: a };
+    }
+
+    pub fn len(self: &Params) -> usize {
+        return self.names.len();
+    }
+
+    /// The parameter called name: its index, or none.
+    pub fn find(self: &Params, name: str) -> ?usize {
+        var i: usize = 0;
+        while i < self.names.len() : (i += 1) {
+            if self.names.items()[i].view().eq(name) {
+                return i;
+            }
+        }
+        return none;
+    }
+
+    pub fn value(self: &Params, i: usize) -> str {
+        return self.values.items()[i].view();
+    }
+
+    pub fn names_at(self: &Params, i: usize) -> str {
+        return self.names.items()[i].view();
+    }
+
+    fn clear(self: &mut Params) {
+        self.names.clear();
+        self.values.clear();
+    }
+}
+
+/// Routes, each a method and a pattern of segments: a word, `:name` for any
+/// one segment, or `*name`, last, for all that is left.
+pub type Router = struct {
+    methods: alloc.List(alloc.String),
+    patterns: alloc.List(alloc.String),
+    a: alloc.Allocator,
+
+    pub fn init(a: alloc.Allocator) -> Router {
+        return Router { methods: alloc.List(alloc.String).init(a), patterns: alloc.List(alloc.String).init(a), a: a };
+    }
+
+    /// A route for method (GET, POST, …) and pattern; its number. Routes
+    /// are tried in the order they were added.
+    pub fn add(self: &mut Router, method: str, pattern: str) -> Route {
+        self.methods.push(alloc.String.from(method, self.a));
+        self.patterns.push(alloc.String.from(pattern, self.a));
+        return (self.methods.len() - 1) as u32;
+    }
+
+    /// The route req takes, its parameters into params. A HEAD request
+    /// takes a GET route.
+    pub fn find(self: &Router, req: &http.Request, params: &mut Params) -> Found {
+        let path = req.path();
+        let method = req.method.view();
+        var wrong = false;
+        var i: usize = 0;
+        while i < self.patterns.len() : (i += 1) {
+            params.clear();
+            if not match_path(pattern: self.patterns.items()[i].view(), path: path, params: params) {
+                continue;
+            }
+            let m = self.methods.items()[i].view();
+            if m.eq(method) or (m.eq("GET") and method.eq("HEAD")) {
+                return Found.Route { route: i as u32 };
+            }
+            wrong = true;
+        }
+        params.clear();
+        if wrong {
+            return Found.WrongMethod;
+        }
+        return Found.NotFound;
+    }
+}
+
+/// The next segment of b from at, to the next '/' or the end.
+fn segment_end(b: []u8, at: usize) -> usize {
+    var j = at;
+    while j < b.len() and b[j] != '/' {
+        j += 1;
+    }
+    return j;
+}
+
+fn match_path(pattern: str, path: str, params: &mut Params) -> bool {
+    let p = pattern.bytes();
+    let q = path.bytes();
+    var i: usize = 0;
+    var j: usize = 0;
+    while i < p.len() {
+        if p[i] == '/' {
+            if j >= q.len() or q[j] != '/' {
+                return false;
+            }
+            i += 1;
+            j += 1;
+            continue;
+        }
+        let pe = segment_end(p, at: i);
+        if p[i] == '*' {
+            var name = alloc.String.init(params.a);
+            _ = name.push_utf8(p[i + 1..pe]);
+            params.names.push(name);
+            params.values.push(decode(q[j..q.len()], a: params.a));
+            return true;
+        }
+        let qe = segment_end(q, at: j);
+        if p[i] == ':' {
+            if qe == j {
+                return false;
+            }
+            var name = alloc.String.init(params.a);
+            _ = name.push_utf8(p[i + 1..pe]);
+            params.names.push(name);
+            params.values.push(decode(q[j..qe], a: params.a));
+        } else {
+            if pe - i != qe - j {
+                return false;
+            }
+            var k: usize = 0;
+            while k < pe - i : (k += 1) {
+                if p[i + k] != q[j + k] {
+                    return false;
+                }
+            }
+        }
+        i = pe;
+        j = qe;
+    }
+    return j == q.len();
+}
+
+fn hex_value(c: u8) -> ?u8 {
+    if c >= '0' and c <= '9' {
+        return c - '0';
+    }
+    if c >= 'a' and c <= 'f' {
+        return c - 'a' + 10;
+    }
+    if c >= 'A' and c <= 'F' {
+        return c - 'A' + 10;
+    }
+    return none;
+}
+
+/// Percent-decoded text: %XX as the byte; what is not UTF-8 after it stays
+/// as it was written.
+pub fn decode(b: []u8, a: alloc.Allocator) -> alloc.String {
+    var bytes = alloc.List(u8).init(a);
+    var i: usize = 0;
+    while i < b.len() {
+        if b[i] == '%' and i + 2 < b.len() + 0 and i + 2 <= b.len() - 1 {
+            match hex_value(b[i + 1]) {
+                some(hi) => {
+                    match hex_value(b[i + 2]) {
+                        some(lo) => {
+                            bytes.push(hi * 16 + lo);
+                            i += 3;
+                            continue;
+                        }
+                        none => { }
+                    }
+                }
+                none => { }
+            }
+        }
+        bytes.push(b[i]);
+        i += 1;
+    }
+    var s = alloc.String.init(a);
+    if not s.push_utf8(bytes.items()) {
+        _ = s.push_utf8(b);
+    }
+    return s;
+}
+
+// ---- answers ----------------------------------------------------------------------------
+
+/// A plain answer: the status, its reason as the body.
+pub fn status(resp: &mut http.Response, code: u16) {
+    resp.status = code;
+    resp.headers.set(name: "content-type", value: "text/plain; charset=utf-8");
+    resp.body.clear();
+    resp.write(http.reason(code));
+    resp.write("\n");
+}
+
+/// The answer for a request no route took: 404, or 405 with Allow unsaid.
+pub fn not_found(found: Found, resp: &mut http.Response) {
+    match found {
+        .WrongMethod => { status(resp, code: 405); }
+        _ => { status(resp, code: 404); }
+    }
+}
+
+/// A JSON body (std.json's text, or web.json's).
+pub fn json_body(resp: &mut http.Response, text: []u8) {
+    resp.headers.set(name: "content-type", value: "application/json");
+    resp.write_bytes(text);
+}
+
+// ---- middleware --------------------------------------------------------------------------
+
+/// Something around a handler: before runs first, and true from it means it
+/// answered, so the handler does not run; after runs last, either way.
+pub type Middleware = interface {
+    fn before(self: &mut Self, req: &http.Request, resp: &mut http.Response) -> bool;
+    fn after(self: &mut Self, req: &http.Request, resp: &mut http.Response);
+}
+
+/// Runs m around next.
+pub fn around(m: &mut dyn Middleware, req: &http.Request, resp: &mut http.Response, next: &dyn fn(&http.Request, &mut http.Response)) {
+    if not m.before(req, resp) {
+        next(req, resp);
+    }
+    m.after(req, resp);
+}
+
+/// Compresses a response with gzip when the client accepts it, its type
+/// is text, and it is long enough to gain; it says so in Content-Encoding
+/// and Vary.
+pub type Gzip = struct {
+    /// The shortest body worth compressing.
+    pub min: usize,
+    /// How many responses it compressed.
+    pub count: u64,
+}
+
+pub fn gzip() -> Gzip {
+    return Gzip { min: 256, count: 0 };
+}
+
+fn accepts_gzip(req: &http.Request) -> bool {
+    match req.headers.find("accept-encoding") {
+        some(i) => {
+            let v = req.headers.value(i).bytes();
+            // "gzip" as a token of the list; "gzip;q=0" turns it off.
+            var k: usize = 0;
+            while k + 4 <= v.len() : (k += 1) {
+                if v[k] == 'g' and v[k + 1] == 'z' and v[k + 2] == 'i' and v[k + 3] == 'p' {
+                    var j = k + 4;
+                    while j < v.len() and v[j] == ' ' {
+                        j += 1;
+                    }
+                    if j + 4 <= v.len() and v[j] == ';' and v[j + 1] == 'q' and v[j + 2] == '=' and v[j + 3] == '0' {
+                        var z = j + 4;
+                        var nonzero = false;
+                        while z < v.len() and v[z] != ',' {
+                            if v[z] >= '1' and v[z] <= '9' {
+                                nonzero = true;
+                            }
+                            z += 1;
+                        }
+                        return nonzero;
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+        none => { return false; }
+    }
+}
+
+fn compressible(resp: &http.Response) -> bool {
+    match resp.headers.find("content-type") {
+        some(i) => {
+            let t = resp.headers.value(i);
+            return t.starts_with("text/") or t.starts_with("application/json") or t.starts_with("application/javascript") or t.starts_with("image/svg+xml") or t.starts_with("application/wasm");
+        }
+        none => { return false; }
+    }
+}
+
+impl Middleware for Gzip {
+    fn before(self: &mut Gzip, req: &http.Request, resp: &mut http.Response) -> bool {
+        return false;
+    }
+
+    fn after(self: &mut Gzip, req: &http.Request, resp: &mut http.Response) {
+        resp.headers.add(name: "vary", value: "accept-encoding");
+        if resp.chunked or resp.body.len() < self.min or not compressible(resp) or not accepts_gzip(req) {
+            return;
+        }
+        match resp.headers.find("content-encoding") {
+            some(_) => { return; }
+            none => { }
+        }
+        var packed = alloc.List(u8).init(resp.alloc);
+        deflate.gzip(resp.body.items(), out: &mut packed, resp.alloc);
+        resp.body = packed;
+        resp.headers.set(name: "content-encoding", value: "gzip");
+        self.count += 1;
+    }
+}
+
+/// Headers every response should carry: no sniffing of types, no framing
+/// by other sites, and no referrer sent elsewhere.
+pub type Security = struct {
+    pub hsts: bool,
+}
+
+impl Middleware for Security {
+    fn before(self: &mut Security, req: &http.Request, resp: &mut http.Response) -> bool {
+        return false;
+    }
+
+    fn after(self: &mut Security, req: &http.Request, resp: &mut http.Response) {
+        resp.headers.set(name: "x-content-type-options", value: "nosniff");
+        resp.headers.set(name: "x-frame-options", value: "DENY");
+        resp.headers.set(name: "referrer-policy", value: "same-origin");
+        if self.hsts {
+            resp.headers.set(name: "strict-transport-security", value: "max-age=31536000");
+        }
+    }
+}
+
+// ---- static files ------------------------------------------------------------------------
+
+/// The content type of a file, by its extension.
+pub fn content_type(path: str) -> str {
+    let b = path.bytes();
+    var dot = b.len();
+    var i = b.len();
+    while i > 0 {
+        i -= 1;
+        if b[i] == '.' {
+            dot = i;
+            break;
+        }
+        if b[i] == '/' {
+            break;
+        }
+    }
+    let ext = path[dot..b.len()];
+    if ext.eq(".html") or ext.eq(".htm") { return "text/html; charset=utf-8"; }
+    if ext.eq(".css") { return "text/css; charset=utf-8"; }
+    if ext.eq(".js") or ext.eq(".mjs") { return "application/javascript; charset=utf-8"; }
+    if ext.eq(".json") { return "application/json"; }
+    if ext.eq(".txt") or ext.eq(".md") { return "text/plain; charset=utf-8"; }
+    if ext.eq(".svg") { return "image/svg+xml"; }
+    if ext.eq(".png") { return "image/png"; }
+    if ext.eq(".jpg") or ext.eq(".jpeg") { return "image/jpeg"; }
+    if ext.eq(".gif") { return "image/gif"; }
+    if ext.eq(".webp") { return "image/webp"; }
+    if ext.eq(".ico") { return "image/x-icon"; }
+    if ext.eq(".wasm") { return "application/wasm"; }
+    if ext.eq(".woff2") { return "font/woff2"; }
+    return "application/octet-stream";
+}
+
+/// Whether a path names something inside the directory: no "..", no ".",
+/// no empty segment but the last, nothing hidden, no NUL or backslash.
+fn safe(path: []u8) -> bool {
+    if path.len() == 0 or path[0] != '/' {
+        return false;
+    }
+    var i: usize = 1;
+    while i < path.len() {
+        let e = segment_end(path, at: i);
+        if e == i and e != path.len() {
+            return false;
+        }
+        if e > i and path[i] == '.' {
+            return false;
+        }
+        var k = i;
+        while k < e : (k += 1) {
+            if path[k] == 0 or path[k] == '\\' {
+                return false;
+            }
+        }
+        i = e + 1;
+    }
+    return true;
+}
+
+/// Serves the file under root that path names (a route's `*path`, say),
+/// for GET and HEAD: index.html for a directory's path, 404 for what is not
+/// there or not safe to look for.
+pub fn serve_file(fs: &std.Fs, root: str, path: str, req: &http.Request, resp: &mut http.Response) {
+    let method = req.method.view();
+    if not method.eq("GET") and not method.eq("HEAD") {
+        status(resp, code: 405);
+        return;
+    }
+    var full = alloc.String.from("/", resp.alloc);
+    full.push_str(path);
+    if full.view().bytes()[full.len() - 1] == '/' {
+        full.push_str("index.html");
+    }
+    if not safe(full.view().bytes()) {
+        status(resp, code: 404);
+        return;
+    }
+    var file = alloc.String.from(root, resp.alloc);
+    file.push_str(full.view());
+    match fs.read_bytes(file.view(), resp.alloc) {
+        ok(data) => {
+            resp.headers.set(name: "content-type", value: content_type(full.view()));
+            resp.headers.set(name: "cache-control", value: "no-cache");
+            resp.body = data;
+        }
+        err(_) => { status(resp, code: 404); }
+    }
+}

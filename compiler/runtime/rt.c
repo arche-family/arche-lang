@@ -736,6 +736,8 @@ struct Fiber {
     int state;
     i64 io_fd;      // the socket it waits for: a descriptor, or a handle
     short io_events;
+    u8 *env_buf;    // the fiber's copy of its task's closure, kept for the next
+    u64 env_cap;
 };
 
 typedef struct TaskScope {
@@ -743,7 +745,7 @@ typedef struct TaskScope {
     u32 failed;      // 1: a task returned an error; 2: one panicked
 } TaskScope;
 
-static Fiber main_fiber = {0, 0, 0, 0, 0, 0, RUNNING, -1, 0};
+static Fiber main_fiber = {0, 0, 0, 0, 0, 0, RUNNING, -1, 0, 0, 0};
 static Fiber *current_fiber = &main_fiber;
 static Fiber **fibers;
 static u64 fiber_count, fiber_cap;
@@ -892,10 +894,6 @@ void a0rt_task_wake(const void *key) {
     }
 }
 
-// Memory for a task's closure: it lives as long as the program.
-void *a0rt_task_memory(u64 n) {
-    return a0rt_alloc(n);
-}
 
 void *a0rt_scope_new(void) {
     TaskScope *s = a0rt_alloc(sizeof(TaskScope));
@@ -947,20 +945,44 @@ static void reap(void) {
     fiber_count = kept;
 }
 
-void a0rt_spawn(void *scope, void *fn, void *env) {
-    TaskScope *s = scope;
+// A fiber for a new task: a spare one, with its stack and its closure's
+// memory, or a new one.
+static Fiber *take_fiber(void) {
     reap();
-    Fiber *f;
     if (spare_count > 0) {
-        f = spare[--spare_count];
-    } else {
-        f = a0rt_alloc(sizeof(Fiber));
-        u8 *p = os_stack_map(TASK_STACK + GUARD);
-        if (!p) {
-            a0rt_die("out of memory", 13);
-        }
-        f->stack = p;
+        return spare[--spare_count];
     }
+    Fiber *f = a0rt_alloc(sizeof(Fiber));
+    u8 *p = os_stack_map(TASK_STACK + GUARD);
+    if (!p) {
+        a0rt_die("out of memory", 13);
+    }
+    f->stack = p;
+    f->env_buf = 0;
+    f->env_cap = 0;
+    return f;
+}
+
+static void start_fiber(Fiber *f, TaskScope *s, void *fn, void *env);
+
+// std.task's spawn: a task running fn on a copy of the size bytes of its
+// closure's captures at env. The copy is the fiber's, and the fiber's next
+// task reuses it, as it does the stack: a server that starts a task for
+// each connection does not grow with connections.
+void a0rt_spawn(void *scope, void *fn, const void *env, u64 size) {
+    Fiber *f = take_fiber();
+    if (f->env_cap < size + 1) {
+        u64 cap = (size + 64) & ~(u64)63;
+        f->env_buf = a0rt_alloc(cap);
+        f->env_cap = cap;
+    }
+    for (u64 i = 0; i < size; i++) {
+        f->env_buf[i] = ((const u8 *)env)[i];
+    }
+    start_fiber(f, scope, fn, f->env_buf);
+}
+
+static void start_fiber(Fiber *f, TaskScope *s, void *fn, void *env) {
     // The frame a0rt_ctx_switch returns through, as this system's one
     // leaves it: the registers it restores, all zero for a fiber that has
     // not run, then where it returns to and that frame's own return

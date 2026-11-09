@@ -12,8 +12,7 @@ pub type TaskError = error { Failed, Panicked }
 
 extern "c" fn a0rt_scope_new() -> *mut u8;
 extern "c" fn a0rt_scope_wait(scope: *mut u8) -> u32;
-extern "c" fn a0rt_spawn(scope: *mut u8, code: *u8, env: *mut u8);
-extern "c" fn a0rt_task_memory(n: u64) -> *mut u8;
+extern "c" fn a0rt_spawn(scope: *mut u8, code: *u8, env: *u8, size: u64);
 extern "c" fn a0rt_task_wait(key: *u8);
 extern "c" fn a0rt_task_wake(key: *u8);
 extern "c" fn a0rt_task_yield();
@@ -29,14 +28,11 @@ pub type Scope = struct {
     /// scope waits for it to end.
     pub fn spawn(self: &mut Scope, task: &dyn fn() -> !void) {
         unsafe {
-            // SAFETY: the copy has the closure's size, and the closure is
-            // not used again (the compiler requires it written here).
+            // SAFETY: the runtime copies the closure's size bytes of
+            // captures, and the closure is not used again (the compiler
+            // requires it written here).
             let size = mem.closure_size(task);
-            let copy = a0rt_task_memory(size as u64 + 1);
-            if size > 0 {
-                mem.copy(copy, mem.closure_env(task), size);
-            }
-            a0rt_spawn(scope: self.raw, code: mem.closure_code(task), env: copy);
+            a0rt_spawn(scope: self.raw, code: mem.closure_code(task), env: mem.closure_env(task), size: size as u64);
         }
     }
 }

@@ -592,6 +592,57 @@ pub type Proc = struct {
         }
     }
 
+    /// How many processors the program may run on.
+    pub fn cpu_count(self: &Proc) -> u32 {
+        var mask: [16]u64 = [0; 16];
+        var r: i64 = 0;
+        unsafe {
+            // SAFETY: sched_getaffinity writes at most 128 bytes of mask.
+            r = linux.syscall(linux.SCHED_GETAFFINITY, [0, 128, linux.arg(u64, &mask[0] as *u64), 0, 0, 0]);
+        }
+        if r <= 0 {
+            return 1;
+        }
+        var n: u32 = 0;
+        for word in mask[0..16] {
+            var w = word.*;
+            while w != 0 {
+                n += (w & 1) as u32;
+                w = w >> 1;
+            }
+        }
+        if n == 0 {
+            return 1;
+        }
+        return n;
+    }
+
+    /// Makes the program count processes in all, count - 1 copies of this
+    /// one from here on, each with what it has open, a listener too, so that
+    /// they accept connections side by side: a server's worker per
+    /// processor. Says which one this is, 0 for the first; a copy ends when
+    /// the first does. Call it before starting tasks.
+    pub fn workers(self: &Proc, count: u32) -> u32 {
+        var i: u32 = 1;
+        while i < count : (i += 1) {
+            var r: i64 = 0;
+            unsafe {
+                // SAFETY: no task runs yet, so the copy has one thread, as
+                // this does.
+                r = linux.fork();
+            }
+            if r == 0 {
+                unsafe {
+                    // SAFETY: PR_SET_PDEATHSIG (1) with SIGTERM (15): the
+                    // copy ends with the process that made it.
+                    _ = linux.syscall(linux.PRCTL, [1, 15, 0, 0, 0, 0]);
+                }
+                return i;
+            }
+        }
+        return 0;
+    }
+
     /// Ends the program with this status, after writing out stdout and
     /// stderr.
     pub fn exit(self: &Proc, status: u8) -> noreturn {

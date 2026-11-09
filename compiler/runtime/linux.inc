@@ -71,20 +71,29 @@ static u16 io_code(i64 e) {
 }
 
 // A path as the kernel wants it: NUL-terminated. 0 when it holds a NUL.
-static char *c_path(const u8 *p, u64 n) {
+// A path with a zero after it, in buf, which holds PATH_MAX bytes: one with
+// a zero inside, or one too long for the kernel, is none. On the stack, not
+// the heap: the program's allocator frees nothing, and a server opens files
+// for as long as it runs.
+enum { PATH_MAX = 4096 };
+
+static char *c_path(const u8 *p, u64 n, char *buf) {
+    if (n >= PATH_MAX) {
+        return 0;
+    }
     for (u64 i = 0; i < n; i++) {
         if (p[i] == 0) {
             return 0;
         }
     }
-    char *s = a0rt_alloc(n + 1);
-    memcpy(s, p, n);
-    s[n] = 0;
-    return s;
+    memcpy(buf, p, n);
+    buf[n] = 0;
+    return buf;
 }
 
 static i64 os_open_read(const u8 *path, u64 path_len) {
-    char *p = c_path(path, path_len);
+    char buf[PATH_MAX];
+    char *p = c_path(path, path_len, buf);
     if (!p) {
         return -IO_NOT_FOUND;
     }
@@ -93,7 +102,8 @@ static i64 os_open_read(const u8 *path, u64 path_len) {
 }
 
 static i64 os_open_write(const u8 *path, u64 path_len) {
-    char *p = c_path(path, path_len);
+    char buf[PATH_MAX];
+    char *p = c_path(path, path_len, buf);
     if (!p) {
         return -IO_NOT_FOUND;
     }
@@ -102,7 +112,8 @@ static i64 os_open_write(const u8 *path, u64 path_len) {
 }
 
 static i64 os_open_program(const u8 *path, u64 path_len) {
-    char *p = c_path(path, path_len);
+    char buf[PATH_MAX];
+    char *p = c_path(path, path_len, buf);
     if (!p) {
         return -IO_NOT_FOUND;
     }

@@ -105,9 +105,13 @@ static u16 win_code(const u16 *path) {
 // Win32 takes paths and gives the command line as UTF-16; Arche's text is
 // UTF-8 (spec/arche.md §2.1), so the runtime translates at the edge.
 
-// The text as UTF-16, NUL-terminated, in memory that lives as long as the
-// program. 0 when the text holds a NUL or is not valid UTF-8, which no
-// path can be.
+// The text as UTF-16, NUL-terminated, in memory the runtime keeps for it:
+// the next call writes over it, so a server that opens files for as long as
+// it runs does not grow. 0 when the text holds a NUL or is not valid UTF-8,
+// which no path can be.
+static u16 *w_scratch;
+static u64 w_scratch_units;
+
 static u16 *w_text(const u8 *p, u64 n) {
     if (!valid_utf8(p, n)) {
         return 0;
@@ -119,7 +123,11 @@ static u16 *w_text(const u8 *p, u64 n) {
     }
     // Two units for every byte is always enough: a byte becomes at most one
     // unit, and a four-byte character two.
-    u16 *w = a0rt_alloc((n + 1) * 2 * sizeof(u16));
+    if ((n + 1) * 2 > w_scratch_units) {
+        w_scratch_units = (n + 1) * 2 + 256;
+        w_scratch = a0rt_alloc(w_scratch_units * sizeof(u16));
+    }
+    u16 *w = w_scratch;
     u64 at = 0;
     u64 i = 0;
     while (i < n) {

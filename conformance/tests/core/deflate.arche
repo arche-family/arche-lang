@@ -1,0 +1,86 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: crc 1095738169 414fa339
+// stdout: round trip true true true
+// stdout: smaller true
+// stdout: corrupt Corrupt
+import alloc;
+import core.deflate;
+import std;
+
+fn hex(sys: &mut std.System, v: u32) {
+    let digits = "0123456789abcdef";
+    var shift: u32 = 32;
+    while shift > 0 {
+        shift -= 4;
+        let d = ((v >> shift) & 0xF) as usize;
+        sys.stdout.write(digits[d..d + 1]);
+    }
+}
+
+fn round_trip(text: []u8, a: alloc.Allocator) -> bool {
+    var packed = alloc.List(u8).init(a);
+    deflate.gzip(text, out: &mut packed, a);
+    var back = alloc.List(u8).init(a);
+    match deflate.gunzip(packed.items(), out: &mut back, limit: 1 << 20) {
+        ok(_) => { }
+        err(_) => { return false; }
+    }
+    if back.len() != text.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < text.len() : (i += 1) {
+        if back.items()[i] != text[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let quick = "The quick brown fox jumps over the lazy dog".bytes();
+    sys.stdout.write("crc ");
+    sys.stdout.write_u64(deflate.crc32(0, data: quick) as u64);
+    sys.stdout.write(" ");
+    hex(sys, v: deflate.crc32(0, data: quick));
+    sys.stdout.write("\n");
+    var page = alloc.String.init(sys.alloc);
+    var i: u32 = 0;
+    while i < 200 : (i += 1) {
+        page.push_str("<li class=\"item\">item number ");
+        page.push_u64(i as u64);
+        page.push_str("</li>\n");
+    }
+    let empty: [0]u8 = [];
+    sys.stdout.write("round trip ");
+    sys.stdout.write(if round_trip(quick, sys.alloc) { "true" } else { "false" });
+    sys.stdout.write(" ");
+    sys.stdout.write(if round_trip(page.view().bytes(), sys.alloc) { "true" } else { "false" });
+    sys.stdout.write(" ");
+    sys.stdout.write(if round_trip(empty[0..0], sys.alloc) { "true" } else { "false" });
+    sys.stdout.write("\n");
+    var packed = alloc.List(u8).init(sys.alloc);
+    deflate.gzip(page.view().bytes(), out: &mut packed, sys.alloc);
+    sys.stdout.write("smaller ");
+    sys.stdout.write(if packed.len() * 4 < page.len() { "true" } else { "false" });
+    sys.stdout.write("\n");
+    // A changed byte is caught: by the codes, or by the CRC.
+    let at = packed.len() - 9;
+    let flipped = packed.items()[at] ^ 0x55;
+    packed.items_mut()[at] = flipped;
+    var back = alloc.List(u8).init(sys.alloc);
+    sys.stdout.write("corrupt ");
+    match deflate.gunzip(packed.items(), out: &mut back, limit: 1 << 20) {
+        ok(_) => { sys.stdout.write("none"); }
+        err(e) => {
+            if e == deflate.DeflateError.Corrupt {
+                sys.stdout.write("Corrupt");
+            } else {
+                sys.stdout.write("TooLarge");
+            }
+        }
+    }
+    sys.stdout.write("\n");
+}

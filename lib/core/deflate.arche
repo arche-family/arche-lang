@@ -1,0 +1,477 @@
+/// DEFLATE (RFC 1951) and gzip (RFC 1952): compress writes to a List the
+/// caller gives, inflate reads one. compress finds repeats along hash chains
+/// of three bytes and codes them with the fixed Huffman codes: fast, and a
+/// third of the size or less for the text a web server sends. inflate reads every kind of
+/// block. crc32 is gzip's checksum.
+import alloc;
+
+/// What is wrong with compressed bytes.
+pub type DeflateError = error { Corrupt, TooLarge }
+
+// ---- CRC-32 (ISO 3309, the polynomial 0xEDB88320 reflected) ----------------------------
+
+/// The CRC-32 of data, continued from crc (0 to start).
+pub fn crc32(crc: u32, data: []u8) -> u32 {
+    var c = ~crc;
+    var i: usize = 0;
+    while i < data.len() : (i += 1) {
+        c = c ^ data[i] as u32;
+        var k: u32 = 0;
+        while k < 8 : (k += 1) {
+            let mask = 0 -% (c & 1);
+            c = (c >> 1) ^ (0xEDB88320 & mask);
+        }
+    }
+    return ~c;
+}
+
+// ---- writing bits ---------------------------------------------------------------------
+
+type Bits = struct {
+    acc: u64,
+    count: u32,
+
+    fn put(self: &mut Bits, out: &mut alloc.List(u8), value: u32, n: u32) {
+        self.acc = self.acc | ((value as u64) << self.count);
+        self.count += n;
+        while self.count >= 8 {
+            out.push((self.acc & 0xFF) as u8);
+            self.acc = self.acc >> 8;
+            self.count -= 8;
+        }
+    }
+
+    /// A Huffman code: written from its first bit, which is its highest.
+    fn code(self: &mut Bits, out: &mut alloc.List(u8), code: u32, n: u32) {
+        var r: u32 = 0;
+        var i: u32 = 0;
+        while i < n : (i += 1) {
+            r = (r << 1) | ((code >> i) & 1);
+        }
+        self.put(out, value: r, n: n);
+    }
+
+    fn flush(self: &mut Bits, out: &mut alloc.List(u8)) {
+        if self.count > 0 {
+            out.push((self.acc & 0xFF) as u8);
+        }
+        self.acc = 0;
+        self.count = 0;
+    }
+}
+
+/// The fixed code of a literal or length symbol (RFC 1951 §3.2.6).
+fn fixed_literal(bits: &mut Bits, out: &mut alloc.List(u8), sym: u32) {
+    if sym < 144 {
+        bits.code(out, code: 0x30 + sym, n: 8);
+    } else if sym < 256 {
+        bits.code(out, code: 0x190 + sym - 144, n: 9);
+    } else if sym < 280 {
+        bits.code(out, code: sym - 256, n: 7);
+    } else {
+        bits.code(out, code: 0xC0 + sym - 280, n: 8);
+    }
+}
+
+// The tables of RFC 1951 §3.2.5: lengths and distances, by symbol.
+fn length_base(i: usize) -> u32 {
+    let t: [29]u32 = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+    return t[i];
+}
+
+fn length_extra(i: usize) -> u32 {
+    let t: [29]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+    return t[i];
+}
+
+fn dist_base(i: usize) -> u32 {
+    let t: [30]u32 = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+    return t[i];
+}
+
+fn dist_extra(i: usize) -> u32 {
+    let t: [30]u32 = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+    return t[i];
+}
+
+fn put_match(bits: &mut Bits, out: &mut alloc.List(u8), length: u32, distance: u32) {
+    var li: usize = 28;
+    while length_base(li) > length {
+        li -= 1;
+    }
+    fixed_literal(bits, out: out, sym: 257 + li as u32);
+    bits.put(out, value: length - length_base(li), n: length_extra(li));
+    var di: usize = 29;
+    while dist_base(di) > distance {
+        di -= 1;
+    }
+    // Distance codes are five bits, fixed.
+    bits.code(out, code: di as u32, n: 5);
+    bits.put(out, value: distance - dist_base(di), n: dist_extra(di));
+}
+
+const WINDOW: usize = 32768;
+const HASH_SIZE: usize = 32768;
+const NOWHERE: u32 = 0xFFFFFFFF;
+
+fn hash3(data: []u8, i: usize) -> usize {
+    let h = ((data[i] as u32) << 10) ^ ((data[i + 1] as u32) << 5) ^ (data[i + 2] as u32);
+    return (h *% 2654435761 >> 17) as usize & (HASH_SIZE - 1);
+}
+
+/// How many earlier places with the same three bytes are tried for a match.
+const CHAIN: u32 = 32;
+
+/// data compressed as raw DEFLATE, onto out: one block with the fixed codes.
+/// Each place is chained to the last one with the same three bytes, and the
+/// longest match among the latest CHAIN of them wins.
+pub fn compress(data: []u8, out: &mut alloc.List(u8), a: alloc.Allocator) {
+    var bits = Bits { acc: 0, count: 0 };
+    // BFINAL 1, BTYPE 01 (fixed).
+    bits.put(out, value: 3, n: 3);
+    var head = alloc.List(u32).with_capacity(a, n: HASH_SIZE);
+    var prev = alloc.List(u32).with_capacity(a, n: WINDOW);
+    var k: usize = 0;
+    while k < HASH_SIZE : (k += 1) {
+        head.push(NOWHERE);
+    }
+    k = 0;
+    while k < WINDOW : (k += 1) {
+        prev.push(NOWHERE);
+    }
+    var i: usize = 0;
+    while i < data.len() {
+        var best_len: u32 = 0;
+        var best_dist: u32 = 0;
+        if i + 3 <= data.len() {
+            let h = hash3(data, i: i);
+            var at = head.items()[h];
+            var tries: u32 = 0;
+            while at != NOWHERE and tries < CHAIN and i - at as usize <= WINDOW and at as usize < i {
+                let from = at as usize;
+                var n: usize = 0;
+                while n < 258 and i + n < data.len() and data[from + n] == data[i + n] {
+                    n += 1;
+                }
+                if n >= 3 and n as u32 > best_len {
+                    best_len = n as u32;
+                    best_dist = (i - from) as u32;
+                    if n == 258 {
+                        break;
+                    }
+                }
+                at = prev.items()[from & (WINDOW - 1)];
+                tries += 1;
+            }
+        }
+        var step: usize = 1;
+        if best_len >= 3 {
+            put_match(&mut bits, out: out, length: best_len, distance: best_dist);
+            step = best_len as usize;
+        } else {
+            fixed_literal(&mut bits, out: out, sym: data[i] as u32);
+        }
+        // Every place passed is chained, for later matches.
+        var j: usize = 0;
+        while j < step : (j += 1) {
+            if i + j + 3 <= data.len() {
+                let h = hash3(data, i: i + j);
+                prev.items_mut()[(i + j) & (WINDOW - 1)] = head.items()[h];
+                head.items_mut()[h] = (i + j) as u32;
+            }
+        }
+        i += step;
+    }
+    fixed_literal(&mut bits, out: out, sym: 256);
+    bits.flush(out);
+}
+
+/// data as a gzip file: header, compressed data, CRC-32 and size.
+pub fn gzip(data: []u8, out: &mut alloc.List(u8), a: alloc.Allocator) {
+    // Magic, CM 8 (deflate), no flags, no time, no extra flags, OS 255.
+    let header: [10]u8 = [0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 255];
+    for b in header[0..10] {
+        out.push(b.*);
+    }
+    compress(data, out: out, a);
+    let crc = crc32(0, data: data);
+    let size = (data.len() & 0xFFFFFFFF) as u32;
+    var k: u32 = 0;
+    while k < 4 : (k += 1) {
+        out.push(((crc >> (8 * k)) & 0xFF) as u8);
+    }
+    k = 0;
+    while k < 4 : (k += 1) {
+        out.push(((size >> (8 * k)) & 0xFF) as u8);
+    }
+}
+
+// ---- reading -------------------------------------------------------------------------------
+
+type Reader = struct {
+    at: usize,
+    acc: u64,
+    count: u32,
+
+    fn need(self: &mut Reader, b: []u8, n: u32) -> DeflateError!void {
+        while self.count < n {
+            if self.at >= b.len() {
+                return DeflateError.Corrupt;
+            }
+            self.acc = self.acc | ((b[self.at] as u64) << self.count);
+            self.at += 1;
+            self.count += 8;
+        }
+    }
+
+    fn bits(self: &mut Reader, b: []u8, n: u32) -> DeflateError!u32 {
+        if n == 0 {
+            return 0;
+        }
+        try self.need(b, n: n);
+        let one: u64 = 1;
+        let v = (self.acc & ((one << n) - 1)) as u32;
+        self.acc = self.acc >> n;
+        self.count -= n;
+        return v;
+    }
+
+    fn align(self: &mut Reader) {
+        let drop = self.count % 8;
+        self.acc = self.acc >> drop;
+        self.count -= drop;
+    }
+}
+
+/// A canonical Huffman code, by the lengths of its symbols: how many codes
+/// of each length, and the symbols in order of their codes.
+type Huffman = struct {
+    counts: [16]u16,
+    symbols: [320]u16,
+}
+
+fn build(lengths: []u8) -> DeflateError!Huffman {
+    var h = Huffman { counts: [0; 16], symbols: [0; 320] };
+    for l in lengths {
+        h.counts[l.* as usize] += 1;
+    }
+    h.counts[0] = 0;
+    // Not more codes of a length than there is room for.
+    var left: i32 = 1;
+    var len: usize = 1;
+    while len < 16 : (len += 1) {
+        left = left * 2 - h.counts[len] as i32;
+        if left < 0 {
+            return DeflateError.Corrupt;
+        }
+    }
+    var offs: [16]u16 = [0; 16];
+    len = 1;
+    while len < 15 : (len += 1) {
+        offs[len + 1] = offs[len] + h.counts[len];
+    }
+    var s: usize = 0;
+    while s < lengths.len() : (s += 1) {
+        let l = lengths[s] as usize;
+        if l != 0 {
+            h.symbols[offs[l] as usize] = s as u16;
+            offs[l] += 1;
+        }
+    }
+    return h;
+}
+
+/// A symbol, its code read a bit at a time (RFC 1951 §3.2.2).
+fn decode(r: &mut Reader, b: []u8, h: &Huffman) -> DeflateError!u32 {
+    var code: i32 = 0;
+    var first: i32 = 0;
+    var index: i32 = 0;
+    var len: usize = 1;
+    while len < 16 : (len += 1) {
+        code = code | (try r.bits(b, n: 1)) as i32;
+        let count = h.counts[len] as i32;
+        if code - count < first {
+            return h.symbols[(index + (code - first)) as usize] as u32;
+        }
+        index += count;
+        first += count;
+        first = first << 1;
+        code = code << 1;
+    }
+    return DeflateError.Corrupt;
+}
+
+/// The order code length codes come in.
+fn order(i: usize) -> usize {
+    let t: [19]u8 = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+    return t[i] as usize;
+}
+
+/// Raw DEFLATE data inflated onto out, at most limit bytes; how many bytes
+/// of data it took.
+pub fn inflate(data: []u8, out: &mut alloc.List(u8), limit: usize) -> DeflateError!usize {
+    var r = Reader { at: 0, acc: 0, count: 0 };
+    var last = false;
+    while not last {
+        last = (try r.bits(data, n: 1)) == 1;
+        let kind = try r.bits(data, n: 2);
+        if kind == 0 {
+            r.align();
+            let len = try r.bits(data, n: 16);
+            let nlen = try r.bits(data, n: 16);
+            if len != (~nlen & 0xFFFF) {
+                return DeflateError.Corrupt;
+            }
+            var i: u32 = 0;
+            while i < len : (i += 1) {
+                if out.len() >= limit {
+                    return DeflateError.TooLarge;
+                }
+                out.push((try r.bits(data, n: 8)) as u8);
+            }
+            continue;
+        }
+        var lit = Huffman { counts: [0; 16], symbols: [0; 320] };
+        var dist = Huffman { counts: [0; 16], symbols: [0; 320] };
+        if kind == 1 {
+            var lengths: [320]u8 = [0; 320];
+            var s: usize = 0;
+            while s < 288 : (s += 1) {
+                if s < 144 { lengths[s] = 8; } else if s < 256 { lengths[s] = 9; } else if s < 280 { lengths[s] = 7; } else { lengths[s] = 8; }
+            }
+            lit = try build(lengths[0..288]);
+            var dl: [30]u8 = [5; 30];
+            dist = try build(dl[0..30]);
+        } else if kind == 2 {
+            let nlit = (try r.bits(data, n: 5)) + 257;
+            let ndist = (try r.bits(data, n: 5)) + 1;
+            let ncode = (try r.bits(data, n: 4)) + 4;
+            if nlit > 286 or ndist > 30 {
+                return DeflateError.Corrupt;
+            }
+            var cl: [19]u8 = [0; 19];
+            var i: u32 = 0;
+            while i < ncode : (i += 1) {
+                cl[order(i as usize)] = (try r.bits(data, n: 3)) as u8;
+            }
+            let ch = try build(cl[0..19]);
+            var lengths: [320]u8 = [0; 320];
+            var at: u32 = 0;
+            while at < nlit + ndist {
+                let sym = try decode(&mut r, data, &ch);
+                if sym < 16 {
+                    lengths[at as usize] = sym as u8;
+                    at += 1;
+                    continue;
+                }
+                var repeat: u32 = 0;
+                var value: u8 = 0;
+                if sym == 16 {
+                    if at == 0 {
+                        return DeflateError.Corrupt;
+                    }
+                    value = lengths[(at - 1) as usize];
+                    repeat = 3 + (try r.bits(data, n: 2));
+                } else if sym == 17 {
+                    repeat = 3 + (try r.bits(data, n: 3));
+                } else {
+                    repeat = 11 + (try r.bits(data, n: 7));
+                }
+                if at + repeat > nlit + ndist {
+                    return DeflateError.Corrupt;
+                }
+                var k: u32 = 0;
+                while k < repeat : (k += 1) {
+                    lengths[(at + k) as usize] = value;
+                }
+                at += repeat;
+            }
+            lit = try build(lengths[0..nlit as usize]);
+            dist = try build(lengths[nlit as usize..(nlit + ndist) as usize]);
+        } else {
+            return DeflateError.Corrupt;
+        }
+        while true {
+            let sym = try decode(&mut r, data, &lit);
+            if sym < 256 {
+                if out.len() >= limit {
+                    return DeflateError.TooLarge;
+                }
+                out.push(sym as u8);
+            } else if sym == 256 {
+                break;
+            } else {
+                let li = (sym - 257) as usize;
+                if li >= 29 {
+                    return DeflateError.Corrupt;
+                }
+                let length = length_base(li) + (try r.bits(data, n: length_extra(li)));
+                let di = (try decode(&mut r, data, &dist)) as usize;
+                if di >= 30 {
+                    return DeflateError.Corrupt;
+                }
+                let distance = dist_base(di) + (try r.bits(data, n: dist_extra(di)));
+                if distance as usize > out.len() {
+                    return DeflateError.Corrupt;
+                }
+                if out.len() + length as usize > limit {
+                    return DeflateError.TooLarge;
+                }
+                var k: u32 = 0;
+                while k < length : (k += 1) {
+                    let x = out.items()[out.len() - distance as usize];
+                    out.push(x);
+                }
+            }
+        }
+    }
+    return r.at;
+}
+
+/// A gzip file's data, checked against its CRC-32 and size, onto out.
+pub fn gunzip(data: []u8, out: &mut alloc.List(u8), limit: usize) -> DeflateError!void {
+    if data.len() < 18 or data[0] != 0x1F or data[1] != 0x8B or data[2] != 8 {
+        return DeflateError.Corrupt;
+    }
+    let flags = data[3];
+    var at: usize = 10;
+    if flags & 4 != 0 {
+        if at + 2 > data.len() {
+            return DeflateError.Corrupt;
+        }
+        at += 2 + (data[at] as usize | (data[at + 1] as usize) << 8);
+    }
+    // FNAME and FCOMMENT end with a zero byte.
+    var f: u8 = 8;
+    while f <= 16 : (f *= 2) {
+        if flags & f != 0 {
+            while at < data.len() and data[at] != 0 {
+                at += 1;
+            }
+            at += 1;
+        }
+    }
+    if flags & 2 != 0 {
+        at += 2;
+    }
+    if at > data.len() {
+        return DeflateError.Corrupt;
+    }
+    let start = out.len();
+    let used = try inflate(data[at..data.len()], out: out, limit: limit);
+    let end = at + used;
+    if end + 8 > data.len() {
+        return DeflateError.Corrupt;
+    }
+    var crc: u32 = 0;
+    var size: u32 = 0;
+    var k: usize = 0;
+    while k < 4 : (k += 1) {
+        crc = crc | (data[end + k] as u32) << (8 * k as u32);
+        size = size | (data[end + 4 + k] as u32) << (8 * k as u32);
+    }
+    let made = out.items()[start..out.len()];
+    if crc32(0, data: made) != crc or (made.len() & 0xFFFFFFFF) as u32 != size {
+        return DeflateError.Corrupt;
+    }
+}

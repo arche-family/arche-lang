@@ -1,0 +1,211 @@
+/// A web application on lib/web (docs/sprints.md S32): HTTPS with HTTP/2 and
+/// HTTP/1.1 by ALPN, a worker per processor, files from a directory, and a
+/// JSON API of notes, kept in memory by each worker. Every request lives in
+/// a region of its own, so memory does not grow with requests.
+///
+///   GET  /api/health       {"ok":true,"worker":n}
+///   GET  /api/notes        the notes, oldest first
+///   POST /api/notes        {"text":"..."} adds one: 201 and it
+///   GET  /api/notes/:id    one note, or 404
+///   GET  /api/memory       the worker's resident memory in KiB
+///   GET  /*path            the directory's files
+///
+/// Usage: webapp <port> <directory> <certificate chain> <key> [workers]
+import alloc;
+import crypto.random;
+import http;
+import http.server;
+import std;
+import std.json;
+import tls;
+import web;
+
+fn number(text: str) -> u64 {
+    var v: u64 = 0;
+    for c in text.bytes() {
+        if c.* >= '0' and c.* <= '9' and v < 1000000000 {
+            v = v * 10 + (c.* - '0') as u64;
+        }
+    }
+    return v;
+}
+
+/// The notes a worker keeps: in the program's memory, which outlives the
+/// requests' regions.
+type Notes = struct {
+    texts: alloc.List(alloc.String),
+    a: alloc.Allocator,
+}
+
+/// A note as JSON: {"id":n,"text":"..."}.
+fn write_note(out: &mut alloc.String, id: usize, text: str) {
+    out.push_str("{\"id\":");
+    out.push_u64(id as u64);
+    out.push_str(",\"text\":");
+    json.write_string(text, out: out);
+    out.push_str("}");
+}
+
+/// The "text" of a JSON object, or none.
+fn note_text(body: []u8, a: alloc.Allocator) -> ?alloc.String {
+    var s = alloc.String.init(a);
+    if not s.push_utf8(body) {
+        return none;
+    }
+    let v = json.parse(s.view(), a) catch return none;
+    let i = json.key_index(&v, key: "text") orelse return none;
+    match v {
+        .Object { values, .. } => {
+            match &values.items()[i] {
+                .Text { value } => {
+                    if value.len() == 0 or value.len() > 1000 {
+                        return none;
+                    }
+                    return value.clone();
+                }
+                _ => { return none; }
+            }
+        }
+        _ => { return none; }
+    }
+}
+
+/// The worker's resident memory in KiB, from /proc/self/status.
+fn resident_kib(fs: &std.Fs, a: alloc.Allocator) -> u64 {
+    let text = fs.read_file("/proc/self/status", a) catch return 0;
+    let b = text.view().bytes();
+    let key = "VmRSS:".bytes();
+    var i: usize = 0;
+    while i + key.len() < b.len() : (i += 1) {
+        var hit = true;
+        var k: usize = 0;
+        while k < key.len() : (k += 1) {
+            if b[i + k] != key[k] {
+                hit = false;
+                break;
+            }
+        }
+        if hit {
+            var v: u64 = 0;
+            var j = i + key.len();
+            while j < b.len() and b[j] != '\n' {
+                if b[j] >= '0' and b[j] <= '9' {
+                    v = v * 10 + (b[j] - '0') as u64;
+                }
+                j += 1;
+            }
+            return v;
+        }
+    }
+    return 0;
+}
+
+const HEALTH: u32 = 0;
+const LIST: u32 = 1;
+const ADD: u32 = 2;
+const ONE: u32 = 3;
+const MEMORY: u32 = 4;
+const FILES: u32 = 5;
+
+/// The application: the router's routes, and what each does.
+fn app(router: &web.Router, notes: &mut Notes, fs: &std.Fs, dir: str, worker: u32, req: &http.Request, resp: &mut http.Response) {
+    var params = web.Params.init(resp.alloc);
+    let found = router.find(req, params: &mut params);
+    let route = match found {
+        .Route { route } => { route }
+        _ => {
+            web.not_found(found, resp: resp);
+            return;
+        }
+    };
+    var out = alloc.String.init(resp.alloc);
+    if route == HEALTH {
+        out.push_str("{\"ok\":true,\"worker\":");
+        out.push_u64(worker as u64);
+        out.push_str("}");
+    } else if route == LIST {
+        out.push_str("[");
+        var i: usize = 0;
+        while i < notes.texts.len() : (i += 1) {
+            if i > 0 {
+                out.push_str(",");
+            }
+            write_note(&mut out, id: i, text: notes.texts.items()[i].view());
+        }
+        out.push_str("]");
+    } else if route == ADD {
+        let text = match note_text(req.body.items(), resp.alloc) {
+            some(t) => { t }
+            none => {
+                web.status(resp, code: 400);
+                return;
+            }
+        };
+        // Kept: copied out of the request's region.
+        notes.texts.push(alloc.String.from(text.view(), notes.a));
+        resp.status = 201;
+        write_note(&mut out, id: notes.texts.len() - 1, text: text.view());
+    } else if route == ONE {
+        let id = number(params.value(0)) as usize;
+        if id >= notes.texts.len() {
+            web.status(resp, code: 404);
+            return;
+        }
+        write_note(&mut out, id: id, text: notes.texts.items()[id].view());
+    } else if route == MEMORY {
+        out.push_str("{\"rss_kib\":");
+        out.push_u64(resident_kib(fs, resp.alloc));
+        out.push_str("}");
+    } else {
+        web.serve_file(fs, root: dir, path: params.value(0), req: req, resp: resp);
+        return;
+    }
+    web.json_body(resp, text: out.view().bytes());
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() != 5 and sys.args.len() != 6 {
+        sys.stderr.write("usage: webapp <port> <directory> <certificate chain> <key> [workers]\n");
+        sys.proc.exit(2);
+    }
+    let port = number(sys.args.get(1)) as u16;
+    let dir = sys.args.get(2);
+    var listener = try sys.net.listen(std.Address { ip: [127, 0, 0, 1], port: port });
+    var config = tls.ServerConfig.init(sys.alloc);
+    let chain = try sys.fs.read_file(sys.args.get(3), sys.alloc);
+    try config.certificates_pem(chain.view(), sys.alloc);
+    let key = try sys.fs.read_file(sys.args.get(4), sys.alloc);
+    try config.private_key_pem(key.view(), sys.alloc);
+    config.accept_protocol("h2");
+    config.accept_protocol("http/1.1");
+    var workers = sys.proc.cpu_count();
+    if sys.args.len() == 6 {
+        workers = number(sys.args.get(5)) as u32;
+    }
+    sys.proc.ignore_broken_pipe();
+    // A worker per processor, each accepting on the one listener.
+    let worker = sys.proc.workers(workers);
+    if worker == 0 {
+        sys.stdout.write("ready\n");
+        sys.stdout.flush();
+    }
+    var router = web.Router.init(sys.alloc);
+    _ = router.add(method: "GET", pattern: "/api/health");
+    _ = router.add(method: "GET", pattern: "/api/notes");
+    _ = router.add(method: "POST", pattern: "/api/notes");
+    _ = router.add(method: "GET", pattern: "/api/notes/:id");
+    _ = router.add(method: "GET", pattern: "/api/memory");
+    _ = router.add(method: "GET", pattern: "/*path");
+    var notes = Notes { texts: alloc.List(alloc.String).init(sys.alloc), a: sys.alloc };
+    var gzip = web.gzip();
+    var security = web.Security { hsts: true };
+    let fs = &sys.fs;
+    let handler = fn [&router, &mut notes, fs, dir, worker, &mut gzip, &mut security](req: &http.Request, resp: &mut http.Response) {
+        web.around(&mut security, req: req, resp: resp, next: fn [&router, &mut notes, fs, dir, worker, &mut gzip](q: &http.Request, r: &mut http.Response) {
+            web.around(&mut gzip, req: q, resp: r, next: fn [&router, &mut notes, fs, dir, worker](q2: &http.Request, r2: &mut http.Response) {
+                app(&router, notes: &mut notes, fs: fs, dir: dir, worker: worker, req: q2, resp: r2);
+            });
+        });
+    };
+    try server.serve_tls(&listener, config: &config, handler: &handler, options: server.Options.init(), proc: &sys.proc, seeds: random.Csprng.init(&mut sys.rand), sys.alloc);
+}
