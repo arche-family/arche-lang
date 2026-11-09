@@ -94,7 +94,8 @@ jobs:
       - name: Install wasmtime and lld
         run: |
           sudo apt-get update && sudo apt-get install -y lld
-          curl -sSL https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.1/wasmtime-v50.0.1-x86_64-linux.tar.xz | tar -xJ
+          curl -fsSL --retry 5 --retry-delay 5 -o wasmtime.tar.xz https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.1/wasmtime-v50.0.1-x86_64-linux.tar.xz
+          tar -xJf wasmtime.tar.xz
           echo "$PWD/wasmtime-v50.0.1-x86_64-linux" >> "$GITHUB_PATH"
       - name: Build stage0, the compiler and the runner
         run: make -C stage0 && make -C compiler && make -C conformance
