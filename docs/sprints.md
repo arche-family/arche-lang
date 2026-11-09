@@ -68,7 +68,7 @@
 - S12'da `where` bilan cheklangan `T` qiymatida faqat constraint method'lari qolishi hali tekshirilmaydi, generic `impl` va `core.Iter` S15'da.
 - S13'da closure'ni `comptime F: type` bilan olish (turini nomlash) S15'da `core` bilan, `  S14'da contract shartlarining side effect'siz ekanligi hali tekshirilmaydi, release build (isbotlangan shartlarni olib tashlash) S26'da, `nopanic` isboti hozircha faqat literal'lar bilan ishlaydi.
 - S15'da Allocator hozircha handle (dastur heap'i yoki region arena'si, runtime'da C'da): page, pool va general allocator'larni Arche turlari sifatida Allocator interface'i orqali ulash, `core.fmt`'da float, Arche-0 paketlarida standart holda kutubxona `alloc`'i (stage0 o'zinikini ishlatadi) keyinroq.
-- S16'da `target_features` va konstantalarga `section` hali yo'q, `core.atomic.U32` kabi turlar S18'da, `naked` va `asm`'ning 32-bitlik boot kodini tekshirish faqat QEMU orqali.
+- S16'da konstantalarga `section` hali yo'q, `core.atomic.U32` kabi turlar S18'da, `naked` va `asm`'ning 32-bitlik boot kodini tekshirish faqat QEMU orqali.
 - S17'da `Fs`'ni katalogga toraytirish (`within`) va Net'da IPv6/UDP/DNS keyinroq, Arche-0 paketlari standart holda hali compiler'ning o'z std'ini ishlatadi.
 - S18'da task'lar bitta OS thread'da fiber sifatida ishlaydi: socket'lar S22'dan beri, Linux'da fayllar ham bloklamaydi, lekin `sleep_ns` va Windows'da fayl hali hammasini to'xtatadi, ko'p protsessorda parallel worker'lar keyinroq; `core.atomic.U32` kabi turlar hali yo'q.
 - S20'da AES dasturiy (AES-NI yo'q, sekin), X25519 TweetNaCl usulida — tezlashtirish S26'da.

@@ -17,7 +17,12 @@ typedef struct {
 
 // ---- what LLVM may call --------------------------------------------------------
 
+// A program built without the FPU, such as a kernel built with -mno-sse
+// (target_features, spec/arche.md §10.2), has no floats, so no float
+// functions to call: on x86-64 a double cannot even be returned then.
+#if !defined(__x86_64__) || defined(__SSE2__)
 #include "math.inc"
+#endif
 
 void *memcpy(void *dst, const void *src, u64 n) {
     u8 *d = dst;

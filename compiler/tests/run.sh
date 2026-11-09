@@ -104,7 +104,9 @@ grep -q '"code": "E0802"' "$out" || { echo "manifest: not E0802:"; cat "$out"; s
 for field in 'name: "../evil", version: "1.0.0"' 'name: "good", version: "../../evil"' \
     'name: "good", version: "1.0.0", dependencies: [build.dep("../evil", "1.0.0")]' \
     'name: "good", version: "1.0.0", dependencies: [build.dep("ok", "1.0.0/../..")]' \
-    'name: "good", version: "1.0.0", dependencies: [build.dep("", "1.0.0")]'; do
+    'name: "good", version: "1.0.0", dependencies: [build.dep("", "1.0.0")]' \
+    'name: "good", target_features: ["sse"]' 'name: "good", target_features: ["-sse,+avx"]' \
+    'name: "good", target_features: "-sse"'; do
     printf 'import std.build;\n\nconst PACKAGE: build.Package = build.Package {\n    %s,\n};\n' "$field" > "$work/overlay/package.arche"
     if "$arche" check --json "$work/overlay/package.arche" > "$out" 2> /dev/null; then
         echo "manifest: accepted $field"
@@ -114,6 +116,29 @@ for field in 'name: "../evil", version: "1.0.0"' 'name: "good", version: "../../
 done
 printf 'import std.build;\n\nconst PACKAGE: build.Package = build.Package {\n    name: "good_1",\n    version: "1.0.0-rc.1+build.5",\n    dependencies: [build.dep("other", "0.2.0")],\n};\n' > "$work/overlay/package.arche"
 "$arche" check "$work/overlay/package.arche" || { echo "manifest: a good one was refused"; status=1; }
+# target_features reach every function as LLVM's "target-features", and a
+# freestanding x86-64 program uses no red zone (spec/arche.md §10.2, §10.3).
+mkdir -p "$work/features"
+printf 'import std.build;\n\nconst PACKAGE: build.Package = build.Package {\n    name: "features",\n    needs: [build.Capability.Unsafe],\n    target_features: ["-sse", "-sse2", "+soft-float"],\n};\n' > "$work/features/package.arche"
+printf 'export("_start") fn start() {\n}\n\nfn halt(message: str, file: str, line: u32, column: u32) -> noreturn {\n    while true {\n    }\n}\n' > "$work/features/main.arche"
+if "$arche" --target freestanding-x86_64 --panic-handler main.halt build "$work/features/main.arche" "$work/features.ll"; then
+    grep -q 'define .*@_start() noredzone "target-features"="-sse,-sse2,+soft-float"' "$work/features.ll" ||
+        { echo "target_features: not on _start:"; grep define "$work/features.ll"; status=1; }
+else
+    echo "target_features: the package does not build"
+    status=1
+fi
+"$arche" --target freestanding-riscv64 --panic-handler main.halt build "$work/features/main.arche" "$work/features-rv.ll" || status=1
+if grep -q noredzone "$work/features-rv.ll"; then
+    echo "noredzone: only x86-64 has a red zone"
+    status=1
+fi
+printf 'import std;\n\nfn main(sys: &mut std.System) -> !void {\n}\n' > "$work/features/host.arche"
+"$arche" build "$work/features/host.arche" "$work/features-host.ll" || status=1
+if grep -q 'target-features\|noredzone' "$work/features-host.ll"; then
+    echo "target_features: a hosted build keeps the host's"
+    status=1
+fi
 # arche fix --edition: edition/before becomes edition/after, which builds.
 mkdir -p "$work/edition"
 cp edition/before/* "$work/edition/"

@@ -1331,9 +1331,28 @@ pub fn lower(c: ck.Checker) -> ir.Module {
             l.m.triple.push_str("x86_64-pc-windows-msvc");
             hosted = true;
         }
-        .FreestandingX86_64 => { l.m.triple.push_str("x86_64-unknown-none-elf"); }
+        .FreestandingX86_64 => {
+            l.m.triple.push_str("x86_64-unknown-none-elf");
+            // An interrupt comes on the stack of the code it stops, so
+            // nothing below the stack pointer is safe (spec/arche.md §10.3).
+            l.m.fn_attrs.push_str(" noredzone");
+        }
         .FreestandingRiscv64 => { l.m.triple.push_str("riscv64-unknown-none-elf"); }
         .FreestandingAarch64 => { l.m.triple.push_str("aarch64-unknown-none-elf"); }
+    }
+    // A package's target features are its machine's: a kernel tested on
+    // Linux keeps the host's.
+    let features = l.c.p.manifest.target_features.items();
+    if not hosted and features.len() > 0 {
+        l.m.fn_attrs.push_str(" \"target-features\"=\"");
+        var fi: usize = 0;
+        while fi < features.len() : (fi += 1) {
+            if fi > 0 {
+                l.m.fn_attrs.push_str(",");
+            }
+            l.m.fn_attrs.push_str(features[fi].view());
+        }
+        l.m.fn_attrs.push_str("\"");
     }
     if hosted {
         entry(&mut l);

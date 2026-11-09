@@ -84,6 +84,9 @@ pub type Manifest = struct {
     /// The dependencies that may have unsafe code: the root package's say.
     pub allow_unsafe: alloc.List(alloc.String),
     pub panic_handler: alloc.String,
+    /// LLVM target features for every function, "+feature" or "-feature"
+    /// (spec/arche.md §10.2): a kernel's "-sse".
+    pub target_features: alloc.List(alloc.String),
     /// Where dependencies come from, and the key that signs them.
     pub registry: alloc.String,
     pub registry_key: alloc.String,
@@ -93,6 +96,24 @@ pub type Manifest = struct {
 pub type Program = struct {
     pub name: alloc.String,
     pub root: alloc.String,
+}
+
+/// "+name" or "-name": an LLVM target feature, which goes into the IR as
+/// it is, so nothing else may be in it.
+fn is_feature(s: str) -> bool {
+    let b = s.bytes();
+    if b.len() < 2 or (b[0] != '+' and b[0] != '-') {
+        return false;
+    }
+    var i: usize = 1;
+    while i < b.len() : (i += 1) {
+        let c = b[i];
+        let fine = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '.' or c == '_' or c == '-';
+        if not fine {
+            return false;
+        }
+    }
+    return true;
 }
 
 pub fn defaults(a: alloc.Allocator) -> Manifest {
@@ -106,6 +127,7 @@ pub fn defaults(a: alloc.Allocator) -> Manifest {
         strict_unsafe: false,
         allow_unsafe: alloc.List(alloc.String).init(a),
         panic_handler: alloc.String.init(a),
+        target_features: alloc.List(alloc.String).init(a),
         registry: alloc.String.init(a),
         registry_key: alloc.String.init(a),
     };
@@ -386,6 +408,20 @@ pub fn read(tree: cst.Tree, text: str, diags: &mut diag.Diagnostics, a: alloc.Al
             }
         } else if name.eq("panic_handler") {
             m.panic_handler = string_value(&r, v, diags: diags, a: a);
+        } else if name.eq("target_features") {
+            if node(&r, v).kind != cst.Kind.ArrayLit {
+                diags.report(codes.BAD_MANIFEST, span_of(&r, v), "target_features is an array of strings such as \"-sse\"");
+            } else {
+                var k: u32 = 0;
+                while k < node(&r, v).children_len : (k += 1) {
+                    let e = child(&r, v, k);
+                    let feature = string_value(&r, e, diags: diags, a: a);
+                    if not is_feature(feature.view()) {
+                        diags.report(codes.BAD_MANIFEST, span_of(&r, e), "a target feature is '+' or '-' and a name of letters, digits, '.', '_' and '-', such as \"-sse\"");
+                    }
+                    m.target_features.push(feature);
+                }
+            }
         } else if name.eq("registry") {
             m.registry = string_value(&r, v, diags: diags, a: a);
         } else if name.eq("registry_key") {
@@ -394,7 +430,7 @@ pub fn read(tree: cst.Tree, text: str, diags: &mut diag.Diagnostics, a: alloc.Al
             var msg = diags.new_message();
             msg.push_str("a manifest has no field '");
             msg.push_str(name);
-            msg.push_str("'; its fields are name, version, edition, needs, dependencies, allow_unsafe, registry, registry_key, strict_unsafe and panic_handler");
+            msg.push_str("'; its fields are name, version, edition, needs, dependencies, allow_unsafe, registry, registry_key, strict_unsafe, panic_handler and target_features");
             diags.report_owned(codes.BAD_MANIFEST, span_of(&r, f), msg);
         }
     }
