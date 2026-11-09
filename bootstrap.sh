@@ -17,11 +17,26 @@ clang=$CLANG
 link="$clang -O1 $LINK_FLAGS -Wno-override-module"
 
 # Where two stages differ: in their LLVM IR, which says why, or in the
-# objects the own backend wrote, the first bytes that do.
+# objects the own backend wrote, the first bytes that do. With the same IR,
+# the binaries come from the C compiler and the linker alone: which sections
+# differ, and whether compiling and linking that IR again gives either.
 show_difference() { # stage2 dir, stage3 dir
-    if [ -f "$1/arche.ll" ]; then
+    if [ -f "$1/arche.ll" ] && ! cmp -s "$1/arche.ll" "$2/arche.ll"; then
         echo "bootstrap: the IR of stage2 (<) and stage3 (>), where they differ:"
         diff "$1/arche.ll" "$2/arche.ll" | head -60
+    elif [ -f "$1/arche.ll" ]; then
+        echo "bootstrap: their IR is the same; $(cmp -l "$1/arche" "$2/arche" | wc -l) bytes of the binaries differ"
+        for section in .text .rodata .data .eh_frame .comment .note.gnu.build-id; do
+            a=$(objcopy -O binary --only-section="$section" "$1/arche" /dev/stdout 2>/dev/null | sha256sum | cut -c1-16)
+            b=$(objcopy -O binary --only-section="$section" "$2/arche" /dev/stdout 2>/dev/null | sha256sum | cut -c1-16)
+            echo "  $section: $a $b"
+        done
+        $clang -c -O1 $LINK_FLAGS -Wno-override-module -o "$1/again.o" "$1/arche.ll"
+        $clang -c -O1 $LINK_FLAGS -Wno-override-module -o "$1/again2.o" "$1/arche.ll"
+        cmp -s "$1/again.o" "$1/again2.o" && echo "  the IR compiled twice: the same object" || echo "  the IR compiled twice: two objects"
+        (cd "$1" && $link -o again arche.ll "$rt")
+        cmp -s "$1/again" "$1/arche" && echo "  linked again: as stage2" || true
+        cmp -s "$1/again" "$2/arche" && echo "  linked again: as stage3" || true
     elif [ -f "$1/arche.ao" ]; then
         cmp "$1/arche.ao" "$2/arche.ao" | head -3
     fi
