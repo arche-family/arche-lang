@@ -41,7 +41,7 @@ ARCHE=$tree/bin/arche ARCHE_FLAGS=--release "$root/compiler/arche-build" "$root/
 cp "$root/compiler/runtime/rt.c" "$root/compiler/runtime/"*.inc "$tree/runtime/"
 "$tree/bin/arche" import "$rt_o" "$tree/runtime/rt-$ARCHE_TARGET.ao"
 cp "$root/README.md" "$root/VERSION" "$tree/"
-[ -f "$root/LICENSE" ] && cp "$root/LICENSE" "$tree/"
+cp "$root/LICENSE" "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$tree/"
 cat > "$tree/INSTALL" <<END
 Arche $version for $ARCHE_TARGET.
 

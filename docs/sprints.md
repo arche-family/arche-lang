@@ -2,9 +2,9 @@
 
 > 2026-11-05 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S34.
+**Joriy sprint:** S35.
 
-**Yopilgan:** S0–S4, S6–S33 va S36.
+**Yopilgan:** S0–S4, S6–S34 va S36. Til yakuniy qabuldan o'tdi (S34).
 
 - Compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da; full-Arche paketlarida generics (monomorphization), comptime interpreter, interface'lar (`impl`, `where`, `&dyn`), `for`, closure'lar (`&dyn fn(P) -> R`), `region` (arena, E0901), `unsafe` va raw pointer'lar, `if`/`match` ifoda sifatida, labeled loop'lar, `f32`/`f64`, `requires`/`ensures`, `nopanic` va error return trace ishlaydi.
 - Manifest (`package.arche`) o'qiladi: `needs` (E0801), `strict_unsafe` (E0920), `panic_handler`, xato manifest E0802/E0803.
@@ -53,6 +53,7 @@
 - Nimadir host'i oynasiz (`wasm/nimadir.arche`, `arche-wasm nimadir`): `nimadir:shell@1.2.0`'ning `host-api` va `dom` interfeyslari (markup, entity va descendant selector'li element daraxti) va shell chegaralari: frame'ga 1 s, init'ga 10 s, 512 MiB xotira, frame'da 16 MiB va 65536 widget, 1 MiB storage. `counter`, `hello` va `store` qayta build qilinmasdan ishlaydi; `runaway` deadline'da (1,00 s), 512 MiB'da va host chegarasida to'xtatiladi; `nimadir-check.sh` buni interpreter'da ham, JIT bilan ham tekshiradi. Deadline'ning soatini embedder closure sifatida beradi, dvigatel o'zi soat o'qimaydi.
 - S32'da `lib/web` (router — `/users/:id`, `/files/*path`, method'lar, percent-decoding; middleware — `around`, `Gzip`, `Security`; static fayllar, katalogdan chiqib bo'lmaydi), `core.deflate` (DEFLATE, inflate, gzip, CRC-32), `Proc.cpu_count` va `Proc.workers` (har CPU'ga worker, bitta listener'ni bo'lishib). `examples/webapp` TLS 1.3 ustida HTTP/2 va HTTP/1.1 bilan static fayl va JSON API beradi; `check.sh` curl bilan tekshiradi, bitta worker'ning xotirasi 20000 so'rovdan keyin ham 432 KiB'da qoladi. Shu tufayli runtime'dagi ikki oqish topildi: task closure'ining nusxasi va fayl yo'lining C nusxasi hech qachon bo'shatilmasdi.
 - S33'da `lib/kv`: sahifali B+ tree va WAL (commit'da o'zgargan sahifalar CRC va salt bilan log'ga, checkpoint, ochishda faqat to'liq commit'lar qayta qo'llanadi), `std.File` (offset'da o'qish/yozish, `size`, `truncate`, `sync` — Linux, Windows, WASI). `examples/kvcrash` yozuvchini 30 marta SIGKILL qiladi: har commit qilingan tranzaksiya to'liq, hech biri qisman emas. `arche-wasm serve` HTTPS so'rovni sandbox'dagi WASM modul (`handle`) bilan javoblaydi: faqat `arche.log` va `arche.now_ms` import qilinadi, 100 ms va 64 MiB chegarasida 503 va yangi instance. `bench/web` throughput va p99'ni o'lchaydi va baseline bilan solishtiradi (JSON 248773 so'rov/s, p99 193 µs). Runtime region chunk'larini qayta ishlatadi: JSON 150k'dan 250k so'rov/s'ga chiqdi.
+- S34'da conformance 2067 testga yetdi: 1565 tasini `conformance/gen/gen.py` o'z modelidan kutilgan natijani hisoblab yozadi (butun sonlar va ularning trap'lari, cast'lar, `List`/`Map`/`String`, compile xatolari, `std.json`, `core.deflate`, router, `kv`); hammasi compiler, o'z backend, release, ARM64 va RISC-V'da, Arche-0 qismi stage0'da ham o'tadi. `compiler/fuzz.py` checker qabul qilganini build ham qiladi (lowering va optimizer) va comptime interpreter'ga tasodifiy rekursiyalar beradi. `dist.sh` versiyalangan arxiv chiqaradi (`arche`, `arche-driver`, `arche-lsp`, `lib/`, runtime va uning o'z linker uchun object'i; bir xil daraxtdan bir xil baytlar), `arche-driver` clang bo'lmasa o'z backend bilan build qiladi; CI'da `release` (avval web benchmark baseline'ni ushlashi kerak), `clean-machine` (C compiler'siz `ubuntu:24.04` konteynerida arxivdan dastur build qilinib ishga tushadi) va `reproducible` (Ubuntu 24.04 va 22.04'da compiler o'z source'idan bir xil release IR va object chiqaradi). Litsenziya: MIT OR Apache-2.0.
 - Yo'l-yo'lakay: `core.float` (`bits64`, `from_bits64` va 32 bitlik juftlari: float bitlari, NaN payload'i bilan), `alloc.List.with_capacity`/`grow_zeroed`, `String.push_utf8`; `-2^63 as i64` noto'g'ri trap berardi (f64'da `-2^63 - 1` yo'q), tuzatildi. CI bootstrap'ni clang 20 bilan qiladi: LLVM 18'ning SCCP'si bir xil IR'dan ba'zan boshqa kod chiqarardi (llvm/llvm-project#105758).
 
 **Ochiq qolganlar:**
@@ -454,6 +455,8 @@ Bajarildi: `make -C wasm check` spec testsuite'ini (27416 tekshiruv) interpreter
 - Benchmark regressiyasi release'ni bloklaydi.
 - Tarqatish: `arche`, `arche-driver`, `arche-lsp`, `lib/` va runtime bitta versiyalangan arxivda; editor ularni `PATH` yoki `ARCHE_HOME` orqali topadi.
 - Litsenziya tanlanadi va `LICENSE` fayli qo'shiladi.
+
+Bajarildi: 2067 conformance testi (1565 tasi generatsiya qilingan), fuzzing parser, checker (tip, xotira, comptime), lowering, TLS va HTTP uchun, ikki mashinada bit-identical build (`reproducible`), benchmark regressiyasi release job'ini to'xtatadi, `dist.sh` arxivi toza mashinada dastur build qiladi va ishga tushiradi (`clean-machine`), litsenziya MIT OR Apache-2.0. Yakuniy mezon: stage2 == stage3 barcha target'larda (bootstrap, cross, windows, wasm), compiler va `std` testlari barcha target'larda, web server HTTPS'da javob beradi, arxiv toza mashinada ishlaydi.
 
 **Qabul (`plan.md`'dagi yakuniy mezon):**
 

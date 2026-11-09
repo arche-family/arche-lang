@@ -66,4 +66,4 @@ pub fn load_config(files: &std.Fs, a: alloc.Allocator, path: str) -> ConfigError
 
 ## License
 
-Not chosen yet.
+Either of the [Apache License, Version 2.0](LICENSE-APACHE) or the [MIT License](LICENSE-MIT), at your option ([LICENSE](LICENSE)).
