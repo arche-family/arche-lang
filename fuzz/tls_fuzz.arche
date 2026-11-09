@@ -52,7 +52,8 @@ fn mangle(data: []u8, g: &mut rand.Seeded, a: alloc.Allocator) -> alloc.List(u8)
         let at = g.below(n) as usize;
         let bit = g.below(8) as u32;
         let one: u8 = 1;
-        out.items_mut()[at] = out.items()[at] ^ (one << bit);
+        let flipped = out.items()[at] ^ (one << bit);
+        out.items_mut()[at] = flipped;
     } else if how == 1 and n > 0 {
         let at = g.below(n) as usize;
         out.items_mut()[at] = (g.next_u64() & 0xff) as u8;

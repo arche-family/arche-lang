@@ -16,6 +16,17 @@ mkdir -p "$work/stage2" "$work/stage3"
 clang=$CLANG
 link="$clang -O1 $LINK_FLAGS -Wno-override-module"
 
+# Where two stages differ: in their LLVM IR, which says why, or in the
+# objects the own backend wrote, the first bytes that do.
+show_difference() { # stage2 dir, stage3 dir
+    if [ -f "$1/arche.ll" ]; then
+        echo "bootstrap: the IR of stage2 (<) and stage3 (>), where they differ:"
+        diff "$1/arche.ll" "$2/arche.ll" | head -60
+    elif [ -f "$1/arche.ao" ]; then
+        cmp "$1/arche.ao" "$2/arche.ao" | head -3
+    fi
+}
+
 echo "bootstrap: stage0 and stage1 for $ARCHE_TARGET"
 make -s -C "$root/stage0"
 make -s -C "$root/compiler"
@@ -37,6 +48,7 @@ if cmp -s "$work/stage2/arche" "$work/stage3/arche"; then
     sha256sum "$work/stage3/arche"
 else
     echo "bootstrap: stage2 and stage3 differ"
+    show_difference "$work/stage2" "$work/stage3"
     exit 1
 fi
 
@@ -57,6 +69,7 @@ if cmp -s "$work/lib/stage2/arche" "$work/lib/stage3/arche"; then
     sha256sum "$work/lib/stage3/arche"
 else
     echo "bootstrap: on lib/alloc and lib/std, stage2 and stage3 differ"
+    show_difference "$work/lib/stage2" "$work/lib/stage3"
     exit 1
 fi
 
@@ -77,6 +90,7 @@ if cmp -s "$work/release/stage2/arche" "$work/release/stage3/arche"; then
     sha256sum "$work/release/stage3/arche"
 else
     echo "bootstrap: in release mode, stage2 and stage3 differ"
+    show_difference "$work/release/stage2" "$work/release/stage3"
     exit 1
 fi
 (cd "$root/compiler" && "$work/release/stage2/arche" $TARGET_FLAG --lib ../lib/ build main.arche "$work/release/check/arche.ll")
@@ -106,6 +120,7 @@ if [ "$ARCHE_TARGET" = linux-x86_64 ]; then
             sha256sum "$work/$1/stage3/arche"
         else
             echo "bootstrap: with the own backend ($1), stage2 and stage3 differ"
+            show_difference "$work/$1/stage2" "$work/$1/stage3"
             exit 1
         fi
     }
