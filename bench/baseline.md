@@ -32,4 +32,6 @@ The baseline of docs/sprints.md S33, measured on 2026-11-09 with `bench/web/run.
 | `examples/webapp`: a file from the disk (`/index.html`) | 84720 | 398 |
 | `arche-wasm serve`: a WASM handler in the interpreter (`/hello`) | 215558 | 158 |
 
+On GitHub's runners (`ci`, from two runs of 2026-11-09, the slower of each): 77022 requests a second for JSON at a p99 of 381 µs, 16259 for a file at 4334 µs, 64249 for the WASM handler at 448 µs.
+
 The numbers are kept in `bench/web/baseline.txt`, a line for each kind of machine (`local` here, `ci` for GitHub's runners), and `run.sh` fails when throughput falls under a third of them or p99 grows past four times: a regression, not a busy machine. A file costs most because reading one stops every task of the worker (files do not use the poller yet).
