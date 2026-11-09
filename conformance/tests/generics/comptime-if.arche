@@ -1,0 +1,53 @@
+// test: run
+// spec: arche/4.4
+// stage0: skip
+// stdout: small 3 large 9 none-1 one wide
+import std;
+
+const WIDE: bool = true;
+
+fn describe(comptime N: u32, out: &mut std.Output) {
+    comptime if N < 5 {
+        out.write("small ");
+        out.write_u64(N as u64);
+    } else comptime if N < 100 {
+        out.write("large ");
+        out.write_u64(N as u64);
+    } else {
+        // Never checked for the instances above: the name does not exist.
+        missing_function(N);
+    }
+}
+
+fn first(comptime N: u32) -> u32 {
+    comptime if N == 0 {
+        return 1;
+    } else {
+        return N;
+    }
+}
+
+fn count(comptime N: u32, out: &mut std.Output) {
+    comptime if N == 0 {
+        out.write("none");
+    }
+    comptime if N == 1 {
+        out.write("one");
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    describe(3, &mut sys.stdout);
+    sys.stdout.write(" ");
+    describe(9, &mut sys.stdout);
+    sys.stdout.write(" ");
+    count(0, &mut sys.stdout);
+    sys.stdout.write("-");
+    sys.stdout.write_u64(first(0) as u64);
+    sys.stdout.write(" ");
+    count(1, &mut sys.stdout);
+    comptime if WIDE {
+        sys.stdout.write(" wide");
+    }
+    sys.stdout.write("\n");
+}

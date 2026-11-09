@@ -8,6 +8,7 @@ import sema.check as ck;
 import sema.consts;
 import sema.floats;
 import sema.memory;
+import sema.meta;
 import sema.stmt;
 import sema.types as ty;
 import manifest;
@@ -128,6 +129,13 @@ pub fn path(c: &mut ck.Checker, n: cst.NodeId) -> Path {
             some(d) => { return generic_instance(c, n, d); }
             none => { }
         }
+        match meta_type_fn(c, callee) {
+            some(d) => {
+                let t = meta_type_of_call(c, n, d);
+                return Path { kind: PathKind.Type, type_id: t, alias: not_path().alias };
+            }
+            none => { }
+        }
         if ck.kind_of(c, callee) != cst.Kind.FieldExpr {
             return not_path();
         }
@@ -186,6 +194,56 @@ fn generic_type_of(c: &mut ck.Checker, callee: cst.NodeId) -> ?u32 {
         none => { }
     }
     return none;
+}
+
+/// The core.meta function that gives a type, field_type or elem_type, that a
+/// callee names.
+fn meta_type_fn(c: &mut ck.Checker, callee: cst.NodeId) -> ?u32 {
+    if ck.kind_of(c, callee) != cst.Kind.FieldExpr {
+        return none;
+    }
+    let base = path(c, ck.child(c, callee, 0));
+    if base.kind != PathKind.Module {
+        return none;
+    }
+    let sym = ck.symbol(c, member_token(c, callee));
+    match ck.find_item(c, base.alias.module, sym) {
+        some(d) => {
+            if meta.gives_type(c, d) {
+                return d;
+            }
+        }
+        none => { }
+    }
+    return none;
+}
+
+/// The type a call of core.meta's field_type or elem_type, d, names.
+fn meta_type_of_call(c: &mut ck.Checker, n: cst.NodeId, d: u32) -> ty.TypeId {
+    let wants = ck.comptime_kinds(c, d);
+    let ws = wants.items();
+    var args = alloc.List(ck.ArgVal).init(c.a);
+    let nargs = ck.child_count(c, n) - 1;
+    var i: u32 = 0;
+    while i < nargs : (i += 1) {
+        let e = ck.child(c, ck.child(c, n, i + 1), 0);
+        if (i as usize) < ws.len() and not ws[i as usize].is_type {
+            let v = ck.comptime_value(c, e, ws[i as usize].type_id);
+            args.push(ck.ArgVal { is_type: false, type_id: ws[i as usize].type_id, value: v });
+        } else {
+            let p = path(c, e);
+            var t = ty.invalid();
+            if p.kind == PathKind.Type {
+                t = p.type_id;
+            } else {
+                let s = ck.span_of(c, e);
+                ck.report(c, codes.BAD_GENERIC, s, "this comptime argument should be a type");
+            }
+            args.push(ck.ArgVal { is_type: true, type_id: t, value: 0 });
+        }
+    }
+    let s = ck.span_of(c, n);
+    return meta.type_of(c, d, &args, at: s);
 }
 
 /// The instance of generic type d that a call such as Grid(u8, 4, 4)
@@ -1528,6 +1586,12 @@ fn report_no_context(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId, me
 
 fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId {
     var target = d;
+    if meta.gives_type(c, d) {
+        let s = ck.span_of(c, call);
+        ck.report(c, codes.META, s, "this names a type: write it where a type goes, as a comptime argument or a variable's type");
+        check_args_loosely(c, call);
+        return ty.invalid();
+    }
     if c.decls[d as usize].generic {
         target = instantiate_call(c, call, d);
         if target == ck.NONE {
@@ -1552,6 +1616,9 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
         ck.require_unsafe(c, s, "calling a foreign function");
     }
     let is_atomic = ck.is_atomic_op(c, target);
+    if meta.is_meta(c, target) {
+        meta.check_call(c, call, target);
+    }
     let f = c.fns[c.decls[target as usize].fn_index as usize];
     let ps = fn_params(c, f, skip);
     c.arg_offset = f.ncomptime;

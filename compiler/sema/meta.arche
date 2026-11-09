@@ -1,0 +1,269 @@
+/// core.meta (lib/core/meta.arche): what a type is made of, which the
+/// compiler answers at compile time (spec/arche.md §4.3).
+import alloc;
+import codes;
+import diag;
+import syntax.cst;
+import sema.check as ck;
+import sema.types as ty;
+
+/// d is a function of core.meta, or an instance of one.
+pub fn is_meta(c: &ck.Checker, d: u32) -> bool {
+    if d == ck.NONE or d >= ck.ENV_REF {
+        return false;
+    }
+    var decl = c.decls[d as usize];
+    if decl.template != ck.NONE {
+        decl = c.decls[decl.template as usize];
+    }
+    return decl.kind == ck.DeclKind.Fn and decl.owner == ck.NONE and c.p.modules[decl.module as usize].name.view().eq("core.meta");
+}
+
+/// The name of core.meta function d, which is_meta says it is.
+fn name_of(c: &ck.Checker, d: u32) -> str {
+    return c.names.text(c.decls[d as usize].name);
+}
+
+/// d is field_type or elem_type: a function of types that gives a type, so
+/// a call of it is written where a type goes.
+pub fn gives_type(c: &ck.Checker, d: u32) -> bool {
+    if not is_meta(c, d) {
+        return false;
+    }
+    let nm = name_of(c, d);
+    return nm.eq("field_type") or nm.eq("elem_type");
+}
+
+/// The pub fields of t, as indexes into the checker's fields, in the order
+/// they are declared; none when t is not a struct.
+pub fn fields(c: &ck.Checker, t: ty.TypeId) -> alloc.List(u32) {
+    var out = alloc.List(u32).init(c.a);
+    let info = c.t.get(t);
+    if info.kind != ty.Kind.Struct {
+        return out;
+    }
+    let d = c.decls[info.decl as usize];
+    var i = d.members_start;
+    while i < d.members_start + d.members_len : (i += 1) {
+        if c.fields[i as usize].is_pub {
+            out.push(i);
+        }
+    }
+    return out;
+}
+
+/// t is the library's alloc.List(E), or Arche-0's built-in list.
+fn is_list(c: &ck.Checker, t: ty.TypeId) -> bool {
+    let info = c.t.get(t);
+    if info.kind == ty.Kind.List {
+        return true;
+    }
+    if info.kind != ty.Kind.Struct {
+        return false;
+    }
+    let d = c.decls[info.decl as usize];
+    if d.template == ck.NONE {
+        return false;
+    }
+    let tmpl = c.decls[d.template as usize];
+    return c.names.text(tmpl.name).eq("List") and c.p.modules[tmpl.module as usize].name.view().eq("alloc");
+}
+
+/// The E of List(E) or ?E; invalid for any other t.
+fn elem_of(c: &ck.Checker, t: ty.TypeId) -> ty.TypeId {
+    let info = c.t.get(t);
+    if info.kind == ty.Kind.List or info.kind == ty.Kind.Optional {
+        return c.t.elem(t);
+    }
+    if is_list(c, t) {
+        let d = c.decls[info.decl as usize];
+        return c.env[d.env_start as usize].type_id;
+    }
+    return ty.invalid();
+}
+
+fn bit(b: bool) -> u64 {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+/// The value of a call of instance d when it is one of core.meta's that
+/// gives a bool or an integer; none otherwise.
+pub fn value(c: &ck.Checker, d: u32) -> ?u64 {
+    if not is_meta(c, d) {
+        return none;
+    }
+    let decl = c.decls[d as usize];
+    if decl.env_len == 0 {
+        return none;
+    }
+    let nm = name_of(c, d);
+    let t = c.env[decl.env_start as usize].type_id;
+    let info = c.t.get(t);
+    if nm.eq("is_struct") {
+        return bit(info.kind == ty.Kind.Struct);
+    }
+    if nm.eq("is_int") {
+        return bit(info.kind == ty.Kind.Int);
+    }
+    if nm.eq("is_signed") {
+        return bit(info.kind == ty.Kind.Int and ty.is_signed(info.int_kind));
+    }
+    if nm.eq("is_float") {
+        return bit(info.kind == ty.Kind.Float);
+    }
+    if nm.eq("is_bool") {
+        return bit(info.kind == ty.Kind.Bool);
+    }
+    if nm.eq("is_list") {
+        return bit(is_list(c, t));
+    }
+    if nm.eq("is_optional") {
+        return bit(info.kind == ty.Kind.Optional);
+    }
+    if nm.eq("same") {
+        let u = c.env[(decl.env_start + 1) as usize].type_id;
+        return bit(t.index == u.index);
+    }
+    if nm.eq("field_count") {
+        return fields(c, t).len() as u64;
+    }
+    if nm.eq("pub_only") {
+        if info.kind != ty.Kind.Struct {
+            return 0;
+        }
+        return bit(fields(c, t).len() == c.decls[info.decl as usize].members_len as usize);
+    }
+    return none;
+}
+
+/// The field a call of field_name, field or field_mut instance d means, as
+/// an index into the checker's fields; NONE when there is none.
+pub fn field_of(c: &ck.Checker, d: u32) -> u32 {
+    let decl = c.decls[d as usize];
+    if decl.env_len < 2 {
+        return ck.NONE;
+    }
+    let t = c.env[decl.env_start as usize].type_id;
+    let i = c.env[(decl.env_start + 1) as usize].value;
+    let fs = fields(c, t);
+    if i >= fs.len() as u64 {
+        return ck.NONE;
+    }
+    return fs[i as usize];
+}
+
+/// The type a call of field_type or elem_type d names for these comptime
+/// arguments. When there is none it is invalid, and the diagnostic is at
+/// `at`, unless the call is core.meta's own (field's result), which the
+/// call of field reports.
+pub fn type_of(c: &mut ck.Checker, d: u32, args: &alloc.List(ck.ArgVal), at: diag.Span) -> ty.TypeId {
+    let quiet = c.p.modules[c.module as usize].name.view().eq("core.meta");
+    var name = alloc.String.init(c.a);
+    name.push_str(name_of(c, d));
+    let nm = name.view();
+    let given = args.items();
+    var wants: usize = 1;
+    if nm.eq("field_type") {
+        wants = 2;
+    }
+    if given.len() != wants or not given[0].is_type or (wants == 2 and given[1].is_type) {
+        if not quiet {
+            ck.report(c, codes.BAD_GENERIC, at, "core.meta.field_type takes a type and a field number; elem_type a type");
+        }
+        return ty.invalid();
+    }
+    let t = given[0].type_id;
+    if ck.is_invalid(c, t) {
+        return t;
+    }
+    if nm.eq("elem_type") {
+        let e = elem_of(c, t);
+        if ck.is_invalid(c, e) and not quiet {
+            var m = ck.new_message(c);
+            ck.write_type(c, &mut m, t);
+            m.push_str(" is neither an alloc.List nor an optional, so it has no element type");
+            ck.report_owned(c, codes.META, at, m);
+        }
+        return e;
+    }
+    let fs = fields(c, t);
+    if given[1].value >= fs.len() as u64 {
+        if not quiet {
+            no_field(c, t, given[1].value, at);
+        }
+        return ty.invalid();
+    }
+    return c.fields[fs[given[1].value as usize] as usize].type_id;
+}
+
+fn no_field(c: &mut ck.Checker, t: ty.TypeId, i: u64, at: diag.Span) {
+    var m = ck.new_message(c);
+    ck.write_type(c, &mut m, t);
+    if c.t.kind(t) != ty.Kind.Struct {
+        m.push_str(" is not a struct, so it has no fields");
+    } else {
+        m.push_str(" has ");
+        ck.write_number(&mut m, fields(c, t).len() as u64);
+        m.push_str(" pub field");
+        if fields(c, t).len() != 1 {
+            m.push_str("s");
+        }
+        m.push_str(", so none is number ");
+        ck.write_number(&mut m, i);
+    }
+    ck.report_owned(c, codes.META, at, m);
+}
+
+/// The checks a call of core.meta instance d at `call` needs beyond its
+/// signature's: a field that exists, and unsupported, which is an error
+/// wherever it is checked.
+pub fn check_call(c: &mut ck.Checker, call: cst.NodeId, d: u32) {
+    var name = alloc.String.init(c.a);
+    name.push_str(name_of(c, d));
+    let nm = name.view();
+    let decl = c.decls[d as usize];
+    let s = ck.span_of(c, call);
+    if nm.eq("field_name") or nm.eq("field") or nm.eq("field_mut") {
+        if field_of(c, d) == ck.NONE {
+            let t = c.env[decl.env_start as usize].type_id;
+            no_field(c, t, c.env[(decl.env_start + 1) as usize].value, s);
+        }
+        return;
+    }
+    if nm.eq("unsupported") {
+        let t = c.env[decl.env_start as usize].type_id;
+        var m = ck.new_message(c);
+        var within = ck.NONE;
+        if c.fn_index != ck.NONE {
+            within = c.fns[c.fn_index as usize].decl;
+            ck.write_decl_name(c, &mut m, within);
+            m.push_str(" does not handle ");
+        } else {
+            m.push_str("this code does not handle ");
+        }
+        ck.write_type(c, &mut m, t);
+        // Said where the program asks for it: the call in the package that
+        // leads, through instances, to this one.
+        var module = c.module;
+        var at = s;
+        var steps: u32 = 0;
+        while within != ck.NONE and not c.p.modules[module as usize].in_package and steps < 1000 : (steps += 1) {
+            match c.origins.get(within) {
+                some(o) => {
+                    module = o.module;
+                    at = o.span;
+                    within = o.within;
+                }
+                none => { break; }
+            }
+        }
+        if module != c.module {
+            m.push_str(", which this call reaches");
+        }
+        c.p.diags.file = module;
+        c.p.diags.report_owned(codes.META, at, m);
+    }
+}

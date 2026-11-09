@@ -1,0 +1,18 @@
+// test: compile-error
+// spec: arche/4.4
+// stage0: skip
+// line: 11
+// code: E0303
+import std;
+
+fn pick(comptime N: u32) -> u32 {
+    comptime if N > 0 {
+        // The branch this instance takes is checked like any other code.
+        return missing(N);
+    }
+    return 0;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(pick(2) as u64);
+}

@@ -332,6 +332,9 @@ pub fn meaning(code: u16) -> str {
     if code == 840 {
         return "Compile-time evaluation that runs too many steps or recurses too deep (§4.3).";
     }
+    if code == 841 {
+        return "A `core.meta` question a type has no answer to: a field number past its `pub` fields, `elem_type` of a type that is not a list or an optional, `field_type` or `elem_type` called as a value; or `core.meta.unsupported(T)` in a branch that is checked (§4.3).";
+    }
     if code == 850 {
         return "A closure body that uses a binding from outside without capturing it (§6).";
     }
@@ -629,7 +632,7 @@ pub fn example(code: u16) -> str {
         return "import std;\n\nfn main(sys: &mut std.System) -> !void {\n\n    let n: u32 = 3;\n    let k: u32 = if n > 2 { 1 };\n}\n";
     }
     if code == 701 {
-        return "import std;\n\nfn seven() -> u32 {\n    return 7;\n}\n\nconst N: u32 = seven();\n\nfn main(sys: &mut std.System) -> !void {\n    sys.stdout.write_u64(N as u64);\n}\n";
+        return "import std;\n\nfn main(sys: &mut std.System) -> !void {\n    let n = sys.args.len();\n    comptime if n > 1 {\n        sys.stdout.write(\"many\\n\");\n    }\n}\n";
     }
     if code == 702 {
         return "import std;\n\nconst BIG: u8 = 200 + 100;\n\nfn main(sys: &mut std.System) -> !void {\n    sys.stdout.write_u64(BIG as u64);\n}\n";
@@ -711,6 +714,9 @@ pub fn example(code: u16) -> str {
     }
     if code == 840 {
         return "import std;\n\nfn down(n: u64) -> u64 {\n    return down(n + 1);\n}\n\nconst A: u64 = down(0);\n\nfn main(sys: &mut std.System) -> !void {\n}\n";
+    }
+    if code == 841 {
+        return "import alloc;\nimport core.meta;\nimport std;\n\nfn main(sys: &mut std.System) -> !void {\n    let t = meta.elem_type(alloc.List(u8));\n    sys.stdout.write(\"\\n\");\n}\n";
     }
     if code == 850 {
         return "import std;\n\nfn main(sys: &mut std.System) -> !void {\n\n    let base: u32 = 2;\n    let f = fn [](x: u32) -> u32 { return x + base; };\n}\n";
@@ -810,6 +816,9 @@ pub fn example_is_full(code: u16) -> bool {
     if code == 512 {
         return true;
     }
+    if code == 701 {
+        return true;
+    }
     if code == 606 {
         return true;
     }
@@ -856,6 +865,9 @@ pub fn example_is_full(code: u16) -> bool {
         return true;
     }
     if code == 840 {
+        return true;
+    }
+    if code == 841 {
         return true;
     }
     if code == 850 {

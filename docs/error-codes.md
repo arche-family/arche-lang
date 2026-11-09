@@ -162,6 +162,7 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0831` | `dyn I` of an interface whose methods do not all take `self` by reference and use `Self` nowhere else (§5.3). |
 | `E0832` | A value converted to `&dyn I`, or passed to `I.name(…)`, whose type does not implement `I` (§5.1, §5.3). |
 | `E0840` | Compile-time evaluation that runs too many steps or recurses too deep (§4.3). |
+| `E0841` | A `core.meta` question a type has no answer to: a field number past its `pub` fields, `elem_type` of a type that is not a list or an optional, `field_type` or `elem_type` called as a value; or `core.meta.unsupported(T)` in a branch that is checked (§4.3). |
 | `E0850` | A closure body that uses a binding from outside without capturing it (§6). |
 | `E0851` | A capture that names no local binding, or one binding twice (§6). |
 

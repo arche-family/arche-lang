@@ -1,0 +1,74 @@
+/// What a type is made of, asked at compile time (spec/arche.md §4.3). The
+/// compiler answers these functions itself, which is why they have no
+/// bodies. Code that walks a struct's fields, such as std.json's encode, is
+/// written in Arche with them and `comptime if`: every call names the type it
+/// asks about, and the fields it sees are those marked pub, the ones any
+/// module may name.
+///
+/// ```arche
+/// fn names(comptime T: type, comptime I: usize, out: &mut alloc.String) {
+///     comptime if I < meta.field_count(T) {
+///         out.push_str(meta.field_name(T, I));
+///         out.push_str(" ");
+///         names(T, I + 1, out);
+///     }
+/// }
+/// ```
+
+/// T is a struct type.
+pub fn is_struct(comptime T: type) -> bool;
+
+/// T is an integer type.
+pub fn is_int(comptime T: type) -> bool;
+
+/// T is a signed integer type.
+pub fn is_signed(comptime T: type) -> bool;
+
+/// T is f32 or f64.
+pub fn is_float(comptime T: type) -> bool;
+
+/// T is bool.
+pub fn is_bool(comptime T: type) -> bool;
+
+/// T is alloc.List(E) for some E.
+pub fn is_list(comptime T: type) -> bool;
+
+/// T is ?E for some E.
+pub fn is_optional(comptime T: type) -> bool;
+
+/// A and B are one type.
+pub fn same(comptime A: type, comptime B: type) -> bool;
+
+/// The E of alloc.List(E) or of ?E; any other T is an error (E0841).
+pub fn elem_type(comptime T: type) -> type;
+
+/// How many pub fields struct T has; 0 for a type that is not a struct.
+pub fn field_count(comptime T: type) -> usize;
+
+/// Every field of struct T is pub, so code that sets each field it sees
+/// sets all of them.
+pub fn pub_only(comptime T: type) -> bool;
+
+/// A T whose bytes are all 0. That need not be a T one may use, as an
+/// alloc.String's allocator shows: the caller gives the fields that need it
+/// a value of their own before the T is used, and says why in its SAFETY
+/// comment.
+pub unsafe fn zeroed(comptime T: type) -> T;
+
+/// The name of T's pub field I, counting from 0 in the order they are
+/// declared; I must be below field_count(T) (E0841).
+pub fn field_name(comptime T: type, comptime I: usize) -> str;
+
+/// The type of T's pub field I.
+pub fn field_type(comptime T: type, comptime I: usize) -> type;
+
+/// T's pub field I of value.
+pub fn field(comptime T: type, comptime I: usize, value: &T) -> &field_type(T, I);
+
+/// T's pub field I of value, to change.
+pub fn field_mut(comptime T: type, comptime I: usize, value: &mut T) -> &mut field_type(T, I);
+
+/// An error where code that walks types reaches one it does not handle: a
+/// call of unsupported(T) that is checked, in a branch a `comptime if` takes,
+/// is E0841 and names T.
+pub fn unsupported(comptime T: type) -> noreturn;

@@ -12,10 +12,14 @@
 ///   headers every response should have.
 /// - Static files: a directory served as it is, GET and HEAD, with a
 ///   content type by extension and no way out of it.
-/// - JSON bodies (std.json), and web.json for typed values (S32's comptime
-///   encoding lives in web.json).
+/// - JSON bodies: std.json, whose encode and decode read and write a typed
+///   value, a struct's pub fields, with code made for its type at compile
+///   time.
+/// - Templates: render puts a value's pub fields into HTML text, escaped,
+///   by the same means.
 import alloc;
 import core.deflate;
+import core.meta;
 import http;
 import std;
 
@@ -441,5 +445,269 @@ pub fn serve_file(fs: &std.Fs, root: str, path: str, req: &http.Request, resp: &
             resp.body = data;
         }
         err(_) => { status(resp, code: 404); }
+    }
+}
+
+// ---- templates ------------------------------------------------------------------------
+//
+// A template is text with tags in {{ }}, which take their values from a
+// value's pub fields. The walk over the fields is code for the value's
+// type, made at compile time (core.meta, `comptime if`, spec/arche.md
+// §4.3); the template is read at run time, so a name it has that the type
+// does not is an error then.
+
+/// What stops render: a tag without its }} or a section without its close
+/// (Syntax), a name that is no pub field of the value in scope
+/// (UnknownName), or a value written as text that is not a string, an
+/// integer, a bool or an optional of one (NotText).
+pub type TemplateError = error { Syntax, UnknownName, NotText }
+
+/// template with value's fields in place of its tags, appended to out.
+///
+/// - {{name}} is the pub field name, as text with &, <, >, " and ' escaped;
+///   {{&name}} the same, not escaped; {{.}} the value in scope itself.
+/// - {{#name}}…{{/name}} shows what is between when the field is true, a
+///   string that is not empty, a number that is not 0, some value, a struct
+///   or a list's items. For a struct or an optional's value, the part between
+///   sees that value's fields; for a list it is shown once per item, which
+///   it sees; otherwise it sees what is outside.
+/// - {{^name}}…{{/name}} shows what is between when {{#name}} would show
+///   nothing.
+///
+/// For a struct Page with `pub title: alloc.String` and `pub tags:
+/// alloc.List(alloc.String)`, "<h1>{{title}}</h1>{{#tags}}<i>{{.}}</i>{{/tags}}"
+/// writes the title and then each tag.
+///
+/// ```arche
+/// import alloc;
+/// let name = alloc.String.from("Tom & Jerry", sys.alloc);
+/// var html = alloc.String.init(sys.alloc);
+/// web.render(alloc.String, "<b>{{.}}</b>", &name, out: &mut html) catch panic("a template error");
+/// assert(html.view().eq("<b>Tom &amp; Jerry</b>"));
+/// ```
+pub fn render(comptime T: type, template: str, value: &T, out: &mut alloc.String) -> TemplateError!void {
+    let b = template.bytes();
+    var at: usize = 0;
+    while at < b.len() {
+        let open = find(b, "{{", from: at) orelse b.len();
+        out.push_str(template[at..open]);
+        if open == b.len() {
+            return;
+        }
+        let close = find(b, "}}", from: open + 2) orelse b.len();
+        if close == b.len() {
+            return TemplateError.Syntax;
+        }
+        let tag = trim(template[open + 2..close]);
+        at = close + 2;
+        let tb = tag.bytes();
+        if tb.len() > 0 and (tb[0] == '#' or tb[0] == '^') {
+            let name = trim(tag[1..tag.len()]);
+            let end = section_end(t: template, name: name, from: at) orelse b.len();
+            if end == b.len() {
+                return TemplateError.Syntax;
+            }
+            let body = template[at..end];
+            at = (find(b, "}}", from: end) orelse b.len()) + 2;
+            try section(T, 0, value, name: name, body: body, inverted: tb[0] == '^', out);
+        } else if tb.len() > 0 and tb[0] == '/' {
+            return TemplateError.Syntax;
+        } else if tb.len() > 0 and tb[0] == '&' {
+            try variable(T, 0, value, trim(tag[1..tag.len()]), escape: false, out);
+        } else {
+            try variable(T, 0, value, tag, escape: true, out);
+        }
+    }
+}
+
+/// Where pattern starts in b at or after from.
+fn find(b: []u8, pattern: str, from: usize) -> ?usize {
+    let p = pattern.bytes();
+    var i = from;
+    while i + p.len() <= b.len() : (i += 1) {
+        var k: usize = 0;
+        while k < p.len() and b[i + k] == p[k] : (k += 1) {
+        }
+        if k == p.len() {
+            return i;
+        }
+    }
+    return none;
+}
+
+/// s without the spaces at its ends.
+fn trim(s: str) -> str {
+    let b = s.bytes();
+    var start: usize = 0;
+    var end = b.len();
+    while start < end and b[start] == ' ' : (start += 1) {
+    }
+    while end > start and b[end - 1] == ' ' : (end -= 1) {
+    }
+    return s[start..end];
+}
+
+/// Where the {{/name}} that closes a section opened just before from
+/// starts, past the sections of that name nested in it.
+fn section_end(t: str, name: str, from: usize) -> ?usize {
+    let b = t.bytes();
+    var depth: u32 = 0;
+    var at = from;
+    while true {
+        let open = find(b, "{{", from: at) orelse b.len();
+        if open == b.len() {
+            return none;
+        }
+        let close = find(b, "}}", from: open + 2) orelse b.len();
+        if close == b.len() {
+            return none;
+        }
+        let tag = trim(t[open + 2..close]);
+        let tb = tag.bytes();
+        at = close + 2;
+        if tb.len() == 0 or not trim(tag[1..tag.len()]).eq(name) {
+            continue;
+        }
+        if tb[0] == '#' or tb[0] == '^' {
+            depth += 1;
+        } else if tb[0] == '/' {
+            if depth == 0 {
+                return open;
+            }
+            depth -= 1;
+        }
+    }
+    return none;
+}
+
+/// {{name}}: the pub field of T called name, from field I on, as text.
+fn variable(comptime T: type, comptime I: usize, value: &T, name: str, escape: bool, out: &mut alloc.String) -> TemplateError!void {
+    if I == 0 and name.eq(".") {
+        return write_text(T, value, escape, out);
+    }
+    comptime if I < meta.field_count(T) {
+        if name.eq(meta.field_name(T, I)) {
+            return write_text(meta.field_type(T, I), meta.field(T, I, value), escape, out);
+        }
+        return variable(T, I + 1, value, name, escape, out);
+    } else {
+        return TemplateError.UnknownName;
+    }
+}
+
+/// value as text: a string, an integer, a bool, or an optional's value
+/// (nothing for none).
+fn write_text(comptime T: type, value: &T, escape: bool, out: &mut alloc.String) -> TemplateError!void {
+    comptime if meta.same(T, alloc.String) {
+        if escape {
+            escape_html(value.view(), out);
+        } else {
+            out.push_str(value.view());
+        }
+    } else comptime if meta.is_int(T) {
+        comptime if meta.is_signed(T) {
+            out.push_i64(value.* as i64);
+        } else {
+            out.push_u64(value.* as u64);
+        }
+    } else comptime if meta.is_bool(T) {
+        if value.* {
+            out.push_str("true");
+        } else {
+            out.push_str("false");
+        }
+    } else comptime if meta.is_optional(T) {
+        match value {
+            some(x) => { try write_text(meta.elem_type(T), x, escape, out); }
+            none => { }
+        }
+    } else {
+        return TemplateError.NotText;
+    }
+}
+
+/// text with the characters that mean something in HTML as entities.
+pub fn escape_html(s: str, out: &mut alloc.String) {
+    let b = s.bytes();
+    var run: usize = 0;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        let c = b[i];
+        if c != '&' and c != '<' and c != '>' and c != '"' and c != '\'' {
+            continue;
+        }
+        out.push_str(s[run..i]);
+        run = i + 1;
+        if c == '&' {
+            out.push_str("&amp;");
+        } else if c == '<' {
+            out.push_str("&lt;");
+        } else if c == '>' {
+            out.push_str("&gt;");
+        } else if c == '"' {
+            out.push_str("&quot;");
+        } else {
+            out.push_str("&#39;");
+        }
+    }
+    out.push_str(s[run..b.len()]);
+}
+
+/// {{#name}}body{{/name}} or {{^name}}: the pub field of T called name,
+/// from field I on.
+fn section(comptime T: type, comptime I: usize, value: &T, name: str, body: str, inverted: bool, out: &mut alloc.String) -> TemplateError!void {
+    comptime if I < meta.field_count(T) {
+        if name.eq(meta.field_name(T, I)) {
+            return show(T, meta.field_type(T, I), value, field: meta.field(T, I, value), body, inverted, out);
+        }
+        return section(T, I + 1, value, name: name, body: body, inverted, out);
+    } else {
+        return TemplateError.UnknownName;
+    }
+}
+
+/// A section over field, of type F, of value, of type T.
+fn show(comptime T: type, comptime F: type, value: &T, field: &F, body: str, inverted: bool, out: &mut alloc.String) -> TemplateError!void {
+    comptime if meta.is_list(F) {
+        if inverted {
+            if field.len() == 0 {
+                try render(T, body, value, out);
+            }
+            return;
+        }
+        for item in field.items() {
+            try render(meta.elem_type(F), body, item, out);
+        }
+    } else comptime if meta.is_optional(F) {
+        match field {
+            some(x) => {
+                if not inverted {
+                    try render(meta.elem_type(F), body, x, out);
+                }
+            }
+            none => {
+                if inverted {
+                    try render(T, body, value, out);
+                }
+            }
+        }
+    } else comptime if meta.same(F, alloc.String) or meta.is_int(F) or meta.is_bool(F) {
+        var shown = false;
+        comptime if meta.same(F, alloc.String) {
+            shown = field.len() > 0;
+        } else comptime if meta.is_int(F) {
+            shown = field.* != 0;
+        } else {
+            shown = field.*;
+        }
+        if shown != inverted {
+            try render(T, body, value, out);
+        }
+    } else comptime if meta.is_struct(F) {
+        if not inverted {
+            try render(F, body, field, out);
+        }
+    } else {
+        return TemplateError.NotText;
     }
 }

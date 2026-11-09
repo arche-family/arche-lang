@@ -18,6 +18,7 @@ import sema.stmt;
 import sema.consts;
 import sema.expr;
 import sema.memory;
+import sema.meta;
 import manifest;
 
 pub const NONE: u32 = 4294967295;
@@ -26,6 +27,11 @@ pub const VALUE_FIELD: u32 = 4294967294;
 /// node_refs from ENV_REF up name entry (ref - ENV_REF) of env: a comptime
 /// value parameter.
 pub const ENV_REF: u32 = 2147483648;
+
+/// What a comptime if (spec/arche.md §4.4) chose, as the ref of its node in
+/// the instance it is checked for: its first branch, or the rest.
+pub const COMPTIME_THEN: u32 = 4294967290;
+pub const COMPTIME_ELSE: u32 = 4294967291;
 
 pub type Library = enum { NotLibrary, Std, Alloc }
 
@@ -139,6 +145,14 @@ pub type InstKey = struct {
     pub a3: u64,
 }
 
+/// Where an instance was first asked for: a span of a module, in the body of
+/// a declaration (NONE outside one).
+pub type Origin = struct {
+    pub module: u32,
+    pub span: diag.Span,
+    pub within: u32,
+}
+
 pub type Field = struct {
     pub name: alloc.Symbol,
     pub name_token: u32,
@@ -237,6 +251,8 @@ pub type Checker = struct {
     pub ref_tables: alloc.List(alloc.Map(u32, u32)),
     pub cur_table: u32,
     pub instances: alloc.Map(InstKey, u32),
+    /// Where each instance was first asked for, by its declaration.
+    pub origins: alloc.Map(u32, Origin),
     /// Instance functions whose bodies are still to be checked.
     pub pending: alloc.List(u32),
     /// The next call checked has this many comptime arguments first.
@@ -318,18 +334,19 @@ pub fn is_nopanic_fn(c: &Checker, d: u32) -> bool {
 /// The module being checked declares functions the compiler provides.
 fn intrinsic_module(c: &Checker) -> bool {
     let m = c.p.modules[c.module as usize].name.view();
-    return m.eq("core.mem") or m.eq("core.ptr") or m.eq("core.atomic") or m.eq("core.float");
+    return m.eq("core.mem") or m.eq("core.ptr") or m.eq("core.atomic") or m.eq("core.float") or m.eq("core.meta");
 }
 
-/// d is a function of core.mem, core.ptr, core.atomic or core.float, which the
-/// compiler provides (lib/core/mem.arche), or an instance of one.
+/// d is a function of core.mem, core.ptr, core.atomic, core.float or
+/// core.meta, which the compiler provides (lib/core/mem.arche), or an
+/// instance of one.
 pub fn is_intrinsic(c: &Checker, d: u32) -> bool {
     var decl = c.decls[d as usize];
     if decl.template != NONE {
         decl = c.decls[decl.template as usize];
     }
     let m = c.p.modules[decl.module as usize].name.view();
-    return decl.kind == DeclKind.Fn and decl.owner == NONE and (m.eq("core.mem") or m.eq("core.ptr") or m.eq("core.atomic") or m.eq("core.float"));
+    return decl.kind == DeclKind.Fn and decl.owner == NONE and (m.eq("core.mem") or m.eq("core.ptr") or m.eq("core.atomic") or m.eq("core.float") or m.eq("core.meta"));
 }
 
 /// d is a function of core.atomic, or an instance of one.
@@ -1570,6 +1587,9 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
         match find_item(c, c.module, sym) {
             some(d) => {
                 let k = c.decls[d as usize].kind;
+                if meta.gives_type(c, d) {
+                    return meta_type_from_args(c, d, n);
+                }
                 if k != DeclKind.Fn and k != DeclKind.Const {
                     note_use(c, token: first, decl_module: c.decls[d as usize].module, decl_token: c.decls[d as usize].name_token);
                     if c.decls[d as usize].generic {
@@ -1621,6 +1641,10 @@ fn resolve_path_type(c: &mut Checker, n: cst.NodeId) -> ty.TypeId {
                 match find_item(c, alias.module, sym) {
                     some(d) => {
                         let decl = c.decls[d as usize];
+                        if meta.gives_type(c, d) {
+                            note_use(c, token: second, decl_module: decl.module, decl_token: decl.name_token);
+                            return meta_type_from_args(c, d, n);
+                        }
                         if decl.kind != DeclKind.Fn and decl.kind != DeclKind.Const {
                             note_use(c, token: second, decl_module: decl.module, decl_token: decl.name_token);
                             let s = span_of(c, n);
@@ -1816,6 +1840,11 @@ pub fn instantiate(c: &mut Checker, d: u32, args: &alloc.List(ArgVal), at: diag.
     let id = c.decls.len() as u32;
     c.decls.push(inst);
     c.instances.put(key, id);
+    var within = NONE;
+    if c.fn_index != NONE {
+        within = c.fns[c.fn_index as usize].decl;
+    }
+    c.origins.put(id, Origin { module: saved.module, span: at, within: within });
     let k = inst.kind;
     if k == DeclKind.Struct {
         c.decls[id as usize].type_id = c.t.declared(ty.Kind.Struct, id);
@@ -1970,6 +1999,27 @@ fn instance_from_type_args(c: &mut Checker, d: u32, n: cst.NodeId) -> ty.TypeId 
         return ty.invalid();
     }
     return c.decls[inst as usize].type_id;
+}
+
+/// The type a written core.meta.field_type(T, I) or elem_type(T) names.
+fn meta_type_from_args(c: &mut Checker, d: u32, n: cst.NodeId) -> ty.TypeId {
+    let wants = comptime_kinds(c, d);
+    var args = alloc.List(ArgVal).init(c.a);
+    let nargs = child_count(c, n);
+    var k: u32 = 0;
+    while k < nargs : (k += 1) {
+        let an = child(c, n, k);
+        if (k as usize) < wants.len() and not ck_is_type(&wants, k) {
+            let vt = wants[k as usize].type_id;
+            let v = comptime_value(c, an, vt);
+            args.push(ArgVal { is_type: false, type_id: vt, value: v });
+        } else {
+            let t = resolve_type(c, an);
+            args.push(ArgVal { is_type: true, type_id: t, value: 0 });
+        }
+    }
+    let s = span_of(c, n);
+    return meta.type_of(c, d, &args, at: s);
 }
 
 fn ck_is_type(wants: &alloc.List(ArgVal), k: u32) -> bool {
@@ -3129,6 +3179,7 @@ pub fn analyze(p: program.Program) -> Checker {
         ref_tables: alloc.List(alloc.Map(u32, u32)).init(a),
         cur_table: NONE,
         instances: alloc.Map(InstKey, u32).init(a),
+        origins: alloc.Map(u32, Origin).init(a),
         pending: alloc.List(u32).init(a),
         arg_offset: 0,
         checked: alloc.Map(u32, bool).init(a),

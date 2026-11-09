@@ -1,0 +1,22 @@
+// test: compile-error
+// spec: arche/4.3
+// stage0: skip
+// line: 15
+// code: E0841
+import core.meta;
+import std;
+
+fn describe(comptime T: type, out: &mut std.Output) {
+    comptime if meta.is_int(T) {
+        out.write("int");
+    } else comptime if meta.is_bool(T) {
+        out.write("bool");
+    } else {
+        meta.unsupported(T);
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    describe(u8, &mut sys.stdout);
+    describe(f64, &mut sys.stdout);
+}

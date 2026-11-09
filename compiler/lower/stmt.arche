@@ -84,6 +84,14 @@ fn stmt(l: &mut lw.Lower, s: cst.NodeId) {
         .DiscardStmt => { _ = expr.value(l, child(l, s, 0)); }
         .AssignStmt => { assign(l, s); }
         .IfStmt => { if_stmt(l, s); }
+        .ComptimeIf => {
+            // The branch checking chose; the other was never checked.
+            if ck.ref_of(&l.c, s) == ck.COMPTIME_THEN {
+                block(l, child(l, s, 1));
+            } else if count(l, s) > 2 {
+                stmt(l, child(l, s, 2));
+            }
+        }
         .WhileStmt => { while_stmt(l, s); }
         .ForStmt => { for_stmt(l, s); }
         .IfExpr => { _ = expr.value(l, s); }

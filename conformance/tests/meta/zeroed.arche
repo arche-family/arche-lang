@@ -1,0 +1,45 @@
+// test: run
+// spec: arche/4.3
+// stage0: skip
+// stdout: true false false 0 0 0 none 5
+import core.meta;
+import std;
+
+type Open = struct {
+    pub a: u32,
+    pub b: ?u8,
+}
+
+type Closed = struct {
+    pub a: u32,
+    hidden: u32,
+}
+
+fn yes(b: bool, out: &mut std.Output) {
+    if b {
+        out.write("true ");
+    } else {
+        out.write("false ");
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    yes(meta.pub_only(Open), &mut sys.stdout);
+    yes(meta.pub_only(Closed), &mut sys.stdout);
+    yes(meta.pub_only(u32), &mut sys.stdout);
+    unsafe {
+        // SAFETY: zero bytes are a valid u32 and a valid none.
+        var o = meta.zeroed(Open);
+        sys.stdout.write_u64(o.a as u64);
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(meta.zeroed(u64));
+        match o.b {
+            some(_) => { sys.stdout.write(" some"); }
+            none => { sys.stdout.write(" 0 none"); }
+        }
+        o.a = 5;
+        sys.stdout.write(" ");
+        sys.stdout.write_u64(o.a as u64);
+    }
+    sys.stdout.write("\n");
+}

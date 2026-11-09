@@ -195,7 +195,25 @@ let g: Grid(u8, 4, 4) = Grid(u8, 4, 4).init();
 
 - `comptime { … }` and `comptime` expressions run at compile time, in an interpreter over the IR. They may call any function whose body uses no capability and no `unsafe`; they cannot do I/O.
 - The interpreter counts steps. A compilation that runs more than 10⁸ steps at compile time, or recurses deeper than 1000 calls, is an error (E0840); `arche build --comptime-profile` shows where the steps went.
-- Types are values of type `type` at compile time. `core.type_info(T)` describes a type (its fields, variants and their types), so generated code, such as JSON encoding, is written in Arche, not in a macro language.
+- Types are values of type `type` at compile time. `core.meta` says what a type is made of. `is_struct(T)`, `is_int(T)`, `is_signed(T)`, `is_float(T)`, `is_bool(T)`, `is_list(T)`, `is_optional(T)` and `same(A, B)` are constant `bool`s, and `field_count(T)` a constant `usize`. `field_name(T, I)` is a field's name, and `field(T, I, &x)` and `field_mut(T, I, &mut x)` are views of the field, projections of `x` (A§5.4). `field_type(T, I)` and `elem_type(T)`, the `E` of `alloc.List(E)` or `?E`, are types and are written where a type goes. The fields are a struct's `pub` fields, in the order they are declared, so a type's private fields stay its module's. A field number past them, `elem_type` of another type, or `field_type` called as a value is an error (E0841).
+- Generated code is written in Arche with these and `comptime if` (§4.4), not in a macro language: JSON encoding (`std.json.encode` and `decode`) and templates (`web.render`) are. `core.meta.unsupported(T)` is an error (E0841) wherever a checked branch reaches it. The diagnostic names `T` and points at the call in the package that leads there.
+
+### 4.4 `comptime if`
+
+```arche
+fn encode_fields(comptime T: type, comptime I: usize, value: &T, out: &mut alloc.String) {
+    comptime if I < meta.field_count(T) {
+        json.write_string(meta.field_name(T, I), out);
+        json.encode(meta.field_type(T, I), meta.field(T, I, value), out);
+        encode_fields(T, I + 1, value, out);
+    }
+}
+```
+
+- `comptime if c { … } else comptime if d { … } else { … }` is a statement that chooses a branch at compile time. Its condition is a constant `bool` expression (E0701), which may use the `comptime` parameters of the instance it is in.
+- Only the chosen branch is checked and compiled. The others are parsed but not checked, so they may name what this instance does not have: a field, a method, a type, or a call that would instantiate without end. Each instance makes its own choice.
+- A `comptime if` ends a path of a function (A§10) when the branch it chooses does.
+- A call in the chosen branch instantiates what it calls, so recursion over a type's fields stops at the instance whose `comptime if` no longer chooses the recursive call.
 
 ## 5. Interfaces
 
@@ -471,12 +489,13 @@ stmt        = ( "let" | "var" ) IDENT [ ":" type ] "=" expr ";"
             | "defer" ( block | simple ";" )
             | "region" IDENT block
             | "unsafe" block
-            | "comptime" block
+            | "comptime" ( block | "if" ct_if )
             | block
             | simple ";" ;
 loop        = "while" expr [ ":" "(" assign ")" ] block
             | "for" for_bind "in" expr [ ( ".." | "..=" ) expr ] block ;
 for_bind    = IDENT [ ":" type ] | "(" IDENT "," IDENT ")" ;
+ct_if       = expr block [ "else" ( "comptime" "if" ct_if | block ) ] ;   (* §4.4 *)
 
 expr        = or_expr [ ( "orelse" | "catch" ) ( expr | jump ) ] ;
 jump        = "return" [ expr ] | "break" [ IDENT ] | "continue" [ IDENT ] ;   (* §3.5 *)

@@ -1963,6 +1963,13 @@ fn stmt(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
         .ExprStmt => { eval(c, f, ck.child(c, s, 0), false); }
         .DiscardStmt => { eval(c, f, ck.child(c, s, 0), true); }
         .AssignStmt => { assign(c, f, s); }
+        .ComptimeIf => {
+            if ck.ref_of(c, s) == ck.COMPTIME_THEN {
+                block(c, f, ck.child(c, s, 1));
+            } else if ck.child_count(c, s) > 2 {
+                stmt(c, f, ck.child(c, s, 2));
+            }
+        }
         .IfStmt | .IfExpr => {
             eval(c, f, ck.child(c, s, 0), false);
             let entry = save(c, f);

@@ -1,0 +1,77 @@
+// test: run
+// spec: arche/4.3
+// stage0: skip
+// stdout: 3 name=ada age=36 admin=1 | age=37 | true false true true false
+import alloc;
+import core.meta;
+import std;
+
+type User = struct {
+    pub name: alloc.String,
+    secret: u64,
+    pub age: u32,
+    pub admin: bool,
+}
+
+/// Writes name=value for every pub field from I on.
+fn show(comptime T: type, comptime I: usize, value: &T, out: &mut std.Output) {
+    comptime if I < meta.field_count(T) {
+        out.write(meta.field_name(T, I));
+        out.write("=");
+        show_value(meta.field_type(T, I), meta.field(T, I, value), out);
+        comptime if I + 1 < meta.field_count(T) {
+            out.write(" ");
+        }
+        show(T, I + 1, value, out);
+    }
+}
+
+fn show_value(comptime T: type, value: &T, out: &mut std.Output) {
+    comptime if meta.same(T, alloc.String) {
+        out.write(value.view());
+    } else comptime if meta.is_bool(T) {
+        if value.* {
+            out.write("1");
+        } else {
+            out.write("0");
+        }
+    } else comptime if meta.is_int(T) {
+        out.write_u64(value.* as u64);
+    } else {
+        meta.unsupported(T);
+    }
+}
+
+fn yes(b: bool, out: &mut std.Output) {
+    if b {
+        out.write("true");
+    } else {
+        out.write("false");
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var name = alloc.String.init(sys.alloc);
+    name.push_str("ada");
+    var u = User { name: name, secret: 7, age: 36, admin: true };
+    sys.stdout.write_u64(meta.field_count(User) as u64);
+    sys.stdout.write(" ");
+    show(User, 0, &u, &mut sys.stdout);
+    sys.stdout.write(" | ");
+    let age = meta.field_mut(User, 1, &mut u);
+    age.* += 1;
+    let t: meta.field_type(User, 1) = u.age;
+    sys.stdout.write("age=");
+    sys.stdout.write_u64(t as u64);
+    sys.stdout.write(" | ");
+    yes(meta.is_struct(User), &mut sys.stdout);
+    sys.stdout.write(" ");
+    yes(meta.is_signed(u32), &mut sys.stdout);
+    sys.stdout.write(" ");
+    yes(meta.is_list(alloc.List(u8)), &mut sys.stdout);
+    sys.stdout.write(" ");
+    yes(meta.same(meta.elem_type(?u16), u16), &mut sys.stdout);
+    sys.stdout.write(" ");
+    yes(meta.is_optional(u16), &mut sys.stdout);
+    sys.stdout.write("\n");
+}

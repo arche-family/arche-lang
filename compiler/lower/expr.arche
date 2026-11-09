@@ -7,6 +7,7 @@ import lower.layout;
 import lower.lower as lw;
 import lower.stmt;
 import sema.floats;
+import sema.meta;
 import sema.check as ck;
 import sema.expr as sx;
 import sema.types as ty;
@@ -1349,6 +1350,9 @@ fn intrinsic(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
     if ck.is_atomic_op(&l.c, d) {
         return atomic(l, n, nm, info.ncomptime);
     }
+    if meta.is_meta(&l.c, d) {
+        return meta_call(l, n, d: d, nm, offset: info.ncomptime);
+    }
     if nm.eq("size_of") {
         return scalar_val(lw.konst(l, ir.Ty.I64, layout.layout(&l.c, t).size));
     }
@@ -1416,6 +1420,38 @@ fn intrinsic(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
     args.push(a2.v);
     _ = lw.call_runtime(l, "a0rt_memmove", ir.Ty.Void, &args);
     return nothing();
+}
+
+/// core.meta's functions (lib/core/meta.arche): constants, a field's name,
+/// and the address of a field.
+fn meta_call(l: &mut lw.Lower, n: cst.NodeId, d: u32, nm: str, offset: u32) -> lw.Val {
+    match meta.value(&l.c, d) {
+        some(v) => {
+            return scalar_val(lw.konst(l, layout.scalar(&l.c, type_of(l, n)), v));
+        }
+        none => { }
+    }
+    if nm.eq("zeroed") {
+        let zt = type_of(l, n);
+        if layout.is_scalar(&l.c, zt) {
+            return scalar_val(lw.konst(l, layout.scalar(&l.c, zt), 0));
+        }
+        // An alloca starts zeroed.
+        return fresh_val(lw.alloca(l, zt));
+    }
+    let f = meta.field_of(&l.c, d);
+    if nm.eq("field_name") {
+        var name = alloc.String.init(l.a);
+        name.push_str(l.c.names.text(l.c.fields[f as usize].name));
+        return lw.str_global(l, name.view());
+    }
+    // field and field_mut: the struct's address, moved to the field.
+    let decl = l.c.decls[d as usize];
+    let t = l.c.env[decl.env_start as usize].type_id;
+    let start = l.c.decls[l.c.t.get(t).decl as usize].members_start;
+    let at = layout.field_offset(&l.c, start: start, i: f);
+    let base = value(l, runtime_arg(l, n, offset: offset, i: 0)).v;
+    return scalar_val(lw.gep(l, base, at));
 }
 
 /// core.atomic's operations, as LLVM's atomic instructions.

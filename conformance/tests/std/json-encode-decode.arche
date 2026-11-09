@@ -1,0 +1,83 @@
+// test: run
+// spec: arche/4.3
+// stage0: skip
+// stdout: {"name":"Ada \"L\"","age":36,"delta":-5,"admin":true,"nick":null,"scores":[3,65535],"tag":{"label":"x"}}
+// stdout: {"name":"Ada \"L\"","age":37,"delta":-128,"admin":true,"nick":"al","scores":[1,2],"tag":{"label":"y"}}
+// stdout: ok mismatch mismatch mismatch mismatch mismatch mismatch mismatch other ok 0 -128
+import alloc;
+import std;
+import std.json;
+
+type Tag = struct {
+    pub label: alloc.String,
+}
+
+type User = struct {
+    pub name: alloc.String,
+    pub age: u32,
+    pub delta: i8,
+    pub admin: bool,
+    pub nick: ?alloc.String,
+    pub scores: alloc.List(u16),
+    pub tag: Tag,
+    hidden: u32,
+}
+
+type Small = struct {
+    pub small: u8,
+    pub neg: i8,
+}
+
+fn show(r: json.DecodeError!void, out: &mut std.Output) {
+    match r {
+        ok(_) => { out.write("ok "); }
+        err(e) => {
+            if e == json.DecodeError.Mismatch {
+                out.write("mismatch ");
+            } else {
+                out.write("other ");
+            }
+        }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var u = User {
+        name: alloc.String.from("Ada \"L\"", sys.alloc),
+        age: 36,
+        delta: -5,
+        admin: true,
+        nick: none,
+        scores: alloc.List(u16).init(sys.alloc),
+        tag: Tag { label: alloc.String.from("x", sys.alloc) },
+        hidden: 9,
+    };
+    u.scores.push(3);
+    u.scores.push(65535);
+    var out = alloc.String.init(sys.alloc);
+    json.encode(User, &u, &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+    // Keys it does not name keep their values; keys of no field are passed over.
+    try json.decode(User, "{\"age\": 37, \"delta\": -128, \"nick\": \"al\", \"scores\": [1, 2], \"tag\": {\"label\": \"y\"}, \"extra\": [1]}", into: &mut u, sys.alloc);
+    var again = alloc.String.init(sys.alloc);
+    json.encode(User, &u, &mut again);
+    sys.stdout.write(again.view());
+    sys.stdout.write("\n");
+
+    var q = Small { small: 0, neg: 0 };
+    show(json.decode(Small, "{\"small\": 255, \"neg\": -128}", into: &mut q, sys.alloc), &mut sys.stdout);
+    show(json.decode(Small, "{\"small\": 256}", into: &mut q, sys.alloc), &mut sys.stdout);
+    show(json.decode(Small, "{\"neg\": -129}", into: &mut q, sys.alloc), &mut sys.stdout);
+    show(json.decode(Small, "{\"neg\": 128}", into: &mut q, sys.alloc), &mut sys.stdout);
+    show(json.decode(Small, "{\"small\": -1}", into: &mut q, sys.alloc), &mut sys.stdout);
+    show(json.decode(Small, "{\"small\": 1.5}", into: &mut q, sys.alloc), &mut sys.stdout);
+    show(json.decode(Small, "[1]", into: &mut q, sys.alloc), &mut sys.stdout);
+    show(json.decode(Small, "{\"small\": \"1\"}", into: &mut q, sys.alloc), &mut sys.stdout);
+    show(json.decode(Small, "{", into: &mut q, sys.alloc), &mut sys.stdout);
+    show(json.decode(Small, "{\"small\": -0}", into: &mut q, sys.alloc), &mut sys.stdout);
+    sys.stdout.write_u64(q.small as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(q.neg as i64);
+    sys.stdout.write("\n");
+}

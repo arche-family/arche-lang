@@ -1,0 +1,63 @@
+// test: run
+// spec: web (docs/sprints.md S32)
+// stage0: skip
+// stdout: <h1>Tom &amp; &quot;Jerry&quot;</h1>Tom & "Jerry" v=7 live<ul><li>a&lt;b</li><li>c</li></ul>by Ada, no comments
+// stdout: unknown syntax syntax not-text
+import alloc;
+import std;
+import web;
+
+type Author = struct {
+    pub name: alloc.String,
+}
+
+type Post = struct {
+    pub title: alloc.String,
+    pub views: u32,
+    pub draft: bool,
+    pub tags: alloc.List(alloc.String),
+    pub author: ?Author,
+    pub comments: alloc.List(Author),
+}
+
+fn report(r: web.TemplateError!void, out: &mut std.Output) {
+    match r {
+        ok(_) => { out.write("ok"); }
+        err(e) => {
+            if e == web.TemplateError.UnknownName {
+                out.write("unknown");
+            } else if e == web.TemplateError.Syntax {
+                out.write("syntax");
+            } else {
+                out.write("not-text");
+            }
+        }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var tags = alloc.List(alloc.String).init(sys.alloc);
+    tags.push(alloc.String.from("a<b", sys.alloc));
+    tags.push(alloc.String.from("c", sys.alloc));
+    let p = Post {
+        title: alloc.String.from("Tom & \"Jerry\"", sys.alloc),
+        views: 7,
+        draft: false,
+        tags: tags,
+        author: some(Author { name: alloc.String.from("Ada", sys.alloc) }),
+        comments: alloc.List(Author).init(sys.alloc),
+    };
+    var out = alloc.String.init(sys.alloc);
+    try web.render(Post, "<h1>{{ title }}</h1>{{&title}} v={{views}} {{#draft}}draft{{/draft}}{{^draft}}live{{/draft}}<ul>{{#tags}}<li>{{.}}</li>{{/tags}}</ul>{{#author}}by {{name}}{{/author}}{{#comments}}, {{name}}{{/comments}}{{^comments}}, no comments{{/comments}}", &p, &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+    var bad = alloc.String.init(sys.alloc);
+    report(web.render(Post, "{{nope}}", &p, &mut bad), &mut sys.stdout);
+    sys.stdout.write(" ");
+    report(web.render(Post, "{{title", &p, &mut bad), &mut sys.stdout);
+    sys.stdout.write(" ");
+    report(web.render(Post, "{{#tags}}x", &p, &mut bad), &mut sys.stdout);
+    sys.stdout.write(" ");
+    report(web.render(Post, "{{tags}}", &p, &mut bad), &mut sys.stdout);
+    sys.stdout.write("\n");
+}

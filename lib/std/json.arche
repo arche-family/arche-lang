@@ -5,6 +5,7 @@
 import alloc;
 import core.fmt;
 import core.mem;
+import core.meta;
 import core.utf8;
 
 pub type Value = enum {
@@ -17,6 +18,10 @@ pub type Value = enum {
 }
 
 pub type JsonError = error { Syntax, TooDeep }
+
+/// What stops decode: JsonError's two, and Mismatch, JSON that is not of
+/// the shape of the type it was asked to read.
+pub type DecodeError = error { Syntax, TooDeep, Mismatch }
 
 /// How deep arrays and objects may nest: deeper text is an error, not a
 /// stack overflow.
@@ -451,4 +456,251 @@ pub fn from_text(s: str, a: alloc.Allocator) -> Value {
     var value = alloc.String.init(a);
     value.push_str(s);
     return Value.Text { value: value };
+}
+
+// ---- encoding and decoding types ------------------------------------------------------
+//
+// encode and decode work on a type named at the call, with core.meta and
+// `comptime if` (spec/arche.md §4.3, §4.4): each instance is the code for
+// one type, so there is no walk over a description at run time. A struct is
+// an object of its pub fields, in the order they are declared;
+// alloc.String a string; bool true or false; an integer type a number; ?T
+// null or a T; alloc.List(T) an array; Value itself. Any other type, a float
+// for one, is a compile error that names it (E0841).
+
+/// value as JSON text, without spaces, appended to out. A struct User with
+/// `pub name: alloc.String` and `pub age: u32` is written as
+/// {"name":"Ada","age":36}.
+///
+/// ```arche
+/// var xs = alloc.List(?u32).init(sys.alloc);
+/// xs.push(some(1));
+/// xs.push(none);
+/// var out = alloc.String.init(sys.alloc);
+/// json.encode(alloc.List(?u32), &xs, out: &mut out);
+/// assert(out.view().eq("[1,null]"));
+/// ```
+pub fn encode(comptime T: type, value: &T, out: &mut alloc.String) {
+    comptime if meta.same(T, alloc.String) {
+        write_string(value.view(), out);
+    } else comptime if meta.same(T, Value) {
+        write(value, out);
+    } else comptime if meta.is_bool(T) {
+        if value.* {
+            out.push_str("true");
+        } else {
+            out.push_str("false");
+        }
+    } else comptime if meta.is_int(T) {
+        comptime if meta.is_signed(T) {
+            out.push_i64(value.* as i64);
+        } else {
+            out.push_u64(value.* as u64);
+        }
+    } else comptime if meta.is_optional(T) {
+        match value {
+            some(x) => { encode(meta.elem_type(T), x, out); }
+            none => { out.push_str("null"); }
+        }
+    } else comptime if meta.is_list(T) {
+        out.push_ascii('[');
+        var i: usize = 0;
+        for item in value.items() {
+            if i > 0 {
+                out.push_ascii(',');
+            }
+            encode(meta.elem_type(T), item, out);
+            i += 1;
+        }
+        out.push_ascii(']');
+    } else comptime if meta.is_struct(T) {
+        out.push_ascii('{');
+        encode_fields(T, 0, value, out);
+        out.push_ascii('}');
+    } else {
+        meta.unsupported(T);
+    }
+}
+
+/// The pub fields of struct T from I on, as "name":value pairs.
+fn encode_fields(comptime T: type, comptime I: usize, value: &T, out: &mut alloc.String) {
+    comptime if I < meta.field_count(T) {
+        comptime if I > 0 {
+            out.push_ascii(',');
+        }
+        write_string(meta.field_name(T, I), out);
+        out.push_ascii(':');
+        encode(meta.field_type(T, I), meta.field(T, I, value), out);
+        encode_fields(T, I + 1, value, out);
+    }
+}
+
+/// Reads text, JSON of T's shape, into `into`. An object's key that names a
+/// pub field sets it; a field it does not name keeps its value, and a key
+/// that names none is passed over, so `into` holds the defaults. A list is
+/// replaced by the array's items. Strings, lists and the parsed text are
+/// allocated with a. On an error `into` may have been changed in part.
+///
+/// ```arche
+/// var xs = alloc.List(i8).init(sys.alloc);
+/// json.decode(alloc.List(i8), "[3, -4]", into: &mut xs, sys.alloc) catch panic("not a list of i8");
+/// assert(xs.len() == 2 and xs.items()[1] == -4);
+/// match json.decode(alloc.List(i8), "[128]", into: &mut xs, sys.alloc) {
+///     ok(_) => { panic("128 is no i8"); }
+///     err(e) => { assert(e == json.DecodeError.Mismatch); }
+/// }
+/// ```
+pub fn decode(comptime T: type, text: str, into: &mut T, a: alloc.Allocator) -> DecodeError!void {
+    let v = try parse(text, a);
+    try decode_value(T, &v, into, a);
+}
+
+/// Reads v into `into`, as decode does.
+pub fn decode_value(comptime T: type, v: &Value, into: &mut T, a: alloc.Allocator) -> DecodeError!void {
+    comptime if meta.same(T, alloc.String) {
+        match v {
+            .Text { value } => { into.* = value.clone(); }
+            _ => { return DecodeError.Mismatch; }
+        }
+    } else comptime if meta.is_bool(T) {
+        match v {
+            .Bool { value } => { into.* = value.*; }
+            _ => { return DecodeError.Mismatch; }
+        }
+    } else comptime if meta.is_int(T) {
+        let bits = try integer(v, signed: meta.is_signed(T), bits: (mem.size_of(T) * 8) as u32);
+        into.* = bits as% T;
+    } else comptime if meta.is_optional(T) {
+        match v {
+            .Null => {
+                into.* = none;
+                return;
+            }
+            _ => { }
+        }
+        var x = fresh(meta.elem_type(T), a);
+        try decode_value(meta.elem_type(T), v, into: &mut x, a);
+        into.* = some(x);
+    } else comptime if meta.is_list(T) {
+        match v {
+            .Array { items } => {
+                into.clear();
+                for item in items.items() {
+                    var x = fresh(meta.elem_type(T), a);
+                    try decode_value(meta.elem_type(T), item, into: &mut x, a);
+                    into.push(x);
+                }
+            }
+            _ => { return DecodeError.Mismatch; }
+        }
+    } else comptime if meta.is_struct(T) {
+        match v {
+            .Object { .. } => { try decode_fields(T, 0, v, into, a); }
+            _ => { return DecodeError.Mismatch; }
+        }
+    } else {
+        meta.unsupported(T);
+    }
+}
+
+/// The pub fields of struct T from I on, from object v.
+fn decode_fields(comptime T: type, comptime I: usize, v: &Value, into: &mut T, a: alloc.Allocator) -> DecodeError!void {
+    comptime if I < meta.field_count(T) {
+        match key_index(v, meta.field_name(T, I)) {
+            some(k) => {
+                match v {
+                    .Object { values, .. } => {
+                        try decode_value(meta.field_type(T, I), &values.items()[k], into: meta.field_mut(T, I, into), a);
+                    }
+                    _ => { }
+                }
+            }
+            none => { }
+        }
+        try decode_fields(T, I + 1, v, into, a);
+    }
+}
+
+/// A new value for an array's item or an optional's payload to be read
+/// into: an empty string or list, false, 0 or none, or a struct of these
+/// whose fields are all pub.
+fn fresh(comptime T: type, a: alloc.Allocator) -> T {
+    comptime if meta.same(T, alloc.String) {
+        return alloc.String.init(a);
+    } else comptime if meta.is_bool(T) {
+        return false;
+    } else comptime if meta.is_int(T) {
+        return 0;
+    } else comptime if meta.is_list(T) {
+        return alloc.List(meta.elem_type(T)).init(a);
+    } else comptime if meta.is_optional(T) {
+        return none;
+    } else comptime if meta.is_struct(T) and meta.pub_only(T) {
+        unsafe {
+            // SAFETY: every field of T is pub, so fresh_fields gives each
+            // one a value of its own; zero bytes are only a start.
+            var x = meta.zeroed(T);
+            fresh_fields(T, 0, &mut x, a);
+            return x;
+        }
+    } else {
+        meta.unsupported(T);
+    }
+}
+
+/// Field I on of struct T, each a new value as fresh makes them.
+fn fresh_fields(comptime T: type, comptime I: usize, x: &mut T, a: alloc.Allocator) {
+    comptime if I < meta.field_count(T) {
+        let v = fresh(meta.field_type(T, I), a);
+        meta.field_mut(T, I, x).* = v;
+        fresh_fields(T, I + 1, x, a);
+    }
+}
+
+/// The integer v holds, as the two's complement bits of a type of `bits`
+/// bits, signed or not; Mismatch when v is not an integer or does not fit.
+fn integer(v: &Value, signed: bool, bits: u32) -> DecodeError!u64 {
+    match v {
+        .Number { text } => {
+            let b = text.view().bytes();
+            var neg = false;
+            var i: usize = 0;
+            if b[0] == '-' {
+                neg = true;
+                i = 1;
+            }
+            var mag: u64 = 0;
+            while i < b.len() : (i += 1) {
+                let c = b[i];
+                if c < '0' or c > '9' {
+                    return DecodeError.Mismatch;
+                }
+                let d = (c - '0') as u64;
+                if mag > (18446744073709551615 - d) / 10 {
+                    return DecodeError.Mismatch;
+                }
+                mag = mag * 10 + d;
+            }
+            let one: u64 = 1;
+            if signed {
+                // The magnitude of the type's least value.
+                let least = one << (bits - 1) as u64;
+                if neg {
+                    if mag > least {
+                        return DecodeError.Mismatch;
+                    }
+                    return 0 -% mag;
+                }
+                if mag >= least {
+                    return DecodeError.Mismatch;
+                }
+                return mag;
+            }
+            if (neg and mag != 0) or (bits < 64 and mag >= one << bits as u64) {
+                return DecodeError.Mismatch;
+            }
+            return mag;
+        }
+        _ => { return DecodeError.Mismatch; }
+    }
 }

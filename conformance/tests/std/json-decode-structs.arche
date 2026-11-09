@@ -1,0 +1,28 @@
+// test: run
+// spec: arche/4.3
+// stage0: skip
+// stdout: {"items":[{"id":1,"name":"a","tags":["x","y"],"parent":null},{"id":2,"name":"","tags":[],"parent":1}]}
+import alloc;
+import std;
+import std.json;
+
+type Item = struct {
+    pub id: u32,
+    pub name: alloc.String,
+    pub tags: alloc.List(alloc.String),
+    pub parent: ?u32,
+}
+
+type Doc = struct {
+    pub items: alloc.List(Item),
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var d = Doc { items: alloc.List(Item).init(sys.alloc) };
+    // Each item starts empty, as json's fresh values: "", [], 0, null.
+    try json.decode(Doc, "{\"items\": [{\"id\": 1, \"name\": \"a\", \"tags\": [\"x\", \"y\"]}, {\"id\": 2, \"parent\": 1}]}", into: &mut d, sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.encode(Doc, &d, &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

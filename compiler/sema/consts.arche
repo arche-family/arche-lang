@@ -9,6 +9,7 @@ import syntax.token as tk;
 import sema.check as ck;
 import sema.expr;
 import sema.interp;
+import sema.meta;
 import sema.types as ty;
 
 pub fn check_const(c: &mut ck.Checker, d: u32) {
@@ -197,6 +198,10 @@ pub fn eval(c: &mut ck.Checker, n: cst.NodeId) -> u64 {
             let d = ck.ref_of(c, n);
             if d == ck.NONE or d >= ck.ENV_REF {
                 return 0;
+            }
+            match meta.value(c, d) {
+                some(v) => { return v; }
+                none => { }
             }
             let offset = c.fns[c.decls[d as usize].fn_index as usize].ncomptime;
             var args = alloc.List(u64).init(c.a);

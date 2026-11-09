@@ -347,6 +347,20 @@ fn check_stmt(c: &mut ck.Checker, s: cst.NodeId) {
                 check_stmt(c, ck.child(c, s, 2));
             }
         }
+        .ComptimeIf => {
+            // The condition is a constant, comptime parameters included;
+            // only the branch it chooses is checked, and compiled.
+            let v = ck.comptime_value(c, ck.child(c, s, 0), ty.bool_type());
+            if v != 0 {
+                ck.set_ref(c, s, ck.COMPTIME_THEN);
+                check_block(c, ck.child(c, s, 1));
+            } else {
+                ck.set_ref(c, s, ck.COMPTIME_ELSE);
+                if ck.child_count(c, s) > 2 {
+                    check_stmt(c, ck.child(c, s, 2));
+                }
+            }
+        }
         .WhileStmt => {
             expr.check_value(c, ck.child(c, s, 0), ty.bool_type());
             let has_step = ck.child_count(c, s) == 3;
@@ -1434,6 +1448,12 @@ fn stmt_ends(c: &ck.Checker, s: cst.NodeId) -> bool {
         .UnsafeStmt | .RegionStmt => { return block_ends(c, ck.child(c, s, 0)); }
         .IfStmt => {
             return ck.child_count(c, s) == 3 and block_ends(c, ck.child(c, s, 1)) and stmt_ends(c, ck.child(c, s, 2));
+        }
+        .ComptimeIf => {
+            if ck.ref_of(c, s) == ck.COMPTIME_THEN {
+                return block_ends(c, ck.child(c, s, 1));
+            }
+            return ck.child_count(c, s) == 3 and stmt_ends(c, ck.child(c, s, 2));
         }
         .WhileStmt => {
             let cond = ck.child(c, s, 0);

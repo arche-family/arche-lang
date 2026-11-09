@@ -1,0 +1,22 @@
+// test: compile-error
+// spec: arche/4.3
+// stage0: skip
+// line: 21
+// code: E0841
+import alloc;
+import std;
+import std.json;
+
+type Item = struct {
+    pub id: u32,
+    secret: u32,
+}
+
+type Doc = struct {
+    pub items: alloc.List(Item),
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var d = Doc { items: alloc.List(Item).init(sys.alloc) };
+    try json.decode(Doc, "{\"items\": []}", into: &mut d, sys.alloc);
+}

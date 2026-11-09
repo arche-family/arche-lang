@@ -899,6 +899,24 @@ fn parse_if(p: &mut Parser, m: cst.Mark) {
     parse_if_as(p, m, cst.Kind.IfStmt);
 }
 
+/// comptime if c { } [else comptime if c { } ...] [else { }] (spec/arche.md
+/// §4.4).
+fn parse_comptime_if(p: &mut Parser, m: cst.Mark) {
+    advance(p);
+    advance(p);
+    parse_condition(p);
+    parse_block(p);
+    if accept(p, tk.Kind.KwElse) {
+        if at(p, tk.Kind.KwComptime) and peek_second(p) == tk.Kind.KwIf {
+            let em = open(p);
+            parse_comptime_if(p, em);
+        } else {
+            parse_block(p);
+        }
+    }
+    _ = close(p, m, cst.Kind.ComptimeIf);
+}
+
 fn parse_if_as(p: &mut Parser, m: cst.Mark, k: cst.Kind) {
     advance(p);
     parse_condition(p);
@@ -937,6 +955,17 @@ fn parse_stmt(p: &mut Parser) {
         }
         .KwIf => {
             parse_if(p, m);
+        }
+        .KwComptime => {
+            if p.full and peek_second(p) == tk.Kind.KwIf {
+                parse_comptime_if(p, m);
+            } else {
+                // Not a statement: the parser says so where an
+                // expression was wanted.
+                parse_expr(p);
+                end_statement(p);
+                _ = close(p, m, cst.Kind.ExprStmt);
+            }
         }
         .KwWhile => {
             advance(p);
