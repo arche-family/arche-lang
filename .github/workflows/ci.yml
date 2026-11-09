@@ -125,8 +125,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build stage0, the compiler and the runtime
         run: make -C stage0 && make -C compiler && make -C wasm
-      - name: The spec's tests in the interpreter, and Nimadir's mini-apps
+      - name: The spec's tests in the interpreter and the JIT, Nimadir's mini-apps, and WASM handlers over HTTPS
         run: make -C wasm check
+      - name: The web benchmark, against its baseline
+        run: bash bench/web/run.sh
 
   # docs/sprints.md S16, S28: freestanding binaries, built with core and alloc
   # only, boot in QEMU on x86-64, RISC-V 64 and ARM64 and write over serial.

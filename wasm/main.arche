@@ -4,13 +4,22 @@
 ///   arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--click text]...
 ///       [--type selector text] [--deny func]... [--tree]
 ///                                        a Nimadir mini-app, with no window
+///   arche-wasm serve <handler.wasm> <port> (<certificate chain> <key> | --plain) [workers]
+///                                        HTTPS, each request answered by the
+///                                        module's handle (serve.arche)
+///                                        a Nimadir mini-app, with no window
 import alloc;
 import component;
 import exec;
+import crypto.random;
+import http;
+import http.server;
 import nimadir;
+import serve;
+import spec;
 import std;
 import std.linux;
-import spec;
+import tls;
 
 fn usage(sys: &mut std.System) -> !void {
     sys.stderr.write("usage: arche-wasm spec [--jit] <script.json>...\n");
@@ -104,6 +113,10 @@ fn main(sys: &mut std.System) -> !void {
         if total.failed > 0 {
             sys.proc.exit(1);
         }
+        return;
+    }
+    if cmd.eq("serve") and sys.args.len() >= 5 {
+        try serve_handler(sys);
         return;
     }
     if cmd.eq("nimadir") and sys.args.len() >= 3 {
@@ -238,4 +251,95 @@ fn component_error(e: component.ComponentError) -> str {
         .Unlinkable => { return "imports what the shell does not give"; }
         .Trapped => { return "trapped while starting"; }
     }
+}
+
+/// Serves HTTPS, each request answered by the handler module (serve.arche),
+/// a worker per processor, each with its own instance.
+fn serve_handler(sys: &mut std.System) -> !void {
+    let bytes = try sys.fs.read_bytes(sys.args.get(2), sys.alloc);
+    let port = number(sys.args.get(3)) as u16;
+    let plain = sys.args.get(4).eq("--plain");
+    var rest: usize = 6;
+    if plain {
+        rest = 5;
+    }
+    if sys.args.len() != rest and sys.args.len() != rest + 1 {
+        try usage(sys);
+    }
+    var listener = try sys.net.listen(std.Address { ip: [127, 0, 0, 1], port: port });
+    var config = tls.ServerConfig.init(sys.alloc);
+    if not plain {
+        let chain = try sys.fs.read_file(sys.args.get(4), sys.alloc);
+        try config.certificates_pem(chain.view(), sys.alloc);
+        let key = try sys.fs.read_file(sys.args.get(5), sys.alloc);
+        try config.private_key_pem(key.view(), sys.alloc);
+        config.accept_protocol("h2");
+        config.accept_protocol("http/1.1");
+    }
+    var workers = sys.proc.cpu_count();
+    if sys.args.len() == rest + 1 {
+        workers = number(sys.args.get(rest));
+    }
+    // The module is checked before any worker starts.
+    var first = match serve.load(bytes.items(), sys.alloc) {
+        ok(h) => { h }
+        err(e) => {
+            sys.stderr.write("arche-wasm: the handler cannot be loaded: ");
+            if e == serve.LoadError.Unlinkable {
+                sys.stderr.write("it imports what the server does not give");
+            } else if e == serve.LoadError.NoExports {
+                sys.stderr.write("it does not export memory, alloc and handle");
+            } else {
+                sys.stderr.write("it is not a valid module");
+            }
+            sys.stderr.write("\n");
+            sys.proc.exit(1);
+        }
+    };
+    sys.proc.ignore_broken_pipe();
+    let worker = sys.proc.workers(workers);
+    _ = worker;
+    if worker == 0 {
+        sys.stdout.write("ready\n");
+        sys.stdout.flush();
+    }
+    let clock = &sys.clock;
+    let now = fn [clock] () -> u64 { return clock.monotonic_ns(); };
+    var handler = first;
+    var restarts: u64 = 0;
+    let module = bytes.items();
+    let out = &mut sys.stderr;
+    let a = sys.alloc;
+    let answer = fn [&mut handler, &now, clock, module, &mut restarts, out, a](req: &http.Request, resp: &mut http.Response) {
+        handler.imports.now_ms = (clock.unix_ns() / 1000000) as i64;
+        let got = serve.run(&mut handler, now: &now, method: req.method.view(), target: req.target.view(), body: req.body.items(), a: resp.alloc);
+        if handler.imports.log.len() > 0 {
+            out.write(handler.imports.log.view());
+            out.flush();
+            handler.imports.log = alloc.String.init(a);
+        }
+        if got.trapped {
+            resp.status = 503;
+            resp.headers.add(name: "content-type", value: "text/plain");
+            resp.write("the handler stopped: ");
+            resp.write(got.why.view());
+            resp.write("\n");
+            // A new instance: what the stopped one was in the middle of is
+            // not to be trusted.
+            match serve.load(module, a) {
+                ok(h) => { handler = h; }
+                err(_) => { }
+            }
+            restarts += 1;
+            return;
+        }
+        resp.status = got.status;
+        resp.headers.add(name: "content-type", value: got.content_type.view());
+        resp.write_bytes(got.body.items());
+    };
+    if plain {
+        try server.serve(&listener, handler: &answer, options: server.Options.init(), proc: &sys.proc, sys.alloc);
+        return;
+    }
+    try server.serve_tls(&listener, config: &config, handler: &answer, options: server.Options.init(), proc: &sys.proc, seeds: random.Csprng.init(&mut sys.rand), sys.alloc);
 }

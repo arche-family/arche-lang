@@ -10,7 +10,8 @@
 ///   GET  /api/memory       the worker's resident memory in KiB
 ///   GET  /*path            the directory's files
 ///
-/// Usage: webapp <port> <directory> <certificate chain> <key> [workers]
+/// Usage: webapp <port> <directory> (<certificate chain> <key> | --plain)
+/// [workers]; --plain serves HTTP in the clear, for bench/web.
 import alloc;
 import crypto.random;
 import http;
@@ -164,23 +165,30 @@ fn app(router: &web.Router, notes: &mut Notes, fs: &std.Fs, dir: str, worker: u3
 }
 
 fn main(sys: &mut std.System) -> !void {
-    if sys.args.len() != 5 and sys.args.len() != 6 {
-        sys.stderr.write("usage: webapp <port> <directory> <certificate chain> <key> [workers]\n");
+    let plain = sys.args.len() >= 4 and sys.args.get(3).eq("--plain");
+    var rest: usize = 5;
+    if plain {
+        rest = 4;
+    }
+    if sys.args.len() != rest and sys.args.len() != rest + 1 {
+        sys.stderr.write("usage: webapp <port> <directory> (<certificate chain> <key> | --plain) [workers]\n");
         sys.proc.exit(2);
     }
     let port = number(sys.args.get(1)) as u16;
     let dir = sys.args.get(2);
     var listener = try sys.net.listen(std.Address { ip: [127, 0, 0, 1], port: port });
     var config = tls.ServerConfig.init(sys.alloc);
-    let chain = try sys.fs.read_file(sys.args.get(3), sys.alloc);
-    try config.certificates_pem(chain.view(), sys.alloc);
-    let key = try sys.fs.read_file(sys.args.get(4), sys.alloc);
-    try config.private_key_pem(key.view(), sys.alloc);
-    config.accept_protocol("h2");
-    config.accept_protocol("http/1.1");
+    if not plain {
+        let chain = try sys.fs.read_file(sys.args.get(3), sys.alloc);
+        try config.certificates_pem(chain.view(), sys.alloc);
+        let key = try sys.fs.read_file(sys.args.get(4), sys.alloc);
+        try config.private_key_pem(key.view(), sys.alloc);
+        config.accept_protocol("h2");
+        config.accept_protocol("http/1.1");
+    }
     var workers = sys.proc.cpu_count();
-    if sys.args.len() == 6 {
-        workers = number(sys.args.get(5)) as u32;
+    if sys.args.len() == rest + 1 {
+        workers = number(sys.args.get(rest)) as u32;
     }
     sys.proc.ignore_broken_pipe();
     // A worker per processor, each accepting on the one listener.
@@ -207,5 +215,9 @@ fn main(sys: &mut std.System) -> !void {
             });
         });
     };
+    if plain {
+        try server.serve(&listener, handler: &handler, options: server.Options.init(), proc: &sys.proc, sys.alloc);
+        return;
+    }
     try server.serve_tls(&listener, config: &config, handler: &handler, options: server.Options.init(), proc: &sys.proc, seeds: random.Csprng.init(&mut sys.rand), sys.alloc);
 }

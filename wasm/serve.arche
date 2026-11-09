@@ -1,0 +1,222 @@
+/// WASM modules as HTTP handlers (docs/sprints.md S33): `arche-wasm serve`
+/// answers HTTPS requests by a module's handle, in its sandbox. The module
+/// exports memory, alloc and handle; the server writes "METHOD TARGET\n"
+/// and the body into memory alloc gives, and handle gives back where its
+/// response is, ptr << 32 | len: "STATUS CONTENT-TYPE\n" and the body.
+///
+/// It reaches the host only by what it imports, and the server gives two
+/// things: arche.log(ptr, len), a line on standard error, and
+/// arche.now_ms(), the wall clock at the request's start. A module that
+/// imports anything else is refused. Each request has 100 ms and the module
+/// 64 MiB of memory; past either, or on a trap, the answer is 503 and the
+/// module starts again from a new instance.
+import alloc;
+import exec;
+import module as m;
+
+pub const BUDGET_NS: u64 = 100000000;
+pub const MAX_MEMORY: u64 = 64 << 20;
+
+/// The host functions a handler may import, by id.
+const HOST_LOG: u32 = 0;
+const HOST_NOW: u32 = 1;
+
+/// What the server gives a module: the time at the request's start, and
+/// a place for the lines it logs.
+pub type Imports = struct {
+    instance: u32,
+    pub now_ms: i64,
+    pub log: alloc.String,
+}
+
+/// A worker's handler: its store, and what the host gives it.
+pub type Handler = struct {
+    pub store: exec.Store,
+    pub imports: Imports,
+    alloc_fn: u32,
+    handle_fn: u32,
+    a: alloc.Allocator,
+}
+
+impl exec.Host for Imports {
+    fn call(self: &mut Imports, store: &mut exec.Store, id: u32, args: []u64, results: []mut u64) -> exec.Trap!void {
+        if id == HOST_NOW {
+            results[0] = self.now_ms as% u64;
+            return;
+        }
+        // log(ptr, len): from the caller's memory, at most a line's worth.
+        let at = args[0] & 0xFFFFFFFF;
+        var len = args[1] & 0xFFFFFFFF;
+        if len > 1024 {
+            len = 1024;
+        }
+        let maddr = store.instances.items()[self.instance as usize].memories.items()[0];
+        let data = store.memories.items()[maddr as usize].data.items();
+        if at + len > data.len() as u64 {
+            return exec.Trap.MemoryOutOfBounds;
+        }
+        if self.log.len() < 65536 {
+            _ = self.log.push_utf8(data[at as usize..(at + len) as usize]);
+            self.log.push_str("\n");
+        }
+    }
+}
+
+pub type LoadError = error { Malformed, Invalid, Unlinkable, Trapped, NoExports }
+
+/// A handler of the module in bytes: instantiated, its imports checked
+/// against what the server gives.
+pub fn load(bytes: []u8, a: alloc.Allocator) -> LoadError!Handler {
+    var limits = exec.default_limits();
+    limits.memory_bytes = MAX_MEMORY;
+    limits.trap = true;
+    var h = Handler { store: exec.new_store(limits, a), imports: Imports { instance: 0, now_ms: 0, log: alloc.String.init(a) }, alloc_fn: 0, handle_fn: 0, a: a };
+    let module = match exec.add_module(&mut h.store, bytes) {
+        ok(x) => { x }
+        err(e) => {
+            if e == m.LoadError.Malformed {
+                return LoadError.Malformed;
+            }
+            return LoadError.Invalid;
+        }
+    };
+    let i32_t: [2]u8 = [m.I32, m.I32];
+    let i64_t: [1]u8 = [m.I64];
+    let none_t: [0]u8 = [];
+    let log = exec.add_host_func(&mut h.store, params: i32_t[0..2], results: none_t[0..0], id: HOST_LOG);
+    let now = exec.add_host_func(&mut h.store, params: none_t[0..0], results: i64_t[0..1], id: HOST_NOW);
+    var externs = alloc.List(exec.Extern).init(a);
+    for imp in h.store.modules.items()[module as usize].imports.items() {
+        if not imp.module.view().eq("arche") or imp.kind != m.EXTERN_FUNC {
+            return LoadError.Unlinkable;
+        }
+        if imp.name.view().eq("log") {
+            externs.push(exec.Extern { kind: m.EXTERN_FUNC, addr: log });
+        } else if imp.name.view().eq("now_ms") {
+            externs.push(exec.Extern { kind: m.EXTERN_FUNC, addr: now });
+        } else {
+            return LoadError.Unlinkable;
+        }
+    }
+    let inst = match exec.instantiate(&mut h.store, &mut h.imports, now: fn [] () -> u64 { return 0; }, module: module, externs.items()) {
+        ok(x) => { x }
+        err(e) => {
+            if e == exec.Trap.Unlinkable {
+                return LoadError.Unlinkable;
+            }
+            return LoadError.Trapped;
+        }
+    };
+    h.imports.instance = inst;
+    let af = exec.export_of(&h.store, instance: inst, name: "alloc") orelse return LoadError.NoExports;
+    let hf = exec.export_of(&h.store, instance: inst, name: "handle") orelse return LoadError.NoExports;
+    _ = exec.export_of(&h.store, instance: inst, name: "memory") orelse return LoadError.NoExports;
+    h.alloc_fn = af.addr;
+    h.handle_fn = hf.addr;
+    return h;
+}
+
+/// What a request came to: a status, its content type and the body, or a
+/// trap, and the trap's message.
+pub type Answer = struct {
+    pub status: u16,
+    pub content_type: alloc.String,
+    pub body: alloc.List(u8),
+    pub trapped: bool,
+    pub why: alloc.String,
+}
+
+fn memory_of(h: &Handler) -> u32 {
+    return h.store.instances.items()[h.imports.instance as usize].memories.items()[0];
+}
+
+fn copy_in(store: &mut exec.Store, memory: u32, at: u64, bytes: []u8) -> bool {
+    let data = store.memories.items_mut()[memory as usize].data.items_mut();
+    if at + bytes.len() as u64 > data.len() as u64 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < bytes.len() : (i += 1) {
+        data[at as usize + i] = bytes[i];
+    }
+    return true;
+}
+
+/// Runs the module's handle on a request, within the budget by now.
+pub fn run(h: &mut Handler, now: &dyn fn() -> u64, method: str, target: str, body: []u8, a: alloc.Allocator) -> Answer {
+    var answer = Answer { status: 500, content_type: alloc.String.init(a), body: alloc.List(u8).init(a), trapped: true, why: alloc.String.init(a) };
+    var request = alloc.List(u8).init(a);
+    for b in method.bytes() {
+        request.push(b.*);
+    }
+    request.push(' ');
+    for b in target.bytes() {
+        request.push(b.*);
+    }
+    request.push('\n');
+    for b in body {
+        request.push(b.*);
+    }
+    var results = alloc.List(u64).init(a);
+    h.store.deadline_ns = now() + BUDGET_NS;
+    let size: [1]u64 = [request.len() as u64];
+    let at = match exec.invoke(&mut h.store, &mut h.imports, now, func: h.alloc_fn, size[0..1], &mut results) {
+        ok(_) => { results.items()[0] & 0xFFFFFFFF }
+        err(e) => {
+            answer.why.push_str(exec.message(e));
+            return answer;
+        }
+    };
+    let maddr = memory_of(h);
+    if not copy_in(&mut h.store, memory: maddr, at: at, bytes: request.items()) {
+        answer.why.push_str("alloc gave memory the module does not have");
+        return answer;
+    }
+    let args: [2]u64 = [at, request.len() as u64];
+    let packed = match exec.invoke(&mut h.store, &mut h.imports, now, func: h.handle_fn, args[0..2], &mut results) {
+        ok(_) => { results.items()[0] }
+        err(e) => {
+            h.store.deadline_ns = 0;
+            answer.why.push_str(exec.message(e));
+            return answer;
+        }
+    };
+    h.store.deadline_ns = 0;
+    let ptr = packed >> 32;
+    let len = packed & 0xFFFFFFFF;
+    let data = h.store.memories.items()[maddr as usize].data.items();
+    if ptr + len > data.len() as u64 {
+        answer.why.push_str("the response is outside the module's memory");
+        return answer;
+    }
+    let resp = data[ptr as usize..(ptr + len) as usize];
+    // "STATUS CONTENT-TYPE" and a newline, then the body.
+    var i: usize = 0;
+    var status: u16 = 0;
+    while i < resp.len() and resp[i] >= '0' and resp[i] <= '9' and status < 1000 {
+        status = status * 10 + (resp[i] - '0') as u16;
+        i += 1;
+    }
+    if status < 100 or status > 599 or i >= resp.len() or resp[i] != ' ' {
+        answer.why.push_str("the response does not start with a status");
+        return answer;
+    }
+    i += 1;
+    let type_start = i;
+    while i < resp.len() and resp[i] != '\n' {
+        i += 1;
+    }
+    if not answer.content_type.push_utf8(resp[type_start..i]) {
+        answer.why.push_str("the content type is not text");
+        return answer;
+    }
+    if i < resp.len() {
+        i += 1;
+    }
+    for b in resp[i..resp.len()] {
+        answer.body.push(b.*);
+    }
+    answer.status = status;
+    answer.trapped = false;
+    return answer;
+}

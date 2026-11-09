@@ -1,0 +1,169 @@
+/// A load generator for HTTP/1.1 (docs/sprints.md S33): connections at once,
+/// each a task on a keep-alive connection, each sending requests one after
+/// another and timing each from the first byte sent to the last received.
+/// Writes how many requests a second the server answered, and the latency
+/// at the 50th and 99th percentiles, in microseconds.
+///
+/// Usage: load <port> <path> <connections> <requests per connection>
+import alloc;
+import std;
+import std.task;
+
+fn number(text: str) -> u64 {
+    var v: u64 = 0;
+    for c in text.bytes() {
+        if c.* >= '0' and c.* <= '9' and v < 1000000000 {
+            v = v * 10 + (c.* - '0') as u64;
+        }
+    }
+    return v;
+}
+
+/// The value of Content-Length in a head, or none.
+fn content_length(head: []u8) -> ?usize {
+    let name = "content-length:".bytes();
+    var i: usize = 0;
+    while i + name.len() <= head.len() : (i += 1) {
+        var hit = true;
+        var k: usize = 0;
+        while k < name.len() : (k += 1) {
+            var c = head[i + k];
+            if c >= 'A' and c <= 'Z' {
+                c = c + 32;
+            }
+            if c != name[k] {
+                hit = false;
+                break;
+            }
+        }
+        if hit {
+            var n: usize = 0;
+            var j = i + name.len();
+            while j < head.len() and head[j] != '\r' {
+                if head[j] >= '0' and head[j] <= '9' {
+                    n = n * 10 + (head[j] - '0') as usize;
+                }
+                j += 1;
+            }
+            return n;
+        }
+    }
+    return none;
+}
+
+/// Where the head ends (after the blank line), or none yet.
+fn head_end(b: []u8) -> ?usize {
+    var i: usize = 0;
+    while i + 4 <= b.len() : (i += 1) {
+        if b[i] == '\r' and b[i + 1] == '\n' and b[i + 2] == '\r' and b[i + 3] == '\n' {
+            return i + 4;
+        }
+    }
+    return none;
+}
+
+/// One connection's requests; the latencies into its share of the list.
+fn run_connection(net: &std.Net, clock: &std.Clock, port: u16, request: []u8, count: u64, times: &task.Shared(alloc.List(u64)), a: alloc.Allocator) -> !void {
+    var sock = try net.connect(std.Address { ip: [127, 0, 0, 1], port: port });
+    var buf: [65536]u8 = [0; 65536];
+    var mine = alloc.List(u64).init(a);
+    var i: u64 = 0;
+    while i < count : (i += 1) {
+        let start = clock.monotonic_ns();
+        try sock.write(request);
+        var have: usize = 0;
+        var done = false;
+        while not done {
+            let n = try sock.read(buf[have..65536]);
+            if n == 0 {
+                return;
+            }
+            have += n;
+            match head_end(buf[0..have]) {
+                some(end) => {
+                    let len = content_length(buf[0..end]) orelse 0;
+                    if have >= end + len {
+                        done = true;
+                    }
+                }
+                none => { }
+            }
+        }
+        mine.push((clock.monotonic_ns() - start) / 1000);
+    }
+    sock.close();
+    times.lock(fn [&mine](all: &mut alloc.List(u64)) {
+        for t in mine.items() {
+            all.push(t.*);
+        }
+    });
+}
+
+fn sort(xs: []mut u64) {
+    // Shell sort: enough for some tens of thousands.
+    var gap = xs.len() / 2;
+    while gap > 0 {
+        var i = gap;
+        while i < xs.len() : (i += 1) {
+            let x = xs[i];
+            var j = i;
+            while j >= gap and xs[j - gap] > x {
+                xs[j] = xs[j - gap];
+                j -= gap;
+            }
+            xs[j] = x;
+        }
+        gap = gap / 2;
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() != 5 {
+        sys.stderr.write("usage: load <port> <path> <connections> <requests per connection>\n");
+        sys.proc.exit(2);
+    }
+    let port = number(sys.args.get(1)) as u16;
+    var request = alloc.String.from("GET ", sys.alloc);
+    request.push_str(sys.args.get(2));
+    request.push_str(" HTTP/1.1\r\nhost: localhost\r\n\r\n");
+    let connections = number(sys.args.get(3));
+    let count = number(sys.args.get(4));
+    let times = task.Shared(alloc.List(u64)).init(alloc.List(u64).init(sys.alloc), sys.alloc);
+    let start = sys.clock.monotonic_ns();
+    let net = &sys.net;
+    let clock = &sys.clock;
+    let req = request.view().bytes();
+    let a = sys.alloc;
+    try task.scope(&sys.proc, fn [net, clock, port, req, count, connections, &times, a](s: &mut task.Scope) -> !void {
+        var c: u64 = 0;
+        while c < connections : (c += 1) {
+            let mine = times.share();
+            s.spawn(fn [net, clock, port, req, count, mine, a]() -> !void {
+                try run_connection(net, clock: clock, port: port, request: req, count: count, times: &mine, a: a);
+            });
+        }
+    });
+    let seconds_ns = sys.clock.monotonic_ns() - start;
+    var all = alloc.List(u64).init(sys.alloc);
+    times.lock(fn [&mut all](xs: &mut alloc.List(u64)) {
+        for t in xs.items() {
+            all.push(t.*);
+        }
+    });
+    sort(all.items_mut());
+    let n = all.len();
+    if n == 0 {
+        sys.stderr.write("load: no request was answered\n");
+        sys.proc.exit(1);
+    }
+    let per_second = (n as u64) * 1000000000 / seconds_ns;
+    sys.stdout.write("requests ");
+    sys.stdout.write_u64(n as u64);
+    sys.stdout.write(" per_second ");
+    sys.stdout.write_u64(per_second);
+    sys.stdout.write(" p50_us ");
+    sys.stdout.write_u64(all.items()[n / 2]);
+    sys.stdout.write(" p99_us ");
+    sys.stdout.write_u64(all.items()[n * 99 / 100]);
+    sys.stdout.write("\n");
+}

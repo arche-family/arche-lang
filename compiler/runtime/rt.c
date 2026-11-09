@@ -144,7 +144,17 @@ static void *alloc_bytes(u64 n) {
 typedef struct Chunk {
     struct Chunk *prev;
     u64 size;
+    u64 used;       // bytes handed out, set when the arena moves past it
+    u64 pad;        // keeps what follows 16-byte aligned
 } Chunk;
+
+// Chunks of the smallest size, kept when their region ends for the next
+// one: a server opens a region a request, and mapping fresh pages for each
+// costs a system call and a fault a page. Only the bytes a chunk handed out
+// are zeroed again, when it is taken.
+enum { SPARE_CHUNKS = 64, SMALL_CHUNK = 65536 };
+static Chunk *spare_chunks[SPARE_CHUNKS];
+static u64 spare_chunk_count;
 
 typedef struct Arena {
     u8 *next;
@@ -159,10 +169,23 @@ static void *arena_alloc(Arena *a, u64 n) {
     n = (n + 15) & ~(u64)15;
     if (n > a->left) {
         u64 size = (n + sizeof(Chunk) + 4095) & ~(u64)4095;
-        if (size < 65536) {
-            size = 65536;
+        if (size < SMALL_CHUNK) {
+            size = SMALL_CHUNK;
         }
-        Chunk *c = map_pages(size);
+        if (a->last) {
+            a->last->used = a->last->size - sizeof(Chunk) - a->left;
+        }
+        Chunk *c;
+        if (size == SMALL_CHUNK && spare_chunk_count > 0) {
+            c = spare_chunks[--spare_chunk_count];
+            u8 *body = (u8 *)c + sizeof(Chunk);
+            for (u64 i = 0; i < c->used; i++) {
+                body[i] = 0;
+            }
+        } else {
+            c = map_pages(size);
+        }
+        c->used = 0;
         c->prev = a->last;
         c->size = size;
         a->last = c;
@@ -232,10 +255,17 @@ u64 a0rt_region_begin(void) {
 
 void a0rt_region_end(u64 handle) {
     Arena *a = (Arena *)handle;
+    if (a->last) {
+        a->last->used = a->last->size - sizeof(Chunk) - a->left;
+    }
     Chunk *c = a->last;
     while (c) {
         Chunk *prev = c->prev;
-        os_unmap(c, c->size);
+        if (c->size == SMALL_CHUNK && spare_chunk_count < SPARE_CHUNKS) {
+            spare_chunks[spare_chunk_count++] = c;
+        } else {
+            os_unmap(c, c->size);
+        }
         c = prev;
     }
     a->free_next = free_arenas;
