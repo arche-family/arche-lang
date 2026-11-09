@@ -4,11 +4,13 @@
 // and traps, which call the program's panic handler. Built per target with
 // clang --target=... -ffreestanding -nostdlib.
 
+// long long, not long: a UEFI application is built for x86_64-windows,
+// where long is 32 bits (LLP64); long long is 64 everywhere.
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
-typedef unsigned long u64;
-typedef long i64;
+typedef unsigned long long u64;
+typedef long long i64;
 
 typedef struct {
     const u8 *ptr;
@@ -126,7 +128,7 @@ u8 a0rt_str_starts_with(const u8 *a, u64 an, const u8 *b, u64 bn) {
 // and its memory goes when the outer region ends.
 
 #ifndef A0_HEAP_SIZE
-#define A0_HEAP_SIZE (4UL << 20)
+#define A0_HEAP_SIZE ((u64)4 << 20)
 #endif
 
 enum { MAX_REGIONS = 64 };
@@ -145,7 +147,7 @@ void *a0rt_alloc_in(u64 handle, u64 n) {
     for (u32 i = (u32)handle; i < depth; i++) {
         pinned[i] = 1; // regions inside this one end above its memory
     }
-    n = (n + 15) & ~15UL;
+    n = (n + 15) & ~(u64)15;
     if (n == 0) {
         n = 16;
     }
