@@ -318,6 +318,24 @@ pub type Fs = struct {
         }
     }
 
+    /// A file opened to read and write anywhere in it: made, empty, when
+    /// create is set and it is not there.
+    pub fn open(self: &Fs, path: str, create: bool) -> FsError!File {
+        var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if not win.wide(path, buf[0..PATH_UNITS]) {
+            return FsError.NotFound;
+        }
+        var disposition = win.OPEN_EXISTING;
+        if create {
+            disposition = win.OPEN_ALWAYS;
+        }
+        let it = win.open_file(buf[0..PATH_UNITS], access: win.GENERIC_READ | win.GENERIC_WRITE, share: win.FILE_SHARE_ALL, disposition: disposition, inherit: false);
+        if it == win.INVALID_HANDLE {
+            return last_fs_error();
+        }
+        return File { handle: it, unique: core.Unique { } };
+    }
+
     pub fn make_dir(self: &Fs, path: str) -> FsError!void {
         var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
         if not win.wide(path, buf[0..PATH_UNITS]) {
@@ -1033,6 +1051,70 @@ pub type Net = struct {
             return net_error(e);
         }
         return Listener { fd: s, unique: core.Unique { } };
+    }
+}
+
+/// A file open to read and write at offsets (Fs.open): what a database keeps
+/// its pages and its log in. Nothing is buffered: a write is the system's
+/// once it returns, and on the disk once sync returns.
+pub type File = struct {
+    handle: i64,
+    unique: core.Unique,
+
+    /// Reads into from offset: how many bytes, fewer only at the end.
+    pub fn read_at(self: &File, offset: u64, into: []mut u8) -> FsError!usize {
+        var done: usize = 0;
+        while done < into.len() {
+            let n = win.read_at(self.handle, offset: offset + done as u64, into: into[done..into.len()]);
+            if n < 0 {
+                return last_fs_error();
+            }
+            if n == 0 {
+                break;
+            }
+            done += n as usize;
+        }
+        return done;
+    }
+
+    /// Writes all of data at offset.
+    pub fn write_at(self: &File, offset: u64, data: []u8) -> FsError!void {
+        var done: usize = 0;
+        while done < data.len() {
+            let n = win.write_at(self.handle, offset: offset + done as u64, data: data[done..data.len()]);
+            if n <= 0 {
+                return last_fs_error();
+            }
+            done += n as usize;
+        }
+    }
+
+    /// The file's size in bytes.
+    pub fn size(self: &File) -> FsError!u64 {
+        let n = win.file_size(self.handle);
+        if n < 0 {
+            return last_fs_error();
+        }
+        return n as u64;
+    }
+
+    /// Cuts the file, or extends it with zeros, to size bytes.
+    pub fn truncate(self: &File, size: u64) -> FsError!void {
+        if not win.set_size(self.handle, size: size) {
+            return last_fs_error();
+        }
+    }
+
+    /// Returns once what was written is on the disk.
+    pub fn sync(self: &File) -> FsError!void {
+        if not win.flush(self.handle) {
+            return FsError.IoFailed;
+        }
+    }
+
+    pub fn close(self: &mut File) {
+        win.close(self.handle);
+        self.handle = win.INVALID_HANDLE;
     }
 }
 

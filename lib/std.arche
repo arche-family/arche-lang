@@ -320,6 +320,29 @@ pub type Fs = struct {
         }
     }
 
+    /// A file opened to read and write anywhere in it: made, empty, when
+    /// create is set and it is not there.
+    pub fn open(self: &Fs, path: str, create: bool) -> FsError!File {
+        var buf: [4096]u8 = [0; 4096];
+        if not linux.c_path(path, buf[0..4096]) {
+            return FsError.NotFound;
+        }
+        // O_RDWR | O_CLOEXEC, and O_CREAT when asked.
+        var flags: i64 = 0x80002;
+        if create {
+            flags = flags | 0x40;
+        }
+        var fd: i64 = 0;
+        unsafe {
+            // SAFETY: the path is NUL-terminated in buf; mode 0644.
+            fd = linux.syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), flags, 0x1A4, 0, 0]);
+        }
+        if linux.errno(fd) != 0 {
+            return errno_error(linux.errno(fd));
+        }
+        return File { fd: fd, unique: core.Unique { } };
+    }
+
     pub fn make_dir(self: &Fs, path: str) -> FsError!void {
         try self.make_dir_with(path, mode: 0x1ED);
     }
@@ -1094,6 +1117,101 @@ pub type Net = struct {
             }
         }
         return Listener { fd: fd, unique: core.Unique { } };
+    }
+}
+
+/// A file open to read and write at offsets (Fs.open): what a database keeps
+/// its pages and its log in. Nothing is buffered: a write is the system's
+/// once it returns, and on the disk once sync returns.
+pub type File = struct {
+    fd: i64,
+    unique: core.Unique,
+
+    /// Reads into from offset: how many bytes, fewer only at the end.
+    pub fn read_at(self: &File, offset: u64, into: []mut u8) -> FsError!usize {
+        var done: usize = 0;
+        while done < into.len() {
+            var r: i64 = 0;
+            unsafe {
+                // SAFETY: pread writes at most the bytes left of into.
+                r = linux.syscall(linux.PREAD64, [self.fd, linux.arg(u8, &into[done] as *u8), (into.len() - done) as i64, (offset + done as u64) as i64, 0, 0]);
+            }
+            if linux.errno(r) == linux.EINTR {
+                continue;
+            }
+            if linux.errno(r) != 0 {
+                return errno_error(linux.errno(r));
+            }
+            if r == 0 {
+                break;
+            }
+            done += r as usize;
+        }
+        return done;
+    }
+
+    /// Writes all of data at offset.
+    pub fn write_at(self: &File, offset: u64, data: []u8) -> FsError!void {
+        var done: usize = 0;
+        while done < data.len() {
+            var r: i64 = 0;
+            unsafe {
+                // SAFETY: pwrite reads the bytes left of data.
+                r = linux.syscall(linux.PWRITE64, [self.fd, linux.arg(u8, &data[done] as *u8), (data.len() - done) as i64, (offset + done as u64) as i64, 0, 0]);
+            }
+            if linux.errno(r) == linux.EINTR {
+                continue;
+            }
+            if linux.errno(r) != 0 {
+                return errno_error(linux.errno(r));
+            }
+            done += r as usize;
+        }
+    }
+
+    /// The file's size in bytes.
+    pub fn size(self: &File) -> FsError!u64 {
+        var r: i64 = 0;
+        unsafe {
+            // SAFETY: lseek to the end (SEEK_END, 2) reads nothing.
+            r = linux.syscall(linux.LSEEK, [self.fd, 0, 2, 0, 0, 0]);
+        }
+        if linux.errno(r) != 0 {
+            return errno_error(linux.errno(r));
+        }
+        return r as u64;
+    }
+
+    /// Cuts the file, or extends it with zeros, to size bytes.
+    pub fn truncate(self: &File, size: u64) -> FsError!void {
+        var r: i64 = 0;
+        unsafe {
+            // SAFETY: ftruncate of the file this holds.
+            r = linux.syscall(linux.FTRUNCATE, [self.fd, size as i64, 0, 0, 0, 0]);
+        }
+        if linux.errno(r) != 0 {
+            return errno_error(linux.errno(r));
+        }
+    }
+
+    /// Returns once what was written is on the disk.
+    pub fn sync(self: &File) -> FsError!void {
+        var r: i64 = 0;
+        unsafe {
+            // SAFETY: fsync of the file this holds.
+            r = linux.syscall(linux.FSYNC, [self.fd, 0, 0, 0, 0, 0]);
+        }
+        if linux.errno(r) != 0 {
+            return errno_error(linux.errno(r));
+        }
+    }
+
+    pub fn close(self: &mut File) {
+        unsafe {
+            // SAFETY: the file is not used after this.
+            _ = linux.syscall(linux.CLOSE, [self.fd, 0, 0, 0, 0, 0]);
+        }
+        self.fd = -1;
     }
 }
 

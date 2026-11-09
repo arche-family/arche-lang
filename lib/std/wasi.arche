@@ -23,6 +23,10 @@ extern "c" fn wasi_fd_write(fd: u32, iovs: u32, count: u32, written: u32) -> u32
 extern "c" fn wasi_fd_read(fd: u32, iovs: u32, count: u32, read: u32) -> u32;
 extern "c" fn wasi_fd_close(fd: u32) -> u32;
 extern "c" fn wasi_fd_sync(fd: u32) -> u32;
+extern "c" fn wasi_fd_pread(fd: u32, iovs: u32, count: u32, offset: u64, read: u32) -> u32;
+extern "c" fn wasi_fd_pwrite(fd: u32, iovs: u32, count: u32, offset: u64, written: u32) -> u32;
+extern "c" fn wasi_fd_filestat_get(fd: u32, out: u32) -> u32;
+extern "c" fn wasi_fd_filestat_set_size(fd: u32, size: u64) -> u32;
 extern "c" fn wasi_fd_readdir(fd: u32, buf: u32, size: u32, cookie: u64, used: u32) -> u32;
 extern "c" fn wasi_fd_prestat_get(fd: u32, out: u32) -> u32;
 extern "c" fn wasi_fd_prestat_dir_name(fd: u32, path: u32, size: u32) -> u32;
@@ -103,6 +107,34 @@ pub fn fd_prestat_dir_name(fd: u32, path: u32, size: u32) -> u32 {
     unsafe {
         // SAFETY: as fd_write.
         return wasi_fd_prestat_dir_name(fd: fd, path: path, size: size);
+    }
+}
+
+pub fn fd_pread(fd: u32, iovs: u32, count: u32, offset: u64, read: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_read.
+        return wasi_fd_pread(fd: fd, iovs: iovs, count: count, offset: offset, read: read);
+    }
+}
+
+pub fn fd_pwrite(fd: u32, iovs: u32, count: u32, offset: u64, written: u32) -> u32 {
+    unsafe {
+        // SAFETY: as fd_write.
+        return wasi_fd_pwrite(fd: fd, iovs: iovs, count: count, offset: offset, written: written);
+    }
+}
+
+pub fn fd_filestat_get(fd: u32, out: u32) -> u32 {
+    unsafe {
+        // SAFETY: out is a filestat of 64 bytes.
+        return wasi_fd_filestat_get(fd: fd, out: out);
+    }
+}
+
+pub fn fd_filestat_set_size(fd: u32, size: u64) -> u32 {
+    unsafe {
+        // SAFETY: no memory is touched.
+        return wasi_fd_filestat_set_size(fd: fd, size: size);
     }
 }
 

@@ -1,0 +1,150 @@
+// test: run
+// spec: kv (docs/sprints.md S33)
+// stage0: skip
+// stdout: same after 20000 operations: true
+// stdout: in order: true, pages over 100: true
+// stdout: same after reopening: true
+// stdout: too large: true
+// wasm: skip
+import alloc;
+import kv;
+import std;
+
+/// A key whose bytes sort as its number does.
+fn key_of(n: u64, out: &mut alloc.List(u8)) {
+    out.clear();
+    var shift: u64 = 64;
+    while shift > 0 {
+        shift -= 8;
+        out.push(((n >> shift) & 0xFF) as u8);
+    }
+}
+
+/// A value of a length that varies with the key and its round, so that
+/// pages split unevenly.
+fn value_of(n: u64, round: u64, out: &mut alloc.List(u8)) {
+    out.clear();
+    var len = (n * 7 + round) % 300 + 1;
+    while len > 0 : (len -= 1) {
+        out.push((97 + (n + len + round) % 26) as u8);
+    }
+}
+
+fn same_bytes(x: []u8, y: []u8) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.len() : (i += 1) {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether the store holds exactly what the map says: each key's value is
+/// the one of its round.
+fn agrees(db: &mut kv.Db, want: &alloc.Map(u64, u64), a: alloc.Allocator) -> bool {
+    var key = alloc.List(u8).init(a);
+    var expected = alloc.List(u8).init(a);
+    var got = alloc.List(u8).init(a);
+    var n: u64 = 0;
+    while n < 3000 : (n += 1) {
+        key_of(n, out: &mut key);
+        let found = db.get(key.items(), value: &mut got) catch return false;
+        match want.get(n) {
+            some(round) => {
+                value_of(n: n, round: round, out: &mut expected);
+                if not found or not same_bytes(x: got.items(), y: expected.items()) {
+                    return false;
+                }
+            }
+            none => {
+                if found {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let tmp = try sys.fs.temp_dir(&sys.env, sys.alloc);
+    var path = alloc.String.from(tmp.view(), sys.alloc);
+    path.push_str("/arche-kv-btree-");
+    path.push_u64(sys.proc.pid() as u64);
+    var wal = alloc.String.from(path.view(), sys.alloc);
+    wal.push_str("-wal");
+    _ = sys.fs.remove(path.view());
+    _ = sys.fs.remove(wal.view());
+    var db = try kv.open(&sys.fs, path.view(), sys.alloc);
+    var want = alloc.Map(u64, u64).init(sys.alloc);
+    var key = alloc.List(u8).init(sys.alloc);
+    var value = alloc.List(u8).init(sys.alloc);
+    var seed: u64 = 0x9E3779B97F4A7C15;
+    var op: u64 = 0;
+    while op < 20000 : (op += 1) {
+        seed = seed ^ (seed << 13);
+        seed = seed ^ (seed >> 7);
+        seed = seed ^ (seed << 17);
+        let n = seed % 3000;
+        key_of(n, out: &mut key);
+        if (seed >> 32) % 10 < 7 {
+            value_of(n: n, round: op, out: &mut value);
+            try db.put(key: key.items(), value: value.items());
+            want.put(key: n, value: op);
+        } else {
+            _ = try db.delete(key.items());
+            _ = want.remove(n);
+        }
+        if op % 100 == 99 {
+            try db.commit();
+        }
+    }
+    sys.stdout.write("same after 20000 operations: ");
+    sys.stdout.write(if agrees(&mut db, want: &want, sys.alloc) { "true\n" } else { "false\n" });
+    // Every key, in order, by next.
+    var count: usize = 0;
+    var ordered = true;
+    var last: i64 = -1;
+    var at = alloc.List(u8).init(sys.alloc);
+    var inclusive = true;
+    while try db.next(at.items(), inclusive: inclusive, key: &mut key, value: &mut value) {
+        var n: u64 = 0;
+        for b in key.items() {
+            n = (n << 8) | b.* as u64;
+        }
+        if n as i64 <= last {
+            ordered = false;
+        }
+        last = n as i64;
+        count += 1;
+        at.clear();
+        for b in key.items() {
+            at.push(b.*);
+        }
+        inclusive = false;
+    }
+    sys.stdout.write("in order: ");
+    sys.stdout.write(if ordered and count == want.len() { "true" } else { "false" });
+    sys.stdout.write(", pages over 100: ");
+    sys.stdout.write(if db.page_count() > 100 { "true\n" } else { "false\n" });
+    try db.close();
+    var again = try kv.open(&sys.fs, path.view(), sys.alloc);
+    sys.stdout.write("same after reopening: ");
+    sys.stdout.write(if agrees(&mut again, want: &want, sys.alloc) { "true\n" } else { "false\n" });
+    var big = alloc.List(u8).init(sys.alloc);
+    while big.len() < 600 {
+        big.push(120);
+    }
+    sys.stdout.write("too large: ");
+    match again.put(key: big.items(), value: big.items()) {
+        ok(_) => { sys.stdout.write("false\n"); }
+        err(e) => { sys.stdout.write(if e == kv.KvError.TooLarge { "true\n" } else { "false\n" }); }
+    }
+    try again.close();
+    _ = sys.fs.remove(path.view());
+    _ = sys.fs.remove(wal.view());
+}

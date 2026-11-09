@@ -1,0 +1,161 @@
+/// The KV store under SIGKILL (docs/sprints.md S33).
+///
+///   kvcrash write <path>     commits transaction after transaction, each of
+///                            ten keys, and writes each one's number once its
+///                            commit has returned, until it is killed
+///   kvcrash check <path> <n> transactions 0 to n were committed: each must
+///                            be there whole, and every other one whole or
+///                            not at all; writes "ok" and how many are there
+import alloc;
+import kv;
+import std;
+
+const PER: u64 = 10;
+
+/// Key i of transaction t: eight bytes that sort as the number does.
+fn key_of(t: u64, i: u64, out: &mut alloc.List(u8)) {
+    out.clear();
+    let n = t * PER + i;
+    var shift: u64 = 64;
+    while shift > 0 {
+        shift -= 8;
+        out.push(((n >> shift) & 0xFF) as u8);
+    }
+}
+
+/// Its value: the key, then filler of a length that varies.
+fn value_of(t: u64, i: u64, out: &mut alloc.List(u8)) {
+    key_of(t: t, i: i, out: out);
+    var len = (t * 31 + i * 7) % 200;
+    while len > 0 : (len -= 1) {
+        out.push((97 + (t + len) % 26) as u8);
+    }
+}
+
+fn number(text: str) -> u64 {
+    var v: u64 = 0;
+    for c in text.bytes() {
+        if c.* >= '0' and c.* <= '9' {
+            v = v * 10 + (c.* - '0') as u64;
+        }
+    }
+    return v;
+}
+
+fn same(x: []u8, y: []u8) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.len() : (i += 1) {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The key that says where the next transaction starts: written with each
+/// one, so a writer started again goes on from there.
+fn next_key() -> str {
+    return "next";
+}
+
+fn write(sys: &mut std.System, path: str) -> !void {
+    var db = try kv.open(&sys.fs, path, sys.alloc);
+    var key = alloc.List(u8).init(sys.alloc);
+    var value = alloc.List(u8).init(sys.alloc);
+    var t: u64 = 0;
+    if try db.get(next_key().bytes(), value: &mut value) {
+        for b in value.items() {
+            t = (t << 8) | b.* as u64;
+        }
+    }
+    while true : (t += 1) {
+        var i: u64 = 0;
+        while i < PER : (i += 1) {
+            key_of(t: t, i: i, out: &mut key);
+            value_of(t: t, i: i, out: &mut value);
+            try db.put(key: key.items(), value: value.items());
+        }
+        value.clear();
+        var shift: u64 = 64;
+        while shift > 0 {
+            shift -= 8;
+            value.push(((t + 1) >> shift & 0xFF) as u8);
+        }
+        try db.put(key: next_key().bytes(), value: value.items());
+        try db.commit();
+        sys.stdout.write_u64(t);
+        sys.stdout.write("\n");
+        sys.stdout.flush();
+    }
+}
+
+fn check(sys: &mut std.System, path: str, committed: u64) -> !void {
+    var db = try kv.open(&sys.fs, path, sys.alloc);
+    var key = alloc.List(u8).init(sys.alloc);
+    var want = alloc.List(u8).init(sys.alloc);
+    var got = alloc.List(u8).init(sys.alloc);
+    var whole: u64 = 0;
+    var t: u64 = 0;
+    // Past the last transaction there may be one more, whole; past that, none.
+    while t <= committed + 2 : (t += 1) {
+        var present: u64 = 0;
+        var i: u64 = 0;
+        while i < PER : (i += 1) {
+            key_of(t: t, i: i, out: &mut key);
+            value_of(t: t, i: i, out: &mut want);
+            if try db.get(key.items(), value: &mut got) {
+                if not same(x: got.items(), y: want.items()) {
+                    sys.stdout.write("FAIL: transaction ");
+                    sys.stdout.write_u64(t);
+                    sys.stdout.write(" has a wrong value\n");
+                    sys.proc.exit(1);
+                }
+                present += 1;
+            }
+        }
+        if present != 0 and present != PER {
+            sys.stdout.write("FAIL: transaction ");
+            sys.stdout.write_u64(t);
+            sys.stdout.write(" is there in part\n");
+            sys.proc.exit(1);
+        }
+        if t <= committed and present != PER {
+            sys.stdout.write("FAIL: committed transaction ");
+            sys.stdout.write_u64(t);
+            sys.stdout.write(" is lost\n");
+            sys.proc.exit(1);
+        }
+        if t > committed + 1 and present != 0 {
+            sys.stdout.write("FAIL: transaction ");
+            sys.stdout.write_u64(t);
+            sys.stdout.write(" was never committed\n");
+            sys.proc.exit(1);
+        }
+        if present == PER {
+            whole += 1;
+        }
+    }
+    try db.close();
+    sys.stdout.write("ok ");
+    sys.stdout.write_u64(whole);
+    sys.stdout.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() == 3 and sys.args.get(1).eq("write") {
+        let path = alloc.String.from(sys.args.get(2), sys.alloc);
+        try write(sys, path: path.view());
+        return;
+    }
+    if sys.args.len() == 4 and sys.args.get(1).eq("check") {
+        let path = alloc.String.from(sys.args.get(2), sys.alloc);
+        let committed = number(sys.args.get(3));
+        try check(sys, path: path.view(), committed: committed);
+        return;
+    }
+    sys.stderr.write("usage: kvcrash write <path> | kvcrash check <path> <last committed>\n");
+    sys.proc.exit(2);
+}

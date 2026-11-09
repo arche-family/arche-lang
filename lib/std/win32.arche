@@ -38,6 +38,7 @@ pub const GENERIC_WRITE: u32 = 0x40000000;
 pub const FILE_SHARE_ALL: u32 = 7;
 pub const CREATE_ALWAYS: u32 = 2;
 pub const OPEN_EXISTING: u32 = 3;
+pub const OPEN_ALWAYS: u32 = 4;
 pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 pub const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
@@ -139,6 +140,10 @@ extern "c" fn FlushFileBuffers(it: i64) -> i32;
 extern "c" fn GetStdHandle(which: u32) -> i64;
 extern "c" fn CreateFileW(path: *u16, access: u32, share: u32, security: *u8, disposition: u32, flags: u32, from: i64) -> i64;
 extern "c" fn ReadFile(file: i64, into: *mut u8, n: u32, got: *mut u32, overlapped: *u8) -> i32;
+extern "c" fn WriteFile(file: i64, data: *u8, n: u32, wrote: *mut u32, overlapped: *u8) -> i32;
+extern "c" fn GetFileSizeEx(file: i64, size: *mut i64) -> i32;
+extern "c" fn SetFilePointerEx(file: i64, to: i64, now: *mut i64, how: u32) -> i32;
+extern "c" fn SetEndOfFile(file: i64) -> i32;
 extern "c" fn PeekNamedPipe(pipe: i64, into: *mut u8, n: u32, read: *mut u32, waiting: *mut u32, left: *mut u32) -> i32;
 extern "c" fn GetConsoleMode(it: i64, mode: *mut u32) -> i32;
 extern "c" fn GetFileAttributesW(path: *u16) -> u32;
@@ -370,6 +375,77 @@ pub fn read(file: i64, into: []mut u8) -> i64 {
         return -1;
     }
     return got as i64;
+}
+
+/// Where a read or write at an offset happens: OVERLAPPED, with no event.
+type At = struct {
+    internal: u64,
+    internal_high: u64,
+    offset: u32,
+    offset_high: u32,
+    event: i64,
+}
+
+fn offset_at(offset: u64) -> At {
+    return At { internal: 0, internal_high: 0, offset: (offset & 0xFFFFFFFF) as u32, offset_high: (offset >> 32) as u32, event: 0 };
+}
+
+/// Reads into from offset of a file: how many bytes, 0 at the end, or -1.
+pub fn read_at(file: i64, offset: u64, into: []mut u8) -> i64 {
+    var got: u32 = 0;
+    var place = offset_at(offset);
+    var worked: i32 = 0;
+    unsafe {
+        // SAFETY: as read; place says the offset, and the handle is not
+        // overlapped, so the call returns when it is done.
+        worked = ReadFile(file, mem.slice_data(u8, into) as *mut u8, into.len() as u32, &mut got as *mut u32, &mut place as *mut At as *u8);
+    }
+    if worked == 0 {
+        if last_error() == ERROR_HANDLE_EOF {
+            return 0;
+        }
+        return -1;
+    }
+    return got as i64;
+}
+
+/// Writes data at offset of a file: how many bytes, or -1.
+pub fn write_at(file: i64, offset: u64, data: []u8) -> i64 {
+    var wrote: u32 = 0;
+    var place = offset_at(offset);
+    var worked: i32 = 0;
+    unsafe {
+        // SAFETY: WriteFile reads data.len() bytes of data.
+        worked = WriteFile(file, data: mem.slice_data(u8, data), n: data.len() as u32, wrote: &mut wrote as *mut u32, overlapped: &mut place as *mut At as *u8);
+    }
+    if worked == 0 {
+        return -1;
+    }
+    return wrote as i64;
+}
+
+/// A file's size, or -1.
+pub fn file_size(file: i64) -> i64 {
+    var size: i64 = 0;
+    unsafe {
+        // SAFETY: GetFileSizeEx writes one i64.
+        if GetFileSizeEx(file, &mut size as *mut i64) == 0 {
+            return -1;
+        }
+    }
+    return size;
+}
+
+/// Sets a file's size: cut, or grown with zeros.
+pub fn set_size(file: i64, size: u64) -> bool {
+    unsafe {
+        // SAFETY: the file pointer moves to size (FILE_BEGIN, 0) and the
+        // end of the file is set there.
+        if SetFilePointerEx(file: file, to: size as i64, now: mem.null(i64), how: 0) == 0 {
+            return false;
+        }
+        return SetEndOfFile(file) != 0;
+    }
 }
 
 /// How many bytes are waiting in a pipe; -1 when it is not a pipe, and 0

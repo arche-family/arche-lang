@@ -401,6 +401,21 @@ pub type Fs = struct {
     /// Waits until what was written to the file at path is on the disk: what
     /// a power cut leaves. For a directory that is the host's to do, if it
     /// can.
+    /// A file opened to read and write anywhere in it: made, empty, when
+    /// create is set and it is not there.
+    pub fn open(self: &Fs, path: str, create: bool) -> FsError!File {
+        var fd: u32 = 0;
+        var oflags: u32 = 0;
+        if create {
+            oflags = wasi.OFLAG_CREATE;
+        }
+        let e = open_path(path, oflags: oflags, fd: &mut fd);
+        if e != 0 {
+            return fs_error(e);
+        }
+        return File { fd: fd, unique: core.Unique { } };
+    }
+
     pub fn sync(self: &Fs, path: str) -> FsError!void {
         var kind: u8 = 0;
         let found = kind_of(path, kind: &mut kind);
@@ -574,6 +589,77 @@ fn clock_subscription(into: []mut u64, ns: u64) {
 }
 
 /// Time: a clock that only goes forward, the wall clock, and sleeping.
+/// A file open to read and write at offsets (Fs.open): what a database keeps
+/// its pages and its log in. Nothing is buffered: a write is the system's
+/// once it returns, and on the disk once sync returns.
+pub type File = struct {
+    fd: u32,
+    unique: core.Unique,
+
+    /// Reads into from offset: how many bytes, fewer only at the end.
+    pub fn read_at(self: &File, offset: u64, into: []mut u8) -> FsError!usize {
+        var done: usize = 0;
+        while done < into.len() {
+            var iov: [2]u32 = [wasi.of(u8, &into[done]), (into.len() - done) as u32];
+            var got: u32 = 0;
+            let e = wasi.fd_pread(fd: self.fd, iovs: wasi.of(u32, &iov[0]), count: 1, offset: offset + done as u64, read: wasi.of(u32, &got));
+            if e != 0 {
+                return fs_error(e);
+            }
+            if got == 0 {
+                break;
+            }
+            done += got as usize;
+        }
+        return done;
+    }
+
+    /// Writes all of data at offset.
+    pub fn write_at(self: &File, offset: u64, data: []u8) -> FsError!void {
+        var done: usize = 0;
+        while done < data.len() {
+            var iov: [2]u32 = [wasi.of(u8, &data[done]), (data.len() - done) as u32];
+            var wrote: u32 = 0;
+            let e = wasi.fd_pwrite(fd: self.fd, iovs: wasi.of(u32, &iov[0]), count: 1, offset: offset + done as u64, written: wasi.of(u32, &wrote));
+            if e != 0 {
+                return fs_error(e);
+            }
+            done += wrote as usize;
+        }
+    }
+
+    /// The file's size in bytes.
+    pub fn size(self: &File) -> FsError!u64 {
+        // A filestat: device, inode, kind, links, then the size.
+        var stat: [8]u64 = [0; 8];
+        let e = wasi.fd_filestat_get(fd: self.fd, out: wasi.of(u64, &stat[0]));
+        if e != 0 {
+            return fs_error(e);
+        }
+        return stat[4];
+    }
+
+    /// Cuts the file, or extends it with zeros, to size bytes.
+    pub fn truncate(self: &File, size: u64) -> FsError!void {
+        let e = wasi.fd_filestat_set_size(self.fd, size: size);
+        if e != 0 {
+            return fs_error(e);
+        }
+    }
+
+    /// Returns once what was written is on the disk.
+    pub fn sync(self: &File) -> FsError!void {
+        let e = wasi.fd_sync(self.fd);
+        if e != 0 {
+            return fs_error(e);
+        }
+    }
+
+    pub fn close(self: &mut File) {
+        _ = wasi.fd_close(self.fd);
+    }
+}
+
 pub type Clock = struct {
     unique: core.Unique,
 

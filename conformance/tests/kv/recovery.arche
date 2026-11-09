@@ -1,0 +1,121 @@
+// test: run
+// spec: kv (docs/sprints.md S33)
+// stage0: skip
+// stdout: after a crash: committed 20, uncommitted 0
+// stdout: a torn last frame: committed 20, torn 0
+// stdout: a changed byte: committed 20, changed 0
+// stdout: a log of before a checkpoint: 30
+// wasm: skip
+import alloc;
+import kv;
+import std;
+
+fn key_of(n: u64, out: &mut alloc.List(u8)) {
+    out.clear();
+    out.push(107);
+    out.push((48 + n / 100) as u8);
+    out.push((48 + n / 10 % 10) as u8);
+    out.push((48 + n % 10) as u8);
+}
+
+fn put_range(db: &mut kv.Db, from: u64, to: u64, a: alloc.Allocator) -> kv.KvError!void {
+    var key = alloc.List(u8).init(a);
+    var n = from;
+    while n < to : (n += 1) {
+        key_of(n, out: &mut key);
+        try db.put(key: key.items(), value: key.items());
+    }
+}
+
+/// How many of the keys from to to the store holds.
+fn held(db: &mut kv.Db, from: u64, to: u64, a: alloc.Allocator) -> u64 {
+    var key = alloc.List(u8).init(a);
+    var value = alloc.List(u8).init(a);
+    var count: u64 = 0;
+    var n = from;
+    while n < to : (n += 1) {
+        key_of(n, out: &mut key);
+        match db.get(key.items(), value: &mut value) {
+            ok(found) => {
+                if found {
+                    count += 1;
+                }
+            }
+            err(_) => { }
+        }
+    }
+    return count;
+}
+
+fn report(sys: &mut std.System, what: str, first: str, n: u64, second: str, m: u64) {
+    sys.stdout.write(what);
+    sys.stdout.write(": ");
+    sys.stdout.write(first);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(n);
+    sys.stdout.write(", ");
+    sys.stdout.write(second);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(m);
+    sys.stdout.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let tmp = try sys.fs.temp_dir(&sys.env, a);
+    var path = alloc.String.from(tmp.view(), a);
+    path.push_str("/arche-kv-recovery-");
+    path.push_u64(sys.proc.pid() as u64);
+    var wal = alloc.String.from(path.view(), a);
+    wal.push_str("-wal");
+    _ = sys.fs.remove(path.view());
+    _ = sys.fs.remove(wal.view());
+
+    // Two transactions committed, a third not: then the program "crashes",
+    // leaving the store as it is, and the store is opened again.
+    var first = try kv.open(&sys.fs, path.view(), a);
+    try put_range(&mut first, from: 0, to: 10, a);
+    try first.commit();
+    try put_range(&mut first, from: 10, to: 20, a);
+    try first.commit();
+    try put_range(&mut first, from: 20, to: 30, a);
+    var second = try kv.open(&sys.fs, path.view(), a);
+    report(sys, what: "after a crash", first: "committed", n: held(&mut second, from: 0, to: 20, a), second: "uncommitted", m: held(&mut second, from: 20, to: 30, a));
+
+    // A transaction whose last frame is cut short: as if the power went
+    // while the log was written.
+    try put_range(&mut second, from: 20, to: 30, a);
+    try second.commit();
+    var log = try sys.fs.open(wal.view(), create: false);
+    let size = try log.size();
+    try log.truncate(size - 1000);
+    log.close();
+    var third = try kv.open(&sys.fs, path.view(), a);
+    report(sys, what: "a torn last frame", first: "committed", n: held(&mut third, from: 0, to: 20, a), second: "torn", m: held(&mut third, from: 20, to: 30, a));
+
+    // One byte of the last transaction changed: its checksum fails.
+    try put_range(&mut third, from: 20, to: 30, a);
+    try third.commit();
+    var log2 = try sys.fs.open(wal.view(), create: false);
+    let at = (try log2.size()) - 2000;
+    var byte: [1]u8 = [0];
+    _ = try log2.read_at(at, into: byte[0..1]);
+    byte[0] = byte[0] ^ 0x40;
+    try log2.write_at(at, data: byte[0..1]);
+    log2.close();
+    var fourth = try kv.open(&sys.fs, path.view(), a);
+    report(sys, what: "a changed byte", first: "committed", n: held(&mut fourth, from: 0, to: 20, a), second: "changed", m: held(&mut fourth, from: 20, to: 30, a));
+
+    // Frames of a log from before a checkpoint, left behind, are not
+    // replayed: their salt is old.
+    try put_range(&mut fourth, from: 20, to: 30, a);
+    try fourth.commit();
+    try fourth.close();
+    var fifth = try kv.open(&sys.fs, path.view(), a);
+    sys.stdout.write("a log of before a checkpoint: ");
+    sys.stdout.write_u64(held(&mut fifth, from: 0, to: 40, a));
+    sys.stdout.write("\n");
+    try fifth.close();
+    _ = sys.fs.remove(path.view());
+    _ = sys.fs.remove(wal.view());
+}
