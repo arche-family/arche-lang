@@ -1,0 +1,382 @@
+/// The binary format into a Module (the spec's "Binary Format" chapter):
+/// sections in their order, each read to its end. What the format cannot say
+/// is Malformed here; what it can say but validation refuses is left to
+/// validate.arche, except where reading itself must know (an index space's
+/// size).
+import alloc;
+import module as m;
+
+const SECTION_CUSTOM: u8 = 0;
+const SECTION_TYPE: u8 = 1;
+const SECTION_IMPORT: u8 = 2;
+const SECTION_FUNCTION: u8 = 3;
+const SECTION_TABLE: u8 = 4;
+const SECTION_MEMORY: u8 = 5;
+const SECTION_GLOBAL: u8 = 6;
+const SECTION_EXPORT: u8 = 7;
+const SECTION_START: u8 = 8;
+const SECTION_ELEMENT: u8 = 9;
+const SECTION_CODE: u8 = 10;
+const SECTION_DATA: u8 = 11;
+const SECTION_DATA_COUNT: u8 = 12;
+
+/// Where a section stands in the order the format requires: data count comes
+/// between element and code.
+fn rank(id: u8) -> u8 {
+    if id == SECTION_DATA_COUNT {
+        return 10;
+    }
+    if id >= SECTION_CODE {
+        return id + 1;
+    }
+    return id;
+}
+
+/// The module that bytes encode.
+pub fn decode(bytes: []u8, a: alloc.Allocator) -> m.LoadError!m.Module {
+    var mod = m.empty(a);
+    var i: usize = 0;
+    while i < bytes.len() : (i += 1) {
+        mod.bytes.push(bytes[i]);
+    }
+    let b = bytes;
+    var r = m.Reader { at: 0, end: b.len() };
+    let magic = try r.fixed(b, n: 4);
+    if magic != 0x6D736100 {
+        return m.LoadError.Malformed;
+    }
+    let version = try r.fixed(b, n: 4);
+    if version != 1 {
+        return m.LoadError.Malformed;
+    }
+    var last: u8 = 0;
+    var func_count: u32 = 0;
+    var code_seen = false;
+    while not r.done() {
+        let id = try r.byte(b);
+        let size = try r.uleb32(b);
+        if size as usize > r.end - r.at {
+            return m.LoadError.Malformed;
+        }
+        var s = m.Reader { at: r.at, end: r.at + size as usize };
+        r.at = s.end;
+        if id == SECTION_CUSTOM {
+            _ = try s.name(b, a);
+            continue;
+        }
+        if id > SECTION_DATA_COUNT or rank(id) <= last {
+            return m.LoadError.Malformed;
+        }
+        last = rank(id);
+        if id == SECTION_TYPE {
+            try types(&mut mod, b, &mut s, a);
+        } else if id == SECTION_IMPORT {
+            try imports(&mut mod, b, &mut s, a);
+        } else if id == SECTION_FUNCTION {
+            let n = try s.uleb32(b);
+            func_count = n;
+            var k: u32 = 0;
+            while k < n : (k += 1) {
+                let t = try s.uleb32(b);
+                mod.funcs.push(m.Func { type_index: t, imported: false, body_start: 0, body_end: 0, locals: alloc.List(u8).init(a), code: alloc.List(u32).init(a), max_height: 0 });
+            }
+        } else if id == SECTION_TABLE {
+            let n = try s.uleb32(b);
+            var k: u32 = 0;
+            while k < n : (k += 1) {
+                let t = try table_type(b, &mut s, imported: false);
+                mod.tables.push(t);
+            }
+        } else if id == SECTION_MEMORY {
+            let n = try s.uleb32(b);
+            var k: u32 = 0;
+            while k < n : (k += 1) {
+                let lim = try limits(b, &mut s);
+                mod.memories.push(m.Memory { limits: lim, imported: false });
+            }
+        } else if id == SECTION_GLOBAL {
+            let n = try s.uleb32(b);
+            var k: u32 = 0;
+            while k < n : (k += 1) {
+                let ty = try value_type(b, &mut s);
+                let mutable = try mutability(b, &mut s);
+                let init = try const_expr(b, &mut s);
+                mod.globals.push(m.Global { ty: ty, mutable: mutable, init: init, imported: false });
+            }
+        } else if id == SECTION_EXPORT {
+            let n = try s.uleb32(b);
+            var k: u32 = 0;
+            while k < n : (k += 1) {
+                let name = try s.name(b, a);
+                let kind = try s.byte(b);
+                if kind > m.EXTERN_GLOBAL {
+                    return m.LoadError.Malformed;
+                }
+                let index = try s.uleb32(b);
+                mod.exports.push(m.Export { name: name, kind: kind, index: index });
+            }
+        } else if id == SECTION_START {
+            mod.start = try s.uleb32(b);
+            mod.has_start = true;
+        } else if id == SECTION_ELEMENT {
+            try elems(&mut mod, b, &mut s, a);
+        } else if id == SECTION_DATA_COUNT {
+            mod.data_count = try s.uleb32(b);
+            mod.has_data_count = true;
+        } else if id == SECTION_CODE {
+            code_seen = true;
+            let n = try s.uleb32(b);
+            if n != func_count {
+                return m.LoadError.Malformed;
+            }
+            let first = mod.funcs.len() - func_count as usize;
+            var k: u32 = 0;
+            while k < n : (k += 1) {
+                let len = try s.uleb32(b);
+                if len as usize > s.end - s.at {
+                    return m.LoadError.Malformed;
+                }
+                var body = m.Reader { at: s.at, end: s.at + len as usize };
+                s.at = body.end;
+                let f = &mut mod.funcs.items_mut()[first + k as usize];
+                // The locals: groups of a count and a type, at most 2^32 - 1
+                // of them in all.
+                let groups = try body.uleb32(b);
+                var total: u64 = 0;
+                var g: u32 = 0;
+                while g < groups : (g += 1) {
+                    let count = try body.uleb32(b);
+                    let ty = try value_type(b, &mut body);
+                    total += count as u64;
+                    if total > 0xFFFFFFFF {
+                        return m.LoadError.Malformed;
+                    }
+                    if total > 1048576 {
+                        // Valid, but more than this engine keeps.
+                        return m.LoadError.Invalid;
+                    }
+                    var c: u32 = 0;
+                    while c < count : (c += 1) {
+                        f.locals.push(ty);
+                    }
+                }
+                f.body_start = body.at;
+                f.body_end = body.end;
+            }
+        } else if id == SECTION_DATA {
+            let n = try s.uleb32(b);
+            if mod.has_data_count and n != mod.data_count {
+                return m.LoadError.Malformed;
+            }
+            var k: u32 = 0;
+            while k < n : (k += 1) {
+                let flags = try s.uleb32(b);
+                var d = m.Data { mode: m.ACTIVE, memory: 0, offset: m.Const { op: 0, value: 0 }, start: 0, len: 0 };
+                if flags == 1 {
+                    d.mode = m.PASSIVE;
+                } else if flags == 0 or flags == 2 {
+                    if flags == 2 {
+                        d.memory = try s.uleb32(b);
+                    }
+                    d.offset = try const_expr(b, &mut s);
+                } else {
+                    return m.LoadError.Malformed;
+                }
+                let len = try s.uleb32(b);
+                if len as usize > s.end - s.at {
+                    return m.LoadError.Malformed;
+                }
+                d.start = s.at;
+                d.len = len as usize;
+                s.at += len as usize;
+                mod.datas.push(d);
+            }
+        }
+        if s.at != s.end {
+            return m.LoadError.Malformed;
+        }
+    }
+    if func_count > 0 and not code_seen {
+        return m.LoadError.Malformed;
+    }
+    if mod.has_data_count and mod.datas.len() != mod.data_count as usize {
+        return m.LoadError.Malformed;
+    }
+    return mod;
+}
+
+fn types(mod: &mut m.Module, b: []u8, s: &mut m.Reader, a: alloc.Allocator) -> m.LoadError!void {
+    let n = try s.uleb32(b);
+    var k: u32 = 0;
+    while k < n : (k += 1) {
+        let tag = try s.byte(b);
+        if tag != 0x60 {
+            return m.LoadError.Malformed;
+        }
+        var t = m.FuncType { params: alloc.List(u8).init(a), results: alloc.List(u8).init(a) };
+        let np = try s.uleb32(b);
+        var i: u32 = 0;
+        while i < np : (i += 1) {
+            t.params.push(try value_type(b, s));
+        }
+        let nr = try s.uleb32(b);
+        i = 0;
+        while i < nr : (i += 1) {
+            t.results.push(try value_type(b, s));
+        }
+        mod.types.push(t);
+    }
+}
+
+fn imports(mod: &mut m.Module, b: []u8, s: &mut m.Reader, a: alloc.Allocator) -> m.LoadError!void {
+    let n = try s.uleb32(b);
+    var k: u32 = 0;
+    while k < n : (k += 1) {
+        let module_name = try s.name(b, a);
+        let field = try s.name(b, a);
+        let kind = try s.byte(b);
+        var index: u32 = 0;
+        if kind == m.EXTERN_FUNC {
+            let t = try s.uleb32(b);
+            index = mod.funcs.len() as u32;
+            mod.funcs.push(m.Func { type_index: t, imported: true, body_start: 0, body_end: 0, locals: alloc.List(u8).init(a), code: alloc.List(u32).init(a), max_height: 0 });
+        } else if kind == m.EXTERN_TABLE {
+            index = mod.tables.len() as u32;
+            let t = try table_type(b, s, imported: true);
+            mod.tables.push(t);
+        } else if kind == m.EXTERN_MEMORY {
+            index = mod.memories.len() as u32;
+            let lim = try limits(b, s);
+            mod.memories.push(m.Memory { limits: lim, imported: true });
+        } else if kind == m.EXTERN_GLOBAL {
+            index = mod.globals.len() as u32;
+            let ty = try value_type(b, s);
+            let mutable = try mutability(b, s);
+            mod.globals.push(m.Global { ty: ty, mutable: mutable, init: m.Const { op: 0, value: 0 }, imported: true });
+        } else {
+            return m.LoadError.Malformed;
+        }
+        mod.imports.push(m.Import { module: module_name, name: field, kind: kind, index: index });
+    }
+}
+
+fn elems(mod: &mut m.Module, b: []u8, s: &mut m.Reader, a: alloc.Allocator) -> m.LoadError!void {
+    let n = try s.uleb32(b);
+    var k: u32 = 0;
+    while k < n : (k += 1) {
+        let flags = try s.uleb32(b);
+        if flags > 7 {
+            return m.LoadError.Malformed;
+        }
+        var e = m.Elem { mode: m.ACTIVE, table: 0, offset: m.Const { op: 0, value: 0 }, ty: m.FUNCREF, items: alloc.List(m.Const).init(a) };
+        if flags & 1 != 0 {
+            if flags & 2 != 0 {
+                e.mode = m.DECLARATIVE;
+            } else {
+                e.mode = m.PASSIVE;
+            }
+        } else {
+            if flags & 2 != 0 {
+                e.table = try s.uleb32(b);
+            }
+            e.offset = try const_expr(b, s);
+        }
+        // Forms 1, 2 and 3 say the kind of element, 5, 6 and 7 its type.
+        if flags & 3 != 0 {
+            if flags & 4 != 0 {
+                e.ty = try value_type(b, s);
+                if not m.is_ref_type(e.ty) {
+                    return m.LoadError.Malformed;
+                }
+            } else {
+                let kind = try s.byte(b);
+                if kind != 0 {
+                    return m.LoadError.Malformed;
+                }
+            }
+        }
+        let count = try s.uleb32(b);
+        var i: u32 = 0;
+        while i < count : (i += 1) {
+            if flags & 4 != 0 {
+                e.items.push(try const_expr(b, s));
+            } else {
+                let f = try s.uleb32(b);
+                e.items.push(m.Const { op: 0xD2, value: f as u64 });
+            }
+        }
+        mod.elems.push(e);
+    }
+}
+
+fn value_type(b: []u8, s: &mut m.Reader) -> m.LoadError!u8 {
+    let t = try s.byte(b);
+    if not m.is_value_type(t) {
+        return m.LoadError.Malformed;
+    }
+    return t;
+}
+
+fn mutability(b: []u8, s: &mut m.Reader) -> m.LoadError!bool {
+    let v = try s.byte(b);
+    if v > 1 {
+        return m.LoadError.Malformed;
+    }
+    return v == 1;
+}
+
+fn limits(b: []u8, s: &mut m.Reader) -> m.LoadError!m.Limits {
+    let flag = try s.byte(b);
+    if flag > 1 {
+        return m.LoadError.Malformed;
+    }
+    let min = try s.uleb32(b);
+    var lim = m.Limits { min: min as u64, max: 0, has_max: false };
+    if flag == 1 {
+        let max = try s.uleb32(b);
+        lim.max = max as u64;
+        lim.has_max = true;
+    }
+    return lim;
+}
+
+fn table_type(b: []u8, s: &mut m.Reader, imported: bool) -> m.LoadError!m.Table {
+    let elem = try value_type(b, s);
+    if not m.is_ref_type(elem) {
+        return m.LoadError.Malformed;
+    }
+    let lim = try limits(b, s);
+    return m.Table { elem: elem, limits: lim, imported: imported };
+}
+
+/// A constant expression: one instruction and end. Which instructions a
+/// place allows, and their types, validation checks.
+fn const_expr(b: []u8, s: &mut m.Reader) -> m.LoadError!m.Const {
+    let op = try s.byte(b);
+    var c = m.Const { op: op, value: 0 };
+    if op == 0x41 {
+        c.value = (try s.signed(b, bits: 32)) & 0xFFFFFFFF;
+    } else if op == 0x42 {
+        c.value = try s.signed(b, bits: 64);
+    } else if op == 0x43 {
+        c.value = try s.fixed(b, n: 4);
+    } else if op == 0x44 {
+        c.value = try s.fixed(b, n: 8);
+    } else if op == 0xD0 {
+        let t = try s.byte(b);
+        if not m.is_ref_type(t) {
+            return m.LoadError.Malformed;
+        }
+        c.value = t as u64;
+    } else if op == 0xD2 or op == 0x23 {
+        c.value = (try s.uleb32(b)) as u64;
+    } else {
+        // Another instruction is not constant: invalid if the format knows it.
+        return m.LoadError.Invalid;
+    }
+    let end = try s.byte(b);
+    if end != 0x0B {
+        return m.LoadError.Invalid;
+    }
+    return c;
+}

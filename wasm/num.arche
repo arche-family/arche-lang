@@ -1,0 +1,276 @@
+/// WebAssembly's numeric instructions over bits (the spec's "Numerics"):
+/// integers wrap, floats keep IEEE 754's rounding, and a NaN made by an
+/// operation is a quiet one.
+import core.float;
+
+pub fn f32_of(b: u64) -> f32 {
+    return float.from_bits32((b & 0xFFFFFFFF) as u32);
+}
+
+pub fn f32_bits(x: f32) -> u64 {
+    return float.bits32(x) as u64;
+}
+
+pub fn f64_of(b: u64) -> f64 {
+    return float.from_bits64(b);
+}
+
+pub fn f64_bits(x: f64) -> u64 {
+    return float.bits64(x);
+}
+
+pub fn clz32(v: u32) -> u32 {
+    if v == 0 {
+        return 32;
+    }
+    var x = v;
+    var n: u32 = 0;
+    if x & 0xFFFF0000 == 0 { n += 16; x = x << 16; }
+    if x & 0xFF000000 == 0 { n += 8; x = x << 8; }
+    if x & 0xF0000000 == 0 { n += 4; x = x << 4; }
+    if x & 0xC0000000 == 0 { n += 2; x = x << 2; }
+    if x & 0x80000000 == 0 { n += 1; }
+    return n;
+}
+
+pub fn ctz32(v: u32) -> u32 {
+    if v == 0 {
+        return 32;
+    }
+    var x = v;
+    var n: u32 = 0;
+    if x & 0xFFFF == 0 { n += 16; x = x >> 16; }
+    if x & 0xFF == 0 { n += 8; x = x >> 8; }
+    if x & 0xF == 0 { n += 4; x = x >> 4; }
+    if x & 0x3 == 0 { n += 2; x = x >> 2; }
+    if x & 0x1 == 0 { n += 1; }
+    return n;
+}
+
+pub fn popcnt32(v: u32) -> u32 {
+    var x = v - ((v >> 1) & 0x55555555);
+    x = (x & 0x33333333) + ((x >> 2) & 0x33333333);
+    x = (x + (x >> 4)) & 0x0F0F0F0F;
+    return (x *% 0x01010101) >> 24;
+}
+
+pub fn clz64(v: u64) -> u64 {
+    let high = (v >> 32) as u32;
+    if high != 0 {
+        return clz32(high) as u64;
+    }
+    return 32 + clz32((v & 0xFFFFFFFF) as u32) as u64;
+}
+
+pub fn ctz64(v: u64) -> u64 {
+    let low = (v & 0xFFFFFFFF) as u32;
+    if low != 0 {
+        return ctz32(low) as u64;
+    }
+    return 32 + ctz32((v >> 32) as u32) as u64;
+}
+
+pub fn popcnt64(v: u64) -> u64 {
+    return (popcnt32((v & 0xFFFFFFFF) as u32) + popcnt32((v >> 32) as u32)) as u64;
+}
+
+pub fn rotl32(x: u32, n: u32) -> u32 {
+    let k = n & 31;
+    if k == 0 {
+        return x;
+    }
+    return (x << k) | (x >> (32 - k));
+}
+
+pub fn rotr32(x: u32, n: u32) -> u32 {
+    let k = n & 31;
+    if k == 0 {
+        return x;
+    }
+    return (x >> k) | (x << (32 - k));
+}
+
+pub fn rotl64(x: u64, n: u64) -> u64 {
+    let k = n & 63;
+    if k == 0 {
+        return x;
+    }
+    return (x << k) | (x >> (64 - k));
+}
+
+pub fn rotr64(x: u64, n: u64) -> u64 {
+    let k = n & 63;
+    if k == 0 {
+        return x;
+    }
+    return (x >> k) | (x << (64 - k));
+}
+
+/// The sign of an i32 kept in the low bits.
+pub fn s32(b: u64) -> i32 {
+    return (b & 0xFFFFFFFF) as u32 as% i32;
+}
+
+pub fn s64(b: u64) -> i64 {
+    return b as% i64;
+}
+
+pub fn of_s32(v: i32) -> u64 {
+    return (v as% u32) as u64;
+}
+
+pub fn of_s64(v: i64) -> u64 {
+    return v as% u64;
+}
+
+// ---- floats ------------------------------------------------------------------------
+
+const SIGN32: u64 = 0x80000000;
+const SIGN64: u64 = 0x8000000000000000;
+const QUIET32: u64 = 0x00400000;
+const QUIET64: u64 = 0x0008000000000000;
+
+fn is_nan32(b: u64) -> bool {
+    return b & 0x7F800000 == 0x7F800000 and b & 0x007FFFFF != 0;
+}
+
+fn is_nan64(b: u64) -> bool {
+    return b & 0x7FF0000000000000 == 0x7FF0000000000000 and b & 0x000FFFFFFFFFFFFF != 0;
+}
+
+pub fn min32(x: u64, y: u64) -> u64 {
+    if is_nan32(x) { return x | QUIET32; }
+    if is_nan32(y) { return y | QUIET32; }
+    let a = f32_of(x);
+    let b = f32_of(y);
+    if a == b {
+        // -0 and +0: the negative one.
+        return x | y;
+    }
+    if a < b { return x; }
+    return y;
+}
+
+pub fn max32(x: u64, y: u64) -> u64 {
+    if is_nan32(x) { return x | QUIET32; }
+    if is_nan32(y) { return y | QUIET32; }
+    let a = f32_of(x);
+    let b = f32_of(y);
+    if a == b {
+        return x & y;
+    }
+    if a > b { return x; }
+    return y;
+}
+
+pub fn min64(x: u64, y: u64) -> u64 {
+    if is_nan64(x) { return x | QUIET64; }
+    if is_nan64(y) { return y | QUIET64; }
+    let a = f64_of(x);
+    let b = f64_of(y);
+    if a == b {
+        return x | y;
+    }
+    if a < b { return x; }
+    return y;
+}
+
+pub fn max64(x: u64, y: u64) -> u64 {
+    if is_nan64(x) { return x | QUIET64; }
+    if is_nan64(y) { return y | QUIET64; }
+    let a = f64_of(x);
+    let b = f64_of(y);
+    if a == b {
+        return x & y;
+    }
+    if a > b { return x; }
+    return y;
+}
+
+pub fn copysign32(x: u64, y: u64) -> u64 {
+    return (x & ~SIGN32 & 0xFFFFFFFF) | (y & SIGN32);
+}
+
+pub fn copysign64(x: u64, y: u64) -> u64 {
+    return (x & ~SIGN64) | (y & SIGN64);
+}
+
+/// Round to nearest, ties to even, as roundeven does.
+pub fn nearest32(b: u64) -> u64 {
+    let x = f32_of(b);
+    let big: f32 = 8388608.0;
+    if not (x.abs() < big) {
+        if is_nan32(b) {
+            return b | QUIET32;
+        }
+        return b;
+    }
+    var r = x.floor();
+    let d = x - r;
+    let half: f32 = 0.5;
+    let one: f32 = 1.0;
+    if d > half or (d == half and (r as i64) % 2 != 0) {
+        r = r + one;
+    }
+    return copysign32(x: f32_bits(r), y: b);
+}
+
+pub fn nearest64(b: u64) -> u64 {
+    let x = f64_of(b);
+    let big: f64 = 4503599627370496.0;
+    if not (x.abs() < big) {
+        if is_nan64(b) {
+            return b | QUIET64;
+        }
+        return b;
+    }
+    var r = x.floor();
+    let d = x - r;
+    let half: f64 = 0.5;
+    let one: f64 = 1.0;
+    if d > half or (d == half and (r as i64) % 2 != 0) {
+        r = r + one;
+    }
+    return copysign64(x: f64_bits(r), y: b);
+}
+
+/// A NaN result of an operation on x, quiet, or the result itself.
+pub fn quiet32(r: u64) -> u64 {
+    if is_nan32(r) {
+        return r | QUIET32;
+    }
+    return r;
+}
+
+pub fn quiet64(r: u64) -> u64 {
+    if is_nan64(r) {
+        return r | QUIET64;
+    }
+    return r;
+}
+
+// ---- float to integer: whether the truncation fits ----------------------------------
+
+/// Whether trunc(x) fits the integer type: signed or not, 32 or 64 bits wide.
+pub fn trunc_fits(x: f64, signed: bool, wide: bool) -> bool {
+    if x != x {
+        return false;
+    }
+    if signed {
+        if wide {
+            let lo: f64 = -9223372036854775808.0;
+            let hi: f64 = 9223372036854775808.0;
+            return x >= lo and x < hi;
+        }
+        let lo: f64 = -2147483649.0;
+        let hi: f64 = 2147483648.0;
+        return x > lo and x < hi;
+    }
+    let lo: f64 = -1.0;
+    if wide {
+        let hi: f64 = 18446744073709551616.0;
+        return x > lo and x < hi;
+    }
+    let hi: f64 = 4294967296.0;
+    return x > lo and x < hi;
+}

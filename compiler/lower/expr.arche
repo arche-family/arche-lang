@@ -336,7 +336,7 @@ fn float_to_int(l: &mut lw.Lower, e: cst.NodeId, x: u32, from: ty.TypeId, to: ty
         }
         return fconv(l, ir.FConvKind.SatToUI, x, s);
     }
-    // Checked in f64, which holds every bound exactly: lo < x < hi.
+    // Checked in f64: lo < x < hi.
     var d = x;
     if l.c.t.get(from).len == 32 {
         d = fconv(l, ir.FConvKind.Ext, x, ir.Ty.F64);
@@ -347,11 +347,18 @@ fn float_to_int(l: &mut lw.Lower, e: cst.NodeId, x: u32, from: ty.TypeId, to: ty
     if sg {
         hi = pow2_f64(bits - 1);
         // -2^(n-1) fits; anything above -2^(n-1) - 1 truncates into range.
+        // An f64 holds that bound below 64 bits; at 64 the float next below
+        // -2^63 is -2^63 - 2048, so the test is d >= -2^63.
         let below = lw.konst(l, ir.Ty.F64, pow2_f64(bits - 1) | SIGN_BIT);
-        let one = lw.konst(l, ir.Ty.F64, pow2_f64(0));
         lo = 0;
-        let limit = fbin(l, ir.FBinKind.Sub, ir.Ty.F64, x: below, y: one);
-        let fine_lo = fcmp(l, ir.FCmpKind.Gt, x: d, y: limit);
+        var fine_lo = below;
+        if bits == 64 {
+            fine_lo = fcmp(l, ir.FCmpKind.Ge, x: d, y: below);
+        } else {
+            let one = lw.konst(l, ir.Ty.F64, pow2_f64(0));
+            let limit = fbin(l, ir.FBinKind.Sub, ir.Ty.F64, x: below, y: one);
+            fine_lo = fcmp(l, ir.FCmpKind.Gt, x: d, y: limit);
+        }
         let fine_hi = fcmp(l, ir.FCmpKind.Lt, x: d, y: lw.konst(l, ir.Ty.F64, hi));
         lw.check(l, lw.bin(l, ir.BinKind.And, x: fine_lo, y: fine_hi), "value does not fit in the integer type", e);
         return fconv(l, ir.FConvKind.ToSI, x, s);

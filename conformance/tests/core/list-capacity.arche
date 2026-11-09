@@ -1,0 +1,54 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 0 1000 1000
+// stdout: 0 0 7
+// stdout: true ok false 2
+import std;
+import alloc;
+
+fn main(sys: &mut std.System) -> !void {
+    var big = alloc.List(u64).with_capacity(sys.alloc, n: 1000);
+    sys.stdout.write_u64(big.len() as u64);
+    big.grow_zeroed(1000);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(big.len() as u64);
+    sys.stdout.write(" ");
+    var zeros: u64 = 0;
+    for x in big.items() {
+        if x.* == 0 {
+            zeros += 1;
+        }
+    }
+    sys.stdout.write_u64(zeros);
+    sys.stdout.write("\n");
+    // What was popped is zero again when the list grows back over it.
+    var small = alloc.List(u8).init(sys.alloc);
+    small.push(7);
+    small.push(9);
+    _ = small.pop();
+    _ = small.pop();
+    small.grow_zeroed(2);
+    small.grow_zeroed(1);
+    small.push(7);
+    sys.stdout.write_u64(small.items()[0] as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(small.items()[1] as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(small.items()[2] as u64);
+    sys.stdout.write("\n");
+    var s = alloc.String.init(sys.alloc);
+    let good: [3]u8 = [0x6F, 0xC2, 0xA9];
+    let bad: [2]u8 = [0xC3, 0x28];
+    if s.push_utf8(good[0..3]) {
+        sys.stdout.write("true ");
+    }
+    if s.view().eq("o©") {
+        sys.stdout.write("ok ");
+    }
+    if not s.push_utf8(bad[0..2]) {
+        sys.stdout.write("false ");
+    }
+    sys.stdout.write_u64(s.view().len() as u64 - 1);
+    sys.stdout.write("\n");
+}

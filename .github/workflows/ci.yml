@@ -117,6 +117,17 @@ jobs:
       - name: The compiler on WebAssembly, stage2 == stage3
         run: sh compiler/wasm-check.sh
 
+  # docs/sprints.md S31: the WASM runtime, written in Arche, against the
+  # WebAssembly spec's own tests (wasm/spec.sh fetches and converts them).
+  wasm-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build stage0, the compiler and the runtime
+        run: make -C stage0 && make -C compiler && make -C wasm
+      - name: The spec's tests in the interpreter
+        run: make -C wasm check
+
   # docs/sprints.md S16, S28: freestanding binaries, built with core and alloc
   # only, boot in QEMU on x86-64, RISC-V 64 and ARM64 and write over serial.
   freestanding:

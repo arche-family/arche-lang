@@ -1,0 +1,523 @@
+/// The spec's own tests: the scripts of WebAssembly/spec's test/core, as
+/// wabt's wast2json writes them, one JSON file of commands and the modules
+/// beside it. Modules in the text format are not this engine's to read, so
+/// assert_malformed on text is skipped; everything else must hold.
+import alloc;
+import exec;
+import module as m;
+import std;
+import std.json;
+
+/// spectest's functions print nothing here, and nothing runs too long.
+type SpecHost = struct {
+    calls: u64,
+}
+
+impl exec.Host for SpecHost {
+    fn call(self: &mut SpecHost, store: &mut exec.Store, id: u32, args: []u64, results: []mut u64) -> exec.Trap!void {
+        self.calls += 1;
+    }
+
+    fn tick(self: &mut SpecHost) -> bool {
+        return true;
+    }
+}
+
+pub type Tally = struct {
+    pub passed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+}
+
+/// A value of a command: its type, and its text (decimal bits, null, or a
+/// NaN's kind).
+type Value = struct {
+    ty: alloc.String,
+    text: alloc.String,
+}
+
+/// One command of a script, its fields as wast2json names them.
+type Command = struct {
+    kind: alloc.String,
+    line: alloc.String,
+    filename: alloc.String,
+    name: alloc.String,
+    as_name: alloc.String,
+    module_type: alloc.String,
+    text: alloc.String,
+    action: alloc.String,
+    module: alloc.String,
+    field: alloc.String,
+    args: alloc.List(Value),
+    expected: alloc.List(Value),
+}
+
+/// A name a module was given or registered under, and its instance.
+type Named = struct {
+    name: alloc.String,
+    instance: u32,
+}
+
+fn push_text(v: &json.Value, out: &mut alloc.String) {
+    match v {
+        .Text { value } => { out.push_str(value.view()); }
+        .Number { text } => { out.push_str(text.view()); }
+        _ => { }
+    }
+}
+
+fn value_list(v: &json.Value, out: &mut alloc.List(Value), a: alloc.Allocator) {
+    match v {
+        .Array { items } => {
+            for item in items.items() {
+                var value = Value { ty: alloc.String.init(a), text: alloc.String.init(a) };
+                match item {
+                    .Object { keys, values } => {
+                        var i: usize = 0;
+                        while i < keys.len() : (i += 1) {
+                            let k = keys.items()[i].view();
+                            if k.eq("type") {
+                                push_text(&values.items()[i], out: &mut value.ty);
+                            } else if k.eq("value") {
+                                push_text(&values.items()[i], out: &mut value.text);
+                            }
+                        }
+                    }
+                    _ => { }
+                }
+                out.push(value);
+            }
+        }
+        _ => { }
+    }
+}
+
+fn command(v: &json.Value, a: alloc.Allocator) -> Command {
+    var c = Command {
+        kind: alloc.String.init(a),
+        line: alloc.String.init(a),
+        filename: alloc.String.init(a),
+        name: alloc.String.init(a),
+        as_name: alloc.String.init(a),
+        module_type: alloc.String.init(a),
+        text: alloc.String.init(a),
+        action: alloc.String.init(a),
+        module: alloc.String.init(a),
+        field: alloc.String.init(a),
+        args: alloc.List(Value).init(a),
+        expected: alloc.List(Value).init(a),
+    };
+    match v {
+        .Object { keys, values: members } => {
+            var i: usize = 0;
+            while i < keys.len() : (i += 1) {
+                let k = keys.items()[i].view();
+                let x = &members.items()[i];
+                if k.eq("type") {
+                    push_text(x, out: &mut c.kind);
+                } else if k.eq("line") {
+                    push_text(x, out: &mut c.line);
+                } else if k.eq("filename") {
+                    push_text(x, out: &mut c.filename);
+                } else if k.eq("name") {
+                    push_text(x, out: &mut c.name);
+                } else if k.eq("as") {
+                    push_text(x, out: &mut c.as_name);
+                } else if k.eq("module_type") {
+                    push_text(x, out: &mut c.module_type);
+                } else if k.eq("text") {
+                    push_text(x, out: &mut c.text);
+                } else if k.eq("expected") {
+                    value_list(x, out: &mut c.expected, a);
+                } else if k.eq("action") {
+                    match x {
+                        .Object { keys: akeys, values: avalues } => {
+                            var j: usize = 0;
+                            while j < akeys.len() : (j += 1) {
+                                let ak = akeys.items()[j].view();
+                                if ak.eq("type") {
+                                    push_text(&avalues.items()[j], out: &mut c.action);
+                                } else if ak.eq("module") {
+                                    push_text(&avalues.items()[j], out: &mut c.module);
+                                } else if ak.eq("field") {
+                                    push_text(&avalues.items()[j], out: &mut c.field);
+                                } else if ak.eq("args") {
+                                    value_list(&avalues.items()[j], out: &mut c.args, a);
+                                }
+                            }
+                        }
+                        _ => { }
+                    }
+                }
+            }
+        }
+        _ => { }
+    }
+    return c;
+}
+
+fn commands(v: &json.Value, a: alloc.Allocator) -> alloc.List(Command) {
+    var out = alloc.List(Command).init(a);
+    match v {
+        .Object { keys, values: members } => {
+            var i: usize = 0;
+            while i < keys.len() : (i += 1) {
+                if keys.items()[i].view().eq("commands") {
+                    match &members.items()[i] {
+                        .Array { items } => {
+                            for item in items.items() {
+                                out.push(command(item, a));
+                            }
+                        }
+                        _ => { }
+                    }
+                }
+            }
+        }
+        _ => { }
+    }
+    return out;
+}
+
+fn decimal(s: str) -> u64 {
+    var n: u64 = 0;
+    let b = s.bytes();
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        let c = b[i];
+        if c >= '0' and c <= '9' {
+            n = n *% 10 +% (c - '0') as u64;
+        }
+    }
+    return n;
+}
+
+fn arg_bits(x: &Value) -> u64 {
+    if x.text.view().eq("null") {
+        return m.NULL_REF;
+    }
+    return decimal(x.text.view());
+}
+
+/// Whether a result is what was expected.
+fn matches(x: &Value, got: u64) -> bool {
+    let ty = x.ty.view();
+    let t = x.text.view();
+    if ty.eq("f32") {
+        if t.eq("nan:canonical") {
+            return got & 0x7FFFFFFF == 0x7FC00000;
+        }
+        if t.eq("nan:arithmetic") {
+            return got & 0x7FC00000 == 0x7FC00000;
+        }
+        return got == decimal(t);
+    }
+    if ty.eq("f64") {
+        if t.eq("nan:canonical") {
+            return got & 0x7FFFFFFFFFFFFFFF == 0x7FF8000000000000;
+        }
+        if t.eq("nan:arithmetic") {
+            return got & 0x7FF8000000000000 == 0x7FF8000000000000;
+        }
+        return got == decimal(t);
+    }
+    if ty.eq("funcref") or ty.eq("externref") {
+        if t.eq("null") {
+            return got == m.NULL_REF;
+        }
+        if t.len() == 0 or ty.eq("funcref") {
+            return got != m.NULL_REF;
+        }
+        return got == decimal(t);
+    }
+    return got == decimal(t);
+}
+
+type Runner = struct {
+    store: exec.Store,
+    host: SpecHost,
+    named: alloc.List(Named),
+    registered: alloc.List(Named),
+    current: u32,
+    has_current: bool,
+    /// spectest's things, by name.
+    spectest_names: alloc.List(alloc.String),
+    spectest: alloc.List(exec.Extern),
+    a: alloc.Allocator,
+}
+
+fn find(list: &alloc.List(Named), name: str) -> ?u32 {
+    var i = list.len();
+    while i > 0 {
+        i -= 1;
+        if list.items()[i].name.view().eq(name) {
+            return list.items()[i].instance;
+        }
+    }
+    return none;
+}
+
+fn add_spectest(r: &mut Runner) {
+    let none_t: [0]u8 = [];
+    let i32_t: [1]u8 = [m.I32];
+    let i64_t: [1]u8 = [m.I64];
+    let f32_t: [1]u8 = [m.F32];
+    let f64_t: [1]u8 = [m.F64];
+    let i32_f32: [2]u8 = [m.I32, m.F32];
+    let f64_f64: [2]u8 = [m.F64, m.F64];
+    let empty = none_t[0..0];
+    add(r, "print", exec.Extern { kind: m.EXTERN_FUNC, addr: exec.add_host_func(&mut r.store, params: empty, results: empty, id: 0) });
+    add(r, "print_i32", exec.Extern { kind: m.EXTERN_FUNC, addr: exec.add_host_func(&mut r.store, params: i32_t[0..1], results: empty, id: 1) });
+    add(r, "print_i64", exec.Extern { kind: m.EXTERN_FUNC, addr: exec.add_host_func(&mut r.store, params: i64_t[0..1], results: empty, id: 2) });
+    add(r, "print_f32", exec.Extern { kind: m.EXTERN_FUNC, addr: exec.add_host_func(&mut r.store, params: f32_t[0..1], results: empty, id: 3) });
+    add(r, "print_f64", exec.Extern { kind: m.EXTERN_FUNC, addr: exec.add_host_func(&mut r.store, params: f64_t[0..1], results: empty, id: 4) });
+    add(r, "print_i32_f32", exec.Extern { kind: m.EXTERN_FUNC, addr: exec.add_host_func(&mut r.store, params: i32_f32[0..2], results: empty, id: 5) });
+    add(r, "print_f64_f64", exec.Extern { kind: m.EXTERN_FUNC, addr: exec.add_host_func(&mut r.store, params: f64_f64[0..2], results: empty, id: 6) });
+    add(r, "global_i32", exec.Extern { kind: m.EXTERN_GLOBAL, addr: exec.add_global(&mut r.store, ty: m.I32, mutable: false, value: 666) });
+    add(r, "global_i64", exec.Extern { kind: m.EXTERN_GLOBAL, addr: exec.add_global(&mut r.store, ty: m.I64, mutable: false, value: 666) });
+    // 666.6 as an f32 and an f64.
+    add(r, "global_f32", exec.Extern { kind: m.EXTERN_GLOBAL, addr: exec.add_global(&mut r.store, ty: m.F32, mutable: false, value: 0x4426A666) });
+    add(r, "global_f64", exec.Extern { kind: m.EXTERN_GLOBAL, addr: exec.add_global(&mut r.store, ty: m.F64, mutable: false, value: 0x4084D4CCCCCCCCCD) });
+    let table = exec.add_table(&mut r.store, elem: m.FUNCREF, m.Limits { min: 10, max: 20, has_max: true }, init: m.NULL_REF);
+    add(r, "table", exec.Extern { kind: m.EXTERN_TABLE, addr: table });
+    let memory = exec.add_memory(&mut r.store, m.Limits { min: 1, max: 2, has_max: true }) catch 0;
+    add(r, "memory", exec.Extern { kind: m.EXTERN_MEMORY, addr: memory });
+}
+
+fn add(r: &mut Runner, name: str, e: exec.Extern) {
+    r.spectest_names.push(alloc.String.from(name, r.a));
+    r.spectest.push(e);
+}
+
+/// What an import names: spectest's, or a registered instance's export.
+fn resolve(r: &Runner, module: str, name: str) -> ?exec.Extern {
+    if module.eq("spectest") {
+        var i: usize = 0;
+        while i < r.spectest.len() : (i += 1) {
+            if r.spectest_names.items()[i].view().eq(name) {
+                return r.spectest.items()[i];
+            }
+        }
+        return none;
+    }
+    let inst = find(&r.registered, name: module) orelse return none;
+    return exec.export_of(&r.store, instance: inst, name: name);
+}
+
+/// The module in path loaded and instantiated: its instance, or why not.
+type Outcome = enum { Loaded, Malformed, Invalid, Unlinkable, Trapped, Missing }
+
+fn load(r: &mut Runner, fs: &std.Fs, path: str, instance: &mut u32) -> Outcome {
+    let bytes = fs.read_bytes(path, r.a) catch return Outcome.Missing;
+    let module = match exec.add_module(&mut r.store, bytes.items()) {
+        ok(x) => { x }
+        err(e) => {
+            if e == m.LoadError.Malformed {
+                return Outcome.Malformed;
+            }
+            return Outcome.Invalid;
+        }
+    };
+    var imports = alloc.List(exec.Extern).init(r.a);
+    let n = r.store.modules.items()[module as usize].imports.len();
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        let imp = &r.store.modules.items()[module as usize].imports.items()[i];
+        let e = resolve(r, module: imp.module.view(), name: imp.name.view()) orelse return Outcome.Unlinkable;
+        imports.push(e);
+    }
+    match exec.instantiate(&mut r.store, &mut r.host, module: module, imports.items()) {
+        ok(x) => {
+            instance.* = x;
+            return Outcome.Loaded;
+        }
+        err(e) => {
+            if e == exec.Trap.Unlinkable {
+                return Outcome.Unlinkable;
+            }
+            return Outcome.Trapped;
+        }
+    }
+}
+
+/// Runs a command's action; its results, or the trap.
+fn act(r: &mut Runner, c: &Command, results: &mut alloc.List(u64)) -> exec.Trap!void {
+    var inst = r.current;
+    if c.module.len() > 0 {
+        inst = find(&r.named, name: c.module.view()) orelse return exec.Trap.Unlinkable;
+    } else if not r.has_current {
+        return exec.Trap.Unlinkable;
+    }
+    let e = exec.export_of(&r.store, instance: inst, name: c.field.view()) orelse return exec.Trap.Unlinkable;
+    results.clear();
+    if c.action.view().eq("get") {
+        results.push(r.store.globals.items()[e.addr as usize].value);
+        return;
+    }
+    var args = alloc.List(u64).init(r.a);
+    for x in c.args.items() {
+        args.push(arg_bits(x));
+    }
+    try exec.invoke(&mut r.store, &mut r.host, func: e.addr, args.items(), results);
+}
+
+fn report(out: &mut std.Output, file: str, c: &Command, what: str) {
+    out.write(file);
+    out.write(":");
+    out.write(c.line.view());
+    out.write(": ");
+    out.write(c.kind.view());
+    out.write(" ");
+    out.write(c.field.view());
+    out.write(": ");
+    out.write(what);
+    out.write("\n");
+}
+
+/// Runs one script: file is its JSON, dir where its modules are.
+pub fn run_file(fs: &std.Fs, out: &mut std.Output, file: str, dir: str, tally: &mut Tally, a: alloc.Allocator) {
+    let text = match fs.read_file(file, a) {
+        ok(t) => { t }
+        err(_) => {
+            out.write(file);
+            out.write(": cannot read\n");
+            tally.failed += 1;
+            return;
+        }
+    };
+    let parsed = match json.parse(text.view(), a) {
+        ok(p) => { p }
+        err(_) => {
+            out.write(file);
+            out.write(": not JSON\n");
+            tally.failed += 1;
+            return;
+        }
+    };
+    let cmds = commands(&parsed, a);
+    var limits = exec.default_limits();
+    limits.frames = 20000;
+    var r = Runner {
+        store: exec.new_store(limits, a),
+        host: SpecHost { calls: 0 },
+        named: alloc.List(Named).init(a),
+        registered: alloc.List(Named).init(a),
+        current: 0,
+        has_current: false,
+        spectest_names: alloc.List(alloc.String).init(a),
+        spectest: alloc.List(exec.Extern).init(a),
+        a: a,
+    };
+    add_spectest(&mut r);
+    var shown: u32 = 0;
+    var results = alloc.List(u64).init(a);
+    for c in cmds.items() {
+        let kind = c.kind.view();
+        var path = alloc.String.from(dir, a);
+        path.push_str("/");
+        path.push_str(c.filename.view());
+        var ok_ = true;
+        var why = "";
+        if kind.eq("module") {
+            var inst: u32 = 0;
+            let o = load(&mut r, fs, path: path.view(), instance: &mut inst);
+            if o == Outcome.Loaded {
+                r.current = inst;
+                r.has_current = true;
+                if c.name.len() > 0 {
+                    r.named.push(Named { name: c.name.clone(), instance: inst });
+                }
+            } else {
+                ok_ = false;
+                why = "module did not load";
+                r.has_current = false;
+            }
+        } else if kind.eq("register") {
+            var inst = r.current;
+            if c.name.len() > 0 {
+                inst = find(&r.named, name: c.name.view()) orelse 0;
+            }
+            r.registered.push(Named { name: c.as_name.clone(), instance: inst });
+            continue;
+        } else if kind.eq("assert_malformed") or kind.eq("assert_invalid") {
+            if c.module_type.view().eq("text") {
+                tally.skipped += 1;
+                continue;
+            }
+            var inst: u32 = 0;
+            let o = load(&mut r, fs, path: path.view(), instance: &mut inst);
+            if o != Outcome.Malformed and o != Outcome.Invalid {
+                ok_ = false;
+                why = "module loaded";
+            }
+        } else if kind.eq("assert_unlinkable") {
+            var inst: u32 = 0;
+            let o = load(&mut r, fs, path: path.view(), instance: &mut inst);
+            if o != Outcome.Unlinkable {
+                ok_ = false;
+                why = "module linked";
+            }
+        } else if kind.eq("assert_uninstantiable") {
+            var inst: u32 = 0;
+            let o = load(&mut r, fs, path: path.view(), instance: &mut inst);
+            if o != Outcome.Trapped {
+                ok_ = false;
+                why = "module did not trap";
+            }
+        } else if kind.eq("action") {
+            match act(&mut r, c, &mut results) {
+                ok(_) => { }
+                err(_) => {
+                    ok_ = false;
+                    why = "trapped";
+                }
+            }
+        } else if kind.eq("assert_return") {
+            match act(&mut r, c, &mut results) {
+                ok(_) => {
+                    if results.len() != c.expected.len() {
+                        ok_ = false;
+                        why = "wrong number of results";
+                    } else {
+                        var i: usize = 0;
+                        while i < results.len() : (i += 1) {
+                            if not matches(&c.expected.items()[i], got: results.items()[i]) {
+                                ok_ = false;
+                                why = "wrong result";
+                            }
+                        }
+                    }
+                }
+                err(e) => {
+                    ok_ = false;
+                    why = exec.message(e);
+                }
+            }
+        } else if kind.eq("assert_trap") or kind.eq("assert_exhaustion") {
+            match act(&mut r, c, &mut results) {
+                ok(_) => {
+                    ok_ = false;
+                    why = "did not trap";
+                }
+                err(e) => {
+                    if not c.text.view().starts_with(exec.message(e)) {
+                        ok_ = false;
+                        why = exec.message(e);
+                    }
+                }
+            }
+        } else {
+            tally.skipped += 1;
+            continue;
+        }
+        if ok_ {
+            tally.passed += 1;
+        } else {
+            tally.failed += 1;
+            if shown < 20 {
+                report(out, file: file, c, what: why);
+                shown += 1;
+            }
+        }
+    }
+}

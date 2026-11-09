@@ -1,0 +1,322 @@
+/// A WebAssembly 2.0 module as the binary format says it (the spec's
+/// "Binary Format" chapter), and the reader of that format. decode.arche fills
+/// a Module; validate.arche checks it and compiles each function's code.
+import alloc;
+
+// ---- value types ----------------------------------------------------------------
+
+pub const I32: u8 = 0x7F;
+pub const I64: u8 = 0x7E;
+pub const F32: u8 = 0x7D;
+pub const F64: u8 = 0x7C;
+pub const FUNCREF: u8 = 0x70;
+pub const EXTERNREF: u8 = 0x6F;
+/// A value of whatever type, where validation no longer knows: in code after
+/// an unconditional branch.
+pub const UNKNOWN: u8 = 0;
+
+/// The null reference, of either reference type. A funcref is otherwise a
+/// function's address in the store, an externref what the host gave.
+pub const NULL_REF: u64 = 0xFFFFFFFFFFFFFFFF;
+
+pub fn is_value_type(t: u8) -> bool {
+    return t == I32 or t == I64 or t == F32 or t == F64 or t == FUNCREF or t == EXTERNREF;
+}
+
+pub fn is_ref_type(t: u8) -> bool {
+    return t == FUNCREF or t == EXTERNREF;
+}
+
+pub fn is_num_type(t: u8) -> bool {
+    return t == I32 or t == I64 or t == F32 or t == F64;
+}
+
+// ---- kinds of import and export -------------------------------------------------
+
+pub const EXTERN_FUNC: u8 = 0;
+pub const EXTERN_TABLE: u8 = 1;
+pub const EXTERN_MEMORY: u8 = 2;
+pub const EXTERN_GLOBAL: u8 = 3;
+
+/// A page of linear memory, and the most a 32-bit memory has.
+pub const PAGE: u64 = 65536;
+pub const MAX_PAGES: u64 = 65536;
+
+// ---- segment modes ----------------------------------------------------------------
+
+pub const ACTIVE: u8 = 0;
+pub const PASSIVE: u8 = 1;
+pub const DECLARATIVE: u8 = 2;
+
+/// Why a module was not loaded: bytes that are not the format, or a module
+/// the format can say that validation refuses.
+pub type LoadError = error { Malformed, Invalid }
+
+pub type FuncType = struct {
+    pub params: alloc.List(u8),
+    pub results: alloc.List(u8),
+}
+
+pub fn same_type(x: &FuncType, y: &FuncType) -> bool {
+    return same_types(x: x.params.items(), y: y.params.items()) and same_types(x: x.results.items(), y: y.results.items());
+}
+
+pub fn same_types(x: []u8, y: []u8) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.len() : (i += 1) {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub type Limits = struct {
+    pub min: u64,
+    pub max: u64,
+    pub has_max: bool,
+}
+
+/// A constant expression: one instruction, its operand in value. op is the
+/// instruction's opcode: i32.const 0x41 to f64.const 0x44 (value the bits),
+/// ref.null 0xD0 (value the type), ref.func 0xD2 and global.get 0x23 (value
+/// the index).
+pub type Const = struct {
+    pub op: u8,
+    pub value: u64,
+}
+
+pub type Func = struct {
+    pub type_index: u32,
+    pub imported: bool,
+    /// The body, locals and code, in the module's bytes.
+    pub body_start: usize,
+    pub body_end: usize,
+    /// The declared locals' types; the params come before them.
+    pub locals: alloc.List(u8),
+    /// What validation compiled the body to (exec.arche reads it).
+    pub code: alloc.List(u32),
+    /// The most operands the body holds at once.
+    pub max_height: u32,
+}
+
+pub type Table = struct {
+    pub elem: u8,
+    pub limits: Limits,
+    pub imported: bool,
+}
+
+pub type Memory = struct {
+    pub limits: Limits,
+    pub imported: bool,
+}
+
+pub type Global = struct {
+    pub ty: u8,
+    pub mutable: bool,
+    pub init: Const,
+    pub imported: bool,
+}
+
+/// An import: index is its place in its kind's index space, where its type is.
+pub type Import = struct {
+    pub module: alloc.String,
+    pub name: alloc.String,
+    pub kind: u8,
+    pub index: u32,
+}
+
+pub type Export = struct {
+    pub name: alloc.String,
+    pub kind: u8,
+    pub index: u32,
+}
+
+pub type Elem = struct {
+    pub mode: u8,
+    pub table: u32,
+    pub offset: Const,
+    pub ty: u8,
+    pub items: alloc.List(Const),
+}
+
+pub type Data = struct {
+    pub mode: u8,
+    pub memory: u32,
+    pub offset: Const,
+    /// The bytes, in the module's bytes.
+    pub start: usize,
+    pub len: usize,
+}
+
+pub type Module = struct {
+    pub bytes: alloc.List(u8),
+    pub types: alloc.List(FuncType),
+    pub imports: alloc.List(Import),
+    pub funcs: alloc.List(Func),
+    pub tables: alloc.List(Table),
+    pub memories: alloc.List(Memory),
+    pub globals: alloc.List(Global),
+    pub exports: alloc.List(Export),
+    pub has_start: bool,
+    pub start: u32,
+    pub elems: alloc.List(Elem),
+    pub datas: alloc.List(Data),
+    pub has_data_count: bool,
+    pub data_count: u32,
+    /// Functions a ref.func in code may name: those named outside function
+    /// bodies (the spec's C.refs).
+    pub declared: alloc.List(bool),
+}
+
+pub fn empty(a: alloc.Allocator) -> Module {
+    return Module {
+        bytes: alloc.List(u8).init(a),
+        types: alloc.List(FuncType).init(a),
+        imports: alloc.List(Import).init(a),
+        funcs: alloc.List(Func).init(a),
+        tables: alloc.List(Table).init(a),
+        memories: alloc.List(Memory).init(a),
+        globals: alloc.List(Global).init(a),
+        exports: alloc.List(Export).init(a),
+        has_start: false,
+        start: 0,
+        elems: alloc.List(Elem).init(a),
+        datas: alloc.List(Data).init(a),
+        has_data_count: false,
+        data_count: 0,
+        declared: alloc.List(bool).init(a),
+    };
+}
+
+/// The export of this name and kind, if the module has one.
+pub fn find_export(m: &Module, name: str, kind: u8) -> ?u32 {
+    for e in m.exports.items() {
+        if e.kind == kind and e.name.view().eq(name) {
+            return e.index;
+        }
+    }
+    return none;
+}
+
+// ---- reading the binary format ----------------------------------------------------
+
+/// Where reading is in a module's bytes, which each method takes as b, and
+/// where the part being read ends.
+pub type Reader = struct {
+    pub at: usize,
+    pub end: usize,
+
+    pub fn done(self: &Reader) -> bool {
+        return self.at >= self.end;
+    }
+
+    pub fn byte(self: &mut Reader, b: []u8) -> LoadError!u8 {
+        if self.at >= self.end {
+            return LoadError.Malformed;
+        }
+        let v = b[self.at];
+        self.at += 1;
+        return v;
+    }
+
+    /// An unsigned LEB128 of at most bits bits: at most ceil(bits / 7)
+    /// bytes, and the last one's bits beyond the width zero.
+    pub fn unsigned(self: &mut Reader, b: []u8, bits: u32) -> LoadError!u64 {
+        var result: u64 = 0;
+        var shift: u32 = 0;
+        while true {
+            let v = try self.byte(b);
+            if shift + 7 >= bits {
+                // The last byte the width allows.
+                if v & 0x80 != 0 {
+                    return LoadError.Malformed;
+                }
+                let room = bits - shift;
+                if room < 7 and (v as u64) >> room != 0 {
+                    return LoadError.Malformed;
+                }
+                return result | ((v as u64) << shift);
+            }
+            result = result | (((v & 0x7F) as u64) << shift);
+            if v & 0x80 == 0 {
+                return result;
+            }
+            shift += 7;
+        }
+        return result;
+    }
+
+    /// A signed LEB128 of at most bits bits, as the bits of an i64: the last
+    /// byte's bits beyond the width all equal the sign.
+    pub fn signed(self: &mut Reader, b: []u8, bits: u32) -> LoadError!u64 {
+        var result: u64 = 0;
+        var shift: u32 = 0;
+        while true {
+            let v = try self.byte(b);
+            if shift + 7 >= bits {
+                if v & 0x80 != 0 {
+                    return LoadError.Malformed;
+                }
+                let room = bits - shift;
+                if room < 7 {
+                    // Bits room - 1 (the sign) through 6 are all one or all zero.
+                    let high = (v as u32) >> (room - 1);
+                    let one: u32 = 1;
+                    let all = (one << (8 - room)) - 1;
+                    if high != 0 and high != all {
+                        return LoadError.Malformed;
+                    }
+                }
+                result = result | ((v as u64) << shift);
+                if v & 0x40 != 0 and shift + 7 < 64 {
+                    result = result | (0xFFFFFFFFFFFFFFFF << (shift + 7));
+                }
+                return result;
+            }
+            result = result | (((v & 0x7F) as u64) << shift);
+            shift += 7;
+            if v & 0x80 == 0 {
+                if v & 0x40 != 0 and shift < 64 {
+                    result = result | (0xFFFFFFFFFFFFFFFF << shift);
+                }
+                return result;
+            }
+        }
+        return result;
+    }
+
+    pub fn uleb32(self: &mut Reader, b: []u8) -> LoadError!u32 {
+        let v = try self.unsigned(b, bits: 32);
+        return v as u32;
+    }
+
+    /// n bytes, little-endian.
+    pub fn fixed(self: &mut Reader, b: []u8, n: u32) -> LoadError!u64 {
+        var v: u64 = 0;
+        var i: u32 = 0;
+        while i < n : (i += 1) {
+            let x = try self.byte(b);
+            v = v | ((x as u64) << (8 * i));
+        }
+        return v;
+    }
+
+    /// A name: a length, then that many bytes of UTF-8.
+    pub fn name(self: &mut Reader, b: []u8, a: alloc.Allocator) -> LoadError!alloc.String {
+        let n = try self.uleb32(b);
+        if n as usize > self.end - self.at {
+            return LoadError.Malformed;
+        }
+        let start = self.at;
+        self.at = start + n as usize;
+        var s = alloc.String.init(a);
+        if not s.push_utf8(b[start..self.at]) {
+            return LoadError.Malformed;
+        }
+        return s;
+    }
+}

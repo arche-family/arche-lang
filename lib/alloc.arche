@@ -5,6 +5,7 @@
 import core;
 import core.fmt;
 import core.mem;
+import core.utf8;
 
 /// Where a container's memory comes from: the program's allocator
 /// (sys.alloc), or a region's (spec/arche.md §7). A handle, copied freely.
@@ -31,6 +32,52 @@ pub type List(comptime T: type) = struct {
 
     pub fn init(a: Allocator) -> List(T) {
         return List(T) { data: mem.null(T), used: 0, cap: 0, allocator: a, unique: core.Unique { } };
+    }
+
+    /// An empty list with room for n elements: up to n are pushed without
+    /// moving any. Memory the allocator hands out is zero, and a large block
+    /// takes pages from the system only as they are written.
+    pub fn with_capacity(a: Allocator, n: usize) -> List(T) {
+        var list = List(T).init(a);
+        if n > 0 {
+            unsafe {
+                // SAFETY: the block holds n elements, none in use yet.
+                list.data = mem.alloc(a.handle, bytes_for(count: n, size: mem.size_of(T))) as *mut T;
+            }
+            list.cap = n;
+        }
+        return list;
+    }
+
+    /// Grows the list to n elements, every new one all zero bytes, as a
+    /// number is zero; within the capacity nothing moves. A list that long
+    /// already stays as it is.
+    pub fn grow_zeroed(self: &mut List(T), n: usize) {
+        if n <= self.used {
+            return;
+        }
+        let size = mem.size_of(T);
+        if n > self.cap {
+            unsafe {
+                // SAFETY: the new block holds n elements and the old one len.
+                let fresh = mem.alloc(self.allocator.handle, bytes_for(count: n, size: size)) as *mut T;
+                if self.used > 0 {
+                    mem.copy(fresh as *mut u8, self.data as *u8, self.used * size);
+                }
+                self.data = fresh;
+            }
+            self.cap = n;
+        }
+        unsafe {
+            // SAFETY: the bytes from len to n are inside the block; an
+            // element popped or cleared may have left some of them set.
+            let bytes = mem.slice_mut(u8, self.data as *mut u8, n * size);
+            var i = self.used * size;
+            while i < n * size : (i += 1) {
+                bytes[i] = 0;
+            }
+        }
+        self.used = n;
     }
 
     pub fn push(self: &mut List(T), item: T) {
@@ -161,6 +208,25 @@ pub type String = struct {
             mem.copy(self.data.add(self.used), &b[0] as *u8, b.len());
         }
         self.used += b.len();
+    }
+
+    /// Appends bytes that are UTF-8, and says true; bytes that are not leave
+    /// the string as it was, and say false.
+    pub fn push_utf8(self: &mut String, bytes: []u8) -> bool {
+        if not utf8.valid(bytes) {
+            return false;
+        }
+        if bytes.len() == 0 {
+            return true;
+        }
+        self.room(bytes.len());
+        unsafe {
+            // SAFETY: room made space for the bytes after len, and they are
+            // UTF-8, so the string stays so.
+            mem.copy(self.data.add(self.used), &bytes[0] as *u8, bytes.len());
+        }
+        self.used += bytes.len();
+        return true;
     }
 
     pub fn push_ascii(self: &mut String, byte: u8) {

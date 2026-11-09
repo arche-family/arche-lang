@@ -1,0 +1,68 @@
+/// arche-wasm: runs WebAssembly.
+///
+///   arche-wasm spec <script.json>...    the spec's tests (wast2json's output)
+///   arche-wasm run <module.wasm> <export> [i32 args]...
+import alloc;
+import std;
+import spec;
+
+fn usage(sys: &mut std.System) -> !void {
+    sys.stderr.write("usage: arche-wasm spec <script.json>...\n");
+    sys.proc.exit(2);
+}
+
+fn dir_of(path: str) -> str {
+    var cut: usize = 0;
+    var found = false;
+    var i: usize = 0;
+    let b = path.bytes();
+    while i < b.len() : (i += 1) {
+        if b[i] == '/' {
+            cut = i;
+            found = true;
+        }
+    }
+    if not found {
+        return ".";
+    }
+    return path[0..cut];
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() < 2 {
+        try usage(sys);
+    }
+    let cmd = sys.args.get(1);
+    if cmd.eq("spec") {
+        var total = spec.Tally { passed: 0, failed: 0, skipped: 0 };
+        var i: usize = 2;
+        while i < sys.args.len() : (i += 1) {
+            let file = sys.args.get(i);
+            var t = spec.Tally { passed: 0, failed: 0, skipped: 0 };
+            region r {
+                spec.run_file(&sys.fs, out: &mut sys.stdout, file: file, dir: dir_of(file), tally: &mut t, a: r);
+            }
+            if t.failed > 0 {
+                sys.stdout.write(file);
+                sys.stdout.write(": ");
+                sys.stdout.write_u64(t.failed);
+                sys.stdout.write(" failed\n");
+            }
+            total.passed += t.passed;
+            total.failed += t.failed;
+            total.skipped += t.skipped;
+        }
+        sys.stdout.write("passed ");
+        sys.stdout.write_u64(total.passed);
+        sys.stdout.write(", failed ");
+        sys.stdout.write_u64(total.failed);
+        sys.stdout.write(", skipped ");
+        sys.stdout.write_u64(total.skipped);
+        sys.stdout.write("\n");
+        if total.failed > 0 {
+            sys.proc.exit(1);
+        }
+        return;
+    }
+    try usage(sys);
+}

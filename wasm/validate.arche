@@ -1,0 +1,1081 @@
+/// Validation (the spec's "Validation" chapter and its appendix's algorithm),
+/// and with it the compilation of each body to the code exec.arche runs: the
+/// same instructions, with every branch's target, the values it keeps and
+/// the height it leaves resolved, and block, loop, else and end gone.
+import alloc;
+import module as m;
+
+// ---- the compiled code's own instructions ------------------------------------------
+// Others keep their opcode; 0xFC n is 0x100 + n.
+
+/// target
+pub const OP_JUMP: u32 = 0x200;
+/// target, keep, height: the top keep values go to height (from the frame's
+/// start), then on to target.
+pub const OP_BR: u32 = 0x201;
+/// target: on a nonzero i32.
+pub const OP_BR_IF: u32 = 0x202;
+/// target, keep, height
+pub const OP_BR_IF_MOVE: u32 = 0x203;
+/// target: on a zero i32.
+pub const OP_IF_FALSE: u32 = 0x204;
+/// n, then n + 1 times target, keep, height; the last is the default.
+pub const OP_BR_TABLE: u32 = 0x205;
+pub const OP_RETURN: u32 = 0x206;
+/// Where a loop begins: a deadline is checked every so often here.
+pub const OP_TICK: u32 = 0x207;
+pub const OP_FC: u32 = 0x100;
+
+const NO_FIXUP: u32 = 0xFFFFFFFF;
+
+const KIND_BLOCK: u8 = 0;
+const KIND_LOOP: u8 = 1;
+const KIND_IF: u8 = 2;
+const KIND_ELSE: u8 = 3;
+const KIND_FUNC: u8 = 4;
+
+// A block type: none, one result, or a function type's params and results.
+const BT_EMPTY: u8 = 0;
+const BT_VALUE: u8 = 1;
+const BT_INDEX: u8 = 2;
+
+/// A block validation is inside (the spec's control frame).
+type Ctl = struct {
+    kind: u8,
+    bt_kind: u8,
+    bt_value: u32,
+    /// The operand height where the block's params begin.
+    height: u32,
+    unreachable: bool,
+    /// For a loop, where a branch to it goes.
+    start: u32,
+    /// The last word to patch with the block's end; each holds the one before.
+    fixups: u32,
+    /// For an if, the word of its jump to the else.
+    else_at: u32,
+}
+
+fn bt_count(mod: &m.Module, kind: u8, value: u32, results: bool) -> u32 {
+    if kind == BT_EMPTY {
+        return 0;
+    }
+    if kind == BT_VALUE {
+        if results {
+            return 1;
+        }
+        return 0;
+    }
+    let t = &mod.types.items()[value as usize];
+    if results {
+        return t.results.len() as u32;
+    }
+    return t.params.len() as u32;
+}
+
+fn bt_type(mod: &m.Module, kind: u8, value: u32, results: bool, i: u32) -> u8 {
+    if kind == BT_VALUE {
+        return value as u8;
+    }
+    let t = &mod.types.items()[value as usize];
+    if results {
+        return t.results.items()[i as usize];
+    }
+    return t.params.items()[i as usize];
+}
+
+/// One function's validation.
+type Checker = struct {
+    vals: alloc.List(u8),
+    ctls: alloc.List(Ctl),
+    code: alloc.List(u32),
+    locals: alloc.List(u8),
+    max: u32,
+    a: alloc.Allocator,
+
+    fn push(self: &mut Checker, t: u8) {
+        self.vals.push(t);
+        let h = self.vals.len() as u32;
+        if h > self.max {
+            self.max = h;
+        }
+    }
+
+    fn pop(self: &mut Checker) -> m.LoadError!u8 {
+        let c = self.ctls.items()[self.ctls.len() - 1];
+        if self.vals.len() as u32 == c.height {
+            if c.unreachable {
+                return m.UNKNOWN;
+            }
+            return m.LoadError.Invalid;
+        }
+        return self.vals.pop() orelse m.UNKNOWN;
+    }
+
+    fn expect(self: &mut Checker, t: u8) -> m.LoadError!u8 {
+        let actual = try self.pop();
+        if actual == m.UNKNOWN {
+            return m.UNKNOWN;
+        }
+        if t != m.UNKNOWN and actual != t {
+            return m.LoadError.Invalid;
+        }
+        return actual;
+    }
+
+    fn emit(self: &mut Checker, w: u32) {
+        self.code.push(w);
+    }
+
+    fn here(self: &Checker) -> u32 {
+        return self.code.len() as u32;
+    }
+
+    fn top(self: &Checker) -> Ctl {
+        return self.ctls.items()[self.ctls.len() - 1];
+    }
+
+    fn set_unreachable(self: &mut Checker) {
+        let c = self.top();
+        while self.vals.len() as u32 > c.height {
+            _ = self.vals.pop();
+        }
+        self.ctls.items_mut()[self.ctls.len() - 1].unreachable = true;
+    }
+
+    fn enter(self: &mut Checker, mod: &m.Module, kind: u8, bt_kind: u8, bt_value: u32) -> m.LoadError!void {
+        let np = bt_count(mod, kind: bt_kind, value: bt_value, results: false);
+        var i = np;
+        while i > 0 {
+            i -= 1;
+            _ = try self.expect(bt_type(mod, kind: bt_kind, value: bt_value, results: false, i: i));
+        }
+        let h = self.vals.len() as u32;
+        self.ctls.push(Ctl { kind: kind, bt_kind: bt_kind, bt_value: bt_value, height: h, unreachable: false, start: self.here(), fixups: NO_FIXUP, else_at: NO_FIXUP });
+        i = 0;
+        while i < np : (i += 1) {
+            self.push(bt_type(mod, kind: bt_kind, value: bt_value, results: false, i: i));
+        }
+    }
+
+    /// The block's results checked and its frame left.
+    fn leave(self: &mut Checker, mod: &m.Module) -> m.LoadError!Ctl {
+        let c = self.top();
+        let nr = bt_count(mod, kind: c.bt_kind, value: c.bt_value, results: true);
+        var i = nr;
+        while i > 0 {
+            i -= 1;
+            _ = try self.expect(bt_type(mod, kind: c.bt_kind, value: c.bt_value, results: true, i: i));
+        }
+        if self.vals.len() as u32 != c.height {
+            return m.LoadError.Invalid;
+        }
+        _ = self.ctls.pop();
+        return c;
+    }
+
+    fn patch(self: &mut Checker, head: u32, target: u32) {
+        var at = head;
+        while at != NO_FIXUP {
+            let next = self.code.items()[at as usize];
+            self.code.items_mut()[at as usize] = target;
+            at = next;
+        }
+    }
+
+    /// How many values a branch to the block keeps.
+    fn arity(self: &Checker, mod: &m.Module, c: Ctl) -> u32 {
+        return bt_count(mod, kind: c.bt_kind, value: c.bt_value, results: c.kind != KIND_LOOP);
+    }
+
+    fn label_type(self: &Checker, mod: &m.Module, c: Ctl, i: u32) -> u8 {
+        return bt_type(mod, kind: c.bt_kind, value: c.bt_value, results: c.kind != KIND_LOOP, i: i);
+    }
+
+    /// The label's types popped and checked, and pushed back; for br_if.
+    fn check_label(self: &mut Checker, mod: &m.Module, c: Ctl, push_back: bool) -> m.LoadError!void {
+        let n = self.arity(mod, c);
+        var got: [64]u8 = [0; 64];
+        if n > 64 {
+            return m.LoadError.Invalid;
+        }
+        var i = n;
+        while i > 0 {
+            i -= 1;
+            got[i as usize] = try self.expect(self.label_type(mod, c, i: i));
+        }
+        if push_back {
+            // br_if leaves the label's types, whatever was there.
+            i = 0;
+            while i < n : (i += 1) {
+                self.push(self.label_type(mod, c, i: i));
+            }
+        }
+    }
+
+    /// The target, keep and height words of a branch to depth.
+    fn branch_words(self: &mut Checker, mod: &m.Module, ci: usize) {
+        let c = self.ctls.items()[ci];
+        if c.kind == KIND_LOOP {
+            self.emit(c.start);
+        } else {
+            self.emit(c.fixups);
+            let at = self.here() - 1;
+            self.ctls.items_mut()[ci].fixups = at;
+        }
+        self.emit(self.arity(mod, c));
+        self.emit(self.locals.len() as u32 + c.height);
+    }
+
+    /// A branch's code: a return to the function's frame, a plain jump when
+    /// the values are where the label wants them, a move otherwise.
+    fn branch(self: &mut Checker, mod: &m.Module, ci: usize, conditional: bool) {
+        let c = self.ctls.items()[ci];
+        if c.kind == KIND_FUNC {
+            if conditional {
+                // br_if to the function: a return when taken.
+                self.emit(OP_IF_FALSE);
+                let skip = self.here();
+                self.emit(0);
+                self.emit(OP_RETURN);
+                let after = self.here();
+                self.code.items_mut()[skip as usize] = after;
+            } else {
+                self.emit(OP_RETURN);
+            }
+            return;
+        }
+        let keep = self.arity(mod, c);
+        let direct = not self.top().unreachable and self.vals.len() as u32 == c.height + keep;
+        if direct {
+            if conditional {
+                self.emit(OP_BR_IF);
+            } else {
+                self.emit(OP_JUMP);
+            }
+            if c.kind == KIND_LOOP {
+                self.emit(c.start);
+            } else {
+                self.emit(c.fixups);
+                let at = self.here() - 1;
+            self.ctls.items_mut()[ci].fixups = at;
+            }
+            return;
+        }
+        if conditional {
+            self.emit(OP_BR_IF_MOVE);
+        } else {
+            self.emit(OP_BR);
+        }
+        self.branch_words(mod, ci);
+    }
+
+    fn label_index(self: &Checker, depth: u32) -> m.LoadError!usize {
+        if depth as usize >= self.ctls.len() {
+            return m.LoadError.Invalid;
+        }
+        return self.ctls.len() - 1 - depth as usize;
+    }
+
+    fn local_type(self: &Checker, i: u32) -> m.LoadError!u8 {
+        if i as usize >= self.locals.len() {
+            return m.LoadError.Invalid;
+        }
+        return self.locals.items()[i as usize];
+    }
+}
+
+/// Checks the whole module, and compiles every function's body.
+pub fn validate(mod: &mut m.Module, a: alloc.Allocator) -> m.LoadError!void {
+    try check_module(mod);
+    var k: usize = 0;
+    while k < mod.funcs.len() : (k += 1) {
+        if mod.funcs.items()[k].imported {
+            continue;
+        }
+        var c = Checker { vals: alloc.List(u8).init(a), ctls: alloc.List(Ctl).init(a), code: alloc.List(u32).init(a), locals: alloc.List(u8).init(a), max: 0, a: a };
+        try body(mod, k, &mut c);
+        let f = &mut mod.funcs.items_mut()[k];
+        f.code = c.code;
+        f.max_height = c.max;
+    }
+}
+
+fn limits_ok(l: m.Limits, bound: u64) -> bool {
+    if l.min > bound {
+        return false;
+    }
+    if l.has_max and (l.max > bound or l.max < l.min) {
+        return false;
+    }
+    return true;
+}
+
+/// A constant expression of type t, where only the first globals count.
+fn check_const(mod: &m.Module, c: m.Const, t: u8, globals: usize) -> m.LoadError!void {
+    var got: u8 = 0;
+    if c.op == 0x41 {
+        got = m.I32;
+    } else if c.op == 0x42 {
+        got = m.I64;
+    } else if c.op == 0x43 {
+        got = m.F32;
+    } else if c.op == 0x44 {
+        got = m.F64;
+    } else if c.op == 0xD0 {
+        got = c.value as u8;
+    } else if c.op == 0xD2 {
+        if c.value >= mod.funcs.len() as u64 {
+            return m.LoadError.Invalid;
+        }
+        got = m.FUNCREF;
+    } else if c.op == 0x23 {
+        if c.value >= globals as u64 {
+            return m.LoadError.Invalid;
+        }
+        let g = mod.globals.items()[c.value as usize];
+        if g.mutable {
+            return m.LoadError.Invalid;
+        }
+        got = g.ty;
+    } else {
+        return m.LoadError.Invalid;
+    }
+    if got != t {
+        return m.LoadError.Invalid;
+    }
+}
+
+fn imported_globals(mod: &m.Module) -> usize {
+    var n: usize = 0;
+    for g in mod.globals.items() {
+        if g.imported {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn check_module(mod: &mut m.Module) -> m.LoadError!void {
+    let ntypes = mod.types.len() as u32;
+    for f in mod.funcs.items() {
+        if f.type_index >= ntypes {
+            return m.LoadError.Invalid;
+        }
+    }
+    for t in mod.tables.items() {
+        if not limits_ok(t.limits, bound: 0xFFFFFFFF) {
+            return m.LoadError.Invalid;
+        }
+    }
+    if mod.memories.len() > 1 {
+        return m.LoadError.Invalid;
+    }
+    for mem in mod.memories.items() {
+        if not limits_ok(mem.limits, bound: m.MAX_PAGES) {
+            return m.LoadError.Invalid;
+        }
+    }
+    let nimported = imported_globals(mod);
+    // C.refs: functions named outside bodies.
+    var i: usize = 0;
+    while i < mod.funcs.len() : (i += 1) {
+        mod.declared.push(false);
+    }
+    for g in mod.globals.items() {
+        if not g.imported {
+            try check_const(mod, g.init, t: g.ty, globals: nimported);
+            if g.init.op == 0xD2 {
+                mod.declared.items_mut()[g.init.value as usize] = true;
+            }
+        }
+    }
+    i = 0;
+    while i < mod.exports.len() : (i += 1) {
+        let e = &mod.exports.items()[i];
+        var j: usize = 0;
+        while j < i : (j += 1) {
+            if mod.exports.items()[j].name.view().eq(e.name.view()) {
+                return m.LoadError.Invalid;
+            }
+        }
+        var count: usize = 0;
+        if e.kind == m.EXTERN_FUNC {
+            count = mod.funcs.len();
+        } else if e.kind == m.EXTERN_TABLE {
+            count = mod.tables.len();
+        } else if e.kind == m.EXTERN_MEMORY {
+            count = mod.memories.len();
+        } else {
+            count = mod.globals.len();
+        }
+        if e.index as usize >= count {
+            return m.LoadError.Invalid;
+        }
+        if e.kind == m.EXTERN_FUNC {
+            mod.declared.items_mut()[e.index as usize] = true;
+        }
+    }
+    if mod.has_start {
+        if mod.start as usize >= mod.funcs.len() {
+            return m.LoadError.Invalid;
+        }
+        let t = &mod.types.items()[mod.funcs.items()[mod.start as usize].type_index as usize];
+        if t.params.len() != 0 or t.results.len() != 0 {
+            return m.LoadError.Invalid;
+        }
+    }
+    for e in mod.elems.items() {
+        for item in e.items.items() {
+            try check_const(mod, item.*, t: e.ty, globals: nimported);
+            if item.op == 0xD2 {
+                mod.declared.items_mut()[item.value as usize] = true;
+            }
+        }
+        if e.mode == m.ACTIVE {
+            if e.table as usize >= mod.tables.len() {
+                return m.LoadError.Invalid;
+            }
+            if mod.tables.items()[e.table as usize].elem != e.ty {
+                return m.LoadError.Invalid;
+            }
+            try check_const(mod, e.offset, t: m.I32, globals: nimported);
+        }
+    }
+    for d in mod.datas.items() {
+        if d.mode == m.ACTIVE {
+            if d.memory as usize >= mod.memories.len() {
+                return m.LoadError.Invalid;
+            }
+            try check_const(mod, d.offset, t: m.I32, globals: nimported);
+        }
+    }
+}
+
+/// Validates function k's body and compiles it into c.code.
+fn body(mod: &m.Module, k: usize, c: &mut Checker) -> m.LoadError!void {
+    let f = &mod.funcs.items()[k];
+    let ft = &mod.types.items()[f.type_index as usize];
+    for t in ft.params.items() {
+        c.locals.push(t.*);
+    }
+    for t in f.locals.items() {
+        c.locals.push(t.*);
+    }
+    let b = mod.bytes.items();
+    var r = m.Reader { at: f.body_start, end: f.body_end };
+    c.ctls.push(Ctl { kind: KIND_FUNC, bt_kind: BT_INDEX, bt_value: f.type_index, height: 0, unreachable: false, start: 0, fixups: NO_FIXUP, else_at: NO_FIXUP });
+    // Each call ticks the deadline once.
+    c.emit(OP_TICK);
+    while c.ctls.len() > 0 {
+        let op = try r.byte(b);
+        try instruction(mod, c, b, &mut r, op);
+    }
+    if not r.done() {
+        return m.LoadError.Malformed;
+    }
+}
+
+fn block_type(mod: &m.Module, b: []u8, r: &mut m.Reader, kind: &mut u8, value: &mut u32) -> m.LoadError!void {
+    if r.at >= r.end {
+        return m.LoadError.Malformed;
+    }
+    let first = b[r.at];
+    if first == 0x40 {
+        r.at += 1;
+        kind.* = BT_EMPTY;
+        return;
+    }
+    if m.is_value_type(first) {
+        r.at += 1;
+        kind.* = BT_VALUE;
+        value.* = first as u32;
+        return;
+    }
+    let x = try r.signed(b, bits: 33);
+    if x >= 0x8000000000000000 {
+        return m.LoadError.Malformed;
+    }
+    if x >= mod.types.len() as u64 {
+        return m.LoadError.Invalid;
+    }
+    kind.* = BT_INDEX;
+    value.* = x as u32;
+}
+
+fn memarg(mod: &m.Module, c: &mut Checker, b: []u8, r: &mut m.Reader, natural: u32) -> m.LoadError!void {
+    let align = try r.uleb32(b);
+    let offset = try r.uleb32(b);
+    if mod.memories.len() == 0 {
+        return m.LoadError.Invalid;
+    }
+    let one: u32 = 1;
+    if align >= 32 or (one << align) > natural {
+        return m.LoadError.Invalid;
+    }
+    c.emit(offset);
+}
+
+/// [a] -> r, or [a a] -> r, by opcode, for the numeric instructions; 0 when
+/// op is not one. Packed as a | b << 8 | r << 16, b 0 for one operand.
+fn numeric(op: u8) -> u32 {
+    let ti = m.I32 as u32;
+    let tl = m.I64 as u32;
+    let tf = m.F32 as u32;
+    let td = m.F64 as u32;
+    if op == 0x45 { return ti | (ti << 16); }
+    if op >= 0x46 and op <= 0x4F { return ti | (ti << 8) | (ti << 16); }
+    if op == 0x50 { return tl | (ti << 16); }
+    if op >= 0x51 and op <= 0x5A { return tl | (tl << 8) | (ti << 16); }
+    if op >= 0x5B and op <= 0x60 { return tf | (tf << 8) | (ti << 16); }
+    if op >= 0x61 and op <= 0x66 { return td | (td << 8) | (ti << 16); }
+    if op >= 0x67 and op <= 0x69 { return ti | (ti << 16); }
+    if op >= 0x6A and op <= 0x78 { return ti | (ti << 8) | (ti << 16); }
+    if op >= 0x79 and op <= 0x7B { return tl | (tl << 16); }
+    if op >= 0x7C and op <= 0x8A { return tl | (tl << 8) | (tl << 16); }
+    if op >= 0x8B and op <= 0x91 { return tf | (tf << 16); }
+    if op >= 0x92 and op <= 0x98 { return tf | (tf << 8) | (tf << 16); }
+    if op >= 0x99 and op <= 0x9F { return td | (td << 16); }
+    if op >= 0xA0 and op <= 0xA6 { return td | (td << 8) | (td << 16); }
+    if op == 0xA7 { return tl | (ti << 16); }
+    if op == 0xA8 or op == 0xA9 { return tf | (ti << 16); }
+    if op == 0xAA or op == 0xAB { return td | (ti << 16); }
+    if op == 0xAC or op == 0xAD { return ti | (tl << 16); }
+    if op == 0xAE or op == 0xAF { return tf | (tl << 16); }
+    if op == 0xB0 or op == 0xB1 { return td | (tl << 16); }
+    if op == 0xB2 or op == 0xB3 { return ti | (tf << 16); }
+    if op == 0xB4 or op == 0xB5 { return tl | (tf << 16); }
+    if op == 0xB6 { return td | (tf << 16); }
+    if op == 0xB7 or op == 0xB8 { return ti | (td << 16); }
+    if op == 0xB9 or op == 0xBA { return tl | (td << 16); }
+    if op == 0xBB { return tf | (td << 16); }
+    if op == 0xBC { return tf | (ti << 16); }
+    if op == 0xBD { return td | (tl << 16); }
+    if op == 0xBE { return ti | (tf << 16); }
+    if op == 0xBF { return tl | (td << 16); }
+    if op == 0xC0 or op == 0xC1 { return ti | (ti << 16); }
+    if op >= 0xC2 and op <= 0xC4 { return tl | (tl << 16); }
+    return 0;
+}
+
+/// The access size and value type of a load (0x28 to 0x35) or store (0x36 to 0x3E).
+fn access(op: u8, ty: &mut u8) -> u32 {
+    if op == 0x28 or op == 0x36 { ty.* = m.I32; return 4; }
+    if op == 0x29 or op == 0x37 { ty.* = m.I64; return 8; }
+    if op == 0x2A or op == 0x38 { ty.* = m.F32; return 4; }
+    if op == 0x2B or op == 0x39 { ty.* = m.F64; return 8; }
+    if op == 0x2C or op == 0x2D or op == 0x3A { ty.* = m.I32; return 1; }
+    if op == 0x2E or op == 0x2F or op == 0x3B { ty.* = m.I32; return 2; }
+    if op == 0x30 or op == 0x31 or op == 0x3C { ty.* = m.I64; return 1; }
+    if op == 0x32 or op == 0x33 or op == 0x3D { ty.* = m.I64; return 2; }
+    ty.* = m.I64;
+    return 4;
+}
+
+fn table_index(mod: &m.Module, b: []u8, r: &mut m.Reader) -> m.LoadError!u32 {
+    let x = try r.uleb32(b);
+    if x as usize >= mod.tables.len() {
+        return m.LoadError.Invalid;
+    }
+    return x;
+}
+
+fn instruction(mod: &m.Module, c: &mut Checker, b: []u8, r: &mut m.Reader, op: u8) -> m.LoadError!void {
+    let sig = numeric(op);
+    if sig != 0 {
+        let x = (sig & 0xFF) as u8;
+        let y = ((sig >> 8) & 0xFF) as u8;
+        if y != 0 {
+            _ = try c.expect(y);
+        }
+        _ = try c.expect(x);
+        c.push(((sig >> 16) & 0xFF) as u8);
+        c.emit(op as u32);
+        return;
+    }
+    if op >= 0x28 and op <= 0x35 {
+        var ty: u8 = 0;
+        let size = access(op, &mut ty);
+        c.emit(op as u32);
+        try memarg(mod, c, b, r, natural: size);
+        _ = try c.expect(m.I32);
+        c.push(ty);
+        return;
+    }
+    if op >= 0x36 and op <= 0x3E {
+        var ty: u8 = 0;
+        let size = access(op, &mut ty);
+        c.emit(op as u32);
+        try memarg(mod, c, b, r, natural: size);
+        _ = try c.expect(ty);
+        _ = try c.expect(m.I32);
+        return;
+    }
+    match op {
+        0x00 => {
+            c.emit(0x00);
+            c.set_unreachable();
+        }
+        0x01 => { }
+        0x02 | 0x03 => {
+            var kind: u8 = 0;
+            var value: u32 = 0;
+            try block_type(mod, b, r, &mut kind, &mut value);
+            if op == 0x03 {
+                try c.enter(mod, kind: KIND_LOOP, bt_kind: kind, bt_value: value);
+                c.emit(OP_TICK);
+            } else {
+                try c.enter(mod, kind: KIND_BLOCK, bt_kind: kind, bt_value: value);
+            }
+        }
+        0x04 => {
+            var kind: u8 = 0;
+            var value: u32 = 0;
+            try block_type(mod, b, r, &mut kind, &mut value);
+            _ = try c.expect(m.I32);
+            try c.enter(mod, kind: KIND_IF, bt_kind: kind, bt_value: value);
+            c.emit(OP_IF_FALSE);
+            let at = c.here();
+            let last = c.ctls.len() - 1;
+            c.ctls.items_mut()[last].else_at = at;
+            c.emit(0);
+        }
+        0x05 => {
+            let top = c.top();
+            if top.kind != KIND_IF {
+                return m.LoadError.Invalid;
+            }
+            let done = try c.leave(mod);
+            // The then branch jumps over the else.
+            c.emit(OP_JUMP);
+            c.emit(done.fixups);
+            var again = done;
+            again.fixups = c.here() - 1;
+            let else_start = c.here();
+            c.code.items_mut()[done.else_at as usize] = else_start;
+            again.else_at = NO_FIXUP;
+            again.kind = KIND_ELSE;
+            again.unreachable = false;
+            again.height = c.vals.len() as u32;
+            c.ctls.push(again);
+            let np = bt_count(mod, kind: done.bt_kind, value: done.bt_value, results: false);
+            var i: u32 = 0;
+            while i < np : (i += 1) {
+                c.push(bt_type(mod, kind: done.bt_kind, value: done.bt_value, results: false, i: i));
+            }
+        }
+        0x0B => {
+            let top = c.top();
+            if top.kind == KIND_IF {
+                // No else: the params are the results.
+                let np = bt_count(mod, kind: top.bt_kind, value: top.bt_value, results: false);
+                let nr = bt_count(mod, kind: top.bt_kind, value: top.bt_value, results: true);
+                if np != nr {
+                    return m.LoadError.Invalid;
+                }
+                var i: u32 = 0;
+                while i < np : (i += 1) {
+                    if bt_type(mod, kind: top.bt_kind, value: top.bt_value, results: false, i: i) != bt_type(mod, kind: top.bt_kind, value: top.bt_value, results: true, i: i) {
+                        return m.LoadError.Invalid;
+                    }
+                }
+            }
+            let done = try c.leave(mod);
+            if done.kind == KIND_FUNC {
+                c.emit(OP_RETURN);
+                return;
+            }
+            if done.kind == KIND_IF {
+                let else_start = c.here();
+            c.code.items_mut()[done.else_at as usize] = else_start;
+            }
+            c.patch(head: done.fixups, target: c.here());
+            let nr = bt_count(mod, kind: done.bt_kind, value: done.bt_value, results: true);
+            var i: u32 = 0;
+            while i < nr : (i += 1) {
+                c.push(bt_type(mod, kind: done.bt_kind, value: done.bt_value, results: true, i: i));
+            }
+        }
+        0x0C => {
+            let depth = try r.uleb32(b);
+            let ci = try c.label_index(depth);
+            let target = c.ctls.items()[ci];
+            try c.check_label(mod, target, push_back: true);
+            c.branch(mod, ci, conditional: false);
+            c.set_unreachable();
+        }
+        0x0D => {
+            let depth = try r.uleb32(b);
+            let ci = try c.label_index(depth);
+            _ = try c.expect(m.I32);
+            let target = c.ctls.items()[ci];
+            try c.check_label(mod, target, push_back: true);
+            c.branch(mod, ci, conditional: true);
+        }
+        0x0E => {
+            let n = try r.uleb32(b);
+            if n > 100000 {
+                return m.LoadError.Invalid;
+            }
+            var depths = alloc.List(u32).init(c.a);
+            var i: u32 = 0;
+            while i <= n : (i += 1) {
+                depths.push(try r.uleb32(b));
+            }
+            _ = try c.expect(m.I32);
+            let last = try c.label_index(depths.items()[n as usize]);
+            let arity = c.arity(mod, c.ctls.items()[last]);
+            c.emit(OP_BR_TABLE);
+            c.emit(n);
+            i = 0;
+            while i <= n : (i += 1) {
+                let ci = try c.label_index(depths.items()[i as usize]);
+                let target = c.ctls.items()[ci];
+                if c.arity(mod, target) != arity {
+                    return m.LoadError.Invalid;
+                }
+                // Each label's types, against the same operands.
+                var got: [64]u8 = [0; 64];
+                if arity > 64 {
+                    return m.LoadError.Invalid;
+                }
+                var k = arity;
+                while k > 0 {
+                    k -= 1;
+                    got[k as usize] = try c.expect(c.label_type(mod, target, i: k));
+                }
+                k = 0;
+                while k < arity : (k += 1) {
+                    c.push(got[k as usize]);
+                }
+                if target.kind == KIND_FUNC {
+                    // A return: the target word says so.
+                    c.emit(NO_FIXUP);
+                    c.emit(arity);
+                    c.emit(0);
+                } else {
+                    c.branch_words(mod, ci);
+                }
+            }
+            c.set_unreachable();
+        }
+        0x0F => {
+            try c.check_label(mod, c.ctls.items()[0], push_back: false);
+            c.emit(OP_RETURN);
+            c.set_unreachable();
+        }
+        0x10 => {
+            let x = try r.uleb32(b);
+            if x as usize >= mod.funcs.len() {
+                return m.LoadError.Invalid;
+            }
+            try call_types(mod, c, mod.funcs.items()[x as usize].type_index);
+            c.emit(0x10);
+            c.emit(x);
+        }
+        0x11 => {
+            let t = try r.uleb32(b);
+            let table = try table_index(mod, b, r);
+            if t as usize >= mod.types.len() or mod.tables.items()[table as usize].elem != m.FUNCREF {
+                return m.LoadError.Invalid;
+            }
+            _ = try c.expect(m.I32);
+            try call_types(mod, c, t);
+            c.emit(0x11);
+            c.emit(t);
+            c.emit(table);
+        }
+        0x1A => {
+            _ = try c.pop();
+            c.emit(0x1A);
+        }
+        0x1B => {
+            _ = try c.expect(m.I32);
+            let x = try c.pop();
+            let y = try c.pop();
+            if m.is_ref_type(x) or m.is_ref_type(y) {
+                return m.LoadError.Invalid;
+            }
+            if x != y and x != m.UNKNOWN and y != m.UNKNOWN {
+                return m.LoadError.Invalid;
+            }
+            if x == m.UNKNOWN {
+                c.push(y);
+            } else {
+                c.push(x);
+            }
+            c.emit(0x1B);
+        }
+        0x1C => {
+            let n = try r.uleb32(b);
+            if n != 1 {
+                return m.LoadError.Invalid;
+            }
+            let t = try r.byte(b);
+            if not m.is_value_type(t) {
+                return m.LoadError.Malformed;
+            }
+            _ = try c.expect(m.I32);
+            _ = try c.expect(t);
+            _ = try c.expect(t);
+            c.push(t);
+            c.emit(0x1B);
+        }
+        0x20 | 0x21 | 0x22 => {
+            let x = try r.uleb32(b);
+            let t = try c.local_type(x);
+            if op == 0x20 {
+                c.push(t);
+            } else {
+                _ = try c.expect(t);
+                if op == 0x22 {
+                    c.push(t);
+                }
+            }
+            c.emit(op as u32);
+            c.emit(x);
+        }
+        0x23 | 0x24 => {
+            let x = try r.uleb32(b);
+            if x as usize >= mod.globals.len() {
+                return m.LoadError.Invalid;
+            }
+            let g = mod.globals.items()[x as usize];
+            if op == 0x23 {
+                c.push(g.ty);
+            } else {
+                if not g.mutable {
+                    return m.LoadError.Invalid;
+                }
+                _ = try c.expect(g.ty);
+            }
+            c.emit(op as u32);
+            c.emit(x);
+        }
+        0x25 | 0x26 => {
+            let x = try table_index(mod, b, r);
+            let t = mod.tables.items()[x as usize].elem;
+            if op == 0x25 {
+                _ = try c.expect(m.I32);
+                c.push(t);
+            } else {
+                _ = try c.expect(t);
+                _ = try c.expect(m.I32);
+            }
+            c.emit(op as u32);
+            c.emit(x);
+        }
+        0x3F | 0x40 => {
+            let zero = try r.byte(b);
+            if zero != 0 {
+                return m.LoadError.Malformed;
+            }
+            if mod.memories.len() == 0 {
+                return m.LoadError.Invalid;
+            }
+            if op == 0x40 {
+                _ = try c.expect(m.I32);
+            }
+            c.push(m.I32);
+            c.emit(op as u32);
+        }
+        0x41 => {
+            let v = try r.signed(b, bits: 32);
+            c.push(m.I32);
+            c.emit(0x41);
+            c.emit((v & 0xFFFFFFFF) as u32);
+        }
+        0x42 => {
+            let v = try r.signed(b, bits: 64);
+            c.push(m.I64);
+            c.emit(0x42);
+            c.emit((v & 0xFFFFFFFF) as u32);
+            c.emit((v >> 32) as u32);
+        }
+        0x43 => {
+            let v = try r.fixed(b, n: 4);
+            c.push(m.F32);
+            c.emit(0x41);
+            c.emit(v as u32);
+        }
+        0x44 => {
+            let v = try r.fixed(b, n: 8);
+            c.push(m.F64);
+            c.emit(0x42);
+            c.emit((v & 0xFFFFFFFF) as u32);
+            c.emit((v >> 32) as u32);
+        }
+        0xD0 => {
+            let t = try r.byte(b);
+            if not m.is_ref_type(t) {
+                return m.LoadError.Malformed;
+            }
+            c.push(t);
+            c.emit(0xD0);
+        }
+        0xD1 => {
+            let t = try c.pop();
+            if t != m.UNKNOWN and not m.is_ref_type(t) {
+                return m.LoadError.Invalid;
+            }
+            c.push(m.I32);
+            c.emit(0xD1);
+        }
+        0xD2 => {
+            let x = try r.uleb32(b);
+            if x as usize >= mod.funcs.len() or not mod.declared.items()[x as usize] {
+                return m.LoadError.Invalid;
+            }
+            c.push(m.FUNCREF);
+            c.emit(0xD2);
+            c.emit(x);
+        }
+        0xFC => {
+            let sub = try r.uleb32(b);
+            try prefixed(mod, c, b, r, sub);
+        }
+        _ => {
+            return m.LoadError.Malformed;
+        }
+    }
+}
+
+fn call_types(mod: &m.Module, c: &mut Checker, t: u32) -> m.LoadError!void {
+    let ft = &mod.types.items()[t as usize];
+    var i = ft.params.len();
+    while i > 0 {
+        i -= 1;
+        _ = try c.expect(ft.params.items()[i]);
+    }
+    for x in ft.results.items() {
+        c.push(x.*);
+    }
+}
+
+fn data_index(mod: &m.Module, b: []u8, r: &mut m.Reader) -> m.LoadError!u32 {
+    let x = try r.uleb32(b);
+    if not mod.has_data_count {
+        return m.LoadError.Malformed;
+    }
+    if x >= mod.data_count {
+        return m.LoadError.Invalid;
+    }
+    return x;
+}
+
+fn prefixed(mod: &m.Module, c: &mut Checker, b: []u8, r: &mut m.Reader, sub: u32) -> m.LoadError!void {
+    if sub <= 7 {
+        var from = m.F32;
+        if sub == 2 or sub == 3 or sub == 6 or sub == 7 {
+            from = m.F64;
+        }
+        var to = m.I32;
+        if sub >= 4 {
+            to = m.I64;
+        }
+        _ = try c.expect(from);
+        c.push(to);
+        c.emit(OP_FC + sub);
+        return;
+    }
+    if sub == 8 {
+        let x = try data_index(mod, b, r);
+        let zero = try r.byte(b);
+        if zero != 0 {
+            return m.LoadError.Malformed;
+        }
+        if mod.memories.len() == 0 {
+            return m.LoadError.Invalid;
+        }
+        _ = try c.expect(m.I32);
+        _ = try c.expect(m.I32);
+        _ = try c.expect(m.I32);
+        c.emit(OP_FC + 8);
+        c.emit(x);
+        return;
+    }
+    if sub == 9 {
+        let x = try data_index(mod, b, r);
+        c.emit(OP_FC + 9);
+        c.emit(x);
+        return;
+    }
+    if sub == 10 or sub == 11 {
+        let zero = try r.byte(b);
+        if zero != 0 {
+            return m.LoadError.Malformed;
+        }
+        if sub == 10 {
+            let zero2 = try r.byte(b);
+            if zero2 != 0 {
+                return m.LoadError.Malformed;
+            }
+        }
+        if mod.memories.len() == 0 {
+            return m.LoadError.Invalid;
+        }
+        _ = try c.expect(m.I32);
+        _ = try c.expect(m.I32);
+        _ = try c.expect(m.I32);
+        c.emit(OP_FC + sub);
+        return;
+    }
+    if sub == 12 {
+        let e = try r.uleb32(b);
+        let t = try table_index(mod, b, r);
+        if e as usize >= mod.elems.len() {
+            return m.LoadError.Invalid;
+        }
+        if mod.elems.items()[e as usize].ty != mod.tables.items()[t as usize].elem {
+            return m.LoadError.Invalid;
+        }
+        _ = try c.expect(m.I32);
+        _ = try c.expect(m.I32);
+        _ = try c.expect(m.I32);
+        c.emit(OP_FC + 12);
+        c.emit(e);
+        c.emit(t);
+        return;
+    }
+    if sub == 13 {
+        let e = try r.uleb32(b);
+        if e as usize >= mod.elems.len() {
+            return m.LoadError.Invalid;
+        }
+        c.emit(OP_FC + 13);
+        c.emit(e);
+        return;
+    }
+    if sub == 14 {
+        let dst = try table_index(mod, b, r);
+        let src = try table_index(mod, b, r);
+        if mod.tables.items()[dst as usize].elem != mod.tables.items()[src as usize].elem {
+            return m.LoadError.Invalid;
+        }
+        _ = try c.expect(m.I32);
+        _ = try c.expect(m.I32);
+        _ = try c.expect(m.I32);
+        c.emit(OP_FC + 14);
+        c.emit(dst);
+        c.emit(src);
+        return;
+    }
+    if sub >= 15 and sub <= 17 {
+        let x = try table_index(mod, b, r);
+        let t = mod.tables.items()[x as usize].elem;
+        if sub == 15 {
+            _ = try c.expect(m.I32);
+            _ = try c.expect(t);
+            c.push(m.I32);
+        } else if sub == 16 {
+            c.push(m.I32);
+        } else {
+            _ = try c.expect(m.I32);
+            _ = try c.expect(t);
+            _ = try c.expect(m.I32);
+        }
+        c.emit(OP_FC + sub);
+        c.emit(x);
+        return;
+    }
+    return m.LoadError.Malformed;
+}

@@ -1,0 +1,24 @@
+// test: run
+// spec: arche/2.3
+// stage0: skip
+// stdout: -9223372036854775808 -2147483648 9223372036854774784
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    // -2^63 fits i64, though -2^63 - 1 is no f64: the float below it is
+    // -2^63 - 2048, which does not.
+    var low: f64 = -9223372036854775808.0;
+    var low32: f64 = -2147483648.9;
+    var high: f64 = 9223372036854774784.0;
+    if sys.args.len() > 5 {
+        low = 1.0;
+        low32 = 1.0;
+        high = 1.0;
+    }
+    sys.stdout.write_i64(low as i64);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64((low32 as i32) as i64);
+    sys.stdout.write(" ");
+    sys.stdout.write_i64(high as i64);
+    sys.stdout.write("\n");
+}
