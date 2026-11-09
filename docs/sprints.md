@@ -2,9 +2,9 @@
 
 > 2026-11-05 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S32.
+**Joriy sprint:** S34.
 
-**Yopilgan:** S0–S4, S6–S31 va S36.
+**Yopilgan:** S0–S4, S6–S33 va S36.
 
 - Compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da; full-Arche paketlarida generics (monomorphization), comptime interpreter, interface'lar (`impl`, `where`, `&dyn`), `for`, closure'lar (`&dyn fn(P) -> R`), `region` (arena, E0901), `unsafe` va raw pointer'lar, `if`/`match` ifoda sifatida, labeled loop'lar, `f32`/`f64`, `requires`/`ensures`, `nopanic` va error return trace ishlaydi.
 - Manifest (`package.arche`) o'qiladi: `needs` (E0801), `strict_unsafe` (E0920), `panic_handler`, xato manifest E0802/E0803.
@@ -51,9 +51,13 @@
 - Baseline JIT x86-64 uchun (`wasm/jit.arche`): instruksiyalar o'sha qiymat stekida mashina kodi bo'ladi; kompilyatsiya qilinmaganini, chaqiruv, qaytish va soatga qarashni bittadan interpreter'ga qaytaradi, shuning uchun frame'lar bitta va trap har doim interpreter'niki. Spec testlarida mashina kodi 368884 marta ishladi va interpreter'ga 135562 instruksiya qaytardi; sikl va rekursiya JIT bilan taxminan 11 marta tez.
 - Component Model (`wasm/component.arche`): bo'limlar tartibi bilan o'qiladi va instantiate qilinadi, canonical ABI string, list, record, tuple, variant, enum, option, result va flags'ni ikki tomonga, flat va xotira orqali o'tkazadi (realloc va post-return bilan). Import qilingan instance'ning har funksiyasi host'da bo'lishi shart, aks holda component rad etiladi.
 - Nimadir host'i oynasiz (`wasm/nimadir.arche`, `arche-wasm nimadir`): `nimadir:shell@1.2.0`'ning `host-api` va `dom` interfeyslari (markup, entity va descendant selector'li element daraxti) va shell chegaralari: frame'ga 1 s, init'ga 10 s, 512 MiB xotira, frame'da 16 MiB va 65536 widget, 1 MiB storage. `counter`, `hello` va `store` qayta build qilinmasdan ishlaydi; `runaway` deadline'da (1,00 s), 512 MiB'da va host chegarasida to'xtatiladi; `nimadir-check.sh` buni interpreter'da ham, JIT bilan ham tekshiradi. Deadline'ning soatini embedder closure sifatida beradi, dvigatel o'zi soat o'qimaydi.
+- S32'da `lib/web` (router — `/users/:id`, `/files/*path`, method'lar, percent-decoding; middleware — `around`, `Gzip`, `Security`; static fayllar, katalogdan chiqib bo'lmaydi), `core.deflate` (DEFLATE, inflate, gzip, CRC-32), `Proc.cpu_count` va `Proc.workers` (har CPU'ga worker, bitta listener'ni bo'lishib). `examples/webapp` TLS 1.3 ustida HTTP/2 va HTTP/1.1 bilan static fayl va JSON API beradi; `check.sh` curl bilan tekshiradi, bitta worker'ning xotirasi 20000 so'rovdan keyin ham 432 KiB'da qoladi. Shu tufayli runtime'dagi ikki oqish topildi: task closure'ining nusxasi va fayl yo'lining C nusxasi hech qachon bo'shatilmasdi.
+- S33'da `lib/kv`: sahifali B+ tree va WAL (commit'da o'zgargan sahifalar CRC va salt bilan log'ga, checkpoint, ochishda faqat to'liq commit'lar qayta qo'llanadi), `std.File` (offset'da o'qish/yozish, `size`, `truncate`, `sync` — Linux, Windows, WASI). `examples/kvcrash` yozuvchini 30 marta SIGKILL qiladi: har commit qilingan tranzaksiya to'liq, hech biri qisman emas. `arche-wasm serve` HTTPS so'rovni sandbox'dagi WASM modul (`handle`) bilan javoblaydi: faqat `arche.log` va `arche.now_ms` import qilinadi, 100 ms va 64 MiB chegarasida 503 va yangi instance. `bench/web` throughput va p99'ni o'lchaydi va baseline bilan solishtiradi (JSON 248773 so'rov/s, p99 193 µs). Runtime region chunk'larini qayta ishlatadi: JSON 150k'dan 250k so'rov/s'ga chiqdi.
 - Yo'l-yo'lakay: `core.float` (`bits64`, `from_bits64` va 32 bitlik juftlari: float bitlari, NaN payload'i bilan), `alloc.List.with_capacity`/`grow_zeroed`, `String.push_utf8`; `-2^63 as i64` noto'g'ri trap berardi (f64'da `-2^63 - 1` yo'q), tuzatildi. CI bootstrap'ni clang 20 bilan qiladi: LLVM 18'ning SCCP'si bir xil IR'dan ba'zan boshqa kod chiqarardi (llvm/llvm-project#105758).
 
 **Ochiq qolganlar:**
+
+- S32'da JSON encode/decode va template'larni comptime'da struct'lardan hosil qilish hali yo'q: buning uchun `comptime if` (instance'da o'lik shoxni tekshirmaslik) va tipning maydonlarini comptime'da berish kerak; hozircha JSON `std.json` bilan qo'lda yoziladi. S33'da fayl o'qish hali butun worker'ni to'xtatadi (fayllar poller'da emas), KV store'da sahifalar birlashtirilmaydi.
 
 - S31'da Component Model'ning resource'lari, ichma-ich component'lar va UTF-16 string'lar hali yo'q (C# va Python component'lariga kerak); core modullar uchun WASI host'i (capability'lar WASI import sifatida) va JIT'ning ARM64/RISC-V varianti keyinroq; JIT hozircha `div`, float→int, float min/max, jadvallar va `call_indirect`ni interpreter'ga qaytaradi.
 
