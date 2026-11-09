@@ -3,7 +3,10 @@
 /// memories and globals, each by its address. The interpreter runs the code
 /// validate.arche compiled, on one stack of values.
 import alloc;
+import core.mem as raw;
+import core.ptr;
 import decode;
+import jit;
 import module as m;
 import num;
 import validate as v;
@@ -152,8 +155,25 @@ pub type Store = struct {
     /// When the guest must have stopped, by the clock invoke is given; 0 for
     /// never. The embedder sets it before a call.
     pub deadline_ns: u64,
+    /// The JIT's: the region of machine code (its address, size and what is
+    /// used), the exit stub's offset, the context, and for each function of
+    /// the store its compiled code's index, or NONE.
+    jit_on: bool,
+    jit_base: u64,
+    jit_size: u64,
+    jit_used: u64,
+    jit_exit: u32,
+    jit_ctx: alloc.List(u64),
+    jit_index: alloc.List(u32),
+    jit_code: alloc.List(jit.Compiled),
+    /// How often machine code ran, and how many instructions it gave back
+    /// to the interpreter.
+    pub jit_runs: u64,
+    pub jit_slow: u64,
     a: alloc.Allocator,
 }
+
+const NONE: u32 = 0xFFFFFFFF;
 
 pub fn new_store(limits: Limits, a: alloc.Allocator) -> Store {
     var s = Store {
@@ -170,6 +190,16 @@ pub fn new_store(limits: Limits, a: alloc.Allocator) -> Store {
         frames: alloc.List(Frame).init(a),
         fuel: limits.tick_every,
         deadline_ns: 0,
+        jit_on: false,
+        jit_base: 0,
+        jit_size: 0,
+        jit_used: 0,
+        jit_exit: 0,
+        jit_ctx: alloc.List(u64).init(a),
+        jit_index: alloc.List(u32).init(a),
+        jit_code: alloc.List(jit.Compiled).init(a),
+        jit_runs: 0,
+        jit_slow: 0,
         a: a,
     };
     s.stack.grow_zeroed(limits.stack_values as usize);
@@ -209,6 +239,7 @@ fn intern(s: &mut Store, params: []u8, results: []u8) -> u32 {
 pub fn add_host_func(s: &mut Store, params: []u8, results: []u8, id: u32) -> u32 {
     let t = intern(s, params: params, results: results);
     s.funcs.push(FuncInst { type_id: t, host: true, instance: 0, index: id });
+    s.jit_index.push(NONE);
     return (s.funcs.len() - 1) as u32;
 }
 
@@ -374,6 +405,7 @@ pub fn instantiate(s: &mut Store, host: &mut dyn Host, now: &dyn fn() -> u64, mo
         if not f.imported {
             let t = inst.types.items()[f.type_index as usize];
             s.funcs.push(FuncInst { type_id: t, host: false, instance: index, index: k as u32 });
+            s.jit_index.push(NONE);
             inst.funcs.push((s.funcs.len() - 1) as u32);
         }
     }
@@ -426,6 +458,9 @@ pub fn instantiate(s: &mut Store, host: &mut dyn Host, now: &dyn fn() -> u64, mo
         }
         let kind = e.kind;
         s.instances.items_mut()[index as usize].exports.push(Extern { kind: kind, addr: addr });
+    }
+    if s.jit_on {
+        compile_instance(s, instance: index);
     }
     // Element segments, evaluated; then the active ones written, in order.
     let nelems = s.modules.items()[module as usize].elems.len();
@@ -615,6 +650,8 @@ fn run(s: &mut Store, host: &mut dyn Host, now: &dyn fn() -> u64, func: u32) -> 
     var fp: usize = 0;
     var sp = s.sp;
     var grow_by: u64 = 0;
+    // One instruction in the interpreter, then back to machine code.
+    var single = false;
     while true {
         if event == EVENT_CALL {
             let f = s.funcs.items()[target as usize];
@@ -692,6 +729,32 @@ fn run(s: &mut Store, host: &mut dyn Host, now: &dyn fn() -> u64, func: u32) -> 
             s.fuel = s.limits.tick_every;
         }
         event = 0;
+        if s.jit_on and not single {
+            let fa = s.instances.items()[inst as usize].funcs.items()[fi as usize];
+            let ji = s.jit_index.items()[fa as usize];
+            if ji != NONE {
+                let resume = s.jit_code.items()[ji as usize].resume.items()[pc];
+                if resume != m.UNREACHED {
+                    let status = enter_jit(s, inst: inst, fp: fp, resume: resume);
+                    s.jit_runs += 1;
+                    pc = s.jit_ctx.items()[jit.CTX_PC as usize] as usize;
+                    sp = fp + s.jit_ctx.items()[jit.CTX_SP as usize] as usize;
+                    if status == jit.EXIT_CALL {
+                        target = s.instances.items()[inst as usize].funcs.items()[s.jit_ctx.items()[jit.CTX_ARG as usize] as usize];
+                        s.frames.push(Frame { instance: inst, func: fi, pc: pc as u32, fp: fp as u32 });
+                        event = EVENT_CALL;
+                    } else if status == jit.EXIT_RETURN {
+                        event = EVENT_RETURN;
+                    } else if status == jit.EXIT_TICK {
+                        event = EVENT_TICK;
+                    } else {
+                        single = true;
+                        s.jit_slow += 1;
+                    }
+                    continue;
+                }
+            }
+        }
         // Run the current function's code until something above is needed.
         let mod = &s.modules.items()[s.instances.items()[inst as usize].module as usize];
         let code = mod.funcs.items()[fi as usize].code.items();
@@ -939,7 +1002,11 @@ fn run(s: &mut Store, host: &mut dyn Host, now: &dyn fn() -> u64, func: u32) -> 
                     }
                 }
             }
+            if single {
+                break;
+            }
         }
+        single = false;
         if event == EVENT_TABLE {
             let op = code[pc - 1];
             var x: u32 = 0;
@@ -1392,4 +1459,102 @@ fn slow_op(s: &mut Store, inst: u32, op: u32, x: u32, y: u32, sp: &mut usize, pc
         s.tables.items_mut()[taddr as usize].items.items_mut()[(dst + i) as usize] = value;
     }
     return pc + 1;
+}
+
+// ---- the JIT ----------------------------------------------------------------------------
+
+/// Machine code from now on, in the region of size bytes at base, which the
+/// embedder made readable, writable and executable. x86-64 only.
+pub fn enable_jit(s: &mut Store, base: u64, size: u64) {
+    var x = jit.new_asm(s.a);
+    let exit_at = jit.stubs(&mut x);
+    s.jit_on = true;
+    s.jit_base = base;
+    s.jit_size = size;
+    s.jit_used = 0;
+    s.jit_exit = exit_at;
+    write_code(s, x.bytes.items());
+    s.jit_ctx.grow_zeroed(jit.CTX_SLOTS as usize);
+}
+
+fn write_code(s: &mut Store, bytes: []u8) {
+    if s.jit_used + bytes.len() as u64 > s.jit_size {
+        return;
+    }
+    unsafe {
+        // SAFETY: the region is the embedder's, size bytes at base, and
+        // this stays inside it.
+        let p = ptr.from_addr(u8, (s.jit_base + s.jit_used) as usize);
+        var i: usize = 0;
+        while i < bytes.len() : (i += 1) {
+            p.add(i).* = bytes[i];
+        }
+    }
+    s.jit_used += bytes.len() as u64;
+}
+
+/// Compiles the instance's functions into the region; one that does not fit
+/// stays with the interpreter.
+fn compile_instance(s: &mut Store, instance: u32) {
+    let mi = s.instances.items()[instance as usize].module;
+    let nfuncs = s.modules.items()[mi as usize].funcs.len();
+    let stride = raw.size_of(GlobalInst) as u32;
+    var k: usize = 0;
+    while k < nfuncs : (k += 1) {
+        if s.modules.items()[mi as usize].funcs.items()[k].imported {
+            continue;
+        }
+        var x = jit.new_asm(s.a);
+        let base = s.jit_used as u32;
+        let compiled = jit.compile(&s.modules.items()[mi as usize].funcs.items()[k], globals: s.instances.items()[instance as usize].globals.items(), global_stride: stride, global_value: 8, base: base, exit_at: s.jit_exit, &mut x, s.a);
+        if s.jit_used + x.bytes.len() as u64 > s.jit_size {
+            return;
+        }
+        write_code(s, x.bytes.items());
+        let addr = s.instances.items()[instance as usize].funcs.items()[k];
+        s.jit_index.items_mut()[addr as usize] = s.jit_code.len() as u32;
+        s.jit_code.push(compiled);
+    }
+}
+
+/// Runs machine code at resume with the frame at fp; what it came back for.
+fn enter_jit(s: &mut Store, inst: u32, fp: usize, resume: u32) -> u64 {
+    let it = &s.instances.items()[inst as usize];
+    var maddr: u32 = 0;
+    if it.memories.len() > 0 {
+        maddr = it.memories.items()[0];
+    }
+    var stack_at: u64 = 0;
+    var mem_at: u64 = 0;
+    var globals_at: u64 = 0;
+    var ctx_at: u64 = 0;
+    unsafe {
+        // SAFETY: addresses only; the machine code reads and writes within
+        // the stack, the memory (checked against its size) and the globals.
+        stack_at = raw.slice_data(u64, s.stack.items()).addr() as u64;
+        mem_at = raw.slice_data(u8, s.memories.items()[maddr as usize].data.items()).addr() as u64;
+        globals_at = raw.slice_data(GlobalInst, s.globals.items()).addr() as u64;
+        ctx_at = raw.slice_data(u64, s.jit_ctx.items()).addr() as u64;
+    }
+    let size = s.memories.items()[maddr as usize].data.len() as u64;
+    let c = s.jit_ctx.items_mut();
+    c[jit.CTX_FRAME as usize] = stack_at + 8 * fp as u64;
+    c[jit.CTX_MEM as usize] = mem_at;
+    c[jit.CTX_MEM_SIZE as usize] = size;
+    c[jit.CTX_RESUME as usize] = s.jit_base + resume as u64;
+    c[jit.CTX_FUEL as usize] = s.fuel as u64;
+    c[jit.CTX_GLOBALS as usize] = globals_at;
+    let entry = s.jit_base + jit.ENTRY as u64;
+    var status: u64 = 0;
+    var arg = ctx_at;
+    unsafe {
+        // SAFETY: entry is the region's entry stub, which keeps what the
+        // System V ABI keeps and returns to here; the code it runs only
+        // touches what the context names.
+        asm("call *%1", out("rax") status, in(reg) entry, inout("rdi") arg,
+            clobber("rcx"), clobber("rdx"), clobber("rsi"), clobber("r8"), clobber("r9"), clobber("r10"), clobber("r11"),
+            clobber("xmm0"), clobber("xmm1"));
+    }
+    s.fuel = s.jit_ctx.items()[jit.CTX_FUEL as usize] as u32;
+    return status;
 }

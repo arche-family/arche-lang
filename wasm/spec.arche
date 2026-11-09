@@ -23,6 +23,9 @@ pub type Tally = struct {
     pub passed: u64,
     pub failed: u64,
     pub skipped: u64,
+    /// With the JIT: runs of machine code, and instructions it gave back.
+    pub jit_runs: u64,
+    pub jit_slow: u64,
 }
 
 /// A value of a command: its type, and its text (decimal bits, null, or a
@@ -371,7 +374,7 @@ fn report(out: &mut std.Output, file: str, c: &Command, what: str) {
 }
 
 /// Runs one script: file is its JSON, dir where its modules are.
-pub fn run_file(fs: &std.Fs, out: &mut std.Output, file: str, dir: str, tally: &mut Tally, a: alloc.Allocator) {
+pub fn run_file(fs: &std.Fs, out: &mut std.Output, file: str, dir: str, tally: &mut Tally, jit_base: u64, jit_size: u64, a: alloc.Allocator) {
     let text = match fs.read_file(file, a) {
         ok(t) => { t }
         err(_) => {
@@ -404,6 +407,9 @@ pub fn run_file(fs: &std.Fs, out: &mut std.Output, file: str, dir: str, tally: &
         spectest: alloc.List(exec.Extern).init(a),
         a: a,
     };
+    if jit_size > 0 {
+        exec.enable_jit(&mut r.store, base: jit_base, size: jit_size);
+    }
     add_spectest(&mut r);
     var shown: u32 = 0;
     var results = alloc.List(u64).init(a);
@@ -516,4 +522,6 @@ pub fn run_file(fs: &std.Fs, out: &mut std.Output, file: str, dir: str, tally: &
             }
         }
     }
+    tally.jit_runs += r.store.jit_runs;
+    tally.jit_slow += r.store.jit_slow;
 }

@@ -78,7 +78,7 @@ pub fn decode(bytes: []u8, a: alloc.Allocator) -> m.LoadError!m.Module {
             var k: u32 = 0;
             while k < n : (k += 1) {
                 let t = try s.uleb32(b);
-                mod.funcs.push(m.Func { type_index: t, imported: false, body_start: 0, body_end: 0, locals: alloc.List(u8).init(a), code: alloc.List(u32).init(a), max_height: 0 });
+                mod.funcs.push(m.Func { type_index: t, imported: false, body_start: 0, body_end: 0, locals: alloc.List(u8).init(a), code: alloc.List(u32).init(a), heights: alloc.List(u32).init(a), max_height: 0 });
             }
         } else if id == SECTION_TABLE {
             let n = try s.uleb32(b);
@@ -239,7 +239,7 @@ fn imports(mod: &mut m.Module, b: []u8, s: &mut m.Reader, a: alloc.Allocator) ->
         if kind == m.EXTERN_FUNC {
             let t = try s.uleb32(b);
             index = mod.funcs.len() as u32;
-            mod.funcs.push(m.Func { type_index: t, imported: true, body_start: 0, body_end: 0, locals: alloc.List(u8).init(a), code: alloc.List(u32).init(a), max_height: 0 });
+            mod.funcs.push(m.Func { type_index: t, imported: true, body_start: 0, body_end: 0, locals: alloc.List(u8).init(a), code: alloc.List(u32).init(a), heights: alloc.List(u32).init(a), max_height: 0 });
         } else if kind == m.EXTERN_TABLE {
             index = mod.tables.len() as u32;
             let t = try table_type(b, s, imported: true);

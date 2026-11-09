@@ -1,7 +1,8 @@
 #!/bin/sh
 # The WebAssembly spec's own tests (docs/sprints.md S31): test/core of
 # WebAssembly/spec at the wg-2.0 tag, SIMD left out, made into JSON and
-# binary modules by wabt's wast2json, and run by arche-wasm.
+# binary modules by wabt's wast2json, and run by arche-wasm: in the
+# interpreter, then with the JIT.
 # Needs git and curl the first time; what they fetch stays in build/spec.
 # Usage: spec.sh <arche-wasm> [script name]...
 set -eu
@@ -40,3 +41,4 @@ else
     set -- "$json"/*/*.json
 fi
 "$wasm" spec "$@"
+"$wasm" spec --jit "$@"

@@ -19,6 +19,9 @@ pub const UNKNOWN: u8 = 0;
 /// function's address in the store, an externref what the host gave.
 pub const NULL_REF: u64 = 0xFFFFFFFFFFFFFFFF;
 
+/// A word of code no instruction starts at, or that no path reaches.
+pub const UNREACHED: u32 = 0xFFFFFFFF;
+
 pub fn is_value_type(t: u8) -> bool {
     return t == I32 or t == I64 or t == F32 or t == F64 or t == FUNCREF or t == EXTERNREF;
 }
@@ -99,6 +102,10 @@ pub type Func = struct {
     pub locals: alloc.List(u8),
     /// What validation compiled the body to (exec.arche reads it).
     pub code: alloc.List(u32),
+    /// For each word of code that starts an instruction, the height of the
+    /// frame's values before it (locals included); UNREACHED for the rest,
+    /// and for code no path reaches. The JIT compiles from it.
+    pub heights: alloc.List(u32),
     /// The most operands the body holds at once.
     pub max_height: u32,
 }

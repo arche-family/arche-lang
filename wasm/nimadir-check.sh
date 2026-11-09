@@ -3,6 +3,7 @@
 # store run unrebuilt in a shell with no window, and runaway is stopped by
 # the shell's limits: a second a frame, 512 MiB of memory, and what a frame
 # may send. An app that imports what the shell does not give is refused.
+# Each runs in the interpreter, and again with the JIT (--jit).
 # Usage: nimadir-check.sh <arche-wasm>
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,17 +17,21 @@ expect() {
     want_status=$2
     want_line=$3
     shift 4
-    set +e
-    out=$("$wasm" nimadir "$@" 2>&1)
-    status=$?
-    set -e
-    if [ "$status" -ne "$want_status" ] || ! printf '%s\n' "$out" | grep -qxF -- "$want_line"; then
-        echo "FAIL $what (status $status, wanted $want_status and '$want_line'):"
-        printf '%s\n' "$out" | head -20
-        failed=$((failed + 1))
-    else
-        echo "PASS $what"
-    fi
+    app=$1
+    shift
+    for mode in "" --jit; do
+        set +e
+        out=$("$wasm" nimadir "$app" $mode "$@" 2>&1)
+        status=$?
+        set -e
+        if [ "$status" -ne "$want_status" ] || ! printf '%s\n' "$out" | grep -qxF -- "$want_line"; then
+            echo "FAIL $what $mode (status $status, wanted $want_status and '$want_line'):"
+            printf '%s\n' "$out" | head -20
+            failed=$((failed + 1))
+        else
+            echo "PASS $what $mode"
+        fi
+    done
 }
 
 expect "counter draws its count" 0 "label: Count: 0" -- "$apps/counter.component.wasm" --frames 1

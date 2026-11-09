@@ -90,6 +90,7 @@ type Checker = struct {
     code: alloc.List(u32),
     locals: alloc.List(u8),
     max: u32,
+    heights: alloc.List(u32),
     a: alloc.Allocator,
 
     fn push(self: &mut Checker, t: u8) {
@@ -124,6 +125,7 @@ type Checker = struct {
 
     fn emit(self: &mut Checker, w: u32) {
         self.code.push(w);
+        self.heights.push(m.UNREACHED);
     }
 
     fn here(self: &Checker) -> u32 {
@@ -236,7 +238,9 @@ type Checker = struct {
                 self.emit(OP_IF_FALSE);
                 let skip = self.here();
                 self.emit(0);
+                let ret = self.here();
                 self.emit(OP_RETURN);
+                self.heights.items_mut()[ret as usize] = self.locals.len() as u32 + self.vals.len() as u32;
                 let after = self.here();
                 self.code.items_mut()[skip as usize] = after;
             } else {
@@ -292,10 +296,11 @@ pub fn validate(mod: &mut m.Module, a: alloc.Allocator) -> m.LoadError!void {
         if mod.funcs.items()[k].imported {
             continue;
         }
-        var c = Checker { vals: alloc.List(u8).init(a), ctls: alloc.List(Ctl).init(a), code: alloc.List(u32).init(a), locals: alloc.List(u8).init(a), max: 0, a: a };
+        var c = Checker { vals: alloc.List(u8).init(a), ctls: alloc.List(Ctl).init(a), code: alloc.List(u32).init(a), locals: alloc.List(u8).init(a), max: 0, heights: alloc.List(u32).init(a), a: a };
         try body(mod, k, &mut c);
         let f = &mut mod.funcs.items_mut()[k];
         f.code = c.code;
+        f.heights = c.heights;
         f.max_height = c.max;
     }
 }
@@ -466,9 +471,19 @@ fn body(mod: &m.Module, k: usize, c: &mut Checker) -> m.LoadError!void {
     c.ctls.push(Ctl { kind: KIND_FUNC, bt_kind: BT_INDEX, bt_value: f.type_index, height: 0, unreachable: false, start: 0, fixups: NO_FIXUP, else_at: NO_FIXUP });
     // Each call ticks the deadline once.
     c.emit(OP_TICK);
+    c.heights.items_mut()[0] = c.locals.len() as u32;
     while c.ctls.len() > 0 {
         let op = try r.byte(b);
+        // The height before the instruction, at the first word it emits.
+        let at = c.here();
+        var height = c.locals.len() as u32 + c.vals.len() as u32;
+        if c.top().unreachable {
+            height = m.UNREACHED;
+        }
         try instruction(mod, c, b, &mut r, op);
+        if c.code.len() > at as usize {
+            c.heights.items_mut()[at as usize] = height;
+        }
     }
     if not r.done() {
         return m.LoadError.Malformed;

@@ -1,7 +1,7 @@
 /// arche-wasm: runs WebAssembly.
 ///
-///   arche-wasm spec <script.json>...    the spec's tests (wast2json's output)
-///   arche-wasm nimadir <app.component.wasm> [--frames n] [--click text]...
+///   arche-wasm spec [--jit] <script.json>...   the spec's tests (wast2json's output)
+///   arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--click text]...
 ///       [--type selector text] [--deny func]... [--tree]
 ///                                        a Nimadir mini-app, with no window
 import alloc;
@@ -9,12 +9,30 @@ import component;
 import exec;
 import nimadir;
 import std;
+import std.linux;
 import spec;
 
 fn usage(sys: &mut std.System) -> !void {
-    sys.stderr.write("usage: arche-wasm spec <script.json>...\n");
-    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--frames n] [--click text]... [--type selector text] [--deny func]... [--tree]\n");
+    sys.stderr.write("usage: arche-wasm spec [--jit] <script.json>...\n");
+    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--click text]... [--type selector text] [--deny func]... [--tree]\n");
     sys.proc.exit(2);
+}
+
+/// The JIT's machine code: 64 MiB, readable, writable and executable; 0
+/// when the system gives none.
+const JIT_SIZE: u64 = 64 << 20;
+
+fn code_region() -> u64 {
+    var at: i64 = 0;
+    unsafe {
+        // SAFETY: mmap of fresh anonymous memory; nothing else holds it.
+        // 9 is mmap; 7 read, write and execute; 0x22 private and anonymous.
+        at = linux.syscall(9, [0, JIT_SIZE as i64, 7, 0x22, -1, 0]);
+    }
+    if at < 0 {
+        return 0;
+    }
+    return at as u64;
 }
 
 fn dir_of(path: str) -> str {
@@ -40,13 +58,22 @@ fn main(sys: &mut std.System) -> !void {
     }
     let cmd = sys.args.get(1);
     if cmd.eq("spec") {
-        var total = spec.Tally { passed: 0, failed: 0, skipped: 0 };
+        var total = spec.Tally { passed: 0, failed: 0, skipped: 0, jit_runs: 0, jit_slow: 0 };
         var i: usize = 2;
+        var jit_base: u64 = 0;
+        var jit_size: u64 = 0;
+        if sys.args.len() > 2 and sys.args.get(2).eq("--jit") {
+            jit_base = code_region();
+            if jit_base != 0 {
+                jit_size = JIT_SIZE;
+            }
+            i = 3;
+        }
         while i < sys.args.len() : (i += 1) {
             let file = sys.args.get(i);
-            var t = spec.Tally { passed: 0, failed: 0, skipped: 0 };
+            var t = spec.Tally { passed: 0, failed: 0, skipped: 0, jit_runs: 0, jit_slow: 0 };
             region r {
-                spec.run_file(&sys.fs, out: &mut sys.stdout, file: file, dir: dir_of(file), tally: &mut t, a: r);
+                spec.run_file(&sys.fs, out: &mut sys.stdout, file: file, dir: dir_of(file), tally: &mut t, jit_base: jit_base, jit_size: jit_size, a: r);
             }
             if t.failed > 0 {
                 sys.stdout.write(file);
@@ -57,6 +84,8 @@ fn main(sys: &mut std.System) -> !void {
             total.passed += t.passed;
             total.failed += t.failed;
             total.skipped += t.skipped;
+            total.jit_runs += t.jit_runs;
+            total.jit_slow += t.jit_slow;
         }
         sys.stdout.write("passed ");
         sys.stdout.write_u64(total.passed);
@@ -65,6 +94,13 @@ fn main(sys: &mut std.System) -> !void {
         sys.stdout.write(", skipped ");
         sys.stdout.write_u64(total.skipped);
         sys.stdout.write("\n");
+        if jit_size > 0 {
+            sys.stdout.write("machine code ran ");
+            sys.stdout.write_u64(total.jit_runs);
+            sys.stdout.write(" times, and gave the interpreter ");
+            sys.stdout.write_u64(total.jit_slow);
+            sys.stdout.write(" instructions\n");
+        }
         if total.failed > 0 {
             sys.proc.exit(1);
         }
@@ -97,6 +133,7 @@ fn run_app(sys: &mut std.System) -> !void {
     var type_sel = alloc.String.init(sys.alloc);
     var type_text = alloc.String.init(sys.alloc);
     var denied = alloc.List(alloc.String).init(sys.alloc);
+    var use_jit = false;
     var i: usize = 3;
     while i < sys.args.len() : (i += 1) {
         let arg = sys.args.get(i);
@@ -113,6 +150,8 @@ fn run_app(sys: &mut std.System) -> !void {
         } else if arg.eq("--deny") and i + 1 < sys.args.len() {
             denied.push(alloc.String.from(sys.args.get(i + 1), sys.alloc));
             i += 1;
+        } else if arg.eq("--jit") {
+            use_jit = true;
         } else if arg.eq("--tree") {
             tree = true;
         } else {
@@ -129,6 +168,12 @@ fn run_app(sys: &mut std.System) -> !void {
     let clock = &sys.clock;
     let now = fn [clock] () -> u64 { return clock.monotonic_ns(); };
     var store = exec.new_store(nimadir.limits(), sys.alloc);
+    if use_jit {
+        let code = code_region();
+        if code != 0 {
+            exec.enable_jit(&mut store, base: code, size: JIT_SIZE);
+        }
+    }
     var ui = nimadir.new_ui(sys.alloc);
     for d in denied.items() {
         nimadir.deny(&mut ui, func: d.view());
