@@ -260,6 +260,11 @@ type Fn = struct {
     /// A closure's view of a capture and the binding that holds the
     /// closure, as view << 32 | holder: the view lives as long as it.
     ties: alloc.List(u64),
+    /// What the last view-valued temporary a place went through views, as
+    /// list.items_mut() in list.items_mut()[i], and whether &mut: empty when
+    /// it went through none (place_or_view).
+    temp_view: alloc.String,
+    temp_view_mutable: bool,
 }
 
 fn new_fn(a: alloc.Allocator) -> Fn {
@@ -279,6 +284,8 @@ fn new_fn(a: alloc.Allocator) -> Fn {
         lent: alloc.List(Lent).init(a),
         deferred: alloc.List(cst.NodeId).init(a),
         ties: alloc.List(u64).init(a),
+        temp_view: alloc.String.init(a),
+        temp_view_mutable: false,
     };
 }
 
@@ -1025,10 +1032,61 @@ fn place_or_view(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId, out: &mut alloc.
             return false;
         }
         out.push_str(v.target.view());
+        f.temp_view = copy_text(v.target.view(), c.a);
+        f.temp_view_mutable = v.mutable;
         return true;
     }
     eval(c, f, e, false);
     return false;
+}
+
+/// The left of an assignment reached through a view-valued temporary, as
+/// list.items_mut()[i] = …: the view is live from there until the place is
+/// written, so the value on the right cannot use what it views (§5.4). A
+/// binding of no name holds it while the value is evaluated; NONE if there is
+/// no such view.
+fn hold_temp_view(c: &mut ck.Checker, f: &mut Fn, target: cst.NodeId, s: cst.NodeId) -> u32 {
+    if f.temp_view.len() == 0 {
+        return ck.NONE;
+    }
+    var base = target;
+    while true {
+        let k = ck.kind_of(c, base);
+        if k == cst.Kind.ParenExpr or k == cst.Kind.IndexExpr or k == cst.Kind.FieldExpr or k == cst.Kind.DerefExpr {
+            base = ck.child(c, base, 0);
+        } else {
+            break;
+        }
+    }
+    if ck.kind_of(c, base) != cst.Kind.CallExpr {
+        return ck.NONE;
+    }
+    // Named as written, for the message: list.items_mut().
+    let sp = ck.span_of(c, base);
+    let source = c.p.modules[c.module as usize].text.view();
+    let name = c.names.intern(source[sp.start as usize..(sp.start + sp.len) as usize]);
+    let held = new_binding(c, f, name: name, t: ck.type_of(c, base), pos: pos_of(c, target));
+    f.bindings[held as usize].is_view = true;
+    f.bindings[held as usize].mutable_view = f.temp_view_mutable;
+    f.bindings[held as usize].live_end = end_of(c, s);
+    f.targets[held as usize] = copy_text(f.temp_view.view(), c.a);
+    return held;
+}
+
+/// The held view ends: the place is written next, through it.
+fn release_temp_view(c: &ck.Checker, f: &mut Fn, held: u32) {
+    if held == ck.NONE {
+        return;
+    }
+    var kept = alloc.List(u32).init(c.a);
+    let ids = f.scope.items();
+    var i: usize = 0;
+    while i < ids.len() : (i += 1) {
+        if ids[i] != held {
+            kept.push(ids[i]);
+        }
+    }
+    f.scope = kept;
 }
 
 fn static_view(a: alloc.Allocator) -> View {
@@ -1517,10 +1575,13 @@ fn assign(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
         }
     }
     var out = alloc.String.init(c.a);
+    f.temp_view = alloc.String.init(c.a);
     let is_place = place(c, f, target, &mut out);
+    let held = hold_temp_view(c, f, target: target, s: s);
     let t = ck.type_of(c, target);
     if op != tk.Kind.Assign {
         eval(c, f, value, false);
+        release_temp_view(c, f, held);
         if is_place {
             access(c, f, target, out.view(), Access.Read);
             access(c, f, target, out.view(), Access.Write);
@@ -1528,6 +1589,7 @@ fn assign(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
         return;
     }
     if is_view(c, t) and is_place {
+        release_temp_view(c, f, held);
         let v = view_of(c, f, value);
         let b = path_root(out.view());
         // §5.4: a view does not outlive what it views.
@@ -1549,6 +1611,7 @@ fn assign(c: &mut ck.Checker, f: &mut Fn, s: cst.NodeId) {
         return;
     }
     eval(c, f, value, true);
+    release_temp_view(c, f, held);
     if is_place {
         access(c, f, target, out.view(), Access.Write);
     }

@@ -1,0 +1,20 @@
+// test: compile-error
+// spec: 5.4
+// stage0: skip
+// line: 19
+// code: E0604
+import alloc;
+import std;
+
+fn grow(xs: &mut alloc.List(u32)) -> u32 {
+    xs.push(7);
+    return 7;
+}
+
+// The place on the left is reached first (§7.3): the view of xs's items is
+// live while grow runs, and grow may move them.
+fn main(sys: &mut std.System) -> !void {
+    var xs = alloc.List(u32).init(sys.alloc);
+    xs.push(1);
+    xs.items_mut()[0] = grow(&mut xs);
+}

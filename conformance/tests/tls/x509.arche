@@ -105,7 +105,8 @@ fn main(sys: &mut std.System) -> !void {
     }
     let c = try x509.parse(leaf.items());
     let i = c.subject.end - 2;
-    bad.items_mut()[i] = bad.items()[i] ^ 1;
+    let flipped = bad.items()[i] ^ 1;
+    bad.items_mut()[i] = flipped;
     check(sys, label: "tampered", leaf: bad.items(), middle: none_der, anchor: root.items(), host: "www.example.com", now: 1800000000);
     check(sys, label: "anchor itself", leaf: leaf.items(), middle: none_der, anchor: leaf.items(), host: "www.example.com", now: 1800000000);
 

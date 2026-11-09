@@ -1238,7 +1238,10 @@ fn sccp(f: &mut ir.Function, map: &mut alloc.List(u32), a: alloc.Allocator) {
                 br.a = target;
                 f.insts[id as usize] = br;
             } else if ins.op != ir.Op.Const and pure(ins) and ins.op != ir.Op.Overflow and is_int(ins.ty) and l.state[id as usize] == CONST {
-                map.items_mut()[id as usize] = constant(f, map: map, t: ins.ty, v: l.value[id as usize]);
+                // The constant first: making it grows map, which a view of
+                // map's items taken before would no longer see (§5.4).
+                let made = constant(f, map: map, t: ins.ty, v: l.value[id as usize]);
+                map.items_mut()[id as usize] = made;
             }
         }
     }

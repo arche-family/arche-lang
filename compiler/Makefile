@@ -6,6 +6,8 @@
 #                    included, is accepted; CST round trips; golden
 #                    diagnostics (tests/)
 #   make differential  stage0 and the Arche compiler agree on every program
+#   make check-sanitized  the compiler, built with gcc's AddressSanitizer and
+#                    UBSan, builds itself and every test, debug and release
 #   make clean       remove build/
 
 STAGE0 := ../stage0
@@ -59,4 +61,22 @@ clean:
 differential: $(BUILD)/arche
 	sh ./differential.sh ../conformance/tests
 
-.PHONY: all check differential clean check-own
+# Undefined behaviour in the compiler shows on some C compilers and not on
+# others, as a use after free in the optimizer did, which made a release
+# bootstrap differ on gcc 13 only. Built with the sanitizers, it shows every
+# time: the compiler builds itself and every test, debug and release.
+SAN_CC ?= gcc
+SAN_FLAGS := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+check-sanitized: | $(BUILD)
+	$(MAKE) -C $(STAGE0)
+	$(MAKE) -C ../conformance
+	CC=$(SAN_CC) A0_CFLAGS="$(SAN_FLAGS)" $(STAGE0)/arche0-build main.arche $(BUILD)/arche-sanitized
+	for mode in "" --release --lib-std "--lib-std --release"; do \
+		ASAN_OPTIONS=detect_leaks=0 $(BUILD)/arche-sanitized --lib ../lib/ $$mode build main.arche $(BUILD)/sanitized.ll || exit 1; \
+	done
+	ARCHE=$(CURDIR)/$(BUILD)/arche-sanitized ARCHE_FLAGS="--lib $(CURDIR)/../lib/" ASAN_OPTIONS=detect_leaks=0 \
+		../conformance/runner/build/runner --timeout 120 --compiler "$(BUILD_CMD)" ../conformance/tests
+	ARCHE=$(CURDIR)/$(BUILD)/arche-sanitized ARCHE_FLAGS="--lib $(CURDIR)/../lib/ --release" ASAN_OPTIONS=detect_leaks=0 \
+		../conformance/runner/build/runner --timeout 120 --compiler "$(BUILD_CMD)" ../conformance/tests
+
+.PHONY: all check differential clean check-own check-sanitized

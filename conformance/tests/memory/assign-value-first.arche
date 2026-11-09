@@ -1,0 +1,22 @@
+// test: run
+// spec: 5.4
+// stdout: 7 2
+import alloc;
+import std;
+
+fn grow(xs: &mut alloc.List(u32)) -> u32 {
+    xs.push(7);
+    return 7;
+}
+
+// The value made first, then written through a view taken after it.
+fn main(sys: &mut std.System) -> !void {
+    var xs = alloc.List(u32).init(sys.alloc);
+    xs.push(1);
+    let made = grow(&mut xs);
+    xs.items_mut()[0] = made;
+    sys.stdout.write_u64(xs[0] as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(xs.len() as u64);
+    sys.stdout.write("\n");
+}

@@ -85,6 +85,15 @@ jobs:
       - name: Bootstrap on that processor, stage2 == stage3
         run: QEMU=qemu-${{ matrix.arch }}-static ./cross-bootstrap.sh ${{ matrix.arch }}
 
+  # The compiler built with gcc's AddressSanitizer and UBSan: undefined
+  # behaviour shows every time, not only on one C compiler (compiler/Makefile).
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The compiler, sanitized, builds itself and every test, debug and release
+        run: make -C compiler check-sanitized
+
   # docs/sprints.md S30: the compiler's WebAssembly backend, its tests in a
   # runtime, and the compiler on WebAssembly building itself.
   wasm:
