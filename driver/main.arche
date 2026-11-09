@@ -155,6 +155,9 @@ type Tools = struct {
     clang: alloc.String,
     /// clang --version's first line: part of every cache key.
     version: alloc.String,
+    /// No clang: programs are built by the compiler's own backend and its
+    /// linker, on the runtime's object a release carries.
+    no_clang: bool,
 }
 
 type Failed = error { Failed }
@@ -210,18 +213,30 @@ fn args_of(words: str, a: alloc.Allocator) -> alloc.List(alloc.String) {
 }
 
 fn find_tools(sys: &mut std.System, work: str, a: alloc.Allocator) -> Failed!Tools {
-    // The compiler: ARCHE, or the repository's, beside this program's
-    // directory (driver/build/arche-driver, compiler/build/arche).
+    // The compiler: ARCHE; a release's, in ARCHE_HOME/bin or beside this
+    // program (bin/arche-driver, bin/arche); or the repository's
+    // (driver/build/arche-driver, compiler/build/arche).
     var arche = alloc.String.init(a);
+    var runtime = alloc.String.init(a);
+    let home = sys.env.get("ARCHE_HOME", a) orelse alloc.String.init(a);
+    let here = parent(sys.args.get(0));
+    let beside = join(dir: here, name: "arche", a);
     match sys.env.get("ARCHE", a) {
         some(v) => { arche.push_str(v.view()); }
         none => {
-            let here = parent(sys.args.get(0));
-            arche.push_str(here);
-            arche.push_str("/../../compiler/build/arche");
+            if home.len() > 0 {
+                arche = join(dir: home.view(), name: "bin/arche", a);
+            } else if here.len() > 0 and sys.fs.exists(beside.view()) {
+                arche.push_str(beside.view());
+            } else {
+                arche.push_str(here);
+                arche.push_str("/../../compiler/build/arche");
+            }
         }
     }
-    let runtime = join(dir: parent(parent(arche.view())), name: "runtime/rt.c", a);
+    // The runtime's source: a release's runtime/, or the repository's
+    // compiler/runtime/, two levels above the compiler either way.
+    runtime = join(dir: parent(parent(arche.view())), name: "runtime/rt.c", a);
     var clang = alloc.String.init(a);
     match sys.env.get("CLANG", a) {
         some(v) => { clang.push_str(v.view()); }
@@ -235,9 +250,14 @@ fn find_tools(sys: &mut std.System, work: str, a: alloc.Allocator) -> Failed!Too
     var argv = alloc.List(alloc.String).init(a);
     argv.push(text_of(clang.view().bytes(), a));
     argv.push(text_of("--version".bytes(), a));
-    if try run(sys, argv: &argv, out_path: version_file.view(), a) != 0 {
-        say(&mut sys.stderr, a: "arche-driver: ", b: clang.view(), c: " --version failed");
-        return Failed.Failed;
+    // Without clang a release still builds: by the compiler's own backend.
+    let ran = run(sys, argv: &argv, out_path: version_file.view(), a) catch 1;
+    if ran != 0 {
+        if not sys.fs.exists(prebuilt_runtime(runtime.view(), a).view()) {
+            say(&mut sys.stderr, a: "arche-driver: ", b: clang.view(), c: " --version failed, and there is no runtime object to build without it");
+            return Failed.Failed;
+        }
+        return Tools { arche: arche, runtime: runtime, clang: clang, version: alloc.String.init(a), no_clang: true };
     }
     let text = sys.fs.read_file(version_file.view(), a) catch alloc.String.init(a);
     let ls = lines(text.view(), a);
@@ -245,7 +265,18 @@ fn find_tools(sys: &mut std.System, work: str, a: alloc.Allocator) -> Failed!Too
     if ls.len() > 0 {
         version.push_str(ls[0].view());
     }
-    return Tools { arche: arche, runtime: runtime, clang: clang, version: version };
+    return Tools { arche: arche, runtime: runtime, clang: clang, version: version, no_clang: false };
+}
+
+/// The runtime's object for the compiler's own linker, as a release carries
+/// it beside rt.c: rt-<target>.ao.
+fn prebuilt_runtime(rt_c: str, a: alloc.Allocator) -> alloc.String {
+    var p = alloc.String.init(a);
+    p.push_str(parent(rt_c));
+    p.push_str("/rt-");
+    p.push_str(target_name());
+    p.push_str(".ao");
+    return p;
 }
 
 /// The object for some source text, from the cache or made now: what is
@@ -343,17 +374,22 @@ fn build_own(sys: &mut std.System, tools: &Tools, dir: str, name: str, root: str
         sys.stderr.write(msg.view());
         return Failed.Failed;
     }
-    var flags = copy_text(runtime_flags(), a);
-    flags.push_str(" -fno-omit-frame-pointer");
-    let includes = runtime_includes(sys, tools: tools, a: a);
-    var rt_hits: u32 = 0;
-    let rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: &includes, flags: flags.view(), cache: cache.view(), hits: &mut rt_hits, a: a);
     let program = join(dir: out_dir.view(), name: name, a);
     var tmp = copy_text(program.view(), a);
     tmp.push_str(".tmp");
-    // The runtime is still C: its object, as the compiler's own linker reads it.
-    var rt_ao = copy_text(rt.view(), a);
-    rt_ao.push_str(".ao");
+    // The runtime is still C: its object, as the compiler's own linker reads
+    // it; a release carries it made, and with no clang that one is used.
+    var rt_ao = prebuilt_runtime(tools.runtime.view(), a);
+    var rt = alloc.String.init(a);
+    if not tools.no_clang {
+        var flags = copy_text(runtime_flags(), a);
+        flags.push_str(" -fno-omit-frame-pointer");
+        let includes = runtime_includes(sys, tools: tools, a: a);
+        var rt_hits: u32 = 0;
+        rt = try object_with(sys, tools: tools, source: tools.runtime.view(), also: &includes, flags: flags.view(), cache: cache.view(), hits: &mut rt_hits, a: a);
+        rt_ao = copy_text(rt.view(), a);
+        rt_ao.push_str(".ao");
+    }
     if not sys.fs.exists(rt_ao.view()) {
         var convert = alloc.List(alloc.String).init(a);
         convert.push(text_of(tools.arche.view().bytes(), a));
@@ -394,7 +430,7 @@ fn copy_text(t: str, a: alloc.Allocator) -> alloc.String {
 /// Builds one program; its path.
 fn build_program(sys: &mut std.System, tools: &Tools, dir: str, name: str, root: str, a: alloc.Allocator) -> Failed!alloc.String {
     let backend = sys.env.get("ARCHE_BACKEND", a) orelse alloc.String.init(a);
-    if backend.view().eq("own") {
+    if backend.view().eq("own") or tools.no_clang {
         return build_own(sys, tools: tools, dir: dir, name: name, root: root, a: a);
     }
     let out_dir = join(dir: dir, name: "build", a);

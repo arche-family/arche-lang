@@ -197,3 +197,63 @@ jobs:
         run: ./fuzz/lsp.sh 60
       - name: Conformance tests, one object per module
         run: cd compiler && ../conformance/runner/build/runner --timeout 60 --compiler ./arche-build-units ../conformance/tests
+
+  # docs/sprints.md S34: two machines build the same bytes. stage1 is built
+  # from stage0's C by each system's own gcc, then builds the compiler's
+  # source to release IR and to an object by its own backend.
+  reproducible:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The compiler's own source, built on this system
+        run: sh ./reproducible.sh | tee hashes-${{ matrix.os }}.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hashes-${{ matrix.os }}
+          path: hashes-${{ matrix.os }}.txt
+
+  reproducible-compare:
+    needs: reproducible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: The same bytes on both
+        run: |
+          cat hashes-*/hashes-*.txt
+          diff hashes-ubuntu-24.04/hashes-ubuntu-24.04.txt hashes-ubuntu-22.04/hashes-ubuntu-22.04.txt
+
+  # docs/sprints.md S34: the release archive, made after the benchmarks hold
+  # their baseline, and then unpacked on a machine with no C compiler and
+  # no LLVM, where it builds a program and runs it.
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang 20
+        run: sudo apt-get update && sudo apt-get install -y clang-20
+      - name: Build stage0, the compiler and the runtime, and wabt for the handler
+        run: make -C stage0 && make -C compiler && make -C wasm && sh wasm/spec.sh wasm/build/arche-wasm i32
+      - name: The web benchmark must hold its baseline
+        run: bash bench/web/run.sh
+      - name: The archive
+        run: CLANG=clang-20 sh ./dist.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: build/dist/*.tar.gz
+
+  clean-machine:
+    needs: release
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+      - name: Unpacked, a program built and run, with no C compiler
+        run: sh ./dist-check.sh arche-*.tar.gz
+
