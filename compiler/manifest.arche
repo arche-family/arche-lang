@@ -14,6 +14,7 @@
 ///         registry: "https://127.0.0.1:8443/",
 ///         registry_key: "<the registry's Ed25519 public key, hex>",
 ///         strict_unsafe: true,
+///         allow_unsafe: ["webkit"],
 ///         panic_handler: "kernel.panic",
 ///     };
 ///
@@ -37,7 +38,10 @@ pub const CLOCK: u32 = 4;
 pub const ENV: u32 = 8;
 pub const PROC: u32 = 16;
 pub const RAND: u32 = 32;
-pub const ALL: u32 = 63;
+/// Not a type of std: code that can reach past every other capability, with
+/// unsafe, extern and export (spec/arche.md §1.3, §10.1).
+pub const UNSAFE: u32 = 64;
+pub const ALL: u32 = 127;
 
 /// The capability bit of a std type name, or 0.
 pub fn capability(name: str) -> u32 {
@@ -47,6 +51,7 @@ pub fn capability(name: str) -> u32 {
     if name.eq("Env") { return ENV; }
     if name.eq("Proc") { return PROC; }
     if name.eq("Rand") { return RAND; }
+    if name.eq("Unsafe") { return UNSAFE; }
     return 0;
 }
 
@@ -76,6 +81,8 @@ pub type Manifest = struct {
     pub needs: u32,
     pub dependencies: alloc.List(Dependency),
     pub strict_unsafe: bool,
+    /// The dependencies that may have unsafe code: the root package's say.
+    pub allow_unsafe: alloc.List(alloc.String),
     pub panic_handler: alloc.String,
     /// Where dependencies come from, and the key that signs them.
     pub registry: alloc.String,
@@ -97,6 +104,7 @@ pub fn defaults(a: alloc.Allocator) -> Manifest {
         needs: ALL,
         dependencies: alloc.List(Dependency).init(a),
         strict_unsafe: false,
+        allow_unsafe: alloc.List(alloc.String).init(a),
         panic_handler: alloc.String.init(a),
         registry: alloc.String.init(a),
         registry_key: alloc.String.init(a),
@@ -319,7 +327,7 @@ pub fn read(tree: cst.Tree, text: str, diags: &mut diag.Diagnostics, a: alloc.Al
                         bit = capability(t[17..t.len()]);
                     }
                     if bit == 0 {
-                        diags.report(codes.BAD_MANIFEST, span_of(&r, e), "a capability is build.Capability.Fs, Net, Clock, Env, Proc or Rand");
+                        diags.report(codes.BAD_MANIFEST, span_of(&r, e), "a capability is build.Capability.Fs, Net, Clock, Env, Proc, Rand or Unsafe");
                     }
                     m.needs = m.needs | bit;
                 }
@@ -362,6 +370,20 @@ pub fn read(tree: cst.Tree, text: str, diags: &mut diag.Diagnostics, a: alloc.Al
             } else if not t.view().eq("false") {
                 diags.report(codes.BAD_MANIFEST, span_of(&r, v), "strict_unsafe is true or false");
             }
+        } else if name.eq("allow_unsafe") {
+            if node(&r, v).kind != cst.Kind.ArrayLit {
+                diags.report(codes.BAD_MANIFEST, span_of(&r, v), "allow_unsafe is an array of the names of dependencies");
+            } else {
+                var k: u32 = 0;
+                while k < node(&r, v).children_len : (k += 1) {
+                    let e = child(&r, v, k);
+                    let dep_name = string_value(&r, e, diags: diags, a: a);
+                    if not is_package_name(dep_name.view()) {
+                        diags.report(codes.BAD_MANIFEST, span_of(&r, e), "allow_unsafe names dependencies: letters, digits and '_'");
+                    }
+                    m.allow_unsafe.push(dep_name);
+                }
+            }
         } else if name.eq("panic_handler") {
             m.panic_handler = string_value(&r, v, diags: diags, a: a);
         } else if name.eq("registry") {
@@ -372,7 +394,7 @@ pub fn read(tree: cst.Tree, text: str, diags: &mut diag.Diagnostics, a: alloc.Al
             var msg = diags.new_message();
             msg.push_str("a manifest has no field '");
             msg.push_str(name);
-            msg.push_str("'; its fields are name, version, edition, needs, dependencies, registry, registry_key, strict_unsafe and panic_handler");
+            msg.push_str("'; its fields are name, version, edition, needs, dependencies, allow_unsafe, registry, registry_key, strict_unsafe and panic_handler");
             diags.report_owned(codes.BAD_MANIFEST, span_of(&r, f), msg);
         }
     }

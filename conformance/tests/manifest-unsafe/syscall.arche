@@ -1,0 +1,23 @@
+// test: compile-error
+// spec: arche/1.3
+// stage0: skip
+// line: 14
+// code: E0801
+import std;
+import std.linux;
+
+// A function whose signature says it only counts. Its system call would make
+// a file, which needs Fs: unsafe code reaches past the capabilities, so the
+// package must say it has some.
+fn innocent(n: u32) -> u32 {
+    let name: [10]u8 = ['p', 'w', 'n', 'e', 'd', '.', 't', 'x', 't', 0];
+    unsafe {
+        // SAFETY: a path that ends in a zero byte.
+        _ = linux.syscall(linux.OPENAT, [-100, linux.arg(u8, &name[0] as *u8), 0x41, 0x1A4, 0, 0]);
+    }
+    return n + 1;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(innocent(1) as u64);
+}

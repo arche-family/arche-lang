@@ -106,6 +106,7 @@ pub fn check_fn(c: &mut ck.Checker, f: u32) {
     c.labels = alloc.List(alloc.Symbol).init(c.a);
     if ck.full(c) and (ck.is_unsafe_fn(c, info.decl) or ck.is_naked_fn(c, info.decl)) {
         c.unsafe_depth = 1;
+        ck.require_unsafe_capability(c, ck.token_span(c, c.decls[info.decl as usize].name_token), what: "an unsafe fn");
     }
     while c.scope.len() > 0 {
         _ = c.scope.pop();
@@ -364,6 +365,7 @@ fn check_stmt(c: &mut ck.Checker, s: cst.NodeId) {
                 let sp = ck.span_of(c, s);
                 ck.report(c, codes.NO_SAFETY_COMMENT, sp, "this package sets strict_unsafe: say why the block is safe in a '// SAFETY:' comment at its start");
             }
+            ck.require_unsafe_capability(c, ck.span_of(c, ck.child(c, s, 0)), what: "unsafe code");
             c.unsafe_depth += 1;
             check_block(c, ck.child(c, s, 0));
             c.unsafe_depth -= 1;

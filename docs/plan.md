@@ -166,7 +166,7 @@ Vositalar `arche` binary'sida jamlanadi. Compiler Arche-0'da qolgani uchun (proc
 
 **Package manager:**
 
-- Manifest'da paketga kerak bo'lgan capability'lar e'lon qilinadi (`needs: [Net]`). Manifest'da yo'q capability turini paket ichida ishlatishga compiler ruxsat bermaydi.
+- Manifest'da paketga kerak bo'lgan capability'lar e'lon qilinadi (`needs: [Net]`). Manifest'da yo'q capability turini paket ichida ishlatishga compiler ruxsat bermaydi. `unsafe`, `extern` va `export` ham capability (`Unsafe`): ular boshqa hamma capability'ni chetlab o'ta oladi. Dependency'ning `unsafe` kodiga root paket `allow_unsafe` bilan nomini yozib ruxsat beradi.
 - Lockfile'da har dependency content hash bilan qayd etiladi.
 - Registry content-addressed bo'ladi: versiyalar o'zgarmas va Ed25519 bilan imzolangan.
 - Reproducible build kafolatlanadi: bir xil source va lockfile har doim bit-identical output beradi.

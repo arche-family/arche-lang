@@ -8,7 +8,9 @@ conformance/testrunner), without its header. In an example of its own, a
 first line `// arche <options> check` gives the options to check it with,
 a line `// package` says it is full Arche (a package.arche beside it), a
 line `// manifest: <text>` gives that package.arche, and a line
-`// as package.arche` says the example is the manifest itself.
+`// as package.arche` says the example is the manifest itself, and a line
+`// dependency <name>: <text>` gives a vendored dependency, <text> its
+package.arche.
 E0101's example ends with the byte 0xFF, which arche explain adds.
 
 Usage: python3 -I compiler/gen-explain.py [output]   (default: compiler/explain.arche)
@@ -20,7 +22,7 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HEADER = re.compile(r"^// (test|spec|line|code|stage0|exit|args|stdout|stderr):")
+HEADER = re.compile(r"^// (test|spec|line|code|stage0|wasm|exit|args|stdout|stderr):")
 
 
 def codes():
@@ -80,7 +82,7 @@ def literal(text):
 
 def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "compiler/explain.arche")
-    meaning, example, full, options, manifests, files = [], [], [], [], [], []
+    meaning, example, full, options, manifests, files, dependencies = [], [], [], [], [], [], []
     for code, text in codes():
         n = int(code[1:])
         meaning.append((n, text))
@@ -102,6 +104,9 @@ def main():
                     manifests.append((n, first[len("// manifest: "):] + "\n"))
                 elif first == "// as package.arche":
                     files.append((n, "package.arche"))
+                elif first.startswith("// dependency "):
+                    name, text = first[len("// dependency "):].split(": ", 1)
+                    dependencies.append((n, name + "\n" + text + "\n"))
                 else:
                     break
                 body = body.split("\n", 1)[1]
@@ -157,6 +162,12 @@ def main():
     for n, f in files:
         lines.append("    if code == %d {" % n)
         lines.append("        return %s;" % literal(f))
+        lines.append("    }")
+    lines += ["    return \"\";", "}", "", "/// A dependency the example needs vendored: its name, a line, then its",
+              "/// package.arche; \"\" for none.", "pub fn example_dependency(code: u16) -> str {"]
+    for n, d in dependencies:
+        lines.append("    if code == %d {" % n)
+        lines.append("        return %s;" % literal(d))
         lines.append("    }")
     lines += ["    return \"\";", "}", ""]
     open(out_path, "w", encoding="utf-8", newline="").write("\n".join(lines))

@@ -33,6 +33,14 @@ for code in $(sed -n 's/^| `\(E[0-9]\{4\}\)` | .*|$/\1/p' "$here/../docs/error-c
     "$arche" explain "$code" | grep -q "in a package" && echo "// A manifest." > "$case_dir/package.arche"
     "$arche" explain --example-manifest "$code" > "$case_dir/manifest"
     [ -s "$case_dir/manifest" ] && cp "$case_dir/manifest" "$case_dir/package.arche"
+    "$arche" explain --example-dependency "$code" > "$case_dir/dependency"
+    if [ -s "$case_dir/dependency" ]; then
+        name=$(head -n 1 "$case_dir/dependency")
+        mkdir -p "$case_dir/vendor/$name"
+        tail -n +2 "$case_dir/dependency" > "$case_dir/vendor/$name/package.arche"
+        echo "// A module of the dependency." > "$case_dir/vendor/$name/$name.arche"
+        echo "$name 1.0.0 sha256:0000000000000000000000000000000000000000000000000000000000000000" > "$case_dir/package.lock"
+    fi
     options=$("$arche" explain "$code" | sed -n 's/.*`arche \(.*\) check` reports.*/\1/p')
     # shellcheck disable=SC2086
     if "$arche" $options check "$case_dir/$file" > /dev/null 2> "$case_dir/out"; then

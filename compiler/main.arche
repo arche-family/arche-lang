@@ -291,7 +291,7 @@ fn write_code(out: &mut std.Output, n: u16) {
 /// `arche explain`: the meaning of a code and its example. With --example
 /// only the example, as a file to check (the byte E0101's needs included);
 /// --example-manifest its package.arche, --example-file the name its file
-/// must have.
+/// must have, --example-dependency the dependency it needs vendored.
 fn explain_code(out: &mut std.Output, err_out: &mut std.Output, text: str, only_example: bool, part: str) -> Failure!void {
     var n: u16 = 0;
     match code_number(text) {
@@ -318,6 +318,10 @@ fn explain_code(out: &mut std.Output, err_out: &mut std.Output, text: str, only_
         out.write("\n");
         return;
     }
+    if part.eq("--example-dependency") {
+        out.write(explain.example_dependency(n));
+        return;
+    }
     if only_example {
         out.write(example);
         if n == 101 {
@@ -342,6 +346,17 @@ fn explain_code(out: &mut std.Output, err_out: &mut std.Output, text: str, only_
         out.write("in a package whose package.arche is\n\n    ");
         out.write(manifest_text);
         out.write("\n");
+        let dependency = explain.example_dependency(n);
+        if dependency.len() > 0 {
+            var cut: usize = 0;
+            while cut < dependency.len() and dependency[cut] != '\n' : (cut += 1) {
+            }
+            out.write("with a dependency ");
+            out.write(dependency[0..cut]);
+            out.write(" whose package.arche is\n\n    ");
+            out.write(dependency[cut + 1..dependency.len()]);
+            out.write("\n");
+        }
     } else if explain.example_is_full(n) {
         out.write("in a package (a package.arche beside it, so full Arche), ");
     }

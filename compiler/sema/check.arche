@@ -647,6 +647,57 @@ pub fn require_capability(c: &mut Checker, bit: u32, s: diag.Span) {
     report_owned(c, codes.NOT_NEEDED, s, m);
 }
 
+/// Unsafe code, an extern fn or an export in the module: what reaches past
+/// every capability (§1.3, §10.1). Its package lists build.Capability.Unsafe
+/// in needs. The library's modules are not checked.
+pub fn require_unsafe_capability(c: &mut Checker, s: diag.Span, what: str) {
+    let module = c.module;
+    if not c.p.modules[module as usize].in_package {
+        return;
+    }
+    if c.p.manifest_of(module).needs & manifest.UNSAFE == 0 {
+        var m = new_message(c);
+        m.push_str(what);
+        m.push_str(" reaches past every capability: this package's manifest does not list build.Capability.Unsafe in needs");
+        report_owned(c, codes.NOT_NEEDED, s, m);
+        return;
+    }
+}
+
+/// An import of another package's module: if that package may have unsafe
+/// code, its manifest says so in needs (require_unsafe_capability), and the
+/// root package must allow it by name, as what it gives that package. A
+/// manifest that does not say what its package needs says it needs all.
+fn require_allowed_package(c: &mut Checker, target: u32, s: diag.Span) {
+    let pk = c.p.modules[target as usize].package;
+    if pk == 0 or pk == program.NO_PACKAGE or pk == c.p.modules[c.module as usize].package {
+        return;
+    }
+    let dep = (pk - 1) as usize;
+    if c.p.deps[dep].manifest.needs & manifest.UNSAFE == 0 {
+        return;
+    }
+    let names = c.p.manifest.allow_unsafe.items();
+    var i: usize = 0;
+    while i < names.len() : (i += 1) {
+        if names[i].view().eq(c.p.deps[dep].name.view()) {
+            return;
+        }
+    }
+    var m = new_message(c);
+    m.push_str("the dependency ");
+    m.push_str(c.p.deps[dep].name.view());
+    if c.p.deps[dep].manifest.found {
+        m.push_str(" may have unsafe code: its manifest lists build.Capability.Unsafe in needs");
+    } else {
+        m.push_str(" may have unsafe code: its manifest does not say what it needs");
+    }
+    m.push_str(", and the root package's manifest does not allow it with allow_unsafe: [\"");
+    m.push_str(c.p.deps[dep].name.view());
+    m.push_str("\"]");
+    report_owned(c, codes.UNSAFE_DEPENDENCY, s, m);
+}
+
 /// Notes that the token, in the module being checked, names what is
 /// declared at decl_token of decl_module (arche query).
 pub fn note_use(c: &mut Checker, token: u32, decl_module: u32, decl_token: u32) {
@@ -2062,6 +2113,7 @@ fn collect_import(c: &mut Checker, n: cst.NodeId) {
             some(id) => { alias.module = id.index; }
             none => { return; } // reported by program.load
         }
+        require_allowed_package(c, alias.module, s: s);
     }
     let sym = symbol(c, bound);
     match find_import(c, sym) {
@@ -2620,6 +2672,10 @@ fn check_signature_here(c: &mut Checker, d: u32) {
     }
     if is_extern_fn(c, d) {
         check_extern(c, d, info);
+        require_unsafe_capability(c, token_span(c, decl.name_token), what: "an extern fn");
+    }
+    if fn_attribute(c, d, "export").len() > 0 {
+        require_unsafe_capability(c, token_span(c, decl.name_token), what: "an export");
     }
     c.decls[d as usize].fn_index = c.fns.len() as u32;
     c.fns.push(info);
