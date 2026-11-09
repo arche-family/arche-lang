@@ -29,12 +29,14 @@ jobs:
         run: cd /tmp && python3 -I $GITHUB_WORKSPACE/compiler/fuzz.py $GITHUB_WORKSPACE/compiler/build/arche 60
       - name: Differential, stage0 against the Arche compiler
         run: make -C compiler differential CC=${{ matrix.cc }}
-      - name: Install lld and gdb
-        run: sudo apt-get update && sudo apt-get install -y lld gdb
+      - name: Install lld, gdb and clang 20
+        run: sudo apt-get update && sudo apt-get install -y lld gdb clang-20
       - name: The compiler's own backend and linker, all the tests, the ABI suite, and a session in gdb
         run: REQUIRE_GDB=1 make -C compiler check-own CC=${{ matrix.cc }}
+      # With clang 20: clang 18, the image's, now and then makes other code
+      # from the same IR (bootstrap.sh), and the binaries then differ.
       - name: Bootstrap, stage2 == stage3
-        run: CC=${{ matrix.cc }} ./bootstrap.sh
+        run: CC=${{ matrix.cc }} CLANG=clang-20 ./bootstrap.sh
 
   # docs/sprints.md S19: the same compiler and the same library on Windows,
   # built with clang and linked with lld-link against Win32. The image has
@@ -70,8 +72,8 @@ jobs:
         arch: [aarch64, riscv64]
     steps:
       - uses: actions/checkout@v4
-      - name: Install lld and QEMU's user mode
-        run: sudo apt-get update && sudo apt-get install -y lld qemu-user-static binfmt-support
+      - name: Install lld, QEMU's user mode and clang 20
+        run: sudo apt-get update && sudo apt-get install -y lld qemu-user-static binfmt-support clang-20
       - name: Build stage0, the compiler and the runner
         run: make -C stage0 && make -C compiler && make -C conformance
       - name: Conformance tests in QEMU
@@ -83,7 +85,7 @@ jobs:
       - name: The ABI suite, each module by each backend
         run: QEMU=qemu-${{ matrix.arch }}-static sh compiler/abi-check.sh ${{ matrix.arch }}
       - name: Bootstrap on that processor, stage2 == stage3
-        run: QEMU=qemu-${{ matrix.arch }}-static ./cross-bootstrap.sh ${{ matrix.arch }}
+        run: CLANG=clang-20 QEMU=qemu-${{ matrix.arch }}-static ./cross-bootstrap.sh ${{ matrix.arch }}
 
   # The compiler built with gcc's AddressSanitizer and UBSan: undefined
   # behaviour shows every time, not only on one C compiler (compiler/Makefile).

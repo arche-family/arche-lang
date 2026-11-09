@@ -5,6 +5,11 @@
 # Needs a C compiler (CC, default cc), clang for LLVM IR, and on Linux lld for
 # the compiler's own backend. It builds for the system it runs on, Linux or
 # Windows (compiler/target.sh).
+# clang must make the same code from the same IR every time. LLVM 18 does not
+# always: its SCCP visited a set in the order of its pointers, so one compile in
+# ten or so turns the release compiler's IR into other code, and the
+# binaries differ with the IR the same. LLVM 20 has the fix
+# (llvm/llvm-project#105758); CI runs this with clang 20.
 # Usage: ./bootstrap.sh [work dir]. The work dir may be anywhere: each stage is
 # told where the library is (--lib), not left to find it beside itself.
 set -eu
@@ -40,7 +45,7 @@ show_difference() { # stage2 dir, stage3 dir
         (cd "$1" && $link -o again arche.ll "$rt")
         cmp -s "$1/again" "$1/arche" && echo "  linked again: as stage2" || true
         cmp -s "$1/again" "$2/arche" && echo "  linked again: as stage3" || true
-        $clang --version | head -1
+        echo "  the C compiler: $($clang --version | head -1); LLVM 18 is known to do this (see the top of this file)"
         objdump -d --no-show-raw-insn "$1/arche" > "$1/arche.s"
         objdump -d --no-show-raw-insn "$2/arche" > "$2/arche.s"
         diff "$1/arche.s" "$2/arche.s" | head -40
