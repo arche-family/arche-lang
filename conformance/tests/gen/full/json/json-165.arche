@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: ["q\"uote",[1.5,{"a":[false,"arche",63283315,true],"id":{"id":"back\\slash","b":null,"name":-0.25,"list":null},"z":[]},935756465],{},null]
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("[\"q\\\"uote\",[1.5,{\"a\":[false, \"arche\",63283315,true], \"id\":{\"id\":\"back\\\\slash\", \"b\":null, \"name\":-0.25, \"list\":null}, \"z\":[]},935756465],{},null]", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

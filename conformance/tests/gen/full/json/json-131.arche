@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: {"a":true,"list":224152808,"key":{"list":[]}}
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("{\"a\":true, \"list\":224152808, \"key\":{\"list\":[]}}", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

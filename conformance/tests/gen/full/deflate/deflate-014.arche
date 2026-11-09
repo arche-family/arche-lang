@@ -1,0 +1,36 @@
+// test: run
+// spec: core.deflate
+// stage0: skip
+// stdout: 3119469405
+// stdout: round trip 4000
+import alloc;
+import core.deflate;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var data = alloc.List(u8).init(sys.alloc);
+    var x: u32 = 1937810681;
+    var i: u32 = 0;
+    while i < 4000 : (i += 1) {
+        x = x ^ (x << 13);
+        x = x ^ (x >> 17);
+        x = x ^ (x << 5);
+        data.push((x % 2) as u8);
+    }
+    sys.stdout.write_u64(deflate.crc32(0, data: data.items()) as u64);
+    sys.stdout.write("\n");
+    var packed = alloc.List(u8).init(sys.alloc);
+    deflate.gzip(data.items(), out: &mut packed, sys.alloc);
+    var back = alloc.List(u8).init(sys.alloc);
+    try deflate.gunzip(packed.items(), out: &mut back, limit: 1 << 20);
+    var same = back.len() == data.len();
+    var k: usize = 0;
+    while same and k < back.len() : (k += 1) {
+        same = back.items()[k] == data.items()[k];
+    }
+    if same {
+        sys.stdout.write("round trip ");
+        sys.stdout.write_u64(back.len() as u64);
+        sys.stdout.write("\n");
+    }
+}

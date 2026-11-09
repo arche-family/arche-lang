@@ -1,0 +1,43 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 1
+// stdout: no
+// stdout: no
+// stdout: no
+// stdout: no
+// stdout: no
+// stdout: [02480zzz5398zzzzlonger worddatazendend.0-]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("0");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("arche") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_u64(2480);
+    s.push_str("");
+    s.push_str("");
+    s.push_str("zz");
+    s.push_ascii('z');
+    s.push_u64(5398);
+    if s.view().starts_with("arche") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("zz");
+    if s.view().starts_with("kent") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("zz");
+    s.push_str("longer word");
+    s.push_str("data");
+    s.push_ascii('z');
+    s.push_str("end");
+    s.push_str("end");
+    s.push_ascii('.');
+    if s.view().starts_with("a b") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("0");
+    s.push_ascii('-');
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

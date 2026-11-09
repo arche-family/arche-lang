@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: [[{"key":[null,"0"],"a":{"z":false,"a":756624753,"name":true}},{"name":"tosh","list":false},794306703],{"name":{"list":{"list":-0.25,"name":null,"a":-0.25,"key":""},"name":[],"b":{"name":"back\\slash","b":null,"id":"data","key":true},"id":{"list":null,"name":null,"b":"a b","z":"kent"}},"a":[[null,false]],"z":null,"list":true},{"b":{"z":{"b":842166288,"name":3e8,"z":"kent","id":308418762}}},true]
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("[[{\"key\":[null, \"0\"], \"a\":{\"z\":false, \"a\":756624753, \"name\":true}},{\"name\":\"tosh\", \"list\":false},794306703],{\"name\":{\"list\":{\"list\":-0.25, \"name\":null, \"a\":-0.25, \"key\":\"\"}, \"name\":[], \"b\":{\"name\":\"back\\\\slash\", \"b\":null, \"id\":\"data\", \"key\":true}, \"id\":{\"list\":null, \"name\":null, \"b\":\"a b\", \"z\":\"kent\"}}, \"a\":[[null,false]], \"z\":null, \"list\":true},{\"b\":{\"z\":{\"b\":842166288, \"name\":3e8, \"z\":\"kent\", \"id\":308418762}}},true]", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

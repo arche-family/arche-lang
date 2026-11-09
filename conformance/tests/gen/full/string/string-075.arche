@@ -1,0 +1,42 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 4
+// stdout: 4
+// stdout: 8
+// stdout: 8
+// stdout: no
+// stdout: no
+// stdout: 23
+// stdout: [2981dataxarche0barcheb.8820]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_u64(2981);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("data");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("x");
+    s.push_str("arche");
+    if s.view().starts_with("x") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("0");
+    s.push_ascii('b');
+    s.push_str("arche");
+    s.push_ascii('b');
+    if s.view().starts_with("data") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('.');
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_u64(8820);
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

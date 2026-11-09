@@ -1,0 +1,26 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 4
+// stdout: no
+// stdout: 12
+// stdout: [6761azzckent]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_u64(6761);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("kent") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('a');
+    s.push_str("zz");
+    s.push_ascii('c');
+    s.push_str("kent");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

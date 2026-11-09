@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: {"a":[[true,null,{"list":true,"a":true,"key":false,"id":1.5},[796548004,null]],[{"z":false,"key":"0","id":853863354},[],{"b":"tosh","key":"q\"uote"},{"a":false,"z":false}],{"name":[true,true,true],"z":{"b":107308599,"z":3e8,"a":"zz","id":873715927},"a":false,"id":[]}]}
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("{\"a\":[[true,null,{\"list\":true, \"a\":true, \"key\":false, \"id\":1.5},[796548004,null]],[{\"z\":false, \"key\":\"0\", \"id\":853863354},[],{\"b\":\"tosh\", \"key\":\"q\\\"uote\"},{\"a\":false, \"z\":false}],{\"name\":[true,true,true], \"z\":{\"b\":107308599, \"z\":3e8, \"a\":\"zz\", \"id\":873715927}, \"a\":false, \"id\":[]}]}", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

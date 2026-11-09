@@ -1,0 +1,73 @@
+// test: run
+// spec: 11
+// stdout: none
+// stdout: 753658
+// stdout: 580248
+// stdout: none
+// stdout: 380930
+// stdout: 380930
+// stdout: 5
+// stdout: 380930
+// stdout: 6
+// stdout: none
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var m = alloc.Map(u64, u64).init(sys.alloc);
+    m.put(key: 37, value: 580248);
+    m.put(key: 44, value: 753658);
+    match m.remove(34) {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    match m.get(44) {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    match m.get(37) {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    match m.get(1) {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    m.put(key: 44, value: 9514);
+    m.put(key: 44, value: 996926);
+    m.put(key: 34, value: 420061);
+    m.put(key: 23, value: 380930);
+    match m.get(23) {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    m.put(key: 9, value: 21250);
+    match m.get(23) {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    m.put(key: 9, value: 924121);
+    sys.stdout.write_u64(m.len() as u64);
+    sys.stdout.write("\n");
+    match m.remove(23) {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    m.put(key: 44, value: 246209);
+    m.put(key: 23, value: 141500);
+    m.put(key: 47, value: 694604);
+    sys.stdout.write_u64(m.len() as u64);
+    sys.stdout.write("\n");
+    match m.remove(2) {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+}

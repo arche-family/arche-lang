@@ -1,0 +1,31 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 1
+// stdout: yes
+// stdout: no
+// stdout: no
+// stdout: 9
+// stdout: [yx0-datax]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_ascii('y');
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("x");
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("0");
+    s.push_ascii('-');
+    if s.view().starts_with("zz") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("data");
+    s.push_ascii('x');
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

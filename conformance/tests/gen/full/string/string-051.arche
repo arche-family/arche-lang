@@ -1,0 +1,37 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: no
+// stdout: 1
+// stdout: no
+// stdout: yes
+// stdout: [0.-endzz8134tosha bxyzzkent.3720]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    if s.view().starts_with("longer word") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("0");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("kent") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('.');
+    s.push_ascii('-');
+    s.push_str("end");
+    s.push_ascii('z');
+    s.push_ascii('z');
+    s.push_u64(8134);
+    s.push_str("tosh");
+    s.push_str("a b");
+    s.push_str("x");
+    s.push_ascii('y');
+    s.push_str("zz");
+    s.push_str("kent");
+    s.push_ascii('.');
+    s.push_u64(3720);
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

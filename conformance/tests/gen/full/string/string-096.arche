@@ -1,0 +1,39 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: no
+// stdout: 4
+// stdout: no
+// stdout: no
+// stdout: yes
+// stdout: yes
+// stdout: yes
+// stdout: [end002899a blonger worda b9797zz.c]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("end");
+    if s.view().starts_with("tosh") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("0");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("0");
+    s.push_u64(2899);
+    s.push_str("a b");
+    if s.view().starts_with("arche") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("data") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("longer word");
+    if s.view().starts_with("end002899a bl") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("a b");
+    s.push_u64(9797);
+    s.push_str("zz");
+    s.push_ascii('.');
+    s.push_ascii('c');
+    if s.view().starts_with("end002899a blonger worda b9797zz.c") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

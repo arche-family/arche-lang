@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: {"b":[[{"list":349868187}],[],"longer word"],"name":[false,508219570,true,[["longer word"],[null,false,null,445612844]]]}
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("{\"b\":[[{\"list\":349868187}],[], \"longer word\"], \"name\":[false,508219570,true,[[\"longer word\"],[null,false,null,445612844]]]}", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

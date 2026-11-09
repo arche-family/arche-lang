@@ -1,0 +1,51 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 0
+// stdout: 5
+// stdout: yes
+// stdout: 12
+// stdout: no
+// stdout: no
+// stdout: 19
+// stdout: 23
+// stdout: no
+// stdout: 23
+// stdout: [9363xenddata68200yx0a by]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_u64(9363);
+    s.push_str("x");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("9363") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("end");
+    s.push_str("data");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_u64(682);
+    s.push_str("0");
+    s.push_str("0");
+    s.push_ascii('y');
+    s.push_ascii('x');
+    if s.view().starts_with("x") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("tosh") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("0");
+    s.push_str("a b");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("0") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_ascii('y');
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

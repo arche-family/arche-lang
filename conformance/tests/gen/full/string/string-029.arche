@@ -1,0 +1,39 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: no
+// stdout: yes
+// stdout: 36
+// stdout: yes
+// stdout: [zz6158ca bxa ba3968cxa5837enda bend_6867]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("zz");
+    s.push_u64(6158);
+    s.push_ascii('c');
+    s.push_str("a b");
+    s.push_str("x");
+    s.push_str("a b");
+    if s.view().starts_with("x") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('a');
+    s.push_u64(3968);
+    s.push_ascii('c');
+    s.push_ascii('x');
+    s.push_ascii('a');
+    if s.view().starts_with("zz") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_u64(5837);
+    s.push_str("end");
+    s.push_str("a b");
+    s.push_str("end");
+    s.push_ascii('_');
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("zz") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_u64(6867);
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

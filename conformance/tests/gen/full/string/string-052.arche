@@ -1,0 +1,25 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: yes
+// stdout: no
+// stdout: [zzendtosh3149enddataz.]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("zz");
+    s.push_str("end");
+    s.push_str("tosh");
+    s.push_u64(3149);
+    s.push_str("end");
+    s.push_str("data");
+    if s.view().starts_with("zze") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('z');
+    s.push_ascii('.');
+    if s.view().starts_with("longer word") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

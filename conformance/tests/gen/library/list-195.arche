@@ -1,0 +1,50 @@
+// test: run
+// spec: 11
+// stdout: 4
+// stdout: 769779
+// stdout: 733538
+// stdout: 656325
+// stdout: 11
+// stdout: 4607436
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var xs = alloc.List(u64).init(sys.alloc);
+    xs.push(243204);
+    xs.push(223819);
+    xs.push(606582);
+    xs.push(704);
+    sys.stdout.write_u64(xs.len() as u64);
+    sys.stdout.write("\n");
+    xs.push(389368);
+    xs.push(49269);
+    xs.push(595762);
+    xs.push(733538);
+    xs.push(743607);
+    xs.push(833107);
+    xs.push(188476);
+    xs.push(769779);
+    match xs.pop() {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    xs.push(656325);
+    sys.stdout.write_u64(xs.items()[7]);
+    sys.stdout.write("\n");
+    match xs.pop() {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(xs.len() as u64);
+    sys.stdout.write("\n");
+    var total: u64 = 0;
+    var i: usize = 0;
+    while i < xs.len() : (i += 1) {
+        total = total +% xs.items()[i];
+    }
+    sys.stdout.write_u64(total);
+    sys.stdout.write("\n");
+}

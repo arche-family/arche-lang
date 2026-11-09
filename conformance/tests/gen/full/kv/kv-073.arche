@@ -1,0 +1,183 @@
+// test: run
+// spec: kv
+// stage0: skip
+// wasm: skip
+// stdout: none
+// stdout: none
+// stdout: v8628
+// stdout: v385343
+// stdout: v511595
+// stdout: none
+// stdout: none
+// stdout: v987443
+// stdout: v777511
+// stdout: v263526
+// stdout: v983761
+// stdout: v777511
+// stdout: v853424
+// stdout: v853424
+// stdout: k03
+// stdout: k04
+// stdout: k06
+// stdout: k09
+// stdout: k12
+// stdout: k17
+// stdout: k24
+// stdout: k33
+// stdout: k34
+import alloc;
+import kv;
+import std;
+
+fn print_bytes(sys: &mut std.System, b: []u8) {
+    var s = alloc.String.init(sys.alloc);
+    _ = s.push_utf8(b);
+    sys.stdout.write(s.view());
+    sys.stdout.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let tmp = try sys.fs.temp_dir(&sys.env, sys.alloc);
+    var path = alloc.String.from(tmp.view(), sys.alloc);
+    path.push_str("/arche-gen-kv-073-");
+    path.push_u64(sys.proc.pid() as u64);
+    var wal = alloc.String.from(path.view(), sys.alloc);
+    wal.push_str("-wal");
+    _ = sys.fs.remove(path.view());
+    _ = sys.fs.remove(wal.view());
+    var db = try kv.open(&sys.fs, path.view(), sys.alloc);
+    var value = alloc.List(u8).init(sys.alloc);
+    try db.put(key: "k18".bytes(), value: "v8628".bytes());
+    _ = try db.delete("k09".bytes());
+    try db.put(key: "k33".bytes(), value: "v773507".bytes());
+    try db.commit();
+    try db.put(key: "k09".bytes(), value: "v385343".bytes());
+    if try db.get("k24".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    try db.put(key: "k25".bytes(), value: "v987443".bytes());
+    try db.put(key: "k03".bytes(), value: "v3246".bytes());
+    _ = try db.delete("k17".bytes());
+    try db.put(key: "k34".bytes(), value: "v498818".bytes());
+    try db.put(key: "k12".bytes(), value: "v334480".bytes());
+    try db.put(key: "k34".bytes(), value: "v511595".bytes());
+    if try db.get("k06".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    _ = try db.delete("k33".bytes());
+    try db.put(key: "k17".bytes(), value: "v777511".bytes());
+    try db.put(key: "k03".bytes(), value: "v826919".bytes());
+    if try db.get("k18".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    try db.close();
+    db = try kv.open(&sys.fs, path.view(), sys.alloc);
+    if try db.get("k09".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    try db.put(key: "k06".bytes(), value: "v484805".bytes());
+    if try db.get("k34".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    _ = try db.delete("k33".bytes());
+    _ = try db.delete("k18".bytes());
+    if try db.get("k24".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    if try db.get("k24".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    try db.commit();
+    try db.close();
+    db = try kv.open(&sys.fs, path.view(), sys.alloc);
+    try db.put(key: "k12".bytes(), value: "v132634".bytes());
+    try db.put(key: "k24".bytes(), value: "v752332".bytes());
+    try db.close();
+    db = try kv.open(&sys.fs, path.view(), sys.alloc);
+    try db.put(key: "k33".bytes(), value: "v387426".bytes());
+    try db.put(key: "k04".bytes(), value: "v526563".bytes());
+    try db.put(key: "k24".bytes(), value: "v918883".bytes());
+    try db.put(key: "k24".bytes(), value: "v637396".bytes());
+    try db.put(key: "k34".bytes(), value: "v159954".bytes());
+    _ = try db.delete("k24".bytes());
+    if try db.get("k25".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    try db.put(key: "k03".bytes(), value: "v263526".bytes());
+    try db.commit();
+    if try db.get("k17".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    try db.put(key: "k09".bytes(), value: "v570323".bytes());
+    try db.put(key: "k34".bytes(), value: "v631939".bytes());
+    try db.put(key: "k24".bytes(), value: "v529219".bytes());
+    if try db.get("k03".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    try db.put(key: "k04".bytes(), value: "v983761".bytes());
+    try db.put(key: "k33".bytes(), value: "v918355".bytes());
+    try db.put(key: "k24".bytes(), value: "v883968".bytes());
+    if try db.get("k04".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    try db.put(key: "k06".bytes(), value: "v812611".bytes());
+    if try db.get("k17".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    try db.put(key: "k12".bytes(), value: "v556374".bytes());
+    try db.put(key: "k03".bytes(), value: "v169698".bytes());
+    try db.put(key: "k24".bytes(), value: "v436205".bytes());
+    try db.put(key: "k24".bytes(), value: "v853424".bytes());
+    try db.commit();
+    _ = try db.delete("k25".bytes());
+    try db.put(key: "k34".bytes(), value: "v790939".bytes());
+    if try db.get("k24".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    if try db.get("k24".bytes(), value: &mut value) {
+        print_bytes(sys, value.items());
+    } else {
+        sys.stdout.write("none\n");
+    }
+    try db.put(key: "k04".bytes(), value: "v888147".bytes());
+    var key = alloc.List(u8).init(sys.alloc);
+    var at = alloc.List(u8).init(sys.alloc);
+    var first = true;
+    while try db.next(at.items(), inclusive: first, key: &mut key, value: &mut value) {
+        print_bytes(sys, key.items());
+        at.clear();
+        for b in key.items() {
+            at.push(b.*);
+        }
+        first = false;
+    }
+    try db.close();
+    _ = sys.fs.remove(path.view());
+    _ = sys.fs.remove(wal.view());
+}

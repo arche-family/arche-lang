@@ -1,0 +1,38 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 16
+// stdout: 24
+// stdout: 34
+// stdout: yes
+// stdout: yes
+// stdout: no
+// stdout: [-longer word30468177985117870xdata]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_ascii('-');
+    s.push_str("longer word");
+    s.push_u64(3046);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_u64(8177);
+    s.push_u64(9851);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_u64(1787);
+    s.push_str("0");
+    s.push_ascii('x');
+    s.push_str("data");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("-longer word30468177985") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("-lon") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("tosh") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("");
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

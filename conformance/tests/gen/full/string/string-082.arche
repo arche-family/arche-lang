@@ -1,0 +1,39 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 6
+// stdout: 12
+// stdout: 12
+// stdout: no
+// stdout: no
+// stdout: [kentzza ba b_longer wordkentdataa07442x4046]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("kent");
+    s.push_str("zz");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("a b");
+    s.push_str("a b");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_ascii('_');
+    s.push_str("longer word");
+    if s.view().starts_with("data") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("kent");
+    s.push_str("data");
+    s.push_ascii('a');
+    s.push_str("0");
+    s.push_u64(7442);
+    s.push_str("x");
+    s.push_u64(4046);
+    if s.view().starts_with("arche") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

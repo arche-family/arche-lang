@@ -1,0 +1,36 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 0
+// stdout: no
+// stdout: no
+// stdout: 15
+// stdout: no
+// stdout: no
+// stdout: no
+// stdout: [0tosharcheyx400data]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("longer word") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("0");
+    s.push_str("tosh");
+    s.push_str("arche");
+    s.push_ascii('y');
+    s.push_str("x");
+    s.push_u64(400);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("kent") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("a b") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("data");
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

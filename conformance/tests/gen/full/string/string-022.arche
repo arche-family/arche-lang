@@ -1,0 +1,27 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 11
+// stdout: no
+// stdout: yes
+// stdout: yes
+// stdout: [longer word2321endarche]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("longer word");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("");
+    s.push_u64(2321);
+    s.push_str("end");
+    if s.view().starts_with("data") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("longer word") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("arche");
+    if s.view().starts_with("l") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

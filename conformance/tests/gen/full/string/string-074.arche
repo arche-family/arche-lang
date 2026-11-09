@@ -1,0 +1,31 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 0
+// stdout: 22
+// stdout: no
+// stdout: 28
+// stdout: [99344507longer word0zzarchea]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_u64(9934);
+    s.push_u64(4507);
+    s.push_str("longer word");
+    s.push_str("0");
+    s.push_str("zz");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("arche");
+    s.push_ascii('a');
+    if s.view().starts_with("x") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

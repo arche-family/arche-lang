@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: {"id":{"list":{"list":[3e8,false,830635844,true]}},"z":null,"b":false,"list":467881802}
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("{\"id\":{\"list\":{\"list\":[3e8,false,830635844,true]}}, \"z\":null, \"b\":false, \"list\":467881802}", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

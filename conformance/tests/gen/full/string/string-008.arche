@@ -1,0 +1,37 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: no
+// stdout: 10
+// stdout: 11
+// stdout: no
+// stdout: no
+// stdout: [z.a bzza bz0archea bx]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_ascii('z');
+    if s.view().starts_with("zz") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('.');
+    s.push_str("a b");
+    s.push_str("zz");
+    s.push_str("");
+    s.push_str("a b");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_ascii('z');
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("0");
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("arche");
+    s.push_str("a b");
+    s.push_str("");
+    s.push_str("x");
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

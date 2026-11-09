@@ -1,0 +1,37 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: yes
+// stdout: yes
+// stdout: 12
+// stdout: yes
+// stdout: 28
+// stdout: yes
+// stdout: [end..a btoshlonger wordkent-x]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    if s.view().starts_with("") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("end");
+    s.push_ascii('.');
+    s.push_ascii('.');
+    s.push_str("a b");
+    s.push_str("tosh");
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("end..a ") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("longer word");
+    s.push_str("kent");
+    s.push_ascii('-');
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_ascii('x');
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

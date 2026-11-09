@@ -1,0 +1,38 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: yes
+// stdout: 28
+// stdout: yes
+// stdout: 32
+// stdout: [9782a b7596--1888zza bx4165bkentxdata]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_u64(9782);
+    s.push_str("");
+    s.push_str("a b");
+    s.push_u64(7596);
+    if s.view().starts_with("9782a b759") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('-');
+    s.push_ascii('-');
+    s.push_u64(1888);
+    s.push_str("zz");
+    s.push_str("a b");
+    s.push_str("x");
+    s.push_u64(4165);
+    s.push_ascii('b');
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("kent");
+    if s.view().starts_with("9782a b7596--1") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("x");
+    s.push_str("data");
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

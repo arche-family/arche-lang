@@ -1,0 +1,49 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 8
+// stdout: 19
+// stdout: 19
+// stdout: no
+// stdout: 36
+// stdout: no
+// stdout: 36
+// stdout: no
+// stdout: 47
+// stdout: no
+// stdout: [895archelonger wordlonger word0archelonger wordzz2718data]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_u64(895);
+    s.push_str("arche");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("longer word");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("longer word") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("longer word");
+    s.push_str("0");
+    s.push_str("arche");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("a b") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("tosh") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("longer word");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("zz");
+    s.push_u64(2718);
+    s.push_str("data");
+    if s.view().starts_with("arche") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

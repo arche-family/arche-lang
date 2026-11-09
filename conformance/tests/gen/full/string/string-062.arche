@@ -1,0 +1,32 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: yes
+// stdout: no
+// stdout: [kenta btosh-4389zztoshydataab9827toshend]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("kent");
+    s.push_str("");
+    s.push_str("a b");
+    s.push_str("tosh");
+    s.push_ascii('-');
+    s.push_u64(4389);
+    s.push_str("zz");
+    s.push_str("tosh");
+    s.push_ascii('y');
+    s.push_str("data");
+    if s.view().starts_with("kenta btosh-4389zz") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('a');
+    s.push_ascii('b');
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_u64(9827);
+    s.push_str("tosh");
+    s.push_str("end");
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

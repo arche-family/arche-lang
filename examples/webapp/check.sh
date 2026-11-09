@@ -71,7 +71,8 @@ check "a method a route does not take" "405" "$("${c[@]}" -X DELETE -o /dev/null
 check "health" '{"ok":true' "$("${c[@]}" "$url/api/health" | cut -c1-10)"
 check "a bad note" "400" "$("${c[@]}" -o /dev/null -w '%{http_code}' -X POST -d 'not json' "$url/api/notes")"
 check "a note that is not there" "404" "$("${c[@]}" -o /dev/null -w '%{http_code}' "$url/api/notes/99")"
-seen=$(for _ in $(seq 60); do "${c[@]}" "$url/api/health"; echo; done | sort -u | wc -l)
+# Connections at once, so that while one worker is busy the other accepts.
+seen=$(seq 64 | xargs -P 16 -I{} curl -s --cacert "$work/ca" --resolve "localhost:$port:127.0.0.1" "$url/api/health?{}" | grep -o '"worker":[0-9]*' | sort -u | wc -l)
 cpus=$(nproc)
 if [ "$cpus" -gt 1 ]; then
     check "two workers answer" "2" "$seen"

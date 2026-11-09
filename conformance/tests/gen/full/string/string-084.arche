@@ -1,0 +1,34 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 13
+// stdout: 17
+// stdout: 27
+// stdout: no
+// stdout: [zzz19598384axtoshendendkent]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("zz");
+    s.push_ascii('z');
+    s.push_u64(1959);
+    s.push_u64(8384);
+    s.push_ascii('a');
+    s.push_str("x");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("tosh");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("end");
+    s.push_str("end");
+    s.push_str("kent");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("tosh") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

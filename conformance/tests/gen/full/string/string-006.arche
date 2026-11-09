@@ -1,0 +1,23 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: no
+// stdout: no
+// stdout: [longer wordlonger wordyazz-]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("longer word");
+    if s.view().starts_with("tosh") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("longer word");
+    if s.view().starts_with("kent") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('y');
+    s.push_ascii('a');
+    s.push_str("zz");
+    s.push_ascii('-');
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

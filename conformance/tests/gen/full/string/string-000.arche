@@ -1,0 +1,30 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 4
+// stdout: no
+// stdout: 4
+// stdout: no
+// stdout: [a b0_3172tosh]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("a b");
+    s.push_str("");
+    s.push_str("0");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("arche") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('_');
+    s.push_u64(3172);
+    s.push_str("");
+    s.push_str("tosh");
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

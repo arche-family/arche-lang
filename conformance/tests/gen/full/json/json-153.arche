@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: {"b":{"list":[{"z":true,"b":true,"key":421482323},true,true,[true,1.5,"kent"]],"a":{"list":[203761618,8422364,true],"name":695356101,"id":[]},"id":{"z":[],"b":null,"key":{"z":null},"name":[137528623,null,true]},"z":{"name":[],"a":3e8,"key":[3e8,null,null,false]}},"list":[],"name":[{"key":null,"list":{"a":"back\\slash","list":"end"}},[{"list":1.5,"name":false,"id":null,"a":3e8}],[{"b":1.5,"a":559893884,"name":"a b"}],{"a":{"name":1.5,"b":true},"id":{},"b":{"key":null}}]}
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("{\"b\":{\"list\":[{\"z\":true, \"b\":true, \"key\":421482323},true,true,[true,1.5, \"kent\"]], \"a\":{\"list\":[203761618,8422364,true], \"name\":695356101, \"id\":[]}, \"id\":{\"z\":[], \"b\":null, \"key\":{\"z\":null}, \"name\":[137528623,null,true]}, \"z\":{\"name\":[], \"a\":3e8, \"key\":[3e8,null,null,false]}}, \"list\":[], \"name\":[{\"key\":null, \"list\":{\"a\":\"back\\\\slash\", \"list\":\"end\"}},[{\"list\":1.5, \"name\":false, \"id\":null, \"a\":3e8}],[{\"b\":1.5, \"a\":559893884, \"name\":\"a b\"}],{\"a\":{\"name\":1.5, \"b\":true}, \"id\":{}, \"b\":{\"key\":null}}]}", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

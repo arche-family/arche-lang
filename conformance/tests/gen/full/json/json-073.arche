@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: {"name":[{"key":[3e8,true,"arche",null]},[]],"key":{"key":{},"id":{"name":"a b","z":[],"b":{"name":"tosh","z":3e8,"key":669699395},"list":[true]},"z":[{"id":719939032,"list":false},{"list":"longer word","z":177559727,"b":false},[false]],"name":["line\nbreak",[false,null,-0.25,729799915]]},"list":{"key":{"id":false,"key":{"key":"end","list":"back\\slash","id":false,"a":355072726},"list":{"id":false,"name":"x","z":774601830}}},"z":{"name":{"z":{"key":true},"name":3e8,"list":{"z":null,"a":"q\"uote","id":"data"}},"z":[]}}
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("{\"name\":[{\"key\":[3e8,true, \"arche\",null]},[]], \"key\":{\"key\":{}, \"id\":{\"name\":\"a b\", \"z\":[], \"b\":{\"name\":\"tosh\", \"z\":3e8, \"key\":669699395}, \"list\":[true]}, \"z\":[{\"id\":719939032, \"list\":false},{\"list\":\"longer word\", \"z\":177559727, \"b\":false},[false]], \"name\":[\"line\\nbreak\",[false,null,-0.25,729799915]]}, \"list\":{\"key\":{\"id\":false, \"key\":{\"key\":\"end\", \"list\":\"back\\\\slash\", \"id\":false, \"a\":355072726}, \"list\":{\"id\":false, \"name\":\"x\", \"z\":774601830}}}, \"z\":{\"name\":{\"z\":{\"key\":true}, \"name\":3e8, \"list\":{\"z\":null, \"a\":\"q\\\"uote\", \"id\":\"data\"}}, \"z\":[]}}", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

@@ -1,0 +1,28 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: yes
+// stdout: 12
+// stdout: no
+// stdout: [dataa b-c1005033.]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("data");
+    s.push_str("a b");
+    if s.view().starts_with("") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('-');
+    s.push_ascii('c');
+    s.push_u64(100);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_u64(5033);
+    s.push_str("");
+    s.push_ascii('.');
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

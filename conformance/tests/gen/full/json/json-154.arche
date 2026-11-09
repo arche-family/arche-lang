@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: [false,{},{"name":[{"key":null},{"key":false,"b":null,"z":true,"list":false},{"name":3e8,"z":266274381,"a":788369462}]},[{"list":{"a":"","key":"a b"},"id":{"key":null,"z":"end"}},true,"longer word"]]
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("[false,{},{\"name\":[{\"key\":null},{\"key\":false, \"b\":null, \"z\":true, \"list\":false},{\"name\":3e8, \"z\":266274381, \"a\":788369462}]},[{\"list\":{\"a\":\"\", \"key\":\"a b\"}, \"id\":{\"key\":null, \"z\":\"end\"}},true, \"longer word\"]]", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

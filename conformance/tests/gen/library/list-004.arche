@@ -1,0 +1,65 @@
+// test: run
+// spec: 11
+// stdout: 3
+// stdout: 858047
+// stdout: 915925
+// stdout: 44035
+// stdout: 8
+// stdout: 497733
+// stdout: 733260
+// stdout: 9
+// stdout: 328454
+// stdout: 6712015
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var xs = alloc.List(u64).init(sys.alloc);
+    xs.push(543865);
+    xs.push(578134);
+    xs.push(497733);
+    sys.stdout.write_u64(xs.len() as u64);
+    sys.stdout.write("\n");
+    xs.push(858047);
+    xs.push(915925);
+    xs.push(888490);
+    xs.push(520924);
+    xs.push(877848);
+    xs.push(44035);
+    sys.stdout.write_u64(xs.items()[3]);
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(xs.items()[4]);
+    sys.stdout.write("\n");
+    match xs.pop() {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(xs.len() as u64);
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(xs.items()[2]);
+    sys.stdout.write("\n");
+    xs.push(922652);
+    xs.push(733260);
+    match xs.pop() {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(xs.len() as u64);
+    sys.stdout.write("\n");
+    xs.push(108397);
+    xs.push(328454);
+    match xs.pop() {
+        some(v) => { sys.stdout.write_u64(v); }
+        none => { sys.stdout.write("none"); }
+    }
+    sys.stdout.write("\n");
+    var total: u64 = 0;
+    var i: usize = 0;
+    while i < xs.len() : (i += 1) {
+        total = total +% xs.items()[i];
+    }
+    sys.stdout.write_u64(total);
+    sys.stdout.write("\n");
+}

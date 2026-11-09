@@ -1,0 +1,32 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: no
+// stdout: 7
+// stdout: 11
+// stdout: 20
+// stdout: [zz_15083293x6522data994]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("zz");
+    if s.view().starts_with("kent") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('_');
+    s.push_u64(1508);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_u64(3293);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("x");
+    s.push_u64(6522);
+    s.push_str("data");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_u64(994);
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

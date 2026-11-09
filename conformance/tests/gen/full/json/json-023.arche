@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: [{"a":[{"b":-0.25,"z":false,"name":"0"},true,["x"]],"id":false,"z":{"a":{"a":221452672,"key":true},"name":587697260,"key":[227260539,null,"data",false],"id":[false]},"list":{"key":{"name":true,"key":560187931},"a":[],"id":{"a":null,"list":false,"b":false,"id":1.5},"name":[]}},true,[[[1.5],[true,877192345,1.5],{"id":343146050,"b":true}],false,true,[true,"back\\slash",[null,1.5,3e8]]],{"id":[{"id":-0.25,"b":48926715,"a":-0.25},[],{"list":true,"z":null,"a":true},null],"a":[[],{"key":3e8,"a":false,"name":true},[-0.25]]}]
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("[{\"a\":[{\"b\":-0.25, \"z\":false, \"name\":\"0\"},true,[\"x\"]], \"id\":false, \"z\":{\"a\":{\"a\":221452672, \"key\":true}, \"name\":587697260, \"key\":[227260539,null, \"data\",false], \"id\":[false]}, \"list\":{\"key\":{\"name\":true, \"key\":560187931}, \"a\":[], \"id\":{\"a\":null, \"list\":false, \"b\":false, \"id\":1.5}, \"name\":[]}},true,[[[1.5],[true,877192345,1.5],{\"id\":343146050, \"b\":true}],false,true,[true, \"back\\\\slash\",[null,1.5,3e8]]],{\"id\":[{\"id\":-0.25, \"b\":48926715, \"a\":-0.25},[],{\"list\":true, \"z\":null, \"a\":true},null], \"a\":[[],{\"key\":3e8, \"a\":false, \"name\":true},[-0.25]]}]", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

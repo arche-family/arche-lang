@@ -1,0 +1,48 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 5
+// stdout: no
+// stdout: no
+// stdout: 9
+// stdout: no
+// stdout: 13
+// stdout: no
+// stdout: no
+// stdout: [6812xx954data.9168kenta b.kent211517863926end]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_u64(6812);
+    s.push_ascii('x');
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("data") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('x');
+    s.push_u64(954);
+    if s.view().starts_with("a b") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("data");
+    if s.view().starts_with("longer word") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_ascii('.');
+    s.push_u64(9168);
+    s.push_str("");
+    if s.view().starts_with("longer word") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("kent");
+    s.push_str("a b");
+    s.push_ascii('.');
+    s.push_str("kent");
+    s.push_u64(2115);
+    s.push_u64(1786);
+    s.push_u64(3926);
+    s.push_str("end");
+    if s.view().starts_with("arche") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

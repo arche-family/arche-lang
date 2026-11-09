@@ -1,0 +1,24 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 4
+// stdout: no
+// stdout: [5381a btoshx]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_u64(5381);
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("0") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("a b");
+    s.push_str("tosh");
+    s.push_ascii('x');
+    s.push_str("");
+    s.push_str("");
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

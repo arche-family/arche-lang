@@ -65,6 +65,10 @@ Values are taken verbatim after `key: `, without escapes. Codes are assigned whe
 
 A test's directory is its package root (§3), so a test can import modules beside it. Files and directories whose names start with `_`, and `vendor/` and `build/` directories, are not tests: `_` marks support modules, and a test package's dependencies are in `vendor/`: `tests/modules/two-modules.arche` imports `_support.shapes` from `tests/modules/_support/shapes.arche`.
 
+## Generated tests
+
+`tests/gen/` is written by [`gen/gen.py`](gen/gen.py), a development tool as `compiler/fuzz.py` is: families of tests, each a case of one rule, whose expected output the script computes from its own model of the rule. Integer arithmetic on edge values for every type and operator, and its traps; `as` and `as%` between every pair of integer types, and the traps of `as`; comparisons; `List` and `Map` in random sequences of operations; `String`; compile errors (a type where another is wanted, mixed operands, labels, shadowing); and, as full Arche, `std.json` round trips, `core.deflate` against zlib's CRC-32, `web`'s router, and `kv` against a dictionary, reopened on the way. The seed is fixed, so the script writes the same files; they are kept, and the suite needs no Python. Change the script, run it, and commit what it wrote.
+
 ## Compiler contract
 
 The runner calls the compiler as `<command> <source> <output>`:

@@ -1,0 +1,15 @@
+// test: run
+// spec: std.json
+// stage0: skip
+// stdout: {"b":{"z":[],"id":false},"a":{"key":[{"z":null,"id":null,"list":true,"b":3e8},[],{"a":"q\"uote","key":337155669,"id":"arche","name":"zz"},{"id":"a b","name":1.5,"list":null}],"b":[{"list":"","id":3e8,"b":1.5},3e8],"name":["data",[79972092,true,null,true]],"z":"arche"}}
+import alloc;
+import std;
+import std.json;
+
+fn main(sys: &mut std.System) -> !void {
+    let v = try json.parse("{\"b\":{\"z\":[], \"id\":false}, \"a\":{\"key\":[{\"z\":null, \"id\":null, \"list\":true, \"b\":3e8},[],{\"a\":\"q\\\"uote\", \"key\":337155669, \"id\":\"arche\", \"name\":\"zz\"},{\"id\":\"a b\", \"name\":1.5, \"list\":null}], \"b\":[{\"list\":\"\", \"id\":3e8, \"b\":1.5},3e8], \"name\":[\"data\",[79972092,true,null,true]], \"z\":\"arche\"}}", sys.alloc);
+    var out = alloc.String.init(sys.alloc);
+    json.write(&v, out: &mut out);
+    sys.stdout.write(out.view());
+    sys.stdout.write("\n");
+}

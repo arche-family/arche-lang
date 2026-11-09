@@ -1,0 +1,37 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: 6
+// stdout: 12
+// stdout: 12
+// stdout: no
+// stdout: yes
+// stdout: [x0kentx8104cendca]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    s.push_str("x");
+    s.push_str("0");
+    s.push_str("kent");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("x");
+    s.push_u64(8104);
+    s.push_ascii('c');
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    if s.view().starts_with("kent") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("end");
+    s.push_str("");
+    s.push_str("");
+    s.push_ascii('c');
+    s.push_ascii('a');
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

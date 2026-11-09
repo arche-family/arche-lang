@@ -1,0 +1,31 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: no
+// stdout: no
+// stdout: yes
+// stdout: 14
+// stdout: no
+// stdout: [0longer word.bdata1627]
+import alloc;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    var s = alloc.String.init(sys.alloc);
+    if s.view().starts_with("a b") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    if s.view().starts_with("end") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_str("");
+    s.push_str("0");
+    s.push_str("longer word");
+    s.push_ascii('.');
+    if s.view().starts_with("0long") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    s.push_ascii('b');
+    sys.stdout.write_u64(s.len() as u64);
+    sys.stdout.write("\n");
+    s.push_str("data");
+    s.push_u64(1627);
+    if s.view().starts_with("data") { sys.stdout.write("yes\n"); } else { sys.stdout.write("no\n"); }
+    sys.stdout.write("[");
+    sys.stdout.write(s.view());
+    sys.stdout.write("]\n");
+}

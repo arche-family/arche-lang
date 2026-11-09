@@ -1,0 +1,63 @@
+// test: run
+// spec: web
+// stage0: skip
+// stdout: 405
+// stdout: 405
+// stdout: 404
+// stdout: 0 rest=deep/er
+// stdout: 2 rest=deep/er
+// stdout: 2 rest=deep/er
+import http;
+import std;
+import web;
+
+fn show(sys: &mut std.System, found: web.Found, params: &web.Params) {
+    match found {
+        .Route { route } => {
+            sys.stdout.write_u64(route as u64);
+            var i: usize = 0;
+            while i < params.len() : (i += 1) {
+                sys.stdout.write(" ");
+                sys.stdout.write(params.names_at(i));
+                sys.stdout.write("=");
+                sys.stdout.write(params.value(i));
+            }
+        }
+        .WrongMethod => { sys.stdout.write("405"); }
+        .NotFound => { sys.stdout.write("404"); }
+    }
+    sys.stdout.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var r = web.Router.init(sys.alloc);
+    _ = r.add(method: "GET", pattern: "/a/files/files/*rest");
+    _ = r.add(method: "GET", pattern: "/b/files/files/*rest");
+    _ = r.add(method: "POST", pattern: "/a/*rest");
+    _ = r.add(method: "POST", pattern: "/a");
+    var params = web.Params.init(sys.alloc);
+    var q0 = http.Request.init(sys.alloc);
+    q0.method.push_str("POST");
+    q0.target.push_str("/b/files/files/deep/er");
+    show(sys, found: r.find(&q0, params: &mut params), params: &params);
+    var q1 = http.Request.init(sys.alloc);
+    q1.method.push_str("PUT");
+    q1.target.push_str("/a");
+    show(sys, found: r.find(&q1, params: &mut params), params: &params);
+    var q2 = http.Request.init(sys.alloc);
+    q2.method.push_str("GET");
+    q2.target.push_str("/users/api");
+    show(sys, found: r.find(&q2, params: &mut params), params: &params);
+    var q3 = http.Request.init(sys.alloc);
+    q3.method.push_str("GET");
+    q3.target.push_str("/a/files/files/deep/er");
+    show(sys, found: r.find(&q3, params: &mut params), params: &params);
+    var q4 = http.Request.init(sys.alloc);
+    q4.method.push_str("POST");
+    q4.target.push_str("/a/deep/er");
+    show(sys, found: r.find(&q4, params: &mut params), params: &params);
+    var q5 = http.Request.init(sys.alloc);
+    q5.method.push_str("POST");
+    q5.target.push_str("/a/deep/er");
+    show(sys, found: r.find(&q5, params: &mut params), params: &params);
+}
