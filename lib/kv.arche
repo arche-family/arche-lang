@@ -12,8 +12,11 @@
 /// or of an older log, so a crash at any moment leaves every transaction
 /// whose commit returned, and nothing of one whose commit did not.
 ///
-/// One process uses a store at a time. A delete leaves its leaf as it is:
-/// pages are not merged.
+/// One process uses a store at a time. A delete that leaves a node less than
+/// a quarter full merges it with a sibling when the two fit in one page,
+/// taking the separator out of their parent, and a root left with one child
+/// gives way to it; freed pages are kept in a list, and new ones come from
+/// it first, so a store that shrinks and grows again does not grow its file.
 import alloc;
 import core.deflate;
 import std;
@@ -200,7 +203,8 @@ fn wal_path(path: str, a: alloc.Allocator) -> alloc.String {
 }
 
 /// An open store. Page 0 is the header: "ARCHEKV1", the number of pages,
-/// the root's page.
+/// the root's page, and the first free page (0 for none; each free page
+/// names the next at offset 4).
 pub type Db = struct {
     file: std.File,
     wal: std.File,
@@ -210,6 +214,7 @@ pub type Db = struct {
     dirty: alloc.List(bool),
     logged: alloc.List(bool),
     root: u32,
+    free: u32,
     salt: u32,
     frames: u32,
     a: alloc.Allocator,
@@ -221,14 +226,42 @@ pub type Db = struct {
         self.logged.push(false);
     }
 
-    /// A new page, zero, already counted as changed.
-    fn new_page(self: &mut Db) -> u32 {
+    /// A new page, zero, already counted as changed: a freed one if there
+    /// is one, else one more.
+    fn new_page(self: &mut Db) -> KvError!u32 {
+        if self.free != 0 {
+            let n = self.free;
+            try self.load(n);
+            let p = self.pages.items_mut()[n as usize].items_mut();
+            self.free = get32(p, at: 4);
+            var i: usize = 0;
+            while i < PAGE : (i += 1) {
+                p[i] = 0;
+            }
+            self.dirty.items_mut()[n as usize] = true;
+            self.write_header();
+            return n;
+        }
         self.grow();
         let n = self.pages.len() - 1;
         self.pages.items_mut()[n].grow_zeroed(PAGE);
         self.dirty.items_mut()[n] = true;
         self.write_header();
         return n as u32;
+    }
+
+    /// Page n onto the free list.
+    fn free_page(self: &mut Db, n: u32) {
+        let head = self.free;
+        let p = self.pages.items_mut()[n as usize].items_mut();
+        var i: usize = 0;
+        while i < PAGE : (i += 1) {
+            p[i] = 0;
+        }
+        put32(p, at: 4, v: head);
+        self.free = n;
+        self.dirty.items_mut()[n as usize] = true;
+        self.write_header();
     }
 
     /// Page n in memory, from the file if it is not yet.
@@ -249,11 +282,13 @@ pub type Db = struct {
         }
         let count = self.pages.len() as u32;
         let root = self.root;
+        let free = self.free;
         let h = self.pages.items_mut()[0].items_mut();
         put32(h, at: 0, v: 0x48435241);
         put32(h, at: 4, v: 0x3156454B);
         put32(h, at: 8, v: count);
         put32(h, at: 12, v: root);
+        put32(h, at: 16, v: free);
         self.dirty.items_mut()[0] = true;
     }
 
@@ -398,6 +433,27 @@ pub type Db = struct {
         try self.reset_log(salt: self.salt + 1);
     }
 
+    /// How many pages are on the free list.
+    pub fn free_count(self: &mut Db) -> KvError!u32 {
+        var n: u32 = 0;
+        var at = self.free;
+        while at != 0 and n <= self.pages.len() as u32 {
+            try self.load(at);
+            at = get32(self.pages.items()[at as usize].items(), at: 4);
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Whether the tree is one leaf: what an empty or a small store is.
+    pub fn root_is_leaf(self: &mut Db) -> bool {
+        match self.load(self.root) {
+            ok(_) => { }
+            err(_) => { return false; }
+        }
+        return self.pages.items()[self.root as usize].items()[0] == LEAF;
+    }
+
     /// How many pages the store has, the header's among them.
     pub fn page_count(self: &Db) -> u32 {
         return self.pages.len() as u32;
@@ -522,11 +578,78 @@ pub type Db = struct {
                 kept.values.push(copy_of(leaf.values.items()[i].items(), r));
             }
             if found {
-                encode(&kept, p: self.pages.items_mut()[leaf_page as usize].items_mut());
-                self.dirty.items_mut()[leaf_page as usize] = true;
+                try self.shrink(leaf_page, node: &mut kept, path: &mut path, r);
             }
         }
         return found;
+    }
+
+    /// Writes node, smaller now, to page at; merges it with a sibling when
+    /// it is under a quarter full and the two fit in one page, and goes on
+    /// up to the parent that lost a separator.
+    fn shrink(self: &mut Db, at: u32, node: &mut Node, path: &mut alloc.List(u32), r: alloc.Allocator) -> KvError!void {
+        encode(node, p: self.pages.items_mut()[at as usize].items_mut());
+        self.dirty.items_mut()[at as usize] = true;
+        if path.len() == 0 {
+            // The root: an inner one with a single child gives way to it.
+            if not node.leaf and node.keys.len() == 0 {
+                self.root = node.children.items()[0];
+                self.free_page(at);
+                self.write_header();
+            }
+            return;
+        }
+        if size_of(node) >= PAGE / 4 {
+            return;
+        }
+        let parent_page = path.pop() orelse 0;
+        var parent = try decode(self.pages.items()[parent_page as usize].items(), r);
+        var idx: usize = 0;
+        while idx < parent.children.len() and parent.children.items()[idx] != at {
+            idx += 1;
+        }
+        if idx == parent.children.len() {
+            return KvError.Corrupt;
+        }
+        // The pair: this node and the one after it, or the one before.
+        var left_idx = idx;
+        if idx + 1 >= parent.children.len() {
+            if idx == 0 {
+                return;
+            }
+            left_idx = idx - 1;
+        }
+        let left_page = parent.children.items()[left_idx];
+        let right_page = parent.children.items()[left_idx + 1];
+        try self.load(left_page);
+        try self.load(right_page);
+        var left = try decode(self.pages.items()[left_page as usize].items(), r);
+        var right = try decode(self.pages.items()[right_page as usize].items(), r);
+        let separator = copy_of(parent.keys.items()[left_idx].items(), r);
+        var combined = size_of(&left) + size_of(&right) - HEAD;
+        if not left.leaf {
+            combined += 6 + separator.len();
+        }
+        if combined > PAGE {
+            return;
+        }
+        if left.leaf {
+            append_all(list: &mut left.keys, from: &mut right.keys, r);
+            append_all(list: &mut left.values, from: &mut right.values, r);
+            left.next = right.next;
+        } else {
+            left.keys.push(separator);
+            append_all(list: &mut left.keys, from: &mut right.keys, r);
+            for c in right.children.items() {
+                left.children.push(c.*);
+            }
+        }
+        encode(&left, p: self.pages.items_mut()[left_page as usize].items_mut());
+        self.dirty.items_mut()[left_page as usize] = true;
+        self.free_page(right_page);
+        remove_at(&mut parent.keys, at: left_idx, r);
+        remove_u32(&mut parent.children, at: left_idx + 1);
+        try self.shrink(parent_page, node: &mut parent, path: path, r);
     }
 
     /// Writes node to page at, splitting it, and its parents as need be.
@@ -554,7 +677,7 @@ pub type Db = struct {
             mid += 1;
         }
         var separator = alloc.List(u8).init(r);
-        let right_page = self.new_page();
+        let right_page = try self.new_page();
         if node.leaf {
             var i: usize = 0;
             while i < node.keys.len() : (i += 1) {
@@ -591,7 +714,7 @@ pub type Db = struct {
         encode(&right, p: self.pages.items_mut()[right_page as usize].items_mut());
         if path.len() == 0 {
             // The root split: a new root above the two.
-            let root = self.new_page();
+            let root = try self.new_page();
             var top = empty_node(false, r);
             top.children.push(at);
             top.children.push(right_page);
@@ -681,6 +804,7 @@ pub fn open(fs: &std.Fs, path: str, a: alloc.Allocator) -> KvError!Db {
         dirty: alloc.List(bool).init(a),
         logged: alloc.List(bool).init(a),
         root: 1,
+        free: 0,
         salt: 1,
         frames: 0,
         a: a,
@@ -712,6 +836,7 @@ pub fn open(fs: &std.Fs, path: str, a: alloc.Allocator) -> KvError!Db {
     }
     count = get32(h, at: 8);
     db.root = get32(h, at: 12);
+    db.free = get32(h, at: 16);
     while (db.pages.len() as u32) < count {
         db.grow();
     }
@@ -719,6 +844,50 @@ pub fn open(fs: &std.Fs, path: str, a: alloc.Allocator) -> KvError!Db {
         try db.checkpoint();
     }
     return db;
+}
+
+/// The items of from, in order, moved onto the end of list.
+fn append_all(list: &mut alloc.List(alloc.List(u8)), from: &mut alloc.List(alloc.List(u8)), a: alloc.Allocator) {
+    var reversed = alloc.List(alloc.List(u8)).init(a);
+    while from.len() > 0 {
+        match from.pop() {
+            some(x) => { reversed.push(x); }
+            none => { break; }
+        }
+    }
+    while reversed.len() > 0 {
+        match reversed.pop() {
+            some(x) => { list.push(x); }
+            none => { break; }
+        }
+    }
+}
+
+/// The item at at taken out of list; the ones after it move down.
+fn remove_at(list: &mut alloc.List(alloc.List(u8)), at: usize, a: alloc.Allocator) {
+    var tail = alloc.List(alloc.List(u8)).init(a);
+    while list.len() > at + 1 {
+        match list.pop() {
+            some(x) => { tail.push(x); }
+            none => { break; }
+        }
+    }
+    _ = list.pop();
+    while tail.len() > 0 {
+        match tail.pop() {
+            some(x) => { list.push(x); }
+            none => { break; }
+        }
+    }
+}
+
+fn remove_u32(list: &mut alloc.List(u32), at: usize) {
+    var i = at;
+    while i + 1 < list.len() : (i += 1) {
+        let x = list.items()[i + 1];
+        list.items_mut()[i] = x;
+    }
+    _ = list.pop();
 }
 
 fn insert_u32(list: &mut alloc.List(u32), at: usize, item: u32) {

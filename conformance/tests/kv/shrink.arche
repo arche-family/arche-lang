@@ -1,0 +1,130 @@
+// test: run
+// spec: kv (docs/sprints.md S33)
+// stage0: skip
+// stdout: after deleting all but 30: 30 found, 30 in order
+// stdout: pages: fewer in use after deleting: true
+// stdout: grown again without growing the file: true
+// stdout: emptied and reopened: 0 keys, the root a leaf again: true
+// wasm: skip
+import alloc;
+import kv;
+import std;
+
+fn key_of(n: u64, out: &mut alloc.List(u8)) {
+    out.clear();
+    var shift: u64 = 32;
+    while shift > 0 {
+        shift -= 8;
+        out.push(((n >> shift) & 0xFF) as u8);
+    }
+}
+
+fn value_of(n: u64, out: &mut alloc.List(u8)) {
+    out.clear();
+    var len = n % 300 + 20;
+    while len > 0 : (len -= 1) {
+        out.push((97 + (n + len) % 26) as u8);
+    }
+}
+
+fn fill(db: &mut kv.Db, a: alloc.Allocator) -> kv.KvError!void {
+    var key = alloc.List(u8).init(a);
+    var value = alloc.List(u8).init(a);
+    var n: u64 = 0;
+    while n < 3000 : (n += 1) {
+        key_of(n, out: &mut key);
+        value_of(n, out: &mut value);
+        try db.put(key: key.items(), value: value.items());
+    }
+    try db.commit();
+}
+
+/// How many keys a walk from the first finds, and whether in order.
+fn walk(db: &mut kv.Db, ordered: &mut bool, a: alloc.Allocator) -> kv.KvError!u64 {
+    var key = alloc.List(u8).init(a);
+    var value = alloc.List(u8).init(a);
+    var at = alloc.List(u8).init(a);
+    var count: u64 = 0;
+    var last: i64 = -1;
+    var first = true;
+    ordered.* = true;
+    while try db.next(at.items(), inclusive: first, key: &mut key, value: &mut value) {
+        var n: u64 = 0;
+        for b in key.items() {
+            n = (n << 8) | b.* as u64;
+        }
+        if n as i64 <= last {
+            ordered.* = false;
+        }
+        last = n as i64;
+        count += 1;
+        at.clear();
+        for b in key.items() {
+            at.push(b.*);
+        }
+        first = false;
+    }
+    return count;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let tmp = try sys.fs.temp_dir(&sys.env, a);
+    var path = alloc.String.from(tmp.view(), a);
+    path.push_str("/arche-kv-shrink-");
+    path.push_u64(sys.proc.pid() as u64);
+    var wal = alloc.String.from(path.view(), a);
+    wal.push_str("-wal");
+    _ = sys.fs.remove(path.view());
+    _ = sys.fs.remove(wal.view());
+    var db = try kv.open(&sys.fs, path.view(), a);
+    try fill(&mut db, a);
+    let full = db.page_count();
+    var key = alloc.List(u8).init(a);
+    var value = alloc.List(u8).init(a);
+    var n: u64 = 0;
+    while n < 3000 : (n += 1) {
+        if n % 100 != 0 {
+            key_of(n, out: &mut key);
+            _ = try db.delete(key.items());
+        }
+    }
+    try db.commit();
+    var found: u64 = 0;
+    n = 0;
+    while n < 3000 : (n += 100) {
+        key_of(n, out: &mut key);
+        if try db.get(key.items(), value: &mut value) {
+            found += 1;
+        }
+    }
+    var ordered = false;
+    let walked = try walk(&mut db, ordered: &mut ordered, a);
+    let in_use = db.page_count() - (try db.free_count());
+    sys.stdout.write("after deleting all but 30: ");
+    sys.stdout.write_u64(found);
+    sys.stdout.write(" found, ");
+    sys.stdout.write_u64(walked);
+    sys.stdout.write(if ordered { " in order\n" } else { " out of order\n" });
+    // Grown again: the freed pages come back before the file grows.
+    try fill(&mut db, a);
+    sys.stdout.write("pages: fewer in use after deleting: ");
+    sys.stdout.write(if in_use * 4 < full { "true\n" } else { "false\n" });
+    sys.stdout.write("grown again without growing the file: ");
+    sys.stdout.write(if db.page_count() <= full + 2 { "true\n" } else { "false\n" });
+    n = 0;
+    while n < 3000 : (n += 1) {
+        key_of(n, out: &mut key);
+        _ = try db.delete(key.items());
+    }
+    try db.close();
+    var again = try kv.open(&sys.fs, path.view(), a);
+    let left = try walk(&mut again, ordered: &mut ordered, a);
+    sys.stdout.write("emptied and reopened: ");
+    sys.stdout.write_u64(left);
+    sys.stdout.write(" keys, the root a leaf again: ");
+    sys.stdout.write(if again.root_is_leaf() { "true\n" } else { "false\n" });
+    try again.close();
+    _ = sys.fs.remove(path.view());
+    _ = sys.fs.remove(wal.view());
+}

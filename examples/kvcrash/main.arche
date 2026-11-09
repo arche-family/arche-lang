@@ -1,16 +1,22 @@
 /// The KV store under SIGKILL (docs/sprints.md S33).
 ///
-///   kvcrash write <path>     commits transaction after transaction, each of
-///                            ten keys, and writes each one's number once its
-///                            commit has returned, until it is killed
-///   kvcrash check <path> <n> transactions 0 to n were committed: each must
-///                            be there whole, and every other one whole or
-///                            not at all; writes "ok" and how many are there
+///   kvcrash write <path>     commits transaction after transaction: each puts
+///                            ten keys and deletes the ten of the transaction
+///                            twenty before it, so pages split and merge; it
+///                            writes each one's number once its commit has
+///                            returned, until it is killed
+///   kvcrash check <path> <n> transactions 0 to n were committed: those of the
+///                            last twenty must be there whole, older ones
+///                            gone, n + 1 whole or not at all, and with it the
+///                            deletion it made; writes "ok" and how many are
+///                            there
 import alloc;
 import kv;
 import std;
 
 const PER: u64 = 10;
+/// How far back a transaction deletes.
+const BACK: u64 = 20;
 
 /// Key i of transaction t: eight bytes that sort as the number does.
 fn key_of(t: u64, i: u64, out: &mut alloc.List(u8)) {
@@ -78,6 +84,13 @@ fn write(sys: &mut std.System, path: str) -> !void {
             value_of(t: t, i: i, out: &mut value);
             try db.put(key: key.items(), value: value.items());
         }
+        if t >= BACK {
+            i = 0;
+            while i < PER : (i += 1) {
+                key_of(t: t - BACK, i: i, out: &mut key);
+                _ = try db.delete(key.items());
+            }
+        }
         value.clear();
         var shift: u64 = 64;
         while shift > 0 {
@@ -99,6 +112,8 @@ fn check(sys: &mut std.System, path: str, committed: u64) -> !void {
     var got = alloc.List(u8).init(sys.alloc);
     var whole: u64 = 0;
     var t: u64 = 0;
+    var next_present = false;
+    var deleted_by_next = true;
     // Past the last transaction there may be one more, whole; past that, none.
     while t <= committed + 2 : (t += 1) {
         var present: u64 = 0;
@@ -122,11 +137,28 @@ fn check(sys: &mut std.System, path: str, committed: u64) -> !void {
             sys.stdout.write(" is there in part\n");
             sys.proc.exit(1);
         }
-        if t <= committed and present != PER {
+        // Committed, and not deleted by a committed one since: there. The
+        // one that n + 1 deletes may be gone, if n + 1 got in: that is
+        // checked below, with n + 1.
+        let kept = t + BACK > committed + 1;
+        if t <= committed and kept and present != PER {
             sys.stdout.write("FAIL: committed transaction ");
             sys.stdout.write_u64(t);
             sys.stdout.write(" is lost\n");
             sys.proc.exit(1);
+        }
+        // Deleted by a committed transaction: gone.
+        if t + BACK <= committed and present != 0 {
+            sys.stdout.write("FAIL: transaction ");
+            sys.stdout.write_u64(t);
+            sys.stdout.write(" was deleted, and is there\n");
+            sys.proc.exit(1);
+        }
+        if t + BACK == committed + 1 {
+            deleted_by_next = present == 0;
+        }
+        if t == committed + 1 {
+            next_present = present == PER;
         }
         if t > committed + 1 and present != 0 {
             sys.stdout.write("FAIL: transaction ");
@@ -137,6 +169,13 @@ fn check(sys: &mut std.System, path: str, committed: u64) -> !void {
         if present == PER {
             whole += 1;
         }
+    }
+    // The transaction in flight, if it is there, is there with its deletion.
+    if committed + 1 >= BACK and next_present != deleted_by_next {
+        sys.stdout.write("FAIL: transaction ");
+        sys.stdout.write_u64(committed + 1);
+        sys.stdout.write(" is there in part: its puts and its deletes disagree\n");
+        sys.proc.exit(1);
     }
     try db.close();
     sys.stdout.write("ok ");
