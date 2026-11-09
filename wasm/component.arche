@@ -1,0 +1,1438 @@
+/// The Component Model (WebAssembly/component-model, Binary.md and
+/// CanonicalABI.md): a component's sections read and instantiated in their
+/// order, its core modules instantiated in the store, and its imports and
+/// exports moved between the host's values and core values by the canonical
+/// ABI: strings, lists, records, tuples, variants, enums, options, results
+/// and flags. Resources and nested components are not supported yet.
+import alloc;
+import exec;
+import module as m;
+
+// ---- types ---------------------------------------------------------------------------
+
+pub const BOOL: u8 = 0x7F;
+pub const S8: u8 = 0x7E;
+pub const U8: u8 = 0x7D;
+pub const S16: u8 = 0x7C;
+pub const U16: u8 = 0x7B;
+pub const S32: u8 = 0x7A;
+pub const U32: u8 = 0x79;
+pub const S64: u8 = 0x78;
+pub const U64: u8 = 0x77;
+pub const F32: u8 = 0x76;
+pub const F64: u8 = 0x75;
+pub const CHAR: u8 = 0x74;
+pub const STRING: u8 = 0x73;
+pub const RECORD: u8 = 0x72;
+pub const VARIANT: u8 = 0x71;
+pub const LIST: u8 = 0x70;
+pub const TUPLE: u8 = 0x6F;
+pub const FLAGS: u8 = 0x6E;
+pub const ENUM: u8 = 0x6D;
+pub const OPTION: u8 = 0x6B;
+pub const RESULT: u8 = 0x6A;
+pub const FUNC: u8 = 0x40;
+pub const INSTANCE: u8 = 0x42;
+
+/// No type: a case without a payload, a function without a result.
+pub const NONE: u32 = 0xFFFFFFFF;
+
+/// A type. parts are type ids: a record's fields, a tuple's items, a
+/// variant's cases (NONE for none), a list's or option's element, a
+/// result's ok and err, a function's params then its result, an instance's
+/// exports. names go with them where they have names.
+pub type CType = struct {
+    pub kind: u8,
+    pub parts: alloc.List(u32),
+    pub names: alloc.List(alloc.String),
+    /// flags and enum: how many; a function: how many params.
+    pub count: u32,
+}
+
+/// A value the host gives or takes. Integers are their bits, sign-extended;
+/// records and tuples are List; options (none 0, some 1), results (ok 0,
+/// err 1), enums and variants are Variant.
+pub type Val = enum {
+    Unit,
+    Bool { v: bool },
+    Int { v: u64 },
+    F32 { bits: u32 },
+    F64 { bits: u64 },
+    Char { v: u32 },
+    Str { v: alloc.String },
+    List { items: alloc.List(Val) },
+    Variant { case: u32, payload: alloc.List(Val) },
+    Flags { bits: u64 },
+}
+
+pub type ComponentError = error { Malformed, Unsupported, Invalid, Unlinkable, Trapped }
+
+/// What the embedder gives a component: the functions of the instances it
+/// imports, by the instance's and the function's names.
+pub type Imports = interface {
+    fn has(self: &Self, instance: str, func: str) -> bool;
+    fn call(self: &mut Self, instance: str, func: str, args: &alloc.List(Val), a: alloc.Allocator) -> exec.Trap!Val;
+}
+
+const FUNC_IMPORTED: u8 = 0;
+const FUNC_LIFTED: u8 = 1;
+
+/// A component function: an import's, or a core function lifted.
+type CFunc = struct {
+    kind: u8,
+    instance: u32,
+    name: alloc.String,
+    type_id: u32,
+    core: u32,
+    memory: u32,
+    realloc: u32,
+    post_return: u32,
+}
+
+/// A component instance: one the component imports, by its name.
+type CInstance = struct {
+    name: alloc.String,
+    type_id: u32,
+}
+
+/// A core instance: one of a module, or one made of exports.
+type CoreInstance = struct {
+    real: bool,
+    instance: u32,
+    names: alloc.List(alloc.String),
+    externs: alloc.List(exec.Extern),
+}
+
+/// An import lowered to a core function: Host.call gets its index as id.
+type Lowered = struct {
+    func: u32,
+    memory: u32,
+    realloc: u32,
+}
+
+pub type Component = struct {
+    types: alloc.List(CType),
+    scope: alloc.List(u32),
+    core_modules: alloc.List(u32),
+    core_instances: alloc.List(CoreInstance),
+    core_funcs: alloc.List(u32),
+    core_memories: alloc.List(u32),
+    core_tables: alloc.List(u32),
+    core_globals: alloc.List(u32),
+    funcs: alloc.List(CFunc),
+    instances: alloc.List(CInstance),
+    lowered: alloc.List(Lowered),
+    export_names: alloc.List(alloc.String),
+    export_funcs: alloc.List(u32),
+    a: alloc.Allocator,
+}
+
+/// A host for the core instances' start functions and for realloc, which
+/// reach no import.
+type NoHost = struct {
+    calls: u32,
+}
+
+impl exec.Host for NoHost {
+    fn call(self: &mut NoHost, store: &mut exec.Store, id: u32, args: []u64, results: []mut u64) -> exec.Trap!void {
+        return exec.Trap.HostTrap;
+    }
+}
+
+fn prim(c: &Component, code: u8) -> u32 {
+    return (0x7F - code) as u32;
+}
+
+fn new_type(c: &mut Component, kind: u8) -> u32 {
+    c.types.push(CType { kind: kind, parts: alloc.List(u32).init(c.a), names: alloc.List(alloc.String).init(c.a), count: 0 });
+    return (c.types.len() - 1) as u32;
+}
+
+// ---- reading ------------------------------------------------------------------------
+
+fn read_name(r: &mut m.Reader, b: []u8, a: alloc.Allocator) -> ComponentError!alloc.String {
+    return r.name(b, a) catch return ComponentError.Malformed;
+}
+
+fn read_u32(r: &mut m.Reader, b: []u8) -> ComponentError!u32 {
+    return r.uleb32(b) catch return ComponentError.Malformed;
+}
+
+fn read_byte(r: &mut m.Reader, b: []u8) -> ComponentError!u8 {
+    return r.byte(b) catch return ComponentError.Malformed;
+}
+
+/// An import's or export's name: plain, or with a version after it.
+fn extern_name(r: &mut m.Reader, b: []u8, a: alloc.Allocator) -> ComponentError!alloc.String {
+    let form = try read_byte(r, b);
+    let n = try read_name(r, b, a);
+    if form == 0x01 {
+        _ = try read_name(r, b, a);
+    } else if form != 0x00 {
+        return ComponentError.Malformed;
+    }
+    return n;
+}
+
+/// A value type: a primitive's code, or a type index of scope.
+fn valtype(c: &mut Component, r: &mut m.Reader, b: []u8, scope: &alloc.List(u32)) -> ComponentError!u32 {
+    if r.at >= r.end {
+        return ComponentError.Malformed;
+    }
+    let first = b[r.at];
+    if first >= STRING and first <= BOOL {
+        r.at += 1;
+        return prim(c, first);
+    }
+    let i = try read_u32(r, b);
+    if i as usize >= scope.len() {
+        return ComponentError.Invalid;
+    }
+    return scope.items()[i as usize];
+}
+
+fn option_valtype(c: &mut Component, r: &mut m.Reader, b: []u8, scope: &alloc.List(u32)) -> ComponentError!u32 {
+    let has = try read_byte(r, b);
+    if has == 0 {
+        return NONE;
+    }
+    return try valtype(c, r, b, scope);
+}
+
+/// A defined type, its id.
+fn deftype(c: &mut Component, r: &mut m.Reader, b: []u8, scope: &mut alloc.List(u32)) -> ComponentError!u32 {
+    let kind = try read_byte(r, b);
+    if kind >= STRING and kind <= BOOL {
+        return prim(c, kind);
+    }
+    let a = c.a;
+    if kind == RECORD or kind == VARIANT or kind == TUPLE or kind == FLAGS or kind == ENUM {
+        let t = new_type(c, kind);
+        let n = try read_u32(r, b);
+        var i: u32 = 0;
+        while i < n : (i += 1) {
+            if kind == TUPLE {
+                let part = try valtype(c, r, b, scope);
+                c.types.items_mut()[t as usize].parts.push(part);
+                continue;
+            }
+            let name = try read_name(r, b, a);
+            c.types.items_mut()[t as usize].names.push(name);
+            if kind == RECORD {
+                let part = try valtype(c, r, b, scope);
+                c.types.items_mut()[t as usize].parts.push(part);
+            } else if kind == VARIANT {
+                let part = try option_valtype(c, r, b, scope);
+                c.types.items_mut()[t as usize].parts.push(part);
+                let refines = try read_byte(r, b);
+                if refines != 0 {
+                    return ComponentError.Unsupported;
+                }
+            }
+        }
+        c.types.items_mut()[t as usize].count = n;
+        return t;
+    }
+    if kind == LIST or kind == OPTION {
+        let t = new_type(c, kind);
+        let part = try valtype(c, r, b, scope);
+        c.types.items_mut()[t as usize].parts.push(part);
+        return t;
+    }
+    if kind == RESULT {
+        let t = new_type(c, kind);
+        let ok_t = try option_valtype(c, r, b, scope);
+        let err_t = try option_valtype(c, r, b, scope);
+        c.types.items_mut()[t as usize].parts.push(ok_t);
+        c.types.items_mut()[t as usize].parts.push(err_t);
+        return t;
+    }
+    if kind == FUNC {
+        let t = new_type(c, kind);
+        let n = try read_u32(r, b);
+        var i: u32 = 0;
+        while i < n : (i += 1) {
+            let name = try read_name(r, b, a);
+            let part = try valtype(c, r, b, scope);
+            c.types.items_mut()[t as usize].names.push(name);
+            c.types.items_mut()[t as usize].parts.push(part);
+        }
+        c.types.items_mut()[t as usize].count = n;
+        let form = try read_byte(r, b);
+        if form == 0x00 {
+            let result = try valtype(c, r, b, scope);
+            c.types.items_mut()[t as usize].parts.push(result);
+        } else {
+            let none_count = try read_u32(r, b);
+            if none_count != 0 {
+                return ComponentError.Unsupported;
+            }
+            c.types.items_mut()[t as usize].parts.push(NONE);
+        }
+        return t;
+    }
+    if kind == INSTANCE {
+        let t = new_type(c, kind);
+        var inner = alloc.List(u32).init(a);
+        let n = try read_u32(r, b);
+        var i: u32 = 0;
+        while i < n : (i += 1) {
+            let decl = try read_byte(r, b);
+            if decl == 0x01 {
+                inner.push(try deftype(c, r, b, &mut inner));
+            } else if decl == 0x02 {
+                // An alias of an outer type: sort type, outer, count, index.
+                let sort = try read_byte(r, b);
+                let target = try read_byte(r, b);
+                let count = try read_u32(r, b);
+                let index = try read_u32(r, b);
+                if sort != 0x03 or target != 0x02 or count != 1 or index as usize >= scope.len() {
+                    return ComponentError.Unsupported;
+                }
+                inner.push(scope.items()[index as usize]);
+            } else if decl == 0x04 {
+                let name = try extern_name(r, b, a);
+                let desc = try read_byte(r, b);
+                if desc == 0x01 {
+                    let ft = try read_u32(r, b);
+                    if ft as usize >= inner.len() {
+                        return ComponentError.Invalid;
+                    }
+                    c.types.items_mut()[t as usize].names.push(name);
+                    let id = inner.items()[ft as usize];
+                    c.types.items_mut()[t as usize].parts.push(id);
+                } else if desc == 0x03 {
+                    let bound = try read_byte(r, b);
+                    if bound != 0x00 {
+                        return ComponentError.Unsupported;
+                    }
+                    let same = try read_u32(r, b);
+                    if same as usize >= inner.len() {
+                        return ComponentError.Invalid;
+                    }
+                    inner.push(inner.items()[same as usize]);
+                } else {
+                    return ComponentError.Unsupported;
+                }
+            } else {
+                return ComponentError.Unsupported;
+            }
+        }
+        return t;
+    }
+    return ComponentError.Unsupported;
+}
+
+// ---- flattening and layout (CanonicalABI.md) ------------------------------------------
+
+const FLAT_I32: u8 = 0x7F;
+const FLAT_I64: u8 = 0x7E;
+const FLAT_F32: u8 = 0x7D;
+const FLAT_F64: u8 = 0x7C;
+pub const MAX_FLAT_PARAMS: usize = 16;
+pub const MAX_FLAT_RESULTS: usize = 1;
+
+fn join(x: u8, y: u8) -> u8 {
+    if x == y {
+        return x;
+    }
+    if (x == FLAT_I32 and y == FLAT_F32) or (x == FLAT_F32 and y == FLAT_I32) {
+        return FLAT_I32;
+    }
+    return FLAT_I64;
+}
+
+fn flatten(c: &Component, t: u32, out: &mut alloc.List(u8)) {
+    let ty = &c.types.items()[t as usize];
+    let k = ty.kind;
+    if k == BOOL or k == S8 or k == U8 or k == S16 or k == U16 or k == S32 or k == U32 or k == CHAR or k == ENUM {
+        out.push(FLAT_I32);
+    } else if k == S64 or k == U64 {
+        out.push(FLAT_I64);
+    } else if k == F32 {
+        out.push(FLAT_F32);
+    } else if k == F64 {
+        out.push(FLAT_F64);
+    } else if k == STRING or k == LIST {
+        out.push(FLAT_I32);
+        out.push(FLAT_I32);
+    } else if k == RECORD or k == TUPLE {
+        for p in ty.parts.items() {
+            flatten(c, p.*, out: out);
+        }
+    } else if k == FLAGS {
+        var n = ty.count;
+        while n > 0 {
+            out.push(FLAT_I32);
+            if n <= 32 {
+                n = 0;
+            } else {
+                n -= 32;
+            }
+        }
+    } else {
+        // Variants: the case, then the cases' flattenings joined.
+        out.push(FLAT_I32);
+        let start = out.len();
+        var cases = alloc.List(u32).init(c.a);
+        cases_of(c, t, out: &mut cases);
+        for case in cases.items() {
+            if case.* == NONE {
+                continue;
+            }
+            var flat = alloc.List(u8).init(c.a);
+            flatten(c, case.*, out: &mut flat);
+            var i: usize = 0;
+            while i < flat.len() : (i += 1) {
+                if start + i < out.len() {
+                    let joined = join(x: out.items()[start + i], y: flat.items()[i]);
+                    out.items_mut()[start + i] = joined;
+                } else {
+                    out.push(flat.items()[i]);
+                }
+            }
+        }
+    }
+}
+
+/// A variant-like type's cases: their payload types, NONE for none.
+fn cases_of(c: &Component, t: u32, out: &mut alloc.List(u32)) {
+    let ty = &c.types.items()[t as usize];
+    if ty.kind == VARIANT {
+        for p in ty.parts.items() {
+            out.push(p.*);
+        }
+    } else if ty.kind == OPTION {
+        out.push(NONE);
+        out.push(ty.parts.items()[0]);
+    } else if ty.kind == RESULT {
+        out.push(ty.parts.items()[0]);
+        out.push(ty.parts.items()[1]);
+    } else if ty.kind == ENUM {
+        var i: u32 = 0;
+        while i < ty.count : (i += 1) {
+            out.push(NONE);
+        }
+    }
+}
+
+fn align_to(x: u64, align: u64) -> u64 {
+    return (x + align - 1) / align * align;
+}
+
+fn discriminant_size(n: usize) -> u64 {
+    if n <= 256 {
+        return 1;
+    }
+    if n <= 65536 {
+        return 2;
+    }
+    return 4;
+}
+
+fn alignment(c: &Component, t: u32) -> u64 {
+    let ty = &c.types.items()[t as usize];
+    let k = ty.kind;
+    if k == BOOL or k == S8 or k == U8 {
+        return 1;
+    }
+    if k == S16 or k == U16 {
+        return 2;
+    }
+    if k == S32 or k == U32 or k == F32 or k == CHAR or k == STRING or k == LIST {
+        return 4;
+    }
+    if k == S64 or k == U64 or k == F64 {
+        return 8;
+    }
+    if k == RECORD or k == TUPLE {
+        var al: u64 = 1;
+        for p in ty.parts.items() {
+            let x = alignment(c, p.*);
+            if x > al {
+                al = x;
+            }
+        }
+        return al;
+    }
+    if k == FLAGS {
+        if ty.count <= 8 {
+            return 1;
+        }
+        if ty.count <= 16 {
+            return 2;
+        }
+        return 4;
+    }
+    var cases = alloc.List(u32).init(c.a);
+    cases_of(c, t, out: &mut cases);
+    var al = discriminant_size(cases.len());
+    for case in cases.items() {
+        if case.* != NONE {
+            let x = alignment(c, case.*);
+            if x > al {
+                al = x;
+            }
+        }
+    }
+    return al;
+}
+
+fn size_of(c: &Component, t: u32) -> u64 {
+    let ty = &c.types.items()[t as usize];
+    let k = ty.kind;
+    if k == BOOL or k == S8 or k == U8 {
+        return 1;
+    }
+    if k == S16 or k == U16 {
+        return 2;
+    }
+    if k == S32 or k == U32 or k == F32 or k == CHAR {
+        return 4;
+    }
+    if k == S64 or k == U64 or k == F64 or k == STRING or k == LIST {
+        return 8;
+    }
+    if k == RECORD or k == TUPLE {
+        var at: u64 = 0;
+        for p in ty.parts.items() {
+            at = align_to(x: at, align: alignment(c, p.*));
+            at += size_of(c, p.*);
+        }
+        return align_to(x: at, align: alignment(c, t));
+    }
+    if k == FLAGS {
+        if ty.count <= 8 {
+            return 1;
+        }
+        if ty.count <= 16 {
+            return 2;
+        }
+        return 4 * ((ty.count as u64 + 31) / 32);
+    }
+    let payload = payload_offset(c, t);
+    var cases = alloc.List(u32).init(c.a);
+    cases_of(c, t, out: &mut cases);
+    var most: u64 = 0;
+    for case in cases.items() {
+        if case.* != NONE {
+            let x = size_of(c, case.*);
+            if x > most {
+                most = x;
+            }
+        }
+    }
+    return align_to(x: payload + most, align: alignment(c, t));
+}
+
+fn payload_offset(c: &Component, t: u32) -> u64 {
+    var cases = alloc.List(u32).init(c.a);
+    cases_of(c, t, out: &mut cases);
+    var al: u64 = 1;
+    for case in cases.items() {
+        if case.* != NONE {
+            let x = alignment(c, case.*);
+            if x > al {
+                al = x;
+            }
+        }
+    }
+    return align_to(x: discriminant_size(cases.len()), align: al);
+}
+
+// ---- lifting: core values to the host's ----------------------------------------------
+
+fn mem_read(s: &exec.Store, memory: u32, at: u64, n: u32) -> exec.Trap!u64 {
+    let data = s.memories.items()[memory as usize].data.items();
+    if at + n as u64 > data.len() as u64 {
+        return exec.Trap.MemoryOutOfBounds;
+    }
+    var v: u64 = 0;
+    var i: u32 = 0;
+    while i < n : (i += 1) {
+        v = v | ((data[at as usize + i as usize] as u64) << (8 * i));
+    }
+    return v;
+}
+
+fn mem_write(s: &mut exec.Store, memory: u32, at: u64, n: u32, value: u64) -> exec.Trap!void {
+    let data = s.memories.items_mut()[memory as usize].data.items_mut();
+    if at + n as u64 > data.len() as u64 {
+        return exec.Trap.MemoryOutOfBounds;
+    }
+    var i: u32 = 0;
+    while i < n : (i += 1) {
+        data[at as usize + i as usize] = ((value >> (8 * i)) & 0xFF) as u8;
+    }
+}
+
+fn sext(v: u64, bits: u32) -> u64 {
+    let shift = 64 - bits;
+    return ((v << shift) as% i64 >> shift) as% u64;
+}
+
+fn read_string(c: &Component, s: &exec.Store, memory: u32, at: u64, len: u64) -> exec.Trap!Val {
+    let data = s.memories.items()[memory as usize].data.items();
+    if at + len > data.len() as u64 {
+        return exec.Trap.MemoryOutOfBounds;
+    }
+    var text = alloc.String.init(c.a);
+    if not text.push_utf8(data[at as usize..(at + len) as usize]) {
+        return exec.Trap.HostTrap;
+    }
+    return Val.Str { v: text };
+}
+
+/// A value of type t from the core values flat[at..], at moved past them.
+fn lift_flat(c: &Component, s: &exec.Store, memory: u32, t: u32, flat: []u64, at: &mut usize) -> exec.Trap!Val {
+    let ty = &c.types.items()[t as usize];
+    let k = ty.kind;
+    if k == RECORD or k == TUPLE {
+        var items = alloc.List(Val).init(c.a);
+        for p in ty.parts.items() {
+            items.push(try lift_flat(c, s, memory: memory, t: p.*, flat: flat, at: at));
+        }
+        return Val.List { items: items };
+    }
+    if k == STRING or k == LIST {
+        let ptr = flat[at.*] & 0xFFFFFFFF;
+        let len = flat[at.* + 1] & 0xFFFFFFFF;
+        at.* += 2;
+        if k == STRING {
+            return try read_string(c, s, memory: memory, at: ptr, len: len);
+        }
+        return try lift_list(c, s, memory: memory, t: t, ptr: ptr, len: len);
+    }
+    if k == FLAGS {
+        var bits: u64 = 0;
+        var n = ty.count;
+        var shift: u64 = 0;
+        while n > 0 {
+            bits = bits | ((flat[at.*] & 0xFFFFFFFF) << shift);
+            at.* += 1;
+            shift += 32;
+            if n <= 32 {
+                n = 0;
+            } else {
+                n -= 32;
+            }
+        }
+        return Val.Flags { bits: bits };
+    }
+    if k == VARIANT or k == OPTION or k == RESULT or k == ENUM {
+        var flat_types = alloc.List(u8).init(c.a);
+        flatten(c, t, out: &mut flat_types);
+        let case = (flat[at.*] & 0xFFFFFFFF) as u32;
+        let start = at.* + 1;
+        var cases = alloc.List(u32).init(c.a);
+        cases_of(c, t, out: &mut cases);
+        if case as usize >= cases.len() {
+            return exec.Trap.HostTrap;
+        }
+        var payload = alloc.List(Val).init(c.a);
+        let pt = cases.items()[case as usize];
+        if pt != NONE {
+            var inner: usize = start;
+            payload.push(try lift_flat(c, s, memory: memory, t: pt, flat: flat, at: &mut inner));
+        }
+        at.* = at.* + flat_types.len();
+        return Val.Variant { case: case, payload: payload };
+    }
+    let v = flat[at.*];
+    at.* += 1;
+    return scalar(k, v: v);
+}
+
+fn scalar(k: u8, v: u64) -> Val {
+    if k == BOOL {
+        return Val.Bool { v: v & 0xFFFFFFFF != 0 };
+    }
+    if k == S8 {
+        return Val.Int { v: sext(v, bits: 8) };
+    }
+    if k == U8 {
+        return Val.Int { v: v & 0xFF };
+    }
+    if k == S16 {
+        return Val.Int { v: sext(v, bits: 16) };
+    }
+    if k == U16 {
+        return Val.Int { v: v & 0xFFFF };
+    }
+    if k == S32 {
+        return Val.Int { v: sext(v, bits: 32) };
+    }
+    if k == U32 {
+        return Val.Int { v: v & 0xFFFFFFFF };
+    }
+    if k == F32 {
+        return Val.F32 { bits: (v & 0xFFFFFFFF) as u32 };
+    }
+    if k == F64 {
+        return Val.F64 { bits: v };
+    }
+    if k == CHAR {
+        return Val.Char { v: (v & 0xFFFFFFFF) as u32 };
+    }
+    return Val.Int { v: v };
+}
+
+fn lift_list(c: &Component, s: &exec.Store, memory: u32, t: u32, ptr: u64, len: u64) -> exec.Trap!Val {
+    let elem = c.types.items()[t as usize].parts.items()[0];
+    let size = size_of(c, elem);
+    if ptr + len * size > s.memories.items()[memory as usize].data.len() as u64 {
+        return exec.Trap.MemoryOutOfBounds;
+    }
+    var items = alloc.List(Val).init(c.a);
+    var i: u64 = 0;
+    while i < len : (i += 1) {
+        items.push(try lift_mem(c, s, memory: memory, t: elem, at: ptr + i * size));
+    }
+    return Val.List { items: items };
+}
+
+/// A value of type t from memory at at.
+fn lift_mem(c: &Component, s: &exec.Store, memory: u32, t: u32, at: u64) -> exec.Trap!Val {
+    let ty = &c.types.items()[t as usize];
+    let k = ty.kind;
+    if k == RECORD or k == TUPLE {
+        var items = alloc.List(Val).init(c.a);
+        var off: u64 = 0;
+        for p in ty.parts.items() {
+            off = align_to(x: off, align: alignment(c, p.*));
+            items.push(try lift_mem(c, s, memory: memory, t: p.*, at: at + off));
+            off += size_of(c, p.*);
+        }
+        return Val.List { items: items };
+    }
+    if k == STRING or k == LIST {
+        let ptr = try mem_read(s, memory: memory, at: at, n: 4);
+        let len = try mem_read(s, memory: memory, at: at + 4, n: 4);
+        if k == STRING {
+            return try read_string(c, s, memory: memory, at: ptr, len: len);
+        }
+        return try lift_list(c, s, memory: memory, t: t, ptr: ptr, len: len);
+    }
+    if k == FLAGS {
+        let n = size_of(c, t);
+        var bits: u64 = 0;
+        if n <= 4 {
+            bits = try mem_read(s, memory: memory, at: at, n: n as u32);
+        } else {
+            bits = try mem_read(s, memory: memory, at: at, n: 8);
+        }
+        return Val.Flags { bits: bits };
+    }
+    if k == VARIANT or k == OPTION or k == RESULT or k == ENUM {
+        var cases = alloc.List(u32).init(c.a);
+        cases_of(c, t, out: &mut cases);
+        let ds = discriminant_size(cases.len());
+        let case = (try mem_read(s, memory: memory, at: at, n: ds as u32)) as u32;
+        if case as usize >= cases.len() {
+            return exec.Trap.HostTrap;
+        }
+        var payload = alloc.List(Val).init(c.a);
+        let pt = cases.items()[case as usize];
+        if pt != NONE {
+            payload.push(try lift_mem(c, s, memory: memory, t: pt, at: at + payload_offset(c, t)));
+        }
+        return Val.Variant { case: case, payload: payload };
+    }
+    let size = size_of(c, t);
+    let v = try mem_read(s, memory: memory, at: at, n: size as u32);
+    return scalar(k, v: v);
+}
+
+// ---- lowering: the host's values to core values ---------------------------------------
+
+/// Memory from the guest: realloc(0, 0, align, size).
+fn allocate(c: &Component, s: &mut exec.Store, realloc: u32, align: u64, size: u64) -> exec.Trap!u64 {
+    if realloc == NONE {
+        return exec.Trap.HostTrap;
+    }
+    var host = NoHost { calls: 0 };
+    var results = alloc.List(u64).init(c.a);
+    let args: [4]u64 = [0, 0, align, size];
+    try exec.invoke(s, &mut host, now: fn [] () -> u64 { return 0; }, func: realloc, args[0..4], &mut results);
+    return results.items()[0] & 0xFFFFFFFF;
+}
+
+fn mask(k: u8, v: u64) -> u64 {
+    if k == S64 or k == U64 or k == F64 {
+        return v;
+    }
+    if k == S8 or k == U8 or k == BOOL {
+        return v & 0xFF;
+    }
+    if k == S16 or k == U16 {
+        return v & 0xFFFF;
+    }
+    return v & 0xFFFFFFFF;
+}
+
+/// The bits of a scalar value of kind k.
+fn scalar_bits(k: u8, x: &Val) -> exec.Trap!u64 {
+    match x {
+        .Bool { v } => {
+            if k != BOOL {
+                return exec.Trap.HostTrap;
+            }
+            if v.* {
+                return 1;
+            }
+            return 0;
+        }
+        .Int { v } => { return mask(k, v: v.*); }
+        .F32 { bits } => { return bits.* as u64; }
+        .F64 { bits } => { return bits.*; }
+        .Char { v } => { return v.* as u64; }
+        .Flags { bits } => { return bits.*; }
+        _ => { return exec.Trap.HostTrap; }
+    }
+}
+
+/// A string or list's bytes in the guest's memory: where, and how many
+/// elements.
+fn lower_seq(c: &Component, s: &mut exec.Store, memory: u32, realloc: u32, t: u32, x: &Val, ptr: &mut u64, len: &mut u64) -> exec.Trap!void {
+    let ty = &c.types.items()[t as usize];
+    match x {
+        .Str { v } => {
+            let b = v.view().bytes();
+            let at = try allocate(c, s, realloc: realloc, align: 1, size: b.len() as u64);
+            let data = s.memories.items_mut()[memory as usize].data.items_mut();
+            if at + b.len() as u64 > data.len() as u64 {
+                return exec.Trap.MemoryOutOfBounds;
+            }
+            var i: usize = 0;
+            while i < b.len() : (i += 1) {
+                data[at as usize + i] = b[i];
+            }
+            ptr.* = at;
+            len.* = b.len() as u64;
+        }
+        .List { items } => {
+            if ty.kind != LIST {
+                return exec.Trap.HostTrap;
+            }
+            let elem = ty.parts.items()[0];
+            let size = size_of(c, elem);
+            let at = try allocate(c, s, realloc: realloc, align: alignment(c, elem), size: size * items.len() as u64);
+            var i: usize = 0;
+            while i < items.len() : (i += 1) {
+                try lower_mem(c, s, memory: memory, realloc: realloc, t: elem, x: &items.items()[i], at: at + i as u64 * size);
+            }
+            ptr.* = at;
+            len.* = items.len() as u64;
+        }
+        _ => { return exec.Trap.HostTrap; }
+    }
+}
+
+/// x, of type t, as core values onto out.
+fn lower_flat(c: &Component, s: &mut exec.Store, memory: u32, realloc: u32, t: u32, x: &Val, out: &mut alloc.List(u64)) -> exec.Trap!void {
+    let k = c.types.items()[t as usize].kind;
+    if k == RECORD or k == TUPLE {
+        match x {
+            .List { items } => {
+                let n = c.types.items()[t as usize].parts.len();
+                if items.len() != n {
+                    return exec.Trap.HostTrap;
+                }
+                var i: usize = 0;
+                while i < n : (i += 1) {
+                    let p = c.types.items()[t as usize].parts.items()[i];
+                    try lower_flat(c, s, memory: memory, realloc: realloc, t: p, x: &items.items()[i], out: out);
+                }
+                return;
+            }
+            _ => { return exec.Trap.HostTrap; }
+        }
+    }
+    if k == STRING or k == LIST {
+        var ptr: u64 = 0;
+        var len: u64 = 0;
+        try lower_seq(c, s, memory: memory, realloc: realloc, t: t, x: x, ptr: &mut ptr, len: &mut len);
+        out.push(ptr);
+        out.push(len);
+        return;
+    }
+    if k == VARIANT or k == OPTION or k == RESULT or k == ENUM {
+        var flat_types = alloc.List(u8).init(c.a);
+        flatten(c, t, out: &mut flat_types);
+        let start = out.len();
+        match x {
+            .Variant { case, payload } => {
+                out.push(case.* as u64);
+                var cases = alloc.List(u32).init(c.a);
+                cases_of(c, t, out: &mut cases);
+                if case.* as usize >= cases.len() {
+                    return exec.Trap.HostTrap;
+                }
+                let pt = cases.items()[case.* as usize];
+                if pt != NONE {
+                    if payload.len() != 1 {
+                        return exec.Trap.HostTrap;
+                    }
+                    try lower_flat(c, s, memory: memory, realloc: realloc, t: pt, x: &payload.items()[0], out: out);
+                }
+            }
+            _ => { return exec.Trap.HostTrap; }
+        }
+        while out.len() < start + flat_types.len() {
+            out.push(0);
+        }
+        return;
+    }
+    if k == FLAGS {
+        let bits = try scalar_bits(k, x: x);
+        var n = c.types.items()[t as usize].count;
+        var shift: u64 = 0;
+        while n > 0 {
+            out.push((bits >> shift) & 0xFFFFFFFF);
+            shift += 32;
+            if n <= 32 {
+                n = 0;
+            } else {
+                n -= 32;
+            }
+        }
+        return;
+    }
+    out.push(try scalar_bits(k, x: x));
+}
+
+/// x, of type t, into memory at at.
+fn lower_mem(c: &Component, s: &mut exec.Store, memory: u32, realloc: u32, t: u32, x: &Val, at: u64) -> exec.Trap!void {
+    let k = c.types.items()[t as usize].kind;
+    if k == RECORD or k == TUPLE {
+        match x {
+            .List { items } => {
+                let n = c.types.items()[t as usize].parts.len();
+                if items.len() != n {
+                    return exec.Trap.HostTrap;
+                }
+                var off: u64 = 0;
+                var i: usize = 0;
+                while i < n : (i += 1) {
+                    let p = c.types.items()[t as usize].parts.items()[i];
+                    off = align_to(x: off, align: alignment(c, p));
+                    try lower_mem(c, s, memory: memory, realloc: realloc, t: p, x: &items.items()[i], at: at + off);
+                    off += size_of(c, p);
+                }
+                return;
+            }
+            _ => { return exec.Trap.HostTrap; }
+        }
+    }
+    if k == STRING or k == LIST {
+        var ptr: u64 = 0;
+        var len: u64 = 0;
+        try lower_seq(c, s, memory: memory, realloc: realloc, t: t, x: x, ptr: &mut ptr, len: &mut len);
+        try mem_write(s, memory: memory, at: at, n: 4, value: ptr);
+        try mem_write(s, memory: memory, at: at + 4, n: 4, value: len);
+        return;
+    }
+    if k == VARIANT or k == OPTION or k == RESULT or k == ENUM {
+        match x {
+            .Variant { case, payload } => {
+                var cases = alloc.List(u32).init(c.a);
+                cases_of(c, t, out: &mut cases);
+                if case.* as usize >= cases.len() {
+                    return exec.Trap.HostTrap;
+                }
+                let ds = discriminant_size(cases.len());
+                try mem_write(s, memory: memory, at: at, n: ds as u32, value: case.* as u64);
+                let pt = cases.items()[case.* as usize];
+                if pt != NONE {
+                    if payload.len() != 1 {
+                        return exec.Trap.HostTrap;
+                    }
+                    try lower_mem(c, s, memory: memory, realloc: realloc, t: pt, x: &payload.items()[0], at: at + payload_offset(c, t));
+                }
+                return;
+            }
+            _ => { return exec.Trap.HostTrap; }
+        }
+    }
+    let bits = try scalar_bits(k, x: x);
+    let size = size_of(c, t);
+    if size <= 8 {
+        try mem_write(s, memory: memory, at: at, n: size as u32, value: bits);
+    }
+}
+
+// ---- instantiation --------------------------------------------------------------------
+
+fn core_extern(c: &Component, s: &exec.Store, instance: u32, name: str) -> ?exec.Extern {
+    let ci = &c.core_instances.items()[instance as usize];
+    if ci.real {
+        return exec.export_of(s, instance: ci.instance, name: name);
+    }
+    var i: usize = 0;
+    while i < ci.names.len() : (i += 1) {
+        if ci.names.items()[i].view().eq(name) {
+            return ci.externs.items()[i];
+        }
+    }
+    return none;
+}
+
+/// A core sort's extern kind, and its index space's address of idx.
+fn core_sort(c: &Component, sort: u8, idx: u32) -> ComponentError!exec.Extern {
+    var space = &c.core_funcs;
+    var kind = m.EXTERN_FUNC;
+    if sort == 0x01 {
+        space = &c.core_tables;
+        kind = m.EXTERN_TABLE;
+    } else if sort == 0x02 {
+        space = &c.core_memories;
+        kind = m.EXTERN_MEMORY;
+    } else if sort == 0x03 {
+        space = &c.core_globals;
+        kind = m.EXTERN_GLOBAL;
+    } else if sort != 0x00 {
+        return ComponentError.Unsupported;
+    }
+    if idx as usize >= space.len() {
+        return ComponentError.Invalid;
+    }
+    return exec.Extern { kind: kind, addr: space.items()[idx as usize] };
+}
+
+fn push_core(c: &mut Component, e: exec.Extern) {
+    if e.kind == m.EXTERN_FUNC {
+        c.core_funcs.push(e.addr);
+    } else if e.kind == m.EXTERN_TABLE {
+        c.core_tables.push(e.addr);
+    } else if e.kind == m.EXTERN_MEMORY {
+        c.core_memories.push(e.addr);
+    } else {
+        c.core_globals.push(e.addr);
+    }
+}
+
+fn instance_func_type(c: &Component, instance: u32, name: str) -> ?u32 {
+    let it = &c.types.items()[c.instances.items()[instance as usize].type_id as usize];
+    var i: usize = 0;
+    while i < it.names.len() : (i += 1) {
+        if it.names.items()[i].view().eq(name) {
+            return it.parts.items()[i];
+        }
+    }
+    return none;
+}
+
+fn core_types(c: &Component, ft: u32, params: &mut alloc.List(u8), results: &mut alloc.List(u8)) {
+    let ty = &c.types.items()[ft as usize];
+    var i: u32 = 0;
+    while i < ty.count : (i += 1) {
+        flatten(c, ty.parts.items()[i as usize], out: params);
+    }
+    if params.len() > MAX_FLAT_PARAMS {
+        params.clear();
+        params.push(FLAT_I32);
+    }
+    let rt = ty.parts.items()[ty.count as usize];
+    if rt != NONE {
+        flatten(c, rt, out: results);
+    }
+}
+
+/// A component in bytes, instantiated in s, its imports from imports.
+pub fn instantiate(s: &mut exec.Store, now: &dyn fn() -> u64, bytes: []u8, imports: &dyn Imports, a: alloc.Allocator) -> ComponentError!Component {
+    var c = Component {
+        types: alloc.List(CType).init(a),
+        scope: alloc.List(u32).init(a),
+        core_modules: alloc.List(u32).init(a),
+        core_instances: alloc.List(CoreInstance).init(a),
+        core_funcs: alloc.List(u32).init(a),
+        core_memories: alloc.List(u32).init(a),
+        core_tables: alloc.List(u32).init(a),
+        core_globals: alloc.List(u32).init(a),
+        funcs: alloc.List(CFunc).init(a),
+        instances: alloc.List(CInstance).init(a),
+        lowered: alloc.List(Lowered).init(a),
+        export_names: alloc.List(alloc.String).init(a),
+        export_funcs: alloc.List(u32).init(a),
+        a: a,
+    };
+    var code: u8 = BOOL;
+    while code >= STRING : (code -= 1) {
+        _ = new_type(&mut c, code);
+    }
+    var r = m.Reader { at: 0, end: bytes.len() };
+    let b = bytes;
+    let magic = r.fixed(b, n: 4) catch return ComponentError.Malformed;
+    let version = r.fixed(b, n: 4) catch return ComponentError.Malformed;
+    if magic != 0x6D736100 or version != 0x0001000D {
+        return ComponentError.Malformed;
+    }
+    while not r.done() {
+        let id = try read_byte(&mut r, b);
+        let size = try read_u32(&mut r, b);
+        if size as usize > r.end - r.at {
+            return ComponentError.Malformed;
+        }
+        var sec = m.Reader { at: r.at, end: r.at + size as usize };
+        r.at = sec.end;
+        if id == 0 {
+            continue;
+        }
+        if id == 1 {
+            let mi = exec.add_module(s, b[sec.at..sec.end]) catch return ComponentError.Invalid;
+            c.core_modules.push(mi);
+            continue;
+        }
+        let n = try read_u32(&mut sec, b);
+        var k: u32 = 0;
+        while k < n : (k += 1) {
+            if id == 2 {
+                try core_instance(&mut c, s, now, &mut sec, b);
+            } else if id == 6 {
+                try alias(&mut c, s, &mut sec, b);
+            } else if id == 7 {
+                var scope = alloc.List(u32).init(a);
+                for x in c.scope.items() {
+                    scope.push(x.*);
+                }
+                let t = try deftype(&mut c, &mut sec, b, &mut scope);
+                c.scope.push(t);
+            } else if id == 8 {
+                try canon(&mut c, s, &mut sec, b);
+            } else if id == 10 {
+                let name = try extern_name(&mut sec, b, a);
+                let desc = try read_byte(&mut sec, b);
+                if desc != 0x05 {
+                    return ComponentError.Unsupported;
+                }
+                let ti = try read_u32(&mut sec, b);
+                if ti as usize >= c.scope.len() {
+                    return ComponentError.Invalid;
+                }
+                let tid = c.scope.items()[ti as usize];
+                // Every function the instance has must be given: a guest
+                // reaches only what it was given.
+                let it = &c.types.items()[tid as usize];
+                var i: usize = 0;
+                while i < it.names.len() : (i += 1) {
+                    if not imports.has(instance: name.view(), func: it.names.items()[i].view()) {
+                        return ComponentError.Unlinkable;
+                    }
+                }
+                c.instances.push(CInstance { name: name, type_id: tid });
+            } else if id == 11 {
+                let name = try extern_name(&mut sec, b, a);
+                let sort = try read_byte(&mut sec, b);
+                let idx = try read_u32(&mut sec, b);
+                let has_type = try read_byte(&mut sec, b);
+                if has_type != 0 {
+                    return ComponentError.Unsupported;
+                }
+                if sort == 0x01 {
+                    if idx as usize >= c.funcs.len() {
+                        return ComponentError.Invalid;
+                    }
+                    let f = &c.funcs.items()[idx as usize];
+                    let copy = CFunc { kind: f.kind, instance: f.instance, name: f.name.clone(), type_id: f.type_id, core: f.core, memory: f.memory, realloc: f.realloc, post_return: f.post_return };
+                    c.funcs.push(copy);
+                    c.export_names.push(name);
+                    c.export_funcs.push(idx);
+                } else {
+                    return ComponentError.Unsupported;
+                }
+            } else {
+                return ComponentError.Unsupported;
+            }
+        }
+        if sec.at != sec.end {
+            return ComponentError.Malformed;
+        }
+    }
+    return c;
+}
+
+fn core_instance(c: &mut Component, s: &mut exec.Store, now: &dyn fn() -> u64, r: &mut m.Reader, b: []u8) -> ComponentError!void {
+    let a = c.a;
+    let form = try read_byte(r, b);
+    if form == 0x00 {
+        let mi = try read_u32(r, b);
+        if mi as usize >= c.core_modules.len() {
+            return ComponentError.Invalid;
+        }
+        let module = c.core_modules.items()[mi as usize];
+        let nargs = try read_u32(r, b);
+        var arg_names = alloc.List(alloc.String).init(a);
+        var arg_instances = alloc.List(u32).init(a);
+        var i: u32 = 0;
+        while i < nargs : (i += 1) {
+            arg_names.push(try read_name(r, b, a));
+            let sort = try read_byte(r, b);
+            if sort != 0x12 {
+                return ComponentError.Unsupported;
+            }
+            arg_instances.push(try read_u32(r, b));
+        }
+        var externs = alloc.List(exec.Extern).init(a);
+        let nimports = s.modules.items()[module as usize].imports.len();
+        var k: usize = 0;
+        while k < nimports : (k += 1) {
+            let imp = &s.modules.items()[module as usize].imports.items()[k];
+            var found = false;
+            var j: usize = 0;
+            while j < arg_names.len() : (j += 1) {
+                if arg_names.items()[j].view().eq(imp.module.view()) {
+                    let e = core_extern(c, s, instance: arg_instances.items()[j], name: imp.name.view()) orelse return ComponentError.Unlinkable;
+                    externs.push(e);
+                    found = true;
+                    break;
+                }
+            }
+            if not found {
+                return ComponentError.Unlinkable;
+            }
+        }
+        var host = NoHost { calls: 0 };
+        let inst = exec.instantiate(s, &mut host, now, module: module, externs.items()) catch return ComponentError.Trapped;
+        c.core_instances.push(CoreInstance { real: true, instance: inst, names: alloc.List(alloc.String).init(a), externs: alloc.List(exec.Extern).init(a) });
+        return;
+    }
+    if form == 0x01 {
+        var names = alloc.List(alloc.String).init(a);
+        var externs = alloc.List(exec.Extern).init(a);
+        let n = try read_u32(r, b);
+        var i: u32 = 0;
+        while i < n : (i += 1) {
+            names.push(try read_name(r, b, a));
+            let sort = try read_byte(r, b);
+            let idx = try read_u32(r, b);
+            externs.push(try core_sort(c, sort: sort, idx: idx));
+        }
+        c.core_instances.push(CoreInstance { real: false, instance: 0, names: names, externs: externs });
+        return;
+    }
+    return ComponentError.Malformed;
+}
+
+fn alias(c: &mut Component, s: &exec.Store, r: &mut m.Reader, b: []u8) -> ComponentError!void {
+    let sort = try read_byte(r, b);
+    var core_kind: u8 = 0;
+    if sort == 0x00 {
+        core_kind = try read_byte(r, b);
+    }
+    let target = try read_byte(r, b);
+    if target == 0x01 and sort == 0x00 {
+        let ci = try read_u32(r, b);
+        let name = try read_name(r, b, c.a);
+        if ci as usize >= c.core_instances.len() {
+            return ComponentError.Invalid;
+        }
+        let e = core_extern(c, s, instance: ci, name: name.view()) orelse return ComponentError.Invalid;
+        var want = m.EXTERN_FUNC;
+        if core_kind == 0x01 {
+            want = m.EXTERN_TABLE;
+        } else if core_kind == 0x02 {
+            want = m.EXTERN_MEMORY;
+        } else if core_kind == 0x03 {
+            want = m.EXTERN_GLOBAL;
+        } else if core_kind != 0x00 {
+            return ComponentError.Unsupported;
+        }
+        if e.kind != want {
+            return ComponentError.Invalid;
+        }
+        push_core(c, e: e);
+        return;
+    }
+    if target == 0x00 and sort == 0x01 {
+        let ii = try read_u32(r, b);
+        let name = try read_name(r, b, c.a);
+        if ii as usize >= c.instances.len() {
+            return ComponentError.Invalid;
+        }
+        let ft = instance_func_type(c, instance: ii, name: name.view()) orelse return ComponentError.Invalid;
+        c.funcs.push(CFunc { kind: FUNC_IMPORTED, instance: ii, name: name, type_id: ft, core: 0, memory: 0, realloc: NONE, post_return: NONE });
+        return;
+    }
+    return ComponentError.Unsupported;
+}
+
+fn canon(c: &mut Component, s: &mut exec.Store, r: &mut m.Reader, b: []u8) -> ComponentError!void {
+    let op = try read_byte(r, b);
+    let zero = try read_byte(r, b);
+    if zero != 0x00 or op > 0x01 {
+        return ComponentError.Unsupported;
+    }
+    let f = try read_u32(r, b);
+    var memory: u32 = 0;
+    var realloc = NONE;
+    var post = NONE;
+    let nopts = try read_u32(r, b);
+    var i: u32 = 0;
+    while i < nopts : (i += 1) {
+        let opt = try read_byte(r, b);
+        if opt == 0x00 {
+            continue;
+        }
+        if opt == 0x03 or opt == 0x04 or opt == 0x05 {
+            let idx = try read_u32(r, b);
+            if opt == 0x03 {
+                memory = (try core_sort(c, sort: 0x02, idx: idx)).addr;
+            } else if opt == 0x04 {
+                realloc = (try core_sort(c, sort: 0x00, idx: idx)).addr;
+            } else {
+                post = (try core_sort(c, sort: 0x00, idx: idx)).addr;
+            }
+            continue;
+        }
+        return ComponentError.Unsupported;
+    }
+    if op == 0x00 {
+        let ti = try read_u32(r, b);
+        if ti as usize >= c.scope.len() {
+            return ComponentError.Invalid;
+        }
+        let core = (try core_sort(c, sort: 0x00, idx: f)).addr;
+        c.funcs.push(CFunc { kind: FUNC_LIFTED, instance: 0, name: alloc.String.init(c.a), type_id: c.scope.items()[ti as usize], core: core, memory: memory, realloc: realloc, post_return: post });
+        return;
+    }
+    if f as usize >= c.funcs.len() {
+        return ComponentError.Invalid;
+    }
+    let ft = c.funcs.items()[f as usize].type_id;
+    var params = alloc.List(u8).init(c.a);
+    var results = alloc.List(u8).init(c.a);
+    core_types(c, ft, params: &mut params, results: &mut results);
+    if results.len() > MAX_FLAT_RESULTS {
+        results.clear();
+        params.push(FLAT_I32);
+    }
+    let addr = exec.add_host_func(s, params: params.items(), results: results.items(), id: c.lowered.len() as u32);
+    c.lowered.push(Lowered { func: f, memory: memory, realloc: realloc });
+    c.core_funcs.push(addr);
+}
+
+// ---- calls ----------------------------------------------------------------------------
+
+/// A lowered import's call: Host.call's body for id, by the canonical ABI.
+pub fn handle(c: &Component, s: &mut exec.Store, imports: &mut dyn Imports, id: u32, args: []u64, results: []mut u64) -> exec.Trap!void {
+    if id as usize >= c.lowered.len() {
+        return exec.Trap.HostTrap;
+    }
+    let lw = c.lowered.items()[id as usize];
+    let f = &c.funcs.items()[lw.func as usize];
+    let ft = &c.types.items()[f.type_id as usize];
+    var flat = alloc.List(u8).init(c.a);
+    var i: u32 = 0;
+    while i < ft.count : (i += 1) {
+        flatten(c, ft.parts.items()[i as usize], out: &mut flat);
+    }
+    var vals = alloc.List(Val).init(c.a);
+    if flat.len() > MAX_FLAT_PARAMS {
+        var off: u64 = 0;
+        i = 0;
+        while i < ft.count : (i += 1) {
+            let p = ft.parts.items()[i as usize];
+            off = align_to(x: off, align: alignment(c, p));
+            vals.push(try lift_mem(c, s, memory: lw.memory, t: p, at: (args[0] & 0xFFFFFFFF) + off));
+            off += size_of(c, p);
+        }
+    } else {
+        var at: usize = 0;
+        i = 0;
+        while i < ft.count : (i += 1) {
+            vals.push(try lift_flat(c, s, memory: lw.memory, t: ft.parts.items()[i as usize], flat: args, at: &mut at));
+        }
+    }
+    let instance = c.instances.items()[f.instance as usize].name.view();
+    let result = try imports.call(instance: instance, func: f.name.view(), &vals, c.a);
+    let rt = ft.parts.items()[ft.count as usize];
+    if rt == NONE {
+        return;
+    }
+    var rflat = alloc.List(u8).init(c.a);
+    flatten(c, rt, out: &mut rflat);
+    if rflat.len() > MAX_FLAT_RESULTS {
+        let retptr = args[args.len() - 1] & 0xFFFFFFFF;
+        try lower_mem(c, s, memory: lw.memory, realloc: lw.realloc, t: rt, x: &result, at: retptr);
+        return;
+    }
+    var out = alloc.List(u64).init(c.a);
+    try lower_flat(c, s, memory: lw.memory, realloc: lw.realloc, t: rt, x: &result, out: &mut out);
+    results[0] = out.items()[0];
+}
+
+/// Whether the component exports a function of this name.
+pub fn exports(c: &Component, name: str) -> bool {
+    for e in c.export_names.items() {
+        if e.view().eq(name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A call of an export made ready: the core function and its args. The
+/// embedder runs it (exec.invoke, with itself as the host) and gives the
+/// results to finish; a call is split so because the embedder that holds
+/// the component is also the host its imports call.
+pub type Prepared = struct {
+    pub core: u32,
+    pub args: alloc.List(u64),
+    func: u32,
+}
+
+/// The export name's call with args, ready to run.
+pub fn prepare(c: &Component, s: &mut exec.Store, name: str, args: &alloc.List(Val)) -> exec.Trap!Prepared {
+    var fi = NONE;
+    var i: usize = 0;
+    while i < c.export_names.len() : (i += 1) {
+        if c.export_names.items()[i].view().eq(name) {
+            fi = c.export_funcs.items()[i];
+        }
+    }
+    if fi == NONE {
+        return exec.Trap.Unlinkable;
+    }
+    let f = &c.funcs.items()[fi as usize];
+    if f.kind != FUNC_LIFTED {
+        return exec.Trap.Unlinkable;
+    }
+    let ft = &c.types.items()[f.type_id as usize];
+    if args.len() != ft.count as usize {
+        return exec.Trap.HostTrap;
+    }
+    var flat = alloc.List(u64).init(c.a);
+    var k: u32 = 0;
+    while k < ft.count : (k += 1) {
+        try lower_flat(c, s, memory: f.memory, realloc: f.realloc, t: ft.parts.items()[k as usize], x: &args.items()[k as usize], out: &mut flat);
+    }
+    if flat.len() > MAX_FLAT_PARAMS {
+        return exec.Trap.HostTrap;
+    }
+    return Prepared { core: f.core, args: flat, func: fi };
+}
+
+/// The result of a call prepare made ready and the embedder ran, or Unit;
+/// post-return runs after it.
+pub fn finish(c: &Component, s: &mut exec.Store, p: &Prepared, results: &alloc.List(u64)) -> exec.Trap!Val {
+    let f = &c.funcs.items()[p.func as usize];
+    let ft = &c.types.items()[f.type_id as usize];
+    let rt = ft.parts.items()[ft.count as usize];
+    var value = Val.Unit;
+    if rt != NONE {
+        var rflat = alloc.List(u8).init(c.a);
+        flatten(c, rt, out: &mut rflat);
+        if rflat.len() > MAX_FLAT_RESULTS {
+            value = try lift_mem(c, s, memory: f.memory, t: rt, at: results.items()[0] & 0xFFFFFFFF);
+        } else {
+            var at: usize = 0;
+            value = try lift_flat(c, s, memory: f.memory, t: rt, flat: results.items(), at: &mut at);
+        }
+    }
+    if f.post_return != NONE {
+        var host = NoHost { calls: 0 };
+        var none_results = alloc.List(u64).init(c.a);
+        try exec.invoke(s, &mut host, now: fn [] () -> u64 { return 0; }, func: f.post_return, results.items(), &mut none_results);
+    }
+    return value;
+}

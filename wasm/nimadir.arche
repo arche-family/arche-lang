@@ -1,0 +1,1077 @@
+/// A host for Nimadir's mini-apps (github.com/Nodirbek-Abdulaxadov/nimadir,
+/// wit/world.wit, nimadir:shell@1.2.0): the shell's side of host-api and dom,
+/// with no window. Each frame calls the app's update and writes what it drew,
+/// one line a widget; a button is clicked by naming it. The limits are the
+/// shell's: a second for a frame, ten for init, 512 MiB of memory, and 16 MiB
+/// and 65536 widgets sent in a frame. Past one the app is stopped, and the
+/// shell says which.
+import alloc;
+import component as c;
+import exec;
+
+pub const FRAME_BUDGET_NS: u64 = 1000000000;
+pub const INIT_BUDGET_NS: u64 = 10000000000;
+pub const MAX_MEMORY: u64 = 512 << 20;
+pub const MAX_FRAME_BYTES: u64 = 16 << 20;
+pub const MAX_FRAME_CMDS: u64 = 1 << 16;
+pub const MAX_STORAGE: u64 = 1 << 20;
+pub const MAX_NODES: usize = 65536;
+pub const MAX_NESTING: u32 = 32;
+
+const HOST_API: str = "nimadir:shell/host-api@1.2.0";
+const DOM: str = "nimadir:shell/dom@1.2.0";
+
+const HOST_FUNCS: str = " log ui-label ui-button ui-text-edit ui-heading ui-search-field ui-tile now-millis list-apps open-app request-frame storage-get storage-set storage-remove storage-keys ui-begin ui-end ui-checkbox ui-choice ui-separator ui-progress ui-submitted image-load ui-image fetch fetch-poll locale time-zone utc-offset app-info ";
+const DOM_FUNCS: str = " root create-element create-text append-child insert-before remove release set-text set-attribute remove-attribute get-attribute toggle-class set-style set-markup query-all parent children value focus bounds add-stylesheet remove-stylesheet listen unlisten events ";
+
+/// An element, or a run of text when tag is empty.
+type Node = struct {
+    tag: alloc.String,
+    text: alloc.String,
+    names: alloc.List(alloc.String),
+    values: alloc.List(alloc.String),
+    children: alloc.List(u32),
+    parent: u32,
+    alive: bool,
+    listens: alloc.List(alloc.String),
+}
+
+/// An event waiting for the app: kind, the node it happened on and the one
+/// that listens, and a control's value.
+type Event = struct {
+    kind: alloc.String,
+    target: u32,
+    current: u32,
+    value: alloc.String,
+}
+
+/// The shell's state the app's calls reach: what it drew this frame, its
+/// storage, its element tree.
+pub type Ui = struct {
+    pub out: alloc.String,
+    clicks: alloc.List(alloc.String),
+    pub now_ms: i64,
+    keys: alloc.List(alloc.String),
+    values: alloc.List(alloc.String),
+    nodes: alloc.List(Node),
+    events: alloc.List(Event),
+    sheets: u32,
+    images: u32,
+    depth: u32,
+    sent_bytes: u64,
+    sent_cmds: u64,
+    pub exceeded: bool,
+    /// Functions this shell keeps from the app, to see it refused.
+    denied: alloc.List(alloc.String),
+    a: alloc.Allocator,
+}
+
+pub fn new_ui(a: alloc.Allocator) -> Ui {
+    var ui = Ui {
+        out: alloc.String.init(a),
+        clicks: alloc.List(alloc.String).init(a),
+        now_ms: 0,
+        keys: alloc.List(alloc.String).init(a),
+        values: alloc.List(alloc.String).init(a),
+        nodes: alloc.List(Node).init(a),
+        events: alloc.List(Event).init(a),
+        sheets: 0,
+        images: 0,
+        depth: 0,
+        sent_bytes: 0,
+        sent_cmds: 0,
+        exceeded: false,
+        denied: alloc.List(alloc.String).init(a),
+        a: a,
+    };
+    // Node 0 is no node; 1 is the page's body.
+    _ = new_node(&mut ui, tag: "none");
+    _ = new_node(&mut ui, tag: "body");
+    return ui;
+}
+
+fn new_node(ui: &mut Ui, tag: str) -> u32 {
+    ui.nodes.push(Node {
+        tag: alloc.String.from(tag, ui.a),
+        text: alloc.String.init(ui.a),
+        names: alloc.List(alloc.String).init(ui.a),
+        values: alloc.List(alloc.String).init(ui.a),
+        children: alloc.List(u32).init(ui.a),
+        parent: 0,
+        alive: true,
+        listens: alloc.List(alloc.String).init(ui.a),
+    });
+    return (ui.nodes.len() - 1) as u32;
+}
+
+/// The shell gives the app no function of this name.
+pub fn deny(ui: &mut Ui, func: str) {
+    ui.denied.push(alloc.String.from(func, ui.a));
+}
+
+/// A button whose text is this is clicked when it is next drawn.
+pub fn click(ui: &mut Ui, text: str) {
+    ui.clicks.push(alloc.String.from(text, ui.a));
+}
+
+/// A new frame: what was sent so far no longer counts.
+pub fn begin_frame(ui: &mut Ui) {
+    ui.out = alloc.String.init(ui.a);
+    ui.sent_bytes = 0;
+    ui.sent_cmds = 0;
+    ui.depth = 0;
+}
+
+// ---- values -------------------------------------------------------------------------
+
+fn text_arg(args: &alloc.List(c.Val), i: usize) -> str {
+    match &args.items()[i] {
+        .Str { v } => { return v.view(); }
+        _ => { return ""; }
+    }
+}
+
+fn int_arg(args: &alloc.List(c.Val), i: usize) -> u64 {
+    match &args.items()[i] {
+        .Int { v } => { return v.*; }
+        .Bool { v } => {
+            if v.* {
+                return 1;
+            }
+            return 0;
+        }
+        _ => { return 0; }
+    }
+}
+
+fn str_val(s: str, a: alloc.Allocator) -> c.Val {
+    return c.Val.Str { v: alloc.String.from(s, a) };
+}
+
+fn int_val(v: u64) -> c.Val {
+    return c.Val.Int { v: v };
+}
+
+fn bool_val(v: bool) -> c.Val {
+    return c.Val.Bool { v: v };
+}
+
+fn some_val(v: c.Val, a: alloc.Allocator) -> c.Val {
+    var p = alloc.List(c.Val).init(a);
+    p.push(v);
+    return c.Val.Variant { case: 1, payload: p };
+}
+
+fn nothing(a: alloc.Allocator) -> c.Val {
+    return c.Val.Variant { case: 0, payload: alloc.List(c.Val).init(a) };
+}
+
+/// result<_, string>: ok, or err with why.
+fn done(why: str, a: alloc.Allocator) -> c.Val {
+    if why.len() == 0 {
+        return c.Val.Variant { case: 0, payload: alloc.List(c.Val).init(a) };
+    }
+    var p = alloc.List(c.Val).init(a);
+    p.push(str_val(why, a));
+    return c.Val.Variant { case: 1, payload: p };
+}
+
+fn node_list(nodes: &alloc.List(u32), a: alloc.Allocator) -> c.Val {
+    var items = alloc.List(c.Val).init(a);
+    for n in nodes.items() {
+        items.push(int_val(n.* as u64));
+    }
+    return c.Val.List { items: items };
+}
+
+// ---- drawing ------------------------------------------------------------------------
+
+/// A widget's line, counted against the frame's limits.
+fn draw(ui: &mut Ui, what: str, text: str) -> exec.Trap!void {
+    ui.sent_cmds += 1;
+    ui.sent_bytes += text.len() as u64;
+    if ui.sent_cmds > MAX_FRAME_CMDS or ui.sent_bytes > MAX_FRAME_BYTES {
+        ui.exceeded = true;
+        return exec.Trap.HostLimit;
+    }
+    // A long text is shown by its start.
+    var shown = text;
+    if shown.len() > 120 {
+        shown = "(long text)";
+    }
+    ui.out.push_str(what);
+    ui.out.push_str(": ");
+    ui.out.push_str(shown);
+    ui.out.push_str("\n");
+}
+
+fn clicked(ui: &mut Ui, text: str) -> bool {
+    var i: usize = 0;
+    while i < ui.clicks.len() : (i += 1) {
+        if ui.clicks.items()[i].view().eq(text) {
+            // Taken: the last one moves into its place.
+            let last = ui.clicks.pop() orelse alloc.String.init(ui.a);
+            if i < ui.clicks.len() {
+                ui.clicks.items_mut()[i] = last;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+fn storage_used(ui: &Ui) -> u64 {
+    var n: u64 = 0;
+    var i: usize = 0;
+    while i < ui.keys.len() : (i += 1) {
+        n += ui.keys.items()[i].len() as u64 + ui.values.items()[i].len() as u64;
+    }
+    return n;
+}
+
+fn storage_index(ui: &Ui, key: str) -> ?usize {
+    var i: usize = 0;
+    while i < ui.keys.len() : (i += 1) {
+        if ui.keys.items()[i].view().eq(key) {
+            return i;
+        }
+    }
+    return none;
+}
+
+fn app_entry(name: str, source: str, about: str, a: alloc.Allocator) -> c.Val {
+    var fields = alloc.List(c.Val).init(a);
+    fields.push(str_val(name, a));
+    fields.push(str_val(source, a));
+    fields.push(str_val(about, a));
+    return c.Val.List { items: fields };
+}
+
+fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
+    let a = ui.a;
+    if func.eq("log") {
+        try draw(ui, what: "log", text: text_arg(args, i: 0));
+        return c.Val.Unit;
+    }
+    if func.eq("ui-label") or func.eq("ui-separator") {
+        if func.eq("ui-separator") {
+            try draw(ui, what: "separator", text: "");
+        } else {
+            try draw(ui, what: "label", text: text_arg(args, i: 0));
+        }
+        return c.Val.Unit;
+    }
+    if func.eq("ui-heading") {
+        try draw(ui, what: "heading", text: text_arg(args, i: 0));
+        return c.Val.Unit;
+    }
+    if func.eq("ui-button") or func.eq("ui-tile") {
+        try draw(ui, what: "button", text: text_arg(args, i: 0));
+        return bool_val(clicked(ui, text: text_arg(args, i: 0)));
+    }
+    if func.eq("ui-checkbox") {
+        try draw(ui, what: "checkbox", text: text_arg(args, i: 0));
+        let checked = int_arg(args, i: 1) != 0;
+        return bool_val(checked != clicked(ui, text: text_arg(args, i: 0)));
+    }
+    if func.eq("ui-text-edit") or func.eq("ui-search-field") {
+        try draw(ui, what: "field", text: text_arg(args, i: 0));
+        return str_val(text_arg(args, i: 0), a);
+    }
+    if func.eq("ui-choice") {
+        try draw(ui, what: "choice", text: "");
+        return int_val(int_arg(args, i: 1));
+    }
+    if func.eq("ui-progress") or func.eq("ui-image") {
+        try draw(ui, what: func, text: "");
+        return c.Val.Unit;
+    }
+    if func.eq("ui-submitted") {
+        return bool_val(false);
+    }
+    if func.eq("ui-begin") {
+        ui.depth += 1;
+        if ui.depth <= MAX_NESTING {
+            try draw(ui, what: "begin", text: text_arg(args, i: 0));
+        }
+        return c.Val.Unit;
+    }
+    if func.eq("ui-end") {
+        if ui.depth > 0 {
+            ui.depth -= 1;
+        }
+        return c.Val.Unit;
+    }
+    if func.eq("now-millis") {
+        return int_val(ui.now_ms as% u64);
+    }
+    if func.eq("list-apps") {
+        var items = alloc.List(c.Val).init(a);
+        items.push(app_entry(name: "Counter", source: "counter.component.wasm", about: "Counts taps", a));
+        items.push(app_entry(name: "Hello", source: "hello.component.wasm", about: "Says hello", a));
+        items.push(app_entry(name: "Store", source: "store.component.wasm", about: "Lists the apps", a));
+        return c.Val.List { items: items };
+    }
+    if func.eq("open-app") {
+        try draw(ui, what: "open", text: text_arg(args, i: 0));
+        return c.Val.Unit;
+    }
+    if func.eq("request-frame") {
+        return c.Val.Unit;
+    }
+    if func.eq("storage-get") {
+        let i = storage_index(ui, key: text_arg(args, i: 0)) orelse return nothing(a);
+        return some_val(str_val(ui.values.items()[i].view(), a), a);
+    }
+    if func.eq("storage-set") {
+        let key = text_arg(args, i: 0);
+        let value = text_arg(args, i: 1);
+        var used = storage_used(ui);
+        let at = storage_index(ui, key: key);
+        match at {
+            some(i) => { used -= ui.keys.items()[i].len() as u64 + ui.values.items()[i].len() as u64; }
+            none => { }
+        }
+        if used + key.len() as u64 + value.len() as u64 > MAX_STORAGE {
+            return done("storage is full: 1 MiB per app", a);
+        }
+        match at {
+            some(i) => { ui.values.items_mut()[i] = alloc.String.from(value, a); }
+            none => {
+                ui.keys.push(alloc.String.from(key, a));
+                ui.values.push(alloc.String.from(value, a));
+            }
+        }
+        return done("", a);
+    }
+    if func.eq("storage-remove") {
+        match storage_index(ui, key: text_arg(args, i: 0)) {
+            some(i) => {
+                ui.keys.items_mut()[i] = alloc.String.init(a);
+                ui.values.items_mut()[i] = alloc.String.init(a);
+            }
+            none => { }
+        }
+        return c.Val.Unit;
+    }
+    if func.eq("storage-keys") {
+        var items = alloc.List(c.Val).init(a);
+        for k in ui.keys.items() {
+            if k.len() > 0 {
+                items.push(str_val(k.view(), a));
+            }
+        }
+        return c.Val.List { items: items };
+    }
+    if func.eq("image-load") {
+        ui.images += 1;
+        var p = alloc.List(c.Val).init(a);
+        p.push(int_val(ui.images as u64));
+        return c.Val.Variant { case: 0, payload: p };
+    }
+    if func.eq("fetch") {
+        return done("no network in this shell", a);
+    }
+    if func.eq("fetch-poll") {
+        return nothing(a);
+    }
+    if func.eq("locale") {
+        return str_val("en-US", a);
+    }
+    if func.eq("time-zone") {
+        return str_val("", a);
+    }
+    if func.eq("utc-offset") {
+        return int_val(0);
+    }
+    if func.eq("app-info") {
+        var fields = alloc.List(c.Val).init(a);
+        fields.push(str_val("", a));
+        fields.push(str_val("", a));
+        return c.Val.List { items: fields };
+    }
+    return exec.Trap.HostTrap;
+}
+
+// ---- the element tree -------------------------------------------------------------------
+
+fn live(ui: &Ui, n: u64) -> bool {
+    return n > 0 and n < ui.nodes.len() as u64 and ui.nodes.items()[n as usize].alive;
+}
+
+fn attr_index(node: &Node, name: str) -> ?usize {
+    var i: usize = 0;
+    while i < node.names.len() : (i += 1) {
+        if node.names.items()[i].view().eq(name) {
+            return i;
+        }
+    }
+    return none;
+}
+
+fn set_attr(ui: &mut Ui, n: u32, name: str, value: str) {
+    let a = ui.a;
+    match attr_index(&ui.nodes.items()[n as usize], name: name) {
+        some(i) => { ui.nodes.items_mut()[n as usize].values.items_mut()[i] = alloc.String.from(value, a); }
+        none => {
+            ui.nodes.items_mut()[n as usize].names.push(alloc.String.from(name, a));
+            ui.nodes.items_mut()[n as usize].values.push(alloc.String.from(value, a));
+        }
+    }
+}
+
+fn detach(ui: &mut Ui, n: u32) {
+    let p = ui.nodes.items()[n as usize].parent;
+    if p == 0 {
+        return;
+    }
+    var kept = alloc.List(u32).init(ui.a);
+    for x in ui.nodes.items()[p as usize].children.items() {
+        if x.* != n {
+            kept.push(x.*);
+        }
+    }
+    ui.nodes.items_mut()[p as usize].children = kept;
+    ui.nodes.items_mut()[n as usize].parent = 0;
+}
+
+fn inside(ui: &Ui, n: u32, of: u32) -> bool {
+    var at = of;
+    while at != 0 {
+        if at == n {
+            return true;
+        }
+        at = ui.nodes.items()[at as usize].parent;
+    }
+    return false;
+}
+
+fn append(ui: &mut Ui, parent: u32, child: u32) {
+    if inside(ui, n: child, of: parent) or ui.nodes.items()[parent as usize].tag.len() == 0 {
+        return;
+    }
+    detach(ui, n: child);
+    ui.nodes.items_mut()[parent as usize].children.push(child);
+    ui.nodes.items_mut()[child as usize].parent = parent;
+}
+
+fn release(ui: &mut Ui, n: u32) {
+    detach(ui, n: n);
+    var stack = alloc.List(u32).init(ui.a);
+    stack.push(n);
+    while stack.len() > 0 {
+        let x = stack.pop() orelse 0;
+        ui.nodes.items_mut()[x as usize].alive = false;
+        for k in ui.nodes.items()[x as usize].children.items() {
+            stack.push(k.*);
+        }
+    }
+}
+
+fn clear_children(ui: &mut Ui, n: u32) {
+    while ui.nodes.items()[n as usize].children.len() > 0 {
+        let k = ui.nodes.items()[n as usize].children.items()[0];
+        release(ui, n: k);
+    }
+}
+
+fn text_content(ui: &Ui, n: u32, out: &mut alloc.String) {
+    let node = &ui.nodes.items()[n as usize];
+    if node.tag.len() == 0 {
+        out.push_str(node.text.view());
+        return;
+    }
+    for k in node.children.items() {
+        text_content(ui, n: k.*, out: out);
+    }
+}
+
+fn make_node(ui: &mut Ui, tag: str) -> exec.Trap!u32 {
+    if ui.nodes.len() >= MAX_NODES {
+        ui.exceeded = true;
+        return exec.Trap.HostLimit;
+    }
+    return new_node(ui, tag: tag);
+}
+
+fn is_void(tag: str) -> bool {
+    return tag.eq("input") or tag.eq("img") or tag.eq("br") or tag.eq("hr") or tag.eq("meta") or tag.eq("link");
+}
+
+fn name_byte(b: u8) -> bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '-' or b == '_' or b == ':';
+}
+
+/// Text with &lt;, &gt;, &amp;, &quot;, &apos;, &#39; and &#NN; read.
+fn unescape(b: []u8, from: usize, to: usize, out: &mut alloc.String) {
+    var i = from;
+    while i < to {
+        if b[i] == '&' {
+            var j = i + 1;
+            while j < to and j < i + 10 and b[j] != ';' {
+                j += 1;
+            }
+            if j < to and b[j] == ';' {
+                let ent = b[i + 1..j];
+                var known = true;
+                if bytes_eq(ent, "lt") {
+                    out.push_ascii('<');
+                } else if bytes_eq(ent, "gt") {
+                    out.push_ascii('>');
+                } else if bytes_eq(ent, "amp") {
+                    out.push_ascii('&');
+                } else if bytes_eq(ent, "quot") {
+                    out.push_ascii('"');
+                } else if bytes_eq(ent, "apos") or bytes_eq(ent, "#39") {
+                    out.push_ascii('\'');
+                } else {
+                    known = false;
+                }
+                if known {
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        // One whole character at a time keeps the string UTF-8.
+        var end = i + 1;
+        while end < to and b[end] & 0xC0 == 0x80 {
+            end += 1;
+        }
+        _ = out.push_utf8(b[i..end]);
+        i = end;
+    }
+}
+
+fn bytes_eq(b: []u8, s: str) -> bool {
+    return same_bytes(x: b, y: s.bytes());
+}
+
+fn same_bytes(x: []u8, y: []u8) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.len() : (i += 1) {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Parses markup into new nodes under parent; an error says where.
+fn parse_markup(ui: &mut Ui, parent: u32, markup: str) -> exec.Trap!alloc.String {
+    let b = markup.bytes();
+    var open = alloc.List(u32).init(ui.a);
+    open.push(parent);
+    var i: usize = 0;
+    var why = alloc.String.init(ui.a);
+    while i < b.len() {
+        let top = open.items()[open.len() - 1];
+        if b[i] != '<' {
+            var j = i;
+            while j < b.len() and b[j] != '<' {
+                j += 1;
+            }
+            let t = try make_node(ui, tag: "");
+            var text = alloc.String.init(ui.a);
+            unescape(b, from: i, to: j, out: &mut text);
+            ui.nodes.items_mut()[t as usize].text = text;
+            append(ui, parent: top, child: t);
+            i = j;
+            continue;
+        }
+        if i + 1 < b.len() and b[i + 1] == '/' {
+            var j = i + 2;
+            while j < b.len() and b[j] != '>' {
+                j += 1;
+            }
+            if j >= b.len() or open.len() <= 1 {
+                why.push_str("an end tag with nothing open, at byte ");
+                why.push_u64(i as u64);
+                return why;
+            }
+            _ = open.pop();
+            i = j + 1;
+            continue;
+        }
+        var j = i + 1;
+        while j < b.len() and name_byte(b[j]) {
+            j += 1;
+        }
+        if j == i + 1 {
+            why.push_str("a '<' that starts no tag, at byte ");
+            why.push_u64(i as u64);
+            return why;
+        }
+        var tag = alloc.String.init(ui.a);
+        _ = tag.push_utf8(b[i + 1..j]);
+        let n = try make_node(ui, tag: tag.view());
+        append(ui, parent: top, child: n);
+        // Attributes, until > or />.
+        var closed = false;
+        while true {
+            while j < b.len() and (b[j] == ' ' or b[j] == '\n' or b[j] == '\t') {
+                j += 1;
+            }
+            if j >= b.len() {
+                why.push_str("a tag that does not end");
+                return why;
+            }
+            if b[j] == '>' {
+                j += 1;
+                break;
+            }
+            if b[j] == '/' and j + 1 < b.len() and b[j + 1] == '>' {
+                j += 2;
+                closed = true;
+                break;
+            }
+            let start = j;
+            while j < b.len() and name_byte(b[j]) {
+                j += 1;
+            }
+            if j == start {
+                why.push_str("an attribute without a name, at byte ");
+                why.push_u64(j as u64);
+                return why;
+            }
+            var name = alloc.String.init(ui.a);
+            _ = name.push_utf8(b[start..j]);
+            var value = alloc.String.init(ui.a);
+            if j < b.len() and b[j] == '=' {
+                j += 1;
+                if j < b.len() and (b[j] == '"' or b[j] == '\'') {
+                    let q = b[j];
+                    let from = j + 1;
+                    j = from;
+                    while j < b.len() and b[j] != q {
+                        j += 1;
+                    }
+                    unescape(b, from: from, to: j, out: &mut value);
+                    j += 1;
+                } else {
+                    let from = j;
+                    while j < b.len() and b[j] != ' ' and b[j] != '>' {
+                        j += 1;
+                    }
+                    unescape(b, from: from, to: j, out: &mut value);
+                }
+            }
+            set_attr(ui, n: n, name: name.view(), value: value.view());
+        }
+        if not closed and not is_void(tag.view()) {
+            open.push(n);
+        }
+        i = j;
+    }
+    return why;
+}
+
+/// Whether n matches one compound selector: a tag, #id and .classes.
+fn matches_compound(ui: &Ui, n: u32, sel: []u8) -> bool {
+    let node = &ui.nodes.items()[n as usize];
+    if node.tag.len() == 0 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < sel.len() {
+        var kind: u8 = 't';
+        if sel[i] == '#' or sel[i] == '.' {
+            kind = sel[i];
+            i += 1;
+        }
+        let start = i;
+        while i < sel.len() and sel[i] != '#' and sel[i] != '.' {
+            i += 1;
+        }
+        let part = sel[start..i];
+        if kind == 't' {
+            if part.len() > 0 and not bytes_eq(part, node.tag.view()) and not bytes_eq(part, "*") {
+                return false;
+            }
+        } else if kind == '#' {
+            match attr_index(node, name: "id") {
+                some(k) => {
+                    if not bytes_eq(part, node.values.items()[k].view()) {
+                        return false;
+                    }
+                }
+                none => { return false; }
+            }
+        } else {
+            var found = false;
+            match attr_index(node, name: "class") {
+                some(k) => {
+                    let classes = node.values.items()[k].view().bytes();
+                    var c0: usize = 0;
+                    while c0 < classes.len() {
+                        var c1 = c0;
+                        while c1 < classes.len() and classes[c1] != ' ' {
+                            c1 += 1;
+                        }
+                        if c1 - c0 == part.len() and same_bytes(x: classes[c0..c1], y: part) {
+                            found = true;
+                        }
+                        c0 = c1 + 1;
+                    }
+                }
+                none => { }
+            }
+            if not found {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Whether n matches a selector of compounds parted by spaces, each an
+/// ancestor of the next (the descendant combinator), below scope.
+fn matches(ui: &Ui, n: u32, sel: []u8, scope: u32) -> bool {
+    // The last compound is n's; the ones before match ancestors, in order.
+    var end = sel.len();
+    while end > 0 and sel[end - 1] == ' ' {
+        end -= 1;
+    }
+    var start = end;
+    while start > 0 and sel[start - 1] != ' ' {
+        start -= 1;
+    }
+    if start == end or not matches_compound(ui, n: n, sel: sel[start..end]) {
+        return false;
+    }
+    var at = ui.nodes.items()[n as usize].parent;
+    var rest = start;
+    while rest > 0 {
+        var e = rest;
+        while e > 0 and sel[e - 1] == ' ' {
+            e -= 1;
+        }
+        if e == 0 {
+            return true;
+        }
+        var st = e;
+        while st > 0 and sel[st - 1] != ' ' {
+            st -= 1;
+        }
+        // The nearest ancestor below scope that matches.
+        while at != 0 and at != scope and not matches_compound(ui, n: at, sel: sel[st..e]) {
+            at = ui.nodes.items()[at as usize].parent;
+        }
+        if at == 0 or at == scope {
+            return false;
+        }
+        at = ui.nodes.items()[at as usize].parent;
+        rest = st;
+    }
+    return true;
+}
+
+fn query(ui: &Ui, scope: u32, n: u32, sel: []u8, out: &mut alloc.List(u32)) {
+    for k in ui.nodes.items()[n as usize].children.items() {
+        if matches(ui, n: k.*, sel: sel, scope: scope) {
+            out.push(k.*);
+        }
+        query(ui, scope: scope, n: k.*, sel: sel, out: out);
+    }
+}
+
+fn first_match(ui: &Ui, sel: str) -> u32 {
+    var found = alloc.List(u32).init(ui.a);
+    query(ui, scope: 1, n: 1, sel: sel.bytes(), out: &mut found);
+    if found.len() == 0 {
+        return 0;
+    }
+    return found.items()[0];
+}
+
+fn dom(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
+    let a = ui.a;
+    if func.eq("root") {
+        return int_val(1);
+    }
+    if func.eq("create-element") {
+        return int_val(try make_node(ui, tag: text_arg(args, i: 0)) as u64);
+    }
+    if func.eq("create-text") {
+        let t = try make_node(ui, tag: "");
+        ui.nodes.items_mut()[t as usize].text = alloc.String.from(text_arg(args, i: 0), a);
+        return int_val(t as u64);
+    }
+    if func.eq("add-stylesheet") {
+        ui.sheets += 1;
+        return int_val(ui.sheets as u64);
+    }
+    if func.eq("remove-stylesheet") or func.eq("focus") {
+        return c.Val.Unit;
+    }
+    if func.eq("events") {
+        var items = alloc.List(c.Val).init(a);
+        for e in ui.events.items() {
+            var fields = alloc.List(c.Val).init(a);
+            fields.push(str_val(e.kind.view(), a));
+            fields.push(int_val(e.target as u64));
+            fields.push(int_val(e.current as u64));
+            fields.push(str_val(e.value.view(), a));
+            fields.push(c.Val.F32 { bits: 0 });
+            fields.push(c.Val.F32 { bits: 0 });
+            items.push(c.Val.List { items: fields });
+        }
+        ui.events.clear();
+        return c.Val.List { items: items };
+    }
+    // The rest name a node first; one that is not a node is ignored.
+    let n = int_arg(args, i: 0);
+    if not live(ui, n: n) {
+        if func.eq("get-attribute") or func.eq("parent") or func.eq("bounds") {
+            return nothing(a);
+        }
+        if func.eq("query-all") or func.eq("children") {
+            return c.Val.List { items: alloc.List(c.Val).init(a) };
+        }
+        if func.eq("value") {
+            return str_val("", a);
+        }
+        if func.eq("set-markup") {
+            return done("", a);
+        }
+        return c.Val.Unit;
+    }
+    let node = n as u32;
+    if func.eq("append-child") or func.eq("insert-before") {
+        let child = int_arg(args, i: 1);
+        if live(ui, n: child) {
+            append(ui, parent: node, child: child as u32);
+            if func.eq("insert-before") and live(ui, n: int_arg(args, i: 2)) {
+                // Moved to just before the one named.
+                let before = int_arg(args, i: 2) as u32;
+                var order = alloc.List(u32).init(a);
+                for k in ui.nodes.items()[node as usize].children.items() {
+                    if k.* == before {
+                        order.push(child as u32);
+                    }
+                    if k.* != child as u32 {
+                        order.push(k.*);
+                    }
+                }
+                if order.len() == ui.nodes.items()[node as usize].children.len() {
+                    ui.nodes.items_mut()[node as usize].children = order;
+                }
+            }
+        }
+        return c.Val.Unit;
+    }
+    if func.eq("remove") {
+        detach(ui, n: node);
+        return c.Val.Unit;
+    }
+    if func.eq("release") {
+        release(ui, n: node);
+        return c.Val.Unit;
+    }
+    if func.eq("set-text") {
+        if ui.nodes.items()[node as usize].tag.len() == 0 {
+            ui.nodes.items_mut()[node as usize].text = alloc.String.from(text_arg(args, i: 1), a);
+        } else {
+            clear_children(ui, n: node);
+            let t = try make_node(ui, tag: "");
+            ui.nodes.items_mut()[t as usize].text = alloc.String.from(text_arg(args, i: 1), a);
+            append(ui, parent: node, child: t);
+        }
+        return c.Val.Unit;
+    }
+    if func.eq("set-attribute") {
+        set_attr(ui, n: node, name: text_arg(args, i: 1), value: text_arg(args, i: 2));
+        return c.Val.Unit;
+    }
+    if func.eq("remove-attribute") {
+        let name = text_arg(args, i: 1);
+        match attr_index(&ui.nodes.items()[node as usize], name: name) {
+            some(k) => {
+                // Kept in order: the rest move up.
+                var names = alloc.List(alloc.String).init(a);
+                var values = alloc.List(alloc.String).init(a);
+                var i: usize = 0;
+                while i < ui.nodes.items()[node as usize].names.len() : (i += 1) {
+                    if i != k {
+                        names.push(ui.nodes.items()[node as usize].names.items()[i].clone());
+                        values.push(ui.nodes.items()[node as usize].values.items()[i].clone());
+                    }
+                }
+                ui.nodes.items_mut()[node as usize].names = names;
+                ui.nodes.items_mut()[node as usize].values = values;
+            }
+            none => { }
+        }
+        return c.Val.Unit;
+    }
+    if func.eq("get-attribute") {
+        match attr_index(&ui.nodes.items()[node as usize], name: text_arg(args, i: 1)) {
+            some(k) => { return some_val(str_val(ui.nodes.items()[node as usize].values.items()[k].view(), a), a); }
+            none => { return nothing(a); }
+        }
+    }
+    if func.eq("toggle-class") or func.eq("set-style") {
+        return c.Val.Unit;
+    }
+    if func.eq("set-markup") {
+        clear_children(ui, n: node);
+        let why = try parse_markup(ui, parent: node, markup: text_arg(args, i: 1));
+        return done(why.view(), a);
+    }
+    if func.eq("query-all") {
+        var found = alloc.List(u32).init(a);
+        query(ui, scope: node, n: node, sel: text_arg(args, i: 1).bytes(), out: &mut found);
+        return node_list(&found, a);
+    }
+    if func.eq("parent") {
+        let p = ui.nodes.items()[node as usize].parent;
+        if p == 0 {
+            return nothing(a);
+        }
+        return some_val(int_val(p as u64), a);
+    }
+    if func.eq("children") {
+        return node_list(&ui.nodes.items()[node as usize].children, a);
+    }
+    if func.eq("value") {
+        match attr_index(&ui.nodes.items()[node as usize], name: "value") {
+            some(k) => { return str_val(ui.nodes.items()[node as usize].values.items()[k].view(), a); }
+            none => { }
+        }
+        var text = alloc.String.init(a);
+        text_content(ui, n: node, out: &mut text);
+        return c.Val.Str { v: text };
+    }
+    if func.eq("bounds") {
+        return nothing(a);
+    }
+    if func.eq("listen") {
+        ui.nodes.items_mut()[node as usize].listens.push(alloc.String.from(text_arg(args, i: 1), a));
+        return c.Val.Unit;
+    }
+    if func.eq("unlisten") {
+        return c.Val.Unit;
+    }
+    return exec.Trap.HostTrap;
+}
+
+impl c.Imports for Ui {
+    fn has(self: &Ui, instance: str, func: str) -> bool {
+        for d in self.denied.items() {
+            if d.view().eq(func) {
+                return false;
+            }
+        }
+        var list = "";
+        if instance.eq(HOST_API) {
+            list = HOST_FUNCS;
+        } else if instance.eq(DOM) {
+            list = DOM_FUNCS;
+        } else {
+            return false;
+        }
+        // " name " in the list.
+        let l = list.bytes();
+        let f = func.bytes();
+        var i: usize = 0;
+        while i + f.len() + 2 <= l.len() : (i += 1) {
+            if l[i] == ' ' and l[i + f.len() + 1] == ' ' and same_bytes(x: l[i + 1..i + 1 + f.len()], y: f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn call(self: &mut Ui, instance: str, func: str, args: &alloc.List(c.Val), a: alloc.Allocator) -> exec.Trap!c.Val {
+        if instance.eq(DOM) {
+            return try dom(self, func: func, args: args);
+        }
+        return try host_api(self, func: func, args: args);
+    }
+}
+
+/// Types text into the first field that matches sel, and tells its
+/// listeners.
+pub fn type_into(ui: &mut Ui, sel: str, text: str) {
+    let n = first_match(ui, sel: sel);
+    if n == 0 {
+        return;
+    }
+    set_attr(ui, n: n, name: "value", value: text);
+    var at = n;
+    while at != 0 {
+        for k in ui.nodes.items()[at as usize].listens.items() {
+            if k.view().eq("input") {
+                ui.events.push(Event { kind: alloc.String.from("input", ui.a), target: n, current: at, value: alloc.String.from(text, ui.a) });
+            }
+        }
+        at = ui.nodes.items()[at as usize].parent;
+    }
+}
+
+/// The element tree as markup, one element a line, indented.
+pub fn write_tree(ui: &Ui, n: u32, depth: u32, out: &mut alloc.String) {
+    let node = &ui.nodes.items()[n as usize];
+    var i: u32 = 0;
+    while i < depth : (i += 1) {
+        out.push_str("  ");
+    }
+    if node.tag.len() == 0 {
+        out.push_str("\"");
+        out.push_str(node.text.view());
+        out.push_str("\"\n");
+        return;
+    }
+    out.push_str("<");
+    out.push_str(node.tag.view());
+    var k: usize = 0;
+    while k < node.names.len() : (k += 1) {
+        out.push_str(" ");
+        out.push_str(node.names.items()[k].view());
+        if node.values.items()[k].len() > 0 {
+            out.push_str("=\"");
+            out.push_str(node.values.items()[k].view());
+            out.push_str("\"");
+        }
+    }
+    out.push_str(">\n");
+    for x in node.children.items() {
+        write_tree(ui, n: x.*, depth: depth + 1, out: out);
+    }
+}
+
+/// An app: its component, and the shell its imports reach. It is the host
+/// the store calls back, for the component's lowered imports.
+pub type App = struct {
+    pub comp: c.Component,
+    pub ui: Ui,
+}
+
+impl exec.Host for App {
+    fn call(self: &mut App, store: &mut exec.Store, id: u32, args: []u64, results: []mut u64) -> exec.Trap!void {
+        try c.handle(&self.comp, store, imports: &mut self.ui, id, args, results);
+    }
+}
+
+/// The shell's limits for a store of apps.
+pub fn limits() -> exec.Limits {
+    var l = exec.default_limits();
+    l.memory_bytes = MAX_MEMORY;
+    l.trap = true;
+    return l;
+}
+
+/// Calls the app's export name (init or update), within budget_ns of now.
+pub fn run(app: &mut App, store: &mut exec.Store, now: &dyn fn() -> u64, name: str, budget_ns: u64) -> exec.Trap!void {
+    let none_args = alloc.List(c.Val).init(app.ui.a);
+    let p = try c.prepare(&app.comp, store, name: name, &none_args);
+    var results = alloc.List(u64).init(app.ui.a);
+    store.deadline_ns = now() + budget_ns;
+    let r = exec.invoke(store, app, now, func: p.core, p.args.items(), &mut results);
+    store.deadline_ns = 0;
+    try r;
+    _ = try c.finish(&app.comp, store, &p, &results);
+}

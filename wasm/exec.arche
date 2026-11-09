@@ -51,14 +51,15 @@ pub fn message(t: Trap) -> str {
 }
 
 /// What the embedder gives a guest beyond itself: the bodies of the host
-/// functions it imports, and a say in how long it runs.
+/// functions it imports. A guest reaches nothing else.
 pub type Host = interface {
     /// Runs host function id: args are its params, results to be filled.
     fn call(self: &mut Self, store: &mut Store, id: u32, args: []u64, results: []mut u64) -> Trap!void;
-    /// Asked now and then while a guest runs, at calls and loops: false
-    /// stops it with Trap.Deadline.
-    fn tick(self: &mut Self) -> bool;
 }
+
+// A deadline's clock is the embedder's: invoke takes it as a closure that
+// gives nanoseconds, and looks every Limits.tick_every calls and loop turns.
+// The engine reads no clock itself.
 
 /// What one store allows its guests.
 pub type Limits = struct {
@@ -71,7 +72,7 @@ pub type Limits = struct {
     /// Slots of the value stack, and calls deep.
     pub stack_values: u32,
     pub frames: u32,
-    /// Instructions between two ticks of the host (Host.tick).
+    /// Calls and loop turns between two looks at the clock.
     pub tick_every: u32,
 }
 
@@ -148,6 +149,9 @@ pub type Store = struct {
     sp: usize,
     frames: alloc.List(Frame),
     fuel: u32,
+    /// When the guest must have stopped, by the clock invoke is given; 0 for
+    /// never. The embedder sets it before a call.
+    pub deadline_ns: u64,
     a: alloc.Allocator,
 }
 
@@ -165,6 +169,7 @@ pub fn new_store(limits: Limits, a: alloc.Allocator) -> Store {
         sp: 0,
         frames: alloc.List(Frame).init(a),
         fuel: limits.tick_every,
+        deadline_ns: 0,
         a: a,
     };
     s.stack.grow_zeroed(limits.stack_values as usize);
@@ -290,7 +295,7 @@ fn eval_const(s: &Store, instance: u32, c: m.Const) -> u64 {
 /// An instance of module, its imports given in the order the module lists
 /// them; its index. Elements and data are written in order, then start
 /// runs; a trap on the way leaves what was written before it.
-pub fn instantiate(s: &mut Store, host: &mut dyn Host, module: u32, imports: []Extern) -> Trap!u32 {
+pub fn instantiate(s: &mut Store, host: &mut dyn Host, now: &dyn fn() -> u64, module: u32, imports: []Extern) -> Trap!u32 {
     let a = s.a;
     var inst = Instance {
         module: module,
@@ -467,7 +472,7 @@ pub fn instantiate(s: &mut Store, host: &mut dyn Host, module: u32, imports: []E
         let f = s.instances.items()[index as usize].funcs.items()[s.modules.items()[module as usize].start as usize];
         var results = alloc.List(u64).init(a);
         let none_args: [0]u64 = [];
-        try invoke(s, host, func: f, none_args[0..0], &mut results);
+        try invoke(s, host, now, func: f, none_args[0..0], &mut results);
     }
     return index;
 }
@@ -506,7 +511,7 @@ fn memory_init(s: &mut Store, instance: u32, data: u32, dst: u64, src: u64, n: u
 }
 
 /// Runs function addr with args, its results into results.
-pub fn invoke(s: &mut Store, host: &mut dyn Host, func: u32, args: []u64, results: &mut alloc.List(u64)) -> Trap!void {
+pub fn invoke(s: &mut Store, host: &mut dyn Host, now: &dyn fn() -> u64, func: u32, args: []u64, results: &mut alloc.List(u64)) -> Trap!void {
     results.clear();
     let base_sp = s.sp;
     let base_frames = s.frames.len();
@@ -521,7 +526,7 @@ pub fn invoke(s: &mut Store, host: &mut dyn Host, func: u32, args: []u64, result
         s.stack.items_mut()[base_sp + i] = args[i];
     }
     s.sp = base_sp + np;
-    match run(s, host, func: func) {
+    match run(s, host, now, func: func) {
         ok(_) => { }
         err(e) => {
             s.sp = base_sp;
@@ -600,7 +605,7 @@ fn sext(x: u64, bits: u32) -> u64 {
 }
 
 /// Calls func, whose args are on the stack, and runs until it returns.
-fn run(s: &mut Store, host: &mut dyn Host, func: u32) -> Trap!void {
+fn run(s: &mut Store, host: &mut dyn Host, now: &dyn fn() -> u64, func: u32) -> Trap!void {
     let base = s.frames.len();
     var event = EVENT_CALL;
     var target = func;
@@ -681,8 +686,7 @@ fn run(s: &mut Store, host: &mut dyn Host, func: u32) -> Trap!void {
                 s.stack.items_mut()[sp - 1] = pages;
             }
         } else if event == EVENT_TICK {
-            s.sp = sp;
-            if not host.tick() {
+            if s.deadline_ns != 0 and now() >= s.deadline_ns {
                 return Trap.Deadline;
             }
             s.fuel = s.limits.tick_every;

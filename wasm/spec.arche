@@ -17,10 +17,6 @@ impl exec.Host for SpecHost {
     fn call(self: &mut SpecHost, store: &mut exec.Store, id: u32, args: []u64, results: []mut u64) -> exec.Trap!void {
         self.calls += 1;
     }
-
-    fn tick(self: &mut SpecHost) -> bool {
-        return true;
-    }
 }
 
 pub type Tally = struct {
@@ -326,7 +322,7 @@ fn load(r: &mut Runner, fs: &std.Fs, path: str, instance: &mut u32) -> Outcome {
         let e = resolve(r, module: imp.module.view(), name: imp.name.view()) orelse return Outcome.Unlinkable;
         imports.push(e);
     }
-    match exec.instantiate(&mut r.store, &mut r.host, module: module, imports.items()) {
+    match exec.instantiate(&mut r.store, &mut r.host, now: fn [] () -> u64 { return 0; }, module: module, imports.items()) {
         ok(x) => {
             instance.* = x;
             return Outcome.Loaded;
@@ -358,7 +354,7 @@ fn act(r: &mut Runner, c: &Command, results: &mut alloc.List(u64)) -> exec.Trap!
     for x in c.args.items() {
         args.push(arg_bits(x));
     }
-    try exec.invoke(&mut r.store, &mut r.host, func: e.addr, args.items(), results);
+    try exec.invoke(&mut r.store, &mut r.host, now: fn [] () -> u64 { return 0; }, func: e.addr, args.items(), results);
 }
 
 fn report(out: &mut std.Output, file: str, c: &Command, what: str) {

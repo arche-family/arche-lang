@@ -2,7 +2,8 @@
 # compiler.
 #
 #   make          build/arche-wasm
-#   make check    the WebAssembly spec's tests (spec.sh)
+#   make check    the WebAssembly spec's tests (spec.sh), and Nimadir's
+#                 mini-apps (nimadir-check.sh)
 
 BUILD := build
 LIB := $(wildcard ../lib/*.arche ../lib/*/*.arche)
@@ -17,6 +18,7 @@ $(BUILD)/arche-wasm: $(wildcard *.arche) $(LIB) $(RUNTIME)
 
 check: $(BUILD)/arche-wasm
 	sh ./spec.sh $(BUILD)/arche-wasm
+	sh ./nimadir-check.sh $(BUILD)/arche-wasm
 
 clean:
 	rm -rf $(BUILD)
