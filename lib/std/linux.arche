@@ -74,6 +74,15 @@ pub unsafe fn syscall(n: i64, args: [6]i64) -> i64 {
     return r;
 }
 
+extern "c" fn a0rt_file_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64;
+
+/// A system call on a file: while tasks run, the runtime makes it on a
+/// thread of its own and the task waits in the poller, so a disk that is
+/// slow stops this task and no other (compiler/runtime/linux.inc).
+pub unsafe fn file_syscall(n: i64, args: [6]i64) -> i64 {
+    return a0rt_file_syscall(n: n, a: args[0], b: args[1], c: args[2], d: args[3], e: args[4], f: args[5]);
+}
+
 /// What the generic table of the other processors does differently.
 pub const O_DIRECTORY: i64 = 0x10000;
 
@@ -91,7 +100,7 @@ pub unsafe fn poll(fds: i64, count: i64, timeout_ms: i64) -> i64 {
 }
 
 pub unsafe fn rename_at(dir_from: i64, from: i64, dir_to: i64, to: i64) -> i64 {
-    return syscall(RENAMEAT, [dir_from, from, dir_to, to, 0, 0]);
+    return file_syscall(RENAMEAT, [dir_from, from, dir_to, to, 0, 0]);
 }
 
 /// A raw pointer as a system call argument.

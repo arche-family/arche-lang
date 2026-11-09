@@ -28,8 +28,40 @@ static i64 sys4(i64 n, i64 a, i64 b, i64 c, i64 d) {
 enum { SYS_READ = 63, SYS_WRITE = 64, SYS_CLOSE = 57, SYS_FSTAT = 80, SYS_MMAP = 222, SYS_MPROTECT = 226, SYS_MUNMAP = 215, SYS_GETPID = 172, SYS_PIPE2 = 59, SYS_SCHED_GETAFFINITY = 123,
        SYS_EXIT = 93, SYS_WAIT4 = 260, SYS_CLOCK_GETTIME = 113, SYS_EXIT_GROUP = 94, SYS_OPENAT = 56, SYS_UNLINKAT = 35 };
 
-static i64 sys_poll(PollFd *fds, u64 n) {
-    return sys6(73, (i64)fds, (i64)n, 0, 0, 0, 0);
+enum { SYS_CLONE = 220, SYS_FUTEX = 98, SYS_EVENTFD2 = 19, SYS_PREAD64 = 67, SYS_PREADV2 = 286 };
+
+// A thread of this process running fn on stack, which must never return:
+// clone with the new stack, and in the child a call of fn (kept in x19).
+static i64 sys_thread(i64 flags, u8 *stack, void (*fn)(void)) {
+    register i64 x8 __asm__("x8") = SYS_CLONE;
+    register i64 x0 __asm__("x0") = flags;
+    register i64 x1 __asm__("x1") = (i64)stack;
+    register i64 x2 __asm__("x2") = 0;
+    register i64 x3 __asm__("x3") = 0;
+    register i64 x4 __asm__("x4") = 0;
+    register void (*x19)(void) __asm__("x19") = fn;
+    __asm__ volatile("svc #0\n"
+                     "cbnz x0, 1f\n"
+                     "blr x19\n"
+                     "mov x8, #93\n"
+                     "mov x0, #0\n"
+                     "svc #0\n"
+                     "1:\n"
+                     : "+r"(x0)
+                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x19)
+                     : "x30", "memory");
+    return x0;
+}
+
+// ppoll: no timeout waits; a zero one does not.
+// A spinning thread's breath: it tells the processor so.
+static void cpu_relax(void) {
+    __asm__ volatile("yield" ::: "memory");
+}
+
+static i64 sys_poll(PollFd *fds, u64 n, int wait) {
+    i64 zero[2] = {0, 0};
+    return sys6(73, (i64)fds, (i64)n, wait ? 0 : (i64)zero, 0, 0, 0);
 }
 
 static i64 sys_fork(void) {

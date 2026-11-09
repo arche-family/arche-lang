@@ -286,7 +286,7 @@ pub type Fs = struct {
         var r: i64 = 0;
         unsafe {
             // SAFETY: newfstatat writes a struct stat, 144 bytes on x86-64.
-            r = linux.syscall(linux.NEWFSTATAT, [self.dir, linux.arg(u8, &buf[0] as *u8), linux.arg(u8, &stat[0] as *u8), 0, 0, 0]);
+            r = linux.file_syscall(linux.NEWFSTATAT, [self.dir, linux.arg(u8, &buf[0] as *u8), linux.arg(u8, &stat[0] as *u8), 0, 0, 0]);
         }
         return r == 0;
     }
@@ -304,7 +304,7 @@ pub type Fs = struct {
         unsafe {
             // SAFETY: the path is NUL-terminated in buf. O_RDONLY | O_CLOEXEC:
             // a directory opens so too.
-            fd = linux.syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80000, 0, 0, 0]);
+            fd = linux.file_syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80000, 0, 0, 0]);
         }
         if linux.errno(fd) != 0 {
             return errno_error(linux.errno(fd));
@@ -312,7 +312,7 @@ pub type Fs = struct {
         var r: i64 = 0;
         unsafe {
             // SAFETY: fd is the file just opened, closed here.
-            r = linux.syscall(linux.FSYNC, [fd, 0, 0, 0, 0, 0]);
+            r = linux.file_syscall(linux.FSYNC, [fd, 0, 0, 0, 0, 0]);
             _ = linux.syscall(linux.CLOSE, [fd, 0, 0, 0, 0, 0]);
         }
         if linux.errno(r) != 0 {
@@ -335,7 +335,7 @@ pub type Fs = struct {
         var fd: i64 = 0;
         unsafe {
             // SAFETY: the path is NUL-terminated in buf; mode 0644.
-            fd = linux.syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), flags, 0x1A4, 0, 0]);
+            fd = linux.file_syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), flags, 0x1A4, 0, 0]);
         }
         if linux.errno(fd) != 0 {
             return errno_error(linux.errno(fd));
@@ -360,7 +360,7 @@ pub type Fs = struct {
         var r: i64 = 0;
         unsafe {
             // SAFETY: the path is NUL-terminated in buf.
-            r = linux.syscall(linux.MKDIRAT, [self.dir, linux.arg(u8, &buf[0] as *u8), mode, 0, 0, 0]);
+            r = linux.file_syscall(linux.MKDIRAT, [self.dir, linux.arg(u8, &buf[0] as *u8), mode, 0, 0, 0]);
         }
         if linux.errno(r) != 0 {
             return errno_error(linux.errno(r));
@@ -376,9 +376,9 @@ pub type Fs = struct {
         var r: i64 = 0;
         unsafe {
             // SAFETY: the path is NUL-terminated in buf.
-            r = linux.syscall(linux.UNLINKAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0, 0, 0, 0]);
+            r = linux.file_syscall(linux.UNLINKAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0, 0, 0, 0]);
             if linux.errno(r) == linux.EISDIR {
-                r = linux.syscall(linux.UNLINKAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x200, 0, 0, 0]);
+                r = linux.file_syscall(linux.UNLINKAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x200, 0, 0, 0]);
             }
         }
         if linux.errno(r) != 0 {
@@ -412,7 +412,7 @@ pub type Fs = struct {
         var fd: i64 = 0;
         unsafe {
             // SAFETY: O_RDONLY | O_DIRECTORY | O_CLOEXEC.
-            fd = linux.syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80000 | linux.O_DIRECTORY, 0, 0, 0]);
+            fd = linux.file_syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80000 | linux.O_DIRECTORY, 0, 0, 0]);
         }
         if linux.errno(fd) != 0 {
             return errno_error(linux.errno(fd));
@@ -423,7 +423,7 @@ pub type Fs = struct {
             var n: i64 = 0;
             unsafe {
                 // SAFETY: getdents64 writes up to 4096 bytes of entries.
-                n = linux.syscall(linux.GETDENTS64, [fd, linux.arg(u8, &entries[0] as *u8), 4096, 0, 0, 0]);
+                n = linux.file_syscall(linux.GETDENTS64, [fd, linux.arg(u8, &entries[0] as *u8), 4096, 0, 0, 0]);
             }
             if n <= 0 {
                 break;
@@ -1134,7 +1134,7 @@ pub type File = struct {
             var r: i64 = 0;
             unsafe {
                 // SAFETY: pread writes at most the bytes left of into.
-                r = linux.syscall(linux.PREAD64, [self.fd, linux.arg(u8, &into[done] as *u8), (into.len() - done) as i64, (offset + done as u64) as i64, 0, 0]);
+                r = linux.file_syscall(linux.PREAD64, [self.fd, linux.arg(u8, &into[done] as *u8), (into.len() - done) as i64, (offset + done as u64) as i64, 0, 0]);
             }
             if linux.errno(r) == linux.EINTR {
                 continue;
@@ -1157,7 +1157,7 @@ pub type File = struct {
             var r: i64 = 0;
             unsafe {
                 // SAFETY: pwrite reads the bytes left of data.
-                r = linux.syscall(linux.PWRITE64, [self.fd, linux.arg(u8, &data[done] as *u8), (data.len() - done) as i64, (offset + done as u64) as i64, 0, 0]);
+                r = linux.file_syscall(linux.PWRITE64, [self.fd, linux.arg(u8, &data[done] as *u8), (data.len() - done) as i64, (offset + done as u64) as i64, 0, 0]);
             }
             if linux.errno(r) == linux.EINTR {
                 continue;
@@ -1187,7 +1187,7 @@ pub type File = struct {
         var r: i64 = 0;
         unsafe {
             // SAFETY: ftruncate of the file this holds.
-            r = linux.syscall(linux.FTRUNCATE, [self.fd, size as i64, 0, 0, 0, 0]);
+            r = linux.file_syscall(linux.FTRUNCATE, [self.fd, size as i64, 0, 0, 0, 0]);
         }
         if linux.errno(r) != 0 {
             return errno_error(linux.errno(r));
@@ -1199,7 +1199,7 @@ pub type File = struct {
         var r: i64 = 0;
         unsafe {
             // SAFETY: fsync of the file this holds.
-            r = linux.syscall(linux.FSYNC, [self.fd, 0, 0, 0, 0, 0]);
+            r = linux.file_syscall(linux.FSYNC, [self.fd, 0, 0, 0, 0, 0]);
         }
         if linux.errno(r) != 0 {
             return errno_error(linux.errno(r));

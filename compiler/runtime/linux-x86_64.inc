@@ -35,8 +35,37 @@ static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
 enum { SYS_READ = 0, SYS_WRITE = 1, SYS_CLOSE = 3, SYS_FSTAT = 5, SYS_MMAP = 9, SYS_MPROTECT = 10, SYS_MUNMAP = 11, SYS_GETPID = 39, SYS_PIPE2 = 293, SYS_SCHED_GETAFFINITY = 204,
        SYS_EXIT = 60, SYS_WAIT4 = 61, SYS_CLOCK_GETTIME = 228, SYS_EXIT_GROUP = 231, SYS_OPENAT = 257, SYS_UNLINKAT = 263 };
 
-static i64 sys_poll(PollFd *fds, u64 n) {
-    return sys3(7, (i64)fds, (i64)n, -1);
+enum { SYS_CLONE = 56, SYS_FUTEX = 202, SYS_EVENTFD2 = 290, SYS_PREAD64 = 17, SYS_PREADV2 = 327 };
+
+// A thread of this process running fn on stack, which must never return:
+// clone with the new stack, and in the child a call of fn (kept in r12,
+// which the child has as the parent left it). The parent gets the id.
+static i64 sys_thread(i64 flags, u8 *stack, void (*fn)(void)) {
+    i64 r;
+    register i64 r10 __asm__("r10") = 0;
+    register i64 r8 __asm__("r8") = 0;
+    register void (*r12)(void) __asm__("r12") = fn;
+    __asm__ volatile("syscall\n"
+                     "test %%rax, %%rax\n"
+                     "jnz 1f\n"
+                     "call *%%r12\n"
+                     "mov $60, %%eax\n"
+                     "xor %%edi, %%edi\n"
+                     "syscall\n"
+                     "1:\n"
+                     : "=a"(r)
+                     : "a"(SYS_CLONE), "D"(flags), "S"(stack), "d"(0), "r"(r10), "r"(r8), "r"(r12)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+
+// A spinning thread's breath: it tells the processor so.
+static void cpu_relax(void) {
+    __asm__ volatile("pause" ::: "memory");
+}
+
+static i64 sys_poll(PollFd *fds, u64 n, int wait) {
+    return sys3(7, (i64)fds, (i64)n, wait ? -1 : 0);
 }
 
 static i64 sys_fork(void) {

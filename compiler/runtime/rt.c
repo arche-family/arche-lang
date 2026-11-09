@@ -39,8 +39,10 @@ static void os_stack_unmap(u8 *p, u64 n);
 static i64 os_open_read(const u8 *path, u64 path_len);
 static i64 os_open_write(const u8 *path, u64 path_len);
 static i64 os_open_program(const u8 *path, u64 path_len);
-static i64 os_read(i64 handle, u8 *p, u64 n);
 static i64 os_write(i64 handle, const u8 *p, u64 n);
+// Reading and writing a file: where tasks run, off their thread (linux.inc).
+static i64 os_file_read(i64 handle, u8 *p, u64 n);
+static i64 os_file_write(i64 handle, const u8 *p, u64 n);
 static void os_close(i64 handle);
 static i64 os_fs_dir(void);            // std.Fs.dir, as this system names the current directory
 // the process
@@ -52,7 +54,8 @@ void a0rt_ctx_switch(u64 *save_rsp, u64 load_rsp);
 static void os_stack_switch(const Fiber *next);
 static u64 os_fiber_frame(void);   // how many words of a new fiber's stack its frame takes
 static u64 os_fiber_saved(void);   // which of them a0rt_ctx_switch returns through
-static void os_poll(const i64 *handles, const short *events, u8 *ready, u64 n);
+// wait: block until one is ready; otherwise say which are, now.
+static void os_poll(const i64 *handles, const short *events, u8 *ready, u64 n, int wait);
 // the test runner: a child process for each test
 static void os_test_child(System *sys);
 // a panic: how it got there, when the program knows (the own backend's table)
@@ -842,18 +845,22 @@ static void poll_add(Fiber *f, u64 *n) {
     (*n)++;
 }
 
-// Blocks until a socket some fiber waits for is ready, and makes that
-// fiber ready. With none waiting for one, every task waits for another.
-static void poll_io(void) {
+// Makes ready the fibers whose sockets are: with wait, blocks until one is,
+// and with none waiting for one, every task waits for another; without,
+// only looks.
+static void poll_io(int wait) {
     u64 n = 0;
     poll_add(&main_fiber, &n);
     for (u64 i = 0; i < fiber_count; i++) {
         poll_add(fibers[i], &n);
     }
     if (n == 0) {
-        a0rt_die("deadlock: every task is waiting", 31);
+        if (wait) {
+            a0rt_die("deadlock: every task is waiting", 31);
+        }
+        return;
     }
-    os_poll(poll_handles, poll_events, poll_ready, n);
+    os_poll(poll_handles, poll_events, poll_ready, n, wait);
     for (u64 i = 0; i < n; i++) {
         if (poll_ready[i]) {
             poll_fibers[i]->state = READY;
@@ -861,17 +868,27 @@ static void poll_io(void) {
     }
 }
 
+// How many picks go by between two looks at the waiting sockets while
+// some task is ready: tasks that keep yielding do not keep the ones waiting
+// for a socket, or a file (linux.inc), from running.
+enum { LOOK_EVERY = 16 };
+static u64 picks;
+
 // The next fiber to run, chosen among the ready ones; when none is ready,
 // one waiting for a socket, once the socket is.
 static Fiber *pick(void) {
     u64 ready = 0;
+    picks++;
+    if (picks % LOOK_EVERY == 0) {
+        poll_io(0);
+    }
     while (ready == 0) {
         ready = main_fiber.state == READY ? 1 : 0;
         for (u64 i = 0; i < fiber_count; i++) {
             ready += fibers[i]->state == READY;
         }
         if (ready == 0) {
-            poll_io();
+            poll_io(1);
         }
     }
     u64 k = sched_next() % ready;
@@ -1140,7 +1157,7 @@ static u16 read_into(const u8 *path, u64 path_len, u64 *out) {
             out[0] = (u64)grow_in(out[3], (void *)out[0], out[1], cap);
             out[2] = cap;
         }
-        i64 n = os_read(fd, (u8 *)(out[0] + out[1]), out[2] - out[1]);
+        i64 n = os_file_read(fd, (u8 *)(out[0] + out[1]), out[2] - out[1]);
         if (n < 0) {
             os_close(fd);
             return io_error(n);
@@ -1212,7 +1229,7 @@ static u16 write_whole(i64 fd, const u8 *data, u64 len) {
     }
     u64 done = 0;
     while (done < len) {
-        i64 n = os_write(fd, data + done, len - done);
+        i64 n = os_file_write(fd, data + done, len - done);
         if (n < 0) {
             os_close(fd);
             return io_error(n);

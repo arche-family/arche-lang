@@ -1,0 +1,65 @@
+// test: run
+// spec: arche/9
+// stage0: skip
+// system: linux
+// stdout: synced and read 16777216 bytes; another task ran meanwhile: true
+// wasm: skip
+import alloc;
+import std;
+import std.task;
+
+// A task that waits for the disk does not stop the others: while tasks run,
+// the runtime makes a file's system calls on a thread of its own, and the
+// task waits in the poller (compiler/runtime/linux.inc). Here one task syncs
+// a file of 16 MiB to the disk, which always goes to the thread, and reads
+// it, while another counts; the count moves between the reader's start and
+// its end only if its waits let the counter run.
+fn main(sys: &mut std.System) -> !void {
+    let tmp = try sys.fs.temp_dir(&sys.env, sys.alloc);
+    var path = alloc.String.from(tmp.view(), sys.alloc);
+    path.push_str("/arche-file-read-yields-");
+    path.push_u64(sys.proc.pid() as u64);
+    var data = alloc.List(u8).init(sys.alloc);
+    data.grow_zeroed(16777216);
+    try sys.fs.write_bytes(path: path.view(), data: data.items());
+    let ticks = task.Shared(u64).init(0, sys.alloc);
+    let done = task.Shared(bool).init(false, sys.alloc);
+    let during = task.Shared(u64).init(0, sys.alloc);
+    let size = task.Shared(u64).init(0, sys.alloc);
+    let fs = &sys.fs;
+    let file = path.view();
+    let a = sys.alloc;
+    try task.scope(&sys.proc, fn [fs, file, a, &ticks, &done, &during, &size](s: &mut task.Scope) -> !void {
+        s.spawn(fn [fs, file, a, &ticks, &done, &during, &size]() -> !void {
+            var start: u64 = 0;
+            ticks.lock(fn [&mut start](n: &mut u64) { start = n.*; });
+            var f = try fs.open(file, create: false);
+            try f.sync();
+            f.close();
+            let read = try fs.read_bytes(file, a);
+            var end: u64 = 0;
+            ticks.lock(fn [&mut end](n: &mut u64) { end = n.*; });
+            let len = read.len() as u64;
+            size.lock(fn [len](n: &mut u64) { n.* = len; });
+            during.lock(fn [start, end](n: &mut u64) { n.* = end - start; });
+            done.lock(fn [](d: &mut bool) { d.* = true; });
+        });
+        s.spawn(fn [&ticks, &done]() -> !void {
+            var finished = false;
+            while not finished {
+                ticks.lock(fn [](n: &mut u64) { n.* += 1; });
+                done.lock(fn [&mut finished](d: &mut bool) { finished = d.*; });
+                task.yield_now();
+            }
+        });
+    });
+    var moved: u64 = 0;
+    during.lock(fn [&mut moved](n: &mut u64) { moved = n.*; });
+    var got: u64 = 0;
+    size.lock(fn [&mut got](n: &mut u64) { got = n.*; });
+    sys.stdout.write("synced and read ");
+    sys.stdout.write_u64(got);
+    sys.stdout.write(" bytes; another task ran meanwhile: ");
+    sys.stdout.write(if moved > 0 { "true\n" } else { "false\n" });
+    _ = sys.fs.remove(path.view());
+}

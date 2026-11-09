@@ -29,8 +29,40 @@ static i64 sys4(i64 n, i64 a, i64 b, i64 c, i64 d) {
 enum { SYS_READ = 63, SYS_WRITE = 64, SYS_CLOSE = 57, SYS_FSTAT = 80, SYS_MMAP = 222, SYS_MPROTECT = 226, SYS_MUNMAP = 215, SYS_GETPID = 172, SYS_PIPE2 = 59, SYS_SCHED_GETAFFINITY = 123,
        SYS_EXIT = 93, SYS_WAIT4 = 260, SYS_CLOCK_GETTIME = 113, SYS_EXIT_GROUP = 94, SYS_OPENAT = 56, SYS_UNLINKAT = 35 };
 
-static i64 sys_poll(PollFd *fds, u64 n) {
-    return sys6(73, (i64)fds, (i64)n, 0, 0, 0, 0);
+enum { SYS_CLONE = 220, SYS_FUTEX = 98, SYS_EVENTFD2 = 19, SYS_PREAD64 = 67, SYS_PREADV2 = 286 };
+
+// A thread of this process running fn on stack, which must never return:
+// clone with the new stack, and in the child a call of fn (kept in s1).
+static i64 sys_thread(i64 flags, u8 *stack, void (*fn)(void)) {
+    register i64 a7 __asm__("a7") = SYS_CLONE;
+    register i64 a0 __asm__("a0") = flags;
+    register i64 a1 __asm__("a1") = (i64)stack;
+    register i64 a2 __asm__("a2") = 0;
+    register i64 a3 __asm__("a3") = 0;
+    register i64 a4 __asm__("a4") = 0;
+    register void (*s1)(void) __asm__("s1") = fn;
+    __asm__ volatile("ecall\n"
+                     "bnez a0, 1f\n"
+                     "jalr s1\n"
+                     "li a7, 93\n"
+                     "li a0, 0\n"
+                     "ecall\n"
+                     "1:\n"
+                     : "+r"(a0)
+                     : "r"(a7), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(s1)
+                     : "ra", "memory");
+    return a0;
+}
+
+// ppoll: no timeout waits; a zero one does not.
+// A spinning thread's breath: it tells the processor so.
+static void cpu_relax(void) {
+    __asm__ volatile("nop" ::: "memory");
+}
+
+static i64 sys_poll(PollFd *fds, u64 n, int wait) {
+    i64 zero[2] = {0, 0};
+    return sys6(73, (i64)fds, (i64)n, wait ? 0 : (i64)zero, 0, 0, 0);
 }
 
 static i64 sys_fork(void) {

@@ -52,6 +52,151 @@ static void os_stack_unmap(u8 *p, u64 n) {
     os_unmap(p, n);
 }
 
+// ---- files off the scheduler's thread ----------------------------------------------
+// A file's system calls wait for the disk, and a regular file is always
+// "ready" to poll, so a task that reads one would stop every other task.
+// While tasks run, the runtime gives such a call to a thread of its own,
+// which makes the call and nothing else (it touches no runtime state and
+// allocates nothing), and the task waits for an eventfd in the poller as it
+// waits for a socket. With no task running, a call is made where it is.
+// One call is out at a time; a task that finds the thread busy waits its
+// turn. A file in the page cache answers in microseconds, so each side spins
+// a little before it sleeps: the thread for the next call, and the task for
+// the answer when no other task is ready to run; only a call that takes
+// longer costs a futex and the poller.
+
+enum { FILE_IDLE = 0, FILE_SUBMITTED = 1, FILE_DONE = 2 };
+enum { THREAD_SPINS = 20000, TASK_SPINS = 4000 };
+enum { CLONE_THREAD_FLAGS = 0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x40000 };
+enum { FUTEX_WAIT_PRIVATE = 128, FUTEX_WAKE_PRIVATE = 129, IO_STACK = 65536 };
+
+static struct {
+    u32 state;
+    i64 n, a, b, c, d, e, f;
+    i64 result;
+} file_job;
+static u32 file_sleeping;   // the thread waits on the futex
+static u32 file_waiting;    // the task waits in the poller
+static i64 file_event = -1;
+static int file_claimed;
+static int file_thread; // 0 not tried, 1 running, -1 could not start
+
+static void file_thread_main(void) {
+    for (;;) {
+        u32 s = __atomic_load_n(&file_job.state, __ATOMIC_ACQUIRE);
+        for (u32 i = 0; s != FILE_SUBMITTED && i < THREAD_SPINS; i++) {
+            cpu_relax();
+            s = __atomic_load_n(&file_job.state, __ATOMIC_ACQUIRE);
+        }
+        if (s != FILE_SUBMITTED) {
+            // Asleep, said first, then the state seen again: a task that
+            // submits after this wakes the futex.
+            __atomic_store_n(&file_sleeping, 1, __ATOMIC_SEQ_CST);
+            s = __atomic_load_n(&file_job.state, __ATOMIC_SEQ_CST);
+            if (s != FILE_SUBMITTED) {
+                sys6(SYS_FUTEX, (i64)&file_job.state, FUTEX_WAIT_PRIVATE, s, 0, 0, 0);
+            }
+            __atomic_store_n(&file_sleeping, 0, __ATOMIC_SEQ_CST);
+            continue;
+        }
+        file_job.result = sys6(file_job.n, file_job.a, file_job.b, file_job.c, file_job.d, file_job.e, file_job.f);
+        __atomic_store_n(&file_job.state, FILE_DONE, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&file_waiting, __ATOMIC_SEQ_CST)) {
+            u64 one = 1;
+            sys3(SYS_WRITE, file_event, (i64)&one, 8);
+        }
+    }
+}
+
+static int file_thread_ready(void) {
+    if (file_thread == 0) {
+        file_thread = -1;
+        // EFD_NONBLOCK | EFD_CLOEXEC
+        i64 fd = sys3(SYS_EVENTFD2, 0, 0x800 | 0x80000, 0);
+        u8 *stack = os_map(IO_STACK);
+        if (fd >= 0 && stack) {
+            file_event = fd;
+            if (sys_thread(CLONE_THREAD_FLAGS, stack + IO_STACK, file_thread_main) > 0) {
+                file_thread = 1;
+            }
+        }
+    }
+    return file_thread == 1;
+}
+
+// lib/std/linux.arche's file_syscall: system call n, made on the file
+// thread while tasks run, and here otherwise. A read first asks for what
+// the page cache has without waiting (preadv2 with RWF_NOWAIT), and an open
+// for a path the kernel has in its cache (openat2 with RESOLVE_CACHED): only
+// a call that would wait for the disk goes to the thread.
+enum { RWF_NOWAIT = 8, RESOLVE_CACHED = 0x20, SYS_OPENAT2 = 437, EAGAIN = 11, EOPNOTSUPP = 95, ENOSYS = 38, EINVAL = 22 };
+
+i64 a0rt_file_syscall(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
+    if (fiber_count == 0 || !file_thread_ready()) {
+        return sys6(n, a, b, c, d, e, f);
+    }
+    if (n == SYS_OPENAT) {
+        // struct open_how: flags, mode, resolve.
+        u64 how[3] = {(u64)c, (u64)d, RESOLVE_CACHED};
+        i64 r = sys4(SYS_OPENAT2, a, b, (i64)how, sizeof(how));
+        if (r != -EAGAIN && r != -EOPNOTSUPP && r != -ENOSYS && r != -EINVAL) {
+            return r;
+        }
+    }
+    if (n == SYS_READ || n == SYS_PREAD64) {
+        i64 iov[2] = {b, c};
+        // An offset of -1 is the file's own, as read uses.
+        i64 r = sys6(SYS_PREADV2, a, (i64)iov, 1, n == SYS_READ ? -1 : d, 0, RWF_NOWAIT);
+        if (r != -EAGAIN && r != -EOPNOTSUPP && r != -ENOSYS && r != -EINVAL) {
+            return r;
+        }
+    }
+    while (file_claimed) {
+        a0rt_task_wait(&file_job);
+    }
+    file_claimed = 1;
+    file_job.n = n;
+    file_job.a = a;
+    file_job.b = b;
+    file_job.c = c;
+    file_job.d = d;
+    file_job.e = e;
+    file_job.f = f;
+    __atomic_store_n(&file_job.state, FILE_SUBMITTED, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&file_sleeping, __ATOMIC_SEQ_CST)) {
+        sys6(SYS_FUTEX, (i64)&file_job.state, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+    }
+    int others = main_fiber.state == READY;
+    for (u64 i = 0; i < fiber_count; i++) {
+        others |= fibers[i]->state == READY;
+    }
+    for (u32 i = 0; !others && i < TASK_SPINS && __atomic_load_n(&file_job.state, __ATOMIC_ACQUIRE) != FILE_DONE; i++) {
+        cpu_relax();
+    }
+    while (__atomic_load_n(&file_job.state, __ATOMIC_SEQ_CST) != FILE_DONE) {
+        // Waiting, said first, then the state seen again: a thread that
+        // finishes after this writes the eventfd.
+        __atomic_store_n(&file_waiting, 1, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&file_job.state, __ATOMIC_SEQ_CST) == FILE_DONE) {
+            break;
+        }
+        a0rt_io_wait(file_event, 1 /* POLLIN */);
+        u64 count;
+        sys3(SYS_READ, file_event, (i64)&count, 8);
+    }
+    __atomic_store_n(&file_waiting, 0, __ATOMIC_SEQ_CST);
+    i64 r = file_job.result;
+    __atomic_store_n(&file_job.state, FILE_IDLE, __ATOMIC_RELEASE);
+    file_claimed = 0;
+    a0rt_task_wake(&file_job);
+    return r;
+}
+
+// The runtime's own file calls go the same way.
+static i64 file_sys4(i64 n, i64 a, i64 b, i64 c, i64 d) {
+    return a0rt_file_syscall(n, a, b, c, d, 0, 0);
+}
+
 // ---- files and output -------------------------------------------------------------
 
 // An errno as one of rt.c's IO_ codes.
@@ -97,7 +242,7 @@ static i64 os_open_read(const u8 *path, u64 path_len) {
     if (!p) {
         return -IO_NOT_FOUND;
     }
-    i64 fd = sys4(SYS_OPENAT, AT_FDCWD, (i64)p, O_RDONLY | O_CLOEXEC, 0);
+    i64 fd = file_sys4(SYS_OPENAT, AT_FDCWD, (i64)p, O_RDONLY | O_CLOEXEC, 0);
     return fd < 0 ? -(i64)io_code(fd) : fd;
 }
 
@@ -107,7 +252,7 @@ static i64 os_open_write(const u8 *path, u64 path_len) {
     if (!p) {
         return -IO_NOT_FOUND;
     }
-    i64 fd = sys4(SYS_OPENAT, AT_FDCWD, (i64)p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    i64 fd = file_sys4(SYS_OPENAT, AT_FDCWD, (i64)p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     return fd < 0 ? -(i64)io_code(fd) : fd;
 }
 
@@ -123,11 +268,6 @@ static i64 os_open_program(const u8 *path, u64 path_len) {
     return fd < 0 ? -(i64)io_code(fd) : fd;
 }
 
-static i64 os_read(i64 handle, u8 *p, u64 n) {
-    i64 got = sys3(SYS_READ, handle, (i64)p, (i64)n);
-    return got < 0 ? -(i64)io_code(got) : got;
-}
-
 static i64 os_write(i64 handle, const u8 *p, u64 n) {
     i64 done = sys3(SYS_WRITE, handle, (i64)p, (i64)n);
     return done < 0 ? -(i64)io_code(done) : done;
@@ -135,6 +275,16 @@ static i64 os_write(i64 handle, const u8 *p, u64 n) {
 
 static void os_close(i64 handle) {
     sys1(SYS_CLOSE, handle);
+}
+
+static i64 os_file_read(i64 handle, u8 *p, u64 n) {
+    i64 got = a0rt_file_syscall(SYS_READ, handle, (i64)p, (i64)n, 0, 0, 0);
+    return got < 0 ? -(i64)io_code(got) : got;
+}
+
+static i64 os_file_write(i64 handle, const u8 *p, u64 n) {
+    i64 done = a0rt_file_syscall(SYS_WRITE, handle, (i64)p, (i64)n, 0, 0, 0);
+    return done < 0 ? -(i64)io_code(done) : done;
 }
 
 // std.Fs works on paths from the current directory (std.Fs.dir).
@@ -181,7 +331,7 @@ static void os_stack_switch(const Fiber *next) {
 static PollFd *poll_entries;
 static u64 poll_entries_cap;
 
-static void os_poll(const i64 *fds, const short *events, u8 *ready, u64 n) {
+static void os_poll(const i64 *fds, const short *events, u8 *ready, u64 n, int wait) {
     if (n > poll_entries_cap) {
         u64 cap = poll_entries_cap ? poll_entries_cap : 16;
         while (cap < n) {
@@ -197,7 +347,7 @@ static void os_poll(const i64 *fds, const short *events, u8 *ready, u64 n) {
     }
     i64 r;
     do {
-        r = sys_poll(poll_entries, n);
+        r = sys_poll(poll_entries, n, wait);
     } while (r == -EINTR);
     for (u64 i = 0; i < n; i++) {
         // An error or a hang-up wakes the fiber too: its next call says so.
@@ -263,7 +413,7 @@ static void os_collect(Run *runs, u64 count) {
     if (n > 0) {
         i64 p;
         do {
-            p = sys_poll(fds, n);
+            p = sys_poll(fds, n, 1);
         } while (p == -EINTR);
         u8 buf[4096];
         for (u64 j = 0; j < n; j++) {

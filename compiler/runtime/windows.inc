@@ -306,6 +306,16 @@ static i64 os_write(i64 handle, const u8 *p, u64 n) {
     return done;
 }
 
+// Windows files still block the program while they are read: the file
+// thread of linux.inc is Linux's (docs/sprints.md S33).
+static i64 os_file_read(i64 handle, u8 *p, u64 n) {
+    return os_read(handle, p, n);
+}
+
+static i64 os_file_write(i64 handle, const u8 *p, u64 n) {
+    return os_write(handle, p, n);
+}
+
 static void os_close(i64 handle) {
     CloseHandle(handle_of(handle));
 }
@@ -463,7 +473,7 @@ typedef struct {
 static PollEntry *poll_entries;
 static u64 poll_entries_cap;
 
-static void os_poll(const i64 *fds, const short *events, u8 *ready, u64 n) {
+static void os_poll(const i64 *fds, const short *events, u8 *ready, u64 n, int wait) {
     if (n > poll_entries_cap) {
         u64 cap = poll_entries_cap ? poll_entries_cap : 16;
         while (cap < n) {
@@ -478,7 +488,7 @@ static void os_poll(const i64 *fds, const short *events, u8 *ready, u64 n) {
         poll_entries[i].events = (short)(((events[i] & 1) ? POLLRDNORM : 0) | ((events[i] & 4) ? POLLWRNORM : 0));
         poll_entries[i].revents = 0;
     }
-    int r = WSAPoll(poll_entries, (u32)n, -1);
+    int r = WSAPoll(poll_entries, (u32)n, wait ? -1 : 0);
     for (u64 i = 0; i < n; i++) {
         // An error or a hang-up wakes the fiber too: its next call says so.
         ready[i] = poll_entries[i].revents != 0 || r < 0;
