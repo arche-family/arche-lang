@@ -3084,6 +3084,12 @@ fn check_main(c: &mut Checker) {
     match find_item(c, 0, main_sym) {
         some(d) => {
             let decl = c.decls[d as usize];
+            if decl.kind == DeclKind.Fn and decl.generic {
+                // A template has no signature of its own to compare.
+                let s = token_span(c, decl.name_token);
+                report(c, codes.BAD_MAIN, s, "main takes no comptime parameters: it must be declared as 'fn main(sys: &mut std.System) -> !void'");
+                return;
+            }
             if decl.kind == DeclKind.Fn {
                 let f = c.fns[decl.fn_index as usize];
                 if f.params_len == 1 and c.params[f.params_start as usize].type_id == want_param and f.ret == want_ret {
