@@ -1346,6 +1346,25 @@ fn library_method(c: &mut ck.Checker, b: ty.Builtin, name: str) -> ?Method {
 }
 
 /// Checks the arguments of a call (children 1.. of the CallExpr) against
+/// An argument's label: the name before its ':', which, alone, is also its
+/// value: f(today:) is f(today: today) (§7.5).
+pub fn arg_label(c: &ck.Checker, arg: cst.NodeId) -> ?u32 {
+    match ck.find_own(c, arg, tk.Kind.Ident) {
+        some(t) => { return t; }
+        none => { }
+    }
+    match ck.find_own(c, arg, tk.Kind.Colon) {
+        some(_) => {
+            let value = ck.child(c, arg, 0);
+            if ck.kind_of(c, value) == cst.Kind.NameExpr {
+                return ck.find_own(c, value, tk.Kind.Ident);
+            }
+        }
+        none => { }
+    }
+    return none;
+}
+
 /// params: their number, their types and their labels (§7.5).
 fn check_args(c: &mut ck.Checker, call: cst.NodeId, params: &alloc.List(Param), labels_by_type: bool) {
     // The comptime arguments of a generic call come first and are checked
@@ -1375,7 +1394,7 @@ fn check_args(c: &mut ck.Checker, call: cst.NodeId, params: &alloc.List(Param), 
     var i: usize = 0;
     while i < ps.len() : (i += 1) {
         let arg = ck.child(c, call, first + i as u32 + 1);
-        match ck.find_own(c, arg, tk.Kind.Ident) {
+        match arg_label(c, arg) {
             some(label) => {
                 let sym = ck.symbol(c, label);
                 if sym != ps[i].name {
@@ -2630,7 +2649,11 @@ fn check_fallback(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty
     let t = check(c, lhs, hint);
     let info = c.t.get(t);
     if info.kind == ty.Kind.Invalid {
-        _ = check(c, rhs, expected);
+        if is_jump(c, rhs) {
+            stmt.check_jump(c, rhs);
+        } else {
+            _ = check(c, rhs, expected);
+        }
         return t;
     }
     let want = ty.Kind.ErrorUnion;
@@ -2644,9 +2667,23 @@ fn check_fallback(c: &mut ck.Checker, n: cst.NodeId, expected: ?ty.TypeId) -> ty
         ck.write_type(c, &mut m, t);
         let s = ck.span_of(c, lhs);
         ck.report_owned(c, codes.BAD_FALLBACK, s, m);
-        _ = check(c, rhs, expected);
+        if is_jump(c, rhs) {
+            stmt.check_jump(c, rhs);
+        } else {
+            _ = check(c, rhs, expected);
+        }
         return ty.invalid();
+    }
+    if is_jump(c, rhs) {
+        stmt.check_jump(c, rhs);
+        return info.elem;
     }
     check_value(c, rhs, info.elem);
     return info.elem;
+}
+
+/// The right of orelse or catch is a return, break or continue.
+pub fn is_jump(c: &ck.Checker, n: cst.NodeId) -> bool {
+    let k = ck.kind_of(c, n);
+    return k == cst.Kind.ReturnStmt or k == cst.Kind.BreakStmt or k == cst.Kind.ContinueStmt;
 }

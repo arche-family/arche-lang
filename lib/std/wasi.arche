@@ -22,6 +22,7 @@ pub const ALL_RIGHTS: u64 = 0x1FFFFFFF;
 extern "c" fn wasi_fd_write(fd: u32, iovs: u32, count: u32, written: u32) -> u32;
 extern "c" fn wasi_fd_read(fd: u32, iovs: u32, count: u32, read: u32) -> u32;
 extern "c" fn wasi_fd_close(fd: u32) -> u32;
+extern "c" fn wasi_fd_sync(fd: u32) -> u32;
 extern "c" fn wasi_fd_readdir(fd: u32, buf: u32, size: u32, cookie: u64, used: u32) -> u32;
 extern "c" fn wasi_fd_prestat_get(fd: u32, out: u32) -> u32;
 extern "c" fn wasi_fd_prestat_dir_name(fd: u32, path: u32, size: u32) -> u32;
@@ -74,6 +75,13 @@ pub fn fd_close(fd: u32) -> u32 {
     unsafe {
         // SAFETY: only a number.
         return wasi_fd_close(fd);
+    }
+}
+
+pub fn fd_sync(fd: u32) -> u32 {
+    unsafe {
+        // SAFETY: only a number.
+        return wasi_fd_sync(fd);
     }
 }
 

@@ -1,0 +1,87 @@
+// test: run
+// spec: arche/3.5
+// stage0: skip
+// stdout: 4 3 42 99 20 bad [defer]7 abc ab1
+// What to do instead of a value: x catch return y, x orelse break, x catch
+// continue. Each leaves by its statement, defers and all.
+import alloc;
+import std;
+
+type E = error { Bad }
+
+fn half(n: u32) -> E!u32 {
+    if n % 2 == 1 {
+        return E.Bad;
+    }
+    return n / 2;
+}
+
+fn first_even(xs: []u32) -> u32 {
+    for x in xs {
+        let h = half(x.*) catch continue;
+        return h;
+    }
+    return 0;
+}
+
+fn sum_until_odd(xs: []u32) -> u32 {
+    var total: u32 = 0;
+    for x in xs {
+        total += half(x.*) catch break;
+    }
+    return total;
+}
+
+fn lookup(m: &alloc.Map(u32, u32), k: u32) -> u32 {
+    let v = m.get(k) orelse return 99;
+    return v + 1;
+}
+
+fn checked(n: u32) -> E!u32 {
+    let h = half(n) catch return E.Bad;
+    return h * 10;
+}
+
+fn with_defer(sys: &mut std.System, n: u32) -> u32 {
+    defer sys.stdout.write("[defer]");
+    let h = half(n) catch return 7;
+    return h;
+}
+
+fn owned(text: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str(text);
+    let n = half(text.len() as u32) catch return s;
+    s.push_ascii('0' + n as u8);
+    return s;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var xs: [4]u32 = [3, 5, 8, 10];
+    var ys: [4]u32 = [2, 4, 5, 6];
+    var m = alloc.Map(u32, u32).init(sys.alloc);
+    m.put(1, 41);
+    sys.stdout.write_u64(first_even(xs[0..4]) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(sum_until_odd(ys[0..4]) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(lookup(&m, 1) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(lookup(&m, 2) as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64((checked(4) catch 0) as u64);
+    sys.stdout.write(" ");
+    match checked(3) {
+        ok(_) => { sys.stdout.write("ok"); }
+        err(_) => { sys.stdout.write("bad"); }
+    }
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(with_defer(sys, 3) as u64);
+    sys.stdout.write(" ");
+    let o = owned("abc", sys.alloc);
+    let p = owned("ab", sys.alloc);
+    sys.stdout.write(o.view());
+    sys.stdout.write(" ");
+    sys.stdout.write(p.view());
+    sys.stdout.write("\n");
+}

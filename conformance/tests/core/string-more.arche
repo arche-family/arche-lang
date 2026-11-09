@@ -1,0 +1,27 @@
+// test: run
+// spec: 11
+// stage0: skip
+// stdout: arche arche! #42 -7 0 -9223372036854775808
+import alloc;
+import std;
+
+// The library's String: one made from a text, a copy that goes its own way,
+// and numbers written into one.
+fn main(sys: &mut std.System) -> !void {
+    let first = alloc.String.from("arche", sys.alloc);
+    var second = first.clone();
+    second.push_ascii('!');
+    sys.stdout.write(first.view());
+    sys.stdout.write(" ");
+    sys.stdout.write(second.view());
+    var n = alloc.String.from(" #", sys.alloc);
+    n.push_u64(42);
+    n.push_ascii(' ');
+    n.push_i64(-7);
+    n.push_ascii(' ');
+    n.push_u64(0);
+    n.push_ascii(' ');
+    n.push_i64(-9223372036854775807 - 1);
+    sys.stdout.write(n.view());
+    sys.stdout.write("\n");
+}

@@ -1,0 +1,32 @@
+// test: run
+// spec: arche/3.6
+// stage0: skip
+// stdout: 7 21
+import std;
+
+// A label alone, as in span(from:, to:), is also the name of what is passed.
+
+type Point = struct {
+    x: i64,
+    y: i64,
+
+    fn moved(self: Point, dx: i64, dy: i64) -> Point {
+        return Point { x: self.x + dx, y: self.y + dy };
+    }
+}
+
+fn span(from: i64, to: i64) -> i64 {
+    return to - from;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let from: i64 = 3;
+    let to: i64 = 10;
+    let dx: i64 = 1;
+    let dy: i64 = 2;
+    sys.stdout.write_i64(span(from:, to:));
+    sys.stdout.write(" ");
+    let p = Point { x: 0, y: 0 }.moved(dx:, dy: dy * 10);
+    sys.stdout.write_i64(p.x + p.y);
+    sys.stdout.write("\n");
+}

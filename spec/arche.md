@@ -135,6 +135,19 @@ for entry in iterator { … }    // until iterator.next() gives none
 
 A loop may have a label, `outer: while … { … }` or `outer: for … { … }`, and `break outer;` or `continue outer;` then applies to it. Labels are not names: they cannot be passed or stored, and an inner label cannot repeat an outer one. A label that no enclosing loop has, or one that repeats, is E0511.
 
+### 3.5 Leaving instead of a value
+
+On the right of `orelse` or `catch` (A§7) may stand, instead of a value, the statement that leaves when there is none: `return`, with the function's value if it has one, `break` or `continue`, with a loop label if need be. `x catch return E.Bad` is `match x { ok(v) => { v } err(_) => { return E.Bad; } }`; it runs the defers, and moves out what the statement moves, as that statement would. The usual rules hold: the value of a `return` has the function's result type (E0401), and `break` and `continue` are inside a loop (E0504).
+
+```arche
+let text = fs.read_file(path, a) catch return Failed.CannotRead;
+let entry = cache.get(key) orelse continue;
+```
+
+### 3.6 A label that names its value
+
+An argument `name:` with nothing after it, before `,` or `)`, is `name: name`: the label is also the name of the value passed, `span(from:, to:)` for `span(from: from, to: to)`. The label rule (A§7.5) checks it like any label, and the name must be in scope (E0301).
+
 ## 4. Generics
 
 Arche has one generic mechanism: parameters known at compile time. There are no type parameter lists separate from ordinary parameters, and no inference of type arguments: the reader of a call sees every argument.
@@ -408,7 +421,7 @@ The rules above do not apply to raw pointers. Code that turns a raw pointer back
 
 ## 12. Grammar
 
-This grammar extends A§14. Rules with the same name replace those of Arche-0; the others are added. As in Arche-0 the grammar is LL(1), except where it says otherwise: an argument label (`IDENT ":"` in a call) and a loop label (`IDENT ":"` before `while` or `for`) look one token further.
+This grammar extends A§14. Rules with the same name replace those of Arche-0; the others are added. As in Arche-0 the grammar is LL(1), except where it says otherwise: an argument label (`IDENT ":"` in a call) and a loop label (`IDENT ":"` before `while` or `for`) look one token further, and a label that names its value (`IDENT ":"` before `,` or `)`, §3.6) two.
 
 ```ebnf
 file        = { import } { item } ;
@@ -464,7 +477,9 @@ loop        = "while" expr [ ":" "(" assign ")" ] block
             | "for" for_bind "in" expr [ ( ".." | "..=" ) expr ] block ;
 for_bind    = IDENT [ ":" type ] | "(" IDENT "," IDENT ")" ;
 
-expr        = or_expr [ ( "orelse" | "catch" ) expr ] ;
+expr        = or_expr [ ( "orelse" | "catch" ) ( expr | jump ) ] ;
+jump        = "return" [ expr ] | "break" [ IDENT ] | "continue" [ IDENT ] ;   (* §3.5 *)
+arg         = [ IDENT ":" ] expr | IDENT ":" ;   (* IDENT ":" before ',' or ')': §3.6 *)
 primary     = INT | FLOAT | CHAR | STRING | "true" | "false" | "none"
             | "[" expr ";" expr "]"
             | "some" "(" expr ")"

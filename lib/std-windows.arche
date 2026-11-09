@@ -291,6 +291,33 @@ pub type Fs = struct {
         return win.file_attributes(buf[0..PATH_UNITS]) != win.INVALID_FILE_ATTRIBUTES;
     }
 
+    /// Waits until what was written to the file at path is on the disk and not
+    /// only in the system's memory: what a power cut leaves. On Windows a
+    /// directory's names are kept by the file system's own journal, so syncing
+    /// a directory asks for nothing more.
+    pub fn sync(self: &Fs, path: str) -> FsError!void {
+        var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
+        if not win.wide(path, buf[0..PATH_UNITS]) {
+            return FsError.NotFound;
+        }
+        let attributes = win.file_attributes(buf[0..PATH_UNITS]);
+        if attributes == win.INVALID_FILE_ATTRIBUTES {
+            return last_fs_error();
+        }
+        if attributes & win.FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return;
+        }
+        let it = win.open_file(buf[0..PATH_UNITS], access: win.GENERIC_WRITE, share: win.FILE_SHARE_ALL, disposition: win.OPEN_EXISTING, inherit: false);
+        if it == win.INVALID_HANDLE {
+            return last_fs_error();
+        }
+        let flushed = win.flush(it);
+        win.close(it);
+        if not flushed {
+            return FsError.IoFailed;
+        }
+    }
+
     pub fn make_dir(self: &Fs, path: str) -> FsError!void {
         var buf: [PATH_UNITS]u16 = [0; PATH_UNITS];
         if not win.wide(path, buf[0..PATH_UNITS]) {

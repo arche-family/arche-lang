@@ -291,6 +291,35 @@ pub type Fs = struct {
         return r == 0;
     }
 
+    /// Waits until what was written to the file at path, or the names in the
+    /// directory at path, is on the disk and not only in the system's memory:
+    /// what a power cut leaves. A file written whole and renamed into place is
+    /// kept once both the file and its directory are synced.
+    pub fn sync(self: &Fs, path: str) -> FsError!void {
+        var buf: [4096]u8 = [0; 4096];
+        if not linux.c_path(path, buf[0..4096]) {
+            return FsError.NotFound;
+        }
+        var fd: i64 = 0;
+        unsafe {
+            // SAFETY: the path is NUL-terminated in buf. O_RDONLY | O_CLOEXEC:
+            // a directory opens so too.
+            fd = linux.syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80000, 0, 0, 0]);
+        }
+        if linux.errno(fd) != 0 {
+            return errno_error(linux.errno(fd));
+        }
+        var r: i64 = 0;
+        unsafe {
+            // SAFETY: fd is the file just opened, closed here.
+            r = linux.syscall(linux.FSYNC, [fd, 0, 0, 0, 0, 0]);
+            _ = linux.syscall(linux.CLOSE, [fd, 0, 0, 0, 0, 0]);
+        }
+        if linux.errno(r) != 0 {
+            return errno_error(linux.errno(r));
+        }
+    }
+
     pub fn make_dir(self: &Fs, path: str) -> FsError!void {
         try self.make_dir_with(path, mode: 0x1ED);
     }

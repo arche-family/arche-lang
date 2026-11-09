@@ -1360,7 +1360,12 @@ fn eval(c: &mut ck.Checker, f: &mut Fn, e: cst.NodeId, consume: bool) {
         .CatchExpr | .OrelseExpr => {
             eval(c, f, ck.child(c, e, 0), true);
             let before = save(c, f);
-            eval(c, f, ck.child(c, e, 1), consume);
+            let rhs = ck.child(c, e, 1);
+            if expr.is_jump(c, rhs) {
+                stmt(c, f, rhs);
+            } else {
+                eval(c, f, rhs, consume);
+            }
             join(c, f, &before);
         }
         _ => { }

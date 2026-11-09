@@ -1085,13 +1085,39 @@ fn parse_nested_expr(p: &mut Parser) {
     p.no_struct_lit = saved;
 }
 
+/// return [x], break [label] or continue [label] as the right side of
+/// orelse or catch: a statement, with no ';' of its own.
+fn parse_jump(p: &mut Parser) {
+    let m = open(p);
+    let k = peek(p);
+    advance(p);
+    if k == tk.Kind.KwReturn {
+        if not at(p, tk.Kind.Semi) and not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Comma) and not at(p, tk.Kind.RBrace) {
+            parse_expr(p);
+        }
+        _ = close(p, m, cst.Kind.ReturnStmt);
+        return;
+    }
+    _ = accept(p, tk.Kind.Ident);
+    if k == tk.Kind.KwBreak {
+        _ = close(p, m, cst.Kind.BreakStmt);
+    } else {
+        _ = close(p, m, cst.Kind.ContinueStmt);
+    }
+}
+
 fn parse_expr(p: &mut Parser) {
     let m = open(p);
     parse_or(p);
     if at(p, tk.Kind.KwOrelse) or at(p, tk.Kind.KwCatch) {
         let k = peek(p);
         advance(p);
-        parse_expr(p); // right-associative
+        // x catch return y: what to do instead of a value (full Arche).
+        if p.full and (at(p, tk.Kind.KwReturn) or at(p, tk.Kind.KwBreak) or at(p, tk.Kind.KwContinue)) {
+            parse_jump(p);
+        } else {
+            parse_expr(p); // right-associative
+        }
         if k == tk.Kind.KwOrelse {
             _ = close(p, m, cst.Kind.OrelseExpr);
         } else {
@@ -1418,13 +1444,26 @@ fn parse_postfix(p: &mut Parser) {
                 advance(p);
                 while not at(p, tk.Kind.RParen) and not at(p, tk.Kind.Eof) {
                     let am = open(p);
+                    var punned = false;
                     if at(p, tk.Kind.Ident) and peek_second(p) == tk.Kind.Colon {
-                        advance(p);
-                        advance(p);
+                        let third = peek_third(p);
+                        if p.full and (third == tk.Kind.Comma or third == tk.Kind.RParen) {
+                            // today: alone is today: today, the name its own
+                            // value (spec/arche.md §7.5).
+                            let nm = open(p);
+                            advance(p);
+                            _ = close(p, nm, cst.Kind.NameExpr);
+                            advance(p);
+                            punned = true;
+                        } else {
+                            advance(p);
+                            advance(p);
+                        }
                     }
                     // ?T, *T and []T start no expression: a type argument,
                     // List(?T) (spec/arche.md §4.2).
-                    if p.full and (at(p, tk.Kind.Question) or at(p, tk.Kind.Star) or
+                    if punned {
+                    } else if p.full and (at(p, tk.Kind.Question) or at(p, tk.Kind.Star) or
                         (at(p, tk.Kind.LBracket) and peek_second(p) == tk.Kind.RBracket)) {
                         parse_type(p);
                     } else {

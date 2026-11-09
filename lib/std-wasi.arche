@@ -398,6 +398,30 @@ pub type Fs = struct {
         return kind_of(path, kind: &mut kind) == 0;
     }
 
+    /// Waits until what was written to the file at path is on the disk: what
+    /// a power cut leaves. For a directory that is the host's to do, if it
+    /// can.
+    pub fn sync(self: &Fs, path: str) -> FsError!void {
+        var kind: u8 = 0;
+        let found = kind_of(path, kind: &mut kind);
+        if found != 0 {
+            return fs_error(found);
+        }
+        if kind == 3 {
+            return;
+        }
+        var fd: u32 = 0;
+        let opened = open_path(path, oflags: 0, fd: &mut fd);
+        if opened != 0 {
+            return fs_error(opened);
+        }
+        let e = wasi.fd_sync(fd);
+        _ = wasi.fd_close(fd);
+        if e != 0 {
+            return fs_error(e);
+        }
+    }
+
     pub fn make_dir(self: &Fs, path: str) -> FsError!void {
         let base = rt.base_of(path);
         if base.fd == 0 {

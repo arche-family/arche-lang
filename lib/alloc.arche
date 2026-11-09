@@ -3,6 +3,7 @@
 /// are written here in Arche over core.mem instead of being built into
 /// the compiler. Every container holds a core.Unique, so it is move-only.
 import core;
+import core.fmt;
 import core.mem;
 
 /// Where a container's memory comes from: the program's allocator
@@ -108,6 +109,25 @@ pub type String = struct {
         return String { data: mem.null(u8), used: 0, cap: 0, allocator: a, unique: core.Unique { } };
     }
 
+    /// A String that holds a copy of text.
+    ///
+    /// ```arche
+    /// let s = alloc.String.from("arche", sys.alloc);
+    /// assert(s.view().eq("arche"));
+    /// ```
+    pub fn from(text: str, a: Allocator) -> String {
+        var s = String.init(a);
+        s.push_str(text);
+        return s;
+    }
+
+    /// A copy, in memory of the same allocator.
+    pub fn clone(self: &String) -> String {
+        var s = String.init(self.allocator);
+        s.push_str(self.view());
+        return s;
+    }
+
     fn room(self: &mut String, more: usize) {
         if self.used + more <= self.cap {
             return;
@@ -153,6 +173,34 @@ pub type String = struct {
             self.data.add(self.used).* = byte;
         }
         self.used += 1;
+    }
+
+    /// The number's decimal digits, at the end.
+    ///
+    /// ```arche
+    /// var s = alloc.String.from("#", sys.alloc);
+    /// s.push_u64(42);
+    /// s.push_ascii(' ');
+    /// s.push_i64(-7);
+    /// assert(s.view().eq("#42 -7"));
+    /// ```
+    pub fn push_u64(self: &mut String, n: u64) {
+        var digits: [20]u8 = [0; 20];
+        let size = fmt.decimal(n, digits[0..20]);
+        var i: usize = 0;
+        while i < size : (i += 1) {
+            self.push_ascii(digits[i]);
+        }
+    }
+
+    /// The number's decimal digits, with a '-' if it is negative.
+    pub fn push_i64(self: &mut String, n: i64) {
+        var digits: [20]u8 = [0; 20];
+        let size = fmt.signed(n, digits[0..20]);
+        var i: usize = 0;
+        while i < size : (i += 1) {
+            self.push_ascii(digits[i]);
+        }
     }
 
     pub fn view(self: &String) -> str {

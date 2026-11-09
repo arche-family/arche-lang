@@ -1,0 +1,21 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: written synced listed not found
+import std;
+
+// What is kept through a power cut: the file, then the directory its name is
+// in. There is nothing to see of it but that it does not fail.
+fn main(sys: &mut std.System) -> !void {
+    try sys.fs.write_file(path: "fs-sync.tmp", data: "kept");
+    sys.stdout.write("written");
+    try sys.fs.sync("fs-sync.tmp");
+    sys.stdout.write(" synced");
+    try sys.fs.sync(".");
+    sys.stdout.write(" listed");
+    match sys.fs.sync("no-such-file.tmp") {
+        err(.NotFound) => { sys.stdout.write(" not found\n"); }
+        _ => { sys.stdout.write(" ?\n"); }
+    }
+    try sys.fs.remove("fs-sync.tmp");
+}

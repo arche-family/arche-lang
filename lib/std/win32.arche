@@ -135,6 +135,7 @@ pub fn new_made() -> Made {
 
 extern "c" fn GetLastError() -> u32;
 extern "c" fn CloseHandle(it: i64) -> i32;
+extern "c" fn FlushFileBuffers(it: i64) -> i32;
 extern "c" fn GetStdHandle(which: u32) -> i64;
 extern "c" fn CreateFileW(path: *u16, access: u32, share: u32, security: *u8, disposition: u32, flags: u32, from: i64) -> i64;
 extern "c" fn ReadFile(file: i64, into: *mut u8, n: u32, got: *mut u32, overlapped: *u8) -> i32;
@@ -321,6 +322,14 @@ pub fn close(it: i64) {
     unsafe {
         // SAFETY: the caller owns the handle and gives it up here.
         _ = CloseHandle(it);
+    }
+}
+
+/// Writes what the system holds of the file to the disk; false when it cannot.
+pub fn flush(it: i64) -> bool {
+    unsafe {
+        // SAFETY: the caller's handle, open for writing.
+        return FlushFileBuffers(it) != 0;
     }
 }
 

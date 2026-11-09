@@ -972,9 +972,13 @@ fn fallback(l: &mut lw.Lower, e: cst.NodeId) -> lw.Val {
     }
     lw.br(l, done);
     lw.switch_to(l, no);
-    let y = value(l, rhs);
-    if not nothing_left and not lw.terminated(l) and l.c.t.kind(type_of(l, rhs)) != ty.Kind.Noreturn {
-        lw.store_val(l, et, y, result);
+    if sx.is_jump(&l.c, rhs) {
+        stmt.lower_jump(l, rhs);
+    } else {
+        let y = value(l, rhs);
+        if not nothing_left and not lw.terminated(l) and l.c.t.kind(type_of(l, rhs)) != ty.Kind.Noreturn {
+            lw.store_val(l, et, y, result);
+        }
     }
     lw.br(l, done);
     lw.switch_to(l, done);
