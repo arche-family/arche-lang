@@ -1357,6 +1357,13 @@ fn intrinsic(l: &mut lw.Lower, n: cst.NodeId, d: u32) -> lw.Val {
         return scalar_val(lw.emit(l, i));
     }
     let a0 = value(l, runtime_arg(l, n, offset: info.ncomptime, i: 0));
+    // core.float: the same bits as the other type, which an Ext between two
+    // types of one width is.
+    if nm.eq("bits64") or nm.eq("bits32") or nm.eq("from_bits64") or nm.eq("from_bits32") {
+        var i = ir.inst(ir.Op.Ext, layout.scalar(&l.c, rt));
+        i.a = a0.v;
+        return scalar_val(lw.emit(l, i));
+    }
     if nm.eq("str_from") {
         return lw.own_val(l, rt, a0);
     }

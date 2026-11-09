@@ -1,0 +1,60 @@
+// test: run
+// spec: arche/2.3
+// stage0: skip
+// stdout: 4607182418800017408 9223372036854775808 1069547520
+// stdout: 9219994337134247937 2141192192
+// stdout: 3.5 -2.5 -0.0 inf
+// stdout: 2143289344 true
+import std;
+import core.float;
+
+fn n(sys: &mut std.System, v: u64, last: bool) {
+    sys.stdout.write_u64(v);
+    if last {
+        sys.stdout.write("\n");
+    } else {
+        sys.stdout.write(" ");
+    }
+}
+
+fn x(sys: &mut std.System, v: f64, last: bool) {
+    sys.stdout.write_f64(v);
+    if last {
+        sys.stdout.write("\n");
+    } else {
+        sys.stdout.write(" ");
+    }
+}
+
+// Through a call, so that the bits cross a register of each kind.
+fn negated(v: f64) -> f64 {
+    let one: u64 = 1;
+    return float.from_bits64(float.bits64(v) ^ (one << 63));
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let one: f64 = 1.0;
+    let zero: f64 = 0.0;
+    let half: f32 = 1.5;
+    n(sys, float.bits64(one), last: false);
+    n(sys, float.bits64(negated(zero)), last: false);
+    n(sys, float.bits32(half) as u64, last: true);
+    // A signalling NaN's payload, kept both ways.
+    let quiet_not: u64 = 0x7FF4000000000001;
+    let narrow: u32 = 0x7FA00000;
+    n(sys, float.bits64(float.from_bits64(quiet_not)), last: false);
+    n(sys, float.bits32(float.from_bits32(narrow)) as u64, last: true);
+    x(sys, float.from_bits64(0x4004000000000000) + one, last: false);
+    x(sys, negated(2.5), last: false);
+    x(sys, negated(zero), last: false);
+    x(sys, float.from_bits64(0x7FF0000000000000), last: true);
+    // A quiet NaN: its exponent is all ones.
+    let nan: f32 = float.from_bits32(0x7FC00000);
+    let b = float.bits32(nan);
+    n(sys, b as u64, last: false);
+    if b & 0x7F800000 == 0x7F800000 {
+        sys.stdout.write("true\n");
+    } else {
+        sys.stdout.write("false\n");
+    }
+}

@@ -84,6 +84,7 @@ The capability types of `std` are `Fs`, `Net`, `Clock`, `Env`, `Proc` and `Rand`
 
 - `x as f64` from an integer rounds to nearest. `x as i32` from a float truncates toward zero and traps when the result does not fit or `x` is a NaN. `x as% i32` saturates instead, and gives 0 for a NaN.
 - `x as f32` from an `f64` rounds to nearest; `x as f64` from an `f32` is exact.
+- `core.float.bits64(x)` and `bits32(x)` are a float's IEEE 754 encoding, as `u64` and `u32`; `from_bits64(b)` and `from_bits32(b)` are the float of an encoding. Every bit is kept, a NaN's payload too, and since every pattern is some float none of them can fail. `as` never reinterprets bits.
 
 ### 2.4 Text
 
