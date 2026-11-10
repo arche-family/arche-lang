@@ -109,7 +109,7 @@
 | 7. Backend'lar | S26–S30 | optimizatsiya, o'z backend'lari, linker, WASM |
 | 8. Web va WASM | S31–S33 | WASM runtime, web server |
 | 9. Yakuniy qabul | S34 | rejaning yakuniy qabul mezoni |
-| 10. Telefon kutubxonalari | S35 | Arche OS telefoni uchun: shrift, PNG, D-Bus, `std.linux` qo'shimchalari |
+| 10. Telefon kutubxonalari | S35, S38–S39 | Arche OS telefoni uchun: shrift, PNG, D-Bus, `std.linux` qo'shimchalari; Arche'dan WASM component; ARM64 JIT |
 | 11. Editor va macOS | S36–S37 | `arche-lsp` va editor integratsiyasi; macOS target |
 
 ```mermaid
@@ -469,7 +469,7 @@ Bajarildi: 2067 conformance testi (1565 tasi generatsiya qilingan), fuzzing pars
 
 ## 10. Telefon kutubxonalari
 
-Arche OS telefonining Trek A'si (Linux kernel ustida Arche userspace) uchun. Faqat 4-bosqichga (`std`) tayanadi, shuning uchun S26–S34 bilan parallel, hatto ulardan oldin ham olib borilishi mumkin. Tilning yakuniy qabuli (S34) bu sprintni kutmaydi.
+Arche OS telefonining Trek A'si (Linux kernel ustida Arche userspace) uchun: arche-os'ning T1–T9 sprintlari shularga tayanadi. 2026-11-10 dan telefon asosiy yo'l, shuning uchun bu bosqich S37'dan oldin bajariladi. Telefon qo'lda yo'q: avval QEMU x86-64'da (KVM bilan), keyin aarch64'da. Tilning yakuniy qabuli (S34) bu sprintlarni kutmaydi.
 
 ### S35. Shrift, PNG, D-Bus va `std.linux`
 
@@ -479,7 +479,22 @@ Arche OS telefonining Trek A'si (Linux kernel ustida Arche userspace) uchun. Faq
 - `std.linux`: DRM/KMS dumb buffer, evdev input, PID 1 sifatida ishlash (bola process'larni yig'ish).
 - Shrift, PNG va D-Bus parser'lari uchun fuzzing.
 
-**Qabul:** shrift golden image testlari har platformada bit-identical. PNG decoder PngSuite'dan o'tadi. D-Bus client `dbus-daemon` bilan interop qiladi va ModemManager'dan modem ro'yxatini oladi. QEMU aarch64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi.
+**Qabul:** shrift golden image testlari har platformada bit-identical. PNG decoder PngSuite'dan o'tadi. D-Bus client `dbus-daemon` bilan interop qiladi va ModemManager'dan modem ro'yxatini oladi. QEMU x86-64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi (aarch64'da S39'da).
+
+### S38. Arche'dan WASM component
+
+- `--target wasm32-component`: S30'ning WASM backend'i, ustiga Component Model o'rami (component, core modul, canonical ABI'ning lift va lower funksiyalari).
+- WIT'dan Arche binding'lari: `arche bindgen <world.wit>` import'larni Arche funksiyalari, export'larni interface qiladi; string, list, record, variant, enum, option, result va flags.
+- Nimadir `host-api` va `dom` uchun binding'lar va ilova shabloni.
+
+**Qabul:** Arche'da yozilgan Nimadir ilovasi Wasmtime'dagi Nimadir'da ham, arche-lang'ning `wasm/` runtime'ida ham bir xil ishlaydi; `wasm-tools validate` component'ni qabul qiladi.
+
+### S39. ARM64 JIT va aarch64 telefon
+
+- `wasm/jit.arche`'ning ARM64 varianti (x86-64'dagi qamrov bilan), S31'ning ochiq qolgani.
+- aarch64 Linux uchun telefon dasturlari (init, UI server, WASM host) build va QEMU aarch64'da sinov.
+
+**Qabul:** WASM spec testsuite'i ARM64 JIT bilan o'tadi; QEMU aarch64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi.
 
 ## 11. Editor va macOS
 
