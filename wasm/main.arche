@@ -1,13 +1,14 @@
 /// arche-wasm: runs WebAssembly.
 ///
 ///   arche-wasm spec [--jit] <script.json>...   the spec's tests (wast2json's output)
-///   arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--click text]...
-///       [--type selector text] [--deny func]... [--tree]
-///                                        a Nimadir mini-app, with no window
+///   arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...]
+///       [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]...
+///       [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]...
+///                                        a Nimadir mini-app, with no window, as
+///                                        Nimadir's headless runner runs it
 ///   arche-wasm serve <handler.wasm> <port> (<certificate chain> <key> | --plain) [workers]
 ///                                        HTTPS, each request answered by the
 ///                                        module's handle (serve.arche)
-///                                        a Nimadir mini-app, with no window
 import alloc;
 import wasm.component;
 import wasm.exec;
@@ -23,7 +24,7 @@ import tls;
 
 fn usage(sys: &mut std.System) -> !void {
     sys.stderr.write("usage: arche-wasm spec [--jit] <script.json>...\n");
-    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--click text]... [--type selector text] [--deny func]... [--tree]\n");
+    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]...\n");
     sys.proc.exit(2);
 }
 
@@ -136,111 +137,525 @@ fn number(s: str) -> u32 {
     return n;
 }
 
-/// Runs an app: init, then frames, each one's drawing written out. A limit
-/// that stops it is written too, and the status is 3.
+/// Something to do at a frame: to button, field or node n, with text.
+type At = struct {
+    frame: u32,
+    n: u32,
+    text: alloc.String,
+}
+
+/// "f:n,f:n" onto out.
+fn pairs(s: str, out: &mut alloc.List(At), a: alloc.Allocator) {
+    let b = s.bytes();
+    var at: usize = 0;
+    while at < b.len() {
+        var e = at;
+        while e < b.len() and b[e] != ',' {
+            e += 1;
+        }
+        var colon = at;
+        while colon < e and b[colon] != ':' {
+            colon += 1;
+        }
+        if colon < e {
+            out.push(At { frame: number(s[at..colon]), n: number(s[colon + 1..e]), text: alloc.String.init(a) });
+        }
+        at = e + 1;
+    }
+}
+
+/// "f:n=text" onto out: all after the first = is the text.
+fn typed(s: str, out: &mut alloc.List(At), a: alloc.Allocator) {
+    let b = s.bytes();
+    var eq: usize = 0;
+    while eq < b.len() and b[eq] != '=' {
+        eq += 1;
+    }
+    var colon: usize = 0;
+    while colon < eq and b[colon] != ':' {
+        colon += 1;
+    }
+    if eq < b.len() and colon < eq {
+        out.push(At { frame: number(s[0..colon]), n: number(s[colon + 1..eq]), text: alloc.String.from(s[eq + 1..b.len()], a) });
+    }
+}
+
+/// An app the registry lists: its name, where it lives, what it is.
+type Entry = struct {
+    name: alloc.String,
+    source: alloc.String,
+    about: alloc.String,
+}
+
+fn trimmed(s: str) -> str {
+    let b = s.bytes();
+    var i: usize = 0;
+    var j = b.len();
+    while i < j and (b[i] == ' ' or b[i] == '\t' or b[i] == '\r') {
+        i += 1;
+    }
+    while j > i and (b[j - 1] == ' ' or b[j - 1] == '\t' or b[j - 1] == '\r') {
+        j -= 1;
+    }
+    return s[i..j];
+}
+
+/// The registry in Nimadir's apps.list: "name | source | description" a
+/// line, # for a comment.
+fn read_registry(text: str, a: alloc.Allocator) -> alloc.List(Entry) {
+    var out = alloc.List(Entry).init(a);
+    let b = text.bytes();
+    var at: usize = 0;
+    while at < b.len() {
+        var e = at;
+        while e < b.len() and b[e] != '\n' {
+            e += 1;
+        }
+        let line = trimmed(text[at..e]);
+        at = e + 1;
+        if line.len() == 0 or line.bytes()[0] == '#' {
+            continue;
+        }
+        let lb = line.bytes();
+        var p1: usize = 0;
+        while p1 < lb.len() and lb[p1] != '|' {
+            p1 += 1;
+        }
+        var p2 = p1 + 1;
+        while p2 < lb.len() and lb[p2] != '|' {
+            p2 += 1;
+        }
+        if p2 >= lb.len() {
+            continue;
+        }
+        out.push(Entry { name: alloc.String.from(trimmed(line[0..p1]), a), source: alloc.String.from(trimmed(line[p1 + 1..p2]), a), about: alloc.String.from(trimmed(line[p2 + 1..lb.len()]), a) });
+    }
+    return out;
+}
+
+/// What an address resolves to, as Nimadir's registry resolves it: a name
+/// or source it lists; a host, which gets https://; else itself. The
+/// title, the listed app's name, into title.
+fn resolve(target: str, registry: &alloc.List(Entry), title: &mut alloc.String, a: alloc.Allocator) -> alloc.String {
+    let t = trimmed(target);
+    for e in registry.items() {
+        if e.name.view().eq(t) or e.source.view().eq(t) {
+            title.push_str(e.name.view());
+            return alloc.String.from(e.source.view(), a);
+        }
+    }
+    title.push_str(t);
+    var out = alloc.String.init(a);
+    if looks_like_host(t) {
+        out.push_str("https://");
+    }
+    out.push_str(t);
+    return out;
+}
+
+/// Whether typed text is a web address missing its scheme: a dot in the
+/// part before the first / ? or #, which is not a file's name.
+fn looks_like_host(s: str) -> bool {
+    let b = s.bytes();
+    if b.len() == 0 or b[0] == '/' or b[0] == '.' {
+        return false;
+    }
+    var end: usize = 0;
+    var dot = false;
+    while end < b.len() and b[end] != '/' and b[end] != '?' and b[end] != '#' : (end += 1) {
+        if b[end] == '.' {
+            dot = true;
+        }
+        if b[end] == ' ' or b[end] == '\\' {
+            return false;
+        }
+        if b[end] == ':' and end + 2 < b.len() and b[end + 1] == '/' and b[end + 2] == '/' {
+            return false;
+        }
+    }
+    let host = s[0..end];
+    if ends(s: host, tail: ".wasm") or ends(s: host, tail: ".html") or ends(s: host, tail: ".htm") or ends(s: host, tail: ".json") {
+        return false;
+    }
+    return dot;
+}
+
+fn ends(s: str, tail: str) -> bool {
+    return s.len() >= tail.len() and s[s.len() - tail.len()..s.len()].eq(tail);
+}
+
+/// An app started: read from source, its imports given, its init run;
+/// what it is and how many bytes it was, or why not.
+type Started = struct {
+    app: nimadir.App,
+    size: u64,
+}
+
+fn start_app(fs: &std.Fs, source: str, store: &mut exec.Store, now: &dyn fn() -> u64, now_ms: i64, registry: &alloc.List(Entry), denied: &alloc.List(alloc.String), why: &mut alloc.String, a: alloc.Allocator) -> ?Started {
+    let bytes = match fs.read_bytes(source, a) {
+        ok(x) => { x }
+        err(_) => {
+            why.push_str("cannot read the component");
+            return none;
+        }
+    };
+    var ui = nimadir.new_ui(a);
+    ui.now_ms = now_ms;
+    for d in denied.items() {
+        nimadir.deny(&mut ui, func: d.view());
+    }
+    // The registry, but the start page: it is how the shell finds home,
+    // not somewhere to go.
+    for e in registry.items() {
+        if not e.name.view().eq("store") {
+            nimadir.add_app(&mut ui, name: e.name.view(), source: e.source.view(), about: e.about.view());
+        }
+    }
+    let comp = match component.instantiate(store, now, bytes.items(), imports: &ui, a) {
+        ok(x) => { x }
+        err(e) => {
+            why.push_str("the component did not instantiate: ");
+            why.push_str(component_error(e));
+            return none;
+        }
+    };
+    var app = nimadir.App { comp: comp, ui: ui };
+    nimadir.begin_frame(&mut app.ui);
+    match nimadir.run(&mut app, store, now, name: "init", budget_ns: nimadir.INIT_BUDGET_NS) {
+        ok(_) => { }
+        err(e) => {
+            why.push_str("stopped: ");
+            why.push_str(exec.message(e));
+            return none;
+        }
+    }
+    return Started { app: app, size: bytes.len() as u64 };
+}
+
+fn write_logs(out: &mut std.Output, ui: &mut nimadir.Ui, indent: str) {
+    for l in nimadir.logs_of(ui) {
+        out.write(indent);
+        out.write("[wasm log] ");
+        out.write(l.view());
+        out.write("\n");
+    }
+    nimadir.clear_logs(ui);
+}
+
+/// The n of the ats at frame, in order, each once.
+fn at_frame(ats: &alloc.List(At), frame: u32, a: alloc.Allocator) -> alloc.List(u32) {
+    var out = alloc.List(u32).init(a);
+    for x in ats.items() {
+        if x.frame == frame {
+            var seen = false;
+            for y in out.items() {
+                if y.* == x.n {
+                    seen = true;
+                }
+            }
+            if not seen {
+                out.push(x.n);
+                // Into order: back while the one before is larger.
+                var k = out.len() - 1;
+                while k > 0 and out.items()[k - 1] > out.items()[k] : (k -= 1) {
+                    let t = out.items()[k];
+                    let before = out.items()[k - 1];
+                    out.items_mut()[k] = before;
+                    out.items_mut()[k - 1] = t;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+/// Runs an app as Nimadir's headless runner does, and says the same: its
+/// init's logs, then each frame's input, page, widgets, logs, the frame it
+/// asks for, and where it goes. A limit that stops it is said, and the
+/// status is 3.
 fn run_app(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
     let path = sys.args.get(2);
     var frames: u32 = 2;
-    var tree = false;
-    var clicks = alloc.List(alloc.String).init(sys.alloc);
-    var type_sel = alloc.String.init(sys.alloc);
-    var type_text = alloc.String.init(sys.alloc);
-    var denied = alloc.List(alloc.String).init(sys.alloc);
+    var script = alloc.List(At).init(a);
+    var inputs = alloc.List(At).init(a);
+    var submits = alloc.List(At).init(a);
+    var dom_clicks = alloc.List(At).init(a);
+    var dom_typed = alloc.List(At).init(a);
+    var dom_enters = alloc.List(At).init(a);
+    var denied = alloc.List(alloc.String).init(a);
+    var registry = alloc.List(Entry).init(a);
     var use_jit = false;
+    var confirm = false;
     var i: usize = 3;
     while i < sys.args.len() : (i += 1) {
         let arg = sys.args.get(i);
-        if arg.eq("--frames") and i + 1 < sys.args.len() {
+        let more = i + 1 < sys.args.len();
+        if arg.eq("--frames") and more {
             frames = number(sys.args.get(i + 1));
             i += 1;
-        } else if arg.eq("--click") and i + 1 < sys.args.len() {
-            clicks.push(alloc.String.from(sys.args.get(i + 1), sys.alloc));
+        } else if arg.eq("--script") and more {
+            pairs(sys.args.get(i + 1), out: &mut script, a);
             i += 1;
-        } else if arg.eq("--type") and i + 2 < sys.args.len() {
-            type_sel = alloc.String.from(sys.args.get(i + 1), sys.alloc);
-            type_text = alloc.String.from(sys.args.get(i + 2), sys.alloc);
-            i += 2;
-        } else if arg.eq("--deny") and i + 1 < sys.args.len() {
-            denied.push(alloc.String.from(sys.args.get(i + 1), sys.alloc));
+        } else if arg.eq("--input") and more {
+            typed(sys.args.get(i + 1), out: &mut inputs, a);
+            i += 1;
+        } else if arg.eq("--submit") and more {
+            pairs(sys.args.get(i + 1), out: &mut submits, a);
+            i += 1;
+        } else if arg.eq("--click") and more {
+            pairs(sys.args.get(i + 1), out: &mut dom_clicks, a);
+            i += 1;
+        } else if arg.eq("--type") and more {
+            typed(sys.args.get(i + 1), out: &mut dom_typed, a);
+            i += 1;
+        } else if arg.eq("--enter") and more {
+            pairs(sys.args.get(i + 1), out: &mut dom_enters, a);
+            i += 1;
+        } else if arg.eq("--registry") and more {
+            let text = match sys.fs.read_file(sys.args.get(i + 1), a) {
+                ok(x) => { x }
+                err(_) => {
+                    sys.stderr.write("arche-wasm: cannot read the registry\n");
+                    sys.proc.exit(1);
+                }
+            };
+            registry = read_registry(text.view(), a: a);
+            i += 1;
+        } else if arg.eq("--deny") and more {
+            denied.push(alloc.String.from(sys.args.get(i + 1), a));
             i += 1;
         } else if arg.eq("--jit") {
             use_jit = true;
-        } else if arg.eq("--tree") {
-            tree = true;
+        } else if arg.eq("--confirm") {
+            confirm = true;
         } else {
             try usage(sys);
         }
     }
-    let bytes = match sys.fs.read_bytes(path, sys.alloc) {
-        ok(x) => { x }
-        err(_) => {
-            sys.stderr.write("arche-wasm: cannot read the component\n");
+    let clock = &sys.clock;
+    let now = fn [clock] () -> u64 { return clock.monotonic_ns(); };
+    let out = &mut sys.stdout;
+    var store = new_store(use_jit, a: a);
+    var why = alloc.String.init(a);
+    var title = alloc.String.init(a);
+    var source = resolve(path, registry: &registry, title: &mut title, a: a);
+    if not sys.fs.exists(source.view()) {
+        source = alloc.String.from(path, a);
+    }
+    var app = match start_app(&sys.fs, source: source.view(), store: &mut store, now: &now, now_ms: (sys.clock.unix_ns() / 1000000) as i64, registry: &registry, denied: &denied, why: &mut why, a: a) {
+        some(s) => {
+            out.write("loaded ");
+            out.write_u64(s.size);
+            out.write(" bytes of wasm from ");
+            out.write(source.view());
+            out.write("\n");
+            s.app
+        }
+        none => {
+            out.flush();
+            if why.view().starts_with("stopped: ") {
+                out.write(why.view());
+                out.write("\n");
+                out.flush();
+                sys.proc.exit(3);
+            }
+            sys.stderr.write("arche-wasm: ");
+            sys.stderr.write(why.view());
+            sys.stderr.write("\n");
             sys.proc.exit(1);
         }
     };
-    let clock = &sys.clock;
-    let now = fn [clock] () -> u64 { return clock.monotonic_ns(); };
-    var store = exec.new_store(nimadir.limits(), sys.alloc);
+    write_logs(out, ui: &mut app.ui, indent: "");
+    out.write("\n=== headless run: ");
+    out.write_u64(frames as u64);
+    out.write(" frames ===\n");
+    var frame: u32 = 0;
+    while frame < frames : (frame += 1) {
+        // What the user does to the tree comes before the frame, so the app
+        // finds it in events() as it runs.
+        var acted = alloc.String.init(a);
+        for n in at_frame(&dom_clicks, frame: frame, a: a).items() {
+            nimadir.click_node(&mut app.ui, n: n.*);
+            acted.push_str("   [tap] #");
+            acted.push_u64(n.* as u64);
+            acted.push_str("\n");
+        }
+        for t in dom_typed.items() {
+            if t.frame == frame {
+                nimadir.type_text(&mut app.ui, n: t.n, text: t.text.view());
+                acted.push_str("   [type] #");
+                acted.push_u64(t.n as u64);
+                acted.push_str(" = ");
+                quote(t.text.view(), out: &mut acted);
+                acted.push_str("\n");
+            }
+        }
+        for n in at_frame(&dom_enters, frame: frame, a: a).items() {
+            nimadir.submit_node(&mut app.ui, n: n.*);
+            acted.push_str("   [enter] #");
+            acted.push_u64(n.* as u64);
+            acted.push_str("\n");
+        }
+        for t in inputs.items() {
+            if t.frame == frame {
+                nimadir.set_field(&mut app.ui, i: t.n, text: t.text.view());
+            }
+        }
+        let clicks = at_frame(&script, frame: frame, a: a);
+        for b in clicks.items() {
+            nimadir.tap(&mut app.ui, i: b.*);
+        }
+        for f in at_frame(&submits, frame: frame, a: a).items() {
+            nimadir.submit_field(&mut app.ui, i: f.*);
+        }
+        nimadir.begin_frame(&mut app.ui);
+        app.ui.now_ms = (sys.clock.unix_ns() / 1000000) as i64;
+        match nimadir.run(&mut app, &mut store, &now, name: "update", budget_ns: nimadir.FRAME_BUDGET_NS) {
+            ok(_) => { }
+            err(e) => {
+                out.write("stopped: ");
+                out.write(exec.message(e));
+                out.write("\n");
+                out.flush();
+                sys.proc.exit(3);
+            }
+        }
+        // Where the app asked to go, or the link it was tapped on.
+        var asks = alloc.String.init(a);
+        var nav = alloc.String.init(a);
+        var drawn = alloc.String.init(a);
+        nimadir.write_frame(&app.ui, out: &mut drawn);
+        let frame_after = app.ui.frame_after;
+        var logs = alloc.String.init(a);
+        for l in nimadir.logs_of(&app.ui) {
+            logs.push_str("   [wasm log] ");
+            logs.push_str(l.view());
+            logs.push_str("\n");
+        }
+        nimadir.clear_logs(&mut app.ui);
+        if app.ui.open_request.len() > 0 {
+            let asked = alloc.String.from(app.ui.open_request.view(), a);
+            app.ui.open_request = alloc.String.init(a);
+            var to_title = alloc.String.init(a);
+            let target = resolve(asked.view(), registry: &registry, title: &mut to_title, a: a);
+            var listed = false;
+            for e in registry.items() {
+                if e.source.view().eq(target.view()) {
+                    listed = true;
+                }
+            }
+            // The start page goes where its user typed; anywhere else, an app
+            // does not take the user somewhere unlisted on its own say.
+            var go = listed or title.view().eq("store");
+            if not go {
+                asks.push_str("   [asks] ");
+                asks.push_str(title.view());
+                asks.push_str(" wants to open ");
+                asks.push_str(target.view());
+                asks.push_str("\n");
+                if confirm {
+                    asks.push_str("   [opened]\n");
+                    go = true;
+                } else {
+                    asks.push_str("   [declined]\n");
+                }
+            }
+            if go {
+                var next_store = new_store(use_jit, a: a);
+                var no = alloc.String.init(a);
+                match start_app(&sys.fs, source: target.view(), store: &mut next_store, now: &now, now_ms: (sys.clock.unix_ns() / 1000000) as i64, registry: &registry, denied: &denied, why: &mut no, a: a) {
+                    some(s) => {
+                        app = s.app;
+                        store = next_store;
+                        title = to_title;
+                        // The frame drawn was the app that left's.
+                        drawn = alloc.String.init(a);
+                        logs = alloc.String.init(a);
+                        for l in nimadir.logs_of(&app.ui) {
+                            logs.push_str("   [wasm log] ");
+                            logs.push_str(l.view());
+                            logs.push_str("\n");
+                        }
+                        nimadir.clear_logs(&mut app.ui);
+                        nav.push_str("   [nav] loaded ");
+                        nav.push_u64(s.size);
+                        nav.push_str(" bytes of wasm from ");
+                        nav.push_str(target.view());
+                        nav.push_str("\n");
+                    }
+                    none => {
+                        nav.push_str("   [nav failed] ");
+                        nav.push_str(no.view());
+                        nav.push_str("\n");
+                    }
+                }
+            }
+        }
+        out.write("\n--- frame ");
+        out.write_u64(frame as u64);
+        out.write("  (clicks fed to guest: [");
+        var k: usize = 0;
+        while k < clicks.len() : (k += 1) {
+            if k > 0 {
+                out.write(", ");
+            }
+            out.write_u64(clicks.items()[k] as u64);
+        }
+        out.write("]) ---\n");
+        out.write(acted.view());
+        if nimadir.has_page(&app.ui) {
+            out.write("   [page] ");
+            out.write_u64(nimadir.live_nodes(&app.ui) as u64);
+            out.write(" nodes\n");
+            var page = alloc.String.init(a);
+            nimadir.write_outline(&app.ui, n: 1, depth: 0, out: &mut page);
+            out.write(page.view());
+        }
+        out.write(drawn.view());
+        out.write(logs.view());
+        if frame_after != nimadir.NONE and nav.len() == 0 {
+            out.write("   [next frame in ");
+            out.write_u64(frame_after as u64);
+            out.write(" ms]\n");
+        }
+        out.write(asks.view());
+        out.write(nav.view());
+    }
+    out.flush();
+}
+
+fn new_store(use_jit: bool, a: alloc.Allocator) -> exec.Store {
+    var store = exec.new_store(nimadir.limits(), a);
     if use_jit {
         let code = code_region();
         if code != 0 {
             exec.enable_jit(&mut store, base: code, size: JIT_SIZE);
         }
     }
-    var ui = nimadir.new_ui(sys.alloc);
-    for d in denied.items() {
-        nimadir.deny(&mut ui, func: d.view());
-    }
-    let comp = match component.instantiate(&mut store, &now, bytes.items(), imports: &ui, sys.alloc) {
-        ok(x) => { x }
-        err(e) => {
-            sys.stderr.write("arche-wasm: the component did not instantiate: ");
-            sys.stderr.write(component_error(e));
-            sys.stderr.write("\n");
-            sys.proc.exit(1);
-        }
-    };
-    var app = nimadir.App { comp: comp, ui: ui };
-    var frame: u32 = 0;
-    while frame <= frames : (frame += 1) {
-        nimadir.begin_frame(&mut app.ui);
-        app.ui.now_ms = (sys.clock.unix_ns() / 1000000) as i64;
-        var name = "update";
-        var budget = nimadir.FRAME_BUDGET_NS;
-        if frame == 0 {
-            name = "init";
-            budget = nimadir.INIT_BUDGET_NS;
-            sys.stdout.write("init\n");
-        } else {
-            if frame == 2 {
-                for c in clicks.items() {
-                    nimadir.click(&mut app.ui, text: c.view());
-                }
-                if type_sel.len() > 0 {
-                    nimadir.type_into(&mut app.ui, sel: type_sel.view(), text: type_text.view());
-                }
+    return store;
+}
+
+/// s in quotes, as Rust's Debug quotes it.
+fn quote(s: str, out: &mut alloc.String) {
+    out.push_str("\"");
+    let b = s.bytes();
+    var at: usize = 0;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        if b[i] == '"' or b[i] == '\\' or b[i] == '\n' {
+            out.push_str(s[at..i]);
+            if b[i] == '\n' {
+                out.push_str("\\n");
+            } else {
+                out.push_str("\\");
+                out.push_ascii(b[i]);
             }
-            sys.stdout.write("frame ");
-            sys.stdout.write_u64(frame as u64);
-            sys.stdout.write("\n");
-        }
-        let r = nimadir.run(&mut app, &mut store, &now, name: name, budget_ns: budget);
-        sys.stdout.write(app.ui.out.view());
-        match r {
-            ok(_) => { }
-            err(e) => {
-                sys.stdout.write("stopped: ");
-                sys.stdout.write(exec.message(e));
-                sys.stdout.write("\n");
-                sys.proc.exit(3);
-            }
+            at = i + 1;
         }
     }
-    if tree {
-        var out = alloc.String.init(sys.alloc);
-        nimadir.write_tree(&app.ui, n: 1, depth: 0, out: &mut out);
-        sys.stdout.write(out.view());
-    }
+    out.push_str(s[at..b.len()]);
+    out.push_str("\"");
 }
 
 fn component_error(e: component.ComponentError) -> str {

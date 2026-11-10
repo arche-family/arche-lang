@@ -1,15 +1,52 @@
 #!/bin/sh
-# Nimadir's mini-apps on arche-wasm (docs/sprints.md S31): counter, hello and
-# store run unrebuilt in a shell with no window, and runaway is stopped by
-# the shell's limits: a second a frame, 512 MiB of memory, and what a frame
-# may send. An app that imports what the shell does not give is refused.
-# Each runs in the interpreter, and again with the JIT (--jit).
+# Nimadir's mini-apps on arche-wasm (docs/sprints.md S31): counter, hello,
+# gallery and store run unrebuilt in a shell with no window, and say what
+# Nimadir's own shell says to the same cases of its test suite
+# (tests/nimadir/cases.txt, expected/). runaway is stopped by the shell's
+# limits: a second a frame, 512 MiB of memory, and what a frame may send.
+# An app that imports what the shell does not give is refused. Each runs
+# in the interpreter, and again with the JIT (--jit).
 # Usage: nimadir-check.sh <arche-wasm>
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-wasm=$1
+wasm=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 apps=$here/tests/nimadir
 failed=0
+
+# The apps where Nimadir's registry says they are, so that both shells are
+# run alike from one directory.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+for app in counter hello store gallery runaway; do
+    mkdir -p "$work/mini-apps/$app"
+    cp "$apps/$app.component.wasm" "$work/mini-apps/$app/"
+done
+
+# The same as Nimadir: each case, normalized, against what Nimadir said.
+grep -v '^#' "$apps/cases.txt" | {
+    while read -r name args; do
+        [ -n "$name" ] || continue
+        for mode in "" --jit; do
+            # shellcheck disable=SC2086
+            if ! (cd "$work" && "$wasm" nimadir $args $mode --registry "$apps/registry.list") > "$work/out" 2>&1; then
+                echo "FAIL $name $mode: arche-wasm failed:"
+                head -20 "$work/out"
+                failed=$((failed + 1))
+                continue
+            fi
+            sh "$apps/normalize.sh" < "$work/out" > "$work/got"
+            if ! diff -u "$apps/expected/$name.txt" "$work/got" > "$work/diff"; then
+                echo "FAIL $name $mode: not what Nimadir says:"
+                head -30 "$work/diff"
+                failed=$((failed + 1))
+            else
+                echo "PASS $name $mode: as Nimadir"
+            fi
+        done
+    done
+    echo "$failed" > "$work/failed"
+}
+failed=$(cat "$work/failed")
 
 # expect <description> <status> <line that must appear> -- <arche-wasm args>...
 expect() {
@@ -34,16 +71,10 @@ expect() {
     done
 }
 
-expect "counter draws its count" 0 "label: Count: 0" -- "$apps/counter.component.wasm" --frames 1
-expect "counter counts a click" 0 "label: Count: 1" -- "$apps/counter.component.wasm" --frames 3 --click Increment
-expect "hello greets" 0 "label: Hello from a *different* mini-app!" -- "$apps/hello.component.wasm" --frames 1
-expect "hello opens the counter" 0 "open: counter" -- "$apps/hello.component.wasm" --frames 2 --click "Open the counter"
-expect "store lists the registry" 0 "      \"3 apps\"" -- "$apps/store.component.wasm" --frames 1 --tree
-expect "store filters as one types" 0 "      <a class=\"tile\" href=\"counter.component.wasm\" hidden>" -- "$apps/store.component.wasm" --frames 2 --type "#q" hel --tree
-expect "runaway spinning is stopped by the frame's deadline" 3 "stopped: deadline exceeded" -- "$apps/runaway.component.wasm" --frames 2 --click "Spin forever"
-expect "runaway eating memory is stopped at 512 MiB" 3 "stopped: memory limit exceeded" -- "$apps/runaway.component.wasm" --frames 2 --click "Eat memory"
-expect "runaway flooding the shell is stopped" 3 "stopped: host limit exceeded" -- "$apps/runaway.component.wasm" --frames 2 --click "Flood the shell"
-expect "a full store is said, not a trap" 0 "log: runaway: storage is full: 1 MiB per app" -- "$apps/runaway.component.wasm" --frames 2 --click "Overfill storage"
+expect "runaway spinning is stopped by the frame's deadline" 3 "stopped: deadline exceeded" -- "$apps/runaway.component.wasm" --frames 2 --script 1:0
+expect "runaway eating memory is stopped at 512 MiB" 3 "stopped: memory limit exceeded" -- "$apps/runaway.component.wasm" --frames 2 --script 1:1
+expect "runaway flooding the shell is stopped" 3 "stopped: host limit exceeded" -- "$apps/runaway.component.wasm" --frames 2 --script 1:2
+expect "a full store is said, not a trap" 0 "   [wasm log] runaway: storage is full: 1 MiB per app" -- "$apps/runaway.component.wasm" --frames 2 --script 1:3
 expect "an import the shell does not give is refused" 1 "arche-wasm: the component did not instantiate: imports what the shell does not give" -- "$apps/counter.component.wasm" --deny now-millis
 
 if [ "$failed" -ne 0 ]; then
