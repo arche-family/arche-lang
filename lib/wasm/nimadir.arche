@@ -24,6 +24,36 @@ const DOM: str = "nimadir:shell/dom@1.2.0";
 const HOST_FUNCS: str = " log ui-label ui-button ui-text-edit ui-heading ui-search-field ui-tile now-millis list-apps open-app request-frame storage-get storage-set storage-remove storage-keys ui-begin ui-end ui-checkbox ui-choice ui-separator ui-progress ui-submitted image-load ui-image fetch fetch-poll locale time-zone utc-offset app-info ";
 const DOM_FUNCS: str = " root create-element create-text append-child insert-before remove release set-text set-attribute remove-attribute get-attribute toggle-class set-style set-markup query-all parent children value focus bounds add-stylesheet remove-stylesheet listen unlisten events ";
 
+/// What a widget is, as a screen's shell draws it.
+pub const LABEL: u32 = 1;
+pub const HEADING: u32 = 2;
+pub const BUTTON: u32 = 3;
+pub const TILE: u32 = 4;
+pub const CHECKBOX: u32 = 5;
+pub const FIELD: u32 = 6;
+pub const SEARCH: u32 = 7;
+pub const CHOICE: u32 = 8;
+pub const SEPARATOR: u32 = 9;
+pub const PROGRESS: u32 = 10;
+pub const IMAGE: u32 = 11;
+/// A group begins, of the kind text says; its widgets have depth one more.
+pub const BEGIN: u32 = 12;
+
+/// A widget the app drew this frame, for a shell with a screen to draw:
+/// its kind, its text, a second text (a tile's detail, a search field's
+/// placeholder, a choice's options, a line apart), a number (a heading's
+/// level, a checkbox's state, a choice, progress in thousandths, an
+/// image), how deep in groups it is, and its index among the frame's
+/// buttons (button, tile, checkbox) or fields (field, search, choice).
+pub type Widget = struct {
+    pub kind: u32,
+    pub text: alloc.String,
+    pub detail: alloc.String,
+    pub value: u64,
+    pub depth: u32,
+    pub index: u32,
+}
+
 /// An element, or a run of text when tag is empty.
 type Node = struct {
     tag: alloc.String,
@@ -49,7 +79,21 @@ type Event = struct {
 /// storage, its element tree.
 pub type Ui = struct {
     pub out: alloc.String,
+    /// What the frame drew, widget by widget.
+    pub widgets: alloc.List(Widget),
     clicks: alloc.List(alloc.String),
+    /// The frame's buttons and fields so far, and what the user did to
+    /// one in the last frame: the button tapped, the field edited, its
+    /// text, whether it was submitted, a choice picked; NONE for none.
+    buttons: u32,
+    fields: u32,
+    tapped: u32,
+    edited: u32,
+    edit: alloc.String,
+    submitted: u32,
+    picked: u32,
+    pick: u64,
+    last_field: u32,
     pub now_ms: i64,
     keys: alloc.List(alloc.String),
     values: alloc.List(alloc.String),
@@ -69,7 +113,17 @@ pub type Ui = struct {
 pub fn new_ui(a: alloc.Allocator) -> Ui {
     var ui = Ui {
         out: alloc.String.init(a),
+        widgets: alloc.List(Widget).init(a),
         clicks: alloc.List(alloc.String).init(a),
+        buttons: 0,
+        fields: 0,
+        tapped: NONE,
+        edited: NONE,
+        edit: alloc.String.init(a),
+        submitted: NONE,
+        picked: NONE,
+        pick: 0,
+        last_field: NONE,
         now_ms: 0,
         keys: alloc.List(alloc.String).init(a),
         values: alloc.List(alloc.String).init(a),
@@ -114,9 +168,38 @@ pub fn click(ui: &mut Ui, text: str) {
     ui.clicks.push(alloc.String.from(text, ui.a));
 }
 
+/// No button or field.
+pub const NONE: u32 = 0xFFFFFFFF;
+
+/// The frame's button i (button, tile or checkbox, counted in the order
+/// they are drawn) was tapped: it says so when it is next drawn.
+pub fn tap(ui: &mut Ui, i: u32) {
+    ui.tapped = i;
+}
+
+/// The frame's field i (field or search) holds text now, and was submitted
+/// when submit: the app gets it when it next draws that field.
+pub fn edit_field(ui: &mut Ui, i: u32, text: str, submit: bool) {
+    ui.edited = i;
+    ui.edit = alloc.String.from(text, ui.a);
+    if submit {
+        ui.submitted = i;
+    }
+}
+
+/// Option option of the frame's choice i was picked.
+pub fn pick(ui: &mut Ui, i: u32, option: u64) {
+    ui.picked = i;
+    ui.pick = option;
+}
+
 /// A new frame: what was sent so far no longer counts.
 pub fn begin_frame(ui: &mut Ui) {
     ui.out = alloc.String.init(ui.a);
+    ui.widgets = alloc.List(Widget).init(ui.a);
+    ui.buttons = 0;
+    ui.fields = 0;
+    ui.last_field = NONE;
     ui.sent_bytes = 0;
     ui.sent_cmds = 0;
     ui.depth = 0;
@@ -205,6 +288,30 @@ fn draw(ui: &mut Ui, what: str, text: str) -> exec.Trap!void {
     ui.out.push_str("\n");
 }
 
+/// A widget for the screen; its index is the next button's or field's when
+/// it is one.
+fn widget(ui: &mut Ui, kind: u32, text: str, detail: str, value: u64) -> u32 {
+    var index = NONE;
+    if kind == BUTTON or kind == TILE or kind == CHECKBOX {
+        index = ui.buttons;
+        ui.buttons += 1;
+    } else if kind == FIELD or kind == SEARCH or kind == CHOICE {
+        index = ui.fields;
+        ui.fields += 1;
+    }
+    ui.widgets.push(Widget { kind: kind, text: alloc.String.from(text, ui.a), detail: alloc.String.from(detail, ui.a), value: value, depth: ui.depth, index: index });
+    return index;
+}
+
+/// Button i was tapped in the last frame; once.
+fn tapped_now(ui: &mut Ui, i: u32) -> bool {
+    if ui.tapped == i {
+        ui.tapped = NONE;
+        return true;
+    }
+    return false;
+}
+
 fn clicked(ui: &mut Ui, text: str) -> bool {
     var i: usize = 0;
     while i < ui.clicks.len() : (i += 1) {
@@ -256,43 +363,106 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
     if func.eq("ui-label") or func.eq("ui-separator") {
         if func.eq("ui-separator") {
             try draw(ui, what: "separator", text: "");
+            _ = widget(ui, kind: SEPARATOR, text: "", detail: "", value: 0);
         } else {
             try draw(ui, what: "label", text: text_arg(args, i: 0));
+            _ = widget(ui, kind: LABEL, text: text_arg(args, i: 0), detail: "", value: 0);
         }
         return c.Val.Unit;
     }
     if func.eq("ui-heading") {
         try draw(ui, what: "heading", text: text_arg(args, i: 0));
+        _ = widget(ui, kind: HEADING, text: text_arg(args, i: 0), detail: "", value: int_arg(args, i: 1));
         return c.Val.Unit;
     }
     if func.eq("ui-button") or func.eq("ui-tile") {
         try draw(ui, what: "button", text: text_arg(args, i: 0));
-        return bool_val(clicked(ui, text: text_arg(args, i: 0)));
+        var kind = BUTTON;
+        var detail = "";
+        if func.eq("ui-tile") {
+            kind = TILE;
+            detail = text_arg(args, i: 1);
+        }
+        let i = widget(ui, kind: kind, text: text_arg(args, i: 0), detail: detail, value: 0);
+        let by_text = clicked(ui, text: text_arg(args, i: 0));
+        return bool_val(tapped_now(ui, i: i) or by_text);
     }
     if func.eq("ui-checkbox") {
         try draw(ui, what: "checkbox", text: text_arg(args, i: 0));
         let checked = int_arg(args, i: 1) != 0;
-        return bool_val(checked != clicked(ui, text: text_arg(args, i: 0)));
+        var v: u64 = 0;
+        if checked {
+            v = 1;
+        }
+        let i = widget(ui, kind: CHECKBOX, text: text_arg(args, i: 0), detail: "", value: v);
+        let by_text = clicked(ui, text: text_arg(args, i: 0));
+        return bool_val(checked != (tapped_now(ui, i: i) or by_text));
     }
     if func.eq("ui-text-edit") or func.eq("ui-search-field") {
         try draw(ui, what: "field", text: text_arg(args, i: 0));
+        var kind = FIELD;
+        var detail = "";
+        if func.eq("ui-search-field") {
+            kind = SEARCH;
+            detail = text_arg(args, i: 1);
+        }
+        let i = widget(ui, kind: kind, text: text_arg(args, i: 0), detail: detail, value: 0);
+        ui.last_field = i;
+        if ui.edited == i {
+            ui.edited = NONE;
+            let typed = alloc.String.from(ui.edit.view(), a);
+            ui.widgets.items_mut()[ui.widgets.len() - 1].text = alloc.String.from(typed.view(), a);
+            return c.Val.Str { v: typed };
+        }
         return str_val(text_arg(args, i: 0), a);
     }
     if func.eq("ui-choice") {
         try draw(ui, what: "choice", text: "");
+        // The options, a line each.
+        var options = alloc.String.init(a);
+        match &args.items()[0] {
+            .List { items } => {
+                for o in items.items() {
+                    match o {
+                        .Str { v } => {
+                            options.push_str(v.view());
+                            options.push_str("\n");
+                        }
+                        _ => { }
+                    }
+                }
+            }
+            _ => { }
+        }
+        let i = widget(ui, kind: CHOICE, text: "", detail: options.view(), value: int_arg(args, i: 1));
+        if ui.picked == i {
+            ui.picked = NONE;
+            return int_val(ui.pick);
+        }
         return int_val(int_arg(args, i: 1));
     }
-    if func.eq("ui-progress") or func.eq("ui-image") {
+    if func.eq("ui-progress") {
         try draw(ui, what: func, text: "");
+        _ = widget(ui, kind: PROGRESS, text: "", detail: "", value: 0);
+        return c.Val.Unit;
+    }
+    if func.eq("ui-image") {
+        try draw(ui, what: func, text: "");
+        _ = widget(ui, kind: IMAGE, text: "", detail: "", value: int_arg(args, i: 0));
         return c.Val.Unit;
     }
     if func.eq("ui-submitted") {
+        if ui.submitted != NONE and ui.submitted == ui.last_field {
+            ui.submitted = NONE;
+            return bool_val(true);
+        }
         return bool_val(false);
     }
     if func.eq("ui-begin") {
         ui.depth += 1;
         if ui.depth <= MAX_NESTING {
             try draw(ui, what: "begin", text: text_arg(args, i: 0));
+            _ = widget(ui, kind: BEGIN, text: text_arg(args, i: 0), detail: "", value: 0);
         }
         return c.Val.Unit;
     }
