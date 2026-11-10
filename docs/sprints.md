@@ -501,7 +501,7 @@ S35 yopildi. Hali yo'q, kerak bo'lganda qo'shiladigan narsalar: GPOS kerning va 
 
 ### S39. ARM64 JIT va aarch64 telefon
 
-- `wasm/jit.arche`'ning ARM64 varianti (x86-64'dagi qamrov bilan), S31'ning ochiq qolgani.
+- `lib/wasm/jit.arche`'ning ARM64 varianti (x86-64'dagi qamrov bilan), S31'ning ochiq qolgani.
 - aarch64 Linux uchun telefon dasturlari (init, UI server, WASM host) build va QEMU aarch64'da sinov.
 
 **Qabul:** WASM spec testsuite'i ARM64 JIT bilan o'tadi; QEMU aarch64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi.

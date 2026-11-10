@@ -3,7 +3,7 @@
 /// same instructions, with every branch's target, the values it keeps and
 /// the height it leaves resolved, and block, loop, else and end gone.
 import alloc;
-import module as m;
+import wasm.module as m;
 
 // ---- the compiled code's own instructions ------------------------------------------
 // Others keep their opcode; 0xFC n is 0x100 + n.
@@ -261,7 +261,7 @@ type Checker = struct {
             } else {
                 self.emit(c.fixups);
                 let at = self.here() - 1;
-            self.ctls.items_mut()[ci].fixups = at;
+                self.ctls.items_mut()[ci].fixups = at;
             }
             return;
         }
@@ -701,7 +701,7 @@ fn instruction(mod: &m.Module, c: &mut Checker, b: []u8, r: &mut m.Reader, op: u
             }
             if done.kind == KIND_IF {
                 let else_start = c.here();
-            c.code.items_mut()[done.else_at as usize] = else_start;
+                c.code.items_mut()[done.else_at as usize] = else_start;
             }
             c.patch(head: done.fixups, target: c.here());
             let nr = bt_count(mod, kind: done.bt_kind, value: done.bt_value, results: true);
