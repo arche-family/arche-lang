@@ -2,8 +2,8 @@
 /dev/console without root (interop/linux/run.sh): the kernel gives the
 first process that console as its standard input and output.
 
-usage: cpio.py <out> <dest>=<file>... ; directories and /dev/console are
-always there."""
+usage: cpio.py <out> <dest>=<file>... ; each file's directories, /dev,
+/proc, /sys, /tmp and /dev/console are there too."""
 import sys
 
 def entry(out, name, mode, data=b"", rdev=(0, 0), ino=[1]):
@@ -22,8 +22,16 @@ def main():
         for d in ["dev", "proc", "sys", "tmp"]:
             entry(out, d, 0o040755)
         entry(out, "dev/console", 0o020600, rdev=(5, 1))
+        made = {"dev", "proc", "sys", "tmp"}
         for spec in sys.argv[2:]:
             dest, src = spec.split("=", 1)
+            # Its directories first, each once.
+            parts = dest.split("/")[:-1]
+            for i in range(1, len(parts) + 1):
+                d = "/".join(parts[:i])
+                if d not in made:
+                    made.add(d)
+                    entry(out, d, 0o040755)
             with open(src, "rb") as f:
                 entry(out, dest, 0o100755, f.read())
         entry(out, "TRAILER!!!", 0)
