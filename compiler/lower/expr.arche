@@ -1431,6 +1431,25 @@ fn meta_call(l: &mut lw.Lower, n: cst.NodeId, d: u32, nm: str, offset: u32) -> l
         }
         none => { }
     }
+    if nm.eq("method_name") {
+        var mname = alloc.String.init(l.a);
+        mname.push_str(meta.method_name_of(&l.c, d));
+        return lw.str_global(l, mname.view());
+    }
+    if nm.eq("call") {
+        return meta_dyn_call(l, n, d: d, offset: offset);
+    }
+    if nm.eq("arg") {
+        // The argument, where the impl by a function put it in the pack.
+        match meta.sig_of(&l.c, d) {
+            some(sig) => {
+                let pack = value(l, runtime_arg(l, n, offset: offset, i: 0)).v;
+                let at = lw.gep(l, pack, layout.pack_offset(&l.c, sig, k: meta.param_asked(&l.c, d)));
+                return lw.load_val(l, type_of(l, n), at);
+            }
+            none => { return nothing(); }
+        }
+    }
     if nm.eq("zeroed") {
         let zt = type_of(l, n);
         if layout.is_scalar(&l.c, zt) {
@@ -1452,6 +1471,38 @@ fn meta_call(l: &mut lw.Lower, n: cst.NodeId, d: u32, nm: str, offset: u32) -> l
     let at = layout.field_offset(&l.c, start: start, i: f);
     let base = value(l, runtime_arg(l, n, offset: offset, i: 0)).v;
     return scalar_val(lw.gep(l, base, at));
+}
+
+/// core.meta.call(I, M, d, a...): method M's address from d's table,
+/// called with d's address as self and the rest as its arguments.
+fn meta_dyn_call(l: &mut lw.Lower, n: cst.NodeId, d: u32, offset: u32) -> lw.Val {
+    let t = type_of(l, n);
+    var info = l.c.fns[0];
+    match meta.sig_of(&l.c, d) {
+        some(sig) => { info = sig; }
+        none => { return nothing(); }
+    }
+    let slot = meta.method_asked(&l.c, d);
+    let receiver = runtime_arg(l, n, offset: offset, i: 0);
+    let dv = in_memory(l, type_of(l, receiver), value(l, receiver));
+    let data = lw.load(l, ir.Ty.Ptr, dv);
+    let table = lw.load(l, ir.Ty.Ptr, lw.gep(l, dv, 8));
+    let fp = lw.load(l, ir.Ty.Ptr, lw.gep(l, table, slot * 8));
+    var args = lw.args0(l);
+    var sret = ck.NONE;
+    if lw.returns_in_memory(&l.c, info.ret) {
+        sret = lw.alloca(l, info.ret);
+        args.push(sret);
+    }
+    args.push(data);
+    var i: u32 = 1;
+    while i < info.params_len : (i += 1) {
+        let pt = l.c.params[(info.params_start + i) as usize].type_id;
+        let v = value(l, runtime_arg(l, n, offset: offset, i: i));
+        args.push(lw.as_arg(l, pt, v));
+    }
+    let r = lw.call_indirect(l, fp, lw.ret_ty(&l.c, info.ret), &args);
+    return result_of(l, t, r: r, sret: sret);
 }
 
 /// core.atomic's operations, as LLVM's atomic instructions.

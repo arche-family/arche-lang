@@ -14,6 +14,35 @@ fn round(n: u64, align: u64) -> u64 {
     return (n + align - 1) / align * align;
 }
 
+/// Where argument k, after self, of a call of the method of signature f
+/// is in a core.meta.Args pack (spec/arche.md §5.4): the arguments in
+/// order, each at its alignment, as they are passed in memory.
+pub fn pack_offset(c: &ck.Checker, f: ck.FnInfo, k: u64) -> u64 {
+    var at: u64 = 0;
+    var i: u64 = 0;
+    while i < k : (i += 1) {
+        let lay = layout(c, c.params[(f.params_start as u64 + 1 + i) as usize].type_id);
+        at = round(n: at, align: lay.align) + lay.size;
+    }
+    let last = layout(c, c.params[(f.params_start as u64 + 1 + k) as usize].type_id);
+    return round(n: at, align: last.align);
+}
+
+/// The size and alignment of a pack of every argument after self.
+pub fn pack_layout(c: &ck.Checker, f: ck.FnInfo) -> Layout {
+    var at: u64 = 0;
+    var align: u64 = 8;
+    var i: u64 = 0;
+    while i + 1 < f.params_len as u64 : (i += 1) {
+        let lay = layout(c, c.params[(f.params_start as u64 + 1 + i) as usize].type_id);
+        at = round(n: at, align: lay.align) + lay.size;
+        if lay.align > align {
+            align = lay.align;
+        }
+    }
+    return Layout { size: round(n: at, align: align), align: align };
+}
+
 /// The IR type of a scalar value, or Void for a composite one.
 pub fn scalar(c: &ck.Checker, t: ty.TypeId) -> ir.Ty {
     let info = c.t.get(t);
@@ -27,7 +56,7 @@ pub fn scalar(c: &ck.Checker, t: ty.TypeId) -> ir.Ty {
                 _ => { return ir.Ty.I64; }
             }
         }
-        .Ref | .Ptr => { return ir.Ty.Ptr; }
+        .Ref | .Ptr | .Args => { return ir.Ty.Ptr; }
         .Float => {
             if info.len == 32 {
                 return ir.Ty.F32;
@@ -184,7 +213,7 @@ pub fn layout(c: &ck.Checker, t: ty.TypeId) -> Layout {
             let n = (ty.bits(info.int_kind) / 8) as u64;
             return Layout { size: n, align: n };
         }
-        .Ref | .Ptr => { return Layout { size: 8, align: 8 }; }
+        .Ref | .Ptr | .Args => { return Layout { size: 8, align: 8 }; }
         .Float => { return Layout { size: info.len / 8, align: info.len / 8 }; }
         .Str | .Slice => { return Layout { size: 16, align: 8 }; }
         .Array => {

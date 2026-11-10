@@ -1,0 +1,149 @@
+// test: run
+// spec: arche/5.4
+// stage0: skip
+// stdout: put get=42 fill=3 get=0 | ok ok ok | 4 calls
+import core.meta;
+import std;
+
+type Store = interface {
+    fn get(self: &mut Self, key: u64) -> u64;
+    fn put(self: &mut Self, key: u64, value: u64);
+    /// Fills into with byte: how many.
+    fn fill(self: &mut Self, into: []mut u8, byte: u8) -> usize;
+}
+
+type Cells = struct {
+    values: [4]u64,
+}
+
+impl Store for Cells {
+    fn get(self: &mut Cells, key: u64) -> u64 {
+        return self.values[key as usize];
+    }
+
+    fn put(self: &mut Cells, key: u64, value: u64) {
+        self.values[key as usize] = value;
+    }
+
+    fn fill(self: &mut Cells, into: []mut u8, byte: u8) -> usize {
+        for b in into {
+            b.* = byte;
+        }
+        return into.len();
+    }
+}
+
+/// A request, as a channel would carry it: the method's number, a word for
+/// each argument that is a value, and the bytes of the one that is a view.
+type Request = struct {
+    op: usize,
+    words: [2]u64,
+    count: usize,
+    bytes: [8]u8,
+}
+
+/// The client's side: a Store whose every method becomes a Request that
+/// the server answers, written once by asking Store what it has.
+type Remote = struct {
+    server: Cells,
+    calls: u64,
+}
+
+impl Store for Remote = forward;
+
+fn forward(comptime I: type, comptime M: usize, self: &mut Remote, args: meta.Args(I, M)) -> meta.result_type(I, M) {
+    var q = Request { op: M, words: [0, 0], count: 0, bytes: [0; 8] };
+    encode(I, M, 0, args, &mut q);
+    self.calls += 1;
+    var answer: u64 = 0;
+    serve(Store, 0, &mut self.server, &mut q, &mut answer);
+    decode_out(I, M, 0, args, &q);
+    comptime if meta.same(meta.result_type(I, M), u64) {
+        return answer;
+    } else comptime if meta.same(meta.result_type(I, M), usize) {
+        return answer as usize;
+    }
+}
+
+/// Arguments P on of a call into q.
+fn encode(comptime I: type, comptime M: usize, comptime P: usize, args: meta.Args(I, M), q: &mut Request) {
+    comptime if P < meta.param_count(I, M) {
+        comptime if meta.same(meta.param_type(I, M, P), []mut u8) {
+            q.count = meta.arg(I, M, P, args).len();
+        } else comptime if meta.same(meta.param_type(I, M, P), u8) {
+            q.words[P] = meta.arg(I, M, P, args) as u64;
+        } else {
+            q.words[P] = meta.arg(I, M, P, args);
+        }
+        encode(I, M, P + 1, args, q);
+    }
+}
+
+/// The bytes the server wrote back into a view argument.
+fn decode_out(comptime I: type, comptime M: usize, comptime P: usize, args: meta.Args(I, M), q: &Request) {
+    comptime if P < meta.param_count(I, M) {
+        comptime if meta.same(meta.param_type(I, M, P), []mut u8) {
+            let into = meta.arg(I, M, P, args);
+            var i: usize = 0;
+            while i < into.len() : (i += 1) {
+                into[i] = q.bytes[i];
+            }
+        }
+        decode_out(I, M, P + 1, args, q);
+    }
+}
+
+/// Argument P, read from a request.
+fn take(comptime T: type, word: u64, bytes: []mut u8) -> T {
+    comptime if meta.same(T, []mut u8) {
+        return bytes;
+    } else comptime if meta.same(T, u8) {
+        return word as u8;
+    } else {
+        return word;
+    }
+}
+
+/// The server's side: the request's method, called on target.
+fn serve(comptime I: type, comptime M: usize, target: &mut dyn I, q: &mut Request, answer: &mut u64) {
+    comptime if M < meta.method_count(I) {
+        if q.op == M {
+            comptime if meta.same(meta.result_type(I, M), void) {
+                meta.call(I, M, target, take(meta.param_type(I, M, 0), word: q.words[0], bytes: q.bytes[0..q.count]), take(meta.param_type(I, M, 1), word: q.words[1], bytes: q.bytes[0..q.count]));
+            } else comptime if meta.param_count(I, M) == 1 {
+                answer.* = meta.call(I, M, target, take(meta.param_type(I, M, 0), word: q.words[0], bytes: q.bytes[0..q.count])) as u64;
+            } else {
+                answer.* = meta.call(I, M, target, take(meta.param_type(I, M, 0), word: q.words[0], bytes: q.bytes[0..q.count]), take(meta.param_type(I, M, 1), word: q.words[1], bytes: q.bytes[0..q.count])) as u64;
+            }
+            return;
+        }
+        serve(I, M + 1, target, q, answer);
+    }
+}
+
+/// Uses a Store through dyn, as a program that does not know it is remote.
+fn use_store(s: &mut dyn Store, out: &mut std.Output, buffer: []mut u8) {
+    s.put(key: 2, value: 42);
+    out.write("put get=");
+    out.write_u64(s.get(2));
+    out.write(" fill=");
+    out.write_u64(s.fill(buffer, byte: 9) as u64);
+    out.write(" get=");
+    out.write_u64(s.get(1));
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let out = &mut sys.stdout;
+    var remote = Remote { server: Cells { values: [0; 4] }, calls: 0 };
+    var buffer: [3]u8 = [0; 3];
+    use_store(&mut remote, out, buffer[0..3]);
+    out.write(" |");
+    for b in buffer[0..3] {
+        if b.* == 9 {
+            out.write(" ok");
+        }
+    }
+    out.write(" | ");
+    out.write_u64(remote.calls);
+    out.write(" calls\n");
+}

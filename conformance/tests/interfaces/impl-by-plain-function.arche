@@ -1,0 +1,26 @@
+// test: compile-error
+// spec: arche/5.4
+// stage0: skip
+// line: 17
+// code: E0822
+import std;
+
+type Counter = interface {
+    fn next(self: &mut Self) -> u64;
+}
+
+type Fixed = struct {
+    pub value: u64,
+}
+
+/// A function without comptime parameters cannot be every method's.
+impl Counter for Fixed = forward;
+
+fn forward(self: &mut Fixed) -> u64 {
+    return self.value;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var f = Fixed { value: 1 };
+    sys.stdout.write_u64(f.next());
+}

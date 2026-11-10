@@ -154,7 +154,7 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0811` | A `for` loop's range or names that do not fit: bounds of two types, a pair over a range or over items that are not a struct of two fields, a type on a name that is not a range's (§3.2). |
 | `E0820` | An `impl` of something that is not an interface, or for a type that cannot implement one here (§5.1). |
 | `E0821` | An `impl` outside both the module that declares the type and the one that declares the interface (§5.1). |
-| `E0822` | An `impl` whose methods are not the interface's: one missing, one more, one with other parameters, names or result, or one the type has already (§5.1). |
+| `E0822` | An `impl` whose methods are not the interface's: one missing, one more, one with other parameters, names or result, or one the type has already (§5.1); or an impl by a function whose call does not fit one of the interface's methods (§5.4). |
 | `E0823` | A second `impl` of one interface for one type (§5.1). |
 | `E0824` | A method call whose name two interfaces of the type have; name the interface: `I.name(&x, …)` (§5.1). |
 | `E0825` | An interface where a type of values is expected; a view of a value that implements it is `&dyn I` (§5.3). |
@@ -162,7 +162,7 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0831` | `dyn I` of an interface whose methods do not all take `self` by reference and use `Self` nowhere else (§5.3). |
 | `E0832` | A value converted to `&dyn I`, or passed to `I.name(…)`, whose type does not implement `I` (§5.1, §5.3). |
 | `E0840` | Compile-time evaluation that runs too many steps or recurses too deep (§4.3). |
-| `E0841` | A `core.meta` question a type has no answer to: a field number past its `pub` fields, `elem_type` of a type that is not a list or an optional, `field_type` or `elem_type` called as a value; or `core.meta.unsupported(T)` in a branch that is checked (§4.3). |
+| `E0841` | A `core.meta` question a type has no answer to: a field number past its `pub` fields, `elem_type` of a type that is not a list, an optional or an error union, `field_type` or `elem_type` called as a value, a method or parameter number past an interface's, or an interface's methods asked of one not usable with `dyn`; or `core.meta.unsupported(T)` in a branch that is checked (§4.3). |
 | `E0850` | A closure body that uses a binding from outside without capturing it (§6). |
 | `E0851` | A capture that names no local binding, or one binding twice (§6). |
 

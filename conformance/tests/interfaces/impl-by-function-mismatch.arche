@@ -1,0 +1,27 @@
+// test: compile-error
+// spec: arche/5.4
+// stage0: skip
+// line: 17
+// code: E0822
+import core.meta;
+import std;
+
+type Counter = interface {
+    fn next(self: &mut Self) -> u64;
+}
+
+type Fixed = struct {
+    pub value: u64,
+}
+
+impl Counter for Fixed = forward;
+
+/// Gives a u32, where the method gives a u64.
+fn forward(comptime I: type, comptime M: usize, self: &mut Fixed, args: meta.Args(I, M)) -> u32 {
+    return self.value as u32;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var f = Fixed { value: 1 };
+    sys.stdout.write_u64(f.next());
+}

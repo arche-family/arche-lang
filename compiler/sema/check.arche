@@ -85,6 +85,10 @@ pub type Decl = struct {
     /// Struct: align(N) on the type, or 0; whether it is packed.
     pub align: u32,
     pub packed: bool,
+    /// A method of an impl by a function (spec/arche.md §5.4): the
+    /// function, its template until check_impls makes the instance for
+    /// the method, whose number is in value; NONE otherwise.
+    pub forward: u32,
 }
 
 /// impl I for T (spec/arche.md §5.1): its methods are methods of T.
@@ -97,6 +101,8 @@ pub type Impl = struct {
     pub target: ty.TypeId,
     pub methods_start: u32,
     pub methods_len: u32,
+    /// An impl by a function: the function's declaration; NONE otherwise.
+    pub forward: u32,
 }
 
 /// A test block (§4): its function, and where it is written.
@@ -907,6 +913,13 @@ pub fn write_type(c: &Checker, m: &mut alloc.String, t: ty.TypeId) {
         .Closure => {
             m.push_str("closure ");
             write_signature(c, m, f: c.closures[info.decl as usize].fn_index, skip: 0);
+        }
+        .Args => {
+            m.push_str("core.meta.Args(");
+            write_decl_name(c, m, info.decl);
+            m.push_str(", ");
+            write_number(m, info.len);
+            m.push_str(")");
         }
         .Builtin => {
             match info.builtin {
@@ -2014,7 +2027,14 @@ fn meta_type_from_args(c: &mut Checker, d: u32, n: cst.NodeId) -> ty.TypeId {
             let v = comptime_value(c, an, vt);
             args.push(ArgVal { is_type: false, type_id: vt, value: v });
         } else {
-            let t = resolve_type(c, an);
+            // An interface is asked about by name, as a type of values is
+            // not (spec/arche.md §4.3).
+            var t = ty.invalid();
+            if kind_of(c, an) == cst.Kind.TypePath {
+                t = resolve_path_type(c, an);
+            } else {
+                t = resolve_type(c, an);
+            }
             args.push(ArgVal { is_type: true, type_id: t, value: 0 });
         }
     }
@@ -2095,6 +2115,7 @@ fn new_decl(kind: DeclKind, module: u32, n: cst.NodeId, name: alloc.Symbol, name
         impl_index: NONE,
         align: 0,
         packed: false,
+        forward: NONE,
     };
 }
 
@@ -2263,7 +2284,7 @@ fn collect_items(c: &mut Checker) {
             continue;
         }
         if k == cst.Kind.ImplDecl {
-            c.impls.push(Impl { module: c.module, node: n, iface: NONE, target: ty.invalid(), methods_start: 0, methods_len: 0 });
+            c.impls.push(Impl { module: c.module, node: n, iface: NONE, target: ty.invalid(), methods_start: 0, methods_len: 0, forward: NONE });
             continue;
         }
         if k == cst.Kind.FnSig and not intrinsic_module(c) and not (child_count(c, n) > 0 and kind_of(c, child(c, n, 0)) == cst.Kind.Attribute) {
@@ -2821,6 +2842,36 @@ fn resolve_impls(c: &mut Checker) {
         c.impls[i].target = target;
         let start = c.methods.len() as u32;
         let count = child_count(c, im.node);
+        if by_function(c, im.node) {
+            // impl I for T = f (spec/arche.md §5.4): a method for each of the
+            // interface's, its signature, with Self as T, and f's instance
+            // for its number as its body.
+            // Made even when f is wrong, so that calls of the methods find
+            // them, and only f's error is said.
+            let f = forwarder(c, child(c, im.node, 2));
+            c.impls[i].forward = f;
+            {
+                let idecl = c.decls[iface as usize];
+                var w = idecl.methods_start;
+                while w < idecl.methods_start + idecl.methods_len : (w += 1) {
+                    let wm = c.decls[c.methods[w as usize] as usize];
+                    var md = new_decl(DeclKind.Fn, module: wm.module, wm.node, wm.name, name_token: wm.name_token, false);
+                    md.owner = td;
+                    md.impl_index = i as u32;
+                    md.forward = f;
+                    md.value = (w - idecl.methods_start) as u64;
+                    if declared {
+                        md.env_start = c.decls[td as usize].env_start;
+                        md.env_len = c.decls[td as usize].env_len;
+                    }
+                    c.methods.push(c.decls.len() as u32);
+                    c.decls.push(md);
+                }
+            }
+            c.impls[i].methods_start = start;
+            c.impls[i].methods_len = c.methods.len() as u32 - start;
+            continue;
+        }
         var k: u32 = 2;
         while k < count : (k += 1) {
             let f = child(c, im.node, k);
@@ -2850,6 +2901,96 @@ fn resolve_impls(c: &mut Checker) {
     }
 }
 
+/// The impl at n is one by a function: `impl I for T = f;`.
+fn by_function(c: &Checker, n: cst.NodeId) -> bool {
+    return child_count(c, n) == 3 and kind_of(c, child(c, n, 2)) == cst.Kind.TypePath;
+}
+
+/// The function an impl by a function names: a generic function of this
+/// module or of a module it imports; NONE after saying why not.
+fn forwarder(c: &mut Checker, n: cst.NodeId) -> u32 {
+    let toks = own(c, n);
+    let items = toks.items();
+    var segments = alloc.List(u32).init(c.a);
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        if tok_kind(c, items[i]) == tk.Kind.Ident {
+            segments.push(items[i]);
+        }
+    }
+    var found = NONE;
+    if segments.len() == 1 and child_count(c, n) == 0 {
+        found = find_item(c, c.module, symbol(c, segments[0])) orelse NONE;
+    } else if segments.len() == 2 and child_count(c, n) == 0 {
+        match find_import(c, symbol(c, segments[0])) {
+            some(alias) => {
+                if alias.library == Library.NotLibrary {
+                    found = find_item(c, alias.module, symbol(c, segments[1])) orelse NONE;
+                    if found != NONE {
+                        let s = span_of(c, n);
+                        require_visible(c, s, c.decls[found as usize].module, c.decls[found as usize].is_pub, "this function");
+                    }
+                }
+            }
+            none => { }
+        }
+    }
+    if found == NONE or c.decls[found as usize].kind != DeclKind.Fn or not c.decls[found as usize].generic {
+        let s = span_of(c, n);
+        report(c, codes.IMPL_MISMATCH, s, "an impl by a function names a function that takes comptime I: type and comptime M: usize, the method's self, and a core.meta.Args(I, M)");
+        return NONE;
+    }
+    return found;
+}
+
+/// Each method of the impl by a function im is f(I, M, self, args): f's
+/// instance for its interface and number, checked to take its self and
+/// arguments and give its result (spec/arche.md §5.4).
+fn check_forwards(c: &mut Checker, i: usize) {
+    let im = c.impls[i];
+    if im.forward == NONE {
+        return;
+    }
+    let iface = c.decls[im.iface as usize];
+    var q = im.methods_start;
+    while q < im.methods_start + im.methods_len : (q += 1) {
+        let md = c.methods[q as usize];
+        check_signature(c, md);
+        let mf = c.fns[c.decls[md as usize].fn_index as usize];
+        var args = alloc.List(ArgVal).init(c.a);
+        args.push(ArgVal { is_type: true, type_id: iface.type_id, value: 0 });
+        args.push(ArgVal { is_type: false, type_id: ty.int_type(ty.IntKind.Usize), value: c.decls[md as usize].value });
+        let s = span_of(c, child(c, im.node, 2));
+        c.module = im.module;
+        let inst = instantiate(c, im.forward, &args, at: s);
+        if inst == NONE {
+            c.decls[md as usize].forward = NONE;
+            continue;
+        }
+        check_signature(c, inst);
+        let ff = c.fns[c.decls[inst as usize].fn_index as usize];
+        var fits = ff.params_len == 2 and ff.ret == mf.ret;
+        if fits {
+            let want_self = c.params[mf.params_start as usize].type_id;
+            let got_self = c.params[ff.params_start as usize].type_id;
+            fits = got_self == want_self or (c.t.kind(want_self) == ty.Kind.Ref and c.t.kind(got_self) == ty.Kind.Ref and c.t.elem(want_self) == c.t.elem(got_self) and not c.t.get(got_self).mutable);
+            fits = fits and c.params[(ff.params_start + 1) as usize].type_id == c.t.args_of(im.iface, m: c.decls[md as usize].value);
+        }
+        if not fits {
+            var m = new_message(c);
+            m.push_str("the impl's method '");
+            m.push_str(c.names.text(c.decls[md as usize].name));
+            m.push_str("' calls ");
+            write_decl_name(c, &mut m, im.forward);
+            m.push_str(", which does not take its self and a core.meta.Args of its arguments, or does not give its result");
+            report_impl(c, im.module, s, m);
+            c.decls[md as usize].forward = NONE;
+            continue;
+        }
+        c.decls[md as usize].forward = inst;
+    }
+}
+
 fn method_named(c: &Checker, start: u32, len: u32, name: alloc.Symbol) -> u32 {
     var i = start;
     while i < start + len : (i += 1) {
@@ -2875,6 +3016,11 @@ fn check_impls(c: &mut Checker) {
     while i < c.impls.len() : (i += 1) {
         let im = c.impls[i];
         if im.iface == NONE {
+            continue;
+        }
+        c.module = im.module;
+        if by_function(c, im.node) {
+            check_forwards(c, i);
             continue;
         }
         let iface = c.decls[im.iface as usize];

@@ -387,6 +387,13 @@ fn parse_impl(p: &mut Parser, m: cst.Mark) {
     parse_type(p);
     _ = expect(p, tk.Kind.KwFor, "'for'");
     parse_type(p);
+    // impl I for T = f; (spec/arche.md §5.4)
+    if p.full and accept(p, tk.Kind.Assign) {
+        parse_type(p);
+        _ = expect(p, tk.Kind.Semi, "';'");
+        _ = close(p, m, cst.Kind.ImplDecl);
+        return;
+    }
     if expect(p, tk.Kind.LBrace, "'{'") {
         while not at(p, tk.Kind.RBrace) and not at(p, tk.Kind.Eof) {
             let before = p.pos;

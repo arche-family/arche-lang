@@ -39,6 +39,9 @@ pub type Kind = enum {
     Closure,
     /// f32 and f64 (spec/arche.md §2); len is 32 or 64.
     Float,
+    /// core.meta.Args(I, M) (spec/arche.md §5.4): a view of the arguments
+    /// of a call of method len of the interface decl.
+    Args,
 }
 
 /// No declaration: an error union with an inferred set, or the error set
@@ -181,6 +184,15 @@ pub type Types = struct {
         var info = plain(Kind.Dyn);
         info.mutable = mutable;
         info.decl = iface;
+        return self.intern(info);
+    }
+
+    /// core.meta.Args(I, M): iface is the interface's declaration, m the
+    /// method's number.
+    pub fn args_of(self: &mut Types, iface: u32, m: u64) -> TypeId {
+        var info = plain(Kind.Args);
+        info.decl = iface;
+        info.len = m;
         return self.intern(info);
     }
 

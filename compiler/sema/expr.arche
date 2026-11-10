@@ -295,6 +295,9 @@ fn prim(name: str) -> ?ty.TypeId {
     if name.eq("str") {
         return ty.str_type();
     }
+    if name.eq("void") {
+        return ty.void_type();
+    }
     return none;
 }
 
@@ -835,6 +838,7 @@ fn check_closure(c: &mut ck.Checker, n: cst.NodeId) -> ty.TypeId {
         impl_index: ck.NONE,
         align: 0,
         packed: false,
+        forward: ck.NONE,
     });
     let pstart = c.params.len() as u32;
     let ps = params.items();
@@ -1619,6 +1623,9 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
     if meta.is_meta(c, target) {
         meta.check_call(c, call, target);
     }
+    if meta.is_named(c, target, "call") {
+        return meta_call_args(c, call, target);
+    }
     let f = c.fns[c.decls[target as usize].fn_index as usize];
     let ps = fn_params(c, f, skip);
     c.arg_offset = f.ncomptime;
@@ -1636,6 +1643,35 @@ fn call_fn(c: &mut ck.Checker, call: cst.NodeId, d: u32, skip: u32) -> ty.TypeId
         }
     }
     return f.ret;
+}
+
+/// core.meta.call(I, M, d, a...) (spec/arche.md §4.3): d is a view of an
+/// I, &mut when the method takes &mut self, and the rest are the method's
+/// arguments, checked as its own but without labels, which code that
+/// chooses the method by number cannot know.
+fn meta_call_args(c: &mut ck.Checker, call: cst.NodeId, target: u32) -> ty.TypeId {
+    let f = c.fns[c.decls[target as usize].fn_index as usize];
+    match meta.sig_of(c, target) {
+        some(m) => {
+            let empty = c.names.intern("");
+            var ps = alloc.List(Param).init(c.a);
+            let iface = meta.iface_asked(c, target);
+            let d = c.t.dyn_ref(mutable: m.self_mode == ck.SelfMode.MutRef, iface: iface);
+            ps.push(Param { name: c.params[f.params_start as usize].name, type_id: d, written: empty });
+            var k = m.params_start + 1;
+            while k < m.params_start + m.params_len : (k += 1) {
+                ps.push(Param { name: c.params[k as usize].name, type_id: c.params[k as usize].type_id, written: empty });
+            }
+            c.arg_offset = f.ncomptime;
+            check_args(c, call, &ps, false);
+            ck.set_ref(c, call, target);
+            return m.ret;
+        }
+        none => {
+            check_args_loosely(c, call);
+            return ty.invalid();
+        }
+    }
 }
 
 /// An atomic operation's Ordering, written as a constant: Ordering.Acquire

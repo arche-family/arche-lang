@@ -195,7 +195,8 @@ let g: Grid(u8, 4, 4) = Grid(u8, 4, 4).init();
 
 - `comptime { … }` and `comptime` expressions run at compile time, in an interpreter over the IR. They may call any function whose body uses no capability and no `unsafe`; they cannot do I/O.
 - The interpreter counts steps. A compilation that runs more than 10⁸ steps at compile time, or recurses deeper than 1000 calls, is an error (E0840); `arche build --comptime-profile` shows where the steps went.
-- Types are values of type `type` at compile time. `core.meta` says what a type is made of. `is_struct(T)`, `is_int(T)`, `is_signed(T)`, `is_float(T)`, `is_bool(T)`, `is_list(T)`, `is_optional(T)` and `same(A, B)` are constant `bool`s, and `field_count(T)` a constant `usize`. `field_name(T, I)` is a field's name, and `field(T, I, &x)` and `field_mut(T, I, &mut x)` are views of the field, projections of `x` (A§5.4). `field_type(T, I)` and `elem_type(T)`, the `E` of `alloc.List(E)` or `?E`, are types and are written where a type goes. The fields are a struct's `pub` fields, in the order they are declared, so a type's private fields stay its module's. A field number past them, `elem_type` of another type, or `field_type` called as a value is an error (E0841).
+- Types are values of type `type` at compile time. `core.meta` says what a type is made of. `is_struct(T)`, `is_int(T)`, `is_signed(T)`, `is_float(T)`, `is_bool(T)`, `is_list(T)`, `is_optional(T)` and `same(A, B)` are constant `bool`s, and `field_count(T)` a constant `usize`. `field_name(T, I)` is a field's name, and `field(T, I, &x)` and `field_mut(T, I, &mut x)` are views of the field, projections of `x` (A§5.4). `field_type(T, I)` and `elem_type(T)`, the `E` of `alloc.List(E)`, `?E` or `X!E`, are types and are written where a type goes. The fields are a struct's `pub` fields, in the order they are declared, so a type's private fields stay its module's. A field number past them, `elem_type` of another type, or `field_type` called as a value is an error (E0841).
+- An interface's methods are asked about the same way. `is_interface(I)` is a constant `bool`. For an interface usable with `dyn` (§5.3), `method_count(I)` is a constant `usize`, `method_name(I, M)` the name of method `M`, counting from 0 in the order they are declared, and `param_count(I, M)` the number of its parameters after `self`; `param_type(I, M, P)` and `result_type(I, M)` are types, written where a type goes. `call(I, M, d, a…)` calls method `M` through `d`, a `&mut dyn I`, or a `&dyn I` when the method takes `&self`, with the arguments after `d`, which are checked as that method's are, but need no labels: code that chooses a method by its number cannot know their names. A method or parameter number past the interface's, or an interface not usable with `dyn`, is an error (E0841). With these and an impl by a function (§5.4), the code that carries an interface's calls over a channel, a client's stub and a server's dispatch, is written once in Arche for every interface.
 - Generated code is written in Arche with these and `comptime if` (§4.4), not in a macro language: JSON encoding (`std.json.encode` and `decode`) and templates (`web.render`) are. `core.meta.unsupported(T)` is an error (E0841) wherever a checked branch reaches it. The diagnostic names `T` and points at the call in the package that leads there.
 
 ### 4.4 `comptime if`
@@ -265,6 +266,23 @@ Inside, a value of type `T` has exactly the methods of its constraints. A call c
 - `dyn I` values are views (A§5.4): they are passed and held in locals, not stored (E0601). A `&dyn I` made from `&x` views `x`, so while it is live `x` obeys A§5.4 rule 4.
 - `&mut dyn I` converts to `&dyn I`, as `&mut T` to `&T`. A method that takes `&mut self` is called only through a `&mut dyn I`.
 - `dyn` of an interface that is not usable with it is E0831; converting a view of a type that does not implement `I` is E0832.
+
+### 5.4 An impl by a function
+
+```arche
+impl BlockDevice for RemoteBlock = forward;
+
+fn forward(comptime I: type, comptime M: usize, self: &mut RemoteBlock, args: meta.Args(I, M)) -> meta.result_type(I, M) {
+    comptime if meta.param_count(I, M) > 0 {
+        let first = meta.arg(I, M, 0, args);
+        …
+    }
+}
+```
+
+- `impl I for T = f;` implements `I` with one function for every method: method `M` of the impl is `return f(I, M, self, args);`, where `args` views the arguments the method was called with. `f` names a function of `comptime I: type` and `comptime M: usize`, then a parameter the methods' `self` converts to, then a `core.meta.Args(I, M)`, whose result is the method's. Each method's call of `f` is checked as if written there; an error in one is E0822 at the impl, and names the method. The rules of §5.1 on where an impl may be, and how often, are unchanged.
+- `core.meta.Args(I, M)` is a view (A§5.4) of the arguments of a call of method `M` of `I`, and only such an impl makes one. `core.meta.arg(I, M, P, args)` is argument `P`: a copy when the argument is a value, a projection of `args` when it is a view.
+- The reader of an impl by a function finds what every method does in `f`, which says by `comptime if` how it treats each method; nothing is generated that is not written there.
 
 ## 6. Closures
 
@@ -416,7 +434,7 @@ This chapter collects every rule of Arche's memory model in one place. Each has 
 
 | Rule | Code |
 | --- | --- |
-| A view (`&T`, `&mut T`, `[]T`, `[]mut T`, `str`, `&dyn I`, a closure that captures a view) is only ever the type of a parameter, a local, a result or the target of a reference: never a field, payload, element, or payload of `?` or `!` | E0601 |
+| A view (`&T`, `&mut T`, `[]T`, `[]mut T`, `str`, `&dyn I`, a closure that captures a view, `core.meta.Args(I, M)`) is only ever the type of a parameter, a local, a result or the target of a reference: never a field, payload, element, or payload of `?` or `!` | E0601 |
 | A function returns a view only with at most one view parameter; the result is a projection of it, or of static memory | E0602 |
 | A view never outlives what it views: it is not returned, stored in an outer binding, captured by a task, or bound to a longer-lived region, when what it views does not live that long | E0603 |
 | While a view of a place is live, the place is not written or viewed `&mut` through another path; while a `&mut` view is live, the place is not used through another path at all. The views given to one call are live during the call | E0604 |
@@ -456,7 +474,7 @@ type_body   = [ "packed" | "extern" ] "struct" [ where ] [ align ] "{" { member 
 cparams     = cparam { "," cparam } [ "," ] ;
 cparam      = "comptime" IDENT ":" type ;
 align       = "align" "(" expr ")" ;
-impl_decl   = "impl" named "for" type "{" { [ "pub" ] fn_decl } "}" ;
+impl_decl   = "impl" named "for" type ( "{" { [ "pub" ] fn_decl } "}" | "=" named ";" ) ;
 
 fn_decl     = fn_sig { contract } block ;
 fn_sig      = { fn_mod | fn_attr } "fn" IDENT "(" [ params ] ")" [ "->" type ] [ where ] ;

@@ -28,7 +28,7 @@ pub fn is_view(c: &ck.Checker, t: ty.TypeId) -> bool {
     if k == ty.Kind.Closure {
         return closure_views(c, c.t.get(t).decl);
     }
-    return k == ty.Kind.Ref or k == ty.Kind.Slice or k == ty.Kind.Str or k == ty.Kind.Dyn;
+    return k == ty.Kind.Ref or k == ty.Kind.Slice or k == ty.Kind.Str or k == ty.Kind.Dyn or k == ty.Kind.Args;
 }
 
 /// Closure ci captures a view, or a view by value: it is a view (§6).
@@ -111,7 +111,7 @@ fn misplaced_view(c: &ck.Checker, t: ty.TypeId, top: bool) -> bool {
     match info.kind {
         .Ref => { return misplaced_view(c, info.elem, true) or not top; }
         .Slice => { return misplaced_view(c, info.elem, false) or not top; }
-        .Str | .Dyn => { return not top; }
+        .Str | .Dyn | .Args => { return not top; }
         .Closure => { return closure_views(c, info.decl) and not top; }
         .Array | .List | .Optional | .ErrorUnion => { return misplaced_view(c, info.elem, false); }
         .Map => { return misplaced_view(c, info.key, false) or misplaced_view(c, info.elem, false); }

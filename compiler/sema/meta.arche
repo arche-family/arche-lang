@@ -24,14 +24,151 @@ fn name_of(c: &ck.Checker, d: u32) -> str {
     return c.names.text(c.decls[d as usize].name);
 }
 
-/// d is field_type or elem_type: a function of types that gives a type, so
-/// a call of it is written where a type goes.
+/// d is core.meta's function called nm, or an instance of it.
+pub fn is_named(c: &ck.Checker, d: u32, nm: str) -> bool {
+    return is_meta(c, d) and name_of(c, d).eq(nm);
+}
+
+/// The interface an instance d of core.meta asks about, its declaration;
+/// NONE when it is not one.
+pub fn iface_asked(c: &ck.Checker, d: u32) -> u32 {
+    if c.decls[d as usize].env_len == 0 {
+        return ck.NONE;
+    }
+    return iface_of(c, env_type(c, d, k: 0));
+}
+
+/// The method number an instance d of core.meta asks about.
+pub fn method_asked(c: &ck.Checker, d: u32) -> u64 {
+    return env_value(c, d, k: 1);
+}
+
+/// The parameter number an instance d of arg asks about.
+pub fn param_asked(c: &ck.Checker, d: u32) -> u64 {
+    return env_value(c, d, k: 2);
+}
+
+/// d is field_type, elem_type, param_type, result_type or Args: a function
+/// of types that gives a type, so a call of it is written where a type
+/// goes.
 pub fn gives_type(c: &ck.Checker, d: u32) -> bool {
     if not is_meta(c, d) {
         return false;
     }
     let nm = name_of(c, d);
-    return nm.eq("field_type") or nm.eq("elem_type");
+    return nm.eq("field_type") or nm.eq("elem_type") or nm.eq("param_type") or nm.eq("result_type") or nm.eq("Args");
+}
+
+// ---- interfaces (spec/arche.md §4.3, §5.4) ------------------------------------------
+
+/// The declaration of interface t; NONE when t is not one.
+pub fn iface_of(c: &ck.Checker, t: ty.TypeId) -> u32 {
+    let info = c.t.get(t);
+    if info.kind != ty.Kind.Interface or info.decl == ty.NO_DECL {
+        return ck.NONE;
+    }
+    return info.decl;
+}
+
+/// Method m of interface declaration i; NONE when it has none such.
+pub fn method_at(c: &ck.Checker, i: u32, m: u64) -> u32 {
+    let d = c.decls[i as usize];
+    if m >= d.methods_len as u64 {
+        return ck.NONE;
+    }
+    return c.methods[(d.methods_start as u64 + m) as usize];
+}
+
+/// Interface i's methods all take self by reference and no comptime
+/// arguments, as dyn needs (spec/arche.md §5.3), and their signatures are
+/// checked.
+pub fn usable(c: &ck.Checker, i: u32) -> bool {
+    let d = c.decls[i as usize];
+    if d.generic {
+        return false;
+    }
+    var k = d.methods_start;
+    while k < d.methods_start + d.methods_len : (k += 1) {
+        let md = c.methods[k as usize];
+        if c.decls[md as usize].fn_index == ck.NONE {
+            return false;
+        }
+        let f = c.fns[c.decls[md as usize].fn_index as usize];
+        if not f.has_self or f.self_mode == ck.SelfMode.Value or f.ncomptime != 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The signature of method m of interface t, when t is an interface usable
+/// with dyn that has it.
+pub fn method_sig(c: &ck.Checker, t: ty.TypeId, m: u64) -> ?ck.FnInfo {
+    let i = iface_of(c, t);
+    if i == ck.NONE or not usable(c, i) {
+        return none;
+    }
+    let md = method_at(c, i, m: m);
+    if md == ck.NONE {
+        return none;
+    }
+    return c.fns[c.decls[md as usize].fn_index as usize];
+}
+
+/// The comptime argument k of instance d: a type's id, or a value.
+fn env_type(c: &ck.Checker, d: u32, k: u64) -> ty.TypeId {
+    return c.env[(c.decls[d as usize].env_start as u64 + k) as usize].type_id;
+}
+
+fn env_value(c: &ck.Checker, d: u32, k: u64) -> u64 {
+    return c.env[(c.decls[d as usize].env_start as u64 + k) as usize].value;
+}
+
+/// The method an instance d of method_name, param_count, call or arg asks
+/// about, its signature; none when the interface has none such.
+pub fn sig_of(c: &ck.Checker, d: u32) -> ?ck.FnInfo {
+    if c.decls[d as usize].env_len < 2 {
+        return none;
+    }
+    return method_sig(c, env_type(c, d, k: 0), m: env_value(c, d, k: 1));
+}
+
+/// The method's name for an instance d of method_name.
+pub fn method_name_of(c: &ck.Checker, d: u32) -> str {
+    let i = iface_of(c, env_type(c, d, k: 0));
+    let md = method_at(c, i, m: env_value(c, d, k: 1));
+    return c.names.text(c.decls[md as usize].name);
+}
+
+/// Says why interface t has no method m, or method m no parameter p
+/// (p is NONE when there is none to ask about).
+fn no_method(c: &mut ck.Checker, t: ty.TypeId, m: u64, p: u64, at: diag.Span) {
+    var msg = ck.new_message(c);
+    let i = iface_of(c, t);
+    ck.write_type(c, &mut msg, t);
+    if i == ck.NONE {
+        msg.push_str(" is not an interface, so it has no methods");
+    } else if not usable(c, i) {
+        msg.push_str(" cannot be used with dyn, so its methods cannot be asked about");
+    } else if m >= c.decls[i as usize].methods_len as u64 {
+        msg.push_str(" has ");
+        ck.write_number(&mut msg, c.decls[i as usize].methods_len as u64);
+        msg.push_str(" method");
+        if c.decls[i as usize].methods_len != 1 {
+            msg.push_str("s");
+        }
+        msg.push_str(", so none is number ");
+        ck.write_number(&mut msg, m);
+    } else {
+        msg.push_str("'s method ");
+        msg.push_str(c.names.text(c.decls[method_at(c, i, m: m) as usize].name));
+        msg.push_str(" has ");
+        let f = c.fns[c.decls[method_at(c, i, m: m) as usize].fn_index as usize];
+        ck.write_number(&mut msg, (f.params_len - 1) as u64);
+        msg.push_str(" parameters after self, so none is number ");
+        ck.write_number(&mut msg, p);
+    }
+    ck.report_owned(c, codes.META, at, msg);
 }
 
 /// The pub fields of t, as indexes into the checker's fields, in the order
@@ -69,10 +206,10 @@ fn is_list(c: &ck.Checker, t: ty.TypeId) -> bool {
     return c.names.text(tmpl.name).eq("List") and c.p.modules[tmpl.module as usize].name.view().eq("alloc");
 }
 
-/// The E of List(E) or ?E; invalid for any other t.
+/// The E of List(E), ?E or X!E; invalid for any other t.
 fn elem_of(c: &ck.Checker, t: ty.TypeId) -> ty.TypeId {
     let info = c.t.get(t);
-    if info.kind == ty.Kind.List or info.kind == ty.Kind.Optional {
+    if info.kind == ty.Kind.List or info.kind == ty.Kind.Optional or info.kind == ty.Kind.ErrorUnion {
         return c.t.elem(t);
     }
     if is_list(c, t) {
@@ -130,6 +267,22 @@ pub fn value(c: &ck.Checker, d: u32) -> ?u64 {
     if nm.eq("field_count") {
         return fields(c, t).len() as u64;
     }
+    if nm.eq("is_interface") {
+        return bit(info.kind == ty.Kind.Interface);
+    }
+    if nm.eq("method_count") {
+        let i = iface_of(c, t);
+        if i == ck.NONE or not usable(c, i) {
+            return 0;
+        }
+        return c.decls[i as usize].methods_len as u64;
+    }
+    if nm.eq("param_count") {
+        match sig_of(c, d) {
+            some(f) => { return (f.params_len - 1) as u64; }
+            none => { return 0; }
+        }
+    }
     if nm.eq("pub_only") {
         if info.kind != ty.Kind.Struct {
             return 0;
@@ -166,12 +319,20 @@ pub fn type_of(c: &mut ck.Checker, d: u32, args: &alloc.List(ck.ArgVal), at: dia
     let nm = name.view();
     let given = args.items();
     var wants: usize = 1;
-    if nm.eq("field_type") {
+    if nm.eq("field_type") or nm.eq("result_type") or nm.eq("Args") {
         wants = 2;
     }
-    if given.len() != wants or not given[0].is_type or (wants == 2 and given[1].is_type) {
+    if nm.eq("param_type") {
+        wants = 3;
+    }
+    var fits = given.len() == wants and given[0].is_type;
+    var k: usize = 1;
+    while fits and k < given.len() : (k += 1) {
+        fits = not given[k].is_type;
+    }
+    if not fits {
         if not quiet {
-            ck.report(c, codes.BAD_GENERIC, at, "core.meta.field_type takes a type and a field number; elem_type a type");
+            ck.report(c, codes.BAD_GENERIC, at, "core.meta.field_type takes a type and a field number; elem_type a type; param_type an interface, a method number and a parameter number; result_type and Args an interface and a method number");
         }
         return ty.invalid();
     }
@@ -179,12 +340,45 @@ pub fn type_of(c: &mut ck.Checker, d: u32, args: &alloc.List(ck.ArgVal), at: dia
     if ck.is_invalid(c, t) {
         return t;
     }
+    if nm.eq("param_type") or nm.eq("result_type") or nm.eq("Args") {
+        // A type may name these before the pass over signatures does.
+        let i = iface_of(c, t);
+        if i != ck.NONE {
+            var k2 = c.decls[i as usize].methods_start;
+            while k2 < c.decls[i as usize].methods_start + c.decls[i as usize].methods_len : (k2 += 1) {
+                ck.check_signature(c, c.methods[k2 as usize]);
+            }
+        }
+        match method_sig(c, t, m: given[1].value) {
+            some(f) => {
+                if nm.eq("Args") {
+                    return c.t.args_of(iface_of(c, t), m: given[1].value);
+                }
+                if nm.eq("result_type") {
+                    return f.ret;
+                }
+                if given[2].value + 1 >= f.params_len as u64 {
+                    if not quiet {
+                        no_method(c, t, m: given[1].value, p: given[2].value, at: at);
+                    }
+                    return ty.invalid();
+                }
+                return c.params[(f.params_start as u64 + 1 + given[2].value) as usize].type_id;
+            }
+            none => {
+                if not quiet {
+                    no_method(c, t, m: given[1].value, p: 0, at: at);
+                }
+                return ty.invalid();
+            }
+        }
+    }
     if nm.eq("elem_type") {
         let e = elem_of(c, t);
         if ck.is_invalid(c, e) and not quiet {
             var m = ck.new_message(c);
             ck.write_type(c, &mut m, t);
-            m.push_str(" is neither an alloc.List nor an optional, so it has no element type");
+            m.push_str(" is not an alloc.List, an optional or an error union, so it has no element type");
             ck.report_owned(c, codes.META, at, m);
         }
         return e;
@@ -230,6 +424,26 @@ pub fn check_call(c: &mut ck.Checker, call: cst.NodeId, d: u32) {
         if field_of(c, d) == ck.NONE {
             let t = c.env[decl.env_start as usize].type_id;
             no_field(c, t, c.env[(decl.env_start + 1) as usize].value, s);
+        }
+        return;
+    }
+    if nm.eq("method_count") {
+        let t = c.env[decl.env_start as usize].type_id;
+        let i = iface_of(c, t);
+        if i == ck.NONE or not usable(c, i) {
+            no_method(c, t, m: 0, p: 0, at: s);
+        }
+        return;
+    }
+    if nm.eq("method_name") or nm.eq("param_count") or nm.eq("call") or nm.eq("arg") {
+        let t = c.env[decl.env_start as usize].type_id;
+        match sig_of(c, d) {
+            some(f) => {
+                if nm.eq("arg") and env_value(c, d, k: 2) + 1 >= f.params_len as u64 {
+                    no_method(c, t, m: env_value(c, d, k: 1), p: env_value(c, d, k: 2), at: s);
+                }
+            }
+            none => { no_method(c, t, m: env_value(c, d, k: 1), p: 0, at: s); }
         }
         return;
     }

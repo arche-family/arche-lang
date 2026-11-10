@@ -874,6 +874,10 @@ pub fn mangle(c: &ck.Checker, d: u32, a: alloc.Allocator) -> alloc.String {
     if decl.impl_index != ck.NONE {
         out.push_str("_X");
         ir.write_number(&mut out, c.impls[decl.impl_index as usize].node.index as u64);
+        if decl.forward != ck.NONE {
+            // Declared by the interface's module, made by the impl's.
+            segment(&mut out, c.p.modules[c.impls[decl.impl_index as usize].module as usize].name.view());
+        }
     }
     // An instance, a method of one, or a closure in one: a hash of the
     // comptime arguments tells it from the template's other instances
@@ -1128,6 +1132,64 @@ fn lower_fn(l: &mut Lower, f: u32) {
     }
 }
 
+/// A method of an impl by a function (spec/arche.md §5.4): its arguments
+/// after self go, in order, into a pack on its stack, and the function's
+/// instance for the method takes self and the pack's address, and gives
+/// the method's result, through the method's own result memory when it
+/// has one.
+fn lower_forwarder(l: &mut Lower, f: u32) {
+    let info = l.c.fns[f as usize];
+    let decl = l.c.decls[info.decl as usize];
+    l.f = declare_fn(l, f);
+    l.block = 0;
+    l.fn_index = f;
+    l.ret = info.ret;
+    ck.enter_decl(&mut l.c, info.decl);
+    l.vars = alloc.List(Var).init(l.a);
+    l.defers = alloc.List(cst.NodeId).init(l.a);
+    l.loops = alloc.List(LoopCtx).init(l.a);
+    l.sret = ck.NONE;
+    var args = args0(l);
+    var position: u64 = 0;
+    if returns_in_memory(&l.c, info.ret) {
+        var p = ir.inst(ir.Op.Param, ir.Ty.Ptr);
+        p.imm = 0;
+        args.push(emit(l, p));
+        position = 1;
+    }
+    var self_p = ir.inst(ir.Op.Param, param_ty(&l.c, l.c.params[info.params_start as usize].type_id));
+    self_p.imm = position;
+    args.push(emit(l, self_p));
+    position += 1;
+    l.f.body_start = l.f.insts.len() as u32;
+    let lay = layout.pack_layout(&l.c, info);
+    let pack = alloca_bytes(l, size: lay.size, align: lay.align);
+    var k: u32 = 1;
+    while k < info.params_len : (k += 1) {
+        let pt = l.c.params[(info.params_start + k) as usize].type_id;
+        var p = ir.inst(ir.Op.Param, param_ty(&l.c, pt));
+        p.imm = position;
+        let v = emit(l, p);
+        position += 1;
+        let at = gep(l, pack, layout.pack_offset(&l.c, info, k: (k - 1) as u64));
+        if layout.is_scalar(&l.c, pt) {
+            store(l, value: v, addr: at);
+        } else if not layout.is_nothing(&l.c, pt) {
+            memcpy(l, dst: at, src: v, layout.layout(&l.c, pt).size);
+        }
+    }
+    args.push(pack);
+    let target = l.c.decls[decl.forward as usize].fn_index;
+    let r = call_with(l, target, false, ret_ty(&l.c, info.ret), &args);
+    if ret_ty(&l.c, info.ret) == ir.Ty.Void {
+        _ = emit(l, ir.inst(ir.Op.RetVoid, ir.Ty.Void));
+    } else {
+        var ret = ir.inst(ir.Op.Ret, ir.Ty.Void);
+        ret.a = r;
+        _ = emit(l, ret);
+    }
+}
+
 /// a0_entry: what the runtime calls; it calls the root module's main.
 /// In a test build, the test block of the root module whose function is f,
 /// or NONE.
@@ -1279,6 +1341,13 @@ pub fn lower(c: ck.Checker) -> ir.Module {
         let test_block = root_test(&l.c, f as u32);
         if test_block != ck.NONE {
             lower_test(&mut l, test_block);
+            let done = l.f;
+            l.m.functions.push(done);
+            l.f = ir.new_function("", ir.Ty.Void, a);
+            continue;
+        }
+        if l.c.fns[f].decl != ck.NONE and l.c.decls[l.c.fns[f].decl as usize].forward != ck.NONE {
+            lower_forwarder(&mut l, f as u32);
             let done = l.f;
             l.m.functions.push(done);
             l.f = ir.new_function("", ir.Ty.Void, a);

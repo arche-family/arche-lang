@@ -1,0 +1,34 @@
+// test: run
+// spec: arche/4.3
+// stage0: skip
+// stdout: 7 true true
+import core.meta;
+import std;
+
+type Error = error { Bad }
+type Answer = Error!u64;
+type Done = Error!void;
+
+fn give(n: u64) -> Error!u64 {
+    if n == 0 {
+        return Error.Bad;
+    }
+    return n;
+}
+
+/// The value of an error union, or zero: written once for any E!T.
+fn value_or_zero(comptime R: type, r: R) -> meta.elem_type(R) {
+    let v = r catch return 0;
+    return v;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    sys.stdout.write_u64(value_or_zero(Answer, r: give(7)));
+    if meta.same(meta.elem_type(Answer), u64) {
+        sys.stdout.write(" true");
+    }
+    if meta.same(meta.elem_type(Done), void) {
+        sys.stdout.write(" true");
+    }
+    sys.stdout.write("\n");
+}

@@ -39,7 +39,8 @@ pub fn is_optional(comptime T: type) -> bool;
 /// A and B are one type.
 pub fn same(comptime A: type, comptime B: type) -> bool;
 
-/// The E of alloc.List(E) or of ?E; any other T is an error (E0841).
+/// The E of alloc.List(E), of ?E or of X!E; any other T is an error
+/// (E0841).
 pub fn elem_type(comptime T: type) -> type;
 
 /// How many pub fields struct T has; 0 for a type that is not a struct.
@@ -67,6 +68,40 @@ pub fn field(comptime T: type, comptime I: usize, value: &T) -> &field_type(T, I
 
 /// T's pub field I of value, to change.
 pub fn field_mut(comptime T: type, comptime I: usize, value: &mut T) -> &mut field_type(T, I);
+
+/// I is an interface type.
+pub fn is_interface(comptime I: type) -> bool;
+
+/// How many methods interface I has, which must be usable with dyn
+/// (spec/arche.md §5.3).
+pub fn method_count(comptime I: type) -> usize;
+
+/// The name of I's method M, counting from 0 in the order they are
+/// declared; M must be below method_count(I) (E0841).
+pub fn method_name(comptime I: type, comptime M: usize) -> str;
+
+/// How many parameters I's method M has after self.
+pub fn param_count(comptime I: type, comptime M: usize) -> usize;
+
+/// The type of parameter P, after self, of I's method M, Self as it is.
+pub fn param_type(comptime I: type, comptime M: usize, comptime P: usize) -> type;
+
+/// The result type of I's method M.
+pub fn result_type(comptime I: type, comptime M: usize) -> type;
+
+/// Calls I's method M through target, with the arguments after it, which
+/// are checked as the method's own: target is a &mut dyn I, or a &dyn I
+/// when the method takes &self. The compiler checks a call of it itself,
+/// which is why it is declared with target alone.
+pub fn call(comptime I: type, comptime M: usize, target: &mut dyn I) -> result_type(I, M);
+
+/// A view of the arguments of a call of I's method M, which only an impl
+/// by a function makes (spec/arche.md §5.4).
+pub fn Args(comptime I: type, comptime M: usize) -> type;
+
+/// Argument P of args: a copy of a value, a projection of args when the
+/// argument is a view.
+pub fn arg(comptime I: type, comptime M: usize, comptime P: usize, args: Args(I, M)) -> param_type(I, M, P);
 
 /// An error where code that walks types reaches one it does not handle: a
 /// call of unsupported(T) that is checked, in a branch a `comptime if` takes,

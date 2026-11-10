@@ -1,0 +1,110 @@
+// test: run
+// spec: arche/4.3
+// stage0: skip
+// stdout: 3 get put fill | 2 1 | get=0 put fill=3 get=42 | ok ok ok
+import core.meta;
+import std;
+
+type Store = interface {
+    fn get(self: &Self, key: u64) -> u64;
+    fn put(self: &mut Self, key: u64, value: u64);
+    /// Fills into with byte: how many.
+    fn fill(self: &mut Self, into: []mut u8, byte: u8) -> usize;
+}
+
+type Cells = struct {
+    values: [4]u64,
+}
+
+impl Store for Cells {
+    fn get(self: &Cells, key: u64) -> u64 {
+        return self.values[key as usize];
+    }
+
+    fn put(self: &mut Cells, key: u64, value: u64) {
+        self.values[key as usize] = value;
+    }
+
+    fn fill(self: &mut Cells, into: []mut u8, byte: u8) -> usize {
+        for b in into {
+            b.* = byte;
+        }
+        return into.len();
+    }
+}
+
+fn names(comptime I: type, comptime M: usize, out: &mut std.Output) {
+    comptime if M < meta.method_count(I) {
+        out.write(" ");
+        out.write(meta.method_name(I, M));
+        names(I, M + 1, out);
+    }
+}
+
+/// Argument P of a request: a word, or the buffer.
+fn decode(comptime T: type, word: u64, buffer: []mut u8) -> T {
+    comptime if meta.same(T, []mut u8) {
+        return buffer;
+    } else comptime if meta.same(T, u8) {
+        return word as u8;
+    } else comptime if meta.same(T, u64) {
+        return word;
+    } else {
+        meta.unsupported(T);
+    }
+}
+
+fn show(comptime T: type, value: T, out: &mut std.Output) {
+    comptime if meta.is_int(T) {
+        out.write("=");
+        out.write_u64(value as u64);
+    }
+}
+
+/// Calls the method numbered op with words and buffer as its arguments, by
+/// asking I what it has: written once for every interface.
+fn dispatch(comptime I: type, comptime M: usize, op: usize, target: &mut dyn I, words: [2]u64, buffer: []mut u8, out: &mut std.Output) {
+    comptime if M < meta.method_count(I) {
+        if op == M {
+            out.write(" ");
+            out.write(meta.method_name(I, M));
+            comptime if meta.same(meta.result_type(I, M), void) {
+                comptime if meta.param_count(I, M) == 2 {
+                    meta.call(I, M, target, decode(meta.param_type(I, M, 0), word: words[0], buffer: buffer), decode(meta.param_type(I, M, 1), word: words[1], buffer: buffer));
+                }
+            } else comptime if meta.param_count(I, M) == 1 {
+                let r = meta.call(I, M, target, decode(meta.param_type(I, M, 0), word: words[0], buffer: buffer));
+                show(meta.result_type(I, M), value: r, out: out);
+            } else comptime if meta.param_count(I, M) == 2 {
+                let r = meta.call(I, M, target, decode(meta.param_type(I, M, 0), word: words[0], buffer: buffer), decode(meta.param_type(I, M, 1), word: words[1], buffer: buffer));
+                show(meta.result_type(I, M), value: r, out: out);
+            }
+            return;
+        }
+        dispatch(I, M + 1, op, target, words, buffer, out);
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let out = &mut sys.stdout;
+    out.write_u64(meta.method_count(Store) as u64);
+    names(Store, 0, out);
+    out.write(" | ");
+    out.write_u64(meta.param_count(Store, 1) as u64);
+    out.write(" ");
+    out.write_u64(meta.param_count(Store, 0) as u64);
+    out.write(" |");
+    var cells = Cells { values: [0; 4] };
+    var buffer: [3]u8 = [0; 3];
+    dispatch(Store, 0, op: 0, target: &mut cells, words: [2, 0], buffer: buffer[0..3], out: out);
+    dispatch(Store, 0, op: 1, target: &mut cells, words: [2, 42], buffer: buffer[0..3], out: out);
+    dispatch(Store, 0, op: 2, target: &mut cells, words: [0, 7], buffer: buffer[0..3], out: out);
+    dispatch(Store, 0, op: 0, target: &mut cells, words: [2, 0], buffer: buffer[0..3], out: out);
+    out.write(" |");
+    for b in buffer[0..3] {
+        if b.* == 7 {
+            out.write(" ok");
+        }
+    }
+    out.write("\n");
+}
