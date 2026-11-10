@@ -1,0 +1,328 @@
+package nimadir:shell@1.2.0;
+
+/// The complete host <-> mini-app contract, defined ONCE and shared by both
+/// sides. `wit-bindgen` generates the guest bindings from this file; wasmtime's
+/// `bindgen!` generates the host bindings from the very same file. There is no
+/// hand-written `(ptr, len)` ABI on either side any more — the Component Model's
+/// canonical ABI moves the strings and bools across the boundary for us.
+interface host-api {
+    /// One app the shell knows about — the same shape the home screen lists.
+    record app-entry {
+        name: string,
+        /// File path or URL. Whatever `open-app` accepts.
+        source: string,
+        description: string,
+    }
+
+    /// What the registry says of an app beyond its entry (`app-info`, `1.2`): each ""
+    /// when it does not say. Its own record, since `app-entry` cannot grow.
+    record app-details {
+        /// From the app's manifest, as the registry was published with it.
+        version: string,
+        /// Who signed it, and who must have: a copy signed by anybody else
+        /// is refused.
+        publisher: string,
+    }
+
+    /// Debug log line, printed by the host.
+    log: func(msg: string);
+
+    /// Draw a text label in the current frame.
+    ui-label: func(text: string);
+
+    /// Draw a button in the current frame; returns true if it was clicked.
+    ui-button: func(text: string) -> bool;
+
+    /// Draw a single-line text field. Pass the value the guest is holding; the
+    /// host returns the value after the user's edits, which the guest stores
+    /// and passes back next frame. Immediate mode, exactly like `ui-button`:
+    /// the guest owns the state, the host owns the widget.
+    ui-text-edit: func(text: string) -> string;
+
+    /// A heading. `level` 1 is the largest — a start page's wordmark — and 2
+    /// and 3 step down; anything else clamps into that range rather than
+    /// failing, since a guest is untrusted and a bad number is not worth a trap.
+    ui-heading: func(text: string, level: u8);
+
+    /// A prominent search field, with placeholder text shown while it is empty.
+    /// Otherwise `ui-text-edit`: the value goes out, the edited value comes
+    /// back, and it **shares the text-field index space** with it — the two are
+    /// the same kind of widget wearing different clothes, and a guest may mix
+    /// them freely.
+    ui-search-field: func(text: string, placeholder: string) -> string;
+
+    /// A clickable card: a title, a line of detail, and a click. **Consecutive
+    /// tiles are laid out by the host as a wrapping grid** — the guest says what
+    /// the tiles are, the host decides how many fit on a row and what a card
+    /// looks like. Shares the button index space with `ui-button`.
+    ///
+    /// This is the one widget that is about *layout*, and it is expressed as a
+    /// thing rather than a coordinate on purpose: a guest that could position
+    /// pixels would be a guest the renderer can no longer be swapped under.
+    ui-tile: func(title: string, subtitle: string) -> bool;
+
+    /// Example host-owned capability: wall-clock time in milliseconds.
+    now-millis: func() -> s64;
+
+    /// The shell's app registry. A mini-app cannot reach the network or the
+    /// disk, so this is how the store learns what there is to list.
+    list-apps: func() -> list<app-entry>;
+
+    /// Ask the shell to open another app. It is a *request*, honoured once the
+    /// current frame returns: a guest cannot be torn down in the middle of its
+    /// own `update`, so navigation always happens between frames, not during
+    /// one. The caller keeps running until then.
+    open-app: func(source: string);
+
+    /// Ask for another frame in `after-ms` milliseconds, whatever happens
+    /// meanwhile. Without it the shell draws only when something happens — a
+    /// tap, a key, a load — so an app with nothing to animate costs nothing,
+    /// which on a phone is battery. An app that shows time passing asks again
+    /// from each frame for the next. The earliest request in a frame wins, and
+    /// nothing comes sooner than one frame (16 ms).
+    request-frame: func(after-ms: u32);
+
+    /// The app's own small store of strings. It is kept between visits for an
+    /// app that is signed and asks for `storage` in its manifest — its
+    /// identity is what the data is kept under. Any other app's lasts only
+    /// until it is left, like the rest of its state. 1 MiB per app, keys and
+    /// values together; a `storage-set` past that fails, saying so.
+    storage-get: func(key: string) -> option<string>;
+    storage-set: func(key: string, value: string) -> result<_, string>;
+    storage-remove: func(key: string);
+    storage-keys: func() -> list<string>;
+
+    /// Start a group of the widgets that follow, until `ui-end`. `kind` says
+    /// what the group *is* — "row", "column", "section" or "scroll" — and the
+    /// host decides how that looks and how big it is; still no coordinates.
+    /// A string, not an enum, so an app may name a kind added later and still
+    /// work on an older host, which draws what it does not know as a column.
+    /// Groups nest; one left open is closed when the frame ends.
+    ui-begin: func(kind: string);
+    ui-end: func();
+
+    /// A checkbox. Pass the value the guest holds; the host returns it after
+    /// the user's tap. Shares the button index space: it is something to tap.
+    ui-checkbox: func(text: string, checked: bool) -> bool;
+
+    /// One of several options, drawn as a row of choices — no popup, which is
+    /// awkward under a finger. Pass the selected index; the host returns it
+    /// after the user's pick. Shares the text-field index space: it holds a
+    /// value, the way a field does.
+    ui-choice: func(options: list<string>, selected: u32) -> u32;
+
+    /// A dividing line.
+    ui-separator: func();
+
+    /// Progress from 0.0 to 1.0; anything outside is clamped.
+    ui-progress: func(fraction: f32);
+
+    /// Whether the text or search field drawn just before this call was
+    /// submitted in the last frame — Enter on a keyboard, the action key on a
+    /// phone's. Lets an app act on "done typing" instead of on every key.
+    ui-submitted: func() -> bool;
+
+    /// Hand the host an image — PNG or JPEG bytes — once, and draw it by the
+    /// number this returns as often as needed. The host decodes it, and
+    /// refuses one larger than 4096 × 4096, or one that would take the app's
+    /// images past 8 megapixels in all. Images last as long as the app.
+    image-load: func(bytes: list<u8>) -> result<u32, string>;
+
+    /// Draw an image from `image-load`: at its own size where there is room,
+    /// scaled down to fit where there is not, never up. A number that is not
+    /// an image draws nothing.
+    ui-image: func(handle: u32);
+
+    /// A request for `fetch`. `method` is GET, POST, …; `body` may be empty.
+    record http-request {
+        method: string,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// What came back: any status at all, not only success.
+    record http-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// Start a request and return at once with its number (ADR-3). Only to an
+    /// origin the app's manifest lists under "network", over https — plain
+    /// http only to this machine — and only once the user has allowed it: the
+    /// first request to an origin is asked about in the chrome, and a signed
+    /// app's yes is remembered. At most 8 in flight; 8 MiB of body each way.
+    fetch: func(request: http-request) -> result<u32, string>;
+
+    /// A request's answer, once it has one: `none` while it is under way (or
+    /// waiting on the user), then the response, or why there is none. Each
+    /// answer is given once.
+    fetch-poll: func(request: u32) -> option<result<http-response, string>>;
+
+    /// The user's language and region, BCP 47 — "uz-UZ", "ru-RU", "en-US" —
+    /// so an app can pick its words and formats. "en-US" when the system does
+    /// not say.
+    locale: func() -> string;
+
+    /// The user's time zone, IANA — "Asia/Tashkent" — or "" when the system
+    /// does not say (`1.2`).
+    time-zone: func() -> string;
+
+    /// Minutes east of UTC in the user's time zone, now: 300 in Tashkent.
+    /// With `time-zone`, enough to show a time as the user reads it (`1.2`).
+    utc-offset: func() -> s32;
+
+    /// The registry's details of an app, by the `source` `list-apps` gave
+    /// (`1.2`). All "" for an address the registry does not list.
+    app-info: func(source: string) -> app-details;
+}
+
+/// A native element tree, styled with CSS (ADR-4) — what HTML and CSS can say,
+/// held and drawn by the host, with no web engine anywhere.
+///
+/// The app builds a tree under `root()` and edits only what changes; the host
+/// keeps it between frames, styles it with the stylesheets the app adds (and a
+/// built-in one that follows the system's light or dark theme), lays it out —
+/// block, flex, grid — and draws it. Immediate-mode widgets (`host-api`'s
+/// `ui-*`) drawn in the same frame follow the tree.
+///
+/// Names are strings — tags, attributes, CSS properties, event kinds — so a
+/// name added later is ignored by an older host, or drawn as a `div`, rather
+/// than failing to link. A node number that is not a node is ignored: a guest
+/// is untrusted, and a stale number is a bug in it, not worth a trap. Going
+/// past the document's limits — 65 536 nodes, 32 MiB of text, attributes and
+/// styles, 256 levels deep — stops the app, as overspending a frame does.
+interface dom {
+    /// An element or a run of text. Numbers start at 1 and are not reused
+    /// while the app runs; 0 is never a node.
+    type node = u32;
+
+    /// A box on the page, in logical pixels from the page's top-left corner.
+    record rect {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    }
+
+    /// Something the user did, delivered to a node that listens for it.
+    record event {
+        /// "click", "input", "change", "submit", "focus", "blur",
+        /// "pointerdown", "pointerup".
+        kind: string,
+        /// The node it happened on: the deepest one under the finger, or the
+        /// control.
+        target: node,
+        /// The node it is delivered to: `target`, or its nearest ancestor
+        /// that listens for `kind`.
+        current: node,
+        /// For `input` and `change`, the control's new value: a field's text,
+        /// "true" or "false" for a checkbox or radio, a number for a range.
+        /// Empty otherwise.
+        value: string,
+        /// For `click` and pointer events, where, relative to `current`'s
+        /// box. 0 otherwise.
+        x: f32,
+        y: f32,
+    }
+
+    /// The page: a `body` element the host made, always there. Everything
+    /// the app shows goes under it; an app that leaves it empty shows only
+    /// its `ui-*` widgets, as before.
+    root: func() -> node;
+
+    /// A new element, not yet in the tree. `tag` is an HTML name — `div`,
+    /// `span`, `p`, `h1`…`h6`, `button`, `input`, `img`, `a`, `ul`, `li`, … —
+    /// and one this host does not know is a `div`.
+    create-element: func(tag: string) -> node;
+
+    /// A new run of text, not yet in the tree.
+    create-text: func(text: string) -> node;
+
+    /// Put `child` last under `parent`, moving it from wherever it was.
+    /// Ignored if it would put a node inside itself, or under a text node.
+    append-child: func(parent: node, child: node);
+
+    /// Put `child` under `parent` just before `before`, which must already
+    /// be one of `parent`'s children; otherwise as `append-child`.
+    insert-before: func(parent: node, child: node, before: node);
+
+    /// Take a node out of the tree, keeping it — and what is under it — to
+    /// be put back later.
+    remove: func(child: node);
+
+    /// Take a node out of the tree and forget it, and everything under it.
+    /// Their numbers mean nothing afterwards.
+    release: func(item: node);
+
+    /// A text node's text; for an element, its children replaced by this
+    /// text alone (`textContent`).
+    set-text: func(item: node, text: string);
+
+    /// Set an attribute: `id`, `class`, `style` (inline CSS, all of it),
+    /// `value`, `placeholder`, `type`, `checked`, `disabled`, `href`, `src`
+    /// (an `image-load` number), `alt`, `min`, `max`, `step`, … Setting
+    /// `value` or `checked` sets what the control shows, whatever the user
+    /// had made it.
+    set-attribute: func(item: node, name: string, value: string);
+    remove-attribute: func(item: node, name: string);
+    get-attribute: func(item: node, name: string) -> option<string>;
+
+    /// Add the class `name` when `on`, take it away otherwise.
+    toggle-class: func(item: node, name: string, on: bool);
+
+    /// One inline CSS property — `set-style(n, "padding", "8px 12px")`. An
+    /// empty value removes it.
+    set-style: func(item: node, property: string, value: string);
+
+    /// Replace an element's children with what an HTML-like snippet
+    /// describes: `<div class="card"><h2>Title</h2><p>Text</p></div>`.
+    /// Elements, attributes, text and entities; no scripts. Fails, changing
+    /// nothing, on markup it cannot read, saying where.
+    set-markup: func(item: node, markup: string) -> result<_, string>;
+
+    /// The nodes under `scope` (itself excluded) that match a CSS selector,
+    /// in document order. An unreadable selector matches nothing.
+    query-all: func(scope: node, selector: string) -> list<node>;
+
+    parent: func(item: node) -> option<node>;
+    children: func(item: node) -> list<node>;
+
+    /// A control's value as the user left it — a field's text, "true" or
+    /// "false" for a checkbox — and any other node's text.
+    value: func(item: node) -> string;
+
+    /// Give a control the keyboard. Ignored for anything else.
+    focus: func(item: node);
+
+    /// Where a node was in the last layout; `none` before there was one, or
+    /// for a node not in the tree.
+    bounds: func(item: node) -> option<rect>;
+
+    /// Add a stylesheet; later ones win over earlier ones, as on the web.
+    /// What cannot be read is skipped, rule by rule, and logged.
+    add-stylesheet: func(css: string) -> u32;
+    remove-stylesheet: func(sheet: u32);
+
+    /// Ask for events of `kind` on `item` and what is under it.
+    listen: func(item: node, kind: string);
+    unlisten: func(item: node, kind: string);
+
+    /// What happened since the last call, oldest first. An app reads it in
+    /// `update`, which the shell calls whenever there is something in it.
+    events: func() -> list<event>;
+}
+
+/// A mini-app. It may import (call) everything in `host-api` and `dom` — those
+/// interfaces ARE its capability set, the only things it can reach outside its
+/// own sandbox — and it must export `init` (one-time setup) and `update`
+/// (called once per frame: to describe its immediate-mode UI, and to answer
+/// its tree's events).
+world mini-app {
+    import host-api;
+    import dom;
+
+    export init: func();
+    export update: func();
+}

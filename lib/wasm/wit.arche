@@ -1,0 +1,575 @@
+/// WIT, the Component Model's interface language (docs/sprints.md S38), read
+/// into the types the runtime reads from a component's binary
+/// (wasm.component's CType), so that what lays them out, flattens and
+/// encodes them is the same code. A package's interfaces, with their
+/// records, variants, enums, flags, aliases and functions, and its worlds,
+/// with what they import and export. Not yet: resources, `use` between
+/// interfaces, and `include`.
+import alloc;
+import wasm.component as c;
+
+/// A function: its name, as written (kebab-case), and its type, a FUNC
+/// whose parts are its params' types then its result's (NONE for none).
+pub type Func = struct {
+    pub name: alloc.String,
+    pub ty: u32,
+}
+
+/// A type an interface names.
+pub type TypeDef = struct {
+    pub name: alloc.String,
+    pub ty: u32,
+}
+
+pub type Interface = struct {
+    pub name: alloc.String,
+    pub types: alloc.List(TypeDef),
+    pub funcs: alloc.List(Func),
+}
+
+/// A world: the interfaces it imports and exports, by their number in
+/// the package, and the functions it imports and exports of its own.
+pub type World = struct {
+    pub name: alloc.String,
+    pub imports: alloc.List(u32),
+    pub exports: alloc.List(u32),
+    pub import_funcs: alloc.List(Func),
+    pub export_funcs: alloc.List(Func),
+}
+
+pub type Wit = struct {
+    /// "namespace:name", and its version, empty for none.
+    pub package: alloc.String,
+    pub version: alloc.String,
+    /// The primitives first, at c's numbers for them (0x7F - code).
+    pub types: alloc.List(c.CType),
+    pub interfaces: alloc.List(Interface),
+    pub worlds: alloc.List(World),
+}
+
+/// A type named before it is defined, or an alias: resolved at the end.
+const RESERVED: u8 = 0;
+const ALIAS: u8 = 1;
+
+type Lexer = struct {
+    text: alloc.String,
+    at: usize,
+    line: u32,
+}
+
+type Parser = struct {
+    lx: Lexer,
+    /// The token just read: its text, and whether it is an identifier.
+    tok: alloc.String,
+    ident: bool,
+    w: Wit,
+    why: alloc.String,
+    a: alloc.Allocator,
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '-' or b == '_';
+}
+
+/// The next token into p.tok: an identifier (a leading % dropped), or one
+/// character of punctuation, or "->"; empty at the end.
+fn next(p: &mut Parser) {
+    let b = p.lx.text.view().bytes();
+    var i = p.lx.at;
+    while i < b.len() {
+        if b[i] == '\n' {
+            p.lx.line += 1;
+            i += 1;
+        } else if b[i] == ' ' or b[i] == '\t' or b[i] == '\r' {
+            i += 1;
+        } else if i + 1 < b.len() and b[i] == '/' and b[i + 1] == '/' {
+            while i < b.len() and b[i] != '\n' {
+                i += 1;
+            }
+        } else if i + 1 < b.len() and b[i] == '/' and b[i + 1] == '*' {
+            i += 2;
+            while i + 1 < b.len() and not (b[i] == '*' and b[i + 1] == '/') {
+                if b[i] == '\n' {
+                    p.lx.line += 1;
+                }
+                i += 1;
+            }
+            i += 2;
+        } else {
+            break;
+        }
+    }
+    p.tok = alloc.String.init(p.a);
+    p.ident = false;
+    if i >= b.len() {
+        p.lx.at = b.len();
+        return;
+    }
+    let text = p.lx.text.view();
+    if b[i] == '-' and i + 1 < b.len() and b[i + 1] == '>' {
+        p.tok.push_str("->");
+        p.lx.at = i + 2;
+        return;
+    }
+    if b[i] == '%' or (is_ident_byte(b[i]) and b[i] != '-') {
+        if b[i] == '%' {
+            i += 1;
+        }
+        let start = i;
+        while i < b.len() and is_ident_byte(b[i]) {
+            i += 1;
+        }
+        p.tok.push_str(text[start..i]);
+        p.ident = true;
+        p.lx.at = i;
+        return;
+    }
+    p.tok.push_ascii(b[i]);
+    p.lx.at = i + 1;
+}
+
+/// A version after @: digits, letters, dots, + and -.
+fn version(p: &mut Parser) -> alloc.String {
+    let b = p.lx.text.view().bytes();
+    var i = p.lx.at;
+    let start = i;
+    while i < b.len() and (is_ident_byte(b[i]) or b[i] == '.' or b[i] == '+') {
+        i += 1;
+    }
+    p.lx.at = i;
+    let v = alloc.String.from(p.lx.text.view()[start..i], p.a);
+    next(p);
+    return v;
+}
+
+fn fail(p: &mut Parser, what: str) {
+    if p.why.len() == 0 {
+        p.why.push_str("line ");
+        p.why.push_u64(p.lx.line as u64);
+        p.why.push_str(": ");
+        p.why.push_str(what);
+        if p.tok.len() > 0 {
+            p.why.push_str(", at '");
+            p.why.push_str(p.tok.view());
+            p.why.push_str("'");
+        }
+    }
+}
+
+fn is(p: &Parser, t: str) -> bool {
+    return p.tok.view().eq(t);
+}
+
+fn expect(p: &mut Parser, t: str) {
+    if is(p, t: t) {
+        next(p);
+        return;
+    }
+    var what = alloc.String.from("expected '", p.a);
+    what.push_str(t);
+    what.push_str("'");
+    fail(p, what: what.view());
+}
+
+fn ident(p: &mut Parser) -> alloc.String {
+    if not p.ident {
+        fail(p, what: "expected a name");
+        return alloc.String.init(p.a);
+    }
+    let name = alloc.String.from(p.tok.view(), p.a);
+    next(p);
+    return name;
+}
+
+fn new_type(p: &mut Parser, kind: u8) -> u32 {
+    p.w.types.push(c.CType { kind: kind, parts: alloc.List(u32).init(p.a), names: alloc.List(alloc.String).init(p.a), count: 0 });
+    return (p.w.types.len() - 1) as u32;
+}
+
+/// A primitive's type by its name; NONE for a name that is not one.
+fn primitive(name: str) -> u32 {
+    var code: u8 = 0;
+    if name.eq("bool") {
+        code = c.BOOL;
+    } else if name.eq("s8") {
+        code = c.S8;
+    } else if name.eq("u8") {
+        code = c.U8;
+    } else if name.eq("s16") {
+        code = c.S16;
+    } else if name.eq("u16") {
+        code = c.U16;
+    } else if name.eq("s32") {
+        code = c.S32;
+    } else if name.eq("u32") {
+        code = c.U32;
+    } else if name.eq("s64") {
+        code = c.S64;
+    } else if name.eq("u64") {
+        code = c.U64;
+    } else if name.eq("f32") or name.eq("float32") {
+        code = c.F32;
+    } else if name.eq("f64") or name.eq("float64") {
+        code = c.F64;
+    } else if name.eq("char") {
+        code = c.CHAR;
+    } else if name.eq("string") {
+        code = c.STRING;
+    } else {
+        return c.NONE;
+    }
+    return (0x7F - code) as u32;
+}
+
+/// The interface's type of that name, made a placeholder until it is
+/// defined when it is not yet.
+fn named(p: &mut Parser, iface: u32, name: str) -> u32 {
+    for d in p.w.interfaces.items()[iface as usize].types.items() {
+        if d.name.view().eq(name) {
+            return d.ty;
+        }
+    }
+    let t = new_type(p, kind: RESERVED);
+    p.w.interfaces.items_mut()[iface as usize].types.push(TypeDef { name: alloc.String.from(name, p.a), ty: t });
+    return t;
+}
+
+/// A type, as a type's place in the package's table.
+fn ty(p: &mut Parser, iface: u32) -> u32 {
+    let name = ident(p);
+    let prim = primitive(name.view());
+    if prim != c.NONE {
+        return prim;
+    }
+    if name.view().eq("list") or name.view().eq("option") {
+        var kind = c.LIST;
+        if name.view().eq("option") {
+            kind = c.OPTION;
+        }
+        expect(p, t: "<");
+        let elem = ty(p, iface: iface);
+        expect(p, t: ">");
+        let t = new_type(p, kind: kind);
+        p.w.types.items_mut()[t as usize].parts.push(elem);
+        return t;
+    }
+    if name.view().eq("tuple") {
+        let t = new_type(p, kind: c.TUPLE);
+        expect(p, t: "<");
+        while p.why.len() == 0 and not is(p, t: ">") {
+            let part = ty(p, iface: iface);
+            p.w.types.items_mut()[t as usize].parts.push(part);
+            if is(p, t: ",") {
+                next(p);
+            }
+        }
+        expect(p, t: ">");
+        return t;
+    }
+    if name.view().eq("result") {
+        let t = new_type(p, kind: c.RESULT);
+        var ok_t = c.NONE;
+        var err_t = c.NONE;
+        if is(p, t: "<") {
+            next(p);
+            if is(p, t: "_") {
+                next(p);
+            } else {
+                ok_t = ty(p, iface: iface);
+            }
+            if is(p, t: ",") {
+                next(p);
+                err_t = ty(p, iface: iface);
+            }
+            expect(p, t: ">");
+        }
+        p.w.types.items_mut()[t as usize].parts.push(ok_t);
+        p.w.types.items_mut()[t as usize].parts.push(err_t);
+        return t;
+    }
+    if name.view().eq("borrow") or name.view().eq("own") or name.view().eq("future") or name.view().eq("stream") {
+        fail(p, what: "resources, futures and streams are not read yet");
+        return 0;
+    }
+    if iface == c.NONE {
+        fail(p, what: "a named type outside an interface");
+        return 0;
+    }
+    return named(p, iface: iface, name: name.view());
+}
+
+/// A function's type after `func`: its params and its result.
+fn func_type(p: &mut Parser, iface: u32) -> u32 {
+    let t = new_type(p, kind: c.FUNC);
+    expect(p, t: "(");
+    var n: u32 = 0;
+    while p.why.len() == 0 and not is(p, t: ")") {
+        let pname = ident(p);
+        expect(p, t: ":");
+        let pt = ty(p, iface: iface);
+        p.w.types.items_mut()[t as usize].names.push(pname);
+        p.w.types.items_mut()[t as usize].parts.push(pt);
+        n += 1;
+        if is(p, t: ",") {
+            next(p);
+        }
+    }
+    expect(p, t: ")");
+    var result = c.NONE;
+    if is(p, t: "->") {
+        next(p);
+        result = ty(p, iface: iface);
+    }
+    p.w.types.items_mut()[t as usize].parts.push(result);
+    p.w.types.items_mut()[t as usize].count = n;
+    return t;
+}
+
+/// The named members of a record, variant, enum or flags, into t.
+fn members(p: &mut Parser, iface: u32, t: u32, kind: u8) {
+    expect(p, t: "{");
+    var n: u32 = 0;
+    while p.why.len() == 0 and not is(p, t: "}") {
+        let name = ident(p);
+        var part = c.NONE;
+        if kind == c.RECORD {
+            expect(p, t: ":");
+            part = ty(p, iface: iface);
+        } else if kind == c.VARIANT and is(p, t: "(") {
+            next(p);
+            part = ty(p, iface: iface);
+            expect(p, t: ")");
+        }
+        p.w.types.items_mut()[t as usize].names.push(name);
+        if kind == c.RECORD or kind == c.VARIANT {
+            p.w.types.items_mut()[t as usize].parts.push(part);
+        }
+        n += 1;
+        if is(p, t: ",") {
+            next(p);
+        }
+    }
+    expect(p, t: "}");
+    p.w.types.items_mut()[t as usize].kind = kind;
+    p.w.types.items_mut()[t as usize].count = n;
+}
+
+fn interface_body(p: &mut Parser, iface: u32) {
+    expect(p, t: "{");
+    while p.why.len() == 0 and not is(p, t: "}") and p.tok.len() > 0 {
+        if is(p, t: "record") or is(p, t: "variant") or is(p, t: "enum") or is(p, t: "flags") {
+            var kind = c.RECORD;
+            if is(p, t: "variant") {
+                kind = c.VARIANT;
+            } else if is(p, t: "enum") {
+                kind = c.ENUM;
+            } else if is(p, t: "flags") {
+                kind = c.FLAGS;
+            }
+            next(p);
+            let name = ident(p);
+            let t = named(p, iface: iface, name: name.view());
+            if p.w.types.items()[t as usize].kind != RESERVED or p.w.types.items()[t as usize].parts.len() > 0 {
+                fail(p, what: "a type defined twice");
+                return;
+            }
+            members(p, iface: iface, t: t, kind: kind);
+        } else if is(p, t: "type") {
+            next(p);
+            let name = ident(p);
+            expect(p, t: "=");
+            let target = ty(p, iface: iface);
+            expect(p, t: ";");
+            let t = named(p, iface: iface, name: name.view());
+            p.w.types.items_mut()[t as usize].kind = ALIAS;
+            p.w.types.items_mut()[t as usize].parts.push(target);
+        } else if is(p, t: "use") or is(p, t: "resource") {
+            fail(p, what: "use and resources are not read yet");
+            return;
+        } else {
+            let name = ident(p);
+            expect(p, t: ":");
+            if not is(p, t: "func") {
+                fail(p, what: "expected a function");
+                return;
+            }
+            next(p);
+            let t = func_type(p, iface: iface);
+            expect(p, t: ";");
+            p.w.interfaces.items_mut()[iface as usize].funcs.push(Func { name: name, ty: t });
+        }
+    }
+    expect(p, t: "}");
+}
+
+fn interface_named(w: &Wit, name: str) -> u32 {
+    var i: u32 = 0;
+    while (i as usize) < w.interfaces.len() : (i += 1) {
+        if w.interfaces.items()[i as usize].name.view().eq(name) {
+            return i;
+        }
+    }
+    return c.NONE;
+}
+
+fn world_body(p: &mut Parser, world: u32) {
+    expect(p, t: "{");
+    while p.why.len() == 0 and not is(p, t: "}") and p.tok.len() > 0 {
+        let importing = is(p, t: "import");
+        if not importing and not is(p, t: "export") {
+            fail(p, what: "a world imports and exports; include is not read yet");
+            return;
+        }
+        next(p);
+        let name = ident(p);
+        if is(p, t: ":") {
+            next(p);
+            if not is(p, t: "func") {
+                fail(p, what: "expected a function; interfaces are imported by name");
+                return;
+            }
+            next(p);
+            let t = func_type(p, iface: c.NONE);
+            expect(p, t: ";");
+            if importing {
+                p.w.worlds.items_mut()[world as usize].import_funcs.push(Func { name: name, ty: t });
+            } else {
+                p.w.worlds.items_mut()[world as usize].export_funcs.push(Func { name: name, ty: t });
+            }
+            continue;
+        }
+        expect(p, t: ";");
+        let i = interface_named(&p.w, name: name.view());
+        if i == c.NONE {
+            fail(p, what: "no interface of that name in this package");
+            return;
+        }
+        if importing {
+            p.w.worlds.items_mut()[world as usize].imports.push(i);
+        } else {
+            p.w.worlds.items_mut()[world as usize].exports.push(i);
+        }
+    }
+    expect(p, t: "}");
+}
+
+/// What an alias stands for, through any aliases.
+fn resolved(w: &Wit, t: u32) -> u32 {
+    var at = t;
+    var hops: u32 = 0;
+    while at != c.NONE and w.types.items()[at as usize].kind == ALIAS and hops < 64 : (hops += 1) {
+        at = w.types.items()[at as usize].parts.items()[0];
+    }
+    return at;
+}
+
+/// A package's WIT text read; none when it cannot be, why saying where.
+pub fn parse(text: str, why: &mut alloc.String, a: alloc.Allocator) -> ?Wit {
+    var p = Parser {
+        lx: Lexer { text: alloc.String.from(text, a), at: 0, line: 1 },
+        tok: alloc.String.init(a),
+        ident: false,
+        w: Wit { package: alloc.String.init(a), version: alloc.String.init(a), types: alloc.List(c.CType).init(a), interfaces: alloc.List(Interface).init(a), worlds: alloc.List(World).init(a) },
+        why: alloc.String.init(a),
+        a: a,
+    };
+    // The primitives, at the component reader's numbers for them.
+    var code: u32 = 0x7F;
+    while code >= 0x73 : (code -= 1) {
+        _ = new_type(&mut p, kind: code as u8);
+    }
+    next(&mut p);
+    if is(&p, t: "package") {
+        next(&mut p);
+        let ns = ident(&mut p);
+        expect(&mut p, t: ":");
+        let name = ident(&mut p);
+        p.w.package.push_str(ns.view());
+        p.w.package.push_str(":");
+        p.w.package.push_str(name.view());
+        if is(&p, t: "@") {
+            p.w.version = version(&mut p);
+        }
+        expect(&mut p, t: ";");
+    }
+    while p.why.len() == 0 and p.tok.len() > 0 {
+        if is(&p, t: "interface") {
+            next(&mut p);
+            let name = ident(&mut p);
+            p.w.interfaces.push(Interface { name: name, types: alloc.List(TypeDef).init(a), funcs: alloc.List(Func).init(a) });
+            interface_body(&mut p, iface: (p.w.interfaces.len() - 1) as u32);
+        } else if is(&p, t: "world") {
+            next(&mut p);
+            let name = ident(&mut p);
+            p.w.worlds.push(World { name: name, imports: alloc.List(u32).init(a), exports: alloc.List(u32).init(a), import_funcs: alloc.List(Func).init(a), export_funcs: alloc.List(Func).init(a) });
+            world_body(&mut p, world: (p.w.worlds.len() - 1) as u32);
+        } else {
+            fail(&mut p, what: "expected an interface or a world");
+        }
+    }
+    // Every name defined, and aliases seen through.
+    if p.why.len() == 0 {
+        for i in p.w.interfaces.items() {
+            for d in i.types.items() {
+                if p.w.types.items()[d.ty as usize].kind == RESERVED {
+                    p.why.push_str("type ");
+                    p.why.push_str(d.name.view());
+                    p.why.push_str(" of ");
+                    p.why.push_str(i.name.view());
+                    p.why.push_str(" is used and not defined");
+                    break;
+                }
+            }
+        }
+    }
+    if p.why.len() > 0 {
+        why.push_str(p.why.view());
+        return none;
+    }
+    var k: usize = 0;
+    while k < p.w.types.len() : (k += 1) {
+        var j: usize = 0;
+        while j < p.w.types.items()[k].parts.len() : (j += 1) {
+            let part = p.w.types.items()[k].parts.items()[j];
+            if part != c.NONE {
+                let r = resolved(&p.w, t: part);
+                p.w.types.items_mut()[k].parts.items_mut()[j] = r;
+            }
+        }
+    }
+    return p.w;
+}
+
+/// What an alias is, or t itself: a type to lay out, flatten or encode.
+pub fn real(w: &Wit, t: u32) -> u32 {
+    return resolved(w, t: t);
+}
+
+/// Whether t is an alias's place: a name for another type.
+pub fn is_alias(w: &Wit, t: u32) -> bool {
+    return w.types.items()[t as usize].kind == ALIAS;
+}
+
+/// The interface's full name, as a component imports it:
+/// "namespace:name/interface@version".
+pub fn interface_id(w: &Wit, i: u32, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.from(w.package.view(), a);
+    s.push_str("/");
+    s.push_str(w.interfaces.items()[i as usize].name.view());
+    if w.version.len() > 0 {
+        s.push_str("@");
+        s.push_str(w.version.view());
+    }
+    return s;
+}
+
+/// The world of that name; NONE for none.
+pub fn world_named(w: &Wit, name: str) -> u32 {
+    var i: u32 = 0;
+    while (i as usize) < w.worlds.len() : (i += 1) {
+        if w.worlds.items()[i as usize].name.view().eq(name) {
+            return i;
+        }
+    }
+    return c.NONE;
+}

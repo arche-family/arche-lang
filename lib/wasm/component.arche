@@ -325,10 +325,10 @@ fn deftype(c: &mut Component, r: &mut m.Reader, b: []u8, scope: &mut alloc.List(
 
 // ---- flattening and layout (CanonicalABI.md) ------------------------------------------
 
-const FLAT_I32: u8 = 0x7F;
-const FLAT_I64: u8 = 0x7E;
-const FLAT_F32: u8 = 0x7D;
-const FLAT_F64: u8 = 0x7C;
+pub const FLAT_I32: u8 = 0x7F;
+pub const FLAT_I64: u8 = 0x7E;
+pub const FLAT_F32: u8 = 0x7D;
+pub const FLAT_F64: u8 = 0x7C;
 pub const MAX_FLAT_PARAMS: usize = 16;
 pub const MAX_FLAT_RESULTS: usize = 1;
 
@@ -342,8 +342,9 @@ fn join(x: u8, y: u8) -> u8 {
     return FLAT_I64;
 }
 
-fn flatten(c: &Component, t: u32, out: &mut alloc.List(u8)) {
-    let ty = &c.types.items()[t as usize];
+/// t flattened to core value types (FLAT_*), as the canonical ABI passes it.
+pub fn flatten_in(types: &alloc.List(CType), t: u32, out: &mut alloc.List(u8), a: alloc.Allocator) {
+    let ty = &types.items()[t as usize];
     let k = ty.kind;
     if k == BOOL or k == S8 or k == U8 or k == S16 or k == U16 or k == S32 or k == U32 or k == CHAR or k == ENUM {
         out.push(FLAT_I32);
@@ -358,7 +359,7 @@ fn flatten(c: &Component, t: u32, out: &mut alloc.List(u8)) {
         out.push(FLAT_I32);
     } else if k == RECORD or k == TUPLE {
         for p in ty.parts.items() {
-            flatten(c, p.*, out: out);
+            flatten_in(types, t: p.*, out: out, a: a);
         }
     } else if k == FLAGS {
         var n = ty.count;
@@ -374,14 +375,14 @@ fn flatten(c: &Component, t: u32, out: &mut alloc.List(u8)) {
         // Variants: the case, then the cases' flattenings joined.
         out.push(FLAT_I32);
         let start = out.len();
-        var cases = alloc.List(u32).init(c.a);
-        cases_of(c, t, out: &mut cases);
+        var cases = alloc.List(u32).init(a);
+        cases_in(types, t: t, out: &mut cases);
         for case in cases.items() {
             if case.* == NONE {
                 continue;
             }
-            var flat = alloc.List(u8).init(c.a);
-            flatten(c, case.*, out: &mut flat);
+            var flat = alloc.List(u8).init(a);
+            flatten_in(types, t: case.*, out: &mut flat, a: a);
             var i: usize = 0;
             while i < flat.len() : (i += 1) {
                 if start + i < out.len() {
@@ -395,9 +396,13 @@ fn flatten(c: &Component, t: u32, out: &mut alloc.List(u8)) {
     }
 }
 
+fn flatten(c: &Component, t: u32, out: &mut alloc.List(u8)) {
+    flatten_in(&c.types, t: t, out: out, a: c.a);
+}
+
 /// A variant-like type's cases: their payload types, NONE for none.
-fn cases_of(c: &Component, t: u32, out: &mut alloc.List(u32)) {
-    let ty = &c.types.items()[t as usize];
+pub fn cases_in(types: &alloc.List(CType), t: u32, out: &mut alloc.List(u32)) {
+    let ty = &types.items()[t as usize];
     if ty.kind == VARIANT {
         for p in ty.parts.items() {
             out.push(p.*);
@@ -416,11 +421,16 @@ fn cases_of(c: &Component, t: u32, out: &mut alloc.List(u32)) {
     }
 }
 
-fn align_to(x: u64, align: u64) -> u64 {
+fn cases_of(c: &Component, t: u32, out: &mut alloc.List(u32)) {
+    cases_in(&c.types, t: t, out: out);
+}
+
+pub fn align_to(x: u64, align: u64) -> u64 {
     return (x + align - 1) / align * align;
 }
 
-fn discriminant_size(n: usize) -> u64 {
+/// How many bytes a variant's case number takes, for n cases.
+pub fn discriminant_size(n: usize) -> u64 {
     if n <= 256 {
         return 1;
     }
@@ -430,8 +440,9 @@ fn discriminant_size(n: usize) -> u64 {
     return 4;
 }
 
-fn alignment(c: &Component, t: u32) -> u64 {
-    let ty = &c.types.items()[t as usize];
+/// t's alignment in linear memory.
+pub fn align_in(types: &alloc.List(CType), t: u32, a: alloc.Allocator) -> u64 {
+    let ty = &types.items()[t as usize];
     let k = ty.kind;
     if k == BOOL or k == S8 or k == U8 {
         return 1;
@@ -448,7 +459,7 @@ fn alignment(c: &Component, t: u32) -> u64 {
     if k == RECORD or k == TUPLE {
         var al: u64 = 1;
         for p in ty.parts.items() {
-            let x = alignment(c, p.*);
+            let x = align_in(types, t: p.*, a: a);
             if x > al {
                 al = x;
             }
@@ -464,12 +475,12 @@ fn alignment(c: &Component, t: u32) -> u64 {
         }
         return 4;
     }
-    var cases = alloc.List(u32).init(c.a);
-    cases_of(c, t, out: &mut cases);
+    var cases = alloc.List(u32).init(a);
+    cases_in(types, t: t, out: &mut cases);
     var al = discriminant_size(cases.len());
     for case in cases.items() {
         if case.* != NONE {
-            let x = alignment(c, case.*);
+            let x = align_in(types, t: case.*, a: a);
             if x > al {
                 al = x;
             }
@@ -478,8 +489,13 @@ fn alignment(c: &Component, t: u32) -> u64 {
     return al;
 }
 
-fn size_of(c: &Component, t: u32) -> u64 {
-    let ty = &c.types.items()[t as usize];
+fn alignment(c: &Component, t: u32) -> u64 {
+    return align_in(&c.types, t: t, a: c.a);
+}
+
+/// t's size in linear memory.
+pub fn size_in(types: &alloc.List(CType), t: u32, a: alloc.Allocator) -> u64 {
+    let ty = &types.items()[t as usize];
     let k = ty.kind;
     if k == BOOL or k == S8 or k == U8 {
         return 1;
@@ -496,10 +512,10 @@ fn size_of(c: &Component, t: u32) -> u64 {
     if k == RECORD or k == TUPLE {
         var at: u64 = 0;
         for p in ty.parts.items() {
-            at = align_to(x: at, align: alignment(c, p.*));
-            at += size_of(c, p.*);
+            at = align_to(x: at, align: align_in(types, t: p.*, a: a));
+            at += size_in(types, t: p.*, a: a);
         }
-        return align_to(x: at, align: alignment(c, t));
+        return align_to(x: at, align: align_in(types, t: t, a: a));
     }
     if k == FLAGS {
         if ty.count <= 8 {
@@ -510,34 +526,43 @@ fn size_of(c: &Component, t: u32) -> u64 {
         }
         return 4 * ((ty.count as u64 + 31) / 32);
     }
-    let payload = payload_offset(c, t);
-    var cases = alloc.List(u32).init(c.a);
-    cases_of(c, t, out: &mut cases);
+    let payload = payload_in(types, t: t, a: a);
+    var cases = alloc.List(u32).init(a);
+    cases_in(types, t: t, out: &mut cases);
     var most: u64 = 0;
     for case in cases.items() {
         if case.* != NONE {
-            let x = size_of(c, case.*);
+            let x = size_in(types, t: case.*, a: a);
             if x > most {
                 most = x;
             }
         }
     }
-    return align_to(x: payload + most, align: alignment(c, t));
+    return align_to(x: payload + most, align: align_in(types, t: t, a: a));
 }
 
-fn payload_offset(c: &Component, t: u32) -> u64 {
-    var cases = alloc.List(u32).init(c.a);
-    cases_of(c, t, out: &mut cases);
+fn size_of(c: &Component, t: u32) -> u64 {
+    return size_in(&c.types, t: t, a: c.a);
+}
+
+/// Where a variant-like type's payload starts, after its case number.
+pub fn payload_in(types: &alloc.List(CType), t: u32, a: alloc.Allocator) -> u64 {
+    var cases = alloc.List(u32).init(a);
+    cases_in(types, t: t, out: &mut cases);
     var al: u64 = 1;
     for case in cases.items() {
         if case.* != NONE {
-            let x = alignment(c, case.*);
+            let x = align_in(types, t: case.*, a: a);
             if x > al {
                 al = x;
             }
         }
     }
     return align_to(x: discriminant_size(cases.len()), align: al);
+}
+
+fn payload_offset(c: &Component, t: u32) -> u64 {
+    return payload_in(&c.types, t: t, a: c.a);
 }
 
 // ---- lifting: core values to the host's ----------------------------------------------

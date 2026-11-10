@@ -1,0 +1,175 @@
+// test: run
+// spec: wit (Component Model, WIT)
+// stage0: skip
+// wasm: skip
+// stdout: package demo:shapes 0.3.1
+// stdout: interface geometry: 4 types, 4 functions
+// stdout:   area: params 2 flat 4, result flat 1
+// stdout:   label: params 1 flat 3, result flat 3
+// stdout:   both: params 1 flat 3, result flat 1
+// stdout:   none: params 0 flat 0, result none
+// stdout: shape: variant size 12 align 4 payload 4
+// stdout: color: enum size 1 align 1
+// stdout: point: record size 8 align 4
+// stdout: id is u32: true
+// stdout: world app: imports demo:shapes/geometry@0.3.1, exports start (0 params), imports log (1 params)
+// stdout: undefined: type missing of broken is used and not defined
+// stdout: bad: line 1: expected a name, at '{'
+import alloc;
+import std;
+import wasm.component as c;
+import wasm.wit;
+
+/// The package read: its lines, with a doc comment, a comment, a type
+/// used before it is defined and an alias.
+fn shapes(a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str("package demo:shapes@0.3.1;\n");
+    s.push_str("\n");
+    s.push_str("/// Docs are comments.\n");
+    s.push_str("interface geometry {\n");
+    s.push_str("    // shape is used before it is defined, and id is an alias of u32.\n");
+    s.push_str("    area: func(s: shape, scale: f32) -> f32;\n");
+    s.push_str("    label: func(s: shape) -> result<string, color>;\n");
+    s.push_str("    both: func(p: tuple<point, id>) -> bool;\n");
+    s.push_str("    none: func();\n");
+    s.push_str("    variant shape { circle(f32), square(point), empty }\n");
+    s.push_str("    record point { x: s32, y: s32 }\n");
+    s.push_str("    enum color { red, green, blue }\n");
+    s.push_str("    type id = u32;\n");
+    s.push_str("}\n");
+    s.push_str("\n");
+    s.push_str("world app {\n");
+    s.push_str("    import geometry;\n");
+    s.push_str("    import log: func(msg: string);\n");
+    s.push_str("    export start: func();\n");
+    s.push_str("}\n");
+    s.push_str("\n");
+    return s;
+}
+
+fn flat(w: &wit.Wit, t: u32, a: alloc.Allocator) -> usize {
+    var out = alloc.List(u8).init(a);
+    c.flatten_in(&w.types, t: t, out: &mut out, a: a);
+    return out.len();
+}
+
+fn kind_name(k: u8) -> str {
+    if k == c.RECORD {
+        return "record";
+    }
+    if k == c.VARIANT {
+        return "variant";
+    }
+    if k == c.ENUM {
+        return "enum";
+    }
+    return "other";
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let out = &mut sys.stdout;
+    var why = alloc.String.init(a);
+    let text = shapes(a);
+    let w = match wit.parse(text.view(), why: &mut why, a: a) {
+        some(x) => { x }
+        none => {
+            out.write(why.view());
+            out.write("\n");
+            return;
+        }
+    };
+    out.write("package ");
+    out.write(w.package.view());
+    out.write(" ");
+    out.write(w.version.view());
+    out.write("\n");
+    let g = &w.interfaces.items()[0];
+    out.write("interface ");
+    out.write(g.name.view());
+    out.write(": ");
+    out.write_u64(g.types.len() as u64);
+    out.write(" types, ");
+    out.write_u64(g.funcs.len() as u64);
+    out.write(" functions\n");
+    for f in g.funcs.items() {
+        let ft = &w.types.items()[f.ty as usize];
+        var flat_params: usize = 0;
+        var k: u32 = 0;
+        while k < ft.count : (k += 1) {
+            flat_params += flat(&w, t: ft.parts.items()[k as usize], a: a);
+        }
+        out.write("  ");
+        out.write(f.name.view());
+        out.write(": params ");
+        out.write_u64(ft.count as u64);
+        out.write(" flat ");
+        out.write_u64(flat_params as u64);
+        let r = ft.parts.items()[ft.count as usize];
+        if r == c.NONE {
+            out.write(", result none\n");
+        } else {
+            out.write(", result flat ");
+            out.write_u64(flat(&w, t: r, a: a) as u64);
+            out.write("\n");
+        }
+    }
+    for d in g.types.items() {
+        if wit.is_alias(&w, t: d.ty) {
+            out.write(d.name.view());
+            out.write(" is u32: ");
+            if wit.real(&w, t: d.ty) == (0x7F - c.U32) as u32 {
+                out.write("true\n");
+            } else {
+                out.write("false\n");
+            }
+            continue;
+        }
+        let t = &w.types.items()[d.ty as usize];
+        out.write(d.name.view());
+        out.write(": ");
+        out.write(kind_name(t.kind));
+        out.write(" size ");
+        out.write_u64(c.size_in(&w.types, t: d.ty, a: a));
+        out.write(" align ");
+        out.write_u64(c.align_in(&w.types, t: d.ty, a: a));
+        if t.kind == c.VARIANT {
+            out.write(" payload ");
+            out.write_u64(c.payload_in(&w.types, t: d.ty, a: a));
+        }
+        out.write("\n");
+    }
+    let wi = wit.world_named(&w, name: "app");
+    let world = &w.worlds.items()[wi as usize];
+    out.write("world app: imports ");
+    out.write(wit.interface_id(&w, i: world.imports.items()[0], a: a).view());
+    out.write(", exports ");
+    out.write(world.export_funcs.items()[0].name.view());
+    out.write(" (");
+    out.write_u64(w.types.items()[world.export_funcs.items()[0].ty as usize].count as u64);
+    out.write(" params), imports ");
+    out.write(world.import_funcs.items()[0].name.view());
+    out.write(" (");
+    out.write_u64(w.types.items()[world.import_funcs.items()[0].ty as usize].count as u64);
+    out.write(" params)\n");
+    // What cannot be read says where.
+    var why2 = alloc.String.init(a);
+    match wit.parse("interface broken {\n    f: func(x: missing);\n}\n", why: &mut why2, a: a) {
+        some(_) => { out.write("undefined: read\n"); }
+        none => {
+            out.write("undefined: ");
+            out.write(why2.view());
+            out.write("\n");
+        }
+    }
+    var why3 = alloc.String.init(a);
+    match wit.parse("interface {", why: &mut why3, a: a) {
+        some(_) => { out.write("bad: read\n"); }
+        none => {
+            out.write("bad: ");
+            out.write(why3.view());
+            out.write("\n");
+        }
+    }
+}
