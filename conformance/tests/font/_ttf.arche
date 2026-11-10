@@ -8,7 +8,8 @@
 //   4 B        a composite: L moved right, and O at half size
 //   5 space    no outline
 // cmap: format 4 for ' ', 'A'-'B' (by glyph array), 'D', 'L', 'O', and,
-// when asked, format 12 too, which also maps U+1F600 to O.
+// when asked, format 12 too, which also maps U+1F600 to O. kern: L then O
+// 100 units closer.
 import alloc;
 
 type P = struct {
@@ -293,6 +294,19 @@ pub fn build(wide: bool, a: alloc.Allocator) -> alloc.List(u8) {
         put32(&mut cmap, v: 12);
         append(&mut cmap, from: &f4);
     }
+    var kern = alloc.List(u8).init(a);
+    put16(&mut kern, v: 0);
+    put16(&mut kern, v: 1);
+    put16(&mut kern, v: 0);
+    put16(&mut kern, v: 6 + 8 + 6);
+    put16(&mut kern, v: 1);
+    put16(&mut kern, v: 1);
+    put16(&mut kern, v: 6);
+    put16(&mut kern, v: 0);
+    put16(&mut kern, v: 0);
+    put16(&mut kern, v: 2);
+    put16(&mut kern, v: 1);
+    put16(&mut kern, v: (-100) & 0xFFFF);
     // The table directory, then the tables, each on 4 bytes.
     var tables = alloc.List(alloc.List(u8)).init(a);
     tables.push(cmap);
@@ -300,16 +314,17 @@ pub fn build(wide: bool, a: alloc.Allocator) -> alloc.List(u8) {
     tables.push(head);
     tables.push(hhea);
     tables.push(hmtx);
+    tables.push(kern);
     tables.push(loca);
     tables.push(maxp);
-    let tags = "cmapglyfheadhheahmtxlocamaxp".bytes();
+    let tags = "cmapglyfheadhheahmtxkernlocamaxp".bytes();
     var out = alloc.List(u8).init(a);
     put32(&mut out, v: 0x00010000);
-    put16(&mut out, v: 7);
-    put16(&mut out, v: 64);
-    put16(&mut out, v: 2);
-    put16(&mut out, v: 48);
-    var at: usize = 12 + 7 * 16;
+    put16(&mut out, v: 8);
+    put16(&mut out, v: 128);
+    put16(&mut out, v: 3);
+    put16(&mut out, v: 0);
+    var at: usize = 12 + 8 * 16;
     var i: usize = 0;
     for t in tables.items() {
         var k: usize = 0;

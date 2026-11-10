@@ -5,7 +5,8 @@
 // stdout: format 4: 5 2 4 3 2 1 0 0
 // stdout: format 12: 5 0 0 3 2 1 0 1
 // stdout: advances: 500 600 550 650 1200 250
-// stdout: width of "LOD B" at 20: 65
+// stdout: kerning L O: -100, O L: 0
+// stdout: width of "LOD B" at 20: 63
 // stdout: glyph 0: 8x12 at 0,-12
 // stdout: | ...... |
 // stdout: |.#++++#.|
@@ -70,22 +71,22 @@
 // stdout: |:%@%-      #%++++-|
 // stdout: | .=:       #@@@@@+|
 // stdout: glyph 5: 0x0 at 0,0
-// stdout: text ends at 47, image 9933568380524242532
+// stdout: text ends at 45, image 8371321013954429200
 // stdout: |                                                                |
 // stdout: |                                                                |
 // stdout: |                                                                |
 // stdout: |                                                                |
 // stdout: |                                                                |
-// stdout: |  =+              =##*+.               .#.                      |
-// stdout: |  +#       -+*=   +@@@@%-              .@.                      |
-// stdout: |  +#      +@@@@%. +@@@@@%              .@.                      |
-// stdout: |  +#     :@@@@@@* +@@@@@@:             .@.                      |
-// stdout: |  +#     +@@@@@@% +@@@@@@-             .@.                      |
-// stdout: |  +#     +@@@@@@% +@@@@@@-     .:      .@.                      |
-// stdout: |  +#     -@@@@@@* +@@@@@@:    :%@*     .@.                      |
-// stdout: |  +#      #@@@@%: +@@@@@%     +@@@.    .@.                      |
-// stdout: |  +#----   =#%*.  +@@@@@=     -@@#     .@=---.                  |
-// stdout: |  +@@@@@          +@@%#-       -=.     .@@@@@-                  |
+// stdout: |  =+             =##*+.              .#.                        |
+// stdout: |  +#     -+*=    +@@@@%-             .@.                        |
+// stdout: |  +#    +@@@@%.  +@@@@@%             .@.                        |
+// stdout: |  +#   :@@@@@@*  +@@@@@@:            .@.                        |
+// stdout: |  +#   +@@@@@@%  +@@@@@@-            .@.                        |
+// stdout: |  +#   +@@@@@@%  +@@@@@@-    .:      .@.                        |
+// stdout: |  +#   -@@@@@@*  +@@@@@@:   :%@*     .@.                        |
+// stdout: |  +#    #@@@@%:  +@@@@@%    +@@@.    .@.                        |
+// stdout: |  +#---- =#%*.   +@@@@@=    -@@#     .@=---.                    |
+// stdout: |  +@@@@@         +@@%#-      -=.     .@@@@@-                    |
 // stdout: |                                                                |
 // stdout: |                                                                |
 // stdout: |                                                                |
@@ -153,6 +154,10 @@ fn main(sys: &mut std.System) -> !void {
         out.write(" ");
         out.write_u64(font.advance(&f, g: g) as u64);
     }
+    out.write("\nkerning L O: ");
+    out.write_i64(font.kerning(&f, left: 2, right: 1) as i64);
+    out.write(", O L: ");
+    out.write_i64(font.kerning(&f, left: 1, right: 2) as i64);
     out.write("\nwidth of \"LOD B\" at 20: ");
     out.write_u64(font.width_of(&f, text: "LOD B", size: 20) as u64);
     out.write("\n");

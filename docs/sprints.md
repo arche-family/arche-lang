@@ -2,9 +2,9 @@
 
 > 2026-11-10 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S35.
+**Joriy sprint:** S38.
 
-**Yopilgan:** S0–S34 va S36. Til yakuniy qabuldan o'tdi (S34).
+**Yopilgan:** S0–S36. Til yakuniy qabuldan o'tdi (S34).
 
 - Compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da; full-Arche paketlarida generics (monomorphization), comptime interpreter, interface'lar (`impl`, `where`, `&dyn`), `for`, closure'lar (`&dyn fn(P) -> R`), `region` (arena, E0901), `unsafe` va raw pointer'lar, `if`/`match` ifoda sifatida, labeled loop'lar, `f32`/`f64`, `requires`/`ensures`, `nopanic` va error return trace ishlaydi.
 - Manifest (`package.arche`) o'qiladi: `needs` (E0801), `strict_unsafe` (E0920), `panic_handler`, xato manifest E0802/E0803.
@@ -483,6 +483,11 @@ Bajarildi (qisman):
 - `lib/font.arche` (`font` root): TrueType o'qiladi (cmap 4 va 12, glyf'ning oddiy va composite glyph'lari, hmtx), rasterizer faqat butun sonlar bilan ishlaydi. Har piksel qatoriga 16 ta namuna qatori olinadi, har birining qamrovi gorizontal bo'yicha aniq hisoblanadi; to'ldirish qoidasi non-zero winding. Glyph cache va satr chizish ham bor. Testlar: `conformance/tests/font` o'z ichida yasalgan kichik shrift bilan ASCII-art golden'lar beradi, ular har target'da (x86-64, aarch64, riscv64, wasm32, own backend) bir xil chiqishi kerak; buzilgan shrift panic bermaydi. `interop/font.sh` DejaVu Sans'ning 6253 glyph'ining hammasini xatosiz chizadi va lotin hamda kirill namunasining hash'ini tekshiradi; CI buni aarch64 va riscv64'da ham bajaradi. `fuzz/font.sh`: 2 daqiqada 59004 holat, panic yo'q. Kerning (kern, GPOS) va hinting hali yo'q.
 - `lib/image/png.arche` (`image` root): barcha rang turlari va bit chuqurliklari, palitra va tRNS, beshala filtr, Adam7. CRC va Adler-32 tekshiriladi. PngSuite'ning 161 ta yaxshi rasmi kutilgan pikselga mos keladi (Pillow bilan solishtirildi; tbbn0g04'da Pillow xato qiladi, spec bo'yicha 464 shaffof piksel), 14 ta buzilgani rad etiladi. `fuzz/png.sh` chunk CRC'larini qayta hisoblab fuzz qiladi: 90 soniyada 6,3 mln holat, panic yo'q.
 - `lib/dbus.arche` (`dbus` root): Unix socket ustida (`std`'ga `Fs.connect_unix` qo'shildi), EXTERNAL autentifikatsiya, Hello, method call, javob, xato va signal'lar ikki tomonga; Writer va Reader har qiymatni signaturaga qarab yozadi va o'qiydi, `skip` istalgan to'liq turdan o'tib ketadi; ikkala bayt tartibi o'qiladi. `conformance/tests/dbus` xabarni xotirada yozib-o'qiydi (big-endian xabar ham). `interop/dbus.sh` o'z `dbus-daemon`ida ikki Arche ulanishini (nom, chaqiruv va javob, signal, ListNames, ServiceUnknown), `dbus-send`dan Arche servisiga chaqiruvni tekshiradi va tizim bus'idagi ModemManager'dan modem ro'yxatini oladi (bu mashinada 0, `busctl` ham shuni ko'rsatadi). `fuzz/dbus.sh`: 90 soniyada 59 mln holat, panic yo'q.
+- `std`'ga Linux qurilmalari qo'shildi: `Fs.open_device` va `std.Device` (o'qish, kutish, ioctl va mmap; oxirgi ikkisi `unsafe`, chunki ular driver'ning strukturalariga bog'liq). Ularning ustida: `std.drm` (birinchi ulangan connector, uning afzal mode'i, 32 bitlik dumb buffer, SETCRTC va DIRTYFB), `std.evdev` (qurilma nomi, absolut o'q oralig'i, hodisalar) va `std.init` (PID 1: mount, bola process'larni yig'ish, o'chirish). `interop/linux/kernel.sh` mainline Linux 6.12.116'ni kernel.org'dan oladi (sha256 tekshiriladi) va `phone.config` bilan build qiladi: hamma narsa kernel ichida, modulsiz; build 1 daqiqa. `interop/linux/run.sh` uni QEMU x86-64'da 720x1440 virtio-gpu, virtio tablet va klaviatura bilan yurgizadi. Arche'dagi `init` PID 1 bo'lib /proc, /sys, /dev'ni mount qiladi, `lib/font` bilan matnni DRM orqali ekranga chizadi (QEMU screendump golden hash bilan tekshiriladi), QMP yuborgan bosishni (360,720 nuqtada) va `a` tugmasini evdev orqali oladi, keyin mashinani o'chiradi.
+
+Shrift `kern` jadvalining juftlari bo'yicha kerning ham qiladi (DejaVu'da bor); test shriftiga ham kern jadvali qo'shildi.
+
+S35 yopildi. Hali yo'q, kerak bo'lganda qo'shiladigan narsalar: GPOS kerning va hinting; D-Bus orqali Unix file descriptor uzatish (PipeWire, T5); `std.drm`da page flip (UI server, T2).
 
 **Qabul:** shrift golden image testlari har platformada bit-identical. PNG decoder PngSuite'dan o'tadi. D-Bus client `dbus-daemon` bilan interop qiladi va ModemManager'dan modem ro'yxatini oladi. QEMU x86-64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi (aarch64'da S39'da).
 

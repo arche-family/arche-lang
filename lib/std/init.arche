@@ -1,0 +1,63 @@
+/// What the first process does on Linux, PID 1 (docs/sprints.md S35): it
+/// mounts the file systems the others need, gathers every child that
+/// ends, its own or one whose parent died, and powers the machine off.
+/// Each takes the capability it needs.
+import std;
+import std.linux;
+
+pub type InitError = error {
+    /// The kernel refused: not PID 1, not allowed, or no such thing.
+    Refused,
+}
+
+/// Mounts the file system of kind (proc, sysfs, devtmpfs, tmpfs...) from
+/// source at target, a directory reached through fs.
+pub fn mount(fs: &std.Fs, source: str, target: str, kind: str) -> InitError!void {
+    var src: [256]u8 = [0; 256];
+    var dst: [4096]u8 = [0; 4096];
+    var typ: [64]u8 = [0; 64];
+    if not linux.c_path(source, src[0..256]) or not linux.c_path(target, dst[0..4096]) or not linux.c_path(kind, typ[0..64]) {
+        return InitError.Refused;
+    }
+    _ = fs;
+    var r: i64 = 0;
+    unsafe {
+        // SAFETY: three NUL-terminated strings; no flags, no data.
+        r = linux.syscall(linux.MOUNT, [linux.arg(u8, &src[0] as *u8), linux.arg(u8, &dst[0] as *u8), linux.arg(u8, &typ[0] as *u8), 0, 0, 0]);
+    }
+    if linux.errno(r) != 0 {
+        return InitError.Refused;
+    }
+}
+
+/// A child that ended: its process id, and its status as wait4 says it.
+pub type Ended = struct {
+    pub pid: u32,
+    pub status: u32,
+}
+
+/// A child that has ended, gathered; none when none has. It does not
+/// wait.
+pub fn reap(proc: &std.Proc) -> ?Ended {
+    _ = proc;
+    var status: i32 = 0;
+    var r: i64 = 0;
+    unsafe {
+        // SAFETY: any child (-1), its status into status, WNOHANG.
+        r = linux.syscall(linux.WAIT4, [-1, linux.arg(i32, &status as *i32), 1, 0, 0, 0]);
+    }
+    if r <= 0 {
+        return none;
+    }
+    return Ended { pid: r as u32, status: status as% u32 };
+}
+
+/// The machine powers off. As PID 1 only; else it returns.
+pub fn power_off(proc: &std.Proc) {
+    _ = proc;
+    unsafe {
+        // SAFETY: the magic numbers reboot(2) wants, and
+        // LINUX_REBOOT_CMD_POWER_OFF.
+        _ = linux.syscall(linux.REBOOT, [0xfee1dead, 0x28121969, 0x4321fedc, 0, 0, 0]);
+    }
+}

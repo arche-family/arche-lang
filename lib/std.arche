@@ -432,6 +432,30 @@ pub type Fs = struct {
         try self.make_dir_with(path, mode: 0x1ED);
     }
 
+    /// The device file at path, open to read and write, or to read alone
+    /// when writing is not allowed: what std.drm and std.evdev reach the
+    /// kernel's drivers through. Reads never wait (Device.wait does).
+    pub fn open_device(self: &Fs, path: str) -> FsError!Device {
+        var buf: [4096]u8 = [0; 4096];
+        if not linux.c_path(path, buf[0..4096]) {
+            return FsError.NotFound;
+        }
+        var fd: i64 = 0;
+        unsafe {
+            // SAFETY: the path is NUL-terminated in buf. O_RDWR |
+            // O_NONBLOCK | O_CLOEXEC, then O_RDONLY | O_NONBLOCK |
+            // O_CLOEXEC.
+            fd = linux.file_syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80802, 0, 0, 0]);
+            if linux.errno(fd) == linux.EACCES {
+                fd = linux.file_syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80800, 0, 0, 0]);
+            }
+        }
+        if linux.errno(fd) != 0 {
+            return errno_error(linux.errno(fd));
+        }
+        return Device { fd: fd, unique: core.Unique { } };
+    }
+
     /// As make_dir, but only this user can enter it (0700).
     pub fn make_private_dir(self: &Fs, path: str) -> FsError!void {
         try self.make_dir_with(path, mode: 0x1C0);
@@ -1335,6 +1359,86 @@ pub type Listener = struct {
     pub fn close(self: &mut Listener) {
         unsafe {
             // SAFETY: fd is this listener's.
+            _ = linux.syscall(linux.CLOSE, [self.fd, 0, 0, 0, 0, 0]);
+        }
+        self.fd = -1;
+    }
+}
+
+/// A device file (Fs.open_device): bytes to read, as an input device
+/// gives its events, and the driver's own requests, ioctl and mmap, which
+/// only code that knows the driver's structures can make, so they are
+/// unsafe.
+pub type Device = struct {
+    fd: i64,
+    unique: core.Unique,
+
+    /// What came, up to into.len() bytes; 0 when nothing has.
+    pub fn read(self: &mut Device, into: []mut u8) -> IoError!usize {
+        var r: i64 = -linux.EINTR;
+        while linux.errno(r) == linux.EINTR {
+            unsafe {
+                // SAFETY: read writes at most into.len() bytes.
+                r = linux.syscall(linux.READ, [self.fd, linux.arg(u8, mem.slice_data(u8, into) as *u8), into.len() as i64, 0, 0, 0]);
+            }
+        }
+        if linux.errno(r) == linux.EAGAIN {
+            return 0;
+        }
+        if linux.errno(r) != 0 {
+            return IoError.IoFailed;
+        }
+        return r as usize;
+    }
+
+    /// Waits up to timeout_ms milliseconds for something to read: whether
+    /// it came.
+    pub fn wait(self: &Device, timeout_ms: u32) -> bool {
+        // struct pollfd: the descriptor, then POLLIN in the events' low
+        // byte.
+        let fd = self.fd as u64;
+        var fds: [8]u8 = [(fd & 0xFF) as u8, ((fd >> 8) & 0xFF) as u8, ((fd >> 16) & 0xFF) as u8, ((fd >> 24) & 0xFF) as u8, 1, 0, 0, 0];
+        var r: i64 = -linux.EINTR;
+        while linux.errno(r) == linux.EINTR {
+            unsafe {
+                // SAFETY: poll reads one pollfd and writes its revents.
+                r = linux.poll(fds: linux.arg(u8, &fds[0] as *u8), count: 1, timeout_ms: timeout_ms as i64);
+            }
+        }
+        return r > 0;
+    }
+
+    /// The driver's request with its argument, as ioctl(2) makes it: the
+    /// kernel's answer, a negative errno when it failed. Unsafe: arg is
+    /// what the request reads and writes, as the driver lays it out.
+    pub unsafe fn ioctl(self: &Device, request: u64, arg: u64) -> i64 {
+        var r: i64 = -linux.EINTR;
+        while linux.errno(r) == linux.EINTR or linux.errno(r) == linux.EAGAIN {
+            r = linux.syscall(linux.IOCTL, [self.fd, request as% i64, arg as% i64, 0, 0, 0]);
+        }
+        return r;
+    }
+
+    /// len bytes of the device at offset, mapped to read and write, shared
+    /// with it: their address; none when the driver refuses. Unsafe: the
+    /// caller keeps to the mapping, and unmaps it.
+    pub unsafe fn map(self: &Device, len: u64, offset: u64) -> ?u64 {
+        // PROT_READ | PROT_WRITE, MAP_SHARED.
+        let r = linux.syscall(linux.MMAP, [0, len as i64, 3, 1, self.fd, offset as i64]);
+        if linux.errno(r) != 0 {
+            return none;
+        }
+        return r as% u64;
+    }
+
+    /// A mapping map made goes. Unsafe: nothing uses it from now on.
+    pub unsafe fn unmap(self: &Device, address: u64, len: u64) {
+        _ = linux.syscall(linux.MUNMAP, [address as% i64, len as i64, 0, 0, 0, 0]);
+    }
+
+    pub fn close(self: &mut Device) {
+        unsafe {
+            // SAFETY: fd is this device's.
             _ = linux.syscall(linux.CLOSE, [self.fd, 0, 0, 0, 0, 0]);
         }
         self.fd = -1;

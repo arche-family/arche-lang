@@ -1,0 +1,262 @@
+/// A screen through Linux's DRM/KMS (docs/sprints.md S35): the first
+/// connected connector, its preferred mode, and a dumb buffer, 32 bits a
+/// pixel (XRGB8888), mapped for the program to draw into and shown on that
+/// connector; flush tells the driver what changed, which a virtual GPU
+/// needs to copy it to the host. The program must be DRM master, as the
+/// only one that opened the device is: what the phone's UI server is.
+import alloc;
+import core.mem;
+import core.ptr;
+import std;
+
+pub type DrmError = error {
+    /// No device there, or it cannot be opened.
+    NoDevice,
+    /// No connector has a screen.
+    NoScreen,
+    /// The driver refused a request.
+    Refused,
+}
+
+/// A screen being drawn on.
+pub type Screen = struct {
+    device: std.Device,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes a row of pixels takes.
+    pub pitch: u32,
+    fb: u32,
+    crtc: u32,
+    connector: u32,
+    handle: u32,
+    size: u64,
+    address: u64,
+}
+
+// The requests, as asm-generic's _IOWR('d', nr, size) makes them; the
+// same on every Linux processor.
+const GET_RESOURCES: u64 = 0xC04064A0;
+const GET_CONNECTOR: u64 = 0xC05064A7;
+const GET_ENCODER: u64 = 0xC01464A6;
+const SET_CRTC: u64 = 0xC06864A2;
+const ADD_FB: u64 = 0xC01C64AE;
+const DIRTY_FB: u64 = 0xC01864B1;
+const CREATE_DUMB: u64 = 0xC02064B2;
+const MAP_DUMB: u64 = 0xC01064B3;
+const RM_FB: u64 = 0xC00464AF;
+const DESTROY_DUMB: u64 = 0xC00464B4;
+
+/// The size of struct drm_mode_modeinfo.
+const MODE: usize = 68;
+
+fn get32(b: []u8, at: usize) -> u32 {
+    return (b[at] as u32) | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24);
+}
+
+fn get16(b: []u8, at: usize) -> u32 {
+    return (b[at] as u32) | ((b[at + 1] as u32) << 8);
+}
+
+fn put32(b: []mut u8, at: usize, v: u32) {
+    b[at] = (v & 0xFF) as u8;
+    b[at + 1] = ((v >> 8) & 0xFF) as u8;
+    b[at + 2] = ((v >> 16) & 0xFF) as u8;
+    b[at + 3] = (v >> 24) as u8;
+}
+
+fn put64(b: []mut u8, at: usize, v: u64) {
+    put32(b, at: at, v: (v & 0xFFFFFFFF) as u32);
+    put32(b, at: at + 4, v: (v >> 32) as u32);
+}
+
+/// The request with the bytes of its structure: whether the driver did it.
+fn request(d: &std.Device, code: u64, arg: []mut u8) -> bool {
+    unsafe {
+        // SAFETY: arg holds the whole structure the request reads and
+        // writes, as its size in code says.
+        return d.ioctl(request: code, arg: mem.slice_data(u8, arg).addr() as u64) >= 0;
+    }
+}
+
+fn address_of(b: []mut u8) -> u64 {
+    unsafe {
+        // SAFETY: only the address is taken; the bytes live for the request.
+        return mem.slice_data(u8, b).addr() as u64;
+    }
+}
+
+/// The screen of the card at path, through fs, in the mode its first
+/// connected connector prefers.
+pub fn open(fs: &std.Fs, path: str, a: alloc.Allocator) -> DrmError!Screen {
+    var device = fs.open_device(path) catch return DrmError.NoDevice;
+    // The card's CRTCs and connectors: first how many, then their ids.
+    var res: [64]u8 = [0; 64];
+    if not request(&device, code: GET_RESOURCES, arg: res[0..64]) {
+        return DrmError.NoDevice;
+    }
+    let crtcs = get32(res[0..64], at: 36);
+    let connectors = get32(res[0..64], at: 40);
+    if crtcs == 0 or connectors == 0 or crtcs > 64 or connectors > 64 {
+        return DrmError.NoScreen;
+    }
+    var crtc_ids = alloc.List(u8).init(a);
+    crtc_ids.grow_zeroed((crtcs as usize) * 4);
+    var connector_ids = alloc.List(u8).init(a);
+    connector_ids.grow_zeroed((connectors as usize) * 4);
+    var res2: [64]u8 = [0; 64];
+    put64(res2[0..64], at: 8, v: address_of(crtc_ids.items_mut()));
+    put64(res2[0..64], at: 16, v: address_of(connector_ids.items_mut()));
+    put32(res2[0..64], at: 36, v: crtcs);
+    put32(res2[0..64], at: 40, v: connectors);
+    if not request(&device, code: GET_RESOURCES, arg: res2[0..64]) {
+        return DrmError.NoDevice;
+    }
+    // The first connector that is connected and has a mode.
+    var mode: [68]u8 = [0; 68];
+    var connector: u32 = 0;
+    var encoder: u32 = 0;
+    var k: usize = 0;
+    while k < connectors as usize and connector == 0 : (k += 1) {
+        let id = get32(connector_ids.items(), at: k * 4);
+        var c: [80]u8 = [0; 80];
+        put32(c[0..80], at: 48, v: id);
+        if not request(&device, code: GET_CONNECTOR, arg: c[0..80]) {
+            continue;
+        }
+        let modes = get32(c[0..80], at: 32);
+        let connected = get32(c[0..80], at: 60) == 1;
+        if not connected or modes == 0 or modes > 256 {
+            continue;
+        }
+        // Again, with room for the modes; the encoders and properties are
+        // not asked for.
+        var mode_list = alloc.List(u8).init(a);
+        mode_list.grow_zeroed((modes as usize) * MODE);
+        var c2: [80]u8 = [0; 80];
+        put64(c2[0..80], at: 8, v: address_of(mode_list.items_mut()));
+        put32(c2[0..80], at: 32, v: modes);
+        put32(c2[0..80], at: 48, v: id);
+        if not request(&device, code: GET_CONNECTOR, arg: c2[0..80]) {
+            continue;
+        }
+        let got = get32(c2[0..80], at: 32);
+        if got == 0 or got > modes {
+            continue;
+        }
+        // The preferred mode (DRM_MODE_TYPE_PREFERRED), else the first.
+        let ms = mode_list.items();
+        var pick: usize = 0;
+        var m: usize = 0;
+        while m < got as usize : (m += 1) {
+            if (get32(ms, at: m * MODE + 32) & 8) != 0 {
+                pick = m;
+                break;
+            }
+        }
+        var i: usize = 0;
+        while i < MODE : (i += 1) {
+            mode[i] = ms[pick * MODE + i];
+        }
+        connector = id;
+        encoder = get32(c2[0..80], at: 44);
+    }
+    if connector == 0 {
+        return DrmError.NoScreen;
+    }
+    // The CRTC: the encoder's, else the first.
+    var crtc = get32(crtc_ids.items(), at: 0);
+    if encoder != 0 {
+        var e: [20]u8 = [0; 20];
+        put32(e[0..20], at: 0, v: encoder);
+        if request(&device, code: GET_ENCODER, arg: e[0..20]) and get32(e[0..20], at: 8) != 0 {
+            crtc = get32(e[0..20], at: 8);
+        }
+    }
+    let width = get16(mode[0..68], at: 4);
+    let height = get16(mode[0..68], at: 14);
+    // A dumb buffer of the mode's size, 32 bits a pixel.
+    var dumb: [32]u8 = [0; 32];
+    put32(dumb[0..32], at: 0, v: height);
+    put32(dumb[0..32], at: 4, v: width);
+    put32(dumb[0..32], at: 8, v: 32);
+    if not request(&device, code: CREATE_DUMB, arg: dumb[0..32]) {
+        return DrmError.Refused;
+    }
+    let handle = get32(dumb[0..32], at: 16);
+    let pitch = get32(dumb[0..32], at: 20);
+    let size = (get32(dumb[0..32], at: 24) as u64) | ((get32(dumb[0..32], at: 28) as u64) << 32);
+    var fb: [28]u8 = [0; 28];
+    put32(fb[0..28], at: 4, v: width);
+    put32(fb[0..28], at: 8, v: height);
+    put32(fb[0..28], at: 12, v: pitch);
+    put32(fb[0..28], at: 16, v: 32);
+    put32(fb[0..28], at: 20, v: 24);
+    put32(fb[0..28], at: 24, v: handle);
+    if not request(&device, code: ADD_FB, arg: fb[0..28]) {
+        return DrmError.Refused;
+    }
+    let fb_id = get32(fb[0..28], at: 0);
+    var map: [16]u8 = [0; 16];
+    put32(map[0..16], at: 0, v: handle);
+    if not request(&device, code: MAP_DUMB, arg: map[0..16]) {
+        return DrmError.Refused;
+    }
+    let offset = (get32(map[0..16], at: 8) as u64) | ((get32(map[0..16], at: 12) as u64) << 32);
+    var address: u64 = 0;
+    unsafe {
+        // SAFETY: the dumb buffer's size, at the offset its map gave.
+        address = device.map(len: size, offset: offset) orelse 0;
+    }
+    if address == 0 {
+        return DrmError.Refused;
+    }
+    // Shown on the connector.
+    var ids: [4]u8 = [0; 4];
+    put32(ids[0..4], at: 0, v: connector);
+    var set: [104]u8 = [0; 104];
+    put64(set[0..104], at: 0, v: address_of(ids[0..4]));
+    put32(set[0..104], at: 8, v: 1);
+    put32(set[0..104], at: 12, v: crtc);
+    put32(set[0..104], at: 16, v: fb_id);
+    put32(set[0..104], at: 32, v: 1);
+    var i: usize = 0;
+    while i < MODE : (i += 1) {
+        set[36 + i] = mode[i];
+    }
+    if not request(&device, code: SET_CRTC, arg: set[0..104]) {
+        return DrmError.Refused;
+    }
+    return Screen { device: device, width: width, height: height, pitch: pitch, fb: fb_id, crtc: crtc, connector: connector, handle: handle, size: size, address: address };
+}
+
+/// The screen's pixels, row by row, pitch / 4 to a row: 0x00RRGGBB.
+pub fn pixels(s: &mut Screen) -> []mut u32 {
+    unsafe {
+        // SAFETY: the dumb buffer stays mapped while the screen is open,
+        // and only through this view, which s's borrow bounds.
+        return mem.slice_mut(u32, ptr.from_addr(u32, s.address as usize), (s.size / 4) as usize);
+    }
+}
+
+/// The driver copies what was drawn to the screen.
+pub fn flush(s: &Screen) -> DrmError!void {
+    var dirty: [24]u8 = [0; 24];
+    put32(dirty[0..24], at: 0, v: s.fb);
+    if not request(&s.device, code: DIRTY_FB, arg: dirty[0..24]) {
+        return DrmError.Refused;
+    }
+}
+
+pub fn close(s: &mut Screen) {
+    unsafe {
+        // SAFETY: nothing draws into the buffer from now on.
+        s.device.unmap(address: s.address, len: s.size);
+    }
+    var fb: [4]u8 = [0; 4];
+    put32(fb[0..4], at: 0, v: s.fb);
+    _ = request(&s.device, code: RM_FB, arg: fb[0..4]);
+    var dumb: [4]u8 = [0; 4];
+    put32(dumb[0..4], at: 0, v: s.handle);
+    _ = request(&s.device, code: DESTROY_DUMB, arg: dumb[0..4]);
+    s.device.close();
+}

@@ -1,0 +1,176 @@
+/// An Arche program as Linux's first process (docs/sprints.md S35;
+/// interop/linux/run.sh): it mounts /proc, /sys and /dev, draws text on
+/// the screen through DRM with lib/font, then says on the serial console
+/// what the input devices report, a touch and a key, and powers off.
+import alloc;
+import font;
+import std;
+import std.drm;
+import std.evdev;
+import std.init;
+
+fn log(out: &mut std.Output, text: str) {
+    out.write("init: ");
+    out.write(text);
+    out.write("\n");
+    out.flush();
+}
+
+/// Text drawn into pixels, white on the background, through lib/font's
+/// coverage.
+fn paint(c: &font.Canvas, pixels: []mut u32, stride: u32, background: u32) {
+    var y: u32 = 0;
+    while y < c.height : (y += 1) {
+        var x: u32 = 0;
+        while x < c.width : (x += 1) {
+            let v = c.alpha.items()[(y * c.width + x) as usize] as u32;
+            let r = ((background >> 16) & 0xFF) * (255 - v) / 255 + v;
+            let g = ((background >> 8) & 0xFF) * (255 - v) / 255 + v;
+            let b = (background & 0xFF) * (255 - v) / 255 + v;
+            pixels[(y * stride + x) as usize] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+fn mount_or_say(fs: &std.Fs, out: &mut std.Output, source: str, target: str, kind: str) {
+    match init.mount(fs, source: source, target: target, kind: kind) {
+        ok(_) => { }
+        err(_) => {
+            out.write("init: could not mount ");
+            out.write(target);
+            out.write("\n");
+        }
+    }
+}
+
+/// Says why it stops, and powers off.
+fn stop(out: &mut std.Output, proc: &std.Proc, why: str) -> !void {
+    log(out, text: why);
+    init.power_off(proc);
+}
+
+fn number(out: &mut std.Output, v: i64) {
+    out.write_i64(v);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let out = &mut sys.stdout;
+    let a = sys.alloc;
+    mount_or_say(&sys.fs, out: out, source: "proc", target: "/proc", kind: "proc");
+    mount_or_say(&sys.fs, out: out, source: "sysfs", target: "/sys", kind: "sysfs");
+    mount_or_say(&sys.fs, out: out, source: "devtmpfs", target: "/dev", kind: "devtmpfs");
+    log(out, text: "PID 1, file systems mounted");
+    // The screen.
+    var screen = drm.open(&sys.fs, path: "/dev/dri/card0", a) catch return stop(out, proc: &sys.proc, why: "no screen");
+    out.write("init: a screen of ");
+    number(out, v: screen.width as i64);
+    out.write("x");
+    number(out, v: screen.height as i64);
+    out.write("\n");
+    let bytes = try sys.fs.read_bytes("/font.ttf", a);
+    let f = try font.parse(bytes.items(), a);
+    var cache = font.new_cache(a);
+    var c = font.new_canvas(width: screen.width, height: screen.height, a);
+    _ = try font.draw(&f, cache: &mut cache, text: "Arche", size: 96, x: 40, y: 200, into: &mut c, a);
+    _ = try font.draw(&f, cache: &mut cache, text: "Linux'da birinchi jarayon", size: 32, x: 40, y: 280, into: &mut c, a);
+    _ = try font.draw(&f, cache: &mut cache, text: "Ўзбекистон, 2026", size: 32, x: 40, y: 330, into: &mut c, a);
+    let stride = screen.pitch / 4;
+    paint(&c, pixels: drm.pixels(&mut screen), stride: stride, background: 0x203040);
+    match drm.flush(&screen) {
+        ok(_) => { }
+        err(_) => { log(out, text: "flush refused"); }
+    }
+    log(out, text: "drew the text");
+    // The input devices, by name.
+    var tablet = evdev.open(&sys.fs, path: "/dev/input/event0") catch return stop(out, proc: &sys.proc, why: "no input");
+    var keyboard = evdev.open(&sys.fs, path: "/dev/input/event0") catch return stop(out, proc: &sys.proc, why: "no input");
+    var k: u32 = 0;
+    while k < 8 : (k += 1) {
+        var path = alloc.String.init(a);
+        path.push_str("/dev/input/event");
+        path.push_u64(k as u64);
+        match evdev.open(&sys.fs, path: path.view()) {
+            ok(i) => {
+                var n = alloc.String.from("?", a);
+                match evdev.name(&i, a) {
+                    ok(got) => { n = got; }
+                    err(_) => { }
+                }
+                out.write("init: ");
+                out.write(path.view());
+                out.write(" is ");
+                out.write(n.view());
+                out.write("\n");
+                if n.view().eq("QEMU Virtio Tablet") {
+                    tablet = i;
+                } else if n.view().eq("QEMU Virtio Keyboard") {
+                    keyboard = i;
+                }
+            }
+            err(_) => { }
+        }
+    }
+    var rx = evdev.Range { min: 0, max: 32767 };
+    match evdev.range(&tablet, axis: evdev.ABS_X) {
+        ok(r) => { rx = r; }
+        err(_) => { }
+    }
+    out.write("init: the tablet's x from ");
+    number(out, v: rx.min as i64);
+    out.write(" to ");
+    number(out, v: rx.max as i64);
+    out.write("\n");
+    log(out, text: "waiting for a touch");
+    // A touch: the left button down, where the axes last were.
+    var x: i32 = 0;
+    var y: i32 = 0;
+    var touched = false;
+    var tries: u32 = 0;
+    while not touched and tries < 300 : (tries += 1) {
+        match evdev.next(&mut tablet, timeout_ms: 100) {
+            some(e) => {
+                if e.kind == evdev.ABS and e.code == evdev.ABS_X {
+                    x = e.value;
+                } else if e.kind == evdev.ABS and e.code == evdev.ABS_Y {
+                    y = e.value;
+                } else if e.kind == evdev.KEY and e.code == evdev.BTN_LEFT and e.value == 1 {
+                    touched = true;
+                }
+            }
+            none => { }
+        }
+    }
+    if touched {
+        out.write("init: a touch at ");
+        number(out, v: (x as i64) * (screen.width as i64) / ((rx.max - rx.min + 1) as i64));
+        out.write(",");
+        number(out, v: (y as i64) * (screen.height as i64) / 32768);
+        out.write("\n");
+    } else {
+        log(out, text: "no touch came");
+    }
+    log(out, text: "waiting for a key");
+    var key: u32 = 0;
+    tries = 0;
+    while key == 0 and tries < 300 : (tries += 1) {
+        match evdev.next(&mut keyboard, timeout_ms: 100) {
+            some(e) => {
+                if e.kind == evdev.KEY and e.value == 1 {
+                    key = e.code;
+                }
+            }
+            none => { }
+        }
+    }
+    out.write("init: key ");
+    number(out, v: key as i64);
+    out.write("\n");
+    // Children that ended: none were started, so none.
+    match init.reap(&sys.proc) {
+        some(_) => { log(out, text: "a child ended"); }
+        none => { log(out, text: "no child to gather"); }
+    }
+    drm.close(&mut screen);
+    log(out, text: "powering off");
+    init.power_off(&sys.proc);
+}

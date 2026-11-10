@@ -1,0 +1,127 @@
+/// Input through Linux's evdev (docs/sprints.md S35): a device's name,
+/// its absolute axes' ranges, and its events, as the kernel reports them:
+/// keys, buttons and touches, each with a type, a code and a value, and a
+/// SYN_REPORT after each whole change.
+import alloc;
+import core.mem;
+import std;
+
+pub type InputError = error {
+    /// No device there, or it cannot be opened.
+    NoDevice,
+    /// The driver refused a request.
+    Refused,
+}
+
+/// Event types (linux/input-event-codes.h).
+pub const SYN: u32 = 0;
+pub const KEY: u32 = 1;
+pub const REL: u32 = 2;
+pub const ABS: u32 = 3;
+
+/// Some codes: a whole change reported, the left button and the touch,
+/// and the axes.
+pub const SYN_REPORT: u32 = 0;
+pub const BTN_LEFT: u32 = 0x110;
+pub const BTN_TOUCH: u32 = 0x14A;
+pub const ABS_X: u32 = 0;
+pub const ABS_Y: u32 = 1;
+
+/// One event.
+pub type Event = struct {
+    pub kind: u32,
+    pub code: u32,
+    pub value: i32,
+}
+
+/// An absolute axis's range.
+pub type Range = struct {
+    pub min: i32,
+    pub max: i32,
+}
+
+/// An input device.
+pub type Input = struct {
+    device: std.Device,
+}
+
+/// The input device at path, through fs.
+pub fn open(fs: &std.Fs, path: str) -> InputError!Input {
+    let d = fs.open_device(path) catch return InputError.NoDevice;
+    return Input { device: d };
+}
+
+fn address_of(b: []mut u8) -> u64 {
+    unsafe {
+        // SAFETY: only the address is taken; the bytes live for the request.
+        return mem.slice_data(u8, b).addr() as u64;
+    }
+}
+
+/// The device's name.
+pub fn name(i: &Input, a: alloc.Allocator) -> InputError!alloc.String {
+    var buf: [256]u8 = [0; 256];
+    // EVIOCGNAME(255): _IOC(_IOC_READ, 'E', 0x06, 255).
+    var r: i64 = 0;
+    unsafe {
+        // SAFETY: the driver writes at most 255 bytes.
+        r = i.device.ioctl(request: 0x80FF4506, arg: address_of(buf[0..256]));
+    }
+    if r < 0 {
+        return InputError.Refused;
+    }
+    var n: usize = 0;
+    while n < 255 and buf[n] != 0 {
+        n += 1;
+    }
+    var s = alloc.String.init(a);
+    if not s.push_utf8(buf[0..n]) {
+        s.push_str("?");
+    }
+    return s;
+}
+
+/// The range of absolute axis axis.
+pub fn range(i: &Input, axis: u32) -> InputError!Range {
+    // struct input_absinfo: value, minimum, maximum, fuzz, flat,
+    // resolution; EVIOCGABS(axis) is _IOR('E', 0x40 + axis, 24).
+    var info: [24]u8 = [0; 24];
+    var r: i64 = 0;
+    unsafe {
+        // SAFETY: the driver writes 24 bytes.
+        r = i.device.ioctl(request: 0x80184540 + (axis as u64), arg: address_of(info[0..24]));
+    }
+    if r < 0 {
+        return InputError.Refused;
+    }
+    return Range { min: get_i32(info[0..24], at: 4), max: get_i32(info[0..24], at: 8) };
+}
+
+fn get_i32(b: []u8, at: usize) -> i32 {
+    let v = (b[at] as u32) | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24);
+    return v as% i32;
+}
+
+/// The next event, waiting up to timeout_ms milliseconds for it; none
+/// when none came. struct input_event is 24 bytes on 64-bit Linux: the
+/// time, 16, then the type, the code and the value.
+pub fn next(i: &mut Input, timeout_ms: u32) -> ?Event {
+    var buf: [24]u8 = [0; 24];
+    var got = i.device.read(buf[0..24]) catch return none;
+    if got == 0 {
+        if not i.device.wait(timeout_ms: timeout_ms) {
+            return none;
+        }
+        got = i.device.read(buf[0..24]) catch return none;
+    }
+    if got != 24 {
+        return none;
+    }
+    let kind = (buf[16] as u32) | ((buf[17] as u32) << 8);
+    let code = (buf[18] as u32) | ((buf[19] as u32) << 8);
+    return Event { kind: kind, code: code, value: get_i32(buf[0..24], at: 20) };
+}
+
+pub fn close(i: &mut Input) {
+    i.device.close();
+}

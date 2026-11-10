@@ -11,7 +11,7 @@ mkdir -p "$build"
 "$here/../compiler/arche-build" "$here/font_draw.arche" "$build/font_draw"
 got=$("$build/font_draw" "$here/fonts/DejaVuSans.ttf" "$build/font-sample.pgm")
 want="glyphs 6253, failed 0, coverage 61353865
-image 640x252, hash 4351598282857021976"
+image 640x252, hash 1859232489788877718"
 if [ "$got" != "$want" ]; then
     echo "font: got"
     echo "$got"

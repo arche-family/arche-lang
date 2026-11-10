@@ -204,6 +204,15 @@ jobs:
           ./interop/dbus.sh
       - name: Fuzz lib/dbus
         run: ./fuzz/dbus.sh 60
+      - name: Install what Linux's kernel builds with, and QEMU
+        run: sudo apt-get install -y flex bison libelf-dev bc qemu-system-x86
+      - name: The phone's Linux kernel, kept between runs
+        uses: actions/cache@v4
+        with:
+          path: build/linux/bzImage-*
+          key: linux-${{ hashFiles('interop/linux/kernel.sh', 'interop/linux/phone.config') }}
+      - name: An Arche init as Linux's first process, drawing through DRM, hearing evdev
+        run: ./interop/linux/run.sh
 
   # docs/sprints.md S24, S25: the build driver and the package manager. A
   # build from the cache is bit-identical to a clean one, every conformance
