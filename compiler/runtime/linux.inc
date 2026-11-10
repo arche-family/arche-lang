@@ -28,7 +28,10 @@ enum { ENOENT = 2, EACCES = 13, ENOTDIR = 20, EISDIR = 21, EPERM = 1, EINTR = 4 
 // ---- memory ---------------------------------------------------------------------
 
 static void *os_map(u64 n) {
-    i64 p = sys6(SYS_MMAP, 0, (i64)n, 3 /* read, write */, 0x22 /* private, anonymous */, -1, 0);
+    // MAP_NORESERVE: a reservation larger than the machine's memory, as a
+    // List's with_capacity makes for a WASM memory's whole range, is not
+    // refused for what it may never use; pages count as they are touched.
+    i64 p = sys6(SYS_MMAP, 0, (i64)n, 3 /* read, write */, 0x4022 /* private, anonymous, noreserve */, -1, 0);
     if (p < 0 && p > -4096) {
         return 0;
     }

@@ -54,6 +54,15 @@ pub type Widget = struct {
     pub index: u32,
 }
 
+/// Where a node was laid out: x, y, width, height; width below 0 for
+/// nowhere.
+type Box = struct {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
 /// An element, or a run of text when tag is empty.
 type Node = struct {
     tag: alloc.String,
@@ -100,6 +109,18 @@ pub type Ui = struct {
     nodes: alloc.List(Node),
     events: alloc.List(Event),
     sheets: u32,
+    /// The stylesheets added, by number less one; a removed one is empty.
+    sheet_texts: alloc.List(alloc.String),
+    /// Where the shell laid each node out last: x, y, width, height, in
+    /// logical pixels; a width below 0 for none.
+    boxes: alloc.List(Box),
+    /// The control that has the keyboard, or 0.
+    pub focused: u32,
+    /// The app asked to open this, honoured between frames; empty for none.
+    pub open_request: alloc.String,
+    /// The apps list-apps gives: name, source and what it is, three
+    /// strings an app; empty for the three of Nimadir's tests.
+    apps: alloc.List(alloc.String),
     images: u32,
     depth: u32,
     sent_bytes: u64,
@@ -130,6 +151,11 @@ pub fn new_ui(a: alloc.Allocator) -> Ui {
         nodes: alloc.List(Node).init(a),
         events: alloc.List(Event).init(a),
         sheets: 0,
+        sheet_texts: alloc.List(alloc.String).init(a),
+        boxes: alloc.List(Box).init(a),
+        focused: 0,
+        open_request: alloc.String.init(a),
+        apps: alloc.List(alloc.String).init(a),
         images: 0,
         depth: 0,
         sent_bytes: 0,
@@ -475,6 +501,14 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
     if func.eq("now-millis") {
         return int_val(ui.now_ms as% u64);
     }
+    if func.eq("list-apps") and ui.apps.len() > 0 {
+        var items = alloc.List(c.Val).init(a);
+        var k: usize = 0;
+        while k + 2 < ui.apps.len() : (k += 3) {
+            items.push(app_entry(name: ui.apps.items()[k].view(), source: ui.apps.items()[k + 1].view(), about: ui.apps.items()[k + 2].view(), a));
+        }
+        return c.Val.List { items: items };
+    }
     if func.eq("list-apps") {
         var items = alloc.List(c.Val).init(a);
         items.push(app_entry(name: "Counter", source: "counter.component.wasm", about: "Counts taps", a));
@@ -484,6 +518,7 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
     }
     if func.eq("open-app") {
         try draw(ui, what: "open", text: text_arg(args, i: 0));
+        ui.open_request = alloc.String.from(text_arg(args, i: 0), a);
         return c.Val.Unit;
     }
     if func.eq("request-frame") {
@@ -711,6 +746,116 @@ fn unescape(b: []u8, from: usize, to: usize, out: &mut alloc.String) {
         _ = out.push_utf8(b[i..end]);
         i = end;
     }
+}
+
+/// A whole number as an f32's bits.
+fn f32_of(v: i32) -> c.Val {
+    if v == 0 {
+        return c.Val.F32 { bits: 0 };
+    }
+    var sign: u32 = 0;
+    var m = v as i64;
+    if m < 0 {
+        sign = 0x80000000;
+        m = -m;
+    }
+    var e: u32 = 0;
+    var t = m;
+    while t > 1 {
+        t = t >> 1;
+        e += 1;
+    }
+    // The bits below the leading one, in the 23 of the mantissa.
+    var frac: u64 = 0;
+    if e <= 23 {
+        frac = ((m as u64) << (23 - e)) & 0x7FFFFF;
+    } else {
+        frac = ((m as u64) >> (e - 23)) & 0x7FFFFF;
+    }
+    return c.Val.F32 { bits: sign | ((e + 127) << 23) | (frac as u32) };
+}
+
+/// The class name added to n's class attribute, or taken away.
+fn toggle_class(ui: &mut Ui, n: u32, name: str, on: bool) {
+    var kept = alloc.String.init(ui.a);
+    var classes = alloc.String.init(ui.a);
+    match attr_index(&ui.nodes.items()[n as usize], name: "class") {
+        some(k) => { classes = alloc.String.from(ui.nodes.items()[n as usize].values.items()[k].view(), ui.a); }
+        none => { }
+    }
+    let b = classes.view().bytes();
+    var c0: usize = 0;
+    while c0 < b.len() {
+        var c1 = c0;
+        while c1 < b.len() and b[c1] != ' ' {
+            c1 += 1;
+        }
+        let one = classes.view()[c0..c1];
+        if one.len() > 0 and not one.eq(name) {
+            if kept.len() > 0 {
+                kept.push_str(" ");
+            }
+            kept.push_str(one);
+        }
+        c0 = c1 + 1;
+    }
+    if on {
+        if kept.len() > 0 {
+            kept.push_str(" ");
+        }
+        kept.push_str(name);
+    }
+    set_attr(ui, n: n, name: "class", value: kept.view());
+}
+
+/// One property of n's inline style set, or taken out when value is empty.
+fn set_style(ui: &mut Ui, n: u32, property: str, value: str) {
+    var out = alloc.String.init(ui.a);
+    match attr_index(&ui.nodes.items()[n as usize], name: "style") {
+        some(k) => {
+            let style = alloc.String.from(ui.nodes.items()[n as usize].values.items()[k].view(), ui.a);
+            let b = style.view().bytes();
+            var d0: usize = 0;
+            while d0 < b.len() {
+                var d1 = d0;
+                while d1 < b.len() and b[d1] != ';' {
+                    d1 += 1;
+                }
+                let decl = style.view()[d0..d1];
+                var colon: usize = 0;
+                while colon < decl.len() and decl.bytes()[colon] != ':' {
+                    colon += 1;
+                }
+                let name = trim(decl[0..colon]);
+                if name.len() > 0 and not name.eq(property) {
+                    out.push_str(trim(decl));
+                    out.push_str("; ");
+                }
+                d0 = d1 + 1;
+            }
+        }
+        none => { }
+    }
+    if value.len() > 0 {
+        out.push_str(property);
+        out.push_str(": ");
+        out.push_str(value);
+        out.push_str("; ");
+    }
+    set_attr(ui, n: n, name: "style", value: trim(out.view()));
+}
+
+fn trim(s: str) -> str {
+    let b = s.bytes();
+    var i: usize = 0;
+    var j = b.len();
+    while i < j and (b[i] == ' ' or b[i] == '\n' or b[i] == '\t') {
+        i += 1;
+    }
+    while j > i and (b[j - 1] == ' ' or b[j - 1] == '\n' or b[j - 1] == '\t') {
+        j -= 1;
+    }
+    return s[i..j];
 }
 
 fn bytes_eq(b: []u8, s: str) -> bool {
@@ -972,9 +1117,21 @@ fn dom(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
     }
     if func.eq("add-stylesheet") {
         ui.sheets += 1;
+        ui.sheet_texts.push(alloc.String.from(text_arg(args, i: 0), a));
         return int_val(ui.sheets as u64);
     }
-    if func.eq("remove-stylesheet") or func.eq("focus") {
+    if func.eq("remove-stylesheet") {
+        let k = int_arg(args, i: 0);
+        if k >= 1 and k <= ui.sheet_texts.len() as u64 {
+            ui.sheet_texts.items_mut()[(k - 1) as usize] = alloc.String.init(a);
+        }
+        return c.Val.Unit;
+    }
+    if func.eq("focus") {
+        let n = int_arg(args, i: 0);
+        if live(ui, n: n) {
+            ui.focused = n as u32;
+        }
         return c.Val.Unit;
     }
     if func.eq("events") {
@@ -1083,7 +1240,12 @@ fn dom(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
             none => { return nothing(a); }
         }
     }
-    if func.eq("toggle-class") or func.eq("set-style") {
+    if func.eq("toggle-class") {
+        toggle_class(ui, n: node, name: text_arg(args, i: 1), on: int_arg(args, i: 2) != 0);
+        return c.Val.Unit;
+    }
+    if func.eq("set-style") {
+        set_style(ui, n: node, property: text_arg(args, i: 1), value: text_arg(args, i: 2));
         return c.Val.Unit;
     }
     if func.eq("set-markup") {
@@ -1116,6 +1278,15 @@ fn dom(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
         return c.Val.Str { v: text };
     }
     if func.eq("bounds") {
+        if (node as usize) < ui.boxes.len() and ui.boxes.items()[node as usize].w >= 0 {
+            let b = ui.boxes.items()[node as usize];
+            var fields = alloc.List(c.Val).init(a);
+            fields.push(f32_of(b.x));
+            fields.push(f32_of(b.y));
+            fields.push(f32_of(b.w));
+            fields.push(f32_of(b.h));
+            return some_val(c.Val.List { items: fields }, a);
+        }
         return nothing(a);
     }
     if func.eq("listen") {
@@ -1244,4 +1415,98 @@ pub fn run(app: &mut App, store: &mut exec.Store, now: &dyn fn() -> u64, name: s
     store.deadline_ns = 0;
     try r;
     _ = try c.finish(&app.comp, store, &p, &results);
+}
+
+// ---- for a shell with a screen -----------------------------------------------------
+
+/// How many node numbers there are; some may name nodes released.
+pub fn node_count(ui: &Ui) -> u32 {
+    return ui.nodes.len() as u32;
+}
+
+/// Whether n is a node in the page: alive, and the body or under it.
+pub fn in_page(ui: &Ui, n: u32) -> bool {
+    if n == 0 or n as usize >= ui.nodes.len() or not ui.nodes.items()[n as usize].alive {
+        return false;
+    }
+    return inside(ui, n: 1, of: n);
+}
+
+/// n's tag, an element's; empty for a run of text.
+pub fn tag_of(ui: &Ui, n: u32) -> str {
+    return ui.nodes.items()[n as usize].tag.view();
+}
+
+/// A run of text's text.
+pub fn text_of(ui: &Ui, n: u32) -> str {
+    return ui.nodes.items()[n as usize].text.view();
+}
+
+/// n's attribute name, copied; none when it has none.
+pub fn attribute(ui: &Ui, n: u32, name: str, a: alloc.Allocator) -> ?alloc.String {
+    let node = &ui.nodes.items()[n as usize];
+    let k = attr_index(node, name: name) orelse return none;
+    return alloc.String.from(node.values.items()[k].view(), a);
+}
+
+/// n's children, in order.
+pub fn children_of(ui: &Ui, n: u32) -> []u32 {
+    return ui.nodes.items()[n as usize].children.items();
+}
+
+pub fn parent_of(ui: &Ui, n: u32) -> u32 {
+    return ui.nodes.items()[n as usize].parent;
+}
+
+/// Whether n matches a selector of compounds (tag, #id, .class) parted by
+/// spaces, as a stylesheet's rule says it.
+pub fn matches_selector(ui: &Ui, n: u32, selector: str) -> bool {
+    return matches(ui, n: n, sel: selector.bytes(), scope: 0);
+}
+
+/// How many stylesheets were added; stylesheet(i) is the ith, from 0,
+/// empty when it was removed.
+pub fn stylesheet_count(ui: &Ui) -> u32 {
+    return ui.sheet_texts.len() as u32;
+}
+
+pub fn stylesheet(ui: &Ui, i: u32) -> str {
+    return ui.sheet_texts.items()[i as usize].view();
+}
+
+/// Where the shell laid n out, for bounds to say.
+pub fn set_box(ui: &mut Ui, n: u32, x: i32, y: i32, width: i32, height: i32) {
+    while ui.boxes.len() <= n as usize {
+        ui.boxes.push(Box { x: 0, y: 0, w: -1, h: 0 });
+    }
+    ui.boxes.items_mut()[n as usize] = Box { x: x, y: y, w: width, h: height };
+}
+
+/// Something the user did to target: it goes to target, or its nearest
+/// ancestor that listens for kind, as the app's events will say. Whether
+/// one listened.
+pub fn dispatch(ui: &mut Ui, kind: str, target: u32, value: str) -> bool {
+    var at = target;
+    while at != 0 {
+        for l in ui.nodes.items()[at as usize].listens.items() {
+            if l.view().eq(kind) {
+                ui.events.push(Event { kind: alloc.String.from(kind, ui.a), target: target, current: at, value: alloc.String.from(value, ui.a) });
+                return true;
+            }
+        }
+        at = ui.nodes.items()[at as usize].parent;
+    }
+    return false;
+}
+
+/// A control's value as the user leaves it: its value attribute.
+pub fn set_value(ui: &mut Ui, n: u32, value: str) {
+    set_attr(ui, n: n, name: "value", value: value);
+}
+
+/// An app list-apps gives from now on, after those added before.
+pub fn add_app(ui: &mut Ui, name: str, source: str, about: str) {
+    ui.apps.push(alloc.String.from(name, ui.a));
+    ui.apps.push(alloc.String.from(source, ui.a));
+    ui.apps.push(alloc.String.from(about, ui.a));
 }

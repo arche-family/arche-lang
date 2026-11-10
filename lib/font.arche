@@ -76,13 +76,17 @@ pub fn new_canvas(width: u32, height: u32, a: alloc.Allocator) -> Canvas {
 }
 
 /// Glyphs drawn before, by glyph and size, so a text draws each once.
+/// They are drawn with the allocator the cache was made with, which is
+/// what it lives in: a cache that outlives a region never holds a glyph
+/// of it.
 pub type Cache = struct {
     index: alloc.Map(u64, u32),
     bitmaps: alloc.List(Bitmap),
+    a: alloc.Allocator,
 }
 
 pub fn new_cache(a: alloc.Allocator) -> Cache {
-    return Cache { index: alloc.Map(u64, u32).init(a), bitmaps: alloc.List(Bitmap).init(a) };
+    return Cache { index: alloc.Map(u64, u32).init(a), bitmaps: alloc.List(Bitmap).init(a), a: a };
 }
 
 // ---- reading -----------------------------------------------------------------
@@ -981,13 +985,13 @@ fn floor_div(n: i64, d: i64) -> i64 {
 
 /// Glyph g at size, from the cache, drawn the first time it is asked for:
 /// its number in the cache.
-fn cached(f: &Font, c: &mut Cache, g: u32, size: u32, a: alloc.Allocator) -> FontError!u32 {
+fn cached(f: &Font, c: &mut Cache, g: u32, size: u32) -> FontError!u32 {
     let key = ((g as u64) << 16) | (size as u64);
     match c.index.get(key) {
         some(i) => { return i; }
         none => { }
     }
-    let b = try render(f, g: g, size: size, a: a);
+    let b = try render(f, g: g, size: size, a: c.a);
     let i = c.bitmaps.len() as u32;
     c.bitmaps.push(b);
     c.index.put(key, i);
@@ -1004,7 +1008,7 @@ fn over(dst: u8, src: u8) -> u8 {
 
 /// Draws text at size into c, its baseline at y, from x; text that is not
 /// UTF-8 draws U+FFFD where it is not. Where the pen ends, in pixels.
-pub fn draw(f: &Font, cache: &mut Cache, text: str, size: u32, x: i32, y: i32, into: &mut Canvas, a: alloc.Allocator) -> FontError!i32 {
+pub fn draw(f: &Font, cache: &mut Cache, text: str, size: u32, x: i32, y: i32, into: &mut Canvas) -> FontError!i32 {
     let b = text.bytes();
     var pen = (x as i64) * 256;
     var at: usize = 0;
@@ -1027,7 +1031,7 @@ pub fn draw(f: &Font, cache: &mut Cache, text: str, size: u32, x: i32, y: i32, i
         }
         first = false;
         previous = g;
-        let i = try cached(f, c: cache, g: g, size: size, a: a);
+        let i = try cached(f, c: cache, g: g, size: size);
         let gx = round_div(n: pen, d: 256) as i32;
         blit(&cache.bitmaps.items()[i as usize], x: gx, y: y, into: into);
         pen += scale(f, advance(f, g: g) as i64, size: size);
