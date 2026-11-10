@@ -276,6 +276,91 @@ pub type Fs = struct {
         return s;
     }
 
+    /// A connection to the Unix socket at path, as a socket's file is
+    /// reached: through this Fs, relative to its directory. A path that
+    /// begins with '@' names one in the abstract namespace, which has no
+    /// file. What D-Bus speaks over (lib/dbus.arche).
+    pub fn connect_unix(self: &Fs, path: str) -> NetError!Socket {
+        // struct sockaddr_un: the family, then up to 108 bytes of path.
+        var sa: [110]u8 = [0; 110];
+        sa[0] = 1;
+        var at: usize = 2;
+        let b = path.bytes();
+        var prefix: [32]u8 = [0; 32];
+        var plen: usize = 0;
+        if b.len() > 0 and b[0] != '/' and b[0] != '@' and self.dir != linux.AT_FDCWD {
+            // Relative to this Fs's directory: through its descriptor.
+            let head = "/proc/self/fd/".bytes();
+            for c in head {
+                prefix[plen] = c.*;
+                plen += 1;
+            }
+            var digits: [20]u8 = [0; 20];
+            var n = self.dir as u64;
+            var k: usize = 0;
+            while true {
+                digits[k] = '0' + (n % 10) as u8;
+                k += 1;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            while k > 0 {
+                k -= 1;
+                prefix[plen] = digits[k];
+                plen += 1;
+            }
+            prefix[plen] = '/';
+            plen += 1;
+        }
+        if b.len() == 0 or plen + b.len() + 1 > 108 {
+            return NetError.NetFailed;
+        }
+        for c in prefix[0..plen] {
+            sa[at] = c.*;
+            at += 1;
+        }
+        for c in b {
+            if c.* == 0 {
+                return NetError.NetFailed;
+            }
+            sa[at] = c.*;
+            at += 1;
+        }
+        var len = at + 1;
+        if b[0] == '@' {
+            // Abstract: a 0 byte for the '@', and no ending 0.
+            sa[2] = 0;
+            len = at;
+        }
+        var fd: i64 = 0;
+        var r: i64 = 0;
+        unsafe {
+            // SAFETY: AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+            // sa holds len bytes of a sockaddr_un; SO_ERROR is one int.
+            fd = linux.syscall(linux.SOCKET, [1, 0x80801, 0, 0, 0, 0]);
+            if linux.errno(fd) != 0 {
+                return net_error(linux.errno(fd));
+            }
+            r = linux.syscall(linux.CONNECT, [fd, linux.arg(u8, &sa[0] as *u8), len as i64, 0, 0, 0]);
+            if linux.errno(r) == linux.EINPROGRESS or linux.errno(r) == linux.EAGAIN {
+                io_wait(fd, events: POLLOUT);
+                var e: i32 = 0;
+                var elen: u32 = 4;
+                r = linux.syscall(linux.GETSOCKOPT, [fd, 1, 4, linux.arg(i32, &e as *i32), linux.arg(u32, &elen as *u32), 0]);
+                if linux.errno(r) == 0 and e != 0 {
+                    r = -(e as i64);
+                }
+            }
+            if linux.errno(r) != 0 {
+                _ = linux.syscall(linux.CLOSE, [fd, 0, 0, 0, 0, 0]);
+                return net_error(linux.errno(r));
+            }
+        }
+        return Socket { fd: fd, unique: core.Unique { } };
+    }
+
     /// Whether something is at path.
     pub fn exists(self: &Fs, path: str) -> bool {
         var buf: [4096]u8 = [0; 4096];

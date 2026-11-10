@@ -1,0 +1,205 @@
+// test: run
+// spec: dbus (D-Bus specification, wire format)
+// stage0: skip
+// wasm: skip
+// stdout: header: call 1 /org/arche/X org.arche.T Do org.arche.Dest ya{sv}(nqi)xtsogab
+// stdout: body: 200 [name=s:arche] [count=u:3] (-2 65535 -70000) -5 18446744073709551615 Ўзбек /a/b su true
+// stdout: skipped to 116 of 116
+// stdout: big-endian: return to 7, u 305419896
+// stdout: lengths: 244 244
+// stdout: changed: 1262 parsed of 3000
+import alloc;
+import core.rand;
+import dbus;
+import std;
+
+/// The body of signature ya{sv}(nqi)xtsogab.
+fn body(a: alloc.Allocator) -> dbus.Writer {
+    var w = dbus.writer(a);
+    dbus.put_byte(&mut w, v: 200);
+    let dict = dbus.begin_array(&mut w, align: 8);
+    dbus.begin_struct(&mut w);
+    dbus.put_string(&mut w, s: "name");
+    dbus.begin_variant(&mut w, signature: "s");
+    dbus.put_string(&mut w, s: "arche");
+    dbus.begin_struct(&mut w);
+    dbus.put_string(&mut w, s: "count");
+    dbus.begin_variant(&mut w, signature: "u");
+    dbus.put_u32(&mut w, v: 3);
+    dbus.end_array(&mut w, m: dict);
+    dbus.begin_struct(&mut w);
+    dbus.put_u16(&mut w, v: 0xFFFE);
+    dbus.put_u16(&mut w, v: 0xFFFF);
+    dbus.put_i32(&mut w, v: -70000);
+    dbus.put_i64(&mut w, v: -5);
+    dbus.put_u64(&mut w, v: 0xFFFFFFFFFFFFFFFF);
+    dbus.put_string(&mut w, s: "Ўзбек");
+    dbus.put_string(&mut w, s: "/a/b");
+    dbus.put_signature(&mut w, s: "su");
+    dbus.put_bool(&mut w, v: true);
+    return w;
+}
+
+fn kind_name(k: u32) -> str {
+    if k == dbus.METHOD_CALL {
+        return "call";
+    }
+    if k == dbus.METHOD_RETURN {
+        return "return";
+    }
+    if k == dbus.SIGNAL {
+        return "signal";
+    }
+    return "error";
+}
+
+fn read_back(m: &dbus.Message, out: &mut std.Output, a: alloc.Allocator) -> dbus.DbusError!void {
+    var r = dbus.reader(m, a: a);
+    out.write("body: ");
+    out.write_u64(try dbus.get_byte(&mut r) as u64);
+    let end = try dbus.enter_array(&mut r, align: 8);
+    while dbus.more(&r, end: end) {
+        try dbus.enter_struct(&mut r);
+        let key = try dbus.get_string(&mut r, a: a);
+        let sig = try dbus.get_signature(&mut r, a: a);
+        out.write(" [");
+        out.write(key.view());
+        out.write("=");
+        out.write(sig.view());
+        out.write(":");
+        if sig.view().eq("s") {
+            let v = try dbus.get_string(&mut r, a: a);
+            out.write(v.view());
+        } else {
+            out.write_u64(try dbus.get_u32(&mut r) as u64);
+        }
+        out.write("]");
+    }
+    try dbus.enter_struct(&mut r);
+    let n = (try dbus.get_u16(&mut r)) as i64;
+    let q = try dbus.get_u16(&mut r);
+    let i = try dbus.get_i32(&mut r);
+    out.write(" (");
+    out.write_i64(n - 65536);
+    out.write(" ");
+    out.write_u64(q as u64);
+    out.write(" ");
+    out.write_i64(i as i64);
+    out.write(") ");
+    out.write_i64(try dbus.get_i64(&mut r));
+    out.write(" ");
+    out.write_u64(try dbus.get_u64(&mut r));
+    out.write(" ");
+    let s = try dbus.get_string(&mut r, a: a);
+    out.write(s.view());
+    out.write(" ");
+    let o = try dbus.get_string(&mut r, a: a);
+    out.write(o.view());
+    out.write(" ");
+    let g = try dbus.get_signature(&mut r, a: a);
+    out.write(g.view());
+    if try dbus.get_bool(&mut r) {
+        out.write(" true\n");
+    } else {
+        out.write(" false\n");
+    }
+    // The whole body again, by skip alone.
+    var r2 = dbus.reader(m, a: a);
+    try dbus.skip(&mut r2, sig: "y");
+    try dbus.skip(&mut r2, sig: "a{sv}");
+    try dbus.skip(&mut r2, sig: "(nqi)");
+    try dbus.skip(&mut r2, sig: "x");
+    try dbus.skip(&mut r2, sig: "t");
+    try dbus.skip(&mut r2, sig: "s");
+    try dbus.skip(&mut r2, sig: "o");
+    try dbus.skip(&mut r2, sig: "g");
+    try dbus.skip(&mut r2, sig: "b");
+    out.write("skipped to ");
+    out.write_u64(r2.at as u64);
+    out.write(" of ");
+    out.write_u64(m.body.len() as u64);
+    out.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let out = &mut sys.stdout;
+    let a = sys.alloc;
+    var h = dbus.header(dbus.METHOD_CALL, a: a);
+    h.destination.push_str("org.arche.Dest");
+    h.path.push_str("/org/arche/X");
+    h.iface.push_str("org.arche.T");
+    h.member.push_str("Do");
+    h.signature.push_str("ya{sv}(nqi)xtsogab");
+    let w = body(a);
+    let bytes = dbus.encode(&h, serial: 1, body: &w, a: a);
+    let m = try dbus.parse(bytes.items(), a: a);
+    out.write("header: ");
+    out.write(kind_name(m.kind));
+    out.write(" ");
+    out.write_u64(m.serial as u64);
+    out.write(" ");
+    out.write(m.path.view());
+    out.write(" ");
+    out.write(m.iface.view());
+    out.write(" ");
+    out.write(m.member.view());
+    out.write(" ");
+    out.write(m.destination.view());
+    out.write(" ");
+    out.write(m.signature.view());
+    out.write("\n");
+    try read_back(&m, out: out, a: a);
+    // A return, big-endian, written here by hand: reply to serial 7, one
+    // u32, 0x12345678.
+    let big: [40]u8 = [
+        'B', 2, 1, 1, 0, 0, 0, 4, 0, 0, 0, 9, 0, 0, 0, 15,
+        5, 1, 'u', 0, 0, 0, 0, 7, 8, 1, 'g', 0, 1, 'u', 0, 0,
+        0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0,
+    ];
+    let b = try dbus.parse(big[0..36], a: a);
+    var rb = dbus.reader(&b, a: a);
+    out.write("big-endian: ");
+    out.write(kind_name(b.kind));
+    out.write(" to ");
+    out.write_u64(b.reply_to as u64);
+    out.write(", ");
+    out.write(b.signature.view());
+    out.write(" ");
+    out.write_u64(try dbus.get_u32(&mut rb) as u64);
+    out.write("\n");
+    out.write("lengths: ");
+    out.write_u64(dbus.message_length(bytes.items()) orelse 0);
+    out.write(" ");
+    out.write_u64(bytes.len() as u64);
+    out.write("\n");
+    // Bytes changed at random: an error or a message, never a panic.
+    var g = rand.Seeded.init(35);
+    var parsed: u64 = 0;
+    var k: u32 = 0;
+    while k < 3000 : (k += 1) {
+        var copy = alloc.List(u8).init(a);
+        for x in bytes.items() {
+            copy.push(x.*);
+        }
+        let changes = g.below(3) + 1;
+        var c: u64 = 0;
+        while c < changes : (c += 1) {
+            let at = g.below(copy.len() as u64) as usize;
+            copy.items_mut()[at] = (g.next_u64() & 0xFF) as u8;
+        }
+        match dbus.parse(copy.items(), a: a) {
+            ok(p) => {
+                parsed += 1;
+                var r = dbus.reader(&p, a: a);
+                match dbus.skip(&mut r, sig: "y") {
+                    ok(_) => { }
+                    err(_) => { }
+                }
+            }
+            err(_) => { }
+        }
+    }
+    out.write("changed: ");
+    out.write_u64(parsed);
+    out.write(" parsed of 3000\n");
+}

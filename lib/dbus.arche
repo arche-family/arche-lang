@@ -1,0 +1,948 @@
+/// D-Bus (docs/sprints.md S35): a client of the message bus, as the
+/// phone's services speak to ModemManager, iwd and PipeWire on Linux. A
+/// connection over a Unix socket, authenticated by EXTERNAL (the kernel
+/// tells the bus who connects), then messages: method calls and their
+/// returns and errors, and signals, both ways.
+///
+/// A message's body is written with a Writer and read with a Reader, a
+/// value at a time, as its signature says; Reader.skip passes over any
+/// complete type. Messages are sent little-endian and read in either
+/// order. A message comes from outside, so reading is checked: a broken
+/// one gives an error, never a panic (fuzz/dbus_fuzz.arche). Unix file
+/// descriptors are not passed.
+import alloc;
+import std;
+
+pub type DbusError = error {
+    /// The bytes are not a message, or not the one the signature says.
+    Malformed,
+    /// The bus did not let this connection in.
+    AuthFailed,
+    /// The connection is gone.
+    Disconnected,
+    /// The call's answer was an error: Bus.error_name says which.
+    Failed,
+}
+
+/// The system bus's socket.
+pub const SYSTEM_BUS: str = "/run/dbus/system_bus_socket";
+
+pub const METHOD_CALL: u32 = 1;
+pub const METHOD_RETURN: u32 = 2;
+pub const ERROR: u32 = 3;
+pub const SIGNAL: u32 = 4;
+
+/// The flag of a call whose sender wants no answer.
+pub const NO_REPLY_EXPECTED: u32 = 1;
+
+/// Messages may be no longer than this (the specification's limit).
+const MAX_MESSAGE: u64 = 0x8000000;
+
+/// A message, its header's fields by name, its body as bytes.
+pub type Message = struct {
+    pub kind: u32,
+    pub flags: u32,
+    pub serial: u32,
+    /// The call a return or an error answers; 0 for others.
+    pub reply_to: u32,
+    pub path: alloc.String,
+    pub iface: alloc.String,
+    pub member: alloc.String,
+    pub error_name: alloc.String,
+    pub destination: alloc.String,
+    pub sender: alloc.String,
+    pub signature: alloc.String,
+    /// Whether the body's numbers are big-endian.
+    pub big: bool,
+    pub body: alloc.List(u8),
+}
+
+fn empty_message(a: alloc.Allocator) -> Message {
+    return Message {
+        kind: 0,
+        flags: 0,
+        serial: 0,
+        reply_to: 0,
+        path: alloc.String.init(a),
+        iface: alloc.String.init(a),
+        member: alloc.String.init(a),
+        error_name: alloc.String.init(a),
+        destination: alloc.String.init(a),
+        sender: alloc.String.init(a),
+        signature: alloc.String.init(a),
+        big: false,
+        body: alloc.List(u8).init(a),
+    };
+}
+
+// ---- writing -----------------------------------------------------------------
+
+/// A body being written, little-endian; alignment counts from its start,
+/// which a message places on 8 bytes.
+pub type Writer = struct {
+    pub bytes: alloc.List(u8),
+}
+
+pub fn writer(a: alloc.Allocator) -> Writer {
+    return Writer { bytes: alloc.List(u8).init(a) };
+}
+
+/// Where an array's length is to be written, and where its elements begin.
+pub type ArrayMark = struct {
+    length_at: usize,
+    start: usize,
+}
+
+fn pad(w: &mut Writer, align: usize) {
+    while w.bytes.len() % align != 0 {
+        w.bytes.push(0);
+    }
+}
+
+fn put_le(w: &mut Writer, v: u64, size: usize) {
+    pad(w, align: size);
+    var i: usize = 0;
+    while i < size : (i += 1) {
+        w.bytes.push(((v >> (8 * i as u64)) & 0xFF) as u8);
+    }
+}
+
+pub fn put_byte(w: &mut Writer, v: u8) {
+    w.bytes.push(v);
+}
+
+pub fn put_bool(w: &mut Writer, v: bool) {
+    var n: u64 = 0;
+    if v {
+        n = 1;
+    }
+    put_le(w, v: n, size: 4);
+}
+
+pub fn put_u16(w: &mut Writer, v: u16) {
+    put_le(w, v: v as u64, size: 2);
+}
+
+pub fn put_i32(w: &mut Writer, v: i32) {
+    put_le(w, v: ((v as i64) as% u64) & 0xFFFFFFFF, size: 4);
+}
+
+pub fn put_u32(w: &mut Writer, v: u32) {
+    put_le(w, v: v as u64, size: 4);
+}
+
+pub fn put_i64(w: &mut Writer, v: i64) {
+    put_le(w, v: v as% u64, size: 8);
+}
+
+pub fn put_u64(w: &mut Writer, v: u64) {
+    put_le(w, v: v, size: 8);
+}
+
+/// A string (s), or an object path (o): its length, its bytes, a 0.
+pub fn put_string(w: &mut Writer, s: str) {
+    put_le(w, v: s.len() as u64, size: 4);
+    for b in s.bytes() {
+        w.bytes.push(b.*);
+    }
+    w.bytes.push(0);
+}
+
+/// A signature (g): its length in a byte, its bytes, a 0.
+pub fn put_signature(w: &mut Writer, s: str) {
+    w.bytes.push(s.len() as u8);
+    for b in s.bytes() {
+        w.bytes.push(b.*);
+    }
+    w.bytes.push(0);
+}
+
+/// An array begins; its elements, of alignment align, follow, then
+/// end_array.
+pub fn begin_array(w: &mut Writer, align: usize) -> ArrayMark {
+    put_le(w, v: 0, size: 4);
+    let length_at = w.bytes.len() - 4;
+    pad(w, align: align);
+    return ArrayMark { length_at: length_at, start: w.bytes.len() };
+}
+
+pub fn end_array(w: &mut Writer, m: ArrayMark) {
+    let n = w.bytes.len() - m.start;
+    let b = w.bytes.items_mut();
+    var i: usize = 0;
+    while i < 4 : (i += 1) {
+        b[m.length_at + i] = ((n >> (8 * i)) & 0xFF) as u8;
+    }
+}
+
+/// A struct or a dict entry begins: on 8 bytes.
+pub fn begin_struct(w: &mut Writer) {
+    pad(w, align: 8);
+}
+
+/// A variant begins: the signature of the one value that follows.
+pub fn begin_variant(w: &mut Writer, signature: str) {
+    put_signature(w, s: signature);
+}
+
+// ---- reading -----------------------------------------------------------------
+
+/// Reads a body, or a header, a value at a time.
+pub type Reader = struct {
+    bytes: alloc.List(u8),
+    pub at: usize,
+    big: bool,
+    a: alloc.Allocator,
+}
+
+/// A reader of m's body.
+pub fn reader(m: &Message, a: alloc.Allocator) -> Reader {
+    var bytes = alloc.List(u8).with_capacity(a, m.body.len());
+    for b in m.body.items() {
+        bytes.push(b.*);
+    }
+    return Reader { bytes: bytes, at: 0, big: m.big, a: a };
+}
+
+fn align_to(r: &mut Reader, align: usize) -> DbusError!void {
+    while r.at % align != 0 {
+        if r.at >= r.bytes.len() or r.bytes.items()[r.at] != 0 {
+            return DbusError.Malformed;
+        }
+        r.at += 1;
+    }
+}
+
+fn get(r: &mut Reader, size: usize) -> DbusError!u64 {
+    try align_to(r, align: size);
+    if r.at > r.bytes.len() or r.bytes.len() - r.at < size {
+        return DbusError.Malformed;
+    }
+    let b = r.bytes.items();
+    var v: u64 = 0;
+    var i: usize = 0;
+    while i < size : (i += 1) {
+        let byte = b[r.at + i] as u64;
+        if r.big {
+            v = (v << 8) | byte;
+        } else {
+            v = v | (byte << (8 * i as u64));
+        }
+    }
+    r.at += size;
+    return v;
+}
+
+pub fn get_byte(r: &mut Reader) -> DbusError!u8 {
+    return (try get(r, size: 1)) as u8;
+}
+
+pub fn get_bool(r: &mut Reader) -> DbusError!bool {
+    let v = try get(r, size: 4);
+    if v > 1 {
+        return DbusError.Malformed;
+    }
+    return v == 1;
+}
+
+pub fn get_u16(r: &mut Reader) -> DbusError!u16 {
+    return (try get(r, size: 2)) as u16;
+}
+
+pub fn get_u32(r: &mut Reader) -> DbusError!u32 {
+    return (try get(r, size: 4)) as u32;
+}
+
+pub fn get_i32(r: &mut Reader) -> DbusError!i32 {
+    return ((try get(r, size: 4)) as u32) as% i32;
+}
+
+pub fn get_u64(r: &mut Reader) -> DbusError!u64 {
+    return get(r, size: 8);
+}
+
+pub fn get_i64(r: &mut Reader) -> DbusError!i64 {
+    return (try get(r, size: 8)) as% i64;
+}
+
+/// A string, or an object path, which must be UTF-8 and end in its 0.
+pub fn get_string(r: &mut Reader, a: alloc.Allocator) -> DbusError!alloc.String {
+    let n = (try get(r, size: 4)) as usize;
+    return text_after(r, n: n, a: a);
+}
+
+/// A signature.
+pub fn get_signature(r: &mut Reader, a: alloc.Allocator) -> DbusError!alloc.String {
+    let n = (try get(r, size: 1)) as usize;
+    return text_after(r, n: n, a: a);
+}
+
+fn text_after(r: &mut Reader, n: usize, a: alloc.Allocator) -> DbusError!alloc.String {
+    if r.at > r.bytes.len() or r.bytes.len() - r.at < n + 1 {
+        return DbusError.Malformed;
+    }
+    let b = r.bytes.items();
+    if b[r.at + n] != 0 {
+        return DbusError.Malformed;
+    }
+    var s = alloc.String.init(a);
+    if not s.push_utf8(b[r.at..r.at + n]) {
+        return DbusError.Malformed;
+    }
+    r.at += n + 1;
+    return s;
+}
+
+/// An array begins: where it ends. Its elements are read while more says
+/// so.
+pub fn enter_array(r: &mut Reader, align: usize) -> DbusError!usize {
+    let n = (try get(r, size: 4)) as usize;
+    if n > 0x4000000 {
+        return DbusError.Malformed;
+    }
+    try align_to(r, align: align);
+    if r.bytes.len() - r.at < n {
+        return DbusError.Malformed;
+    }
+    return r.at + n;
+}
+
+/// Whether an array that ends at end has more elements.
+pub fn more(r: &Reader, end: usize) -> bool {
+    return r.at < end;
+}
+
+/// A struct or a dict entry begins.
+pub fn enter_struct(r: &mut Reader) -> DbusError!void {
+    try align_to(r, align: 8);
+}
+
+/// The alignment of the first type of signature s at i.
+fn alignment(c: u8) -> usize {
+    if c == 'y' or c == 'g' or c == 'v' {
+        return 1;
+    }
+    if c == 'n' or c == 'q' {
+        return 2;
+    }
+    if c == 'x' or c == 't' or c == 'd' or c == '(' or c == '{' {
+        return 8;
+    }
+    return 4;
+}
+
+/// Where the complete type that begins at i in sig ends, one past it.
+fn type_end(sig: []u8, i: usize, depth: u32) -> DbusError!usize {
+    if i >= sig.len() or depth > 64 {
+        return DbusError.Malformed;
+    }
+    let c = sig[i];
+    if c == 'a' {
+        return type_end(sig, i: i + 1, depth: depth + 1);
+    }
+    if c == '(' or c == '{' {
+        var closer: u8 = ')';
+        if c == '{' {
+            closer = '}';
+        }
+        var j = i + 1;
+        while j < sig.len() and sig[j] != closer {
+            j = try type_end(sig, i: j, depth: depth + 1);
+        }
+        if j >= sig.len() or j == i + 1 {
+            return DbusError.Malformed;
+        }
+        return j + 1;
+    }
+    let basic = "ybnqiuxtdsoghv".bytes();
+    for b in basic {
+        if b.* == c {
+            return i + 1;
+        }
+    }
+    return DbusError.Malformed;
+}
+
+/// Passes over one value of the complete type sig.
+pub fn skip(r: &mut Reader, sig: str) -> DbusError!void {
+    let b = sig.bytes();
+    let end = try type_end(b, i: 0, depth: 0);
+    if end != b.len() {
+        return DbusError.Malformed;
+    }
+    try skip_at(r, sig: b, i: 0, depth: 0);
+}
+
+fn skip_at(r: &mut Reader, sig: []u8, i: usize, depth: u32) -> DbusError!void {
+    if depth > 64 or i >= sig.len() {
+        return DbusError.Malformed;
+    }
+    let c = sig[i];
+    if c == 'y' {
+        _ = try get(r, size: 1);
+    } else if c == 'n' or c == 'q' {
+        _ = try get(r, size: 2);
+    } else if c == 'b' or c == 'i' or c == 'u' or c == 'h' {
+        _ = try get(r, size: 4);
+    } else if c == 'x' or c == 't' or c == 'd' {
+        _ = try get(r, size: 8);
+    } else if c == 's' or c == 'o' {
+        let n = (try get(r, size: 4)) as usize;
+        if r.bytes.len() - r.at < n + 1 {
+            return DbusError.Malformed;
+        }
+        r.at += n + 1;
+    } else if c == 'g' {
+        let n = (try get(r, size: 1)) as usize;
+        if r.bytes.len() - r.at < n + 1 {
+            return DbusError.Malformed;
+        }
+        r.at += n + 1;
+    } else if c == 'v' {
+        let n = (try get(r, size: 1)) as usize;
+        if r.bytes.len() - r.at < n + 1 or n == 0 {
+            return DbusError.Malformed;
+        }
+        // The variant's signature, copied out of the bytes it reads.
+        var inner = alloc.List(u8).with_capacity(r.a, n);
+        for x in r.bytes.items()[r.at..r.at + n] {
+            inner.push(x.*);
+        }
+        r.at += n + 1;
+        let is = inner.items();
+        if (try type_end(is, i: 0, depth: depth + 1)) != n {
+            return DbusError.Malformed;
+        }
+        try skip_at(r, sig: is, i: 0, depth: depth + 1);
+    } else if c == 'a' {
+        let elem = i + 1;
+        let end = try enter_array(r, align: alignment(try at_or(sig, elem)));
+        while r.at < end {
+            let before = r.at;
+            try skip_at(r, sig: sig, i: elem, depth: depth + 1);
+            if r.at == before {
+                return DbusError.Malformed;
+            }
+        }
+        if r.at != end {
+            return DbusError.Malformed;
+        }
+    } else if c == '(' or c == '{' {
+        try align_to(r, align: 8);
+        var j = i + 1;
+        let last = (try type_end(sig, i: i, depth: depth)) - 1;
+        while j < last {
+            try skip_at(r, sig: sig, i: j, depth: depth + 1);
+            j = try type_end(sig, i: j, depth: depth + 1);
+        }
+    } else {
+        return DbusError.Malformed;
+    }
+}
+
+fn at_or(sig: []u8, i: usize) -> DbusError!u8 {
+    if i >= sig.len() {
+        return DbusError.Malformed;
+    }
+    return sig[i];
+}
+
+// ---- messages ----------------------------------------------------------------
+
+/// The message in bytes, which must be exactly one.
+pub fn parse(bytes: []u8, a: alloc.Allocator) -> DbusError!Message {
+    if bytes.len() < 16 {
+        return DbusError.Malformed;
+    }
+    var m = empty_message(a);
+    if bytes[0] == 'B' {
+        m.big = true;
+    } else if bytes[0] != 'l' {
+        return DbusError.Malformed;
+    }
+    if bytes[3] != 1 or bytes[1] == 0 or bytes[1] > 4 {
+        return DbusError.Malformed;
+    }
+    m.kind = bytes[1] as u32;
+    m.flags = bytes[2] as u32;
+    var r = Reader { bytes: alloc.List(u8).with_capacity(a, bytes.len()), at: 4, big: m.big, a: a };
+    for b in bytes {
+        r.bytes.push(b.*);
+    }
+    let body_len = (try get(&mut r, size: 4)) as u64;
+    m.serial = try get_u32(&mut r);
+    if m.serial == 0 {
+        return DbusError.Malformed;
+    }
+    let end = try enter_array(&mut r, align: 8);
+    while r.at < end {
+        try enter_struct(&mut r);
+        let code = try get_byte(&mut r);
+        let sig = try get_signature(&mut r, a: a);
+        let s = sig.view();
+        if code == 1 and s.eq("o") {
+            m.path = try get_string(&mut r, a: a);
+        } else if code == 2 and s.eq("s") {
+            m.iface = try get_string(&mut r, a: a);
+        } else if code == 3 and s.eq("s") {
+            m.member = try get_string(&mut r, a: a);
+        } else if code == 4 and s.eq("s") {
+            m.error_name = try get_string(&mut r, a: a);
+        } else if code == 5 and s.eq("u") {
+            m.reply_to = try get_u32(&mut r);
+        } else if code == 6 and s.eq("s") {
+            m.destination = try get_string(&mut r, a: a);
+        } else if code == 7 and s.eq("s") {
+            m.sender = try get_string(&mut r, a: a);
+        } else if code == 8 and s.eq("g") {
+            m.signature = try get_signature(&mut r, a: a);
+        } else if code >= 1 and code <= 9 {
+            // A known field of the wrong type.
+            return DbusError.Malformed;
+        } else {
+            try skip(&mut r, sig: s);
+        }
+    }
+    if r.at != end {
+        return DbusError.Malformed;
+    }
+    try align_to(&mut r, align: 8);
+    if (bytes.len() - r.at) as u64 != body_len {
+        return DbusError.Malformed;
+    }
+    for b in bytes[r.at..bytes.len()] {
+        m.body.push(b.*);
+    }
+    // The fields each kind must have.
+    if m.kind == METHOD_CALL and (m.path.len() == 0 or m.member.len() == 0) {
+        return DbusError.Malformed;
+    }
+    if m.kind == SIGNAL and (m.path.len() == 0 or m.member.len() == 0 or m.iface.len() == 0) {
+        return DbusError.Malformed;
+    }
+    if (m.kind == METHOD_RETURN or m.kind == ERROR) and m.reply_to == 0 {
+        return DbusError.Malformed;
+    }
+    if m.kind == ERROR and m.error_name.len() == 0 {
+        return DbusError.Malformed;
+    }
+    return m;
+}
+
+/// How long the message that begins bytes is, once its first 16 bytes are
+/// there; none when they are not, or say what cannot be.
+pub fn message_length(bytes: []u8) -> ?u64 {
+    if bytes.len() < 16 {
+        return none;
+    }
+    let big = bytes[0] == 'B';
+    var body: u64 = 0;
+    var fields: u64 = 0;
+    var i: usize = 0;
+    while i < 4 : (i += 1) {
+        if big {
+            body = (body << 8) | (bytes[4 + i] as u64);
+            fields = (fields << 8) | (bytes[12 + i] as u64);
+        } else {
+            body = body | ((bytes[4 + i] as u64) << (8 * i as u64));
+            fields = fields | ((bytes[12 + i] as u64) << (8 * i as u64));
+        }
+    }
+    let total = (16 + fields + 7) / 8 * 8 + body;
+    if total > MAX_MESSAGE {
+        return none;
+    }
+    return total;
+}
+
+fn field_string(w: &mut Writer, code: u8, sig: str, value: str) {
+    if value.len() == 0 {
+        return;
+    }
+    begin_struct(w);
+    put_byte(w, v: code);
+    begin_variant(w, signature: sig);
+    if sig.eq("g") {
+        put_signature(w, s: value);
+    } else {
+        put_string(w, s: value);
+    }
+}
+
+/// What a message to send says besides its body: its kind and flags, a
+/// return's or an error's call, and its fields; an empty one is left out.
+pub type Header = struct {
+    pub kind: u32,
+    pub flags: u32,
+    pub reply_to: u32,
+    pub destination: alloc.String,
+    pub path: alloc.String,
+    pub iface: alloc.String,
+    pub member: alloc.String,
+    pub error_name: alloc.String,
+    pub signature: alloc.String,
+}
+
+/// A header of kind with no fields yet.
+pub fn header(kind: u32, a: alloc.Allocator) -> Header {
+    return Header {
+        kind: kind,
+        flags: 0,
+        reply_to: 0,
+        destination: alloc.String.init(a),
+        path: alloc.String.init(a),
+        iface: alloc.String.init(a),
+        member: alloc.String.init(a),
+        error_name: alloc.String.init(a),
+        signature: alloc.String.init(a),
+    };
+}
+
+/// The bytes of a message with header h, serial serial, and body body.
+pub fn encode(h: &Header, serial: u32, body: &Writer, a: alloc.Allocator) -> alloc.List(u8) {
+    var w = writer(a);
+    put_byte(&mut w, v: 'l');
+    put_byte(&mut w, v: h.kind as u8);
+    put_byte(&mut w, v: h.flags as u8);
+    put_byte(&mut w, v: 1);
+    put_u32(&mut w, v: body.bytes.len() as u32);
+    put_u32(&mut w, v: serial);
+    let fields = begin_array(&mut w, align: 8);
+    field_string(&mut w, code: 1, sig: "o", value: h.path.view());
+    field_string(&mut w, code: 2, sig: "s", value: h.iface.view());
+    field_string(&mut w, code: 3, sig: "s", value: h.member.view());
+    field_string(&mut w, code: 4, sig: "s", value: h.error_name.view());
+    if h.reply_to != 0 {
+        begin_struct(&mut w);
+        put_byte(&mut w, v: 5);
+        begin_variant(&mut w, signature: "u");
+        put_u32(&mut w, v: h.reply_to);
+    }
+    field_string(&mut w, code: 6, sig: "s", value: h.destination.view());
+    field_string(&mut w, code: 8, sig: "g", value: h.signature.view());
+    end_array(&mut w, m: fields);
+    pad(&mut w, align: 8);
+    for b in body.bytes.items() {
+        w.bytes.push(b.*);
+    }
+    return w.bytes;
+}
+
+// ---- the bus -------------------------------------------------------------------
+
+/// A connection to a message bus.
+pub type Bus = struct {
+    socket: std.Socket,
+    serial: u32,
+    /// Bytes read and not yet a whole message.
+    inbox: alloc.List(u8),
+    /// Messages that came while a call waited for its answer.
+    waiting: alloc.List(Message),
+    /// This connection's unique name on the bus, from Hello.
+    pub name: alloc.String,
+    /// The last error a call was answered with.
+    pub error_name: alloc.String,
+    pub error_text: alloc.String,
+    a: alloc.Allocator,
+}
+
+/// The session bus's socket, from DBUS_SESSION_BUS_ADDRESS when it names a
+/// path or an abstract socket; none otherwise.
+pub fn session_bus(env: &std.Env, a: alloc.Allocator) -> ?alloc.String {
+    let owned = env.get("DBUS_SESSION_BUS_ADDRESS", a) orelse return none;
+    let address = owned.view();
+    let b = address.bytes();
+    var at: usize = 0;
+    // The first of ;-separated addresses that is unix:path= or
+    // unix:abstract=.
+    while at < b.len() {
+        var end = at;
+        while end < b.len() and b[end] != ';' {
+            end += 1;
+        }
+        let one = address[at..end];
+        var out = alloc.String.init(a);
+        if one.starts_with("unix:") {
+            let rest = one[5..one.len()];
+            var k: usize = 0;
+            while k < rest.len() {
+                var e = k;
+                while e < rest.len() and rest.bytes()[e] != ',' {
+                    e += 1;
+                }
+                let kv = rest[k..e];
+                if kv.starts_with("path=") {
+                    out.push_str(kv[5..kv.len()]);
+                    return out;
+                }
+                if kv.starts_with("abstract=") {
+                    out.push_str("@");
+                    out.push_str(kv[9..kv.len()]);
+                    return out;
+                }
+                k = e + 1;
+            }
+        }
+        at = end + 1;
+    }
+    return none;
+}
+
+fn send_raw(b: &mut Bus, bytes: []u8) -> DbusError!void {
+    b.socket.write(bytes) catch return DbusError.Disconnected;
+}
+
+/// The first n bytes the inbox holds, taken out of it.
+fn take(b: &mut Bus, n: usize) -> alloc.List(u8) {
+    var head = alloc.List(u8).with_capacity(b.a, n);
+    var rest = alloc.List(u8).init(b.a);
+    let items = b.inbox.items();
+    var i: usize = 0;
+    while i < items.len() : (i += 1) {
+        if i < n {
+            head.push(items[i]);
+        } else {
+            rest.push(items[i]);
+        }
+    }
+    b.inbox = rest;
+    return head;
+}
+
+/// Where the first \r\n in the inbox is.
+fn line_end(b: &Bus) -> ?usize {
+    let items = b.inbox.items();
+    var i: usize = 0;
+    while i + 1 < items.len() : (i += 1) {
+        if items[i] == '\r' and items[i + 1] == '\n' {
+            return i;
+        }
+    }
+    return none;
+}
+
+/// More bytes from the socket into the inbox, waiting for them.
+fn fill(b: &mut Bus) -> DbusError!void {
+    var buf: [4096]u8 = [0; 4096];
+    let n = b.socket.read(buf[0..4096]) catch return DbusError.Disconnected;
+    if n == 0 {
+        return DbusError.Disconnected;
+    }
+    for x in buf[0..n] {
+        b.inbox.push(x.*);
+    }
+}
+
+/// A line of the authentication, without its \r\n.
+fn auth_line(b: &mut Bus) -> DbusError!alloc.String {
+    while true {
+        match line_end(b) {
+            some(i) => {
+                let bytes = take(b, n: i + 2);
+                var line = alloc.String.init(b.a);
+                if not line.push_utf8(bytes.items()[0..i]) {
+                    return DbusError.AuthFailed;
+                }
+                return line;
+            }
+            none => { }
+        }
+        if b.inbox.len() > 4096 {
+            return DbusError.AuthFailed;
+        }
+        try fill(b);
+    }
+    return DbusError.AuthFailed;
+}
+
+/// A connection to the bus at path, through fs: authenticated, and named
+/// by the bus's Hello.
+pub fn connect(fs: &std.Fs, path: str, a: alloc.Allocator) -> DbusError!Bus {
+    let socket = fs.connect_unix(path) catch return DbusError.Disconnected;
+    var b = Bus {
+        socket: socket,
+        serial: 0,
+        inbox: alloc.List(u8).init(a),
+        waiting: alloc.List(Message).init(a),
+        name: alloc.String.init(a),
+        error_name: alloc.String.init(a),
+        error_text: alloc.String.init(a),
+        a: a,
+    };
+    // A 0 byte, then EXTERNAL with no identity of its own: the bus asks
+    // for it with DATA, and the empty DATA answer lets it take it from the
+    // socket.
+    try send_raw(&mut b, bytes: "\u{0}AUTH EXTERNAL\r\n".bytes());
+    var line = try auth_line(&mut b);
+    if line.view().eq("DATA") {
+        try send_raw(&mut b, bytes: "DATA\r\n".bytes());
+        line = try auth_line(&mut b);
+    }
+    if not line.view().starts_with("OK ") {
+        return DbusError.AuthFailed;
+    }
+    try send_raw(&mut b, bytes: "BEGIN\r\n".bytes());
+    let body = writer(a);
+    let hello = try call(&mut b, destination: "org.freedesktop.DBus", path: "/org/freedesktop/DBus", iface: "org.freedesktop.DBus", member: "Hello", signature: "", body: &body);
+    var r = reader(&hello, a: a);
+    b.name = try get_string(&mut r, a: a);
+    return b;
+}
+
+fn next_serial(b: &mut Bus) -> u32 {
+    b.serial += 1;
+    if b.serial == 0 {
+        b.serial = 1;
+    }
+    return b.serial;
+}
+
+/// Sends a message with header h and body body: its serial.
+pub fn send(b: &mut Bus, h: &Header, body: &Writer) -> DbusError!u32 {
+    let serial = next_serial(b);
+    let bytes = encode(h, serial: serial, body: body, a: b.a);
+    try send_raw(b, bytes: bytes.items());
+    return serial;
+}
+
+/// The next message from the socket, waiting for it.
+fn receive(b: &mut Bus) -> DbusError!Message {
+    while true {
+        match message_length(b.inbox.items()) {
+            some(n) => {
+                if b.inbox.len() as u64 >= n {
+                    let bytes = take(b, n: n as usize);
+                    return parse(bytes.items(), a: b.a);
+                }
+            }
+            none => {
+                if b.inbox.len() >= 16 {
+                    return DbusError.Malformed;
+                }
+            }
+        }
+        try fill(b);
+    }
+    return DbusError.Disconnected;
+}
+
+/// The next message that came to this connection: a signal, or a call to
+/// it; those that came while a call waited first.
+pub fn next(b: &mut Bus) -> DbusError!Message {
+    if b.waiting.len() == 0 {
+        return receive(b);
+    }
+    // waiting holds them oldest first: turned over, the oldest is last.
+    var turned = alloc.List(Message).init(b.a);
+    while b.waiting.len() > 0 {
+        match b.waiting.pop() {
+            some(m) => { turned.push(m); }
+            none => { break; }
+        }
+    }
+    let oldest = turned.pop() orelse return DbusError.Disconnected;
+    while turned.len() > 0 {
+        match turned.pop() {
+            some(m) => { b.waiting.push(m); }
+            none => { break; }
+        }
+    }
+    return oldest;
+}
+
+/// Calls member of iface at path on destination, with body, and waits
+/// for the answer; an error answer is Failed, its name and text in
+/// error_name and error_text.
+pub fn call(b: &mut Bus, destination: str, path: str, iface: str, member: str, signature: str, body: &Writer) -> DbusError!Message {
+    var h = header(METHOD_CALL, a: b.a);
+    h.destination.push_str(destination);
+    h.path.push_str(path);
+    h.iface.push_str(iface);
+    h.member.push_str(member);
+    h.signature.push_str(signature);
+    let serial = try send(b, h: &h, body: body);
+    while true {
+        let m = try receive(b);
+        if (m.kind == METHOD_RETURN or m.kind == ERROR) and m.reply_to == serial {
+            if m.kind == ERROR {
+                b.error_name = alloc.String.from(m.error_name.view(), b.a);
+                b.error_text = alloc.String.init(b.a);
+                if m.signature.view().starts_with("s") {
+                    var r = reader(&m, a: b.a);
+                    match get_string(&mut r, a: b.a) {
+                        ok(t) => { b.error_text = t; }
+                        err(_) => { }
+                    }
+                }
+                return DbusError.Failed;
+            }
+            return m;
+        }
+        b.waiting.push(m);
+    }
+    return DbusError.Disconnected;
+}
+
+/// Answers the call m with body, of signature signature.
+pub fn reply(b: &mut Bus, m: &Message, signature: str, body: &Writer) -> DbusError!void {
+    if (m.flags & NO_REPLY_EXPECTED) != 0 {
+        return;
+    }
+    var h = header(METHOD_RETURN, a: b.a);
+    h.reply_to = m.serial;
+    h.destination.push_str(m.sender.view());
+    h.signature.push_str(signature);
+    _ = try send(b, h: &h, body: body);
+}
+
+/// Answers the call m with the error name, saying text.
+pub fn reply_error(b: &mut Bus, m: &Message, name: str, text: str) -> DbusError!void {
+    if (m.flags & NO_REPLY_EXPECTED) != 0 {
+        return;
+    }
+    var w = writer(b.a);
+    put_string(&mut w, s: text);
+    var h = header(ERROR, a: b.a);
+    h.reply_to = m.serial;
+    h.destination.push_str(m.sender.view());
+    h.error_name.push_str(name);
+    h.signature.push_str("s");
+    _ = try send(b, h: &h, body: &w);
+}
+
+/// Sends the signal member of iface from path, with body.
+pub fn emit(b: &mut Bus, path: str, iface: str, member: str, signature: str, body: &Writer) -> DbusError!void {
+    var h = header(SIGNAL, a: b.a);
+    h.path.push_str(path);
+    h.iface.push_str(iface);
+    h.member.push_str(member);
+    h.signature.push_str(signature);
+    _ = try send(b, h: &h, body: body);
+}
+
+/// The bus's own call of member, with one string argument.
+fn bus_call(b: &mut Bus, member: str, arg: str) -> DbusError!Message {
+    var w = writer(b.a);
+    put_string(&mut w, s: arg);
+    return call(b, destination: "org.freedesktop.DBus", path: "/org/freedesktop/DBus", iface: "org.freedesktop.DBus", member: member, signature: "s", body: &w);
+}
+
+/// Signals that match rule come to this connection (next).
+pub fn add_match(b: &mut Bus, rule: str) -> DbusError!void {
+    _ = try bus_call(b, member: "AddMatch", arg: rule);
+}
+
+/// Asks for the well-known name: the bus's answer, 1 when this connection
+/// is its owner now.
+pub fn request_name(b: &mut Bus, name: str) -> DbusError!u32 {
+    var w = writer(b.a);
+    put_string(&mut w, s: name);
+    put_u32(&mut w, v: 4);
+    let m = try call(b, destination: "org.freedesktop.DBus", path: "/org/freedesktop/DBus", iface: "org.freedesktop.DBus", member: "RequestName", signature: "su", body: &w);
+    var r = reader(&m, a: b.a);
+    return get_u32(&mut r);
+}
+
+pub fn close(b: &mut Bus) {
+    b.socket.close();
+}

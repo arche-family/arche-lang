@@ -1,0 +1,190 @@
+/// Fuzzes lib/dbus (docs/sprints.md S35): messages as the bus sends them,
+/// with bytes changed, cut, or noise written over a run, parsed, and their
+/// bodies read by their own signature, or by one made up. Every input
+/// must give an error or a message; a panic is a bug.
+///
+/// usage: dbus_fuzz <seconds> [seed]. The seed printed first repeats a run.
+import alloc;
+import core.rand;
+import dbus;
+import std;
+
+fn number(s: str) -> u64 {
+    var n: u64 = 0;
+    for c in s.bytes() {
+        if c.* >= '0' and c.* <= '9' {
+            n = n * 10 + (c.* - '0') as u64;
+        }
+    }
+    return n;
+}
+
+/// Signatures to read bodies by.
+fn signature(i: u64) -> str {
+    if i == 0 { return "a{oa{sa{sv}}}"; }
+    if i == 1 { return "ya{sv}(nqi)xtsogab"; }
+    if i == 2 { return "av"; }
+    if i == 3 { return "(sa(uv))"; }
+    if i == 4 { return "a{s(ia{sv})}"; }
+    return "s";
+}
+
+/// A message to start from: a call with a body of signature(i % 5).
+fn seed_message(i: u64, a: alloc.Allocator) -> alloc.List(u8) {
+    var h = dbus.header(dbus.METHOD_CALL, a: a);
+    h.destination.push_str("org.freedesktop.ModemManager1");
+    h.path.push_str("/org/freedesktop/ModemManager1/Modem/0");
+    h.iface.push_str("org.freedesktop.DBus.Properties");
+    h.member.push_str("GetAll");
+    var w = dbus.writer(a);
+    let which = i % 5;
+    h.signature.push_str(signature(which));
+    if which == 0 {
+        let outer = dbus.begin_array(&mut w, align: 8);
+        dbus.begin_struct(&mut w);
+        dbus.put_string(&mut w, s: "/m/0");
+        let mid = dbus.begin_array(&mut w, align: 8);
+        dbus.begin_struct(&mut w);
+        dbus.put_string(&mut w, s: "org.x");
+        let inner = dbus.begin_array(&mut w, align: 8);
+        dbus.begin_struct(&mut w);
+        dbus.put_string(&mut w, s: "State");
+        dbus.begin_variant(&mut w, signature: "i");
+        dbus.put_i32(&mut w, v: 8);
+        dbus.end_array(&mut w, m: inner);
+        dbus.end_array(&mut w, m: mid);
+        dbus.end_array(&mut w, m: outer);
+    } else if which == 1 {
+        dbus.put_byte(&mut w, v: 1);
+        let d = dbus.begin_array(&mut w, align: 8);
+        dbus.begin_struct(&mut w);
+        dbus.put_string(&mut w, s: "k");
+        dbus.begin_variant(&mut w, signature: "as");
+        let l = dbus.begin_array(&mut w, align: 4);
+        dbus.put_string(&mut w, s: "x");
+        dbus.end_array(&mut w, m: l);
+        dbus.end_array(&mut w, m: d);
+        dbus.begin_struct(&mut w);
+        dbus.put_u16(&mut w, v: 1);
+        dbus.put_u16(&mut w, v: 2);
+        dbus.put_i32(&mut w, v: 3);
+        dbus.put_i64(&mut w, v: 4);
+        dbus.put_u64(&mut w, v: 5);
+        dbus.put_string(&mut w, s: "s");
+        dbus.put_string(&mut w, s: "/o");
+        dbus.put_signature(&mut w, s: "g");
+        dbus.put_bool(&mut w, v: false);
+    } else if which == 2 {
+        let l = dbus.begin_array(&mut w, align: 1);
+        dbus.begin_variant(&mut w, signature: "(us)");
+        dbus.begin_struct(&mut w);
+        dbus.put_u32(&mut w, v: 9);
+        dbus.put_string(&mut w, s: "v");
+        dbus.begin_variant(&mut w, signature: "t");
+        dbus.put_u64(&mut w, v: 7);
+        dbus.end_array(&mut w, m: l);
+    } else if which == 3 {
+        dbus.begin_struct(&mut w);
+        dbus.put_string(&mut w, s: "s");
+        let l = dbus.begin_array(&mut w, align: 8);
+        dbus.begin_struct(&mut w);
+        dbus.put_u32(&mut w, v: 1);
+        dbus.begin_variant(&mut w, signature: "y");
+        dbus.put_byte(&mut w, v: 2);
+        dbus.end_array(&mut w, m: l);
+    } else {
+        let d = dbus.begin_array(&mut w, align: 8);
+        dbus.begin_struct(&mut w);
+        dbus.put_string(&mut w, s: "a");
+        dbus.begin_struct(&mut w);
+        dbus.put_i32(&mut w, v: -1);
+        let e = dbus.begin_array(&mut w, align: 8);
+        dbus.end_array(&mut w, m: e);
+        dbus.end_array(&mut w, m: d);
+    }
+    return dbus.encode(&h, serial: (i + 1) as u32, body: &w, a: a);
+}
+
+fn mangle(data: []u8, g: &mut rand.Seeded, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    for x in data {
+        out.push(x.*);
+    }
+    let rounds = g.below(4) + 1;
+    var k: u64 = 0;
+    while k < rounds and out.len() > 0 : (k += 1) {
+        let n = out.len() as u64;
+        let how = g.below(8);
+        if how < 5 {
+            let at = g.below(n) as usize;
+            out.items_mut()[at] = (g.next_u64() & 0xff) as u8;
+        } else if how == 5 {
+            // A small number where lengths are.
+            let at = g.below(n) as usize;
+            out.items_mut()[at] = g.below(16) as u8;
+        } else if how == 6 {
+            let at = g.below(n) as usize;
+            let len = g.below(16) as usize;
+            var i = at;
+            while i < at + len and i < out.len() : (i += 1) {
+                out.items_mut()[i] = (g.next_u64() & 0xff) as u8;
+            }
+        } else {
+            let keep = g.below(n + 1);
+            while out.len() as u64 > keep {
+                _ = out.pop();
+            }
+        }
+    }
+    return out;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() < 2 {
+        sys.stderr.write("usage: dbus_fuzz <seconds> [seed]\n");
+        sys.proc.exit(2);
+    }
+    let seconds = number(sys.args.get(1));
+    var seed = sys.rand.next_u64() % 1000000000;
+    if sys.args.len() > 2 {
+        seed = number(sys.args.get(2));
+    }
+    sys.stdout.write("seed ");
+    sys.stdout.write_u64(seed);
+    sys.stdout.write("\n");
+    sys.stdout.flush();
+    var g = rand.Seeded.init(seed);
+    let start = sys.clock.monotonic_ns();
+    var cases: u64 = 0;
+    var parsed: u64 = 0;
+    while sys.clock.monotonic_ns() - start < seconds * 1000000000 : (cases += 1) {
+        region r {
+            let seed_bytes = seed_message(g.below(5), a: r);
+            let input = mangle(seed_bytes.items(), g: &mut g, a: r);
+            _ = dbus.message_length(input.items());
+            match dbus.parse(input.items(), a: r) {
+                ok(m) => {
+                    parsed += 1;
+                    var rd = dbus.reader(&m, a: r);
+                    var by = alloc.String.init(r);
+                    if g.below(2) == 0 {
+                        by.push_str(m.signature.view());
+                    } else {
+                        by.push_str(signature(g.below(6)));
+                    }
+                    // Each complete type of the signature in turn.
+                    let b = by.view();
+                    match dbus.skip(&mut rd, sig: b) {
+                        ok(_) => { }
+                        err(_) => { }
+                    }
+                }
+                err(_) => { }
+            }
+        }
+    }
+    sys.stdout.write_u64(cases);
+    sys.stdout.write(" cases, ");
+    sys.stdout.write_u64(parsed);
+    sys.stdout.write(" parsed, no panic\n");
+}

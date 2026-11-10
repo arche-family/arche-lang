@@ -1,0 +1,219 @@
+/// lib/dbus against a real bus (docs/sprints.md S35).
+///
+/// usage:
+///   dbus_check echo <socket>   two connections through the bus at socket:
+///                              names, a call and its answer, a signal, the
+///                              list of names and an error answer;
+///   dbus_check serve <socket>  org.arche.Test answers Echo(su) with the
+///                              string and "!", the number plus one, until
+///                              Quit: for dbus-send (interop/dbus.sh);
+///   dbus_check modems <socket> ModemManager's modems, by their paths.
+import alloc;
+import dbus;
+import std;
+
+const NAME: str = "org.arche.Test";
+const PATH: str = "/org/arche/Test";
+const IFACE: str = "org.arche.Echo";
+
+fn say(out: &mut std.Output, what: str, fine: bool) -> u32 {
+    out.write("dbus: ");
+    out.write(what);
+    if fine {
+        out.write(" ok\n");
+        return 0;
+    }
+    out.write(" FAILED\n");
+    return 1;
+}
+
+/// Answers an Echo call: its string and "!", its number plus one.
+fn answer_echo(bus: &mut dbus.Bus, m: &dbus.Message, a: alloc.Allocator) -> dbus.DbusError!void {
+    var r = dbus.reader(m, a: a);
+    var s = try dbus.get_string(&mut r, a: a);
+    let n = try dbus.get_u32(&mut r);
+    s.push_str("!");
+    var w = dbus.writer(a);
+    dbus.put_string(&mut w, s: s.view());
+    dbus.put_u32(&mut w, v: n + 1);
+    try dbus.reply(bus, m: m, signature: "su", body: &w);
+}
+
+/// The next message on bus of kind, passing over others: the bus's own
+/// signals, NameAcquired and the like, come too.
+fn next_of(bus: &mut dbus.Bus, kind: u32) -> dbus.DbusError!dbus.Message {
+    while true {
+        let m = try dbus.next(bus);
+        if m.kind == kind and not m.sender.view().eq("org.freedesktop.DBus") {
+            return m;
+        }
+    }
+    return dbus.DbusError.Disconnected;
+}
+
+fn echo(sys: &mut std.System, socket: str) -> dbus.DbusError!u32 {
+    let out = &mut sys.stdout;
+    let a = sys.alloc;
+    var failed: u32 = 0;
+    var server = try dbus.connect(&sys.fs, path: socket, a: a);
+    var client = try dbus.connect(&sys.fs, path: socket, a: a);
+    failed += say(out, what: "two connections, each with a unique name", fine: server.name.view().starts_with(":") and client.name.view().starts_with(":") and not server.name.view().eq(client.name.view()));
+    failed += say(out, what: "the name org.arche.Test, owned", fine: (try dbus.request_name(&mut server, name: NAME)) == 1);
+    // The bus's list of names has it.
+    let empty = dbus.writer(a);
+    let names = try dbus.call(&mut client, destination: "org.freedesktop.DBus", path: "/org/freedesktop/DBus", iface: "org.freedesktop.DBus", member: "ListNames", signature: "", body: &empty);
+    var r = dbus.reader(&names, a: a);
+    let end = try dbus.enter_array(&mut r, align: 4);
+    var listed = false;
+    while dbus.more(&r, end: end) {
+        let n = try dbus.get_string(&mut r, a: a);
+        listed = listed or n.view().eq(NAME);
+    }
+    failed += say(out, what: "the bus lists it", fine: listed);
+    // A call, sent without waiting, answered by the server.
+    var h = dbus.header(dbus.METHOD_CALL, a: a);
+    h.destination.push_str(NAME);
+    h.path.push_str(PATH);
+    h.iface.push_str(IFACE);
+    h.member.push_str("Echo");
+    h.signature.push_str("su");
+    var w = dbus.writer(a);
+    dbus.put_string(&mut w, s: "hi");
+    dbus.put_u32(&mut w, v: 41);
+    let serial = try dbus.send(&mut client, h: &h, body: &w);
+    let call = try next_of(&mut server, kind: dbus.METHOD_CALL);
+    failed += say(out, what: "the call came to the server", fine: call.kind == dbus.METHOD_CALL and call.member.view().eq("Echo") and call.sender.view().eq(client.name.view()));
+    try answer_echo(&mut server, m: &call, a: a);
+    let back = try next_of(&mut client, kind: dbus.METHOD_RETURN);
+    var rb = dbus.reader(&back, a: a);
+    let s = try dbus.get_string(&mut rb, a: a);
+    let n = try dbus.get_u32(&mut rb);
+    failed += say(out, what: "its answer: \"hi!\" and 42", fine: back.kind == dbus.METHOD_RETURN and back.reply_to == serial and s.view().eq("hi!") and n == 42);
+    // A signal, to a connection that asked for it.
+    try dbus.add_match(&mut client, rule: "type='signal',interface='org.arche.Echo'");
+    var sw = dbus.writer(a);
+    dbus.put_u32(&mut sw, v: 7);
+    try dbus.emit(&mut server, path: PATH, iface: IFACE, member: "Ping", signature: "u", body: &sw);
+    let sig = try next_of(&mut client, kind: dbus.SIGNAL);
+    var rs = dbus.reader(&sig, a: a);
+    failed += say(out, what: "a signal, Ping(7)", fine: sig.kind == dbus.SIGNAL and sig.member.view().eq("Ping") and (try dbus.get_u32(&mut rs)) == 7);
+    // A name no one has: the bus answers with an error.
+    var refused = false;
+    match dbus.call(&mut client, destination: "org.arche.Nobody", path: PATH, iface: IFACE, member: "Echo", signature: "", body: &empty) {
+        ok(_) => { }
+        err(e) => { refused = e == dbus.DbusError.Failed and client.error_name.view().eq("org.freedesktop.DBus.Error.ServiceUnknown"); }
+    }
+    failed += say(out, what: "a call to a name no one has, ServiceUnknown", fine: refused);
+    dbus.close(&mut client);
+    dbus.close(&mut server);
+    return failed;
+}
+
+/// Serves org.arche.Test until Quit; says so when it owns the name, so
+/// that the script calls it only then.
+fn serve(sys: &mut std.System, socket: str) -> dbus.DbusError!u32 {
+    let a = sys.alloc;
+    var bus = try dbus.connect(&sys.fs, path: socket, a: a);
+    if (try dbus.request_name(&mut bus, name: NAME)) != 1 {
+        return 1;
+    }
+    sys.stdout.write("serving\n");
+    sys.stdout.flush();
+    while true {
+        let m = try next_of(&mut bus, kind: dbus.METHOD_CALL);
+        if m.member.view().eq("Echo") and m.signature.view().eq("su") {
+            try answer_echo(&mut bus, m: &m, a: a);
+        } else if m.member.view().eq("Quit") {
+            let empty = dbus.writer(a);
+            try dbus.reply(&mut bus, m: &m, signature: "", body: &empty);
+            break;
+        } else {
+            try dbus.reply_error(&mut bus, m: &m, name: "org.freedesktop.DBus.Error.UnknownMethod", text: "no such method");
+        }
+    }
+    dbus.close(&mut bus);
+    return 0;
+}
+
+/// ModemManager's modems: the object paths GetManagedObjects names.
+fn modems(sys: &mut std.System, socket: str) -> dbus.DbusError!u32 {
+    let a = sys.alloc;
+    var bus = try dbus.connect(&sys.fs, path: socket, a: a);
+    let empty = dbus.writer(a);
+    let m = try dbus.call(&mut bus, destination: "org.freedesktop.ModemManager1", path: "/org/freedesktop/ModemManager1", iface: "org.freedesktop.DBus.ObjectManager", member: "GetManagedObjects", signature: "", body: &empty);
+    if not m.signature.view().eq("a{oa{sa{sv}}}") {
+        sys.stdout.write("dbus: GetManagedObjects answered with another signature FAILED\n");
+        return 1;
+    }
+    var r = dbus.reader(&m, a: a);
+    let end = try dbus.enter_array(&mut r, align: 8);
+    var count: u64 = 0;
+    while dbus.more(&r, end: end) {
+        try dbus.enter_struct(&mut r);
+        let path = try dbus.get_string(&mut r, a: a);
+        try dbus.skip(&mut r, sig: "a{sa{sv}}");
+        sys.stdout.write("dbus: modem ");
+        sys.stdout.write(path.view());
+        sys.stdout.write("\n");
+        count += 1;
+    }
+    sys.stdout.write("dbus: ModemManager has ");
+    sys.stdout.write_u64(count);
+    sys.stdout.write(" modems\n");
+    dbus.close(&mut bus);
+    return 0;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() != 3 {
+        sys.stderr.write("usage: dbus_check echo|serve|modems <socket>\n");
+        sys.proc.exit(2);
+    }
+    let mode = alloc.String.from(sys.args.get(1), sys.alloc);
+    let socket = alloc.String.from(sys.args.get(2), sys.alloc);
+    var failed: u32 = 0;
+    var result = dbus.DbusError.Malformed;
+    var fine = true;
+    if mode.view().eq("echo") {
+        match echo(sys, socket: socket.view()) {
+            ok(n) => { failed = n; }
+            err(e) => {
+                fine = false;
+                result = e;
+            }
+        }
+    } else if mode.view().eq("serve") {
+        match serve(sys, socket: socket.view()) {
+            ok(n) => { failed = n; }
+            err(e) => {
+                fine = false;
+                result = e;
+            }
+        }
+    } else {
+        match modems(sys, socket: socket.view()) {
+            ok(n) => { failed = n; }
+            err(e) => {
+                fine = false;
+                result = e;
+            }
+        }
+    }
+    if not fine {
+        sys.stdout.write("dbus: ");
+        if result == dbus.DbusError.Failed {
+            sys.stdout.write("an error answer");
+        } else if result == dbus.DbusError.AuthFailed {
+            sys.stdout.write("not let in");
+        } else if result == dbus.DbusError.Disconnected {
+            sys.stdout.write("the connection went");
+        } else {
+            sys.stdout.write("a broken message");
+        }
+        sys.stdout.write(" FAILED\n");
+        sys.proc.exit(1);
+    }
+    if failed != 0 {
+        sys.proc.exit(1);
+    }
+}

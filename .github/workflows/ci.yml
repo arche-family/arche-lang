@@ -182,7 +182,8 @@ jobs:
         run: make -C examples/kvcrash check
 
   # docs/sprints.md S35: the libraries the phone needs: lib/font with a real
-  # font, lib/image/png with PngSuite, and a minute of fuzzing each.
+  # font, lib/image/png with PngSuite, lib/dbus with a dbus-daemon of its
+  # own and dbus-send, and a minute of fuzzing each.
   phone:
     runs-on: ubuntu-latest
     steps:
@@ -197,6 +198,12 @@ jobs:
         run: ./interop/png.sh
       - name: Fuzz lib/image/png
         run: ./fuzz/png.sh 60
+      - name: D-Bus with dbus-daemon and dbus-send
+        run: |
+          sudo apt-get update && sudo apt-get install -y dbus-daemon dbus-bin
+          ./interop/dbus.sh
+      - name: Fuzz lib/dbus
+        run: ./fuzz/dbus.sh 60
 
   # docs/sprints.md S24, S25: the build driver and the package manager. A
   # build from the cache is bit-identical to a clean one, every conformance
