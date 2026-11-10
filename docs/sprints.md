@@ -499,6 +499,10 @@ S35 yopildi. Hali yo'q, kerak bo'lganda qo'shiladigan narsalar: GPOS kerning va 
 
 **Qabul:** Arche'da yozilgan Nimadir ilovasi Wasmtime'dagi Nimadir'da ham, arche-lang'ning `wasm/` runtime'ida ham bir xil ishlaydi; `wasm-tools validate` component'ni qabul qiladi.
 
+Qilingani:
+- `lib/wasm/wit`: WIT o'qiladi. Interface'lar (record, variant, enum, flags, alias, funksiyalar; tur e'lon qilinishidan oldin ham ishlatilishi mumkin) va world'lar (import va export qilinadigan interface va funksiyalar). Turlar runtime component binary'sidan o'qiydigan jadvalga tushadi (`CType`), shuning uchun layout, flatten va encode ikkalasi uchun bitta kod: `flatten_in`, `size_in`, `align_in`, `payload_in`. Hali o'qilmaydi: resource, `use`, `include` (qayerdaligini aytib rad etiladi). `conformance/tests/wit`; Nimadir'ning `world.wit`i to'liq o'qiladi.
+- `lib/wasm/encode`: core modul va WIT world'dan component, wit-component qilgandek. Import'lar modul instansiyasidan keyin uning memory va realloc'i bilan lower qilinadi. Shuning uchun modul shim funksiyalari bilan instansiyalanadi, ular jadval orqali chaqiradi; lower qilingan import'larni jadvalga fixup modul qo'yadi. Har import'ning core imzosi canonical ABI'niki bilan solishtiriladi va mos kelmasa aytiladi. Nomli turlar instance turida eq bound bilan export qilinadi. `arche-wasm component <core> <wit> <world> <out>` va `arche-wasm core`. Nimadir'ning counter, hello, gallery, store va runaway'ining dasturlari component'dan olinib, shu encoder bilan qayta o'raladi. 19 holat yana Nimadir bilan bir xil chiqadi: interpreter'da ham, JIT bilan ham, Nimadir'ning Wasmtime'dagi shell'ida ham (lokal).
+
 ### S39. ARM64 JIT va aarch64 telefon
 
 - `lib/wasm/jit.arche`'ning ARM64 varianti (x86-64'dagi qamrov bilan), S31'ning ochiq qolgani.

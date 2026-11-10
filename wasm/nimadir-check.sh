@@ -2,7 +2,9 @@
 # Nimadir's mini-apps on arche-wasm (docs/sprints.md S31): counter, hello,
 # gallery and store run unrebuilt in a shell with no window, and say what
 # Nimadir's own shell says to the same cases of its test suite
-# (tests/nimadir/cases.txt, expected/). runaway is stopped by the shell's
+# (tests/nimadir/cases.txt, expected/); so do they once their programs are
+# made components again by arche-wasm's encoder (S38), which refuses a world
+# that lacks what a program imports. runaway is stopped by the shell's
 # limits: a second a frame, 512 MiB of memory, and what a frame may send.
 # An app that imports what the shell does not give is refused. Each runs
 # in the interpreter, and again with the JIT (--jit).
@@ -23,6 +25,9 @@ for app in counter hello store gallery runaway; do
 done
 
 # The same as Nimadir: each case, normalized, against what Nimadir said.
+# Then again with each app's program taken out of its component and made a
+# component again by arche-wasm's own encoder (lib/wasm/encode.arche).
+check_cases() {
 grep -v '^#' "$apps/cases.txt" | {
     while read -r name args; do
         [ -n "$name" ] || continue
@@ -35,18 +40,43 @@ grep -v '^#' "$apps/cases.txt" | {
                 continue
             fi
             sh "$apps/normalize.sh" < "$work/out" > "$work/got"
-            if ! diff -u "$apps/expected/$name.txt" "$work/got" > "$work/diff"; then
-                echo "FAIL $name $mode: not what Nimadir says:"
+            cp "$apps/expected/$name.txt" "$work/want"
+            if [ -n "$1" ]; then
+                # The components are this encoder's, not wit-component's: their
+                # sizes are their own.
+                sed -i 's/loaded [0-9]* bytes/loaded N bytes/' "$work/got" "$work/want"
+            fi
+            if ! diff -u "$work/want" "$work/got" > "$work/diff"; then
+                echo "FAIL $name $mode $1: not what Nimadir says:"
                 head -30 "$work/diff"
                 failed=$((failed + 1))
             else
-                echo "PASS $name $mode: as Nimadir"
+                echo "PASS $name $mode $1: as Nimadir"
             fi
         done
     done
     echo "$failed" > "$work/failed"
 }
 failed=$(cat "$work/failed")
+}
+check_cases ""
+for app in counter hello store gallery runaway; do
+    "$wasm" core "$apps/$app.component.wasm" "$work/$app.core.wasm"
+    "$wasm" component "$work/$app.core.wasm" "$apps/world.wit" mini-app "$work/mini-apps/$app/$app.component.wasm"
+done
+check_cases "(encoded again)"
+# What the world does not have, the encoder refuses, saying what.
+grep -v 'ui-button: func' "$apps/world.wit" > "$work/less.wit"
+if "$wasm" component "$work/counter.core.wasm" "$work/less.wit" mini-app "$work/less.wasm" 2> "$work/err"; then
+    echo "FAIL a world without ui-button made the counter a component"
+    failed=$((failed + 1))
+elif ! grep -qxF "arche-wasm: the world imports no nimadir:shell/host-api@1.2.0 ui-button" "$work/err"; then
+    echo "FAIL a world without ui-button, said:"
+    cat "$work/err"
+    failed=$((failed + 1))
+else
+    echo "PASS a world without ui-button is refused for the counter"
+fi
 
 # expect <description> <status> <line that must appear> -- <arche-wasm args>...
 expect() {

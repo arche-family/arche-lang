@@ -1,0 +1,1018 @@
+/// A component made of a core module and the world it is built for (docs/
+/// sprints.md S38), as wit-component makes one. The module imports each
+/// function of the world's imported interfaces from a module named by the
+/// interface ("ns:pkg/iface@version"), and the world's own imported
+/// functions from "$root", with the core signature the canonical ABI
+/// gives it; it exports its memory as "memory", "cabi_realloc" when the
+/// host must give it strings or lists, and each function the world
+/// exports, by the function's name.
+///
+/// The imports are lowered with the module's memory and realloc, which do
+/// not exist until the module is instantiated. So the module is
+/// instantiated with a shim's functions instead, each of which calls
+/// through a table; the imports are lowered after it, and a fixup module
+/// puts them in the table. Then the exports are lifted and exported.
+import alloc;
+import wasm.component as c;
+import wasm.decode;
+import wasm.module as m;
+import wasm.wit;
+
+const ROOT: str = "$root";
+const TABLE: str = "$imports";
+
+// ---- bytes ------------------------------------------------------------------------------
+
+fn uleb(out: &mut alloc.List(u8), v: u64) {
+    var x = v;
+    while true {
+        let low = (x & 0x7F) as u8;
+        x = x >> 7;
+        if x == 0 {
+            out.push(low);
+            return;
+        }
+        out.push(low | 0x80);
+    }
+}
+
+/// A non-negative number as a signed LEB128: a type index where a
+/// primitive's code could be.
+fn sleb(out: &mut alloc.List(u8), v: u64) {
+    var x = v;
+    while true {
+        let low = (x & 0x7F) as u8;
+        x = x >> 7;
+        if x == 0 and (low & 0x40) == 0 {
+            out.push(low);
+            return;
+        }
+        out.push(low | 0x80);
+    }
+}
+
+fn name(out: &mut alloc.List(u8), s: str) {
+    uleb(out, v: s.len() as u64);
+    for b in s.bytes() {
+        out.push(b.*);
+    }
+}
+
+fn bytes(out: &mut alloc.List(u8), b: []u8) {
+    for x in b {
+        out.push(x.*);
+    }
+}
+
+/// A section: its id, its length, its contents.
+fn section(out: &mut alloc.List(u8), id: u8, body: &alloc.List(u8)) {
+    out.push(id);
+    uleb(out, v: body.len() as u64);
+    bytes(out, b: body.items());
+}
+
+/// A vector's contents with its count before it.
+fn vector(out: &mut alloc.List(u8), count: u32, body: &alloc.List(u8)) {
+    uleb(out, v: count as u64);
+    bytes(out, b: body.items());
+}
+
+// ---- the canonical ABI's core signatures --------------------------------------------------
+
+/// A function's core signature: its params and results as core value types.
+type Sig = struct {
+    params: alloc.List(u8),
+    results: alloc.List(u8),
+}
+
+fn flat(w: &wit.Wit, t: u32, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    c.flatten_in(&w.types, t: t, out: &mut out, a: a);
+    return out;
+}
+
+/// A function's params, flattened, and its result's.
+fn flat_params(w: &wit.Wit, f: u32, a: alloc.Allocator) -> alloc.List(u8) {
+    let ft = &w.types.items()[f as usize];
+    var out = alloc.List(u8).init(a);
+    var i: u32 = 0;
+    while i < ft.count : (i += 1) {
+        c.flatten_in(&w.types, t: ft.parts.items()[i as usize], out: &mut out, a: a);
+    }
+    return out;
+}
+
+fn flat_result(w: &wit.Wit, f: u32, a: alloc.Allocator) -> alloc.List(u8) {
+    let ft = &w.types.items()[f as usize];
+    let r = ft.parts.items()[ft.count as usize];
+    if r == c.NONE {
+        return alloc.List(u8).init(a);
+    }
+    return flat(w, t: r, a: a);
+}
+
+/// What a lowered import's core function is: params past 16 by a pointer,
+/// a result past one through a pointer it is given.
+fn lower_sig(w: &wit.Wit, f: u32, a: alloc.Allocator) -> Sig {
+    var params = flat_params(w, f: f, a: a);
+    if params.len() > c.MAX_FLAT_PARAMS {
+        params = alloc.List(u8).init(a);
+        params.push(c.FLAT_I32);
+    }
+    var results = flat_result(w, f: f, a: a);
+    if results.len() > c.MAX_FLAT_RESULTS {
+        results = alloc.List(u8).init(a);
+        params.push(c.FLAT_I32);
+    }
+    return Sig { params: params, results: results };
+}
+
+/// What a lifted export's core function is: params past 16 by a pointer,
+/// a result past one returned as a pointer.
+fn lift_sig(w: &wit.Wit, f: u32, a: alloc.Allocator) -> Sig {
+    var params = flat_params(w, f: f, a: a);
+    if params.len() > c.MAX_FLAT_PARAMS {
+        params = alloc.List(u8).init(a);
+        params.push(c.FLAT_I32);
+    }
+    var results = flat_result(w, f: f, a: a);
+    if results.len() > c.MAX_FLAT_RESULTS {
+        results = alloc.List(u8).init(a);
+        results.push(c.FLAT_I32);
+    }
+    return Sig { params: params, results: results };
+}
+
+/// Whether t has a string or a list in it: memory is how it crosses.
+fn in_memory(w: &wit.Wit, t: u32) -> bool {
+    if t == c.NONE {
+        return false;
+    }
+    let ty = &w.types.items()[t as usize];
+    if ty.kind == c.STRING or ty.kind == c.LIST {
+        return true;
+    }
+    if ty.kind == c.RECORD or ty.kind == c.TUPLE or ty.kind == c.VARIANT or ty.kind == c.OPTION or ty.kind == c.RESULT {
+        for p in ty.parts.items() {
+            if in_memory(w, t: p.*) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn params_in_memory(w: &wit.Wit, f: u32) -> bool {
+    let ft = &w.types.items()[f as usize];
+    var i: u32 = 0;
+    while i < ft.count : (i += 1) {
+        if in_memory(w, t: ft.parts.items()[i as usize]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn result_of(w: &wit.Wit, f: u32) -> u32 {
+    let ft = &w.types.items()[f as usize];
+    return ft.parts.items()[ft.count as usize];
+}
+
+// ---- types -------------------------------------------------------------------------------
+
+/// A scope of type indices: a component's, or an instance type's. The
+/// WIT types defined in it and their indices there.
+type Scope = struct {
+    ids: alloc.List(u32),
+    idx: alloc.List(u32),
+    count: u32,
+    /// The scope's declarations, and how many: an instance type's.
+    decls: alloc.List(u8),
+    decl_count: u32,
+    instance: bool,
+}
+
+fn new_scope(instance: bool, a: alloc.Allocator) -> Scope {
+    return Scope { ids: alloc.List(u32).init(a), idx: alloc.List(u32).init(a), count: 0, decls: alloc.List(u8).init(a), decl_count: 0, instance: instance };
+}
+
+fn index_in(s: &Scope, t: u32) -> u32 {
+    var i: usize = 0;
+    while i < s.ids.len() : (i += 1) {
+        if s.ids.items()[i] == t {
+            return s.idx.items()[i];
+        }
+    }
+    return c.NONE;
+}
+
+/// The WIT name of t, when an interface names it (a record, variant, enum
+/// or flags); empty otherwise.
+fn type_name(w: &wit.Wit, t: u32) -> str {
+    for i in w.interfaces.items() {
+        for d in i.types.items() {
+            if d.ty == t {
+                return d.name.view();
+            }
+        }
+    }
+    return "";
+}
+
+fn is_primitive(t: u32) -> bool {
+    return t <= (0x7F - c.STRING) as u32;
+}
+
+/// t as a value type of the scope: a primitive's code, or its index there,
+/// defined first when it is not yet.
+fn valtype(w: &wit.Wit, s: &mut Scope, t: u32, out: &mut alloc.List(u8), a: alloc.Allocator) {
+    if is_primitive(t) {
+        out.push((0x7F - t) as u8);
+        return;
+    }
+    var i = index_in(s, t: t);
+    if i == c.NONE {
+        i = define(w, s: s, t: t, a: a);
+    }
+    sleb(out, v: i as u64);
+}
+
+fn optional(w: &wit.Wit, s: &mut Scope, t: u32, out: &mut alloc.List(u8), a: alloc.Allocator) {
+    if t == c.NONE {
+        out.push(0);
+        return;
+    }
+    out.push(1);
+    valtype(w, s: s, t: t, out: out, a: a);
+}
+
+/// t defined in the scope, after what it is made of; a named type exported
+/// there too, as the component model wants of what a function names. Its
+/// index.
+fn define(w: &wit.Wit, s: &mut Scope, t: u32, a: alloc.Allocator) -> u32 {
+    let ty = &w.types.items()[t as usize];
+    var body = alloc.List(u8).init(a);
+    let k = ty.kind;
+    body.push(k);
+    if k == c.RECORD {
+        uleb(&mut body, v: ty.parts.len() as u64);
+        var i: usize = 0;
+        while i < ty.parts.len() : (i += 1) {
+            name(&mut body, s: ty.names.items()[i].view());
+            valtype(w, s: s, t: ty.parts.items()[i], out: &mut body, a: a);
+        }
+    } else if k == c.VARIANT {
+        uleb(&mut body, v: ty.parts.len() as u64);
+        var i: usize = 0;
+        while i < ty.parts.len() : (i += 1) {
+            name(&mut body, s: ty.names.items()[i].view());
+            optional(w, s: s, t: ty.parts.items()[i], out: &mut body, a: a);
+            // No refinement.
+            body.push(0);
+        }
+    } else if k == c.TUPLE {
+        uleb(&mut body, v: ty.parts.len() as u64);
+        for p in ty.parts.items() {
+            valtype(w, s: s, t: p.*, out: &mut body, a: a);
+        }
+    } else if k == c.FLAGS or k == c.ENUM {
+        uleb(&mut body, v: ty.names.len() as u64);
+        for n in ty.names.items() {
+            name(&mut body, s: n.view());
+        }
+    } else if k == c.LIST or k == c.OPTION {
+        valtype(w, s: s, t: ty.parts.items()[0], out: &mut body, a: a);
+    } else if k == c.RESULT {
+        optional(w, s: s, t: ty.parts.items()[0], out: &mut body, a: a);
+        optional(w, s: s, t: ty.parts.items()[1], out: &mut body, a: a);
+    } else if k == c.FUNC {
+        uleb(&mut body, v: ty.count as u64);
+        var i: u32 = 0;
+        while i < ty.count : (i += 1) {
+            name(&mut body, s: ty.names.items()[i as usize].view());
+            valtype(w, s: s, t: ty.parts.items()[i as usize], out: &mut body, a: a);
+        }
+        let r = ty.parts.items()[ty.count as usize];
+        if r == c.NONE {
+            body.push(0x01);
+            body.push(0x00);
+        } else {
+            body.push(0x00);
+            valtype(w, s: s, t: r, out: &mut body, a: a);
+        }
+    }
+    var at = s.count;
+    if s.instance {
+        s.decls.push(0x01);
+    }
+    bytes(&mut s.decls, b: body.items());
+    s.decl_count += 1;
+    s.count += 1;
+    let named = type_name(w, t: t);
+    if named.len() > 0 and k != c.FUNC and s.instance {
+        // export "name" (type (eq at)): a new index, the one used.
+        s.decls.push(0x04);
+        s.decls.push(0x00);
+        name(&mut s.decls, s: named);
+        s.decls.push(0x03);
+        s.decls.push(0x00);
+        uleb(&mut s.decls, v: at as u64);
+        s.decl_count += 1;
+        at = s.count;
+        s.count += 1;
+    }
+    s.ids.push(t);
+    s.idx.push(at);
+    return at;
+}
+
+// ---- the module's imports ----------------------------------------------------------------
+
+/// An import the module makes of a world's function: which interface's
+/// (its place in the world's imports, or NONE for the world's own), and
+/// which of its functions.
+type Lowering = struct {
+    group: u32,
+    index: u32,
+}
+
+/// The function a lowering is of.
+fn func_at(w: &wit.Wit, world: u32, l: Lowering) -> &wit.Func {
+    let wd = &w.worlds.items()[world as usize];
+    if l.group == c.NONE {
+        return &wd.import_funcs.items()[l.index as usize];
+    }
+    return &w.interfaces.items()[wd.imports.items()[l.group as usize] as usize].funcs.items()[l.index as usize];
+}
+
+fn same(x: []u8, y: []u8) -> bool {
+    return m.same_types(x: x, y: y);
+}
+
+fn signature_text(out: &mut alloc.String, params: []u8, results: []u8) {
+    out.push_str("(");
+    var i: usize = 0;
+    while i < params.len() : (i += 1) {
+        if i > 0 {
+            out.push_str(" ");
+        }
+        out.push_str(core_name(params[i]));
+    }
+    out.push_str(") -> (");
+    i = 0;
+    while i < results.len() : (i += 1) {
+        if i > 0 {
+            out.push_str(" ");
+        }
+        out.push_str(core_name(results[i]));
+    }
+    out.push_str(")");
+}
+
+fn core_name(t: u8) -> str {
+    if t == c.FLAT_I32 {
+        return "i32";
+    }
+    if t == c.FLAT_I64 {
+        return "i64";
+    }
+    if t == c.FLAT_F32 {
+        return "f32";
+    }
+    return "f64";
+}
+
+fn find_func(funcs: &alloc.List(wit.Func), n: str) -> u32 {
+    var i: u32 = 0;
+    while (i as usize) < funcs.len() : (i += 1) {
+        if funcs.items()[i as usize].name.view().eq(n) {
+            return i;
+        }
+    }
+    return c.NONE;
+}
+
+// ---- core modules of the component's own --------------------------------------------------
+
+fn core_header(out: &mut alloc.List(u8)) {
+    bytes(out, b: "\x00asm".bytes());
+    out.push(1);
+    out.push(0);
+    out.push(0);
+    out.push(0);
+}
+
+fn core_functype(out: &mut alloc.List(u8), s: &Sig) {
+    out.push(0x60);
+    uleb(out, v: s.params.len() as u64);
+    bytes(out, b: s.params.items());
+    uleb(out, v: s.results.len() as u64);
+    bytes(out, b: s.results.items());
+}
+
+/// The shim: function i calls the table's slot i with what it is given,
+/// for the lowered import i to be put there; the table is exported.
+fn shim(sigs: &alloc.List(Sig), a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    core_header(&mut out);
+    let n = sigs.len() as u32;
+    var types = alloc.List(u8).init(a);
+    for s in sigs.items() {
+        core_functype(&mut types, s: s);
+    }
+    var sec = alloc.List(u8).init(a);
+    vector(&mut sec, count: n, body: &types);
+    section(&mut out, id: 1, body: &sec);
+    var funcs = alloc.List(u8).init(a);
+    var i: u32 = 0;
+    while i < n : (i += 1) {
+        uleb(&mut funcs, v: i as u64);
+    }
+    sec = alloc.List(u8).init(a);
+    vector(&mut sec, count: n, body: &funcs);
+    section(&mut out, id: 3, body: &sec);
+    // The table: funcref, n slots.
+    sec = alloc.List(u8).init(a);
+    sec.push(1);
+    sec.push(0x70);
+    sec.push(0x01);
+    uleb(&mut sec, v: n as u64);
+    uleb(&mut sec, v: n as u64);
+    section(&mut out, id: 4, body: &sec);
+    var exports = alloc.List(u8).init(a);
+    i = 0;
+    while i < n : (i += 1) {
+        var digits = alloc.String.init(a);
+        digits.push_u64(i as u64);
+        name(&mut exports, s: digits.view());
+        exports.push(0x00);
+        uleb(&mut exports, v: i as u64);
+    }
+    name(&mut exports, s: TABLE);
+    exports.push(0x01);
+    exports.push(0x00);
+    sec = alloc.List(u8).init(a);
+    vector(&mut sec, count: n + 1, body: &exports);
+    section(&mut out, id: 7, body: &sec);
+    var codes = alloc.List(u8).init(a);
+    i = 0;
+    while i < n : (i += 1) {
+        var body = alloc.List(u8).init(a);
+        // No locals.
+        body.push(0);
+        let s = &sigs.items()[i as usize];
+        var p: u32 = 0;
+        while (p as usize) < s.params.len() : (p += 1) {
+            body.push(0x20);
+            uleb(&mut body, v: p as u64);
+        }
+        body.push(0x41);
+        sleb(&mut body, v: i as u64);
+        body.push(0x11);
+        uleb(&mut body, v: i as u64);
+        body.push(0x00);
+        body.push(0x0B);
+        uleb(&mut codes, v: body.len() as u64);
+        bytes(&mut codes, b: body.items());
+    }
+    sec = alloc.List(u8).init(a);
+    vector(&mut sec, count: n, body: &codes);
+    section(&mut out, id: 10, body: &sec);
+    return out;
+}
+
+/// The fixup: it imports the lowered functions and the shim's table, and
+/// its element segment puts them in the table's slots.
+fn fixup(sigs: &alloc.List(Sig), a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    core_header(&mut out);
+    let n = sigs.len() as u32;
+    var types = alloc.List(u8).init(a);
+    for s in sigs.items() {
+        core_functype(&mut types, s: s);
+    }
+    var sec = alloc.List(u8).init(a);
+    vector(&mut sec, count: n, body: &types);
+    section(&mut out, id: 1, body: &sec);
+    var imports = alloc.List(u8).init(a);
+    var i: u32 = 0;
+    while i < n : (i += 1) {
+        name(&mut imports, s: "");
+        var digits = alloc.String.init(a);
+        digits.push_u64(i as u64);
+        name(&mut imports, s: digits.view());
+        imports.push(0x00);
+        uleb(&mut imports, v: i as u64);
+    }
+    name(&mut imports, s: "");
+    name(&mut imports, s: TABLE);
+    imports.push(0x01);
+    imports.push(0x70);
+    imports.push(0x01);
+    uleb(&mut imports, v: n as u64);
+    uleb(&mut imports, v: n as u64);
+    sec = alloc.List(u8).init(a);
+    vector(&mut sec, count: n + 1, body: &imports);
+    section(&mut out, id: 2, body: &sec);
+    // One active segment at slot 0 of table 0: the functions in order.
+    var elems = alloc.List(u8).init(a);
+    elems.push(0x00);
+    elems.push(0x41);
+    elems.push(0x00);
+    elems.push(0x0B);
+    uleb(&mut elems, v: n as u64);
+    i = 0;
+    while i < n : (i += 1) {
+        uleb(&mut elems, v: i as u64);
+    }
+    sec = alloc.List(u8).init(a);
+    vector(&mut sec, count: 1, body: &elems);
+    section(&mut out, id: 9, body: &sec);
+    return out;
+}
+
+// ---- the component -------------------------------------------------------------------------
+
+fn find_export(md: &m.Module, n: str, kind: u8) -> u32 {
+    for e in md.exports.items() {
+        if e.kind == kind and e.name.view().eq(n) {
+            return e.index;
+        }
+    }
+    return c.NONE;
+}
+
+/// The component of the core module core built for the world numbered
+/// world of w; empty, with why saying why, when it cannot be made.
+pub fn component(core: []u8, w: &wit.Wit, world: u32, why: &mut alloc.String, a: alloc.Allocator) -> alloc.List(u8) {
+    let none_out = alloc.List(u8).init(a);
+    let md = match decode.decode(core, a) {
+        ok(x) => { x }
+        err(_) => {
+            why.push_str("the core module does not decode");
+            return none_out;
+        }
+    };
+    let wd = &w.worlds.items()[world as usize];
+    let memory = find_export(&md, n: "memory", kind: 2);
+    let realloc = find_export(&md, n: "cabi_realloc", kind: 0);
+    // The module's function imports, each a world's function.
+    var lowerings = alloc.List(Lowering).init(a);
+    var sigs = alloc.List(Sig).init(a);
+    var groups_used = alloc.List(bool).init(a);
+    while groups_used.len() < wd.imports.len() {
+        groups_used.push(false);
+    }
+    var needs_memory = false;
+    var needs_realloc = false;
+    for imp in md.imports.items() {
+        if imp.kind != 0 {
+            why.push_str("the core module imports what is not a function: ");
+            why.push_str(imp.module.view());
+            why.push_str(" ");
+            why.push_str(imp.name.view());
+            return none_out;
+        }
+        var group = c.NONE;
+        var fi = c.NONE;
+        if imp.module.view().eq(ROOT) {
+            fi = find_func(&wd.import_funcs, n: imp.name.view());
+        } else {
+            var g: u32 = 0;
+            while (g as usize) < wd.imports.len() : (g += 1) {
+                let id = wit.interface_id(w, i: wd.imports.items()[g as usize], a: a);
+                if id.view().eq(imp.module.view()) {
+                    group = g;
+                    fi = find_func(&w.interfaces.items()[wd.imports.items()[g as usize] as usize].funcs, n: imp.name.view());
+                }
+            }
+        }
+        if fi == c.NONE {
+            why.push_str("the world imports no ");
+            why.push_str(imp.module.view());
+            why.push_str(" ");
+            why.push_str(imp.name.view());
+            return none_out;
+        }
+        let lw = Lowering { group: group, index: fi };
+        if group != c.NONE {
+            groups_used.items_mut()[group as usize] = true;
+        }
+        let fty = func_at(w, world: world, l: lw).ty;
+        let sig = lower_sig(w, f: fty, a: a);
+        let declared = &md.types.items()[md.funcs.items()[imp.index as usize].type_index as usize];
+        if not same(x: declared.params.items(), y: sig.params.items()) or not same(x: declared.results.items(), y: sig.results.items()) {
+            why.push_str(imp.module.view());
+            why.push_str(" ");
+            why.push_str(imp.name.view());
+            why.push_str(" is imported as ");
+            signature_text(why, params: declared.params.items(), results: declared.results.items());
+            why.push_str(", and the canonical ABI makes it ");
+            signature_text(why, params: sig.params.items(), results: sig.results.items());
+            return none_out;
+        }
+        if params_in_memory(w, f: fty) or in_memory(w, t: result_of(w, f: fty)) or sig.params.len() != flat_params(w, f: fty, a: a).len() {
+            needs_memory = true;
+        }
+        if in_memory(w, t: result_of(w, f: fty)) {
+            needs_realloc = true;
+        }
+        lowerings.push(lw);
+        sigs.push(sig);
+    }
+    // Each function the world exports, exported by the module as it lifts.
+    for f in wd.export_funcs.items() {
+        let at = find_export(&md, n: f.name.view(), kind: 0);
+        if at == c.NONE {
+            why.push_str("the core module does not export ");
+            why.push_str(f.name.view());
+            return none_out;
+        }
+        let sig = lift_sig(w, f: f.ty, a: a);
+        let declared = &md.types.items()[md.funcs.items()[at as usize].type_index as usize];
+        if not same(x: declared.params.items(), y: sig.params.items()) or not same(x: declared.results.items(), y: sig.results.items()) {
+            why.push_str(f.name.view());
+            why.push_str(" is exported as ");
+            signature_text(why, params: declared.params.items(), results: declared.results.items());
+            why.push_str(", and the canonical ABI makes it ");
+            signature_text(why, params: sig.params.items(), results: sig.results.items());
+            return none_out;
+        }
+        if params_in_memory(w, f: f.ty) or in_memory(w, t: result_of(w, f: f.ty)) or sig.params.len() != flat_params(w, f: f.ty, a: a).len() or sig.results.len() != flat_result(w, f: f.ty, a: a).len() {
+            needs_memory = true;
+        }
+        if params_in_memory(w, f: f.ty) or sig.params.len() != flat_params(w, f: f.ty, a: a).len() {
+            needs_realloc = true;
+        }
+    }
+    if wd.exports.len() > 0 {
+        why.push_str("a world that exports interfaces is not encoded yet");
+        return none_out;
+    }
+    if needs_memory and memory == c.NONE {
+        why.push_str("the core module does not export its memory as \"memory\"");
+        return none_out;
+    }
+    if needs_realloc and realloc == c.NONE {
+        why.push_str("the core module does not export \"cabi_realloc\"");
+        return none_out;
+    }
+
+    var out = alloc.List(u8).init(a);
+    // The component's preamble: layer 1.
+    bytes(&mut out, b: "\x00asm".bytes());
+    out.push(0x0D);
+    out.push(0x00);
+    out.push(0x01);
+    out.push(0x00);
+
+    // Types: an instance type for each interface imported, the functions
+    // the module uses of it; a function type for each of the world's own.
+    var top = new_scope(instance: false, a: a);
+    var instance_type = alloc.List(u32).init(a);
+    var g: u32 = 0;
+    while (g as usize) < wd.imports.len() : (g += 1) {
+        if not groups_used.items()[g as usize] {
+            instance_type.push(c.NONE);
+            continue;
+        }
+        var inner = new_scope(instance: true, a: a);
+        for l in lowerings.items() {
+            if l.group != g {
+                continue;
+            }
+            let lf = func_at(w, world: world, l: l.*);
+            let ft = define(w, s: &mut inner, t: lf.ty, a: a);
+            inner.decls.push(0x04);
+            inner.decls.push(0x00);
+            name(&mut inner.decls, s: lf.name.view());
+            inner.decls.push(0x01);
+            uleb(&mut inner.decls, v: ft as u64);
+            inner.decl_count += 1;
+        }
+        var body = alloc.List(u8).init(a);
+        body.push(c.INSTANCE);
+        vector(&mut body, count: inner.decl_count, body: &inner.decls);
+        bytes(&mut top.decls, b: body.items());
+        top.decl_count += 1;
+        instance_type.push(top.count);
+        top.count += 1;
+    }
+    var root_type = alloc.List(u32).init(a);
+    for l in lowerings.items() {
+        if l.group == c.NONE {
+            root_type.push(define(w, s: &mut top, t: func_at(w, world: world, l: l.*).ty, a: a));
+        } else {
+            root_type.push(c.NONE);
+        }
+    }
+    var export_type = alloc.List(u32).init(a);
+    for f in wd.export_funcs.items() {
+        export_type.push(define(w, s: &mut top, t: f.ty, a: a));
+    }
+    if top.decl_count > 0 {
+        var sec = alloc.List(u8).init(a);
+        vector(&mut sec, count: top.decl_count, body: &top.decls);
+        section(&mut out, id: 7, body: &sec);
+    }
+
+    // Imports: the interfaces, as instances; the world's own functions.
+    var imports = alloc.List(u8).init(a);
+    var import_count: u32 = 0;
+    var instance_of = alloc.List(u32).init(a);
+    var instances: u32 = 0;
+    g = 0;
+    while (g as usize) < wd.imports.len() : (g += 1) {
+        if instance_type.items()[g as usize] == c.NONE {
+            instance_of.push(c.NONE);
+            continue;
+        }
+        imports.push(0x00);
+        name(&mut imports, s: wit.interface_id(w, i: wd.imports.items()[g as usize], a: a).view());
+        imports.push(0x05);
+        uleb(&mut imports, v: instance_type.items()[g as usize] as u64);
+        import_count += 1;
+        instance_of.push(instances);
+        instances += 1;
+    }
+    var funcs: u32 = 0;
+    var func_of = alloc.List(u32).init(a);
+    var k: usize = 0;
+    while k < lowerings.len() : (k += 1) {
+        let l = lowerings.items()[k];
+        if l.group == c.NONE {
+            imports.push(0x00);
+            name(&mut imports, s: func_at(w, world: world, l: l).name.view());
+            imports.push(0x01);
+            uleb(&mut imports, v: root_type.items()[k] as u64);
+            import_count += 1;
+            func_of.push(funcs);
+            funcs += 1;
+        } else {
+            func_of.push(c.NONE);
+        }
+    }
+    if import_count > 0 {
+        var sec = alloc.List(u8).init(a);
+        vector(&mut sec, count: import_count, body: &imports);
+        section(&mut out, id: 10, body: &sec);
+    }
+
+    // The core modules: the program, the shim and the fixup.
+    var body = alloc.List(u8).init(a);
+    bytes(&mut body, b: core);
+    section(&mut out, id: 1, body: &body);
+    let n = lowerings.len() as u32;
+    let shim_bytes = shim(&sigs, a: a);
+    section(&mut out, id: 1, body: &shim_bytes);
+    let fixup_bytes = fixup(&sigs, a: a);
+    section(&mut out, id: 1, body: &fixup_bytes);
+
+    // Core instance 0: the shim.
+    var sec = alloc.List(u8).init(a);
+    var inst = alloc.List(u8).init(a);
+    inst.push(0x00);
+    uleb(&mut inst, v: 1);
+    uleb(&mut inst, v: 0);
+    vector(&mut sec, count: 1, body: &inst);
+    section(&mut out, id: 2, body: &sec);
+    var core_instances: u32 = 1;
+    // Core functions 0..n: the shim's; core table 0: its table.
+    var aliases = alloc.List(u8).init(a);
+    var i: u32 = 0;
+    while i < n : (i += 1) {
+        aliases.push(0x00);
+        aliases.push(0x00);
+        aliases.push(0x01);
+        uleb(&mut aliases, v: 0);
+        var digits = alloc.String.init(a);
+        digits.push_u64(i as u64);
+        name(&mut aliases, s: digits.view());
+    }
+    aliases.push(0x00);
+    aliases.push(0x01);
+    aliases.push(0x01);
+    uleb(&mut aliases, v: 0);
+    name(&mut aliases, s: TABLE);
+    sec = alloc.List(u8).init(a);
+    vector(&mut sec, count: n + 1, body: &aliases);
+    section(&mut out, id: 6, body: &sec);
+    var core_funcs = n;
+
+    // What the program is instantiated with: for each module it imports
+    // from, an instance of the shim's functions by their names.
+    var modules = alloc.List(alloc.String).init(a);
+    for l in lowerings.items() {
+        var mname = alloc.String.from(ROOT, a);
+        if l.group != c.NONE {
+            mname = wit.interface_id(w, i: wd.imports.items()[l.group as usize], a: a);
+        }
+        var seen = false;
+        for x in modules.items() {
+            if x.view().eq(mname.view()) {
+                seen = true;
+            }
+        }
+        if not seen {
+            modules.push(mname);
+        }
+    }
+    var insts = alloc.List(u8).init(a);
+    var module_instance = alloc.List(u32).init(a);
+    for mname in modules.items() {
+        var exports = alloc.List(u8).init(a);
+        var count: u32 = 0;
+        k = 0;
+        while k < lowerings.len() : (k += 1) {
+            let l = &lowerings.items()[k];
+            var lm = alloc.String.from(ROOT, a);
+            if l.group != c.NONE {
+                lm = wit.interface_id(w, i: wd.imports.items()[l.group as usize], a: a);
+            }
+            if lm.view().eq(mname.view()) {
+                name(&mut exports, s: func_at(w, world: world, l: l.*).name.view());
+                exports.push(0x00);
+                uleb(&mut exports, v: k as u64);
+                count += 1;
+            }
+        }
+        insts.push(0x01);
+        vector(&mut insts, count: count, body: &exports);
+        module_instance.push(core_instances);
+        core_instances += 1;
+    }
+    // The program, instantiated with them.
+    insts.push(0x00);
+    uleb(&mut insts, v: 0);
+    uleb(&mut insts, v: modules.len() as u64);
+    k = 0;
+    while k < modules.len() : (k += 1) {
+        name(&mut insts, s: modules.items()[k].view());
+        insts.push(0x12);
+        uleb(&mut insts, v: module_instance.items()[k] as u64);
+    }
+    let program = core_instances;
+    core_instances += 1;
+    sec = alloc.List(u8).init(a);
+    vector(&mut sec, count: modules.len() as u32 + 1, body: &insts);
+    section(&mut out, id: 2, body: &sec);
+
+    // Its memory and realloc.
+    aliases = alloc.List(u8).init(a);
+    var alias_count: u32 = 0;
+    var realloc_func = c.NONE;
+    if memory != c.NONE {
+        aliases.push(0x00);
+        aliases.push(0x02);
+        aliases.push(0x01);
+        uleb(&mut aliases, v: program as u64);
+        name(&mut aliases, s: "memory");
+        alias_count += 1;
+    }
+    if realloc != c.NONE {
+        aliases.push(0x00);
+        aliases.push(0x00);
+        aliases.push(0x01);
+        uleb(&mut aliases, v: program as u64);
+        name(&mut aliases, s: "cabi_realloc");
+        alias_count += 1;
+        realloc_func = core_funcs;
+        core_funcs += 1;
+    }
+    // The imported interfaces' functions, as component functions.
+    k = 0;
+    while k < lowerings.len() : (k += 1) {
+        let l = lowerings.items()[k];
+        if l.group == c.NONE {
+            continue;
+        }
+        aliases.push(0x01);
+        aliases.push(0x00);
+        uleb(&mut aliases, v: instance_of.items()[l.group as usize] as u64);
+        name(&mut aliases, s: func_at(w, world: world, l: l).name.view());
+        alias_count += 1;
+        func_of.items_mut()[k] = funcs;
+        funcs += 1;
+    }
+    if alias_count > 0 {
+        sec = alloc.List(u8).init(a);
+        vector(&mut sec, count: alias_count, body: &aliases);
+        section(&mut out, id: 6, body: &sec);
+    }
+
+    // Each import lowered, with the memory and realloc it needs.
+    var canons = alloc.List(u8).init(a);
+    var lowered_first = core_funcs;
+    k = 0;
+    while k < lowerings.len() : (k += 1) {
+        let lty = func_at(w, world: world, l: lowerings.items()[k]).ty;
+        canons.push(0x01);
+        canons.push(0x00);
+        uleb(&mut canons, v: func_of.items()[k] as u64);
+        var opts = alloc.List(u8).init(a);
+        var opt_count: u32 = 0;
+        let mem = params_in_memory(w, f: lty) or in_memory(w, t: result_of(w, f: lty)) or sigs.items()[k].params.len() != flat_params(w, f: lty, a: a).len();
+        if mem {
+            // UTF-8, the memory, and realloc when the result is given in it.
+            opts.push(0x00);
+            opts.push(0x03);
+            uleb(&mut opts, v: 0);
+            opt_count += 2;
+            if in_memory(w, t: result_of(w, f: lty)) {
+                opts.push(0x04);
+                uleb(&mut opts, v: realloc_func as u64);
+                opt_count += 1;
+            }
+        }
+        vector(&mut canons, count: opt_count, body: &opts);
+        core_funcs += 1;
+    }
+    if n > 0 {
+        sec = alloc.List(u8).init(a);
+        vector(&mut sec, count: n, body: &canons);
+        section(&mut out, id: 8, body: &sec);
+    }
+
+    // The fixup, with the lowered functions and the shim's table.
+    var fix = alloc.List(u8).init(a);
+    var fix_exports = alloc.List(u8).init(a);
+    i = 0;
+    while i < n : (i += 1) {
+        var digits = alloc.String.init(a);
+        digits.push_u64(i as u64);
+        name(&mut fix_exports, s: digits.view());
+        fix_exports.push(0x00);
+        uleb(&mut fix_exports, v: (lowered_first + i) as u64);
+    }
+    name(&mut fix_exports, s: TABLE);
+    fix_exports.push(0x01);
+    uleb(&mut fix_exports, v: 0);
+    fix.push(0x01);
+    vector(&mut fix, count: n + 1, body: &fix_exports);
+    let fix_args = core_instances;
+    core_instances += 1;
+    fix.push(0x00);
+    uleb(&mut fix, v: 2);
+    uleb(&mut fix, v: 1);
+    name(&mut fix, s: "");
+    fix.push(0x12);
+    uleb(&mut fix, v: fix_args as u64);
+    core_instances += 1;
+    sec = alloc.List(u8).init(a);
+    vector(&mut sec, count: 2, body: &fix);
+    section(&mut out, id: 2, body: &sec);
+
+    // The world's exports: aliased from the program, lifted, exported.
+    k = 0;
+    while k < wd.export_funcs.len() : (k += 1) {
+        let f = &wd.export_funcs.items()[k];
+        aliases = alloc.List(u8).init(a);
+        aliases.push(0x00);
+        aliases.push(0x00);
+        aliases.push(0x01);
+        uleb(&mut aliases, v: program as u64);
+        name(&mut aliases, s: f.name.view());
+        sec = alloc.List(u8).init(a);
+        vector(&mut sec, count: 1, body: &aliases);
+        section(&mut out, id: 6, body: &sec);
+        let core_func = core_funcs;
+        core_funcs += 1;
+        canons = alloc.List(u8).init(a);
+        canons.push(0x00);
+        canons.push(0x00);
+        uleb(&mut canons, v: core_func as u64);
+        var opts = alloc.List(u8).init(a);
+        var opt_count: u32 = 0;
+        let sig = lift_sig(w, f: f.ty, a: a);
+        let mem = params_in_memory(w, f: f.ty) or in_memory(w, t: result_of(w, f: f.ty)) or sig.params.len() != flat_params(w, f: f.ty, a: a).len() or sig.results.len() != flat_result(w, f: f.ty, a: a).len();
+        if mem {
+            opts.push(0x00);
+            opts.push(0x03);
+            uleb(&mut opts, v: 0);
+            opt_count += 2;
+            if params_in_memory(w, f: f.ty) or sig.params.len() != flat_params(w, f: f.ty, a: a).len() {
+                opts.push(0x04);
+                uleb(&mut opts, v: realloc_func as u64);
+                opt_count += 1;
+            }
+        }
+        vector(&mut canons, count: opt_count, body: &opts);
+        uleb(&mut canons, v: export_type.items()[k] as u64);
+        sec = alloc.List(u8).init(a);
+        vector(&mut sec, count: 1, body: &canons);
+        section(&mut out, id: 8, body: &sec);
+        let lifted = funcs;
+        funcs += 1;
+        var exp = alloc.List(u8).init(a);
+        exp.push(0x00);
+        name(&mut exp, s: f.name.view());
+        exp.push(0x01);
+        uleb(&mut exp, v: lifted as u64);
+        exp.push(0x00);
+        sec = alloc.List(u8).init(a);
+        vector(&mut sec, count: 1, body: &exp);
+        section(&mut out, id: 11, body: &sec);
+        funcs += 1;
+    }
+    return out;
+}

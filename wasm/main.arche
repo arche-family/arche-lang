@@ -6,12 +6,20 @@
 ///       [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]...
 ///                                        a Nimadir mini-app, with no window, as
 ///                                        Nimadir's headless runner runs it
+///   arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>
+///                                        the component of a core module built
+///                                        for a WIT world (lib/wasm/encode.arche)
+///   arche-wasm core <component.wasm> <out.wasm>
+///                                        a component's first core module, the
+///                                        program's, as wit-component lays it out
 ///   arche-wasm serve <handler.wasm> <port> (<certificate chain> <key> | --plain) [workers]
 ///                                        HTTPS, each request answered by the
 ///                                        module's handle (serve.arche)
 import alloc;
 import wasm.component;
+import wasm.encode;
 import wasm.exec;
+import wasm.wit;
 import crypto.random;
 import http;
 import http.server;
@@ -24,6 +32,7 @@ import tls;
 
 fn usage(sys: &mut std.System) -> !void {
     sys.stderr.write("usage: arche-wasm spec [--jit] <script.json>...\n");
+    sys.stderr.write("       arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>\n");
     sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]...\n");
     sys.proc.exit(2);
 }
@@ -122,6 +131,14 @@ fn main(sys: &mut std.System) -> !void {
     }
     if cmd.eq("nimadir") and sys.args.len() >= 3 {
         try run_app(sys);
+        return;
+    }
+    if cmd.eq("core") and sys.args.len() == 4 {
+        try first_core_module(sys);
+        return;
+    }
+    if cmd.eq("component") and sys.args.len() == 6 {
+        try make_component(sys);
         return;
     }
     try usage(sys);
@@ -656,6 +673,71 @@ fn quote(s: str, out: &mut alloc.String) {
     }
     out.push_str(s[at..b.len()]);
     out.push_str("\"");
+}
+
+/// A component's first core module, written out: its sections walked, the
+/// first of id 1 taken.
+fn first_core_module(sys: &mut std.System) -> !void {
+    let bytes = try sys.fs.read_bytes(sys.args.get(2), sys.alloc);
+    let b = bytes.items();
+    var at: usize = 8;
+    while at < b.len() {
+        let id = b[at];
+        at += 1;
+        var size: u64 = 0;
+        var shift: u64 = 0;
+        while at < b.len() {
+            let x = b[at];
+            at += 1;
+            size = size | (((x & 0x7F) as u64) << shift);
+            shift += 7;
+            if (x & 0x80) == 0 {
+                break;
+            }
+        }
+        if at + size as usize > b.len() {
+            break;
+        }
+        if id == 1 {
+            try sys.fs.write_bytes(sys.args.get(3), b[at..at + size as usize]);
+            return;
+        }
+        at += size as usize;
+    }
+    sys.stderr.write("arche-wasm: no core module in the component\n");
+    sys.proc.exit(1);
+}
+
+/// The component of a core module built for a world of a WIT package.
+fn make_component(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let core = try sys.fs.read_bytes(sys.args.get(2), a);
+    let text = try sys.fs.read_file(sys.args.get(3), a);
+    var why = alloc.String.init(a);
+    let w = match wit.parse(text.view(), why: &mut why, a: a) {
+        some(x) => { x }
+        none => {
+            sys.stderr.write("arche-wasm: ");
+            sys.stderr.write(sys.args.get(3));
+            sys.stderr.write(": ");
+            sys.stderr.write(why.view());
+            sys.stderr.write("\n");
+            sys.proc.exit(1);
+        }
+    };
+    let world = wit.world_named(&w, name: sys.args.get(4));
+    if world == component.NONE {
+        sys.stderr.write("arche-wasm: no world of that name\n");
+        sys.proc.exit(1);
+    }
+    let out = encode.component(core.items(), w: &w, world: world, why: &mut why, a: a);
+    if why.len() > 0 {
+        sys.stderr.write("arche-wasm: ");
+        sys.stderr.write(why.view());
+        sys.stderr.write("\n");
+        sys.proc.exit(1);
+    }
+    try sys.fs.write_bytes(sys.args.get(5), out.items());
 }
 
 fn component_error(e: component.ComponentError) -> str {
