@@ -479,6 +479,10 @@ Arche OS telefonining Trek A'si (Linux kernel ustida Arche userspace) uchun: arc
 - `std.linux`: DRM/KMS dumb buffer, evdev input, PID 1 sifatida ishlash (bola process'larni yig'ish).
 - Shrift, PNG va D-Bus parser'lari uchun fuzzing.
 
+Bajarildi (qisman):
+- `lib/font.arche` (`font` root): TrueType o'qiladi (cmap 4 va 12, glyf'ning oddiy va composite glyph'lari, hmtx), rasterizer faqat butun sonlar bilan ishlaydi. Har piksel qatoriga 16 ta namuna qatori olinadi, har birining qamrovi gorizontal bo'yicha aniq hisoblanadi; to'ldirish qoidasi non-zero winding. Glyph cache va satr chizish ham bor. Testlar: `conformance/tests/font` o'z ichida yasalgan kichik shrift bilan ASCII-art golden'lar beradi, ular har target'da (x86-64, aarch64, riscv64, wasm32, own backend) bir xil chiqishi kerak; buzilgan shrift panic bermaydi. `interop/font.sh` DejaVu Sans'ning 6253 glyph'ining hammasini xatosiz chizadi va lotin hamda kirill namunasining hash'ini tekshiradi; CI buni aarch64 va riscv64'da ham bajaradi. `fuzz/font.sh`: 2 daqiqada 59004 holat, panic yo'q. Kerning (kern, GPOS) va hinting hali yo'q.
+- `lib/image/png.arche` (`image` root): barcha rang turlari va bit chuqurliklari, palitra va tRNS, beshala filtr, Adam7. CRC va Adler-32 tekshiriladi. PngSuite'ning 161 ta yaxshi rasmi kutilgan pikselga mos keladi (Pillow bilan solishtirildi; tbbn0g04'da Pillow xato qiladi, spec bo'yicha 464 shaffof piksel), 14 ta buzilgani rad etiladi. `fuzz/png.sh` chunk CRC'larini qayta hisoblab fuzz qiladi: 90 soniyada 6,3 mln holat, panic yo'q.
+
 **Qabul:** shrift golden image testlari har platformada bit-identical. PNG decoder PngSuite'dan o'tadi. D-Bus client `dbus-daemon` bilan interop qiladi va ModemManager'dan modem ro'yxatini oladi. QEMU x86-64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi (aarch64'da S39'da).
 
 ### S38. Arche'dan WASM component

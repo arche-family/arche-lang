@@ -1,0 +1,100 @@
+/// lib/font with a real font (docs/sprints.md S35): every glyph of it
+/// drawn, and a sample of Latin and Cyrillic text at three sizes into an
+/// image, whose FNV-1a hash interop/font.sh holds to the one it had: the
+/// same bytes on every platform.
+///
+/// usage: font_draw <font.ttf> <out.pgm>
+import alloc;
+import font;
+import std;
+
+fn line(i: usize) -> str {
+    if i == 0 {
+        return "O'zbekiston Respublikasi, 2026";
+    }
+    if i == 1 {
+        return "Ўзбекистон Республикаси";
+    }
+    if i == 2 {
+        return "The quick brown fox jumps over the lazy dog.";
+    }
+    return "Съешь же ещё этих мягких французских булок";
+}
+
+fn hash(b: []u8) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for x in b {
+        h = (h ^ (x.* as u64)) *% 0x100000001b3;
+    }
+    return h;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let out = &mut sys.stdout;
+    if sys.args.len() != 3 {
+        out.write("usage: font_draw <font.ttf> <out.pgm>\n");
+        sys.proc.exit(2);
+    }
+    let bytes = try sys.fs.read_bytes(sys.args.get(1), sys.alloc);
+    let f = try font.parse(bytes.items(), sys.alloc);
+    // Every glyph, at a size where a mistake shows.
+    var failed: u64 = 0;
+    var covered: u64 = 0;
+    var g: u32 = 0;
+    while g < f.glyphs : (g += 1) {
+        match font.render(&f, g: g, size: 16, sys.alloc) {
+            ok(b) => {
+                for v in b.alpha.items() {
+                    covered += v.* as u64;
+                }
+            }
+            err(_) => { failed += 1; }
+        }
+    }
+    out.write("glyphs ");
+    out.write_u64(f.glyphs as u64);
+    out.write(", failed ");
+    out.write_u64(failed);
+    out.write(", coverage ");
+    out.write_u64(covered);
+    out.write("\n");
+    // The sample: each line at 12, 16 and 24 pixels.
+    let sizes: [3]u32 = [12, 16, 24];
+    var height: u32 = 8;
+    for s in sizes[0..3] {
+        height += 4 * (font.line_height(&f, size: s.*) as u32);
+    }
+    var c = font.new_canvas(width: 640, height: height, sys.alloc);
+    var cache = font.new_cache(sys.alloc);
+    var y: i32 = 4;
+    for s in sizes[0..3] {
+        var i: usize = 0;
+        while i < 4 : (i += 1) {
+            y += font.ascent(&f, size: s.*);
+            _ = try font.draw(&f, cache: &mut cache, text: line(i), size: s.*, x: 4, y: y, into: &mut c, sys.alloc);
+            y += font.line_height(&f, size: s.*) - font.ascent(&f, size: s.*);
+        }
+    }
+    out.write("image ");
+    out.write_u64(c.width as u64);
+    out.write("x");
+    out.write_u64(c.height as u64);
+    out.write(", hash ");
+    out.write_u64(hash(c.alpha.items()));
+    out.write("\n");
+    // As a PGM, dark text on light.
+    var pgm = alloc.List(u8).init(sys.alloc);
+    var head = alloc.String.init(sys.alloc);
+    head.push_str("P5\n");
+    head.push_u64(c.width as u64);
+    head.push_str(" ");
+    head.push_u64(c.height as u64);
+    head.push_str("\n255\n");
+    for b in head.view().bytes() {
+        pgm.push(b.*);
+    }
+    for v in c.alpha.items() {
+        pgm.push(255 - v.*);
+    }
+    try sys.fs.write_bytes(sys.args.get(2), data: pgm.items());
+}

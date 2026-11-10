@@ -1,0 +1,184 @@
+// test: run
+// spec: font
+// stage0: skip
+// stdout: em 1000, glyphs 6, line 22, ascent 16
+// stdout: format 4: 5 2 4 3 2 1 0 0
+// stdout: format 12: 5 0 0 3 2 1 0 1
+// stdout: advances: 500 600 550 650 1200 250
+// stdout: width of "LOD B" at 20: 65
+// stdout: glyph 0: 8x12 at 0,-12
+// stdout: | ...... |
+// stdout: |.#++++#.|
+// stdout: |.+    +.|
+// stdout: |.+    +.|
+// stdout: |.+    +.|
+// stdout: |.+    +.|
+// stdout: |.+    +.|
+// stdout: |.+    +.|
+// stdout: |.+    +.|
+// stdout: |.+    +.|
+// stdout: |.+    +.|
+// stdout: |.%####%.|
+// stdout: glyph 1: 10x10 at 0,-11
+// stdout: |          |
+// stdout: |  -*%%+.  |
+// stdout: | =@@@@@%. |
+// stdout: |.%@@@@@@* |
+// stdout: |=@@@@@@@% |
+// stdout: |+@@@@@@@@.|
+// stdout: |-@@@@@@@% |
+// stdout: | %@@@@@@* |
+// stdout: | -%@@@@#  |
+// stdout: |  .+**=   |
+// stdout: glyph 2: 7x12 at 1,-12
+// stdout: | .     |
+// stdout: |-@.    |
+// stdout: |-@.    |
+// stdout: |-@.    |
+// stdout: |-@.    |
+// stdout: |-@.    |
+// stdout: |-@.    |
+// stdout: |-@.    |
+// stdout: |-@.    |
+// stdout: |-@.    |
+// stdout: |-@*++++|
+// stdout: |-@@@@@@|
+// stdout: glyph 3: 9x12 at 1,-12
+// stdout: | ....    |
+// stdout: |-@@@@%=  |
+// stdout: |-@@@@@@+ |
+// stdout: |-@@@@@@%.|
+// stdout: |-@@@@@@@-|
+// stdout: |-@@@@@@@=|
+// stdout: |-@@@@@@@+|
+// stdout: |-@@@@@@@=|
+// stdout: |-@@@@@@@-|
+// stdout: |-@@@@@@% |
+// stdout: |-@@@@@%- |
+// stdout: |-@@@%*:  |
+// stdout: glyph 4: 18x12 at 0,-12
+// stdout: |           ..     |
+// stdout: |           ##     |
+// stdout: |           ##     |
+// stdout: |           ##     |
+// stdout: |           ##     |
+// stdout: |           ##     |
+// stdout: |           ##     |
+// stdout: | +%*       ##     |
+// stdout: |=@@@+      ##     |
+// stdout: |+@@@*      ##     |
+// stdout: |:%@%-      #%++++-|
+// stdout: | .=:       #@@@@@+|
+// stdout: glyph 5: 0x0 at 0,0
+// stdout: text ends at 47, image 9933568380524242532
+// stdout: |                                                                |
+// stdout: |                                                                |
+// stdout: |                                                                |
+// stdout: |                                                                |
+// stdout: |                                                                |
+// stdout: |  =+              =##*+.               .#.                      |
+// stdout: |  +#       -+*=   +@@@@%-              .@.                      |
+// stdout: |  +#      +@@@@%. +@@@@@%              .@.                      |
+// stdout: |  +#     :@@@@@@* +@@@@@@:             .@.                      |
+// stdout: |  +#     +@@@@@@% +@@@@@@-             .@.                      |
+// stdout: |  +#     +@@@@@@% +@@@@@@-     .:      .@.                      |
+// stdout: |  +#     -@@@@@@* +@@@@@@:    :%@*     .@.                      |
+// stdout: |  +#      #@@@@%: +@@@@@%     +@@@.    .@.                      |
+// stdout: |  +#----   =#%*.  +@@@@@=     -@@#     .@=---.                  |
+// stdout: |  +@@@@@          +@@%#-       -=.     .@@@@@-                  |
+// stdout: |                                                                |
+// stdout: |                                                                |
+// stdout: |                                                                |
+// stdout: |                                                                |
+// stdout: |                                                                |
+import alloc;
+import font;
+import std;
+import _ttf;
+
+const SHADES: str = " .:-=+*#%@";
+
+/// A bitmap as text: a character a pixel, darker as more is covered.
+fn show(out: &mut std.Output, alpha: []u8, width: u32, height: u32) {
+    let shades = SHADES.bytes();
+    var y: u32 = 0;
+    while y < height : (y += 1) {
+        out.write("|");
+        var x: u32 = 0;
+        while x < width : (x += 1) {
+            let v = alpha[(y * width + x) as usize] as u32;
+            out.write_byte(shades[(v * 9 / 255) as usize]);
+        }
+        out.write("|\n");
+    }
+}
+
+/// FNV-1a of the bytes: the image, in one number.
+fn hash(b: []u8) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for x in b {
+        h = (h ^ (x.* as u64)) *% 0x100000001b3;
+    }
+    return h;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let out = &mut sys.stdout;
+    let narrow = _ttf.build(false, sys.alloc);
+    let f = try font.parse(narrow.items(), sys.alloc);
+    out.write("em ");
+    out.write_u64(f.units_per_em as u64);
+    out.write(", glyphs ");
+    out.write_u64(f.glyphs as u64);
+    out.write(", line ");
+    out.write_u64(font.line_height(&f, size: 20) as u64);
+    out.write(", ascent ");
+    out.write_u64(font.ascent(&f, size: 20) as u64);
+    out.write("\nformat 4:");
+    let codes: [8]u32 = [0x20, 0x41, 0x42, 0x44, 0x4C, 0x4F, 0x5A, 0x1F600];
+    for c in codes[0..8] {
+        out.write(" ");
+        out.write_u64(font.glyph_of(&f, cp: c.*) as u64);
+    }
+    let wide = _ttf.build(true, sys.alloc);
+    let w = try font.parse(wide.items(), sys.alloc);
+    out.write("\nformat 12:");
+    for c in codes[0..8] {
+        out.write(" ");
+        out.write_u64(font.glyph_of(&w, cp: c.*) as u64);
+    }
+    out.write("\nadvances:");
+    var g: u32 = 0;
+    while g < f.glyphs : (g += 1) {
+        out.write(" ");
+        out.write_u64(font.advance(&f, g: g) as u64);
+    }
+    out.write("\nwidth of \"LOD B\" at 20: ");
+    out.write_u64(font.width_of(&f, text: "LOD B", size: 20) as u64);
+    out.write("\n");
+    g = 0;
+    while g < f.glyphs : (g += 1) {
+        let b = try font.render(&f, g: g, size: 16, sys.alloc);
+        out.write("glyph ");
+        out.write_u64(g as u64);
+        out.write(": ");
+        out.write_u64(b.width as u64);
+        out.write("x");
+        out.write_u64(b.height as u64);
+        out.write(" at ");
+        out.write_i64(b.left as i64);
+        out.write(",");
+        out.write_i64(b.top as i64);
+        out.write("\n");
+        show(out, b.alpha.items(), width: b.width, height: b.height);
+    }
+    var c = font.new_canvas(width: 64, height: 20, sys.alloc);
+    var cache = font.new_cache(sys.alloc);
+    let end = try font.draw(&f, cache: &mut cache, text: "LOD B", size: 14, x: 1, y: 15, into: &mut c, sys.alloc);
+    out.write("text ends at ");
+    out.write_u64(end as u64);
+    out.write(", image ");
+    out.write_u64(hash(c.alpha.items()));
+    out.write("\n");
+    show(out, c.alpha.items(), width: c.width, height: c.height);
+}

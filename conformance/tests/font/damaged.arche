@@ -1,0 +1,82 @@
+// test: run
+// spec: font
+// stage0: skip
+// stdout: cut: 2 parsed of 600, 12 drawn
+// stdout: changed: 2054 parsed of 3000, 11467 glyphs drawn
+import alloc;
+import core.rand;
+import font;
+import std;
+import _ttf;
+
+/// Whatever a font's bytes are, reading and drawing it gives a result or
+/// an error, never a panic: every glyph of what parses is drawn.
+fn try_all(bytes: []u8, a: alloc.Allocator) -> [2]u64 {
+    match font.parse(bytes, a) {
+        ok(f) => {
+            var drawn: u64 = 0;
+            var g: u32 = 0;
+            while g < f.glyphs and g < 64 : (g += 1) {
+                match font.render(&f, g: g, size: 24, a) {
+                    ok(_) => { drawn += 1; }
+                    err(_) => { }
+                }
+            }
+            var c = font.new_canvas(width: 40, height: 30, a);
+            var cache = font.new_cache(a);
+            match font.draw(&f, cache: &mut cache, text: "BOLD \u{1F600}", size: 12, x: 0, y: 20, into: &mut c, a) {
+                ok(_) => { }
+                err(_) => { }
+            }
+            return [1, drawn];
+        }
+        err(_) => { return [0, 0]; }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let out = &mut sys.stdout;
+    let whole = _ttf.build(true, sys.alloc);
+    let b = whole.items();
+    // Every cut short of the whole.
+    var parsed: u64 = 0;
+    var drawn: u64 = 0;
+    var n: usize = 0;
+    while n < b.len() : (n += 1) {
+        let r = try_all(b[0..n], sys.alloc);
+        parsed += r[0];
+        drawn += r[1];
+    }
+    out.write("cut: ");
+    out.write_u64(parsed);
+    out.write(" parsed of ");
+    out.write_u64(b.len() as u64);
+    out.write(", ");
+    out.write_u64(drawn);
+    out.write(" drawn\n");
+    // Bytes changed at random, a seed that repeats.
+    var g = rand.Seeded.init(35);
+    parsed = 0;
+    drawn = 0;
+    var k: u32 = 0;
+    while k < 3000 : (k += 1) {
+        var copy = alloc.List(u8).with_capacity(sys.alloc, b.len());
+        for x in b {
+            copy.push(x.*);
+        }
+        let changes = g.below(4) + 1;
+        var c: u64 = 0;
+        while c < changes : (c += 1) {
+            let at = g.below(copy.len() as u64) as usize;
+            copy.items_mut()[at] = (g.next_u64() & 0xFF) as u8;
+        }
+        let r = try_all(copy.items(), sys.alloc);
+        parsed += r[0];
+        drawn += r[1];
+    }
+    out.write("changed: ");
+    out.write_u64(parsed);
+    out.write(" parsed of 3000, ");
+    out.write_u64(drawn);
+    out.write(" glyphs drawn\n");
+}

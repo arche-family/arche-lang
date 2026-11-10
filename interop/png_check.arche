@@ -1,0 +1,53 @@
+/// Decodes each PNG named, and says its size and the FNV-1a hash of its
+/// RGBA pixels, or that it was refused (docs/sprints.md S35).
+/// interop/png.sh holds what it says of PngSuite to interop/png/expected.txt.
+///
+/// usage: png_check <file.png>...
+import alloc;
+import image.png;
+import std;
+
+fn hash(b: []u8) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for x in b {
+        h = (h ^ (x.* as u64)) *% 0x100000001b3;
+    }
+    return h;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var i: usize = 1;
+    while i < sys.args.len() : (i += 1) {
+        let bytes = try sys.fs.read_bytes(sys.args.get(i), sys.alloc);
+        // The file's name, without its directory.
+        let path = sys.args.get(i);
+        var start: usize = 0;
+        var k: usize = 0;
+        while k < path.len() : (k += 1) {
+            if path.bytes()[k] == '/' {
+                start = k + 1;
+            }
+        }
+        sys.stdout.write(path[start..path.len()]);
+        match png.decode(bytes.items(), max_pixels: 1 << 24, sys.alloc) {
+            ok(img) => {
+                sys.stdout.write(" ");
+                sys.stdout.write_u64(img.width as u64);
+                sys.stdout.write("x");
+                sys.stdout.write_u64(img.height as u64);
+                sys.stdout.write(" ");
+                sys.stdout.write_u64(hash(img.rgba.items()));
+            }
+            err(e) => {
+                if e == png.PngError.BadChecksum {
+                    sys.stdout.write(" refused: checksum");
+                } else if e == png.PngError.TooLarge {
+                    sys.stdout.write(" refused: too large");
+                } else {
+                    sys.stdout.write(" refused");
+                }
+            }
+        }
+        sys.stdout.write("\n");
+    }
+}

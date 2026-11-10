@@ -1,0 +1,332 @@
+// A helper of the font tests: a small TrueType font, made here byte by
+// byte, so the tests need no font file and run the same everywhere. 1000
+// units to the em; its glyphs:
+//   0 .notdef  a frame: an outer contour and a hole
+//   1 O        a ring of control points only, no point on the curve
+//   2 L        straight lines
+//   3 D        lines and curves, with control points between
+//   4 B        a composite: L moved right, and O at half size
+//   5 space    no outline
+// cmap: format 4 for ' ', 'A'-'B' (by glyph array), 'D', 'L', 'O', and,
+// when asked, format 12 too, which also maps U+1F600 to O.
+import alloc;
+
+type P = struct {
+    x: i32,
+    y: i32,
+    on: bool,
+}
+
+fn put16(out: &mut alloc.List(u8), v: i64) {
+    out.push(((v >> 8) & 0xFF) as u8);
+    out.push((v & 0xFF) as u8);
+}
+
+fn put32(out: &mut alloc.List(u8), v: i64) {
+    put16(out, v: (v >> 16) & 0xFFFF);
+    put16(out, v: v & 0xFFFF);
+}
+
+fn append(out: &mut alloc.List(u8), from: &alloc.List(u8)) {
+    for b in from.items() {
+        out.push(b.*);
+    }
+}
+
+/// A simple glyph: its contours, given by where each ends, with short
+/// coordinates where they fit and repeated flags run together.
+fn simple(points: []P, ends: []u32, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    put16(&mut out, v: ends.len() as i64);
+    var k: usize = 0;
+    while k < 4 : (k += 1) {
+        put16(&mut out, v: 0);
+    }
+    for e in ends {
+        put16(&mut out, v: (e.* - 1) as i64);
+    }
+    put16(&mut out, v: 0);
+    var flags = alloc.List(u8).init(a);
+    var xs = alloc.List(u8).init(a);
+    var ys = alloc.List(u8).init(a);
+    var px: i32 = 0;
+    var py: i32 = 0;
+    for p in points {
+        var f: u8 = 0;
+        if p.on {
+            f = f | 1;
+        }
+        let dx = p.x - px;
+        let dy = p.y - py;
+        if dx == 0 {
+            f = f | 16;
+        } else if dx > -256 and dx < 256 {
+            f = f | 2;
+            if dx > 0 {
+                f = f | 16;
+                xs.push(dx as u8);
+            } else {
+                xs.push((-dx) as u8);
+            }
+        } else {
+            put16(&mut xs, v: (dx as i64) & 0xFFFF);
+        }
+        if dy == 0 {
+            f = f | 32;
+        } else if dy > -256 and dy < 256 {
+            f = f | 4;
+            if dy > 0 {
+                f = f | 32;
+                ys.push(dy as u8);
+            } else {
+                ys.push((-dy) as u8);
+            }
+        } else {
+            put16(&mut ys, v: (dy as i64) & 0xFFFF);
+        }
+        flags.push(f);
+        px = p.x;
+        py = p.y;
+    }
+    // Runs of one flag: the flag with REPEAT, then how many more.
+    let fs = flags.items();
+    var i: usize = 0;
+    while i < fs.len() {
+        var run: usize = 1;
+        while i + run < fs.len() and fs[i + run] == fs[i] and run < 255 {
+            run += 1;
+        }
+        if run > 1 {
+            out.push(fs[i] | 8);
+            out.push((run - 1) as u8);
+        } else {
+            out.push(fs[i]);
+        }
+        i += run;
+    }
+    append(&mut out, from: &xs);
+    append(&mut out, from: &ys);
+    while out.len() % 2 != 0 {
+        out.push(0);
+    }
+    return out;
+}
+
+/// B: L 600 units right, then O at half size, 10 right and 5 down.
+fn composite(a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    put16(&mut out, v: 0xFFFF);
+    var k: usize = 0;
+    while k < 4 : (k += 1) {
+        put16(&mut out, v: 0);
+    }
+    // ARG_1_AND_2_ARE_WORDS | ARGS_ARE_XY_VALUES | MORE_COMPONENTS
+    put16(&mut out, v: 0x23);
+    put16(&mut out, v: 2);
+    put16(&mut out, v: 600);
+    put16(&mut out, v: 0);
+    // ARGS_ARE_XY_VALUES | WE_HAVE_A_SCALE, byte offsets
+    put16(&mut out, v: 0x0A);
+    put16(&mut out, v: 1);
+    out.push(10);
+    out.push(251);
+    put16(&mut out, v: 8192);
+    return out;
+}
+
+fn notdef(a: alloc.Allocator) -> alloc.List(u8) {
+    let pts: [8]P = [
+        P { x: 50, y: 0, on: true }, P { x: 50, y: 700, on: true }, P { x: 450, y: 700, on: true }, P { x: 450, y: 0, on: true },
+        P { x: 100, y: 50, on: true }, P { x: 400, y: 50, on: true }, P { x: 400, y: 650, on: true }, P { x: 100, y: 650, on: true },
+    ];
+    let ends: [2]u32 = [4, 8];
+    return simple(pts[0..8], ends: ends[0..2], a: a);
+}
+
+fn letter_o(a: alloc.Allocator) -> alloc.List(u8) {
+    let pts: [8]P = [
+        P { x: 300, y: 650, on: false }, P { x: 512, y: 562, on: false }, P { x: 600, y: 350, on: false }, P { x: 512, y: 138, on: false },
+        P { x: 300, y: 50, on: false }, P { x: 88, y: 138, on: false }, P { x: 0, y: 350, on: false }, P { x: 88, y: 562, on: false },
+    ];
+    let ends: [1]u32 = [8];
+    return simple(pts[0..8], ends: ends[0..1], a: a);
+}
+
+fn letter_l(a: alloc.Allocator) -> alloc.List(u8) {
+    let pts: [6]P = [
+        P { x: 100, y: 0, on: true }, P { x: 100, y: 700, on: true }, P { x: 200, y: 700, on: true },
+        P { x: 200, y: 100, on: true }, P { x: 500, y: 100, on: true }, P { x: 500, y: 0, on: true },
+    ];
+    let ends: [1]u32 = [6];
+    return simple(pts[0..6], ends: ends[0..1], a: a);
+}
+
+fn letter_d(a: alloc.Allocator) -> alloc.List(u8) {
+    let pts: [7]P = [
+        P { x: 100, y: 0, on: true }, P { x: 100, y: 700, on: true }, P { x: 300, y: 700, on: true }, P { x: 600, y: 700, on: false },
+        P { x: 600, y: 350, on: true }, P { x: 600, y: 0, on: false }, P { x: 300, y: 0, on: true },
+    ];
+    let ends: [1]u32 = [7];
+    return simple(pts[0..7], ends: ends[0..1], a: a);
+}
+
+/// cmap's format 4 subtable.
+fn format4(a: alloc.Allocator) -> alloc.List(u8) {
+    let ends: [6]i64 = [0x20, 0x42, 0x44, 0x4C, 0x4F, 0xFFFF];
+    let starts: [6]i64 = [0x20, 0x41, 0x44, 0x4C, 0x4F, 0xFFFF];
+    // Each segment's glyph minus its code, mod 2^16; the second one goes
+    // through the glyph array instead.
+    let deltas: [6]i64 = [5 - 0x20 + 0x10000, 0, 3 - 0x44 + 0x10000, 2 - 0x4C + 0x10000, 1 - 0x4F + 0x10000, 1];
+    let ranges: [6]i64 = [0, 10, 0, 0, 0, 0];
+    var out = alloc.List(u8).init(a);
+    put16(&mut out, v: 4);
+    put16(&mut out, v: 16 + 6 * 8 + 4);
+    put16(&mut out, v: 0);
+    put16(&mut out, v: 12);
+    put16(&mut out, v: 8);
+    put16(&mut out, v: 2);
+    put16(&mut out, v: 4);
+    for v in ends[0..6] {
+        put16(&mut out, v: v.*);
+    }
+    put16(&mut out, v: 0);
+    for v in starts[0..6] {
+        put16(&mut out, v: v.*);
+    }
+    for v in deltas[0..6] {
+        put16(&mut out, v: v.* & 0xFFFF);
+    }
+    for v in ranges[0..6] {
+        put16(&mut out, v: v.*);
+    }
+    // 'A' is L, 'B' is B.
+    put16(&mut out, v: 2);
+    put16(&mut out, v: 4);
+    return out;
+}
+
+/// cmap's format 12 subtable.
+fn format12(a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    put16(&mut out, v: 12);
+    put16(&mut out, v: 0);
+    put32(&mut out, v: 16 + 5 * 12);
+    put32(&mut out, v: 0);
+    put32(&mut out, v: 5);
+    // ' ', 'D', 'L', 'O' and U+1F600; not 'A' and 'B', which format 4
+    // has, so a test sees which subtable was read.
+    let groups: [5][3]i64 = [[0x20, 0x20, 5], [0x44, 0x44, 3], [0x4C, 0x4C, 2], [0x4F, 0x4F, 1], [0x1F600, 0x1F600, 1]];
+    for g in groups[0..5] {
+        let one = g.*;
+        put32(&mut out, v: one[0]);
+        put32(&mut out, v: one[1]);
+        put32(&mut out, v: one[2]);
+    }
+    return out;
+}
+
+/// The font: format 12 in its cmap too when wide.
+pub fn build(wide: bool, a: alloc.Allocator) -> alloc.List(u8) {
+    var glyphs = alloc.List(alloc.List(u8)).init(a);
+    glyphs.push(notdef(a));
+    glyphs.push(letter_o(a));
+    glyphs.push(letter_l(a));
+    glyphs.push(letter_d(a));
+    glyphs.push(composite(a));
+    glyphs.push(alloc.List(u8).init(a));
+    let n = glyphs.len() as i64;
+    var glyf = alloc.List(u8).init(a);
+    var loca = alloc.List(u8).init(a);
+    for g in glyphs.items() {
+        put16(&mut loca, v: (glyf.len() / 2) as i64);
+        append(&mut glyf, from: g);
+    }
+    put16(&mut loca, v: (glyf.len() / 2) as i64);
+    var head = alloc.List(u8).init(a);
+    put32(&mut head, v: 0x00010000);
+    put32(&mut head, v: 0x00010000);
+    put32(&mut head, v: 0);
+    put32(&mut head, v: 0x5F0F3CF5);
+    put16(&mut head, v: 0);
+    put16(&mut head, v: 1000);
+    while head.len() < 50 {
+        head.push(0);
+    }
+    put16(&mut head, v: 0);
+    put16(&mut head, v: 0);
+    var maxp = alloc.List(u8).init(a);
+    put32(&mut maxp, v: 0x00005000);
+    put16(&mut maxp, v: n);
+    var hhea = alloc.List(u8).init(a);
+    put32(&mut hhea, v: 0x00010000);
+    put16(&mut hhea, v: 800);
+    put16(&mut hhea, v: (-200) & 0xFFFF);
+    put16(&mut hhea, v: 100);
+    while hhea.len() < 34 {
+        hhea.push(0);
+    }
+    put16(&mut hhea, v: n);
+    var hmtx = alloc.List(u8).init(a);
+    let advances: [6]i64 = [500, 600, 550, 650, 1200, 250];
+    for w in advances[0..6] {
+        put16(&mut hmtx, v: w.*);
+        put16(&mut hmtx, v: 0);
+    }
+    var cmap = alloc.List(u8).init(a);
+    let f4 = format4(a);
+    let f12 = format12(a);
+    put16(&mut cmap, v: 0);
+    if wide {
+        put16(&mut cmap, v: 2);
+        put16(&mut cmap, v: 3);
+        put16(&mut cmap, v: 1);
+        put32(&mut cmap, v: 20);
+        put16(&mut cmap, v: 3);
+        put16(&mut cmap, v: 10);
+        put32(&mut cmap, v: 20 + f4.len() as i64);
+        append(&mut cmap, from: &f4);
+        append(&mut cmap, from: &f12);
+    } else {
+        put16(&mut cmap, v: 1);
+        put16(&mut cmap, v: 3);
+        put16(&mut cmap, v: 1);
+        put32(&mut cmap, v: 12);
+        append(&mut cmap, from: &f4);
+    }
+    // The table directory, then the tables, each on 4 bytes.
+    var tables = alloc.List(alloc.List(u8)).init(a);
+    tables.push(cmap);
+    tables.push(glyf);
+    tables.push(head);
+    tables.push(hhea);
+    tables.push(hmtx);
+    tables.push(loca);
+    tables.push(maxp);
+    let tags = "cmapglyfheadhheahmtxlocamaxp".bytes();
+    var out = alloc.List(u8).init(a);
+    put32(&mut out, v: 0x00010000);
+    put16(&mut out, v: 7);
+    put16(&mut out, v: 64);
+    put16(&mut out, v: 2);
+    put16(&mut out, v: 48);
+    var at: usize = 12 + 7 * 16;
+    var i: usize = 0;
+    for t in tables.items() {
+        var k: usize = 0;
+        while k < 4 : (k += 1) {
+            out.push(tags[i * 4 + k]);
+        }
+        put32(&mut out, v: 0);
+        put32(&mut out, v: at as i64);
+        put32(&mut out, v: t.len() as i64);
+        at += (t.len() + 3) / 4 * 4;
+        i += 1;
+    }
+    for t in tables.items() {
+        append(&mut out, from: t);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+    return out;
+}

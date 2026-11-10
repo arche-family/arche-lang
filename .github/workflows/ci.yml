@@ -82,6 +82,8 @@ jobs:
         run: cd compiler && CLANG=false LLD=false ARCHE_BACKEND=own ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
       - name: Conformance tests in QEMU, in a release build
         run: cd compiler && ARCHE_FLAGS=--release ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
+      - name: A real font drawn as on x86-64, bit for bit; PngSuite decoded as there
+        run: ARCHE_TARGET=linux-${{ matrix.arch }} ./interop/font.sh && ARCHE_TARGET=linux-${{ matrix.arch }} ./interop/png.sh
       - name: The ABI suite, each module by each backend
         run: QEMU=qemu-${{ matrix.arch }}-static sh compiler/abi-check.sh ${{ matrix.arch }}
       - name: Bootstrap on that processor, stage2 == stage3
@@ -178,6 +180,23 @@ jobs:
         run: make -C examples/webapp check
       - name: The KV store under SIGKILL, 30 times
         run: make -C examples/kvcrash check
+
+  # docs/sprints.md S35: the libraries the phone needs: lib/font with a real
+  # font, lib/image/png with PngSuite, and a minute of fuzzing each.
+  phone:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Arche compiler
+        run: make -C stage0 && make -C compiler
+      - name: Every glyph of DejaVu Sans, and a sample of text as it was
+        run: ./interop/font.sh
+      - name: Fuzz lib/font
+        run: ./fuzz/font.sh 60
+      - name: PngSuite, every good image as expected and every broken one refused
+        run: ./interop/png.sh
+      - name: Fuzz lib/image/png
+        run: ./fuzz/png.sh 60
 
   # docs/sprints.md S24, S25: the build driver and the package manager. A
   # build from the cache is bit-identical to a clean one, every conformance

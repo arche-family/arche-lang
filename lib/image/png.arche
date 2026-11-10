@@ -1,0 +1,454 @@
+/// PNG images (docs/sprints.md S35), decoded to 8-bit RGBA: every color
+/// type and bit depth of the standard, palettes and their transparency,
+/// tRNS for gray and RGB, the five filters and Adam7 interlacing. Chunk
+/// CRCs and the zlib stream's Adler-32 are checked; ancillary chunks
+/// besides tRNS are passed over, an unknown critical one is refused.
+/// Samples of 16 bits keep their high byte, as libpng's strip does; one of
+/// 1, 2 or 4 bits is scaled to the whole byte.
+///
+/// An image comes from outside, so every read is checked and the pixels
+/// it may have are bounded: a broken file gives an error, never a panic
+/// (fuzz/png_fuzz.arche).
+import alloc;
+import core.deflate;
+
+pub type PngError = error {
+    /// Not a PNG, or one that breaks its rules.
+    Malformed,
+    /// A chunk, or the zlib stream, whose checksum is not its own.
+    BadChecksum,
+    /// More pixels than the caller allows.
+    TooLarge,
+}
+
+/// An image: width x height pixels, row by row, four bytes each: red,
+/// green, blue and alpha.
+pub type Image = struct {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: alloc.List(u8),
+}
+
+/// What IHDR says, and what the other chunks add.
+type Header = struct {
+    width: u32,
+    height: u32,
+    depth: u32,
+    color: u32,
+    interlaced: bool,
+    /// Samples a pixel has.
+    channels: u32,
+}
+
+fn u32_at(b: []u8, at: usize) -> PngError!u32 {
+    if at > b.len() or b.len() - at < 4 {
+        return PngError.Malformed;
+    }
+    return ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | (b[at + 3] as u32);
+}
+
+fn header_of(d: []u8) -> PngError!Header {
+    if d.len() != 13 {
+        return PngError.Malformed;
+    }
+    let width = try u32_at(d, at: 0);
+    let height = try u32_at(d, at: 4);
+    let depth = d[8] as u32;
+    let color = d[9] as u32;
+    if width == 0 or height == 0 or width > 0x7FFFFFFF or height > 0x7FFFFFFF {
+        return PngError.Malformed;
+    }
+    if d[10] != 0 or d[11] != 0 or d[12] > 1 {
+        return PngError.Malformed;
+    }
+    var channels: u32 = 0;
+    var fits = false;
+    if color == 0 {
+        channels = 1;
+        fits = depth == 1 or depth == 2 or depth == 4 or depth == 8 or depth == 16;
+    } else if color == 2 {
+        channels = 3;
+        fits = depth == 8 or depth == 16;
+    } else if color == 3 {
+        channels = 1;
+        fits = depth == 1 or depth == 2 or depth == 4 or depth == 8;
+    } else if color == 4 {
+        channels = 2;
+        fits = depth == 8 or depth == 16;
+    } else if color == 6 {
+        channels = 4;
+        fits = depth == 8 or depth == 16;
+    }
+    if not fits {
+        return PngError.Malformed;
+    }
+    return Header { width: width, height: height, depth: depth, color: color, interlaced: d[12] == 1, channels: channels };
+}
+
+/// The bytes of one row of w pixels, without its filter byte.
+fn row_bytes(h: &Header, w: u64) -> u64 {
+    return (w * (h.channels as u64) * (h.depth as u64) + 7) / 8;
+}
+
+/// The image in bytes, of at most max_pixels pixels.
+pub fn decode(bytes: []u8, max_pixels: u64, a: alloc.Allocator) -> PngError!Image {
+    let sig: [8]u8 = [137, 80, 78, 71, 13, 10, 26, 10];
+    if bytes.len() < 8 {
+        return PngError.Malformed;
+    }
+    var i: usize = 0;
+    while i < 8 : (i += 1) {
+        if bytes[i] != sig[i] {
+            return PngError.Malformed;
+        }
+    }
+    var at: usize = 8;
+    var h = Header { width: 0, height: 0, depth: 0, color: 0, interlaced: false, channels: 0 };
+    var seen_header = false;
+    var palette = alloc.List(u8).init(a);
+    // A palette's alphas; or the one gray, or RGB, that is transparent.
+    var alphas = alloc.List(u8).init(a);
+    var key: [3]u32 = [0, 0, 0];
+    var keyed = false;
+    var data = alloc.List(u8).init(a);
+    var idat_done = false;
+    var ended = false;
+    while not ended {
+        let len = (try u32_at(bytes, at: at)) as usize;
+        if len > 0x7FFFFFFF or at + 12 > bytes.len() or bytes.len() - at - 12 < len {
+            return PngError.Malformed;
+        }
+        let kind = bytes[at + 4..at + 8];
+        let body = bytes[at + 8..at + 8 + len];
+        let crc = try u32_at(bytes, at: at + 8 + len);
+        if deflate.crc32(0, bytes[at + 4..at + 8 + len]) != crc {
+            return PngError.BadChecksum;
+        }
+        at += 12 + len;
+        let first = not seen_header;
+        if is(kind, name: "IHDR") {
+            if not first {
+                return PngError.Malformed;
+            }
+            h = try header_of(body);
+            if (h.width as u64) * (h.height as u64) > max_pixels {
+                return PngError.TooLarge;
+            }
+            seen_header = true;
+            continue;
+        }
+        if first {
+            return PngError.Malformed;
+        }
+        if is(kind, name: "IDAT") {
+            if idat_done or (h.color == 3 and palette.len() == 0) {
+                return PngError.Malformed;
+            }
+            for x in body {
+                data.push(x.*);
+            }
+            continue;
+        }
+        if data.len() > 0 {
+            idat_done = true;
+        }
+        if is(kind, name: "PLTE") {
+            if len == 0 or len % 3 != 0 or len / 3 > 256 or data.len() > 0 or palette.len() > 0 or h.color == 0 or h.color == 4 {
+                return PngError.Malformed;
+            }
+            let one: usize = 1;
+            if h.color == 3 and len / 3 > one << (h.depth as usize) {
+                return PngError.Malformed;
+            }
+            for x in body {
+                palette.push(x.*);
+            }
+        } else if is(kind, name: "tRNS") {
+            if data.len() > 0 {
+                return PngError.Malformed;
+            }
+            if h.color == 3 {
+                if len > palette.len() / 3 {
+                    return PngError.Malformed;
+                }
+                for x in body {
+                    alphas.push(x.*);
+                }
+            } else if h.color == 0 and len == 2 {
+                key[0] = ((body[0] as u32) << 8) | (body[1] as u32);
+                keyed = true;
+            } else if h.color == 2 and len == 6 {
+                key = [((body[0] as u32) << 8) | (body[1] as u32), ((body[2] as u32) << 8) | (body[3] as u32), ((body[4] as u32) << 8) | (body[5] as u32)];
+                keyed = true;
+            } else {
+                return PngError.Malformed;
+            }
+        } else if is(kind, name: "IEND") {
+            ended = true;
+        } else if (kind[0] & 0x20) == 0 {
+            // An unknown critical chunk: the image cannot be read without it.
+            return PngError.Malformed;
+        }
+    }
+    if data.len() == 0 {
+        return PngError.Malformed;
+    }
+    // The rows, every pass's, each after its filter byte.
+    var raw_size: u64 = 0;
+    var p: u32 = 0;
+    while p < 7 : (p += 1) {
+        let dims = pass_size(&h, pass: p);
+        if dims[0] > 0 and dims[1] > 0 {
+            raw_size += (row_bytes(&h, w: dims[0]) + 1) * dims[1];
+        }
+        if not h.interlaced {
+            break;
+        }
+    }
+    var raw = alloc.List(u8).init(a);
+    try inflate_zlib(data.items(), out: &mut raw, size: raw_size);
+    var image = Image { width: h.width, height: h.height, rgba: alloc.List(u8).init(a) };
+    image.rgba.grow_zeroed((h.width as usize) * (h.height as usize) * 4);
+    var from: usize = 0;
+    p = 0;
+    while p < 7 : (p += 1) {
+        let dims = pass_size(&h, pass: p);
+        if dims[0] > 0 and dims[1] > 0 {
+            let stride = row_bytes(&h, w: dims[0]) as usize;
+            let rows = dims[1] as usize;
+            let part = raw.items_mut()[from..from + (stride + 1) * rows];
+            try unfilter(part, stride: stride, bpp: bytes_per_pixel(&h));
+            place(&h, pass: p, part: part, stride: stride, palette: palette.items(), alphas: alphas.items(), key: key, keyed: keyed, into: &mut image);
+            from += (stride + 1) * rows;
+        }
+        if not h.interlaced {
+            break;
+        }
+    }
+    return image;
+}
+
+fn is(kind: []u8, name: str) -> bool {
+    let n = name.bytes();
+    return kind[0] == n[0] and kind[1] == n[1] and kind[2] == n[2] and kind[3] == n[3];
+}
+
+/// A zlib stream (RFC 1950): its header checked, its data inflated to
+/// exactly size bytes, its Adler-32 checked.
+fn inflate_zlib(data: []u8, out: &mut alloc.List(u8), size: u64) -> PngError!void {
+    if data.len() < 6 {
+        return PngError.Malformed;
+    }
+    let cmf = data[0] as u32;
+    let flg = data[1] as u32;
+    if (cmf & 15) != 8 or (cmf >> 4) > 7 or (cmf * 256 + flg) % 31 != 0 or (flg & 0x20) != 0 {
+        return PngError.Malformed;
+    }
+    if size > 0x7FFFFFFF {
+        return PngError.TooLarge;
+    }
+    var used: usize = 0;
+    match deflate.inflate(data[2..data.len()], out: out, limit: size as usize) {
+        ok(n) => { used = n; }
+        err(_) => { return PngError.Malformed; }
+    }
+    if out.len() as u64 != size {
+        return PngError.Malformed;
+    }
+    let at = 2 + used;
+    let want = try u32_at(data, at: at);
+    if adler32(out.items()) != want {
+        return PngError.BadChecksum;
+    }
+}
+
+fn adler32(b: []u8) -> u32 {
+    var s1: u32 = 1;
+    var s2: u32 = 0;
+    for x in b {
+        s1 = (s1 + x.* as u32) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    return (s2 << 16) | s1;
+}
+
+fn bytes_per_pixel(h: &Header) -> usize {
+    let bits = h.channels * h.depth;
+    if bits < 8 {
+        return 1;
+    }
+    return (bits / 8) as usize;
+}
+
+/// Adam7's passes: where each starts, and every how many pixels.
+fn pass_geometry(pass: u32) -> [4]u64 {
+    if pass == 0 { return [0, 0, 8, 8]; }
+    if pass == 1 { return [4, 0, 8, 8]; }
+    if pass == 2 { return [0, 4, 4, 8]; }
+    if pass == 3 { return [2, 0, 4, 4]; }
+    if pass == 4 { return [0, 2, 2, 4]; }
+    if pass == 5 { return [1, 0, 2, 2]; }
+    return [0, 1, 1, 2];
+}
+
+/// How many pixels across and rows a pass has; the whole image when it is
+/// not interlaced.
+fn pass_size(h: &Header, pass: u32) -> [2]u64 {
+    if not h.interlaced {
+        return [h.width as u64, h.height as u64];
+    }
+    let g = pass_geometry(pass);
+    let w = h.width as u64;
+    let ht = h.height as u64;
+    var cols: u64 = 0;
+    if w > g[0] {
+        cols = (w - g[0] + g[2] - 1) / g[2];
+    }
+    var rows: u64 = 0;
+    if ht > g[1] {
+        rows = (ht - g[1] + g[3] - 1) / g[3];
+    }
+    return [cols, rows];
+}
+
+fn paeth(a: u32, b: u32, c: u32) -> u32 {
+    let p = (a as i32) + (b as i32) - (c as i32);
+    var pa = p - (a as i32);
+    var pb = p - (b as i32);
+    var pc = p - (c as i32);
+    if pa < 0 { pa = -pa; }
+    if pb < 0 { pb = -pb; }
+    if pc < 0 { pc = -pc; }
+    if pa <= pb and pa <= pc {
+        return a;
+    }
+    if pb <= pc {
+        return b;
+    }
+    return c;
+}
+
+/// The rows of part, each its filter byte then stride bytes, unfiltered in
+/// place.
+fn unfilter(part: []mut u8, stride: usize, bpp: usize) -> PngError!void {
+    let rows = part.len() / (stride + 1);
+    var r: usize = 0;
+    while r < rows : (r += 1) {
+        let at = r * (stride + 1);
+        let kind = part[at];
+        if kind > 4 {
+            return PngError.Malformed;
+        }
+        let cur = at + 1;
+        var prev: usize = 0;
+        if r > 0 {
+            prev = cur - (stride + 1);
+        }
+        var i: usize = 0;
+        while i < stride : (i += 1) {
+            var left: u32 = 0;
+            if i >= bpp {
+                left = part[cur + i - bpp] as u32;
+            }
+            var up: u32 = 0;
+            var corner: u32 = 0;
+            if r > 0 {
+                up = part[prev + i] as u32;
+                if i >= bpp {
+                    corner = part[prev + i - bpp] as u32;
+                }
+            }
+            let x = part[cur + i] as u32;
+            var v = x;
+            if kind == 1 {
+                v = x + left;
+            } else if kind == 2 {
+                v = x + up;
+            } else if kind == 3 {
+                v = x + (left + up) / 2;
+            } else if kind == 4 {
+                v = x + paeth(a: left, b: up, c: corner);
+            }
+            part[cur + i] = (v & 0xFF) as u8;
+        }
+    }
+}
+
+/// Sample k of a row of n-bit samples.
+fn sample(row: []u8, k: u64, depth: u32) -> u32 {
+    if depth == 8 {
+        return row[k as usize] as u32;
+    }
+    if depth == 16 {
+        return ((row[(2 * k) as usize] as u32) << 8) | (row[(2 * k + 1) as usize] as u32);
+    }
+    let bit = k * (depth as u64);
+    let byte = row[(bit / 8) as usize] as u32;
+    let shift = 8 - (depth as u64) - bit % 8;
+    return (byte >> (shift as u32)) & ((1 << depth) - 1);
+}
+
+/// A sample of depth bits as 8.
+fn eight(v: u32, depth: u32) -> u8 {
+    if depth == 16 {
+        return (v >> 8) as u8;
+    }
+    if depth == 8 {
+        return v as u8;
+    }
+    return (v * 255 / ((1 << depth) - 1)) as u8;
+}
+
+/// A pass's unfiltered rows into the image, as RGBA.
+fn place(h: &Header, pass: u32, part: []u8, stride: usize, palette: []u8, alphas: []u8, key: [3]u32, keyed: bool, into: &mut Image) {
+    let dims = pass_size(h, pass: pass);
+    var g: [4]u64 = [0, 0, 1, 1];
+    if h.interlaced {
+        g = pass_geometry(pass);
+    }
+    var r: u64 = 0;
+    while r < dims[1] : (r += 1) {
+        let row = part[(r as usize) * (stride + 1) + 1..(r as usize + 1) * (stride + 1)];
+        let y = g[1] + r * g[3];
+        var c: u64 = 0;
+        while c < dims[0] : (c += 1) {
+            let x = g[0] + c * g[2];
+            var px: [4]u8 = [0, 0, 0, 255];
+            let ch = h.channels as u64;
+            if h.color == 3 {
+                let i = sample(row, k: c, depth: h.depth) as usize;
+                if i * 3 + 2 < palette.len() {
+                    px = [palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2], 255];
+                }
+                if i < alphas.len() {
+                    px[3] = alphas[i];
+                }
+            } else if h.color == 0 or h.color == 4 {
+                let v = sample(row, k: c * ch, depth: h.depth);
+                let g8 = eight(v: v, depth: h.depth);
+                px = [g8, g8, g8, 255];
+                if h.color == 4 {
+                    px[3] = eight(v: sample(row, k: c * ch + 1, depth: h.depth), depth: h.depth);
+                } else if keyed and v == key[0] {
+                    px[3] = 0;
+                }
+            } else {
+                let rv = sample(row, k: c * ch, depth: h.depth);
+                let gv = sample(row, k: c * ch + 1, depth: h.depth);
+                let bv = sample(row, k: c * ch + 2, depth: h.depth);
+                px = [eight(v: rv, depth: h.depth), eight(v: gv, depth: h.depth), eight(v: bv, depth: h.depth), 255];
+                if h.color == 6 {
+                    px[3] = eight(v: sample(row, k: c * ch + 3, depth: h.depth), depth: h.depth);
+                } else if keyed and rv == key[0] and gv == key[1] and bv == key[2] {
+                    px[3] = 0;
+                }
+            }
+            let at = ((y * (into.width as u64) + x) * 4) as usize;
+            let out = into.rgba.items_mut();
+            out[at] = px[0];
+            out[at + 1] = px[1];
+            out[at + 2] = px[2];
+            out[at + 3] = px[3];
+        }
+    }
+}

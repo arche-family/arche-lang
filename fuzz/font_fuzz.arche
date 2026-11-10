@@ -1,0 +1,114 @@
+/// Fuzzes lib/font (docs/sprints.md S35): a real font with bytes changed,
+/// cut, or noise written over a run of it, then parsed, glyphs of it drawn
+/// at random sizes, and a line of text laid out. Every input must give an
+/// error or a result; a panic is a bug.
+///
+/// usage: font_fuzz <font.ttf> <seconds> [seed]. The seed printed first
+/// repeats a run.
+import alloc;
+import core.rand;
+import font;
+import std;
+
+fn number(s: str) -> u64 {
+    var n: u64 = 0;
+    for c in s.bytes() {
+        if c.* >= '0' and c.* <= '9' {
+            n = n * 10 + (c.* - '0') as u64;
+        }
+    }
+    return n;
+}
+
+fn mangle(data: []u8, g: &mut rand.Seeded, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).with_capacity(a, data.len());
+    for x in data {
+        out.push(x.*);
+    }
+    let rounds = g.below(8) + 1;
+    var k: u64 = 0;
+    while k < rounds and out.len() > 0 : (k += 1) {
+        let n = out.len() as u64;
+        var front = n;
+        if front > 4096 {
+            front = 4096;
+        }
+        let how = g.below(10);
+        if how < 6 {
+            // A byte anywhere: most land in outlines.
+            let at = g.below(n) as usize;
+            out.items_mut()[at] = (g.next_u64() & 0xff) as u8;
+        } else if how < 8 {
+            // A byte in the first 4 KiB: the directory and small tables.
+            let at = g.below(front) as usize;
+            out.items_mut()[at] = (g.next_u64() & 0xff) as u8;
+        } else if how == 8 {
+            // Noise over a run.
+            let at = g.below(n) as usize;
+            let len = g.below(64) as usize;
+            var i = at;
+            while i < at + len and i < out.len() : (i += 1) {
+                out.items_mut()[i] = (g.next_u64() & 0xff) as u8;
+            }
+        } else {
+            // Cut.
+            let keep = g.below(n + 1);
+            while out.len() as u64 > keep {
+                _ = out.pop();
+            }
+        }
+    }
+    return out;
+}
+
+fn one_case(seed: []u8, g: &mut rand.Seeded, a: alloc.Allocator) {
+    let input = mangle(seed, g: g, a);
+    match font.parse(input.items(), a) {
+        ok(f) => {
+            var k: u64 = 0;
+            while k < 24 : (k += 1) {
+                let glyph = g.below((f.glyphs as u64) + 4) as u32;
+                let size = (g.below(64) + 1) as u32;
+                match font.render(&f, g: glyph, size: size, a) {
+                    ok(_) => { }
+                    err(_) => { }
+                }
+            }
+            var c = font.new_canvas(width: 200, height: 40, a);
+            var cache = font.new_cache(a);
+            match font.draw(&f, cache: &mut cache, text: "Ўзбек Aq 0", size: 20, x: 2, y: 30, into: &mut c, a) {
+                ok(_) => { }
+                err(_) => { }
+            }
+            _ = font.width_of(&f, text: "fuzz", size: 13);
+        }
+        err(_) => { }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() < 3 {
+        sys.stderr.write("usage: font_fuzz <font.ttf> <seconds> [seed]\n");
+        sys.proc.exit(2);
+    }
+    let seed_font = try sys.fs.read_bytes(sys.args.get(1), sys.alloc);
+    let seconds = number(sys.args.get(2));
+    var seed = sys.rand.next_u64() % 1000000000;
+    if sys.args.len() > 3 {
+        seed = number(sys.args.get(3));
+    }
+    sys.stdout.write("seed ");
+    sys.stdout.write_u64(seed);
+    sys.stdout.write("\n");
+    sys.stdout.flush();
+    var g = rand.Seeded.init(seed);
+    let start = sys.clock.monotonic_ns();
+    var cases: u64 = 0;
+    while sys.clock.monotonic_ns() - start < seconds * 1000000000 : (cases += 1) {
+        region r {
+            one_case(seed_font.items(), g: &mut g, r);
+        }
+    }
+    sys.stdout.write_u64(cases);
+    sys.stdout.write(" cases, no panic\n");
+}
