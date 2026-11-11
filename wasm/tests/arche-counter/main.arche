@@ -1,0 +1,34 @@
+/// Nimadir's counter mini-app (mini-apps/counter), written in Arche
+/// (docs/sprints.md S38): a label of the count and two buttons, Increment
+/// and Reset. It calls the world through the modules `arche-wasm bindgen`
+/// makes of tests/nimadir/world.wit, host_api.arche and host_api_raw.arche,
+/// which nimadir-check.sh generates next to this file before it builds it.
+/// Unlike the Rust one it keeps no count in storage and logs nothing at
+/// init: neither shows in what the two shells are compared on.
+import alloc;
+import host_api;
+import std;
+
+type Counter = struct {
+    count: i32,
+}
+
+fn init(host: &mut std.Host, a: alloc.Allocator) -> Counter {
+    return Counter { count: 0 };
+}
+
+/// Each frame: the count, then the buttons, so that a click shows the
+/// frame after it, as in the Rust one.
+fn update(state: &mut Counter, host: &mut std.Host, a: alloc.Allocator) {
+    var line = alloc.String.from("Count: ", a);
+    line.push_i64(state.count as i64);
+    host_api.ui_label(host, text: line.view());
+    // Button 0.
+    if host_api.ui_button(host, text: "Increment") {
+        state.count += 1;
+    }
+    // Button 1.
+    if host_api.ui_button(host, text: "Reset") {
+        state.count = 0;
+    }
+}

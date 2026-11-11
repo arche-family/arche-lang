@@ -89,15 +89,88 @@ if ! "$arche" --target wasm32-component build "$here/tests/arche-app/main.arche"
     failed=$((failed + 1))
 else
     for mode in "" --jit; do
-        "$wasm" nimadir "$work/app.wasm" --frames 3 $mode > "$work/out" 2>&1 || true
-        if grep -qxF '   label   : "Kadr: 3"' "$work/out" && [ "$(grep -c 'Salom, Arche' "$work/out")" -eq 3 ]; then
-            echo "PASS the Arche app counts its frames $mode"
+        "$wasm" nimadir "$work/app.wasm" --frames 3 --input 1:0=Ada $mode > "$work/out" 2>&1 || true
+        if grep -qxF '   label   : "Kadr: 3"' "$work/out" && [ "$(grep -c 'Salom, Arche' "$work/out")" -eq 3 ] &&
+            [ "$(grep -cxF '   label   : "Typed: Ada"' "$work/out")" -eq 2 ]; then
+            echo "PASS the Arche app counts its frames and keeps the text the host hands back $mode"
         else
             echo "FAIL the Arche app $mode:"
             head -20 "$work/out"
             failed=$((failed + 1))
         fi
     done
+fi
+
+# Nimadir's counter written in Arche (tests/arche-counter, S38), calling
+# the world through the modules arche-wasm bindgen makes of it, generated
+# here rather than kept, so that they are always this bindgen's: it says
+# what Nimadir's shell says to the Rust one.
+mkdir -p "$work/arche-counter"
+cp "$here/tests/arche-counter/main.arche" "$here/tests/arche-counter/package.arche" "$work/arche-counter/"
+if ! "$wasm" bindgen "$apps/world.wit" mini-app "$work/arche-counter" > "$work/err" 2>&1; then
+    echo "FAIL bindgen did not generate the bindings:"
+    head -20 "$work/err"
+    failed=$((failed + 1))
+elif ! grep -qxF 'pub fn ui_label(host: &mut std.Host, text: str) {' "$work/arche-counter/host_api.arche" ||
+    ! grep -qxF 'extern "wasm:nimadir:shell/host-api@1.2.0" fn ui_button(text_ptr: u32, text_len: u32) -> u32;' "$work/arche-counter/host_api_raw.arche" ||
+    ! grep -qxF '// not bound yet: storage-get: returns an option' "$work/arche-counter/host_api.arche" ||
+    ! [ -f "$work/arche-counter/dom.arche" ] || ! [ -f "$work/arche-counter/dom_raw.arche" ]; then
+    echo "FAIL bindgen generated other bindings:"
+    head -30 "$work/arche-counter/host_api.arche"
+    failed=$((failed + 1))
+else
+    echo "PASS bindgen generates the bindings of host-api and dom"
+    # Every module it generates builds, and the encoder takes what they
+    # import.
+    "$wasm" bindgen "$apps/world.wit" mini-app "$work/bindings"
+    cp "$here/tests/arche-counter/package.arche" "$work/bindings/"
+    cat > "$work/bindings/main.arche" <<'EOF'
+import alloc;
+import dom;
+import host_api;
+import std;
+
+type S = struct {
+    root: u32,
+}
+
+fn init(host: &mut std.Host, a: alloc.Allocator) -> S {
+    return S { root: dom.root(host) };
+}
+
+fn update(state: &mut S, host: &mut std.Host, a: alloc.Allocator) {
+    let t = dom.create_text(host, text: "bound");
+    dom.append_child(host, parent_: state.root, child: t);
+    host_api.ui_label(host, text: dom.value(host, item: t, a: a).view());
+}
+EOF
+    if ! "$arche" --target wasm32-component build "$work/bindings/main.arche" "$work/bindings.core.wasm" > "$work/err" 2>&1 ||
+        ! "$wasm" component "$work/bindings.core.wasm" "$apps/world.wit" mini-app "$work/bindings.wasm" >> "$work/err" 2>&1; then
+        echo "FAIL the generated bindings did not build:"
+        head -20 "$work/err"
+        failed=$((failed + 1))
+    else
+        echo "PASS the generated bindings build and are a component of the world"
+    fi
+    if ! "$arche" --target wasm32-component build "$work/arche-counter/main.arche" "$work/arche-counter.core.wasm" > "$work/err" 2>&1 ||
+        ! "$wasm" component "$work/arche-counter.core.wasm" "$apps/world.wit" mini-app "$work/arche-counter.wasm" >> "$work/err" 2>&1; then
+        echo "FAIL the Arche counter did not build:"
+        head -20 "$work/err"
+        failed=$((failed + 1))
+    else
+        for mode in "" --jit; do
+            # shellcheck disable=SC2086
+            "$wasm" nimadir "$work/arche-counter.wasm" --script 1:0,2:0,3:0,5:1 --frames 8 $mode --registry "$apps/registry.list" > "$work/out" 2>&1 || true
+            sh "$apps/normalize.sh" < "$work/out" > "$work/got"
+            if ! diff -u "$apps/expected/counter-script.txt" "$work/got" > "$work/diff"; then
+                echo "FAIL the Arche counter $mode: not what Nimadir says to the Rust one:"
+                head -30 "$work/diff"
+                failed=$((failed + 1))
+            else
+                echo "PASS the Arche counter $mode: as Nimadir to the Rust one"
+            fi
+        done
+    fi
 fi
 
 # A component's root module without update is refused (E0313).
@@ -140,6 +213,25 @@ expect "runaway eating memory is stopped at 512 MiB" 3 "stopped: memory limit ex
 expect "runaway flooding the shell is stopped" 3 "stopped: host limit exceeded" -- "$apps/runaway.component.wasm" --frames 2 --script 1:2
 expect "a full store is said, not a trap" 0 "   [wasm log] runaway: storage is full: 1 MiB per app" -- "$apps/runaway.component.wasm" --frames 2 --script 1:3
 expect "an import the shell does not give is refused" 1 "arche-wasm: the component did not instantiate: imports what the shell does not give" -- "$apps/counter.component.wasm" --deny now-millis
+
+# Every component the encoder made, validated by wasm-tools where there is
+# one; CI requires it (WASM_TOOLS_REQUIRED=1).
+if command -v wasm-tools > /dev/null 2>&1; then
+    for f in "$work"/mini-apps/*/*.component.wasm "$work/app.wasm"; do
+        if wasm-tools validate "$f" 2> "$work/err"; then
+            echo "PASS wasm-tools validates $(basename "$f")"
+        else
+            echo "FAIL wasm-tools does not validate $(basename "$f"):"
+            head -5 "$work/err"
+            failed=$((failed + 1))
+        fi
+    done
+elif [ "${WASM_TOOLS_REQUIRED:-0}" = 1 ]; then
+    echo "FAIL no wasm-tools, and WASM_TOOLS_REQUIRED is set"
+    failed=$((failed + 1))
+else
+    echo "SKIP wasm-tools validate: no wasm-tools here"
+fi
 
 if [ "$failed" -ne 0 ]; then
     echo "nimadir-check: $failed failed"

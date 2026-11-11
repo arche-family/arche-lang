@@ -9,6 +9,10 @@
 ///   arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>
 ///                                        the component of a core module built
 ///                                        for a WIT world (lib/wasm/encode.arche)
+///   arche-wasm bindgen <world.wit> <world> <out-dir>
+///                                        Arche modules through which an app
+///                                        calls what the world imports
+///                                        (bindgen.arche)
 ///   arche-wasm core <component.wasm> <out.wasm>
 ///                                        a component's first core module, the
 ///                                        program's, as wit-component lays it out
@@ -16,6 +20,7 @@
 ///                                        HTTPS, each request answered by the
 ///                                        module's handle (serve.arche)
 import alloc;
+import bindgen;
 import wasm.component;
 import wasm.encode;
 import wasm.exec;
@@ -33,6 +38,7 @@ import tls;
 fn usage(sys: &mut std.System) -> !void {
     sys.stderr.write("usage: arche-wasm spec [--jit] <script.json>...\n");
     sys.stderr.write("       arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>\n");
+    sys.stderr.write("       arche-wasm bindgen <world.wit> <world> <out-dir>\n");
     sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]...\n");
     sys.proc.exit(2);
 }
@@ -139,6 +145,10 @@ fn main(sys: &mut std.System) -> !void {
     }
     if cmd.eq("component") and sys.args.len() == 6 {
         try make_component(sys);
+        return;
+    }
+    if cmd.eq("bindgen") and sys.args.len() == 5 {
+        try make_bindings(sys);
         return;
     }
     try usage(sys);
@@ -738,6 +748,47 @@ fn make_component(sys: &mut std.System) -> !void {
         sys.proc.exit(1);
     }
     try sys.fs.write_bytes(sys.args.get(5), out.items());
+}
+
+/// The modules of what a world imports, written into a directory, made
+/// if need be.
+fn make_bindings(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let text = try sys.fs.read_file(sys.args.get(2), a);
+    var why = alloc.String.init(a);
+    let w = match wit.parse(text.view(), why: &mut why, a: a) {
+        some(x) => { x }
+        none => {
+            sys.stderr.write("arche-wasm: ");
+            sys.stderr.write(sys.args.get(2));
+            sys.stderr.write(": ");
+            sys.stderr.write(why.view());
+            sys.stderr.write("\n");
+            sys.proc.exit(1);
+        }
+    };
+    let world = wit.world_named(&w, name: sys.args.get(3));
+    if world == component.NONE {
+        sys.stderr.write("arche-wasm: no world of that name\n");
+        sys.proc.exit(1);
+    }
+    let files = bindgen.generate(&w, world: world, why: &mut why, a: a);
+    if why.len() > 0 {
+        sys.stderr.write("arche-wasm: ");
+        sys.stderr.write(why.view());
+        sys.stderr.write("\n");
+        sys.proc.exit(1);
+    }
+    let dir = sys.args.get(4);
+    if not sys.fs.exists(dir) {
+        try sys.fs.make_dir(dir);
+    }
+    for f in files.items() {
+        var path = alloc.String.from(dir, a);
+        path.push_str("/");
+        path.push_str(f.name.view());
+        try sys.fs.write_file(path: path.view(), data: f.text.view());
+    }
 }
 
 fn component_error(e: component.ComponentError) -> str {

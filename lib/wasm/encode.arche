@@ -657,6 +657,23 @@ pub fn component(core: []u8, w: &wit.Wit, world: u32, why: &mut alloc.String, a:
         why.push_str("the core module does not export \"cabi_realloc\"");
         return none_out;
     }
+    if realloc != c.NONE {
+        // (old, old size, alignment, new size) -> address, all i32.
+        let rt = &md.types.items()[md.funcs.items()[realloc as usize].type_index as usize];
+        var want = alloc.List(u8).init(a);
+        var k4: u32 = 0;
+        while k4 < 4 : (k4 += 1) {
+            want.push(c.FLAT_I32);
+        }
+        var one = alloc.List(u8).init(a);
+        one.push(c.FLAT_I32);
+        if not same(x: rt.params.items(), y: want.items()) or not same(x: rt.results.items(), y: one.items()) {
+            why.push_str("cabi_realloc is exported as ");
+            signature_text(why, params: rt.params.items(), results: rt.results.items());
+            why.push_str(", and the canonical ABI calls it as (i32 i32 i32 i32) -> (i32)");
+            return none_out;
+        }
+    }
 
     var out = alloc.List(u8).init(a);
     // The component's preamble: layer 1.

@@ -401,7 +401,7 @@ These exist for the `freestanding` target (S16) and are all `unsafe`:
 | Inline assembly | `asm("mov %0, cr3", in(reg) addr)` with typed operands and clobbers; adjacent strings are one text, so assembly can span lines: `in(r) e`, `out(r) p`, `inout(r) p` and `clobber("name")`, where `r` is `reg` (any register) or a register in quotes, `"rax"`; `%N` in the text is the N-th operand, `%%` a `%`. Operands are integers, `bool`s or pointers; `out` and `inout` ones are writable places (E0922). An `asm` also clobbers memory, so the compiler keeps loads and stores in order around it |
 | Naked functions | `naked fn`: no prologue or epilogue; it takes no parameters, returns nothing, and its body is one `asm` statement (E0923) |
 | Volatile access | `p.read_volatile()`, `p.write_volatile(v)` on a raw pointer to a scalar; `p.addr()` is its address and `core.ptr.from_addr(T, n)` a pointer to address `n` |
-| Foreign functions | `extern "c" fn name(x: u64) -> u64;` declares a function of another object file, called by its own name; only integers, `bool`s, floats and raw pointers cross it (E0924). On WebAssembly, `extern "wasm:module" fn name(…)` is an import of the module of that name, its field the function's name with `-` for `_`; a 32-bit integer crosses as `i32` (E0924 on other targets). `export("name") fn …` gives an Arche function that name |
+| Foreign functions | `extern "c" fn name(x: u64) -> u64;` declares a function of another object file, called by its own name, in its module only: other modules reach it through a function of that module; only integers, `bool`s, floats and raw pointers cross it (E0924). On WebAssembly, `extern "wasm:module" fn name(…)` is an import of the module of that name, its field the function's name with `-` for `_`; a 32-bit integer crosses as `i32` (E0924 on other targets). `export("name") fn …` gives an Arche function that name |
 | Atomics | `core.atomic.load(T, p, order: o)`, `store`, `swap`, `fetch_add`, `fetch_sub`, `fetch_and`, `fetch_or` and `compare_exchange(T, p, expected: e, new: n, order: o)` on raw pointers to integers (and, without `fetch_`, to raw pointers), with an explicit `Ordering` on every operation: `Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst`. The ordering is written as a constant, and a load cannot release, nor a store acquire (E0927). `fetch_add` and `fetch_sub` wrap. The types `core.atomic.U32` and friends, which need no `unsafe`, come with concurrency (§9) |
 | Barriers | `core.atomic.fence(o)`; a `Relaxed` one is E0927 |
 | Layout | `packed struct`: no padding, alignment 1, and a view of its fields is an error, since it may be unaligned (E0926); `align(N)` after `struct` or a field's type raises the alignment to `N`, a power of two up to 4096 (E0925); `extern struct` for C's layout, which for fields of the types Arche has is the layout it already uses (docs/abi.md) |
@@ -463,8 +463,8 @@ This grammar extends A§14. Rules with the same name replace those of Arche-0; t
 
 ```ebnf
 file        = { import } { item } ;
-item        = { DOC } ( [ "pub" ] decl | test_decl | impl_decl ) ;
-decl        = const_decl | type_decl | fn_decl | extern_decl ;
+item        = { DOC } ( [ "pub" ] decl | extern_decl | test_decl | impl_decl ) ;   (* a foreign function is its module's own *)
+decl        = const_decl | type_decl | fn_decl ;
 
 type_decl   = "type" IDENT [ "(" cparams ")" ] "=" type_body ;
 type_body   = [ "packed" | "extern" ] "struct" [ where ] [ align ] "{" { member } "}"   (* a field may end with [ align ] *)
