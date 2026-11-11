@@ -1,0 +1,30 @@
+/// An app of a world that includes Nimadir's and imports more (ext.wit,
+/// nimadir-check.sh): woken, it posts a note; drawn, it shows the note's
+/// number, and its button cancels the note.
+import alloc;
+import host_api;
+import notes;
+import std;
+import wake;
+
+type App = struct {
+    id: u32,
+}
+
+fn init(host: &mut std.Host, a: alloc.Allocator) -> App {
+    return App { id: 0 };
+}
+
+fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
+    if wake.woken(host) {
+        state.id = notes.post(host, title: "Woken", body: "by the test");
+        return;
+    }
+    host_api.ui_heading(host, text: "Extension", level: 1);
+    var line = alloc.String.from("Note ", a);
+    line.push_u64(state.id as u64);
+    host_api.ui_label(host, text: line.view());
+    if host_api.ui_button(host, text: "Cancel") {
+        notes.cancel(host, id: state.id);
+    }
+}

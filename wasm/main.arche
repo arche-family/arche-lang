@@ -46,7 +46,7 @@ fn usage(sys: &mut std.System) -> !void {
     sys.stderr.write("       arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>\n");
     sys.stderr.write("       arche-wasm bindgen <world.wit> <world> <out-dir>\n");
     sys.stderr.write("       arche-wasm echo <component.wasm>\n");
-    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]... [--locale tag] [--time-zone name] [--utc-offset minutes]\n");
+    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]... [--add instance#func[=numbered|true|false|n]]... [--locale tag] [--time-zone name] [--utc-offset minutes]\n");
     sys.proc.exit(2);
 }
 
@@ -352,7 +352,57 @@ type Who = struct {
     utc_offset: i32,
 }
 
-fn start_app(fs: &std.Fs, source: str, store: &mut exec.Store, now: &dyn fn() -> u64, now_ms: i64, who: &Who, registry: &alloc.List(Entry), denied: &alloc.List(alloc.String), why: &mut alloc.String, a: alloc.Allocator) -> ?Started {
+/// A function added to Nimadir's world, as --add says it:
+/// instance#func, answered with nothing; =numbered, with each call's
+/// number; =true, =false or =n, with that.
+fn add_spec(ui: &mut nimadir.Ui, given: str) -> bool {
+    let b = given.bytes();
+    var hash: usize = 0;
+    while hash < b.len() and b[hash] != '#' {
+        hash += 1;
+    }
+    if hash == 0 or hash == b.len() {
+        return false;
+    }
+    var eq = hash + 1;
+    while eq < b.len() and b[eq] != '=' {
+        eq += 1;
+    }
+    let instance = given[0..hash];
+    let func = given[hash + 1..eq];
+    if eq == b.len() {
+        nimadir.add(ui, instance: instance, func: func, numbered: false, answer: component.Val.Unit);
+        return true;
+    }
+    let value = given[eq + 1..b.len()];
+    if value.eq("numbered") {
+        nimadir.add(ui, instance: instance, func: func, numbered: true, answer: component.Val.Unit);
+    } else if value.eq("true") or value.eq("false") {
+        nimadir.add(ui, instance: instance, func: func, numbered: false, answer: component.Val.Bool { v: value.eq("true") });
+    } else {
+        nimadir.add(ui, instance: instance, func: func, numbered: false, answer: component.Val.Int { v: number(value) as u64 });
+    }
+    return true;
+}
+
+/// A value an app gave an added function, as a frame's report says it.
+fn say_val(v: &component.Val, out: &mut alloc.String) {
+    match v {
+        .Str { v: text } => { quote(text.view(), out: out); }
+        .Int { v: n } => { out.push_u64(n.*); }
+        .Bool { v: x } => {
+            if x.* {
+                out.push_str("true");
+            } else {
+                out.push_str("false");
+            }
+        }
+        .Unit => { out.push_str("()"); }
+        _ => { out.push_str("..."); }
+    }
+}
+
+fn start_app(fs: &std.Fs, source: str, store: &mut exec.Store, now: &dyn fn() -> u64, now_ms: i64, who: &Who, registry: &alloc.List(Entry), denied: &alloc.List(alloc.String), added: &alloc.List(alloc.String), why: &mut alloc.String, a: alloc.Allocator) -> ?Started {
     let bytes = match fs.read_bytes(source, a) {
         ok(x) => { x }
         err(_) => {
@@ -367,6 +417,13 @@ fn start_app(fs: &std.Fs, source: str, store: &mut exec.Store, now: &dyn fn() ->
     ui.utc_offset = who.utc_offset;
     for d in denied.items() {
         nimadir.deny(&mut ui, func: d.view());
+    }
+    for g in added.items() {
+        if not add_spec(&mut ui, given: g.view()) {
+            why.push_str("not instance#func[=answer]: ");
+            why.push_str(g.view());
+            return none;
+        }
     }
     // The registry, but the start page: it is how the shell finds home,
     // not somewhere to go.
@@ -448,6 +505,7 @@ fn run_app(sys: &mut std.System) -> !void {
     var dom_typed = alloc.List(At).init(a);
     var dom_enters = alloc.List(At).init(a);
     var denied = alloc.List(alloc.String).init(a);
+    var added = alloc.List(alloc.String).init(a);
     var registry = alloc.List(Entry).init(a);
     var use_jit = false;
     var confirm = false;
@@ -490,6 +548,9 @@ fn run_app(sys: &mut std.System) -> !void {
         } else if arg.eq("--deny") and more {
             denied.push(alloc.String.from(sys.args.get(i + 1), a));
             i += 1;
+        } else if arg.eq("--add") and more {
+            added.push(alloc.String.from(sys.args.get(i + 1), a));
+            i += 1;
         } else if arg.eq("--locale") and more {
             who.locale = alloc.String.from(sys.args.get(i + 1), a);
             i += 1;
@@ -522,7 +583,7 @@ fn run_app(sys: &mut std.System) -> !void {
     if not sys.fs.exists(source.view()) {
         source = alloc.String.from(path, a);
     }
-    var app = match start_app(&sys.fs, source: source.view(), store: &mut store, now: &now, now_ms: (sys.clock.unix_ns() / 1000000) as i64, who: &who, registry: &registry, denied: &denied, why: &mut why, a: a) {
+    var app = match start_app(&sys.fs, source: source.view(), store: &mut store, now: &now, now_ms: (sys.clock.unix_ns() / 1000000) as i64, who: &who, registry: &registry, denied: &denied, added: &added, why: &mut why, a: a) {
         some(s) => {
             out.write("loaded ");
             out.write_u64(s.size);
@@ -613,6 +674,23 @@ fn run_app(sys: &mut std.System) -> !void {
             logs.push_str("\n");
         }
         nimadir.clear_logs(&mut app.ui);
+        // What the app asked of the functions added to its world.
+        for k in nimadir.take_calls(&mut app.ui, a: a).items() {
+            logs.push_str("   [call] ");
+            logs.push_str(k.instance.view());
+            logs.push_str("#");
+            logs.push_str(k.func.view());
+            logs.push_str("(");
+            var first = true;
+            for v in k.args.items() {
+                if not first {
+                    logs.push_str(", ");
+                }
+                first = false;
+                say_val(v, out: &mut logs);
+            }
+            logs.push_str(")\n");
+        }
         if app.ui.open_request.len() > 0 {
             let asked = alloc.String.from(app.ui.open_request.view(), a);
             app.ui.open_request = alloc.String.init(a);
@@ -643,7 +721,7 @@ fn run_app(sys: &mut std.System) -> !void {
             if go {
                 var next_store = new_store(use_jit, a: a);
                 var no = alloc.String.init(a);
-                match start_app(&sys.fs, source: target.view(), store: &mut next_store, now: &now, now_ms: (sys.clock.unix_ns() / 1000000) as i64, who: &who, registry: &registry, denied: &denied, why: &mut no, a: a) {
+                match start_app(&sys.fs, source: target.view(), store: &mut next_store, now: &now, now_ms: (sys.clock.unix_ns() / 1000000) as i64, who: &who, registry: &registry, denied: &denied, added: &added, why: &mut no, a: a) {
                     some(s) => {
                         app = s.app;
                         store = next_store;
@@ -770,13 +848,66 @@ fn first_core_module(sys: &mut std.System) -> !void {
     sys.proc.exit(1);
 }
 
+fn is_wit(name: str) -> bool {
+    return name.len() > 4 and name[name.len() - 4..name.len()].eq(".wit");
+}
+
+/// The .wit files of dir, in order of their names, onto texts.
+fn wit_files(fs: &std.Fs, dir: str, texts: &mut alloc.List(alloc.String), a: alloc.Allocator) -> !void {
+    let names = try fs.list(dir, a);
+    for n in names.items() {
+        if is_wit(n.view()) {
+            var path = alloc.String.from(dir, a);
+            path.push_str("/");
+            path.push_str(n.view());
+            texts.push(try fs.read_file(path.view(), a));
+        }
+    }
+}
+
+/// The WIT at path: a file, or a directory as wit-bindgen reads one: what
+/// its deps/ has first, a directory of .wit files or one, then its own
+/// .wit files.
+fn wit_texts(fs: &std.Fs, path: str, a: alloc.Allocator) -> !alloc.List(alloc.String) {
+    var texts = alloc.List(alloc.String).init(a);
+    match fs.list(path, a) {
+        ok(_) => { }
+        err(_) => {
+            texts.push(try fs.read_file(path, a));
+            return texts;
+        }
+    }
+    var deps = alloc.String.from(path, a);
+    deps.push_str("/deps");
+    match fs.list(deps.view(), a) {
+        ok(names) => {
+            for n in names.items() {
+                var sub = alloc.String.from(deps.view(), a);
+                sub.push_str("/");
+                sub.push_str(n.view());
+                match fs.list(sub.view(), a) {
+                    ok(_) => { try wit_files(fs, dir: sub.view(), texts: &mut texts, a: a); }
+                    err(_) => {
+                        if is_wit(n.view()) {
+                            texts.push(try fs.read_file(sub.view(), a));
+                        }
+                    }
+                }
+            }
+        }
+        err(_) => { }
+    }
+    try wit_files(fs, dir: path, texts: &mut texts, a: a);
+    return texts;
+}
+
 /// The component of a core module built for a world of a WIT package.
 fn make_component(sys: &mut std.System) -> !void {
     let a = sys.alloc;
     let core = try sys.fs.read_bytes(sys.args.get(2), a);
-    let text = try sys.fs.read_file(sys.args.get(3), a);
+    let texts = try wit_texts(&sys.fs, path: sys.args.get(3), a: a);
     var why = alloc.String.init(a);
-    let w = match wit.parse(text.view(), why: &mut why, a: a) {
+    let w = match wit.parse_all(&texts, why: &mut why, a: a) {
         some(x) => { x }
         none => {
             sys.stderr.write("arche-wasm: ");
@@ -806,9 +937,9 @@ fn make_component(sys: &mut std.System) -> !void {
 /// if need be.
 fn make_bindings(sys: &mut std.System) -> !void {
     let a = sys.alloc;
-    let text = try sys.fs.read_file(sys.args.get(2), a);
+    let texts = try wit_texts(&sys.fs, path: sys.args.get(2), a: a);
     var why = alloc.String.init(a);
-    let w = match wit.parse(text.view(), why: &mut why, a: a) {
+    let w = match wit.parse_all(&texts, why: &mut why, a: a) {
         some(x) => { x }
         none => {
             sys.stderr.write("arche-wasm: ");

@@ -229,6 +229,51 @@ else
     failed=$((failed + 1))
 fi
 
+# A world that includes Nimadir's and imports more (tests/extension), as
+# the phone's does: its WIT a directory with Nimadir's in deps/, its
+# include and its other package's interfaces read, bound and encoded; the
+# functions the embedder adds (--add) answered and their calls said;
+# woken, the app posts, drawn, it cancels; without them, it is refused.
+mkdir -p "$work/ext-wit/deps/nimadir"
+cp "$here/tests/extension/ext.wit" "$work/ext-wit/"
+cp "$apps/world.wit" "$work/ext-wit/deps/nimadir/"
+if ! ARCHE="$arche" ARCHE_WASM="$wasm" WIT="$work/ext-wit" WORLD=app sh "$here/nimadir-app.sh" "$here/tests/extension" "$work/ext.wasm" > "$work/err" 2>&1; then
+    echo "FAIL the app of a world that includes Nimadir's did not build:"
+    head -20 "$work/err"
+    failed=$((failed + 1))
+else
+    for woken in false true; do
+        expected=$here/tests/extension/expected.txt
+        frames="--frames 3 --script 2:0"
+        if [ "$woken" = true ]; then
+            expected=$here/tests/extension/expected-woken.txt
+            frames="--frames 1"
+        fi
+        for mode in "" --jit; do
+            # shellcheck disable=SC2086
+            "$wasm" nimadir "$work/ext.wasm" $frames $mode --add 'test:ext/notes@0.1.0#post=numbered' --add 'test:ext/notes@0.1.0#cancel' --add "test:ext/wake@0.1.0#woken=$woken" > "$work/out" 2>&1 || true
+            sh "$apps/normalize.sh" < "$work/out" > "$work/got"
+            if diff -u "$expected" "$work/got" > "$work/diff"; then
+                echo "PASS an app of a world that includes Nimadir's, woken $woken $mode"
+            else
+                echo "FAIL an app of a world that includes Nimadir's, woken $woken $mode:"
+                head -30 "$work/diff"
+                failed=$((failed + 1))
+            fi
+        done
+    done
+    if "$wasm" nimadir "$work/ext.wasm" --frames 1 > "$work/out" 2>&1; then
+        echo "FAIL an app that imports what the shell does not give ran"
+        failed=$((failed + 1))
+    elif grep -qF "imports what the shell does not give" "$work/out"; then
+        echo "PASS an app that imports what no one added is refused"
+    else
+        echo "FAIL an app that imports what no one added:"
+        head -5 "$work/out"
+        failed=$((failed + 1))
+    fi
+fi
+
 # Every kind of WIT type bindgen binds (tests/echo): an app given each,
 # through its bindings, to a function of echo.wit that arche-wasm echo
 # answers with what it was given, by the runtime's canonical ABI, and
@@ -252,7 +297,7 @@ fi
 # Every component the encoder made, validated by wasm-tools where there is
 # one; CI requires it (WASM_TOOLS_REQUIRED=1).
 if command -v wasm-tools > /dev/null 2>&1; then
-    for f in "$work"/mini-apps/*/*.component.wasm "$work/app.wasm" "$work/template.wasm" "$work/echo.wasm"; do
+    for f in "$work"/mini-apps/*/*.component.wasm "$work/app.wasm" "$work/template.wasm" "$work/echo.wasm" "$work/ext.wasm"; do
         if wasm-tools validate "$f" 2> "$work/err"; then
             echo "PASS wasm-tools validates $(basename "$f")"
         else

@@ -174,8 +174,105 @@ pub type Ui = struct {
     denied: alloc.List(alloc.String),
     /// What a runtime the app is built on reaches through WASI.
     wasi: wasip2.Wasi,
+    /// Functions the embedder adds to Nimadir's world, and the calls made
+    /// to them since it last took them (add, take_calls).
+    added: alloc.List(Added),
+    calls: alloc.List(Call),
+    next_call: u32,
     a: alloc.Allocator,
 }
+
+/// A function the embedder adds to what Nimadir's world gives, for a world
+/// that includes it and imports more (the phone's arche:phone): each call
+/// is kept for the embedder (take_calls) and answered at once, with
+/// answer, which the embedder may change between calls (set_answer), or,
+/// when numbered, with the call's own number, a u32.
+type Added = struct {
+    instance: alloc.String,
+    func: alloc.String,
+    numbered: bool,
+    answer: c.Val,
+}
+
+/// A call to an added function: its number, where it went, and what it
+/// was given.
+pub type Call = struct {
+    pub number: u32,
+    pub instance: alloc.String,
+    pub func: alloc.String,
+    pub args: alloc.List(c.Val),
+}
+
+/// func of instance (as "ns:pkg/interface@version") added: answered with
+/// answer, or, numbered, with each call's number (Added).
+pub fn add(ui: &mut Ui, instance: str, func: str, numbered: bool, answer: c.Val) {
+    ui.added.push(Added { instance: alloc.String.from(instance, ui.a), func: alloc.String.from(func, ui.a), numbered: numbered, answer: answer });
+}
+
+/// What calls to func of instance are answered with from now on.
+pub fn set_answer(ui: &mut Ui, instance: str, func: str, answer: c.Val) {
+    var k: usize = 0;
+    while k < ui.added.len() : (k += 1) {
+        if ui.added.items()[k].instance.view().eq(instance) and ui.added.items()[k].func.view().eq(func) {
+            ui.added.items_mut()[k].answer = copy_val(&answer, a: ui.a);
+        }
+    }
+}
+
+/// The calls to added functions since this was last asked, in order.
+pub fn take_calls(ui: &mut Ui, a: alloc.Allocator) -> alloc.List(Call) {
+    var out = alloc.List(Call).init(a);
+    for k in ui.calls.items() {
+        var args = alloc.List(c.Val).init(a);
+        for v in k.args.items() {
+            args.push(copy_val(v, a: a));
+        }
+        out.push(Call { number: k.number, instance: alloc.String.from(k.instance.view(), a), func: alloc.String.from(k.func.view(), a), args: args });
+    }
+    ui.calls = alloc.List(Call).init(ui.a);
+    return out;
+}
+
+/// A copy of v, its strings and lists too.
+fn copy_val(v: &c.Val, a: alloc.Allocator) -> c.Val {
+    match v {
+        .Unit => { return c.Val.Unit; }
+        .Bool { v: b } => { return c.Val.Bool { v: b.* }; }
+        .Int { v: n } => { return c.Val.Int { v: n.* }; }
+        .F32 { bits } => { return c.Val.F32 { bits: bits.* }; }
+        .F64 { bits } => { return c.Val.F64 { bits: bits.* }; }
+        .Char { v: ch } => { return c.Val.Char { v: ch.* }; }
+        .Str { v: text } => { return c.Val.Str { v: alloc.String.from(text.view(), a) }; }
+        .List { items } => {
+            var out = alloc.List(c.Val).init(a);
+            for x in items.items() {
+                out.push(copy_val(x, a: a));
+            }
+            return c.Val.List { items: out };
+        }
+        .Variant { case, payload } => {
+            var out = alloc.List(c.Val).init(a);
+            for x in payload.items() {
+                out.push(copy_val(x, a: a));
+            }
+            return c.Val.Variant { case: case.*, payload: out };
+        }
+        .Flags { bits } => { return c.Val.Flags { bits: bits.* }; }
+    }
+}
+
+/// The added function func of instance, by its place; NONE for none.
+fn added_at(ui: &Ui, instance: str, func: str) -> usize {
+    var k: usize = 0;
+    while k < ui.added.len() : (k += 1) {
+        if ui.added.items()[k].instance.view().eq(instance) and ui.added.items()[k].func.view().eq(func) {
+            return k;
+        }
+    }
+    return NONE_AT;
+}
+
+const NONE_AT: usize = 0xFFFFFFFFFFFFFFFF;
 
 pub fn new_ui(a: alloc.Allocator) -> Ui {
     var ui = Ui {
@@ -220,6 +317,9 @@ pub fn new_ui(a: alloc.Allocator) -> Ui {
         exceeded: false,
         denied: alloc.List(alloc.String).init(a),
         wasi: wasip2.new_wasi(seed: WASI_SEED, a),
+        added: alloc.List(Added).init(a),
+        calls: alloc.List(Call).init(a),
+        next_call: 1,
         a: a,
     };
     // Node 0 is no node; 1 is the page's body.
@@ -2471,7 +2571,7 @@ impl c.Imports for Ui {
         } else if instance.eq(DOM) {
             list = DOM_FUNCS;
         } else {
-            return false;
+            return added_at(self, instance: instance, func: func) != NONE_AT;
         }
         // " name " in the list.
         let l = list.bytes();
@@ -2486,6 +2586,20 @@ impl c.Imports for Ui {
     }
 
     fn call(self: &mut Ui, instance: str, func: str, args: &alloc.List(c.Val), a: alloc.Allocator) -> exec.Trap!c.Val {
+        let k = added_at(self, instance: instance, func: func);
+        if k != NONE_AT {
+            var kept = alloc.List(c.Val).init(self.a);
+            for v in args.items() {
+                kept.push(copy_val(v, a: self.a));
+            }
+            let made = self.next_call;
+            self.next_call += 1;
+            self.calls.push(Call { number: made, instance: alloc.String.from(instance, self.a), func: alloc.String.from(func, self.a), args: kept });
+            if self.added.items()[k].numbered {
+                return c.Val.Int { v: made as u64 };
+            }
+            return copy_val(&self.added.items()[k].answer, a: a);
+        }
         if instance.eq(DOM) {
             return try dom(self, func: func, args: args);
         }

@@ -1,10 +1,13 @@
 /// WIT, the Component Model's interface language (docs/sprints.md S38), read
 /// into the types the runtime reads from a component's binary
 /// (wasm.component's CType), so that what lays them out, flattens and
-/// encodes them is the same code. A package's interfaces, with their
-/// records, variants, enums, flags, aliases and functions, and its worlds,
-/// with what they import and export. Not yet: resources, `use` between
-/// interfaces, and `include`.
+/// encodes them is the same code. Packages' interfaces, with their
+/// records, variants, enums, flags, aliases and functions, and their
+/// worlds, with what they import and export: their own package's
+/// interfaces by name, another's by its full name, and what another world
+/// imports and exports, by `include`. Several texts are read as one
+/// (parse_all, those a world uses first), each of its own package. Not
+/// yet: resources, and `use` between interfaces.
 import alloc;
 import wasm.component as c;
 
@@ -21,16 +24,26 @@ pub type TypeDef = struct {
     pub ty: u32,
 }
 
+/// A package: "namespace:name", and its version, empty for none.
+pub type Package = struct {
+    pub name: alloc.String,
+    pub version: alloc.String,
+}
+
 pub type Interface = struct {
     pub name: alloc.String,
+    /// Its package, by its number in Wit.packages.
+    pub package: u32,
     pub types: alloc.List(TypeDef),
     pub funcs: alloc.List(Func),
 }
 
 /// A world: the interfaces it imports and exports, by their number in
-/// the package, and the functions it imports and exports of its own.
+/// Wit.interfaces, and the functions it imports and exports of its own;
+/// with them, those of the worlds it includes.
 pub type World = struct {
     pub name: alloc.String,
+    pub package: u32,
     pub imports: alloc.List(u32),
     pub exports: alloc.List(u32),
     pub import_funcs: alloc.List(Func),
@@ -38,9 +51,11 @@ pub type World = struct {
 }
 
 pub type Wit = struct {
+    /// The package of the last text read, whose worlds a tool builds:
     /// "namespace:name", and its version, empty for none.
     pub package: alloc.String,
     pub version: alloc.String,
+    pub packages: alloc.List(Package),
     /// The primitives first, at c's numbers for them (0x7F - code).
     pub types: alloc.List(c.CType),
     pub interfaces: alloc.List(Interface),
@@ -63,6 +78,8 @@ type Parser = struct {
     tok: alloc.String,
     ident: bool,
     w: Wit,
+    /// The package of the text being read.
+    pkg: u32,
     why: alloc.String,
     a: alloc.Allocator,
 }
@@ -402,44 +419,160 @@ fn interface_body(p: &mut Parser, iface: u32) {
     expect(p, t: "}");
 }
 
-fn interface_named(w: &Wit, name: str) -> u32 {
+fn interface_named(w: &Wit, pkg: u32, name: str) -> u32 {
     var i: u32 = 0;
     while (i as usize) < w.interfaces.len() : (i += 1) {
-        if w.interfaces.items()[i as usize].name.view().eq(name) {
+        let it = &w.interfaces.items()[i as usize];
+        if it.package == pkg and it.name.view().eq(name) {
             return i;
         }
     }
     return c.NONE;
 }
 
+fn world_in(w: &Wit, pkg: u32, name: str) -> u32 {
+    var i: u32 = 0;
+    while (i as usize) < w.worlds.len() : (i += 1) {
+        let it = &w.worlds.items()[i as usize];
+        if it.package == pkg and it.name.view().eq(name) {
+            return i;
+        }
+    }
+    return c.NONE;
+}
+
+fn package_named(w: &Wit, name: str, ver: str) -> u32 {
+    var i: u32 = 0;
+    while (i as usize) < w.packages.len() : (i += 1) {
+        let it = &w.packages.items()[i as usize];
+        if it.name.view().eq(name) and it.version.view().eq(ver) {
+            return i;
+        }
+    }
+    return c.NONE;
+}
+
+/// What a world names after import, export or include, its first name
+/// read: an interface or world of its own package, or, after ns:, one of
+/// another, ns:pkg/name@version. Its package (NONE when there is none
+/// such), and its name.
+type Ref = struct {
+    pkg: u32,
+    name: alloc.String,
+}
+
+fn reference(p: &mut Parser, first: alloc.String) -> Ref {
+    if not is(p, t: ":") {
+        return Ref { pkg: p.pkg, name: first };
+    }
+    next(p);
+    var pkg_name = alloc.String.from(first.view(), p.a);
+    pkg_name.push_str(":");
+    pkg_name.push_str(ident(p).view());
+    expect(p, t: "/");
+    let name = ident(p);
+    var ver = alloc.String.init(p.a);
+    if is(p, t: "@") {
+        ver = version(p);
+    }
+    return Ref { pkg: package_named(&p.w, name: pkg_name.view(), ver: ver.view()), name: name };
+}
+
+/// A copy of world's imports and exports.
+fn copy_of(w: &Wit, world: u32, a: alloc.Allocator) -> World {
+    let o = &w.worlds.items()[world as usize];
+    var out = World { name: alloc.String.from(o.name.view(), a), package: o.package, imports: alloc.List(u32).init(a), exports: alloc.List(u32).init(a), import_funcs: alloc.List(Func).init(a), export_funcs: alloc.List(Func).init(a) };
+    for i in o.imports.items() {
+        out.imports.push(i.*);
+    }
+    for i in o.exports.items() {
+        out.exports.push(i.*);
+    }
+    for f in o.import_funcs.items() {
+        out.import_funcs.push(Func { name: alloc.String.from(f.name.view(), a), ty: f.ty });
+    }
+    for f in o.export_funcs.items() {
+        out.export_funcs.push(Func { name: alloc.String.from(f.name.view(), a), ty: f.ty });
+    }
+    return out;
+}
+
 fn world_body(p: &mut Parser, world: u32) {
     expect(p, t: "{");
     while p.why.len() == 0 and not is(p, t: "}") and p.tok.len() > 0 {
+        if is(p, t: "include") {
+            next(p);
+            let first = ident(p);
+            let r = reference(p, first: first);
+            expect(p, t: ";");
+            let other = world_in(&p.w, pkg: r.pkg, name: r.name.view());
+            if other == c.NONE or other == world {
+                fail(p, what: "no world of that name to include");
+                return;
+            }
+            // What it imports and exports, this world's too.
+            let o = copy_of(&p.w, world: other, a: p.a);
+            for i in o.imports.items() {
+                p.w.worlds.items_mut()[world as usize].imports.push(i.*);
+            }
+            for i in o.exports.items() {
+                p.w.worlds.items_mut()[world as usize].exports.push(i.*);
+            }
+            for f in o.import_funcs.items() {
+                p.w.worlds.items_mut()[world as usize].import_funcs.push(Func { name: alloc.String.from(f.name.view(), p.a), ty: f.ty });
+            }
+            for f in o.export_funcs.items() {
+                p.w.worlds.items_mut()[world as usize].export_funcs.push(Func { name: alloc.String.from(f.name.view(), p.a), ty: f.ty });
+            }
+            continue;
+        }
         let importing = is(p, t: "import");
         if not importing and not is(p, t: "export") {
-            fail(p, what: "a world imports and exports; include is not read yet");
+            fail(p, what: "a world imports, exports and includes");
             return;
         }
         next(p);
         let name = ident(p);
         if is(p, t: ":") {
             next(p);
-            if not is(p, t: "func") {
-                fail(p, what: "expected a function; interfaces are imported by name");
+            if is(p, t: "func") {
+                next(p);
+                let t = func_type(p, iface: c.NONE);
+                expect(p, t: ";");
+                if importing {
+                    p.w.worlds.items_mut()[world as usize].import_funcs.push(Func { name: name, ty: t });
+                } else {
+                    p.w.worlds.items_mut()[world as usize].export_funcs.push(Func { name: name, ty: t });
+                }
+                continue;
+            }
+            // ns:pkg/interface@version: another package's interface. The
+            // ':' is read; reference reads on from the package's name.
+            var pkg_name = alloc.String.from(name.view(), p.a);
+            pkg_name.push_str(":");
+            pkg_name.push_str(ident(p).view());
+            expect(p, t: "/");
+            let iname = ident(p);
+            var ver = alloc.String.init(p.a);
+            if is(p, t: "@") {
+                ver = version(p);
+            }
+            expect(p, t: ";");
+            let pkg = package_named(&p.w, name: pkg_name.view(), ver: ver.view());
+            let i = interface_named(&p.w, pkg: pkg, name: iname.view());
+            if i == c.NONE {
+                fail(p, what: "no interface of that name in that package");
                 return;
             }
-            next(p);
-            let t = func_type(p, iface: c.NONE);
-            expect(p, t: ";");
             if importing {
-                p.w.worlds.items_mut()[world as usize].import_funcs.push(Func { name: name, ty: t });
+                p.w.worlds.items_mut()[world as usize].imports.push(i);
             } else {
-                p.w.worlds.items_mut()[world as usize].export_funcs.push(Func { name: name, ty: t });
+                p.w.worlds.items_mut()[world as usize].exports.push(i);
             }
             continue;
         }
         expect(p, t: ";");
-        let i = interface_named(&p.w, name: name.view());
+        let i = interface_named(&p.w, pkg: p.pkg, name: name.view());
         if i == c.NONE {
             fail(p, what: "no interface of that name in this package");
             return;
@@ -463,13 +596,67 @@ fn resolved(w: &Wit, t: u32) -> u32 {
     return at;
 }
 
+/// One text, into p: its package, then its interfaces and worlds.
+fn read_text(p: &mut Parser, a: alloc.Allocator) {
+    next(p);
+    var name = alloc.String.init(a);
+    var ver = alloc.String.init(a);
+    if is(p, t: "package") {
+        next(p);
+        let ns = ident(p);
+        expect(p, t: ":");
+        let pn = ident(p);
+        name.push_str(ns.view());
+        name.push_str(":");
+        name.push_str(pn.view());
+        if is(p, t: "@") {
+            ver = version(p);
+        }
+        expect(p, t: ";");
+    }
+    var pkg = package_named(&p.w, name: name.view(), ver: ver.view());
+    if pkg == c.NONE {
+        p.w.packages.push(Package { name: alloc.String.from(name.view(), a), version: alloc.String.from(ver.view(), a) });
+        pkg = (p.w.packages.len() - 1) as u32;
+    }
+    p.pkg = pkg;
+    p.w.package = name;
+    p.w.version = ver;
+    while p.why.len() == 0 and p.tok.len() > 0 {
+        if is(p, t: "interface") {
+            next(p);
+            let iname = ident(p);
+            p.w.interfaces.push(Interface { name: iname, package: pkg, types: alloc.List(TypeDef).init(a), funcs: alloc.List(Func).init(a) });
+            interface_body(p, iface: (p.w.interfaces.len() - 1) as u32);
+        } else if is(p, t: "world") {
+            next(p);
+            let wname = ident(p);
+            p.w.worlds.push(World { name: wname, package: pkg, imports: alloc.List(u32).init(a), exports: alloc.List(u32).init(a), import_funcs: alloc.List(Func).init(a), export_funcs: alloc.List(Func).init(a) });
+            world_body(p, world: (p.w.worlds.len() - 1) as u32);
+        } else {
+            fail(p, what: "expected an interface or a world");
+        }
+    }
+}
+
 /// A package's WIT text read; none when it cannot be, why saying where.
 pub fn parse(text: str, why: &mut alloc.String, a: alloc.Allocator) -> ?Wit {
+    var texts = alloc.List(alloc.String).init(a);
+    texts.push(alloc.String.from(text, a));
+    return parse_all(&texts, why: why, a: a);
+}
+
+/// Several WIT texts read as one, in their order: a world may name what
+/// a text before it, or its own, has. Each text is of the package it
+/// says, or of a package with no name; the last's is the Wit's package.
+/// none when they cannot be read, why saying where.
+pub fn parse_all(texts: &alloc.List(alloc.String), why: &mut alloc.String, a: alloc.Allocator) -> ?Wit {
     var p = Parser {
-        lx: Lexer { text: alloc.String.from(text, a), at: 0, line: 1 },
+        lx: Lexer { text: alloc.String.init(a), at: 0, line: 1 },
         tok: alloc.String.init(a),
         ident: false,
-        w: Wit { package: alloc.String.init(a), version: alloc.String.init(a), types: alloc.List(c.CType).init(a), interfaces: alloc.List(Interface).init(a), worlds: alloc.List(World).init(a) },
+        w: Wit { package: alloc.String.init(a), version: alloc.String.init(a), packages: alloc.List(Package).init(a), types: alloc.List(c.CType).init(a), interfaces: alloc.List(Interface).init(a), worlds: alloc.List(World).init(a) },
+        pkg: 0,
         why: alloc.String.init(a),
         a: a,
     };
@@ -478,34 +665,10 @@ pub fn parse(text: str, why: &mut alloc.String, a: alloc.Allocator) -> ?Wit {
     while code >= 0x73 : (code -= 1) {
         _ = new_type(&mut p, kind: code as u8);
     }
-    next(&mut p);
-    if is(&p, t: "package") {
-        next(&mut p);
-        let ns = ident(&mut p);
-        expect(&mut p, t: ":");
-        let name = ident(&mut p);
-        p.w.package.push_str(ns.view());
-        p.w.package.push_str(":");
-        p.w.package.push_str(name.view());
-        if is(&p, t: "@") {
-            p.w.version = version(&mut p);
-        }
-        expect(&mut p, t: ";");
-    }
-    while p.why.len() == 0 and p.tok.len() > 0 {
-        if is(&p, t: "interface") {
-            next(&mut p);
-            let name = ident(&mut p);
-            p.w.interfaces.push(Interface { name: name, types: alloc.List(TypeDef).init(a), funcs: alloc.List(Func).init(a) });
-            interface_body(&mut p, iface: (p.w.interfaces.len() - 1) as u32);
-        } else if is(&p, t: "world") {
-            next(&mut p);
-            let name = ident(&mut p);
-            p.w.worlds.push(World { name: name, imports: alloc.List(u32).init(a), exports: alloc.List(u32).init(a), import_funcs: alloc.List(Func).init(a), export_funcs: alloc.List(Func).init(a) });
-            world_body(&mut p, world: (p.w.worlds.len() - 1) as u32);
-        } else {
-            fail(&mut p, what: "expected an interface or a world");
-        }
+    var t: usize = 0;
+    while t < texts.len() and p.why.len() == 0 : (t += 1) {
+        p.lx = Lexer { text: alloc.String.from(texts.items()[t].view(), a), at: 0, line: 1 };
+        read_text(&mut p, a: a);
     }
     // Every name defined, and aliases seen through.
     if p.why.len() == 0 {
@@ -553,18 +716,25 @@ pub fn is_alias(w: &Wit, t: u32) -> bool {
 /// The interface's full name, as a component imports it:
 /// "namespace:name/interface@version".
 pub fn interface_id(w: &Wit, i: u32, a: alloc.Allocator) -> alloc.String {
-    var s = alloc.String.from(w.package.view(), a);
+    let it = &w.interfaces.items()[i as usize];
+    let pkg = &w.packages.items()[it.package as usize];
+    var s = alloc.String.from(pkg.name.view(), a);
     s.push_str("/");
-    s.push_str(w.interfaces.items()[i as usize].name.view());
-    if w.version.len() > 0 {
+    s.push_str(it.name.view());
+    if pkg.version.len() > 0 {
         s.push_str("@");
-        s.push_str(w.version.view());
+        s.push_str(pkg.version.view());
     }
     return s;
 }
 
-/// The world of that name; NONE for none.
+/// The world of that name, the last text's package's first; NONE for none.
 pub fn world_named(w: &Wit, name: str) -> u32 {
+    let own = package_named(w, name: w.package.view(), ver: w.version.view());
+    let mine = world_in(w, pkg: own, name: name);
+    if mine != c.NONE {
+        return mine;
+    }
     var i: u32 = 0;
     while (i as usize) < w.worlds.len() : (i += 1) {
         if w.worlds.items()[i as usize].name.view().eq(name) {
