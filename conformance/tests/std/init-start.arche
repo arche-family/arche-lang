@@ -1,0 +1,44 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: 3 127
+// wasm: skip
+import alloc;
+import std;
+import std.init;
+
+/// The status the child pid ended with, waited for.
+fn ended(sys: &mut std.System, pid: u32) -> u32 {
+    while true {
+        match init.reap(&sys.proc) {
+            some(e) => {
+                if e.pid == pid {
+                    return (e.status >> 8) & 0xFF;
+                }
+            }
+            none => { sys.clock.sleep_ns(10000000); }
+        }
+    }
+    return 0;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    // A daemon started, and not waited for: a shell that ends with 3, its
+    // only environment what it is given.
+    var argv = alloc.List(alloc.String).init(a);
+    argv.push(alloc.String.from("/bin/sh", a));
+    argv.push(alloc.String.from("-c", a));
+    argv.push(alloc.String.from("exit $CODE", a));
+    var env = alloc.List(alloc.String).init(a);
+    env.push(alloc.String.from("CODE=3", a));
+    let pid = init.start(&sys.proc, argv: &argv, env: &env, a: a) orelse panic("no process");
+    sys.stdout.write_u64(ended(sys, pid: pid) as u64);
+    // No such program: it ends with 127.
+    var missing = alloc.List(alloc.String).init(a);
+    missing.push(alloc.String.from("/no/such/program", a));
+    let other = init.start(&sys.proc, argv: &missing, env: &env, a: a) orelse panic("no process");
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(ended(sys, pid: other) as u64);
+    sys.stdout.write("\n");
+}

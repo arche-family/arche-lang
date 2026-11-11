@@ -496,6 +496,9 @@ Keyin, telefon tarmog'i uchun (arche-os T5):
   - `lookup`: server'larni navbatma-navbat ikki aylana so'raydi. Boshqa manzildan kelgan yoki boshqa savolga berilgan javob olinmaydi.
 
   `conformance/tests/dns` bularni tarmoqsiz, tayyor baytlar bilan, `lookup`ni esa javob bermaydigan server bilan tekshiradi.
+- `dbus`: `Header`da `sender` maydoni (7) bor, `header_of` va `body_of` esa xabarni kelganidek qaytaradi. Bus xabarni uzatishi uchun shu kerak; arche-os'ning `phone/dbusd`i shular ustida yozilgan. `interop/dbus.sh` `DBUS_BUS` bilan dbus-daemon o'rnida boshqa bus'ni ham sinaydi.
+- `std.init.start`: daemon'ni kutmasdan ishga tushiradi (fork va execve). Unga faqat berilgan muhit o'tadi, `reap` uni tugaganda yig'adi. `conformance/tests/std/init-start.arche` tekshiradi.
+- `phone.config`: Wi-Fi uchun simsiz tarmoq steki, `mac80211_hwsim` (QEMU'da Wi-Fi qurilmasi yo'q, hwsim ikki radio beradi) va iwd ishlatadigan kernel kriptosi (AF_ALG, kalitlar, Diffie-Hellman) qo'shildi.
 
 S35 yopildi. Hali yo'q, kerak bo'lganda qo'shiladigan narsalar: GPOS kerning va hinting; D-Bus orqali Unix file descriptor uzatish (PipeWire, T5); `std.drm`da page flip (UI server, T2).
 
