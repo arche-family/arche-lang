@@ -1,0 +1,92 @@
+/// An app of a world that imports a shared folder (files.wit,
+/// nimadir-check.sh): on its first frame it lists the folder and a folder
+/// in it, reads a file, writes one, makes a folder, removes a file, and
+/// tries paths that leave the folder, which are refused; then it lists the
+/// folder in it again. Each answer is a label.
+import alloc;
+import files;
+import host_api;
+import std;
+
+type App = struct {
+    done: bool,
+}
+
+fn init(host: &mut std.Host, a: alloc.Allocator) -> App {
+    return App { done: false };
+}
+
+/// The entries of path, as "name/ 0" for a folder, "name 5" for a file.
+fn listed(host: &mut std.Host, path: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.from("list ", a);
+    s.push_str(path);
+    s.push_str(":");
+    for e in files.list(host, path: path, a: a).items() {
+        s.push_str(" ");
+        s.push_str(e.name.view());
+        if e.folder {
+            s.push_str("/");
+        }
+        s.push_str(" ");
+        s.push_u64(e.size);
+    }
+    return s;
+}
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
+    if state.done {
+        return;
+    }
+    state.done = true;
+    host_api.ui_label(host, text: listed(host, path: "", a: a).view());
+    host_api.ui_label(host, text: listed(host, path: "docs", a: a).view());
+    match files.read(host, path: "docs/hello.txt", a: a) {
+        some(bytes) => {
+            var s = alloc.String.from("read: ", a);
+            for b in bytes.items() {
+                s.push_ascii(b.*);
+            }
+            host_api.ui_label(host, text: s.view());
+        }
+        none => { host_api.ui_label(host, text: "read: none"); }
+    }
+    let made: [4]u8 = ['m', 'a', 'd', 'e'];
+    var w = alloc.String.from("write: ", a);
+    w.push_str(yes(files.write(host, path: "docs/new.txt", data: made[0..4])));
+    host_api.ui_label(host, text: w.view());
+    var m = alloc.String.from("make-folder: ", a);
+    m.push_str(yes(files.make_folder(host, path: "made")));
+    host_api.ui_label(host, text: m.view());
+    var r = alloc.String.from("remove: ", a);
+    r.push_str(yes(files.remove(host, path: "docs/old.txt")));
+    host_api.ui_label(host, text: r.view());
+    // Paths that leave the folder, or are not paths: refused.
+    var refused = alloc.String.from("refused:", a);
+    match files.read(host, path: "../outside.txt", a: a) {
+        some(_) => { refused.push_str(" read"); }
+        none => { refused.push_str(" -"); }
+    }
+    match files.read(host, path: "/etc/hostname", a: a) {
+        some(_) => { refused.push_str(" read"); }
+        none => { refused.push_str(" -"); }
+    }
+    if files.write(host, path: "docs/../escape.txt", data: made[0..4]) {
+        refused.push_str(" written");
+    } else {
+        refused.push_str(" -");
+    }
+    if files.remove(host, path: "") {
+        refused.push_str(" removed");
+    } else {
+        refused.push_str(" -");
+    }
+    host_api.ui_label(host, text: refused.view());
+    host_api.ui_label(host, text: listed(host, path: "docs", a: a).view());
+}

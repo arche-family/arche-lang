@@ -46,7 +46,7 @@ fn usage(sys: &mut std.System) -> !void {
     sys.stderr.write("       arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>\n");
     sys.stderr.write("       arche-wasm bindgen <world.wit> <world> <out-dir>\n");
     sys.stderr.write("       arche-wasm echo <component.wasm>\n");
-    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]... [--add instance#func[=numbered|true|false|n|[]|none]]... [--locale tag] [--time-zone name] [--utc-offset minutes] [--now-millis ms]\n");
+    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]... [--add instance#func[=numbered|true|false|n|[]|none]]... [--locale tag] [--time-zone name] [--utc-offset minutes] [--now-millis ms] [--share instance=folder]\n");
     sys.proc.exit(2);
 }
 
@@ -345,11 +345,14 @@ type Started = struct {
 }
 
 /// Who the user is, as the shell says to the app: locale, time-zone and
-/// utc-offset's answers.
+/// utc-offset's answers; and a folder shared with the app.
 type Who = struct {
     locale: alloc.String,
     time_zone: alloc.String,
     utc_offset: i32,
+    /// A folder shared with the app (--share), as "instance=folder";
+    /// empty for none.
+    share: alloc.String,
 }
 
 /// A function added to Nimadir's world, as --add says it:
@@ -428,6 +431,28 @@ fn start_app(fs: &std.Fs, source: str, store: &mut exec.Store, now: &dyn fn() ->
             why.push_str("not instance#func[=answer]: ");
             why.push_str(g.view());
             return none;
+        }
+    }
+    // A folder shared as an interface of files (nimadir.share): through an
+    // Fs of its own.
+    if who.share.len() > 0 {
+        let given = who.share.view();
+        var eq: usize = 0;
+        while eq < given.len() and given.bytes()[eq] != '=' {
+            eq += 1;
+        }
+        if eq == 0 or eq + 1 >= given.len() {
+            why.push_str("not instance=folder: ");
+            why.push_str(given);
+            return none;
+        }
+        match fs.open_folder(given[eq + 1..given.len()]) {
+            ok(folder) => { nimadir.share(&mut ui, instance: given[0..eq], folder: folder); }
+            err(_) => {
+                why.push_str("cannot open the folder to share: ");
+                why.push_str(given[eq + 1..given.len()]);
+                return none;
+            }
         }
     }
     // The registry, but the start page: it is how the shell finds home,
@@ -535,7 +560,7 @@ fn run_app(sys: &mut std.System) -> !void {
     var registry = alloc.List(Entry).init(a);
     var use_jit = false;
     var confirm = false;
-    var who = Who { locale: alloc.String.from("en-US", a), time_zone: alloc.String.init(a), utc_offset: 0 };
+    var who = Who { locale: alloc.String.from("en-US", a), time_zone: alloc.String.init(a), utc_offset: 0, share: alloc.String.init(a) };
     // The app's now-millis, the time of day standing still at it, as a
     // phone's tests have it (arche-os docs/sprints.md T7): a calendar's
     // month the same whenever the run is; -1 for the clock's.
@@ -594,6 +619,9 @@ fn run_app(sys: &mut std.System) -> !void {
             } else {
                 who.utc_offset = number(text) as i32;
             }
+            i += 1;
+        } else if arg.eq("--share") and more {
+            who.share = alloc.String.from(sys.args.get(i + 1), a);
             i += 1;
         } else if arg.eq("--now-millis") and more {
             fixed_ms = millis_of(sys.args.get(i + 1));

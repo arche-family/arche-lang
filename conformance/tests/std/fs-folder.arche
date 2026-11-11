@@ -1,0 +1,69 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: inner hello folder file 5 recent written missing
+// wasm: skip
+// system: linux
+import std;
+import alloc;
+import core.fmt;
+
+// A folder opened as an Fs of its own (Fs.open_folder): relative paths
+// through it are under it, for reading, listing and writing; Fs.info says
+// what is there: a folder, a file and its size, written just now.
+
+fn main(sys: &mut std.System) -> !void {
+    var dir = try sys.fs.temp_dir(env: &sys.env, sys.alloc);
+    dir.push_str("/arche-folder-");
+    var digits: [20]u8 = [0; 20];
+    let n = fmt.decimal(sys.proc.pid() as u64, digits[0..20]);
+    for d in digits[0..n] {
+        dir.push_ascii(d.*);
+    }
+    try sys.fs.make_dir(dir.view());
+    var inner = alloc.String.from(dir.view(), sys.alloc);
+    inner.push_str("/inner");
+    try sys.fs.make_dir(inner.view());
+    var note = alloc.String.from(inner.view(), sys.alloc);
+    note.push_str("/note.txt");
+    try sys.fs.write_file(path: note.view(), data: "hello");
+    let f = try sys.fs.open_folder(dir.view());
+    for name in (try f.list(".", sys.alloc)).items() {
+        sys.stdout.write(name.view());
+        sys.stdout.write(" ");
+    }
+    let text = try f.read_file("inner/note.txt", sys.alloc);
+    sys.stdout.write(text.view());
+    sys.stdout.write(" ");
+    let i = try f.info("inner");
+    if i.folder {
+        sys.stdout.write("folder ");
+    }
+    let j = try f.info("inner/note.txt");
+    if not j.folder {
+        sys.stdout.write("file ");
+    }
+    sys.stdout.write_u64(j.size);
+    sys.stdout.write(" ");
+    // Written within the last day, by the clock.
+    let now_ms = (sys.clock.unix_ns() / 1000000) as i64;
+    if j.modified_ms <= now_ms + 1000 and j.modified_ms > now_ms - 86400000 {
+        sys.stdout.write("recent ");
+    }
+    try f.write_file(path: "inner/two.txt", data: "2");
+    var two = alloc.String.from(inner.view(), sys.alloc);
+    two.push_str("/two.txt");
+    if sys.fs.exists(two.view()) {
+        sys.stdout.write("written ");
+    }
+    match f.info("inner/none.txt") {
+        ok(_) => { sys.stdout.write("found"); }
+        err(.NotFound) => { sys.stdout.write("missing"); }
+        err(_) => { sys.stdout.write("other"); }
+    }
+    try sys.fs.remove(two.view());
+    try sys.fs.remove(note.view());
+    try sys.fs.remove(inner.view());
+    try sys.fs.remove(dir.view());
+    sys.stdout.write("\n");
+}

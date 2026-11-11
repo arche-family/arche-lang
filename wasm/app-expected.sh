@@ -25,8 +25,12 @@ for dir in "$@"; do
     sh "$here/nimadir-app.sh" "$dir" "$work/$name.wasm"
     if [ -d "$dir/wit" ] && [ -f "$dir/world" ]; then
         make -s -C "$here" > /dev/null
+        # In a copy of the app's directory, as app-check.sh runs it: a
+        # folder the app is given (--share) as the repository has it.
+        rm -rf "$work/cwd"
+        cp -R "$dir" "$work/cwd"
         # shellcheck disable=SC2046
-        "$here/build/arche-wasm" nimadir "$work/$name.wasm" $(cat "$dir/headless") --locale en-US --time-zone Asia/Tashkent --utc-offset 300 > "$work/out"
+        (cd "$work/cwd" && "$here/build/arche-wasm" nimadir "$work/$name.wasm" $(cat headless) --locale en-US --time-zone Asia/Tashkent --utc-offset 300) > "$work/out"
     else
         home=$(mktemp -d)
         # shellcheck disable=SC2046

@@ -1,0 +1,22 @@
+// A world that includes Nimadir's and imports a folder of files, which the
+// embedder shares (nimadir.share; nimadir-check.sh), as the phone shares
+// its files (arche-os T7).
+package test:files@0.1.0;
+
+interface files {
+    record entry {
+        name: string,
+        folder: bool,
+        size: u64,
+    }
+    list: func(path: string) -> list<entry>;
+    read: func(path: string) -> option<list<u8>>;
+    write: func(path: string, data: list<u8>) -> bool;
+    make-folder: func(path: string) -> bool;
+    remove: func(path: string) -> bool;
+}
+
+world app {
+    include nimadir:shell/mini-app@1.2.0;
+    import files;
+}

@@ -275,6 +275,39 @@ else
     fi
 fi
 
+# A folder the embedder shares (tests/files, --share, nimadir.share), as
+# the phone shares its files: the app lists it, reads, writes, makes a
+# folder and removes a file in it, by the interpreter and by the JIT, each
+# from the same folder; what leaves it is refused, and the file beside it
+# is not read. Afterwards the folder holds what the app wrote.
+mkdir -p "$work/files-wit/deps/nimadir"
+cp "$here/tests/files/files.wit" "$work/files-wit/"
+cp "$apps/world.wit" "$work/files-wit/deps/nimadir/"
+if ! ARCHE="$arche" ARCHE_WASM="$wasm" WIT="$work/files-wit" WORLD=app sh "$here/nimadir-app.sh" "$here/tests/files" "$work/files.wasm" > "$work/err" 2>&1; then
+    echo "FAIL the app of a shared folder did not build:"
+    head -20 "$work/err"
+    failed=$((failed + 1))
+else
+    for mode in "" --jit; do
+        rm -rf "$work/share"
+        mkdir -p "$work/share/shared/docs" "$work/share/shared/pics"
+        echo hello > "$work/share/shared/docs/hello.txt"
+        echo old > "$work/share/shared/docs/old.txt"
+        echo secret > "$work/share/outside.txt"
+        # shellcheck disable=SC2086
+        (cd "$work/share" && "$wasm" nimadir "$work/files.wasm" --frames 1 $mode --share test:files/files@0.1.0=shared) > "$work/out" 2>&1 || true
+        sh "$apps/normalize.sh" < "$work/out" > "$work/got"
+        left=$(cd "$work/share" && find shared -print | sort | tr '\n' ' ')
+        if diff -u "$here/tests/files/expected.txt" "$work/got" > "$work/diff" && [ "$left" = "shared shared/docs shared/docs/hello.txt shared/docs/new.txt shared/made shared/pics " ]; then
+            echo "PASS a folder shared $mode"
+        else
+            echo "FAIL a folder shared $mode, the folder left as: $left"
+            head -30 "$work/diff"
+            failed=$((failed + 1))
+        fi
+    done
+fi
+
 # Every kind of WIT type bindgen binds (tests/echo): an app given each,
 # through its bindings, to a function of echo.wit that arche-wasm echo
 # answers with what it was given, by the runtime's canonical ABI, and

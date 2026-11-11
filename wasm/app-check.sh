@@ -21,6 +21,7 @@ if [ -z "${ARCHE_WASM:-}" ]; then
     make -s -C "$here" > /dev/null
 fi
 wasm=${ARCHE_WASM:-$here/build/arche-wasm}
+wasm=$(cd "$(dirname "$wasm")" && pwd)/$(basename "$wasm")
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 failed=0
@@ -39,8 +40,13 @@ for dir in "$@"; do
         continue
     fi
     for mode in "" --jit; do
+        # In a copy of the app's directory, fresh for each run: a folder
+        # the app is given (--share) is as the repository has it, whatever
+        # a run before wrote there.
+        rm -rf "$work/cwd"
+        cp -R "$dir" "$work/cwd"
         # shellcheck disable=SC2046,SC2086
-        "$wasm" nimadir "$work/$name.wasm" $(cat "$dir/headless") --locale en-US --time-zone Asia/Tashkent --utc-offset 300 $mode > "$work/out" 2>&1 || true
+        (cd "$work/cwd" && "$wasm" nimadir "$work/$name.wasm" $(cat headless) --locale en-US --time-zone Asia/Tashkent --utc-offset 300 $mode) > "$work/out" 2>&1 || true
         if [ -f "$dir/normalize.sed" ]; then
             sed -f "$dir/normalize.sed" "$work/out" | sh "$here/tests/nimadir/normalize.sh" > "$work/got"
         else

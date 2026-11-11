@@ -35,6 +35,14 @@ pub type IoError = error { NotFound, AccessDenied, IsDirectory, InvalidUtf8, IoF
 /// The errors of the other file operations.
 pub type FsError = error { NotFound, AccessDenied, IsDirectory, IoFailed, AlreadyExists, NotEmpty }
 
+/// What is at a path (Fs.info): whether it is a directory, its size in
+/// bytes, and when it was last written, in ms since 1970.
+pub type FileInfo = struct {
+    pub folder: bool,
+    pub size: u64,
+    pub modified_ms: i64,
+}
+
 /// The runtime's functions std calls (compiler/runtime/rt.c).
 extern "c" fn a0rt_write(output: *i64, p: *u8, n: u64);
 extern "c" fn a0rt_write_byte(output: *i64, c: u8);
@@ -57,6 +65,96 @@ fn io_error(code: u16) -> IoError {
         3 => { return IoError.IsDirectory; }
         4 => { return IoError.InvalidUtf8; }
         _ => { return IoError.IoFailed; }
+    }
+}
+
+/// An errno as an IoError.
+fn errno_io(e: i64) -> IoError {
+    if e == linux.ENOENT { return IoError.NotFound; }
+    if e == linux.EACCES { return IoError.AccessDenied; }
+    if e == linux.EISDIR { return IoError.IsDirectory; }
+    return IoError.IoFailed;
+}
+
+/// The file at path, through the directory dir, whole, onto out: the
+/// reads of an Fs a folder opened (Fs.open_folder).
+fn read_at(dir: i64, path: str, out: &mut alloc.List(u8)) -> IoError!void {
+    var buf: [4096]u8 = [0; 4096];
+    if not linux.c_path(path, buf[0..4096]) {
+        return IoError.NotFound;
+    }
+    var fd: i64 = 0;
+    unsafe {
+        // SAFETY: O_RDONLY | O_CLOEXEC, the path NUL-terminated in buf.
+        fd = linux.file_syscall(linux.OPENAT, [dir, linux.arg(u8, &buf[0] as *u8), 0x80000, 0, 0, 0]);
+    }
+    if linux.errno(fd) != 0 {
+        return errno_io(linux.errno(fd));
+    }
+    var chunk: [16384]u8 = [0; 16384];
+    var failed: i64 = 0;
+    while true {
+        var n: i64 = 0;
+        unsafe {
+            // SAFETY: read writes at most 16384 bytes into chunk.
+            n = linux.file_syscall(linux.READ, [fd, linux.arg(u8, &chunk[0] as *u8), 16384, 0, 0, 0]);
+        }
+        if linux.errno(n) != 0 {
+            failed = linux.errno(n);
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        for b in chunk[0..n as usize] {
+            out.push(b.*);
+        }
+    }
+    unsafe {
+        // SAFETY: fd is this function's own.
+        _ = linux.syscall(linux.CLOSE, [fd, 0, 0, 0, 0, 0]);
+    }
+    if failed != 0 {
+        return errno_io(failed);
+    }
+}
+
+/// data written to the file at path through the directory dir, made with
+/// mode or emptied: the writes of an Fs a folder opened.
+fn write_at(dir: i64, path: str, data: []u8, mode: i64) -> IoError!void {
+    var buf: [4096]u8 = [0; 4096];
+    if not linux.c_path(path, buf[0..4096]) {
+        return IoError.NotFound;
+    }
+    var fd: i64 = 0;
+    unsafe {
+        // SAFETY: O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, the path
+        // NUL-terminated in buf.
+        fd = linux.file_syscall(linux.OPENAT, [dir, linux.arg(u8, &buf[0] as *u8), 0x1 | 0x40 | 0x200 | 0x80000, mode, 0, 0]);
+    }
+    if linux.errno(fd) != 0 {
+        return errno_io(linux.errno(fd));
+    }
+    var done: usize = 0;
+    var failed: i64 = 0;
+    while done < data.len() {
+        var n: i64 = 0;
+        unsafe {
+            // SAFETY: write reads the bytes of data from done on.
+            n = linux.file_syscall(linux.WRITE, [fd, linux.arg(u8, mem.slice_data(u8, data[done..data.len()]) as *u8), (data.len() - done) as i64, 0, 0, 0]);
+        }
+        if linux.errno(n) != 0 {
+            failed = linux.errno(n);
+            break;
+        }
+        done += n as usize;
+    }
+    unsafe {
+        // SAFETY: fd is this function's own.
+        _ = linux.syscall(linux.CLOSE, [fd, 0, 0, 0, 0, 0]);
+    }
+    if failed != 0 {
+        return errno_io(failed);
     }
 }
 
@@ -168,6 +266,18 @@ pub type Fs = struct {
 
     pub fn read_file(self: &Fs, path: str, a: alloc.Allocator) -> IoError!alloc.String {
         var text = alloc.String.init(a);
+        if self.dir != linux.AT_FDCWD {
+            var bytes = alloc.List(u8).init(a);
+            try read_at(self.dir, path: path, out: &mut bytes);
+            if not utf8.valid(bytes.items()) {
+                return IoError.InvalidUtf8;
+            }
+            unsafe {
+                // SAFETY: the bytes are UTF-8, as checked.
+                text.push_str(mem.str_from(bytes.items()));
+            }
+            return text;
+        }
         var code: u16 = 0;
         unsafe {
             // SAFETY: the runtime fills text as a String, with its allocator.
@@ -181,6 +291,10 @@ pub type Fs = struct {
 
     pub fn read_bytes(self: &Fs, path: str, a: alloc.Allocator) -> IoError!alloc.List(u8) {
         var bytes = alloc.List(u8).init(a);
+        if self.dir != linux.AT_FDCWD {
+            try read_at(self.dir, path: path, out: &mut bytes);
+            return bytes;
+        }
         var code: u16 = 0;
         unsafe {
             // SAFETY: as read_file, for a List(u8).
@@ -194,6 +308,10 @@ pub type Fs = struct {
 
     /// Writes bytes, which need not be text, to a file, made or emptied.
     pub fn write_bytes(self: &Fs, path: str, data: []u8) -> IoError!void {
+        if self.dir != linux.AT_FDCWD {
+            try write_at(dir: self.dir, path: path, data: data, mode: 0x1A4);
+            return;
+        }
         var code: u16 = 0;
         unsafe {
             // SAFETY: both are read during the call only.
@@ -207,6 +325,10 @@ pub type Fs = struct {
 
     /// Writes a program: a new file that the system can run.
     pub fn write_executable(self: &Fs, path: str, data: []u8) -> IoError!void {
+        if self.dir != linux.AT_FDCWD {
+            try write_at(dir: self.dir, path: path, data: data, mode: 0x1ED);
+            return;
+        }
         var code: u16 = 0;
         unsafe {
             // SAFETY: both are read during the call only.
@@ -219,6 +341,10 @@ pub type Fs = struct {
     }
 
     pub fn write_file(self: &Fs, path: str, data: str) -> IoError!void {
+        if self.dir != linux.AT_FDCWD {
+            try write_at(dir: self.dir, path: path, data: data.bytes(), mode: 0x1A4);
+            return;
+        }
         var code: u16 = 0;
         unsafe {
             // SAFETY: both texts are read during the call only.
@@ -359,6 +485,64 @@ pub type Fs = struct {
             }
         }
         return Socket { fd: fd, unique: core.Unique { } };
+    }
+
+    /// A new Fs whose directory is the one at path: relative paths through
+    /// it reach only what is under that directory, as a program given a
+    /// folder of its own does (arche-os T7, the phone's shared files). An
+    /// absolute path is still the machine's, so whoever hands it on checks
+    /// the paths it is given.
+    pub fn open_folder(self: &Fs, path: str) -> FsError!Fs {
+        var buf: [4096]u8 = [0; 4096];
+        if not linux.c_path(path, buf[0..4096]) {
+            return FsError.NotFound;
+        }
+        var fd: i64 = 0;
+        unsafe {
+            // SAFETY: O_RDONLY | O_DIRECTORY | O_CLOEXEC, the path
+            // NUL-terminated in buf.
+            fd = linux.file_syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80000 | linux.O_DIRECTORY, 0, 0, 0]);
+        }
+        if linux.errno(fd) != 0 {
+            return errno_error(linux.errno(fd));
+        }
+        return Fs { dir: fd, unique: core.Unique { } };
+    }
+
+    /// What is at path: a directory or not, its size, when it was last
+    /// written. Through statx, one layout on every machine.
+    pub fn info(self: &Fs, path: str) -> FsError!FileInfo {
+        var buf: [4096]u8 = [0; 4096];
+        if not linux.c_path(path, buf[0..4096]) {
+            return FsError.NotFound;
+        }
+        var sx: [256]u8 = [0; 256];
+        var r: i64 = 0;
+        unsafe {
+            // SAFETY: statx writes a struct statx, 256 bytes; the mask asks
+            // for the type, the size and mtime (STATX_TYPE | STATX_SIZE |
+            // STATX_MTIME).
+            r = linux.file_syscall(linux.STATX, [self.dir, linux.arg(u8, &buf[0] as *u8), 0, 0x1 | 0x200 | 0x40, linux.arg(u8, &sx[0] as *u8), 0]);
+        }
+        if linux.errno(r) != 0 {
+            return errno_error(linux.errno(r));
+        }
+        // stx_mode at 28 (u16), stx_size at 40, stx_mtime at 112: tv_sec
+        // (i64) and tv_nsec (u32).
+        let mode = (sx[28] as u32) | ((sx[29] as u32) << 8);
+        var size: u64 = 0;
+        var sec: u64 = 0;
+        var k: usize = 0;
+        while k < 8 : (k += 1) {
+            size |= (sx[40 + k] as u64) << (8 * k as u64);
+            sec |= (sx[112 + k] as u64) << (8 * k as u64);
+        }
+        var nsec: u64 = 0;
+        k = 0;
+        while k < 4 : (k += 1) {
+            nsec |= (sx[120 + k] as u64) << (8 * k as u64);
+        }
+        return FileInfo { folder: (mode & 0xF000) == 0x4000, size: size, modified_ms: (sec as% i64) * 1000 + (nsec / 1000000) as i64 };
     }
 
     /// Whether something is at path.
