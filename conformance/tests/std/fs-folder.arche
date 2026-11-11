@@ -1,7 +1,7 @@
 // test: run
 // spec: std
 // stage0: skip
-// stdout: inner hello folder file 5 recent written missing
+// stdout: inner hello folder file 5 recent written missing opened
 // wasm: skip
 // system: linux
 import std;
@@ -10,7 +10,8 @@ import core.fmt;
 
 // A folder opened as an Fs of its own (Fs.open_folder): relative paths
 // through it are under it, for reading, listing and writing; Fs.info says
-// what is there: a folder, a file and its size, written just now.
+// what is there: a folder, a file and its size, written just now. A
+// directory opens as a device too, to read, for a filesystem's ioctls.
 
 fn main(sys: &mut std.System) -> !void {
     var dir = try sys.fs.temp_dir(env: &sys.env, sys.alloc);
@@ -60,6 +61,15 @@ fn main(sys: &mut std.System) -> !void {
         ok(_) => { sys.stdout.write("found"); }
         err(.NotFound) => { sys.stdout.write("missing"); }
         err(_) => { sys.stdout.write("other"); }
+    }
+    // A directory opens as a device, to read, for a filesystem's ioctls.
+    match sys.fs.open_device(inner.view()) {
+        ok(d) => {
+            sys.stdout.write(" opened");
+            var dev = d;
+            dev.close();
+        }
+        err(_) => { sys.stdout.write(" refused"); }
     }
     try sys.fs.remove(two.view());
     try sys.fs.remove(note.view());

@@ -618,7 +618,9 @@ pub type Fs = struct {
 
     /// The device file at path, open to read and write, or to read alone
     /// when writing is not allowed: what std.drm and std.evdev reach the
-    /// kernel's drivers through. Reads never wait (Device.wait does).
+    /// kernel's drivers through. Reads never wait (Device.wait does). A
+    /// directory opens too, to read, for the ioctls a filesystem takes on
+    /// one (fscrypt's: arche-os T8).
     pub fn open_device(self: &Fs, path: str) -> FsError!Device {
         var buf: [4096]u8 = [0; 4096];
         if not linux.c_path(path, buf[0..4096]) {
@@ -630,7 +632,9 @@ pub type Fs = struct {
             // O_NONBLOCK | O_CLOEXEC, then O_RDONLY | O_NONBLOCK |
             // O_CLOEXEC.
             fd = linux.file_syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80802, 0, 0, 0]);
-            if linux.errno(fd) == linux.EACCES {
+            // Read alone when writing is not allowed, and for a directory,
+            // whose ioctls (fscrypt's) take it opened to read.
+            if linux.errno(fd) == linux.EACCES or linux.errno(fd) == linux.EISDIR {
                 fd = linux.file_syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80800, 0, 0, 0]);
             }
         }
