@@ -4,6 +4,10 @@
 # and English, normalized as app-check.sh normalizes what arche-wasm says.
 # Needs a Nimadir checkout whose shell is built (cargo build -p host),
 # named by NIMADIR.
+# An app of another world (its wit/ and world, nimadir-app.sh), which
+# Nimadir's shell does not run, has what arche-wasm says, by the
+# interpreter, written instead: its headless file names the functions the
+# world adds (--add).
 # Usage: NIMADIR=~/nimadir app-expected.sh <app-dir>...
 set -eu
 if [ $# -eq 0 ]; then
@@ -19,11 +23,17 @@ for dir in "$@"; do
     name=$(basename "$dir")
     [ -f "$dir/headless" ] || { echo "app-expected: $name has no headless file" >&2; exit 1; }
     sh "$here/nimadir-app.sh" "$dir" "$work/$name.wasm"
-    home=$(mktemp -d)
-    # shellcheck disable=SC2046
-    (cd "$NIMADIR" && TZ=Asia/Tashkent LANG=en_US.UTF-8 NIMADIR_HOME=$home NIMADIR_HOSTED_REGISTRY="" \
-        ./target/debug/nimadir-shell "$work/$name.wasm" $(cat "$dir/headless")) > "$work/out"
-    rm -rf "$home"
+    if [ -d "$dir/wit" ] && [ -f "$dir/world" ]; then
+        make -s -C "$here" > /dev/null
+        # shellcheck disable=SC2046
+        "$here/build/arche-wasm" nimadir "$work/$name.wasm" $(cat "$dir/headless") --locale en-US --time-zone Asia/Tashkent --utc-offset 300 > "$work/out"
+    else
+        home=$(mktemp -d)
+        # shellcheck disable=SC2046
+        (cd "$NIMADIR" && TZ=Asia/Tashkent LANG=en_US.UTF-8 NIMADIR_HOME=$home NIMADIR_HOSTED_REGISTRY="" \
+            ./target/debug/nimadir-shell "$work/$name.wasm" $(cat "$dir/headless")) > "$work/out"
+        rm -rf "$home"
+    fi
     if [ -f "$dir/normalize.sed" ]; then
         sed -f "$dir/normalize.sed" "$work/out" | sh "$here/tests/nimadir/normalize.sh" > "$dir/expected.txt"
     else
