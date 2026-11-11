@@ -2,9 +2,9 @@
 
 > 2026-11-10 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S38.
+**Joriy sprint:** S40.
 
-**Yopilgan:** S0–S36. Til yakuniy qabuldan o'tdi (S34).
+**Yopilgan:** S0–S36, S38. Til yakuniy qabuldan o'tdi (S34).
 
 - Compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da; full-Arche paketlarida generics (monomorphization), comptime interpreter, interface'lar (`impl`, `where`, `&dyn`), `for`, closure'lar (`&dyn fn(P) -> R`), `region` (arena, E0901), `unsafe` va raw pointer'lar, `if`/`match` ifoda sifatida, labeled loop'lar, `f32`/`f64`, `requires`/`ensures`, `nopanic` va error return trace ishlaydi.
 - Manifest (`package.arche`) o'qiladi: `needs` (E0801), `strict_unsafe` (E0920), `panic_handler`, xato manifest E0802/E0803.
@@ -109,7 +109,7 @@
 | 7. Backend'lar | S26–S30 | optimizatsiya, o'z backend'lari, linker, WASM |
 | 8. Web va WASM | S31–S33 | WASM runtime, web server |
 | 9. Yakuniy qabul | S34 | rejaning yakuniy qabul mezoni |
-| 10. Telefon kutubxonalari | S35, S38–S39 | Arche OS telefoni uchun: shrift, PNG, D-Bus, `std.linux` qo'shimchalari; Arche'dan WASM component; ARM64 JIT |
+| 10. Telefon kutubxonalari | S35, S38–S40 | Arche OS telefoni uchun: shrift, PNG, D-Bus, `std.linux` qo'shimchalari; Arche'dan WASM component; ARM64 JIT; Nimadir'nikidek CSS va layout |
 | 11. Editor va macOS | S36–S37 | `arche-lsp` va editor integratsiyasi; macOS target |
 
 ```mermaid
@@ -573,7 +573,7 @@ Qilingani:
 
 - `locale`, `time-zone` va `utc-offset` endi o'zgarmas emas: ularni embedder `Ui`ning maydonlari orqali beradi. `arche-wasm nimadir` `--locale`, `--time-zone` va `--utc-offset` flag'larini oladi, telefon esa "Asia/Tashkent" va +300 daqiqani beradi (status bar'dagidek). Nimadir bularni tizimdan oladi (`TZ`, `LANG`), shuning uchun headless solishtirishda Nimadir `TZ=Asia/Tashkent LANG=en_US.UTF-8` bilan yuritiladi. `set-text ""` Nimadir'dagidek text tuguni yaratmaydi.
 
-Qolgani: headless `arche-wasm` sahifani joylashtirmaydi, shuning uchun unda `dom.bounds` doim `none`. Nimadir'ning headless shell'i kadrdan keyin joylashtiradi va quti beradi; telefonning UI server'i ham beradi (`page.arche`, `set_box`).
+S38 yopildi: Nimadir world'idagi Arche ilovalari (`arche-app`, `arche-bindings`) arche-wasm'da ham, Nimadir'ning Wasmtime'dagi shell'ida ham bir xil ishlaydi, `wasm-tools validate` ularni qabul qiladi. Telefon world'idagi 11 ilovani (arche-family) Nimadir'ning shell'i ishga tushirmaydi; ular arche-wasm'da har biri o'z CI'sida tekshiriladi. Qolgan band — headless `arche-wasm` sahifani joylashtirmaydi, shuning uchun unda `dom.bounds` doim `none` — S40'ga ko'chdi. Uni yopish uchun Nimadir'ning CSS kaskadi va layout'i (taffy) Arche'da kerak; bu alohida katta ish, telefonga ham kerak, shuning uchun o'z sprinti bor va S39'dan oldin bajariladi.
 
 ### S39. ARM64 JIT va aarch64 telefon
 
@@ -581,6 +581,17 @@ Qolgani: headless `arche-wasm` sahifani joylashtirmaydi, shuning uchun unda `dom
 - aarch64 Linux uchun telefon dasturlari (init, UI server, WASM host) build va QEMU aarch64'da sinov.
 
 **Qabul:** WASM spec testsuite'i ARM64 JIT bilan o'tadi; QEMU aarch64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi.
+
+### S40. CSS va layout, Nimadir'nikidek
+
+Nimadir ilovasi sahifasining ko'rinishi CSS va layout'dan chiqadi. Hozir telefon uni o'zining soddalashtirilgan layout'i bilan chizadi (arche-os `phone/page.arche`), headless `arche-wasm` esa umuman joylashtirmaydi. Bu sprint ikkalasiga bitta dvigatel beradi, natijasi Nimadir'nikidek: ilova telefonda ham, Nimadir'da ham bir xil ko'rinadi, `dom.bounds` ham bir xil javob beradi (S38'dan).
+
+- CSS Arche'da, Nimadir'ning `host/src/dom`idagi qoidalar bilan: tokenizer, selektorlar (atribut, `:nth-child`, `:not`, qo'shni va bola kombinatorlari), qiymatlar (rang, uzunlik, `calc()`, `var()`, em va rem), `@media`, kaskad (UA sheet, ilova sheet'lari, inline `style`, `!important`, specificity, tartib). `query-all` ham shu selektorlar bilan ishlaydi.
+- Layout `lib/layout/`'da: taffy 0.15'ning algoritmlari Arche'da — block (float'lar bilan), flex, grid (`repeat`, `auto-fill`, `auto-fit`, `minmax`), absolute va relative pozitsiya, kesh va yaxlitlash. Kutubxona faqat `core` va `alloc`dan foydalanadi. Matn Nimadir'ning paragraf modeli bo'yicha o'lchanadi: shriftni embedder beradi, headless'da esa Nimadir'ning `Approx`i ishlatiladi.
+- `arche-wasm nimadir` har kadrdan keyin sahifani joylashtiradi, shuning uchun `dom.bounds` Nimadir'dagidek javob beradi. `--boxes`, `--styles`, `--viewport` va `--dark` flag'lari qo'shiladi.
+- Telefonning UI server'i (arche-os) sahifani shu layout bilan, o'z shriftlari bilan joylashtiradi.
+
+**Qabul:** Nimadir'ning `run-tests.sh`idagi CSS va layout holatlari, shuningdek probe, todo, store va gallery'ning `--boxes` va `--styles` chiqishi arche-wasm'da Nimadir'nikidek; telefon ilovalari yangi layout bilan `tests/phone.sh`dan o'tadi.
 
 ## 11. Editor va macOS
 
