@@ -161,9 +161,12 @@ pub fn power_off(proc: &std.Proc) {
 pub fn reboot(proc: &std.Proc) {
     _ = proc;
     unsafe {
-        // SAFETY: what is buffered written out first; then the magic
-        // numbers reboot(2) wants, and LINUX_REBOOT_CMD_RESTART.
+        // SAFETY: what is buffered written out first, and every
+        // filesystem's dirty data (reboot(2) does not: what is not synced
+        // is lost); then the magic numbers reboot(2) wants, and
+        // LINUX_REBOOT_CMD_RESTART.
         a0rt_flush_all();
+        _ = linux.syscall(linux.SYNC, [0, 0, 0, 0, 0, 0]);
         _ = linux.syscall(linux.REBOOT, [0xfee1dead, 0x28121969, 0x01234567, 0, 0, 0]);
     }
 }
