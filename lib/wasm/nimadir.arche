@@ -1336,6 +1336,33 @@ fn be32(b: []u8, at: usize) -> u32 {
 /// An image the app hands over, decoded and kept; why not, into why. Its
 /// size is read from the header first, so a few bytes that claim a huge
 /// image cost nothing.
+/// An image the embedder hands the app (arche-os T7, a camera's view): in
+/// place of the one numbered at, when the app has it, or else as a new
+/// one, within the shell's limits as image-load's are. Its number; none
+/// past them.
+pub fn put_picture(ui: &mut Ui, at: u64, image: png.Image) -> ?u64 {
+    if image.width > MAX_IMAGE_SIDE or image.height > MAX_IMAGE_SIDE {
+        return none;
+    }
+    let n = (image.width as u64) * (image.height as u64);
+    if at < ui.pictures.len() as u64 {
+        let old = &ui.pictures.items()[at as usize];
+        let before = (old.width as u64) * (old.height as u64);
+        if ui.pixels - before + n > MAX_APP_PIXELS {
+            return none;
+        }
+        ui.pixels = ui.pixels - before + n;
+        ui.pictures.items_mut()[at as usize] = image;
+        return at;
+    }
+    if ui.pixels + n > MAX_APP_PIXELS {
+        return none;
+    }
+    ui.pixels += n;
+    ui.pictures.push(image);
+    return (ui.pictures.len() - 1) as u64;
+}
+
 fn load_image(ui: &mut Ui, bytes: []u8, why: &mut alloc.String) {
     let sig: [8]u8 = [137, 80, 78, 71, 13, 10, 26, 10];
     var is_png = bytes.len() >= 24;

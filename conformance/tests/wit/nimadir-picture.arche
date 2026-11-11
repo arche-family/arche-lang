@@ -1,0 +1,57 @@
+// test: run
+// spec: wit (Nimadir's host, an embedder's pictures)
+// stage0: skip
+// wasm: skip
+// stdout: new 0: 2x2
+// stdout: in its place 0: 3x1
+// stdout: new 1: 1x1
+// stdout: too wide: refused
+// stdout: past 8 megapixels: refused
+import alloc;
+import image.png;
+import std;
+import wasm.nimadir;
+
+// Pictures an embedder hands an app (nimadir.put_picture), as the phone's
+// camera hands its view: a new one numbered after the app's others, one
+// in place of another keeping its number, and none past the shell's
+// limits: 4096 on a side, 8 megapixels in all.
+
+fn plain(w: u32, h: u32, a: alloc.Allocator) -> png.Image {
+    var img = png.Image { width: w, height: h, rgba: alloc.List(u8).init(a) };
+    img.rgba.grow_zeroed((w as usize) * (h as usize) * 4);
+    return img;
+}
+
+fn said(out: &mut std.Output, what: str, ui: &nimadir.Ui, got: ?u64) {
+    out.write(what);
+    match got {
+        some(h) => {
+            let p = nimadir.picture(ui, h: h);
+            out.write(" ");
+            out.write_u64(h);
+            out.write(": ");
+            out.write_u64(p.width as u64);
+            out.write("x");
+            out.write_u64(p.height as u64);
+        }
+        none => { out.write(": refused"); }
+    }
+    out.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    var ui = nimadir.new_ui(a);
+    let none_yet: u64 = 0xFFFFFFFF;
+    let first = nimadir.put_picture(&mut ui, at: none_yet, image: plain(w: 2, h: 2, a: a));
+    said(&mut sys.stdout, what: "new", ui: &ui, got: first);
+    let again = nimadir.put_picture(&mut ui, at: 0, image: plain(w: 3, h: 1, a: a));
+    said(&mut sys.stdout, what: "in its place", ui: &ui, got: again);
+    let second = nimadir.put_picture(&mut ui, at: 7, image: plain(w: 1, h: 1, a: a));
+    said(&mut sys.stdout, what: "new", ui: &ui, got: second);
+    let wide = nimadir.put_picture(&mut ui, at: none_yet, image: plain(w: 4097, h: 1, a: a));
+    said(&mut sys.stdout, what: "too wide", ui: &ui, got: wide);
+    let big = nimadir.put_picture(&mut ui, at: none_yet, image: plain(w: 4096, h: 2049, a: a));
+    said(&mut sys.stdout, what: "past 8 megapixels", ui: &ui, got: big);
+}
