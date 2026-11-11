@@ -487,6 +487,16 @@ Bajarildi (qisman):
 
 Shrift `kern` jadvalining juftlari bo'yicha kerning ham qiladi (DejaVu'da bor); test shriftiga ham kern jadvali qo'shildi.
 
+Keyin, telefon tarmog'i uchun (arche-os T5):
+- `std.Net.udp`: UDP socket (`Udp`: `send_to`, `receive`, `port`). `receive` javobni ko'pi bilan berilgan vaqtcha kutadi (`poll`); bu vaqtda dasturning boshqa task'lari ishlamaydi, `Input.ready`dagidek. Hozircha Linux'da (x86-64, aarch64, riscv64); Windows'da o'z sprinti bilan keladi. `conformance/tests/std/udp.arche` ikki socket orasida ping-pong va muddat o'tishini tekshiradi.
+- `lib/dns.arche` (`dns` root), RFC 1035 bo'yicha host nomining IPv4 manzillari. Uning qismlari:
+  - `query`: so'rov paketi (A, IN, RD);
+  - `answers`: javobni o'qiydi. Siqilgan nomlar va CNAME'dan keyingi A yozuvlari tushuniladi. `id` boshqa, NXDOMAIN, SERVFAIL, TC yoki kesilgan javob sababi bilan rad etiladi;
+  - `servers_of`: `resolv.conf`dagi `nameserver` qatorlari. `ip:port` ko'rinishi ham qabul qilinadi; bu test resolver'i uchun.
+  - `lookup`: server'larni navbatma-navbat ikki aylana so'raydi. Boshqa manzildan kelgan yoki boshqa savolga berilgan javob olinmaydi.
+
+  `conformance/tests/dns` bularni tarmoqsiz, tayyor baytlar bilan, `lookup`ni esa javob bermaydigan server bilan tekshiradi.
+
 S35 yopildi. Hali yo'q, kerak bo'lganda qo'shiladigan narsalar: GPOS kerning va hinting; D-Bus orqali Unix file descriptor uzatish (PipeWire, T5); `std.drm`da page flip (UI server, T2).
 
 **Qabul:** shrift golden image testlari har platformada bit-identical. PNG decoder PngSuite'dan o'tadi. D-Bus client `dbus-daemon` bilan interop qiladi va ModemManager'dan modem ro'yxatini oladi. QEMU x86-64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi (aarch64'da S39'da).

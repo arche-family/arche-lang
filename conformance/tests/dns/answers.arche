@@ -1,0 +1,108 @@
+// test: run
+// spec: dns (RFC 1035)
+// stage0: skip
+// stdout: 10.0.2.2 10.0.2.9
+// stdout: not the answer to the question asked
+// stdout: not the answer to the question asked
+// stdout: there is no such name
+// stdout: the resolver failed to answer
+// stdout: the answer was cut short
+// stdout: an answer cut short
+// stdout: the name has no IPv4 address
+// wasm: skip
+import alloc;
+import dns;
+import std;
+
+fn nibble(c: u8) -> u8 {
+    if c >= 'a' {
+        return c - 'a' + 10;
+    }
+    return c - '0';
+}
+
+/// The bytes the hex says, spaces passed over.
+fn bytes_of(hex: str, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    var high: u8 = 0;
+    var half = false;
+    for c in hex.bytes() {
+        if c.* == ' ' {
+            continue;
+        }
+        if half {
+            out.push(high * 16 + nibble(c.*));
+        } else {
+            high = nibble(c.*);
+        }
+        half = not half;
+    }
+    return out;
+}
+
+fn say(out: &mut std.Output, msg: []u8, id: u16, a: alloc.Allocator) {
+    var why = alloc.String.init(a);
+    match dns.answers(msg, id: id, why: &mut why, a: a) {
+        some(ips) => {
+            var first = true;
+            for ip in ips.items() {
+                if not first {
+                    out.write(" ");
+                }
+                first = false;
+                out.write_u64(ip.octets[0] as u64);
+                out.write(".");
+                out.write_u64(ip.octets[1] as u64);
+                out.write(".");
+                out.write_u64(ip.octets[2] as u64);
+                out.write(".");
+                out.write_u64(ip.octets[3] as u64);
+            }
+        }
+        none => { out.write(why.view()); }
+    }
+    out.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let out = &mut sys.stdout;
+    // www.example.test, id 0x1234: a CNAME to host.example.test (its name
+    // a pointer to the question's, its target ending in one), then that
+    // name's two A records, then one of another class.
+    let question = "03 777777 07 6578616d706c65 04 74657374 00 0001 0001";
+    let cname = "c00c 0005 0001 00000e10 0007 04 686f7374 c010";
+    let first = "c02e 0001 0001 00000e10 0004 0a000202";
+    let second = "c02e 0001 0001 00000e10 0004 0a000209";
+    let chaos = "c02e 0001 0003 00000e10 0004 01020304";
+    var all = alloc.String.from("1234 8180 0001 0004 0000 0000 ", a);
+    all.push_str(question);
+    all.push_str(cname);
+    all.push_str(first);
+    all.push_str(second);
+    all.push_str(chaos);
+    let msg = bytes_of(all.view(), a: a);
+    say(out, msg: msg.items(), id: 0x1234, a: a);
+    // Another question's answer; a question, not an answer.
+    say(out, msg: msg.items(), id: 0x1235, a: a);
+    var asked = alloc.String.from("1234 0100 0001 0000 0000 0000 ", a);
+    asked.push_str(question);
+    say(out, msg: bytes_of(asked.view(), a: a).items(), id: 0x1234, a: a);
+    // NXDOMAIN; SERVFAIL; TC set.
+    var none_such = alloc.String.from("1234 8183 0001 0000 0000 0000 ", a);
+    none_such.push_str(question);
+    say(out, msg: bytes_of(none_such.view(), a: a).items(), id: 0x1234, a: a);
+    var failed = alloc.String.from("1234 8182 0001 0000 0000 0000 ", a);
+    failed.push_str(question);
+    say(out, msg: bytes_of(failed.view(), a: a).items(), id: 0x1234, a: a);
+    var cut = alloc.String.from("1234 8380 0001 0001 0000 0000 ", a);
+    cut.push_str(question);
+    say(out, msg: bytes_of(cut.view(), a: a).items(), id: 0x1234, a: a);
+    // The answer's record runs past its end.
+    say(out, msg: msg.items()[0..msg.len() - 20], id: 0x1234, a: a);
+    // Only the CNAME: no address.
+    var only = alloc.String.from("1234 8180 0001 0001 0000 0000 ", a);
+    only.push_str(question);
+    only.push_str(cname);
+    say(out, msg: bytes_of(only.view(), a: a).items(), id: 0x1234, a: a);
+}

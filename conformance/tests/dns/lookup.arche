@@ -1,0 +1,31 @@
+// test: run
+// spec: dns (RFC 1035)
+// stage0: skip
+// stdout: no resolver is known
+// stdout: a b is not a host's name
+// stdout: no resolver answered for example.test
+// wasm: skip
+import alloc;
+import dns;
+import std;
+
+fn say(sys: &mut std.System, servers: []std.Address, name: str) {
+    var why = alloc.String.init(sys.alloc);
+    match dns.lookup(&sys.net, rand: &mut sys.rand, servers: servers, name: name, timeout_ms: 50, why: &mut why, a: sys.alloc) {
+        some(_) => { sys.stdout.write("an answer"); }
+        none => { sys.stdout.write(why.view()); }
+    }
+    sys.stdout.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var none_known: [0]std.Address = [];
+    say(sys, servers: none_known[0..0], name: "example.test");
+    // A resolver that hears the question and never answers: each asked
+    // twice round, waited for 50 ms each time.
+    var silent = try sys.net.udp(std.Address { ip: [127, 0, 0, 1], port: 0 });
+    let at: [1]std.Address = [std.Address { ip: [127, 0, 0, 1], port: silent.port() }];
+    say(sys, servers: at[0..1], name: "a b");
+    say(sys, servers: at[0..1], name: "example.test");
+    silent.close();
+}

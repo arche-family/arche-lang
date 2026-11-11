@@ -1,0 +1,352 @@
+/// DNS (RFC 1035): the IPv4 addresses of a host's name, asked of a
+/// resolver over UDP. What is asked and what comes back are bytes made and
+/// read here (query, answers), so they are tried without a network; lookup
+/// asks each resolver in turn. Which resolvers there are is the caller's to
+/// say: servers_of reads them from resolv.conf's text.
+import alloc;
+import std;
+
+/// An IPv4 address an answer gives.
+pub type Ip = struct {
+    pub octets: [4]u8,
+}
+
+/// The resolvers resolv.conf's text names: a `nameserver` line each, an
+/// IPv4 address, at port 53, or address:port (which resolv.conf itself
+/// does not have, for a resolver at another port). Other lines, and
+/// resolvers named by IPv6 addresses, are passed over.
+pub fn servers_of(text: str, a: alloc.Allocator) -> alloc.List(std.Address) {
+    var out = alloc.List(std.Address).init(a);
+    let b = text.bytes();
+    var at: usize = 0;
+    while at < b.len() {
+        var end = at;
+        while end < b.len() and b[end] != '\n' {
+            end += 1;
+        }
+        let line = trim(text[at..end]);
+        at = end + 1;
+        if not line.starts_with("nameserver") or line.len() <= 10 or (line.bytes()[10] != ' ' and line.bytes()[10] != '\t') {
+            continue;
+        }
+        match address_of(trim(line[10..line.len()])) {
+            some(x) => { out.push(x); }
+            none => { }
+        }
+    }
+    return out;
+}
+
+fn trim(s: str) -> str {
+    let b = s.bytes();
+    var from: usize = 0;
+    var to = b.len();
+    while from < to and (b[from] == ' ' or b[from] == '\t' or b[from] == '\r') {
+        from += 1;
+    }
+    while to > from and (b[to - 1] == ' ' or b[to - 1] == '\t' or b[to - 1] == '\r') {
+        to -= 1;
+    }
+    return s[from..to];
+}
+
+/// a.b.c.d, or a.b.c.d:port; none for anything else.
+fn address_of(s: str) -> ?std.Address {
+    var ip: [4]u8 = [0, 0, 0, 0];
+    var part: usize = 0;
+    var n: u32 = 0;
+    var digits: u32 = 0;
+    var port: u32 = 53;
+    var i: usize = 0;
+    let b = s.bytes();
+    while i < b.len() : (i += 1) {
+        let c = b[i];
+        if c >= '0' and c <= '9' {
+            n = n * 10 + (c - '0') as u32;
+            digits += 1;
+            if n > 255 or digits > 3 {
+                return none;
+            }
+        } else if c == '.' and digits > 0 and part < 3 {
+            ip[part] = n as u8;
+            part += 1;
+            n = 0;
+            digits = 0;
+        } else if c == ':' and digits > 0 and part == 3 {
+            port = 0;
+            var j = i + 1;
+            if j == b.len() {
+                return none;
+            }
+            while j < b.len() : (j += 1) {
+                if b[j] < '0' or b[j] > '9' {
+                    return none;
+                }
+                port = port * 10 + (b[j] - '0') as u32;
+                if port > 65535 {
+                    return none;
+                }
+            }
+            i = b.len() - 1;
+        } else {
+            return none;
+        }
+    }
+    if part != 3 or digits == 0 {
+        return none;
+    }
+    ip[3] = n as u8;
+    return std.Address { ip: ip, port: port as u16 };
+}
+
+/// Whether name is a host's name as DNS has them: labels of letters,
+/// digits and hyphens, 1 to 63 each, parted by dots, 253 at most in all;
+/// a dot at the end is allowed.
+pub fn good_name(name: str) -> bool {
+    var n = name.len();
+    if n > 0 and name.bytes()[n - 1] == '.' {
+        n -= 1;
+    }
+    if n == 0 or n > 253 {
+        return false;
+    }
+    var label: usize = 0;
+    for c in name[0..n].bytes() {
+        if c.* == '.' {
+            if label == 0 {
+                return false;
+            }
+            label = 0;
+        } else if (c.* >= 'a' and c.* <= 'z') or (c.* >= 'A' and c.* <= 'Z') or (c.* >= '0' and c.* <= '9') or c.* == '-' {
+            label += 1;
+            if label > 63 {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    return label > 0;
+}
+
+/// The question of name's IPv4 addresses (type A, class IN), recursion
+/// desired, as id: the bytes to send; none when name is not a host's
+/// name (good_name).
+pub fn query(id: u16, name: str, a: alloc.Allocator) -> ?alloc.List(u8) {
+    if not good_name(name) {
+        return none;
+    }
+    var out = alloc.List(u8).init(a);
+    // The header: id, RD set, one question.
+    out.push((id >> 8) as u8);
+    out.push((id & 0xFF) as u8);
+    out.push(0x01);
+    out.push(0x00);
+    out.push(0);
+    out.push(1);
+    var k: usize = 0;
+    while k < 6 : (k += 1) {
+        out.push(0);
+    }
+    // The name, label by label, each after its length.
+    var n = name.len();
+    if name.bytes()[n - 1] == '.' {
+        n -= 1;
+    }
+    var from: usize = 0;
+    var i: usize = 0;
+    while i <= n : (i += 1) {
+        if i == n or name.bytes()[i] == '.' {
+            out.push((i - from) as u8);
+            for c in name[from..i].bytes() {
+                out.push(c.*);
+            }
+            from = i + 1;
+        }
+    }
+    out.push(0);
+    // QTYPE A, QCLASS IN.
+    out.push(0);
+    out.push(1);
+    out.push(0);
+    out.push(1);
+    return out;
+}
+
+fn u16_at(b: []u8, at: usize) -> u32 {
+    return ((b[at] as u32) << 8) | (b[at + 1] as u32);
+}
+
+/// Where the name at at ends in msg: past its labels, or past the pointer
+/// that ends it; none when it runs past msg.
+fn skip_name(msg: []u8, at: usize) -> ?usize {
+    var i = at;
+    while i < msg.len() {
+        let len = msg[i];
+        if len == 0 {
+            return i + 1;
+        }
+        if (len & 0xC0) == 0xC0 {
+            if i + 1 >= msg.len() {
+                return none;
+            }
+            return i + 2;
+        }
+        if (len & 0xC0) != 0 {
+            return none;
+        }
+        i += 1 + len as usize;
+    }
+    return none;
+}
+
+/// The IPv4 addresses an answer msg gives to the question id asked: every
+/// A record of class IN in its answer section, which a resolver gives
+/// after the CNAMEs it followed. none, with why, when msg is not that
+/// answer, says there is no such name, failed, or has no address.
+pub fn answers(msg: []u8, id: u16, why: &mut alloc.String, a: alloc.Allocator) -> ?alloc.List(Ip) {
+    if msg.len() < 12 or u16_at(msg, at: 0) != id as u32 or (msg[2] & 0x80) == 0 {
+        why.push_str("not the answer to the question asked");
+        return none;
+    }
+    let rcode = msg[3] & 0x0F;
+    if rcode == 3 {
+        why.push_str("there is no such name");
+        return none;
+    }
+    if rcode != 0 {
+        why.push_str("the resolver failed to answer");
+        return none;
+    }
+    if (msg[2] & 0x02) != 0 {
+        why.push_str("the answer was cut short");
+        return none;
+    }
+    let questions = u16_at(msg, at: 4);
+    let count = u16_at(msg, at: 6);
+    var at: usize = 12;
+    var q: u32 = 0;
+    while q < questions : (q += 1) {
+        at = skip_name(msg, at: at) orelse 0;
+        if at == 0 or at + 4 > msg.len() {
+            why.push_str("an answer cut short");
+            return none;
+        }
+        at += 4;
+    }
+    var out = alloc.List(Ip).init(a);
+    var r: u32 = 0;
+    while r < count : (r += 1) {
+        at = skip_name(msg, at: at) orelse 0;
+        if at == 0 or at + 10 > msg.len() {
+            why.push_str("an answer cut short");
+            return none;
+        }
+        let kind = u16_at(msg, at: at);
+        let class = u16_at(msg, at: at + 2);
+        let len = u16_at(msg, at: at + 8) as usize;
+        at += 10;
+        if at + len > msg.len() {
+            why.push_str("an answer cut short");
+            return none;
+        }
+        if kind == 1 and class == 1 and len == 4 {
+            out.push(Ip { octets: [msg[at], msg[at + 1], msg[at + 2], msg[at + 3]] });
+        }
+        at += len;
+    }
+    if out.len() == 0 {
+        why.push_str("the name has no IPv4 address");
+        return none;
+    }
+    return out;
+}
+
+/// The IPv4 addresses of name, as the first of servers to answer says:
+/// each asked in turn, twice round at most, an answer waited for up to
+/// timeout_ms; one that comes from elsewhere, or answers another question,
+/// is not taken. none, with why, when none answers, or the answer is that
+/// there is none. The program waits meanwhile (Udp.receive).
+pub fn lookup(net: &std.Net, rand: &mut std.Rand, servers: []std.Address, name: str, timeout_ms: u32, why: &mut alloc.String, a: alloc.Allocator) -> ?alloc.List(Ip) {
+    var id_bytes: [2]u8 = [0, 0];
+    rand.fill(id_bytes[0..2]);
+    let id = ((id_bytes[0] as u16) << 8) | (id_bytes[1] as u16);
+    var asked = alloc.List(u8).init(a);
+    match query(id, name: name, a: a) {
+        some(q) => { asked = q; }
+        none => {
+            why.push_str(name);
+            why.push_str(" is not a host's name");
+            return none;
+        }
+    }
+    if servers.len() == 0 {
+        why.push_str("no resolver is known");
+        return none;
+    }
+    match net.udp(std.Address { ip: [0, 0, 0, 0], port: 0 }) {
+        ok(u) => {
+            var sock = u;
+            let found = ask(&mut sock, servers: servers, asked: asked.items(), id: id, name: name, timeout_ms: timeout_ms, why: why, a: a);
+            sock.close();
+            return found;
+        }
+        err(_) => {
+            why.push_str("no socket to ask with");
+            return none;
+        }
+    }
+}
+
+/// asked, the question id, put to each of servers in turn through sock, as
+/// lookup says.
+fn ask(sock: &mut std.Udp, servers: []std.Address, asked: []u8, id: u16, name: str, timeout_ms: u32, why: &mut alloc.String, a: alloc.Allocator) -> ?alloc.List(Ip) {
+    var buf: [1500]u8 = [0; 1500];
+    var round: u32 = 0;
+    while round < 2 : (round += 1) {
+        for server in servers {
+            match sock.send_to(server.*, data: asked) {
+                ok(_) => { }
+                err(_) => { continue; }
+            }
+            // Datagrams from elsewhere, or answers to another question, are
+            // passed over until the time is up.
+            var tries: u32 = 0;
+            while tries < 4 : (tries += 1) {
+                var got: ?std.Datagram = none;
+                match sock.receive(buf[0..1500], timeout_ms: timeout_ms) {
+                    ok(x) => { got = x; }
+                    err(_) => { break; }
+                }
+                match got {
+                    some(d) => {
+                        if not same(x: d.from, y: server.*) {
+                            continue;
+                        }
+                        var because = alloc.String.init(a);
+                        match answers(buf[0..d.len], id: id, why: &mut because, a: a) {
+                            some(ips) => { return ips; }
+                            none => {
+                                if because.view().eq("not the answer to the question asked") {
+                                    continue;
+                                }
+                                why.push_str(name);
+                                why.push_str(": ");
+                                why.push_str(because.view());
+                                return none;
+                            }
+                        }
+                    }
+                    none => { break; }
+                }
+            }
+        }
+    }
+    why.push_str("no resolver answered for ");
+    why.push_str(name);
+    return none;
+}
+
+fn same(x: std.Address, y: std.Address) -> bool {
+    return x.port == y.port and x.ip[0] == y.ip[0] and x.ip[1] == y.ip[1] and x.ip[2] == y.ip[2] and x.ip[3] == y.ip[3];
+}

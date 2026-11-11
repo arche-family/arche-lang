@@ -1,0 +1,46 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: ping 4 pong 4 none
+// wasm: skip
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    let local = std.Address { ip: [127, 0, 0, 1], port: 0 };
+    var a = try sys.net.udp(local);
+    var b = try sys.net.udp(local);
+    let at_b = std.Address { ip: [127, 0, 0, 1], port: b.port() };
+    try a.send_to(at_b, data: "ping".bytes());
+    var buf: [16]u8 = [0; 16];
+    match try b.receive(buf[0..16], timeout_ms: 1000) {
+        some(d) => {
+            for c in buf[0..d.len] {
+                sys.stdout.write_byte(c.*);
+            }
+            sys.stdout.write(" ");
+            sys.stdout.write_u64(d.len as u64);
+            // The answer goes back to whoever sent it.
+            try b.send_to(d.from, data: "pong".bytes());
+        }
+        none => { sys.stdout.write("no ping"); }
+    }
+    match try a.receive(buf[0..16], timeout_ms: 1000) {
+        some(d) => {
+            sys.stdout.write(" ");
+            for c in buf[0..d.len] {
+                sys.stdout.write_byte(c.*);
+            }
+            sys.stdout.write(" ");
+            sys.stdout.write_u64(d.len as u64);
+        }
+        none => { sys.stdout.write(" no pong"); }
+    }
+    // Nothing more comes: none, after the time given.
+    match try a.receive(buf[0..16], timeout_ms: 50) {
+        some(_) => { sys.stdout.write(" more"); }
+        none => { sys.stdout.write(" none"); }
+    }
+    a.close();
+    b.close();
+    sys.stdout.write("\n");
+}

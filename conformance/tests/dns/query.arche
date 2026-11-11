@@ -1,0 +1,63 @@
+// test: run
+// spec: dns (RFC 1035)
+// stage0: skip
+// stdout: 12340100000100000000000001610262630000010001
+// stdout: names: true true false false false true
+// stdout: 10.0.2.3:53 10.0.2.2:5353
+// wasm: skip
+import alloc;
+import dns;
+import std;
+
+fn hex(out: &mut std.Output, b: []u8) {
+    let digits = "0123456789abcdef";
+    for c in b {
+        out.write_byte(digits.bytes()[(c.* >> 4) as usize]);
+        out.write_byte(digits.bytes()[(c.* & 15) as usize]);
+    }
+}
+
+fn say(out: &mut std.Output, x: bool) {
+    if x {
+        out.write(" true");
+    } else {
+        out.write(" false");
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let out = &mut sys.stdout;
+    // The question of a.bc's addresses, as id 0x1234: the header (RD, one
+    // question), the labels, type A, class IN.
+    let q = dns.query(0x1234, name: "a.bc", a: a) orelse panic("a.bc is a name");
+    hex(out, b: q.items());
+    out.write("\nnames:");
+    say(out, x: dns.good_name("example.com"));
+    say(out, x: dns.good_name("x.y."));
+    say(out, x: dns.good_name("a..b"));
+    say(out, x: dns.good_name("a b"));
+    say(out, x: dns.good_name("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com"));
+    say(out, x: dns.good_name("10.0.2.2"));
+    out.write("\n");
+    // resolv.conf: its nameservers, one at another port; not an IPv6 one,
+    // nor other lines.
+    let servers = dns.servers_of("# the phone's\nnameserver 10.0.2.3\nnameserver\t10.0.2.2:5353\nnameserver ::1\nsearch arche.test\nnameservers 1.2.3.4\n", a: a);
+    var first = true;
+    for s in servers.items() {
+        if not first {
+            out.write(" ");
+        }
+        first = false;
+        out.write_u64(s.ip[0] as u64);
+        out.write(".");
+        out.write_u64(s.ip[1] as u64);
+        out.write(".");
+        out.write_u64(s.ip[2] as u64);
+        out.write(".");
+        out.write_u64(s.ip[3] as u64);
+        out.write(":");
+        out.write_u64(s.port as u64);
+    }
+    out.write("\n");
+}

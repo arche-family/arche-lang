@@ -1169,8 +1169,9 @@ pub type Input = struct {
     }
 }
 
-/// TCP over IPv4. Sockets do not block the program: a task that waits for
-/// one lets the others run.
+/// TCP and UDP over IPv4. Sockets do not block the program: a task that
+/// waits for one lets the others run (but Udp.receive, which waits at most
+/// as long as it is told).
 pub type Net = struct {
     unique: core.Unique,
 
@@ -1226,6 +1227,27 @@ pub type Net = struct {
             }
         }
         return Listener { fd: fd, unique: core.Unique { } };
+    }
+
+    /// A UDP socket at the address, to send datagrams from and receive
+    /// them at; port 0 lets the kernel choose one, which Udp.port says.
+    pub fn udp(self: &Net, at: Address) -> NetError!Udp {
+        var sa = sock_addr(at);
+        var fd: i64 = 0;
+        unsafe {
+            // SAFETY: AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+            // sa is 16 bytes.
+            fd = linux.syscall(linux.SOCKET, [2, 0x80802, 0, 0, 0, 0]);
+            if linux.errno(fd) != 0 {
+                return net_error(linux.errno(fd));
+            }
+            let r = linux.syscall(linux.BIND, [fd, linux.arg(SockAddr, &sa as *SockAddr), 16, 0, 0, 0]);
+            if linux.errno(r) != 0 {
+                _ = linux.syscall(linux.CLOSE, [fd, 0, 0, 0, 0, 0]);
+                return net_error(linux.errno(r));
+            }
+        }
+        return Udp { fd: fd, unique: core.Unique { } };
     }
 }
 
@@ -1499,6 +1521,112 @@ pub type Socket = struct {
     }
 
     pub fn close(self: &mut Socket) {
+        unsafe {
+            // SAFETY: fd is this socket's.
+            _ = linux.syscall(linux.CLOSE, [self.fd, 0, 0, 0, 0, 0]);
+        }
+        self.fd = -1;
+    }
+}
+
+/// A datagram received (Udp.receive): how many of its bytes were kept, and
+/// who sent it.
+pub type Datagram = struct {
+    pub len: usize,
+    pub from: Address,
+}
+
+fn received(len: usize, sa: &SockAddr) -> ?Datagram {
+    return Datagram { len: len, from: Address { ip: sa.ip, port: (sa.port >> 8) | (sa.port << 8) } };
+}
+
+/// UDP over IPv4 (Net.udp): datagrams sent to an address, and received
+/// from any.
+pub type Udp = struct {
+    fd: i64,
+    unique: core.Unique,
+
+    pub fn port(self: &Udp) -> u16 {
+        var sa = SockAddr { family: 0, port: 0, ip: [0, 0, 0, 0], zero: 0 };
+        var len: u32 = 16;
+        unsafe {
+            // SAFETY: getsockname writes up to len bytes of sa.
+            _ = linux.syscall(linux.GETSOCKNAME, [self.fd, linux.arg(SockAddr, &sa as *SockAddr), linux.arg(u32, &len as *u32), 0, 0, 0]);
+        }
+        return (sa.port >> 8) | (sa.port << 8);
+    }
+
+    /// data to to, as one datagram.
+    pub fn send_to(self: &mut Udp, to: Address, data: []u8) -> NetError!void {
+        var sa = sock_addr(to);
+        var r: i64 = -linux.EAGAIN;
+        while linux.errno(r) == linux.EAGAIN or linux.errno(r) == linux.EINTR {
+            unsafe {
+                // SAFETY: sendto reads data and the 16 bytes of sa.
+                r = linux.syscall(linux.SENDTO, [self.fd, linux.arg(u8, mem.slice_data(u8, data) as *u8), data.len() as i64, 0x4000, linux.arg(SockAddr, &sa as *SockAddr), 16]);
+            }
+            if linux.errno(r) == linux.EAGAIN {
+                io_wait(self.fd, events: POLLOUT);
+            }
+        }
+        if linux.errno(r) != 0 {
+            return net_error(linux.errno(r));
+        }
+    }
+
+    /// The next datagram, as much of it as into holds, and who sent it;
+    /// none when none came within timeout_ms. Nothing else runs while it
+    /// waits, as in Input.ready: what a resolver's question needs, an
+    /// answer or none.
+    pub fn receive(self: &mut Udp, into: []mut u8, timeout_ms: u32) -> NetError!?Datagram {
+        var sa = SockAddr { family: 0, port: 0, ip: [0, 0, 0, 0], zero: 0 };
+        var len: u32 = 16;
+        var r = self.receive_now(into, sa: &mut sa, len: &mut len);
+        if linux.errno(r) == linux.EAGAIN {
+            // struct pollfd: the fd, then POLLIN in the events' low byte.
+            var fds: [8]u8 = [0; 8];
+            let fd = self.fd as u32;
+            fds[0] = (fd & 0xFF) as u8;
+            fds[1] = ((fd >> 8) & 0xFF) as u8;
+            fds[2] = ((fd >> 16) & 0xFF) as u8;
+            fds[3] = ((fd >> 24) & 0xFF) as u8;
+            fds[4] = 1;
+            var p: i64 = -linux.EINTR;
+            while linux.errno(p) == linux.EINTR {
+                unsafe {
+                    // SAFETY: poll reads one pollfd and writes its revents.
+                    p = linux.poll(fds: linux.arg(u8, &fds[0] as *u8), count: 1, timeout_ms: timeout_ms as i64);
+                }
+            }
+            if p <= 0 {
+                return none;
+            }
+            len = 16;
+            r = self.receive_now(into, sa: &mut sa, len: &mut len);
+        }
+        if linux.errno(r) == linux.EAGAIN {
+            return none;
+        }
+        if linux.errno(r) != 0 {
+            return net_error(linux.errno(r));
+        }
+        return received(len: r as usize, sa: &sa);
+    }
+
+    /// recvfrom, not waiting: the bytes, or -EAGAIN when none is there.
+    fn receive_now(self: &mut Udp, into: []mut u8, sa: &mut SockAddr, len: &mut u32) -> i64 {
+        var r: i64 = -linux.EINTR;
+        while linux.errno(r) == linux.EINTR {
+            unsafe {
+                // SAFETY: recvfrom writes at most into.len() bytes, and at
+                // most len bytes of sa.
+                r = linux.syscall(linux.RECVFROM, [self.fd, linux.arg(u8, mem.slice_data(u8, into) as *u8), into.len() as i64, 0, linux.arg(SockAddr, sa as *SockAddr), linux.arg(u32, len as *u32)]);
+            }
+        }
+        return r;
+    }
+
+    pub fn close(self: &mut Udp) {
         unsafe {
             // SAFETY: fd is this socket's.
             _ = linux.syscall(linux.CLOSE, [self.fd, 0, 0, 0, 0, 0]);
