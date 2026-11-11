@@ -1,7 +1,7 @@
 // test: run
 // spec: arche-0/5.1
 // stage0: skip
-// stdout: 7 4 128512 checked 0
+// stdout: 7 4 128512 checked 0 ўзбек none
 import std;
 import core.utf8;
 
@@ -25,5 +25,15 @@ fn main(sys: &mut std.System) -> !void {
     }
     sys.stdout.write(" ");
     sys.stdout.write_u64(utf8.encode(0xD800, buf[0..8]) as u64);
+    // Bytes as text, once they are known to be UTF-8.
+    let word = "ўзбек";
+    sys.stdout.write(" ");
+    if utf8.valid(word.bytes()) {
+        sys.stdout.write(utf8.as_str(word.bytes()));
+    }
+    sys.stdout.write(" ");
+    if not utf8.valid(surrogate[0..3]) {
+        sys.stdout.write("none");
+    }
     sys.stdout.write("\n");
 }

@@ -1,0 +1,14 @@
+// test: run
+// spec: arche-0/5.1
+// stage0: skip
+// exit: 101
+// stderr: utf8.as_str: not UTF-8; ask valid first
+import std;
+import core.utf8;
+
+// Bytes that are not UTF-8, given to as_str all the same: a panic, never
+// a str that breaks its rule.
+fn main(sys: &mut std.System) -> !void {
+    let overlong: [2]u8 = [0xC0, 0x80];
+    sys.stdout.write(utf8.as_str(overlong[0..2]));
+}

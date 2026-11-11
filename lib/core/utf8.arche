@@ -1,4 +1,5 @@
 /// UTF-8 (spec/arche-0.md §5.1): decoding, encoding and checking bytes.
+import core.mem;
 
 /// A code point, and how many bytes it took.
 pub type Decoded = struct {
@@ -68,6 +69,19 @@ pub fn valid(b: []u8) -> bool {
         }
     }
     return true;
+}
+
+/// b as text, the same bytes, which must be well-formed UTF-8: what valid
+/// says first, and a panic when they are not. What a program read, a
+/// file's bytes, becomes text this way without unsafe code of its own.
+pub fn as_str(b: []u8) -> str {
+    if not valid(b) {
+        panic("utf8.as_str: not UTF-8; ask valid first");
+    }
+    unsafe {
+        // SAFETY: b is well-formed UTF-8, as valid says.
+        return mem.str_from(b);
+    }
 }
 
 /// The number of code points in s.
