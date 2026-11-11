@@ -233,7 +233,8 @@ fi
 # the phone's does: its WIT a directory with Nimadir's in deps/, its
 # include and its other package's interfaces read, bound and encoded; the
 # functions the embedder adds (--add) answered and their calls said;
-# woken, the app posts, drawn, it cancels; without them, it is refused.
+# woken, the app posts, drawn, it cancels, its time the one --now-millis
+# gives; without them, it is refused.
 mkdir -p "$work/ext-wit/deps/nimadir"
 cp "$here/tests/extension/ext.wit" "$work/ext-wit/"
 cp "$apps/world.wit" "$work/ext-wit/deps/nimadir/"
@@ -251,7 +252,7 @@ else
         fi
         for mode in "" --jit; do
             # shellcheck disable=SC2086
-            "$wasm" nimadir "$work/ext.wasm" $frames $mode --add 'test:ext/notes@0.1.0#post=numbered' --add 'test:ext/notes@0.1.0#cancel' --add "test:ext/wake@0.1.0#woken=$woken" --add 'test:ext/inbox@0.1.0#list=[]' --add 'test:ext/inbox@0.1.0#located=none' > "$work/out" 2>&1 || true
+            "$wasm" nimadir "$work/ext.wasm" $frames $mode --now-millis 1794294000000 --add 'test:ext/notes@0.1.0#post=numbered' --add 'test:ext/notes@0.1.0#cancel' --add "test:ext/wake@0.1.0#woken=$woken" --add 'test:ext/inbox@0.1.0#list=[]' --add 'test:ext/inbox@0.1.0#located=none' > "$work/out" 2>&1 || true
             sh "$apps/normalize.sh" < "$work/out" > "$work/got"
             if diff -u "$expected" "$work/got" > "$work/diff"; then
                 echo "PASS an app of a world that includes Nimadir's, woken $woken $mode"

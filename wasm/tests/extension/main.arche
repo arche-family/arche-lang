@@ -1,7 +1,8 @@
 /// An app of a world that includes Nimadir's and imports more (ext.wit,
 /// nimadir-check.sh): woken, it posts a note; drawn, it shows the note's
-/// number, how many messages the inbox has and whether it knows where it
-/// is, and its button cancels the note.
+/// number, how many messages the inbox has, whether it knows where it is
+/// and its now-millis (the check's --now-millis), and its button cancels
+/// the note.
 import alloc;
 import host_api;
 import inbox;
@@ -33,6 +34,9 @@ fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
         some(_) => { host_api.ui_label(host, text: "Somewhere"); }
         none => { host_api.ui_label(host, text: "Nowhere"); }
     }
+    var now = alloc.String.from("Now ", a);
+    now.push_i64(host_api.now_millis(host));
+    host_api.ui_label(host, text: now.view());
     if host_api.ui_button(host, text: "Cancel") {
         notes.cancel(host, id: state.id);
     }
