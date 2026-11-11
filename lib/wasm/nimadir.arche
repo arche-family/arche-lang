@@ -110,11 +110,16 @@ pub type Ui = struct {
     groups: u32,
     /// What the user did, for the next frame: the buttons tapped and the
     /// fields submitted, for that frame only; and the text each field
-    /// edited holds, until it is edited again.
+    /// edited holds, until it is edited again, or the app hands the field
+    /// something else than it was given (a message's text cleared once it
+    /// is sent): what each edited text field gave the app last, and
+    /// whether it has yet.
     clicked: alloc.List(u32),
     submits: alloc.List(u32),
     edit_fields: alloc.List(u32),
     edits: alloc.List(alloc.String),
+    gave: alloc.List(alloc.String),
+    gave_yet: alloc.List(bool),
     /// The text field drawn last, for ui-submitted; NONE for none.
     last_field: u32,
     pub now_ms: i64,
@@ -284,6 +289,8 @@ pub fn new_ui(a: alloc.Allocator) -> Ui {
         submits: alloc.List(u32).init(a),
         edit_fields: alloc.List(u32).init(a),
         edits: alloc.List(alloc.String).init(a),
+        gave: alloc.List(alloc.String).init(a),
+        gave_yet: alloc.List(bool).init(a),
         last_field: NONE,
         now_ms: 0,
         locale: alloc.String.from("en-US", a),
@@ -380,6 +387,29 @@ pub fn set_field(ui: &mut Ui, i: u32, text: str) {
     }
     ui.edit_fields.push(i);
     ui.edits.push(alloc.String.from(text, ui.a));
+    ui.gave.push(alloc.String.init(ui.a));
+    ui.gave_yet.push(false);
+}
+
+/// The edit of the field at k dropped: the app's own text holds again.
+fn drop_edit(ui: &mut Ui, k: usize) {
+    var fields = alloc.List(u32).init(ui.a);
+    var edits = alloc.List(alloc.String).init(ui.a);
+    var gave = alloc.List(alloc.String).init(ui.a);
+    var gave_yet = alloc.List(bool).init(ui.a);
+    var j: usize = 0;
+    while j < ui.edit_fields.len() : (j += 1) {
+        if j != k {
+            fields.push(ui.edit_fields.items()[j]);
+            edits.push(alloc.String.from(ui.edits.items()[j].view(), ui.a));
+            gave.push(alloc.String.from(ui.gave.items()[j].view(), ui.a));
+            gave_yet.push(ui.gave_yet.items()[j]);
+        }
+    }
+    ui.edit_fields = fields;
+    ui.edits = edits;
+    ui.gave = gave;
+    ui.gave_yet = gave_yet;
 }
 
 /// The field i is submitted in the next frame: Enter, or a phone
@@ -1241,11 +1271,22 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
             kind = SEARCH;
             detail = text_arg(args, i: 1);
         }
-        // What the user typed, else what the app holds.
+        // What the user typed, else what the app holds; and what the app
+        // holds when it hands the field other text than it was given, as
+        // it does to clear what was sent.
         let i = ui.fields;
-        var current = alloc.String.from(text_arg(args, i: 0), a);
+        let held = text_arg(args, i: 0);
+        var current = alloc.String.from(held, a);
         match edit_of(ui, i: i) {
-            some(k) => { current = alloc.String.from(ui.edits.items()[k].view(), a); }
+            some(k) => {
+                if ui.gave_yet.items()[k] and not held.eq(ui.gave.items()[k].view()) and not held.eq(ui.edits.items()[k].view()) {
+                    drop_edit(ui, k: k);
+                } else {
+                    current = alloc.String.from(ui.edits.items()[k].view(), a);
+                    ui.gave.items_mut()[k] = alloc.String.from(current.view(), ui.a);
+                    ui.gave_yet.items_mut()[k] = true;
+                }
+            }
             none => { }
         }
         try spend(ui, bytes: current.len() + detail.len());
