@@ -214,22 +214,19 @@ expect "a full store is said, not a trap" 0 "   [wasm log] runaway: storage is f
 expect "an import the shell does not give is refused" 1 "arche-wasm: the component did not instantiate: imports what the shell does not give" -- "$apps/counter.component.wasm" --deny now-millis
 
 # The app template (template/, S38), built by nimadir-app.sh as an app
-# author would: its button counts.
+# author would, and checked as an app's own repository checks it
+# (app-check.sh): its button counts, by the interpreter and by the JIT,
+# as Nimadir's shell said to the same taps (template/expected.txt).
 if ! ARCHE="$arche" ARCHE_WASM="$wasm" sh "$here/nimadir-app.sh" "$here/template" "$work/template.wasm" > "$work/err" 2>&1; then
     echo "FAIL the template did not build:"
     head -20 "$work/err"
     failed=$((failed + 1))
+elif ARCHE="$arche" ARCHE_WASM="$wasm" sh "$here/app-check.sh" "$here/template" > "$work/check" 2>&1; then
+    echo "PASS the template counts its taps as Nimadir's shell, by app-check.sh"
 else
-    for mode in "" --jit; do
-        "$wasm" nimadir "$work/template.wasm" --script 1:0,2:0 --frames 4 $mode > "$work/out" 2>&1 || true
-        if grep -qxF '   label   : "Tapped 2 times"' "$work/out"; then
-            echo "PASS the template, built by nimadir-app.sh, counts its taps $mode"
-        else
-            echo "FAIL the template $mode:"
-            head -20 "$work/out"
-            failed=$((failed + 1))
-        fi
-    done
+    echo "FAIL the template, by app-check.sh:"
+    head -30 "$work/check"
+    failed=$((failed + 1))
 fi
 
 # Every kind of WIT type bindgen binds (tests/echo): an app given each,
