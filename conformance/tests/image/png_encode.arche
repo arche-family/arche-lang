@@ -1,0 +1,70 @@
+// test: run
+// spec: image.png (encode)
+// stage0: skip
+// stdout: 7x5 encoded, its 140 bytes of pixels decoded as they were
+// stdout: 1x1 encoded, its 4 bytes of pixels decoded as they were
+// stdout: 64x48 encoded, its 12288 bytes of pixels decoded as they were
+// stdout: a byte changed: refused
+import alloc;
+import image.png;
+import std;
+
+// Images encoded by png.encode and decoded again by png.decode: a
+// gradient with alpha, one pixel, and a larger one of stripes, as a test
+// pattern is; each pixel the same both ways. A changed byte breaks a
+// checksum, and the file is refused.
+
+fn made(w: u32, h: u32, a: alloc.Allocator) -> png.Image {
+    var img = png.Image { width: w, height: h, rgba: alloc.List(u8).init(a) };
+    var y: u32 = 0;
+    while y < h : (y += 1) {
+        var x: u32 = 0;
+        while x < w : (x += 1) {
+            img.rgba.push((x * 37 + y * 11) as% u8);
+            img.rgba.push((y * 53) as% u8);
+            img.rgba.push(((x / 8) % 2 * 255) as% u8);
+            img.rgba.push((255 - x * 3) as% u8);
+        }
+    }
+    return img;
+}
+
+fn round_trip(out: &mut std.Output, w: u32, h: u32, a: alloc.Allocator) {
+    let img = made(w: w, h: h, a: a);
+    let bytes = png.encode(&img, a: a);
+    match png.decode(bytes.items(), max_pixels: 1000000, a) {
+        ok(back) => {
+            var same: u64 = 0;
+            if back.width == w and back.height == h {
+                var k: usize = 0;
+                while k < img.rgba.len() : (k += 1) {
+                    if back.rgba.items()[k] == img.rgba.items()[k] {
+                        same += 1;
+                    }
+                }
+            }
+            out.write_u64(w as u64);
+            out.write("x");
+            out.write_u64(h as u64);
+            out.write(" encoded, its ");
+            out.write_u64(same);
+            out.write(" bytes of pixels decoded as they were\n");
+        }
+        err(_) => { out.write("refused\n"); }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    round_trip(&mut sys.stdout, w: 7, h: 5, a: a);
+    round_trip(&mut sys.stdout, w: 1, h: 1, a: a);
+    round_trip(&mut sys.stdout, w: 64, h: 48, a: a);
+    let img = made(w: 9, h: 9, a: a);
+    var bytes = png.encode(&img, a: a);
+    let k = bytes.len() - 20;
+    bytes.items_mut()[k] ^= 0x40;
+    match png.decode(bytes.items(), max_pixels: 1000000, a) {
+        ok(_) => { sys.stdout.write("a byte changed: decoded\n"); }
+        err(_) => { sys.stdout.write("a byte changed: refused\n"); }
+    }
+}

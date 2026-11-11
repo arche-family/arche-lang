@@ -9,6 +9,9 @@
 /// An image comes from outside, so every read is checked and the pixels
 /// it may have are bounded: a broken file gives an error, never a panic
 /// (fuzz/png_fuzz.arche).
+///
+/// encode writes an image as PNG (arche-os T7, the camera's photos): 8-bit
+/// RGBA, each row filtered by Sub, deflated by core.deflate.
 import alloc;
 import core.deflate;
 
@@ -451,4 +454,72 @@ fn place(h: &Header, pass: u32, part: []u8, stride: usize, palette: []u8, alphas
             out[at + 3] = px[3];
         }
     }
+}
+
+/// A chunk of kind with data, onto out: its length, kind, data and CRC.
+fn put_chunk(out: &mut alloc.List(u8), kind: str, data: []u8) {
+    put_u32(out, v: data.len() as u32);
+    let start = out.len();
+    for c in kind.bytes() {
+        out.push(c.*);
+    }
+    for b in data {
+        out.push(b.*);
+    }
+    let crc = deflate.crc32(0, out.items()[start..out.len()]);
+    put_u32(out, v: crc);
+}
+
+fn put_u32(out: &mut alloc.List(u8), v: u32) {
+    out.push((v >> 24) as% u8);
+    out.push((v >> 16) as% u8);
+    out.push((v >> 8) as% u8);
+    out.push(v as% u8);
+}
+
+/// img as a PNG file: 8-bit RGBA, not interlaced, each row filtered by Sub
+/// (the byte four before taken away), its data one zlib stream.
+pub fn encode(img: &Image, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    let sig: [8]u8 = [137, 80, 78, 71, 13, 10, 26, 10];
+    for b in sig[0..8] {
+        out.push(b.*);
+    }
+    var head = alloc.List(u8).init(a);
+    put_u32(&mut head, v: img.width);
+    put_u32(&mut head, v: img.height);
+    // 8 bits, color type 6 (RGBA), deflate, filters of method 0, no
+    // interlace.
+    head.push(8);
+    head.push(6);
+    head.push(0);
+    head.push(0);
+    head.push(0);
+    put_chunk(&mut out, kind: "IHDR", data: head.items());
+    let stride = img.width as usize * 4;
+    let px = img.rgba.items();
+    var raw = alloc.List(u8).init(a);
+    var y: usize = 0;
+    while y < img.height as usize : (y += 1) {
+        raw.push(1);
+        let row = y * stride;
+        var x: usize = 0;
+        while x < stride : (x += 1) {
+            var left: u8 = 0;
+            if x >= 4 {
+                left = px[row + x - 4];
+            }
+            raw.push(px[row + x] -% left);
+        }
+    }
+    var z = alloc.List(u8).init(a);
+    // CMF 0x78: deflate with a 32 KiB window; FLG 0x01 makes it a
+    // multiple of 31, no dictionary.
+    z.push(0x78);
+    z.push(0x01);
+    deflate.compress(raw.items(), out: &mut z, a: a);
+    put_u32(&mut z, v: adler32(raw.items()));
+    put_chunk(&mut out, kind: "IDAT", data: z.items());
+    put_chunk(&mut out, kind: "IEND", data: sig[0..0]);
+    return out;
 }
