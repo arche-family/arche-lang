@@ -1363,6 +1363,13 @@ pub fn put_picture(ui: &mut Ui, at: u64, image: png.Image) -> ?u64 {
     return (ui.pictures.len() - 1) as u64;
 }
 
+/// The pixels of the image numbered h, which has_image says there is, to
+/// write into in place: a camera's view, frame after frame, with nothing
+/// allocated anew.
+pub fn pixels_of(ui: &mut Ui, h: u64) -> []mut u8 {
+    return ui.pictures.items_mut()[h as usize].rgba.items_mut();
+}
+
 fn load_image(ui: &mut Ui, bytes: []u8, why: &mut alloc.String) {
     let sig: [8]u8 = [137, 80, 78, 71, 13, 10, 26, 10];
     var is_png = bytes.len() >= 24;

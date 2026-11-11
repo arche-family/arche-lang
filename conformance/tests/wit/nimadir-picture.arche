@@ -7,6 +7,7 @@
 // stdout: new 1: 1x1
 // stdout: too wide: refused
 // stdout: past 8 megapixels: refused
+// stdout: written in place: 7 9
 import alloc;
 import image.png;
 import std;
@@ -15,7 +16,8 @@ import wasm.nimadir;
 // Pictures an embedder hands an app (nimadir.put_picture), as the phone's
 // camera hands its view: a new one numbered after the app's others, one
 // in place of another keeping its number, and none past the shell's
-// limits: 4096 on a side, 8 megapixels in all.
+// limits: 4096 on a side, 8 megapixels in all. Its pixels written in
+// place (nimadir.pixels_of), as a camera's frames are.
 
 fn plain(w: u32, h: u32, a: alloc.Allocator) -> png.Image {
     var img = png.Image { width: w, height: h, rgba: alloc.List(u8).init(a) };
@@ -54,4 +56,13 @@ fn main(sys: &mut std.System) -> !void {
     said(&mut sys.stdout, what: "too wide", ui: &ui, got: wide);
     let big = nimadir.put_picture(&mut ui, at: none_yet, image: plain(w: 4096, h: 2049, a: a));
     said(&mut sys.stdout, what: "past 8 megapixels", ui: &ui, got: big);
+    let px = nimadir.pixels_of(&mut ui, h: 0);
+    px[0] = 7;
+    px[11] = 9;
+    let p = nimadir.picture(&ui, h: 0);
+    sys.stdout.write("written in place: ");
+    sys.stdout.write_u64(p.rgba.items()[0] as u64);
+    sys.stdout.write(" ");
+    sys.stdout.write_u64(p.rgba.items()[11] as u64);
+    sys.stdout.write("\n");
 }
