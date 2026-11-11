@@ -1006,6 +1006,51 @@ fn over(dst: u8, src: u8) -> u8 {
     return (s + d - (s * d + 127) / 255) as u8;
 }
 
+/// Where a glyph of a text goes: its bitmap's place in the cache, and the
+/// pen's x there, in pixels.
+pub type Placed = struct {
+    pub bitmap: u32,
+    pub x: i32,
+}
+
+/// Where the glyphs of text at size go, from x, onto out, each drawn into
+/// the cache if it is not there yet: for a caller that draws them itself,
+/// with no canvas between. Where the pen ends, in pixels.
+pub fn place(f: &Font, cache: &mut Cache, text: str, size: u32, x: i32, out: &mut alloc.List(Placed)) -> FontError!i32 {
+    let b = text.bytes();
+    var pen = (x as i64) * 256;
+    var at: usize = 0;
+    var previous: u32 = 0;
+    var first = true;
+    while at < b.len() {
+        var cp: u32 = 0xFFFD;
+        var len: usize = 1;
+        match utf8.decode(b, at) {
+            some(d) => {
+                cp = d.code;
+                len = d.len;
+            }
+            none => { }
+        }
+        at += len;
+        let g = glyph_of(f, cp: cp);
+        if not first {
+            pen += scale(f, kerning(f, left: previous, right: g) as i64, size: size);
+        }
+        first = false;
+        previous = g;
+        let i = try cached(f, c: cache, g: g, size: size);
+        out.push(Placed { bitmap: i, x: round_div(n: pen, d: 256) as i32 });
+        pen += scale(f, advance(f, g: g) as i64, size: size);
+    }
+    return round_div(n: pen, d: 256) as i32;
+}
+
+/// The bitmap place gave a glyph of.
+pub fn bitmap_of(cache: &Cache, i: u32) -> &Bitmap {
+    return &cache.bitmaps.items()[i as usize];
+}
+
 /// Draws text at size into c, its baseline at y, from x; text that is not
 /// UTF-8 draws U+FFFD where it is not. Where the pen ends, in pixels.
 pub fn draw(f: &Font, cache: &mut Cache, text: str, size: u32, x: i32, y: i32, into: &mut Canvas) -> FontError!i32 {
