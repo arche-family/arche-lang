@@ -6,6 +6,7 @@
 /// and 65536 widgets sent in a frame. Past one the app is stopped, and the
 /// shell says which.
 import alloc;
+import core.utf8;
 import image.png;
 import wasm.component as c;
 import wasm.exec;
@@ -325,6 +326,231 @@ fn int_arg(args: &alloc.List(c.Val), i: usize) -> u64 {
         _ => { return 0; }
     }
 }
+
+/// Whether x sorts before y, byte by byte.
+fn bytes_before(x: str, y: str) -> bool {
+    let xb = x.bytes();
+    let yb = y.bytes();
+    var i: usize = 0;
+    while i < xb.len() and i < yb.len() : (i += 1) {
+        if xb[i] != yb[i] {
+            return xb[i] < yb[i];
+        }
+    }
+    return xb.len() < yb.len();
+}
+
+/// A request's url, its record's second field.
+fn url_of(args: &alloc.List(c.Val)) -> str {
+    match &args.items()[0] {
+        .List { items } => {
+            if items.len() > 1 {
+                match &items.items()[1] {
+                    .Str { v } => { return v.view(); }
+                    _ => { }
+                }
+            }
+        }
+        _ => { }
+    }
+    return "";
+}
+
+/// Why a fetch of url is refused, as Nimadir's shell says it: plain http
+/// to anywhere but this machine, an address that is no http or https one
+/// or has no host, this machine or its local network, and, past those,
+/// an app that declares no network access.
+fn refusal(url: str, why: &mut alloc.String, a: alloc.Allocator) {
+    if url.starts_with("http://") and not loopback(host_in(url[7..url.len()]), a: a) {
+        why.push_str(url);
+        why.push_str(" is plain http — the shell only fetches over https:// (this machine, localhost or 127.0.0.1, is the one exception)");
+        return;
+    }
+    let b = url.bytes();
+    var sep: usize = 0;
+    while sep + 3 <= b.len() and not url[sep..sep + 3].eq("://") {
+        sep += 1;
+    }
+    if sep + 3 > b.len() {
+        why.push_str(url);
+        why.push_str(" is not an http or https address");
+        return;
+    }
+    let scheme = lower(url[0..sep], a: a);
+    var default_port = "";
+    if scheme.view().eq("https") {
+        default_port = ":443";
+    } else if scheme.view().eq("http") {
+        default_port = ":80";
+    } else {
+        why.push_str(url);
+        why.push_str(" is not an http or https address");
+        return;
+    }
+    let host = lower(authority_in(url[sep + 3..url.len()]), a: a);
+    var end = host.len();
+    if end >= default_port.len() and host.view()[end - default_port.len()..end].eq(default_port) {
+        end -= default_port.len();
+    }
+    if end == 0 {
+        why.push_str(url);
+        why.push_str(" has no host");
+        return;
+    }
+    if local(host.view()[0..end]) {
+        why.push_str(scheme.view());
+        why.push_str("://");
+        why.push_str(host.view()[0..end]);
+        why.push_str(" is this machine or its local network, which apps may not reach");
+        return;
+    }
+    why.push_str("this app declares no network access in its manifest");
+}
+
+/// s in lower case.
+fn lower(s: str, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    for ch in s.bytes() {
+        if ch.* >= 'A' and ch.* <= 'Z' {
+            out.push_ascii(ch.* + 32);
+        } else {
+            out.push_ascii(ch.*);
+        }
+    }
+    return out;
+}
+
+/// An address's authority, after its scheme: up to its path, query or
+/// fragment, past any user in it.
+fn authority_in(rest: str) -> str {
+    let b = rest.bytes();
+    var end: usize = 0;
+    while end < b.len() and b[end] != '/' and b[end] != '?' and b[end] != '#' {
+        end += 1;
+    }
+    var start: usize = 0;
+    var i: usize = 0;
+    while i < end : (i += 1) {
+        if b[i] == '@' {
+            start = i + 1;
+        }
+    }
+    return rest[start..end];
+}
+
+/// The host of an address after its scheme: inside its brackets, or
+/// before its port.
+fn host_in(rest: str) -> str {
+    let auth = authority_in(rest);
+    let b = auth.bytes();
+    if b.len() > 0 and b[0] == '[' {
+        var e: usize = 1;
+        while e < b.len() and b[e] != ']' {
+            e += 1;
+        }
+        return auth[1..e];
+    }
+    var e: usize = 0;
+    while e < b.len() and b[e] != ':' {
+        e += 1;
+    }
+    return auth[0..e];
+}
+
+/// A dotted IPv4 address as a number; none for what is not one.
+fn ipv4(host: str) -> ?u32 {
+    let b = host.bytes();
+    var value: u32 = 0;
+    var parts: u32 = 0;
+    var i: usize = 0;
+    while parts < 4 {
+        var n: u32 = 0;
+        var digits: u32 = 0;
+        while i < b.len() and b[i] >= '0' and b[i] <= '9' and digits < 4 {
+            n = n * 10 + (b[i] - '0') as u32;
+            digits += 1;
+            i += 1;
+        }
+        if digits == 0 or n > 255 {
+            return none;
+        }
+        value = (value << 8) | n;
+        parts += 1;
+        if parts < 4 {
+            if i >= b.len() or b[i] != '.' {
+                return none;
+            }
+            i += 1;
+        }
+    }
+    if i != b.len() {
+        return none;
+    }
+    return value;
+}
+
+/// The first 16 bits of an IPv6 address, as far as its text tells them:
+/// 0 for one that starts with ::.
+fn ipv6_first(host: str) -> u32 {
+    let b = host.bytes();
+    var v: u32 = 0;
+    var i: usize = 0;
+    while i < b.len() and b[i] != ':' : (i += 1) {
+        let d = b[i];
+        if d >= '0' and d <= '9' {
+            v = v * 16 + (d - '0') as u32;
+        } else if d >= 'a' and d <= 'f' {
+            v = v * 16 + (d - 'a' + 10) as u32;
+        } else if d >= 'A' and d <= 'F' {
+            v = v * 16 + (d - 'A' + 10) as u32;
+        }
+    }
+    return v & 0xFFFF;
+}
+
+/// Whether host is this machine: localhost, or a loopback address.
+fn loopback(host: str, a: alloc.Allocator) -> bool {
+    if lower(host, a: a).view().eq("localhost") or host.eq("::1") {
+        return true;
+    }
+    match ipv4(host) {
+        some(ip) => { return (ip >> 24) == 127; }
+        none => { return false; }
+    }
+}
+
+/// Whether host, in lower case, names this machine or a private network
+/// by address: localhost, loopback, RFC 1918, link-local, unspecified,
+/// and IPv6's unique-local and link-local.
+fn local(host: str) -> bool {
+    let suffix = ".localhost";
+    if host.eq("localhost") or (host.len() > suffix.len() and host[host.len() - suffix.len()..host.len()].eq(suffix)) {
+        return true;
+    }
+    match ipv4(host) {
+        some(ip) => {
+            let first = ip >> 24;
+            let second = (ip >> 16) & 0xFF;
+            return first == 127 or first == 10 or (first == 172 and second >= 16 and second <= 31) or (first == 192 and second == 168) or (first == 169 and second == 254) or ip == 0;
+        }
+        none => { }
+    }
+    var colons: u32 = 0;
+    for d in host.bytes() {
+        if d.* == ':' {
+            colons += 1;
+        }
+    }
+    if colons < 2 {
+        return false;
+    }
+    if host.eq("::1") or host.eq("::") {
+        return true;
+    }
+    let first = ipv6_first(host);
+    return (first & 0xFE00) == 0xFC00 or (first & 0xFFC0) == 0xFE80;
+}
+
 
 fn str_val(s: str, a: alloc.Allocator) -> c.Val {
     return c.Val.Str { v: alloc.String.from(s, a) };
@@ -842,11 +1068,29 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
         return c.Val.Unit;
     }
     if func.eq("storage-keys") {
-        var items = alloc.List(c.Val).init(a);
-        for k in ui.keys.items() {
-            if k.len() > 0 {
-                items.push(str_val(k.view(), a));
+        // In order of their bytes, as Nimadir's shell keeps them (a
+        // BTreeMap), whatever order they were set in.
+        var keys = alloc.List(u32).init(a);
+        var i: u32 = 0;
+        while (i as usize) < ui.keys.len() : (i += 1) {
+            if ui.keys.items()[i as usize].len() > 0 {
+                keys.push(i);
             }
+        }
+        let ks = keys.items_mut();
+        var j: usize = 1;
+        while j < ks.len() : (j += 1) {
+            var m = j;
+            while m > 0 and bytes_before(x: ui.keys.items()[ks[m] as usize].view(), y: ui.keys.items()[ks[m - 1] as usize].view()) {
+                let keep = ks[m];
+                ks[m] = ks[m - 1];
+                ks[m - 1] = keep;
+                m -= 1;
+            }
+        }
+        var items = alloc.List(c.Val).init(a);
+        for k in keys.items() {
+            items.push(str_val(ui.keys.items()[k.* as usize].view(), a));
         }
         return c.Val.List { items: items };
     }
@@ -876,10 +1120,18 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
         return c.Val.Variant { case: 0, payload: p };
     }
     if func.eq("fetch") {
-        return done("no network in this shell", a);
+        // Refused as Nimadir's shell refuses it (host/src/net.rs), in its
+        // order; every app run here declares no network access, since no
+        // manifest is read.
+        var why = alloc.String.init(a);
+        refusal(url_of(args), why: &mut why, a: a);
+        return done(why.view(), a);
     }
     if func.eq("fetch-poll") {
-        return nothing(a);
+        // No request is ever under way here.
+        var why = alloc.String.from("no request numbered ", a);
+        why.push_u64(int_arg(args, i: 0));
+        return some_val(done(why.view(), a), a);
     }
     if func.eq("locale") {
         return str_val("en-US", a);
@@ -1000,54 +1252,11 @@ fn make_node(ui: &mut Ui, tag: str) -> exec.Trap!u32 {
     return new_node(ui, tag: tag);
 }
 
-fn is_void(tag: str) -> bool {
-    return tag.eq("input") or tag.eq("img") or tag.eq("br") or tag.eq("hr") or tag.eq("meta") or tag.eq("link");
-}
 
 fn name_byte(b: u8) -> bool {
     return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '-' or b == '_' or b == ':';
 }
 
-/// Text with &lt;, &gt;, &amp;, &quot;, &apos;, &#39; and &#NN; read.
-fn unescape(b: []u8, from: usize, to: usize, out: &mut alloc.String) {
-    var i = from;
-    while i < to {
-        if b[i] == '&' {
-            var j = i + 1;
-            while j < to and j < i + 10 and b[j] != ';' {
-                j += 1;
-            }
-            if j < to and b[j] == ';' {
-                let ent = b[i + 1..j];
-                var known = true;
-                if bytes_eq(ent, "lt") {
-                    out.push_ascii('<');
-                } else if bytes_eq(ent, "gt") {
-                    out.push_ascii('>');
-                } else if bytes_eq(ent, "amp") {
-                    out.push_ascii('&');
-                } else if bytes_eq(ent, "quot") {
-                    out.push_ascii('"');
-                } else if bytes_eq(ent, "apos") or bytes_eq(ent, "#39") {
-                    out.push_ascii('\'');
-                } else {
-                    known = false;
-                }
-                if known {
-                    i = j + 1;
-                    continue;
-                }
-            }
-        }
-        // One whole character at a time keeps the string UTF-8.
-        var end = i + 1;
-        while end < to and b[end] & 0xC0 == 0x80 {
-            end += 1;
-        }
-        _ = out.push_utf8(b[i..end]);
-        i = end;
-    }
-}
 
 /// A whole number as an f32's bits.
 fn f32_of(v: i32) -> c.Val {
@@ -1176,111 +1385,461 @@ fn same_bytes(x: []u8, y: []u8) -> bool {
     return true;
 }
 
-/// Parses markup into new nodes under parent; an error says where.
-fn parse_markup(ui: &mut Ui, parent: u32, markup: str) -> exec.Trap!alloc.String {
-    let b = markup.bytes();
-    var open = alloc.List(u32).init(ui.a);
-    open.push(parent);
+/// Elements that never have content, so never a closing tag, as Nimadir's
+/// shell has them (host/src/dom/markup.rs).
+fn is_void(tag: str) -> bool {
+    return tag.eq("br") or tag.eq("hr") or tag.eq("img") or tag.eq("input") or tag.eq("meta") or tag.eq("link") or tag.eq("area") or tag.eq("base") or tag.eq("col") or tag.eq("embed") or tag.eq("source") or tag.eq("track") or tag.eq("wbr");
+}
+
+/// How deep markup nests at most, as Nimadir's document does.
+const MARKUP_DEPTH: usize = 256;
+
+/// A node of markup read, not yet in the document: an element's tag
+/// (empty for a text) and attributes, or a text; and its parent among
+/// them, NO_PARENT for one at the top.
+type Parsed = struct {
+    tag: alloc.String,
+    text: alloc.String,
+    names: alloc.List(alloc.String),
+    values: alloc.List(alloc.String),
+    parent: u32,
+}
+
+const NO_PARENT: u32 = 0xFFFFFFFF;
+
+/// Where at is in src, as a person counts: "line 3, column 7".
+fn place(src: str, at: usize, out: &mut alloc.String) {
+    let b = src.bytes();
+    var end = at;
+    if end > b.len() {
+        end = b.len();
+    }
+    var line: u64 = 1;
+    var column: u64 = 1;
     var i: usize = 0;
-    var why = alloc.String.init(ui.a);
+    while i < end : (i += 1) {
+        if b[i] == '\n' {
+            line += 1;
+            column = 1;
+        } else if (b[i] & 0xC0) != 0x80 {
+            column += 1;
+        }
+    }
+    out.push_str("line ");
+    out.push_u64(line);
+    out.push_str(", column ");
+    out.push_u64(column);
+}
+
+fn is_space(b: u8) -> bool {
+    return b == ' ' or b == '\t' or b == '\n' or b == '\r' or b == 0x0B or b == 0x0C;
+}
+
+/// Whether b is part of a tag's name: a letter, a digit, - _ or :, or a
+/// byte of a character past ASCII.
+fn tag_byte(b: u8) -> bool {
+    return name_byte(b) or b >= 0x80;
+}
+
+/// Where what is first at or after from in s; none for nowhere.
+fn find_in(s: str, from: usize, what: str) -> ?usize {
+    let b = s.bytes();
+    let w = what.bytes();
+    var at = from;
+    while at + w.len() <= b.len() : (at += 1) {
+        if s[at..at + w.len()].eq(what) {
+            return at;
+        }
+    }
+    return none;
+}
+
+/// s in ASCII lower case.
+fn lowered(s: str, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    var i: usize = 0;
+    let b = s.bytes();
     while i < b.len() {
-        let top = open.items()[open.len() - 1];
-        if b[i] != '<' {
-            var j = i;
-            while j < b.len() and b[j] != '<' {
-                j += 1;
-            }
-            let t = try make_node(ui, tag: "");
-            var text = alloc.String.init(ui.a);
-            unescape(b, from: i, to: j, out: &mut text);
-            ui.nodes.items_mut()[t as usize].text = text;
-            append(ui, parent: top, child: t);
-            i = j;
-            continue;
+        var end = i + 1;
+        while end < b.len() and (b[end] & 0xC0) == 0x80 {
+            end += 1;
         }
-        if i + 1 < b.len() and b[i + 1] == '/' {
-            var j = i + 2;
-            while j < b.len() and b[j] != '>' {
-                j += 1;
-            }
-            if j >= b.len() or open.len() <= 1 {
-                why.push_str("an end tag with nothing open, at byte ");
-                why.push_u64(i as u64);
-                return why;
-            }
-            _ = open.pop();
-            i = j + 1;
-            continue;
+        if end == i + 1 and b[i] >= 'A' and b[i] <= 'Z' {
+            out.push_ascii(b[i] + 32);
+        } else {
+            _ = out.push_utf8(b[i..end]);
         }
-        var j = i + 1;
-        while j < b.len() and name_byte(b[j]) {
-            j += 1;
-        }
-        if j == i + 1 {
-            why.push_str("a '<' that starts no tag, at byte ");
-            why.push_u64(i as u64);
-            return why;
-        }
-        var tag = alloc.String.init(ui.a);
-        _ = tag.push_utf8(b[i + 1..j]);
-        let n = try make_node(ui, tag: tag.view());
-        append(ui, parent: top, child: n);
-        // Attributes, until > or />.
-        var closed = false;
-        while true {
-            while j < b.len() and (b[j] == ' ' or b[j] == '\n' or b[j] == '\t') {
-                j += 1;
+        i = end;
+    }
+    return out;
+}
+
+/// s without the spaces at its ends.
+fn trimmed(s: str) -> str {
+    let b = s.bytes();
+    var from: usize = 0;
+    var to = b.len();
+    while from < to and is_space(b[from]) {
+        from += 1;
+    }
+    while to > from and is_space(b[to - 1]) {
+        to -= 1;
+    }
+    return s[from..to];
+}
+
+/// Text with its entities put back, onto out, as Nimadir reads them:
+/// &amp; &lt; &gt; &quot; &apos; &nbsp; &mdash; &ndash; &hellip; &copy;
+/// &times;, and &#NN; and &#xHH;. One it does not know stays as written.
+fn decode(s: str, out: &mut alloc.String) {
+    let b = s.bytes();
+    var i: usize = 0;
+    while i < b.len() {
+        if b[i] == '&' {
+            var semi = i + 1;
+            while semi < b.len() and b[semi] != ';' {
+                semi += 1;
             }
-            if j >= b.len() {
-                why.push_str("a tag that does not end");
-                return why;
-            }
-            if b[j] == '>' {
-                j += 1;
-                break;
-            }
-            if b[j] == '/' and j + 1 < b.len() and b[j + 1] == '>' {
-                j += 2;
-                closed = true;
-                break;
-            }
-            let start = j;
-            while j < b.len() and name_byte(b[j]) {
-                j += 1;
-            }
-            if j == start {
-                why.push_str("an attribute without a name, at byte ");
-                why.push_u64(j as u64);
-                return why;
-            }
-            var name = alloc.String.init(ui.a);
-            _ = name.push_utf8(b[start..j]);
-            var value = alloc.String.init(ui.a);
-            if j < b.len() and b[j] == '=' {
-                j += 1;
-                if j < b.len() and (b[j] == '"' or b[j] == '\'') {
-                    let q = b[j];
-                    let from = j + 1;
-                    j = from;
-                    while j < b.len() and b[j] != q {
-                        j += 1;
-                    }
-                    unescape(b, from: from, to: j, out: &mut value);
-                    j += 1;
-                } else {
-                    let from = j;
-                    while j < b.len() and b[j] != ' ' and b[j] != '>' {
-                        j += 1;
-                    }
-                    unescape(b, from: from, to: j, out: &mut value);
+            if semi < b.len() and semi - i <= 10 {
+                let name = s[i + 1..semi];
+                var cp: u32 = 0xFFFFFFFF;
+                if name.eq("amp") {
+                    cp = 0x26;
+                } else if name.eq("lt") {
+                    cp = 0x3C;
+                } else if name.eq("gt") {
+                    cp = 0x3E;
+                } else if name.eq("quot") {
+                    cp = 0x22;
+                } else if name.eq("apos") {
+                    cp = 0x27;
+                } else if name.eq("nbsp") {
+                    cp = 0xA0;
+                } else if name.eq("mdash") {
+                    cp = 0x2014;
+                } else if name.eq("ndash") {
+                    cp = 0x2013;
+                } else if name.eq("hellip") {
+                    cp = 0x2026;
+                } else if name.eq("copy") {
+                    cp = 0xA9;
+                } else if name.eq("times") {
+                    cp = 0xD7;
+                } else if name.starts_with("#x") or name.starts_with("#X") {
+                    cp = number(name[2..name.len()], base: 16);
+                } else if name.starts_with("#") {
+                    cp = number(name[1..name.len()], base: 10);
+                }
+                if cp <= 0x10FFFF and (cp < 0xD800 or cp > 0xDFFF) {
+                    var buf: [4]u8 = [0, 0, 0, 0];
+                    let n = utf8.encode(cp, buf[0..4]);
+                    _ = out.push_utf8(buf[0..n]);
+                    i = semi + 1;
+                    continue;
                 }
             }
-            set_attr(ui, n: n, name: name.view(), value: value.view());
         }
-        if not closed and not is_void(tag.view()) {
-            open.push(n);
+        // One whole character at a time keeps the string UTF-8.
+        var end = i + 1;
+        while end < b.len() and (b[end] & 0xC0) == 0x80 {
+            end += 1;
         }
-        i = j;
+        _ = out.push_utf8(b[i..end]);
+        i = end;
+    }
+}
+
+/// digits as a number in base; 0xFFFFFFFF for what is none, or too large.
+fn number(digits: str, base: u32) -> u32 {
+    let b = digits.bytes();
+    if b.len() == 0 {
+        return 0xFFFFFFFF;
+    }
+    var v: u64 = 0;
+    for d in b {
+        var x: u32 = 99;
+        if d.* >= '0' and d.* <= '9' {
+            x = (d.* - '0') as u32;
+        } else if d.* >= 'a' and d.* <= 'f' {
+            x = (d.* - 'a' + 10) as u32;
+        } else if d.* >= 'A' and d.* <= 'F' {
+            x = (d.* - 'A' + 10) as u32;
+        }
+        if x >= base {
+            return 0xFFFFFFFF;
+        }
+        v = v * base as u64 + x as u64;
+        if v > 0xFFFFFFFF {
+            return 0xFFFFFFFF;
+        }
+    }
+    return v as u32;
+}
+
+/// The opening tag at start: its name into tag, its attributes into
+/// names and values (the first of a name kept), whether it closes itself
+/// into closes; how long it is. Why it cannot be read, into why.
+fn open_tag(src: str, start: usize, tag: &mut alloc.String, names: &mut alloc.List(alloc.String), values: &mut alloc.List(alloc.String), closes: &mut bool, why: &mut alloc.String, a: alloc.Allocator) -> usize {
+    let b = src.bytes();
+    var j = start + 1;
+    while j < b.len() and tag_byte(b[j]) {
+        j += 1;
+    }
+    tag.* = lowered(src[start + 1..j], a: a);
+    if tag.len() == 0 {
+        why.push_str("`<` begins no tag, at ");
+        place(src, at: start, out: why);
+        return 0;
+    }
+    while true {
+        while j < b.len() and is_space(b[j]) {
+            j += 1;
+        }
+        if j >= b.len() {
+            why.push_str("`<");
+            why.push_str(tag.view());
+            why.push_str("` is never finished, at ");
+            place(src, at: start, out: why);
+            return 0;
+        }
+        if b[j] == '>' {
+            return j + 1 - start;
+        }
+        if b[j] == '/' {
+            j += 1;
+            if j < b.len() and b[j] == '>' {
+                closes.* = true;
+                return j + 1 - start;
+            }
+            continue;
+        }
+        let name_at = j;
+        while j < b.len() and not is_space(b[j]) and b[j] != '=' and b[j] != '>' and b[j] != '/' and b[j] != '"' and b[j] != '\'' {
+            j += 1;
+        }
+        if j == name_at {
+            why.push_str("an attribute of `<");
+            why.push_str(tag.view());
+            why.push_str(">` has no name, at ");
+            place(src, at: name_at, out: why);
+            return 0;
+        }
+        let name = lowered(src[name_at..j], a: a);
+        while j < b.len() and is_space(b[j]) {
+            j += 1;
+        }
+        var value = alloc.String.init(a);
+        if j < b.len() and b[j] == '=' {
+            j += 1;
+            while j < b.len() and is_space(b[j]) {
+                j += 1;
+            }
+            var from = j;
+            if j < b.len() and (b[j] == '"' or b[j] == '\'') {
+                let q = b[j];
+                j += 1;
+                from = j;
+                while j < b.len() and b[j] != q {
+                    j += 1;
+                }
+                if j >= b.len() {
+                    why.push_str("a value in `<");
+                    why.push_str(tag.view());
+                    why.push_str(">` is never closed, at ");
+                    place(src, at: start, out: why);
+                    return 0;
+                }
+                decode(src[from..j], out: &mut value);
+                j += 1;
+            } else {
+                while j < b.len() and not is_space(b[j]) and b[j] != '>' {
+                    j += 1;
+                }
+                decode(src[from..j], out: &mut value);
+            }
+        }
+        var seen = false;
+        for n in names.items() {
+            if n.view().eq(name.view()) {
+                seen = true;
+            }
+        }
+        if not seen {
+            names.push(name);
+            values.push(value);
+        }
+    }
+    return 0;
+}
+
+/// The nodes src describes, in the order a document gets them, onto out,
+/// read as Nimadir's shell reads set-markup's: whole before any of it
+/// touches the document. Why it cannot be read, into why.
+fn read_markup(src: str, out: &mut alloc.List(Parsed), why: &mut alloc.String, a: alloc.Allocator) {
+    let b = src.bytes();
+    // The open elements, by their place in out, and where each opened.
+    var stack = alloc.List(u32).init(a);
+    var opened = alloc.List(usize).init(a);
+    var i: usize = 0;
+    while i < b.len() {
+        var top = NO_PARENT;
+        if stack.len() > 0 {
+            top = stack.items()[stack.len() - 1];
+        }
+        if b[i] != '<' {
+            var end = i;
+            while end < b.len() and b[end] != '<' {
+                end += 1;
+            }
+            var text = alloc.String.init(a);
+            decode(src[i..end], out: &mut text);
+            if text.len() > 0 {
+                out.push(Parsed { tag: alloc.String.init(a), text: text, names: alloc.List(alloc.String).init(a), values: alloc.List(alloc.String).init(a), parent: top });
+            }
+            i = end;
+            continue;
+        }
+        let rest = src[i..b.len()];
+        if rest.starts_with("<!--") {
+            match find_in(s: src, from: i, what: "-->") {
+                some(end) => {
+                    i = end + 3;
+                    continue;
+                }
+                none => {
+                    why.push_str("a comment is never closed, at ");
+                    place(src, at: i, out: why);
+                    return;
+                }
+            }
+        }
+        if rest.starts_with("<!") or rest.starts_with("<?") {
+            match find_in(s: src, from: i, what: ">") {
+                some(end) => {
+                    i = end + 1;
+                    continue;
+                }
+                none => {
+                    why.push_str("`<!` is never closed, at ");
+                    place(src, at: i, out: why);
+                    return;
+                }
+            }
+        }
+        if rest.starts_with("</") {
+            match find_in(s: src, from: i + 2, what: ">") {
+                some(gt) => {
+                    let closing = lowered(trimmed(src[i + 2..gt]), a: a);
+                    match stack.pop() {
+                        some(open) => {
+                            let open_tag_name = out.items()[open as usize].tag.view();
+                            if not open_tag_name.eq(closing.view()) {
+                                why.push_str("`</");
+                                why.push_str(closing.view());
+                                why.push_str(">` closes `<");
+                                why.push_str(open_tag_name);
+                                why.push_str(">`, at ");
+                                place(src, at: i, out: why);
+                                return;
+                            }
+                            _ = opened.pop();
+                        }
+                        none => {
+                            why.push_str("`</");
+                            why.push_str(closing.view());
+                            why.push_str(">` closes nothing, at ");
+                            place(src, at: i, out: why);
+                            return;
+                        }
+                    }
+                    i = gt + 1;
+                    continue;
+                }
+                none => {
+                    why.push_str("a closing tag is never finished, at ");
+                    place(src, at: i, out: why);
+                    return;
+                }
+            }
+        }
+        var tag = alloc.String.init(a);
+        var names = alloc.List(alloc.String).init(a);
+        var values = alloc.List(alloc.String).init(a);
+        var closes = false;
+        let len = open_tag(src, start: i, tag: &mut tag, names: &mut names, values: &mut values, closes: &mut closes, why: why, a: a);
+        if why.len() > 0 {
+            return;
+        }
+        i += len;
+        if tag.view().eq("script") or tag.view().eq("style") {
+            // Dropped, with everything up to its closing tag.
+            var closing = alloc.String.from("</", a);
+            closing.push_str(tag.view());
+            let low = lowered(src[i..b.len()], a: a);
+            match find_in(s: low.view(), from: 0, what: closing.view()) {
+                some(end) => {
+                    match find_in(s: src, from: i + end, what: ">") {
+                        some(gt) => { i = gt + 1; }
+                        none => { i = b.len(); }
+                    }
+                }
+                none => {
+                    why.push_str("`<");
+                    why.push_str(tag.view());
+                    why.push_str(">` is never closed, at ");
+                    place(src, at: i, out: why);
+                    return;
+                }
+            }
+            continue;
+        }
+        let empty = closes or is_void(tag.view());
+        if not empty and stack.len() >= MARKUP_DEPTH {
+            why.push_str("nested more than 256 levels deep, at ");
+            place(src, at: i, out: why);
+            return;
+        }
+        if not empty {
+            stack.push(out.len() as u32);
+            opened.push(i);
+        }
+        out.push(Parsed { tag: tag, text: alloc.String.init(a), names: names, values: values, parent: top });
+    }
+    if stack.len() > 0 {
+        why.push_str("`<");
+        why.push_str(out.items()[stack.items()[stack.len() - 1] as usize].tag.view());
+        why.push_str(">` is never closed, opened at ");
+        place(src, at: opened.items()[opened.len() - 1], out: why);
+    }
+}
+
+/// set-markup: the markup read whole, then n's children replaced by what
+/// it describes; why it could not be read, or "", when nothing changes.
+fn set_markup(ui: &mut Ui, n: u32, markup: str, a: alloc.Allocator) -> exec.Trap!alloc.String {
+    var parsed = alloc.List(Parsed).init(a);
+    var why = alloc.String.init(a);
+    read_markup(markup, out: &mut parsed, why: &mut why, a: a);
+    if why.len() > 0 {
+        return why;
+    }
+    clear_children(ui, n: n);
+    var made = alloc.List(u32).init(a);
+    for p in parsed.items() {
+        let k = try make_node(ui, tag: p.tag.view());
+        if p.tag.len() == 0 {
+            ui.nodes.items_mut()[k as usize].text = alloc.String.from(p.text.view(), ui.a);
+        } else {
+            var j: usize = 0;
+            while j < p.names.len() : (j += 1) {
+                set_attr(ui, n: k, name: p.names.items()[j].view(), value: p.values.items()[j].view());
+            }
+        }
+        var parent = n;
+        if p.parent != NO_PARENT {
+            parent = made.items()[p.parent as usize];
+        }
+        append(ui, parent: parent, child: k);
+        made.push(k);
     }
     return why;
 }
@@ -1463,7 +2022,10 @@ fn dom(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
             return str_val("", a);
         }
         if func.eq("set-markup") {
-            return done("", a);
+            var not_one = alloc.String.from("#", a);
+            not_one.push_u64(n);
+            not_one.push_str(" is not an element");
+            return done(not_one.view(), a);
         }
         return c.Val.Unit;
     }
@@ -1550,8 +2112,13 @@ fn dom(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
         return c.Val.Unit;
     }
     if func.eq("set-markup") {
-        clear_children(ui, n: node);
-        let why = try parse_markup(ui, parent: node, markup: text_arg(args, i: 1));
+        if ui.nodes.items()[node as usize].tag.len() == 0 {
+            var not_one = alloc.String.from("#", a);
+            not_one.push_u64(node as u64);
+            not_one.push_str(" is not an element");
+            return done(not_one.view(), a);
+        }
+        let why = try set_markup(ui, n: node, markup: text_arg(args, i: 1), a: a);
         return done(why.view(), a);
     }
     if func.eq("query-all") {

@@ -7,25 +7,32 @@
 ///                     the import's field from the name (- for _); and a
 ///                     `pub unsafe fn call_<name>` that forwards to it, since
 ///                     an extern cannot be pub;
-///   <name>.arche      for each, `pub fn <name>(host: &mut std.Host, ...)`
-///                     with Arche's types, lowering them as the canonical ABI
-///                     does (encode.arche's lower_sig), so that the encoder
-///                     takes the program.
+///   <name>.arche      the interface's types, and for each function `pub fn
+///                     <name>(host: &mut std.Host, ...)` with Arche's types,
+///                     lowering them as the canonical ABI does (encode.arche's
+///                     lower_sig), so that the encoder takes the program.
 ///
 /// The two names could not share a module: the wrapper and the import it
 /// calls have the same name. Functions whose types are not bound yet are
 /// left out, each with a line saying why.
 ///
-/// What is bound: scalars, strings (`str` in, `alloc.String` out), and
-/// options, results and lists of those. option<T> is `?T`; list<T> is a
-/// `[]T` in (`&alloc.List(alloc.String)` for strings, since a slice holds
-/// no views) and an `alloc.List(T)` out; result<T, string> is `?T`, or
-/// `bool` for result<_, string>, the error written into a `why: &mut
-/// alloc.String` param, as wit.parse says what is wrong. A result of more
-/// than one flat value comes back through a return area the host writes,
-/// its strings and lists in memory it asks cabi_realloc for; the wrapper
-/// copies them into the caller's allocator. Records and variants are not
-/// bound yet.
+/// Types: a scalar is Arche's (a char a u32); a string is `str` in and
+/// `alloc.String` out; a list is `[]T` in when its items are scalars, else
+/// `&alloc.List(T)`, and `alloc.List(T)` out; option<T> is `?T`. A record
+/// is a struct of its fields, a tuple a struct of f0, f1, ...; a variant is
+/// an enum whose cases hold their payload as `value`, an enum an enum, and
+/// flags a struct of bools; a result inside another type is an enum of Ok
+/// and Err. A param of any other type is taken by reference. A function's
+/// own result<T, string> is `?T`, or `bool` for result<_, string>, the
+/// error written into a `why: &mut alloc.String` param, as wit.parse says
+/// what is wrong. What the host gives back in memory, the wrapper copies
+/// into the caller's allocator, `a`, which a function takes when it must.
+///
+/// Each type has its functions, written once and only when used: load_
+/// reads one where the canonical ABI lays it out, store_ writes one there,
+/// lay_ lays a list's items out and says where. Params of more than 16
+/// flat values go through memory, as do results of more than one. Not
+/// bound yet: resources, and an option of an option.
 import alloc;
 import wasm.component as c;
 import wasm.wit;
@@ -36,13 +43,13 @@ pub type File = struct {
     pub text: alloc.String,
 }
 
-/// Names the bindings use themselves: no function may have one (nor a
-/// name starting address_of, the helpers' that pass a list).
-const OWN_FUNCTIONS: str = "address_of bit_of load_string area at items n i out host a why bytes p";
+/// Names the bindings use themselves: no function may have one, nor a
+/// name that starts like the helpers' (address_of, load_, store_, lay_).
+const OWN_FUNCTIONS: str = "address_of bit_of load_string at host a why p";
 
 /// The wrappers' own params and locals: a param that has one of these
 /// names is renamed with a _ after it.
-const OWN_NAMES: str = "area at items n i out host a why";
+const OWN_NAMES: str = "area at cell base buf ret args host a why v x";
 
 const KEYWORDS: str = "and as break catch const continue defer else enum err error false fn if import let match mut none not ok or orelse pub return some struct test true try type var while asm comptime dyn ensures for in interface naked nopanic region requires unsafe where";
 
@@ -60,6 +67,8 @@ pub fn generate(w: &wit.Wit, world: u32, why: &mut alloc.String, a: alloc.Alloca
     return files;
 }
 
+// ---- names ----------------------------------------------------------------------------
+
 /// A WIT name as an Arche one: - as _.
 fn snake(name: str, a: alloc.Allocator) -> alloc.String {
     var s = alloc.String.init(a);
@@ -68,6 +77,25 @@ fn snake(name: str, a: alloc.Allocator) -> alloc.String {
             s.push_ascii('_');
         } else {
             s.push_ascii(b.*);
+        }
+    }
+    return s;
+}
+
+/// A WIT name as an Arche type's or case's: each word's first letter up,
+/// the dashes gone.
+fn pascal(name: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    var up = true;
+    for b in name.bytes() {
+        if b.* == '-' or b.* == '_' {
+            up = true;
+        } else if up and b.* >= 'a' and b.* <= 'z' {
+            s.push_ascii(b.* - 32);
+            up = false;
+        } else {
+            s.push_ascii(b.*);
+            up = false;
         }
     }
     return s;
@@ -94,11 +122,26 @@ fn reserved(name: str) -> bool {
     return listed(name: name, words: KEYWORDS) or listed(name: name, words: PRIMITIVES);
 }
 
+/// Whether name is one the helpers take.
+fn helper_like(name: str) -> bool {
+    return name.starts_with("address_of") or name.starts_with("load_") or name.starts_with("store_") or name.starts_with("lay_");
+}
+
 /// A param's name: renamed, with a _ after it, while it is a keyword, a
 /// type's name, one of the bindings' own or a function's of the module.
 fn param_name(name: str, funcs: &alloc.List(alloc.String), a: alloc.Allocator) -> alloc.String {
     var s = snake(name, a: a);
     while reserved(s.view()) or listed(name: s.view(), words: OWN_NAMES) or taken(s.view(), funcs: funcs) {
+        s.push_ascii('_');
+    }
+    return s;
+}
+
+/// A field's or flag's name: with a _ after it while it is a keyword or a
+/// type's name.
+fn field_name(name: str, a: alloc.Allocator) -> alloc.String {
+    var s = snake(name, a: a);
+    while reserved(s.view()) {
         s.push_ascii('_');
     }
     return s;
@@ -116,12 +159,33 @@ fn taken(name: str, funcs: &alloc.List(alloc.String)) -> bool {
     return false;
 }
 
+/// Whether s holds piece.
+fn holds(s: str, piece: str) -> bool {
+    let b = s.bytes();
+    let p = piece.bytes();
+    var at: usize = 0;
+    while at + p.len() <= b.len() : (at += 1) {
+        if s[at..at + p.len()].eq(piece) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Flag i's bit in its word.
+fn bit(i: usize) -> u32 {
+    let one: u32 = 1;
+    return one << ((i % 32) as u32);
+}
+
+// ---- types ----------------------------------------------------------------------------
+
 /// t's kind, an alias's the type's it names.
 fn kind_of(w: &wit.Wit, t: u32) -> u8 {
     return w.types.items()[wit.real(w, t: t) as usize].kind;
 }
 
-/// Arche's type for a scalar of kind k; "" for one not bound yet.
+/// Arche's type for a scalar of kind k; "" for a kind that is no scalar.
 fn arche_of(k: u8) -> str {
     if k == c.BOOL {
         return "bool";
@@ -159,146 +223,1029 @@ fn arche_of(k: u8) -> str {
     return "";
 }
 
-/// The import's core type for a scalar of kind k, as Arche says it.
-fn flat_of(k: u8) -> str {
-    if k == c.S8 or k == c.S16 or k == c.S32 {
-        return "i32";
+fn is_scalar(w: &wit.Wit, t: u32) -> bool {
+    return arche_of(kind_of(w, t: t)).len() > 0;
+}
+
+/// Arche's name for a core value type, as the raw imports take it.
+fn flat_name(f: u8) -> str {
+    if f == c.FLAT_I64 {
+        return "u64";
     }
-    if k == c.U64 or k == c.S64 or k == c.F32 or k == c.F64 {
-        return arche_of(k);
+    if f == c.FLAT_F32 {
+        return "f32";
+    }
+    if f == c.FLAT_F64 {
+        return "f64";
     }
     return "u32";
 }
 
-/// Whether t, real, crosses as one value of its own: a string or a
-/// scalar. Option, result and list are bound of these.
-fn element(w: &wit.Wit, t: u32) -> bool {
-    let k = kind_of(w, t: t);
-    return k == c.STRING or arche_of(k).len() > 0;
-}
-
-/// Arche's type for an element of kind k, as a wrapper returns it.
-fn element_type(k: u8) -> str {
-    if k == c.STRING {
-        return "alloc.String";
-    }
-    return arche_of(k);
-}
-
-/// The part of r, an option, result or list, at i, real; NONE for none.
-fn part(w: &wit.Wit, r: u32, i: usize) -> u32 {
-    let p = w.types.items()[r as usize].parts.items()[i];
+/// The part of t at i, real; NONE for none.
+fn part(w: &wit.Wit, t: u32, i: usize) -> u32 {
+    let p = w.types.items()[t as usize].parts.items()[i];
     if p == c.NONE {
         return c.NONE;
     }
     return wit.real(w, t: p);
 }
 
-/// Why f is not bound yet; empty when it is.
-fn unbound(w: &wit.Wit, f: &wit.Func, a: alloc.Allocator) -> alloc.String {
-    var why = alloc.String.init(a);
-    let ty = &w.types.items()[f.ty as usize];
-    var flat: usize = 0;
-    var i: u32 = 0;
-    while i < ty.count : (i += 1) {
-        let p = wit.real(w, t: ty.parts.items()[i as usize]);
-        let k = kind_of(w, t: p);
-        if k == c.STRING {
-            flat += 2;
-        } else if arche_of(k).len() > 0 {
-            flat += 1;
-        } else if k == c.LIST and (kind_of(w, t: part(w, r: p, i: 0)) == c.STRING or (element(w, t: part(w, r: p, i: 0)) and kind_of(w, t: part(w, r: p, i: 0)) != c.BOOL)) {
-            flat += 2;
-        } else {
-            why.push_str(param_kind(k));
-            return why;
-        }
-    }
-    if flat > c.MAX_FLAT_PARAMS {
-        why.push_str("more than 16 flat params");
-        return why;
-    }
-    let r = result(w, f: f);
-    if r != c.NONE and not element(w, t: r) {
-        let k = kind_of(w, t: r);
-        var bound = false;
-        if k == c.OPTION or k == c.LIST {
-            bound = element(w, t: part(w, r: r, i: 0));
-        } else if k == c.RESULT {
-            let ok_t = part(w, r: r, i: 0);
-            let err_t = part(w, r: r, i: 1);
-            bound = err_t != c.NONE and kind_of(w, t: err_t) == c.STRING and (ok_t == c.NONE or element(w, t: ok_t));
-        }
-        if not bound {
-            why.push_str(result_kind(k));
-            why.push_str(nested(w, r: r));
-            return why;
-        }
-    }
-    if listed(name: snake(f.name.view(), a: a).view(), words: KEYWORDS) {
-        why.push_str("its name is Arche's keyword");
-    }
-    return why;
+fn parts_of(w: &wit.Wit, t: u32) -> usize {
+    return w.types.items()[t as usize].parts.len();
 }
 
-/// What an option, result or list r holds, when it is what keeps it
-/// unbound.
-fn nested(w: &wit.Wit, r: u32) -> str {
-    let k = kind_of(w, t: r);
-    if k != c.OPTION and k != c.LIST and k != c.RESULT {
+/// The name of t in the interface, when it is a record, variant, enum or
+/// flags the interface defines; "" otherwise.
+fn def_name(w: &wit.Wit, iface: u32, t: u32) -> str {
+    for d in w.interfaces.items()[iface as usize].types.items() {
+        if d.ty == t {
+            return d.name.view();
+        }
+    }
+    return "";
+}
+
+/// t's own words, for its helpers' names: u32, string, app_entry,
+/// list_app_entry, option_rect, result_u32_string, tuple_string_string.
+fn spell(w: &wit.Wit, iface: u32, t: u32, a: alloc.Allocator) -> alloc.String {
+    if t == c.NONE {
+        return alloc.String.from("unit", a);
+    }
+    let k = kind_of(w, t: t);
+    if k == c.CHAR {
+        return alloc.String.from("char", a);
+    }
+    if arche_of(k).len() > 0 {
+        return alloc.String.from(arche_of(k), a);
+    }
+    if k == c.STRING {
+        return alloc.String.from("string", a);
+    }
+    if k == c.RECORD or k == c.VARIANT or k == c.ENUM or k == c.FLAGS {
+        return snake(def_name(w, iface: iface, t: t), a: a);
+    }
+    var s = alloc.String.init(a);
+    if k == c.LIST {
+        s.push_str("list");
+    } else if k == c.OPTION {
+        s.push_str("option");
+    } else if k == c.RESULT {
+        s.push_str("result");
+    } else {
+        s.push_str("tuple");
+    }
+    var i: usize = 0;
+    while i < parts_of(w, t: t) : (i += 1) {
+        s.push_str("_");
+        s.push_str(spell(w, iface: iface, t: part(w, t: t, i: i), a: a).view());
+    }
+    return s;
+}
+
+/// Why t cannot be bound yet; "" when it can.
+fn unbindable(w: &wit.Wit, t: u32) -> str {
+    if t == c.NONE {
         return "";
     }
-    let p = part(w, r: r, i: 0);
-    if p != c.NONE and not element(w, t: p) {
-        return kind_name(kind_of(w, t: p));
+    let k = kind_of(w, t: t);
+    if k == c.OWN or k == c.BORROW or k == c.RESOURCE {
+        return "it uses a resource";
     }
-    return " whose error is not a string";
+    if k == c.OPTION and kind_of(w, t: part(w, t: t, i: 0)) == c.OPTION {
+        return "it has an option of an option";
+    }
+    if k == c.RECORD or k == c.TUPLE or k == c.VARIANT or k == c.OPTION or k == c.RESULT or k == c.LIST {
+        var i: usize = 0;
+        while i < parts_of(w, t: t) : (i += 1) {
+            let why = unbindable(w, t: part(w, t: t, i: i));
+            if why.len() > 0 {
+                return why;
+            }
+        }
+    }
+    return "";
 }
 
-fn kind_name(k: u8) -> str {
-    if k == c.RECORD {
-        return " of records";
+/// Whether reading a t makes anything in an allocator: a string or a list
+/// in it.
+fn loads_alloc(w: &wit.Wit, t: u32) -> bool {
+    if t == c.NONE {
+        return false;
     }
-    if k == c.LIST {
-        return " of lists";
+    let k = kind_of(w, t: t);
+    if k == c.STRING or k == c.LIST {
+        return true;
     }
-    if k == c.RESULT {
-        return " of results";
+    if k == c.RECORD or k == c.TUPLE or k == c.VARIANT or k == c.OPTION or k == c.RESULT {
+        var i: usize = 0;
+        while i < parts_of(w, t: t) : (i += 1) {
+            if loads_alloc(w, t: part(w, t: t, i: i)) {
+                return true;
+            }
+        }
     }
-    if k == c.TUPLE {
-        return " of tuples";
-    }
-    return " of a type not bound yet";
+    return false;
 }
 
-fn param_kind(k: u8) -> str {
-    if k == c.LIST {
-        return "takes a list of what is not bound yet";
+/// Whether writing a t lays anything out in an allocator: a list in it of
+/// what is not a scalar.
+fn stores_alloc(w: &wit.Wit, t: u32) -> bool {
+    if t == c.NONE {
+        return false;
     }
-    if k == c.RECORD {
-        return "takes a record";
+    let k = kind_of(w, t: t);
+    if k == c.LIST {
+        return not is_scalar(w, t: part(w, t: t, i: 0));
+    }
+    if k == c.RECORD or k == c.TUPLE or k == c.VARIANT or k == c.OPTION or k == c.RESULT {
+        var i: usize = 0;
+        while i < parts_of(w, t: t) : (i += 1) {
+            if stores_alloc(w, t: part(w, t: t, i: i)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn flatten(w: &wit.Wit, t: u32, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).init(a);
+    if t != c.NONE {
+        c.flatten_in(&w.types, t: t, out: &mut out, a: a);
+    }
+    return out;
+}
+
+fn size(w: &wit.Wit, t: u32, a: alloc.Allocator) -> u64 {
+    return c.size_in(&w.types, t: t, a: a);
+}
+
+/// The offsets of a record's or tuple's fields.
+fn offsets(w: &wit.Wit, t: u32, a: alloc.Allocator) -> alloc.List(u64) {
+    var out = alloc.List(u64).init(a);
+    var at: u64 = 0;
+    var i: usize = 0;
+    while i < parts_of(w, t: t) : (i += 1) {
+        let p = part(w, t: t, i: i);
+        at = c.align_to(x: at, align: c.align_in(&w.types, t: p, a: a));
+        out.push(at);
+        at += size(w, t: p, a: a);
+    }
+    return out;
+}
+
+/// A variant-like type's cases: an option's none and some, a result's ok
+/// and err, a variant's or an enum's own.
+fn case_count(w: &wit.Wit, t: u32) -> usize {
+    let ty = &w.types.items()[t as usize];
+    if ty.kind == c.OPTION or ty.kind == c.RESULT {
+        return 2;
+    }
+    if ty.kind == c.ENUM {
+        return ty.count as usize;
+    }
+    return ty.parts.len();
+}
+
+/// A case's payload; NONE for none.
+fn case_payload(w: &wit.Wit, t: u32, i: usize) -> u32 {
+    let ty = &w.types.items()[t as usize];
+    if ty.kind == c.ENUM {
+        return c.NONE;
+    }
+    if ty.kind == c.OPTION {
+        if i == 0 {
+            return c.NONE;
+        }
+        return part(w, t: t, i: 0);
+    }
+    return part(w, t: t, i: i);
+}
+
+/// The Arche name of a variant's, result's or enum's case i, after its
+/// enum's name and a dot.
+fn case_name(w: &wit.Wit, t: u32, i: usize, a: alloc.Allocator) -> alloc.String {
+    let ty = &w.types.items()[t as usize];
+    if ty.kind == c.RESULT {
+        if i == 0 {
+            return alloc.String.from("Ok", a);
+        }
+        return alloc.String.from("Err", a);
+    }
+    return pascal(ty.names.items()[i].view(), a: a);
+}
+
+/// The type of the discriminant of a type of n cases, as Arche says it.
+fn discriminant(n: usize) -> str {
+    let s = c.discriminant_size(n);
+    if s == 1 {
+        return "u8";
+    }
+    if s == 2 {
+        return "u16";
+    }
+    return "u32";
+}
+
+// ---- what is generated ----------------------------------------------------------------
+
+/// What an interface's modules are made of as they are written: the types
+/// it declares, its helpers, which helpers are written already, and
+/// whether the function being written needs an allocator.
+type Gen = struct {
+    iface: u32,
+    decls: alloc.String,
+    helpers: alloc.String,
+    done: alloc.List(alloc.String),
+    wants_a: bool,
+    a: alloc.Allocator,
+}
+
+fn have(g: &Gen, name: str) -> bool {
+    for d in g.done.items() {
+        if d.view().eq(name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn mark(g: &mut Gen, name: str) {
+    g.done.push(alloc.String.from(name, g.a));
+}
+
+/// Arche's type for t as a value: declared first, when it is one of the
+/// interface's.
+fn arche_type(w: &wit.Wit, g: &mut Gen, t: u32) -> alloc.String {
+    let a = g.a;
+    let k = kind_of(w, t: t);
+    if arche_of(k).len() > 0 {
+        return alloc.String.from(arche_of(k), a);
+    }
+    if k == c.STRING {
+        return alloc.String.from("alloc.String", a);
+    }
+    if k == c.LIST {
+        var s = alloc.String.from("alloc.List(", a);
+        s.push_str(arche_type(w, g: g, t: part(w, t: t, i: 0)).view());
+        s.push_str(")");
+        return s;
     }
     if k == c.OPTION {
-        return "takes an option";
+        var s = alloc.String.from("?", a);
+        s.push_str(arche_type(w, g: g, t: part(w, t: t, i: 0)).view());
+        return s;
     }
-    return "takes a type not bound yet";
+    let name = pascal(spell(w, iface: g.iface, t: t, a: a).view(), a: a);
+    declare(w, g: g, t: t, name: name.view());
+    return name;
 }
 
-fn result_kind(k: u8) -> str {
-    if k == c.LIST {
-        return "returns a list";
+/// The declaration of t, a record, tuple, variant, enum, flags or result,
+/// as name, once.
+fn declare(w: &wit.Wit, g: &mut Gen, t: u32, name: str) {
+    let a = g.a;
+    var key = alloc.String.from("type ", a);
+    key.push_str(name);
+    if have(g, name: key.view()) {
+        return;
     }
-    if k == c.RECORD {
-        return "returns a record";
+    mark(g, name: key.view());
+    let ty = &w.types.items()[t as usize];
+    let k = ty.kind;
+    var d = alloc.String.init(a);
+    if k == c.RECORD or k == c.TUPLE {
+        d.push_str("pub type ");
+        d.push_str(name);
+        d.push_str(" = struct {\n");
+        var i: usize = 0;
+        while i < ty.parts.len() : (i += 1) {
+            d.push_str("    pub ");
+            if k == c.RECORD {
+                d.push_str(field_name(ty.names.items()[i].view(), a: a).view());
+            } else {
+                d.push_str("f");
+                d.push_u64(i as u64);
+            }
+            d.push_str(": ");
+            d.push_str(arche_type(w, g: g, t: part(w, t: t, i: i)).view());
+            d.push_str(",\n");
+        }
+        d.push_str("}\n\n");
+    } else if k == c.FLAGS {
+        d.push_str("pub type ");
+        d.push_str(name);
+        d.push_str(" = struct {\n");
+        for f in ty.names.items() {
+            d.push_str("    pub ");
+            d.push_str(field_name(f.view(), a: a).view());
+            d.push_str(": bool,\n");
+        }
+        d.push_str("}\n\n");
+    } else {
+        d.push_str("pub type ");
+        d.push_str(name);
+        d.push_str(" = enum {\n");
+        var i: usize = 0;
+        while i < case_count(w, t: t) : (i += 1) {
+            d.push_str("    ");
+            d.push_str(case_name(w, t: t, i: i, a: a).view());
+            let p = case_payload(w, t: t, i: i);
+            if p != c.NONE {
+                d.push_str(" { value: ");
+                d.push_str(arche_type(w, g: g, t: p).view());
+                d.push_str(" }");
+            }
+            d.push_str(",\n");
+        }
+        d.push_str("}\n\n");
     }
-    if k == c.OPTION {
-        return "returns an option";
-    }
-    if k == c.RESULT {
-        return "returns a result";
-    }
-    return "returns a type not bound yet";
+    g.decls.push_str(d.view());
 }
+
+/// A call of t's load_ at the address at.
+fn load_call(w: &wit.Wit, g: &mut Gen, t: u32, at: str) -> alloc.String {
+    var s = load_fn(w, g: g, t: t);
+    s.push_str("(");
+    s.push_str(at);
+    if loads_alloc(w, t: t) {
+        s.push_str(", a: a");
+        g.wants_a = true;
+    }
+    s.push_str(")");
+    return s;
+}
+
+/// The name of the function that reads a t at an address: written first,
+/// when it is not yet.
+fn load_fn(w: &wit.Wit, g: &mut Gen, t: u32) -> alloc.String {
+    let a = g.a;
+    var name = alloc.String.from("load_", a);
+    name.push_str(spell(w, iface: g.iface, t: t, a: a).view());
+    if have(g, name: name.view()) {
+        return name;
+    }
+    mark(g, name: name.view());
+    let k = kind_of(w, t: t);
+    let ty_name = arche_type(w, g: g, t: t);
+    let wants = g.wants_a;
+    var body = alloc.String.init(a);
+    if arche_of(k).len() > 0 {
+        body.push_str("    unsafe {\n        // SAFETY: the host wrote one there.\n        return ptr.from_addr(");
+        if k == c.BOOL {
+            body.push_str("u8, at).* != 0;\n    }\n");
+        } else {
+            body.push_str(arche_of(k));
+            body.push_str(", at).*;\n    }\n");
+        }
+    } else if k == c.STRING {
+        body.push_str("    var bytes = alloc.List(u8).init(a);\n    unsafe {\n");
+        body.push_str("        // SAFETY: the host wrote the string's address and length at at, and its\n");
+        body.push_str("        // bytes in memory it asked cabi_realloc for.\n");
+        body.push_str("        let p = ptr.from_addr(u8, ptr.from_addr(u32, at).* as usize);\n");
+        body.push_str("        let n = ptr.from_addr(u32, at + 4).* as usize;\n");
+        body.push_str("        var i: usize = 0;\n        while i < n : (i += 1) {\n            bytes.push(p.add(i).*);\n        }\n    }\n");
+        body.push_str("    var out = alloc.String.init(a);\n    if not out.push_utf8(bytes.items()) {\n");
+        body.push_str("        panic(\"the host gave a string that is not UTF-8\");\n    }\n    return out;\n");
+    } else if k == c.LIST {
+        let e = part(w, t: t, i: 0);
+        body.push_str("    var out = ");
+        body.push_str(ty_name.view());
+        body.push_str(".init(a);\n    let items = ");
+        body.push_str(load_call(w, g: g, t: prim(c.U32), at: "at").view());
+        body.push_str(" as usize;\n    let n = ");
+        body.push_str(load_call(w, g: g, t: prim(c.U32), at: "at + 4").view());
+        body.push_str(" as usize;\n    var i: usize = 0;\n    while i < n : (i += 1) {\n        out.push(");
+        var item = alloc.String.from("items + i * ", a);
+        item.push_u64(size(w, t: e, a: a));
+        body.push_str(load_call(w, g: g, t: e, at: item.view()).view());
+        body.push_str(");\n    }\n    return out;\n");
+    } else if k == c.RECORD or k == c.TUPLE {
+        let ty = &w.types.items()[t as usize];
+        let offs = offsets(w, t: t, a: a);
+        body.push_str("    return ");
+        body.push_str(ty_name.view());
+        body.push_str(" {\n");
+        var i: usize = 0;
+        while i < ty.parts.len() : (i += 1) {
+            body.push_str("        ");
+            if k == c.RECORD {
+                body.push_str(field_name(ty.names.items()[i].view(), a: a).view());
+            } else {
+                body.push_str("f");
+                body.push_u64(i as u64);
+            }
+            body.push_str(": ");
+            var at = alloc.String.from("at + ", a);
+            at.push_u64(offs.items()[i]);
+            body.push_str(load_call(w, g: g, t: part(w, t: t, i: i), at: at.view()).view());
+            body.push_str(",\n");
+        }
+        body.push_str("    };\n");
+    } else if k == c.FLAGS {
+        let ty = &w.types.items()[t as usize];
+        let words = ((ty.count + 31) / 32) as usize;
+        var word: usize = 0;
+        while word < words : (word += 1) {
+            body.push_str("    let w");
+            body.push_u64(word as u64);
+            body.push_str(" = ");
+            var at = alloc.String.from("at + ", a);
+            at.push_u64((4 * word) as u64);
+            var unit = prim(c.U32);
+            if ty.count <= 8 {
+                unit = prim(c.U8);
+            } else if ty.count <= 16 {
+                unit = prim(c.U16);
+            }
+            body.push_str(load_call(w, g: g, t: unit, at: at.view()).view());
+            body.push_str(" as u32;\n");
+        }
+        body.push_str("    return ");
+        body.push_str(ty_name.view());
+        body.push_str(" {\n");
+        var i: usize = 0;
+        while i < ty.names.len() : (i += 1) {
+            body.push_str("        ");
+            body.push_str(field_name(ty.names.items()[i].view(), a: a).view());
+            body.push_str(": (w");
+            body.push_u64((i / 32) as u64);
+            body.push_str(" & 0x");
+            body.push_str(hex(bit(i), a: a).view());
+            body.push_str(") != 0,\n");
+        }
+        body.push_str("    };\n");
+    } else {
+        // Option, result, variant, enum: the case, then its payload.
+        let n = case_count(w, t: t);
+        var payload_at = alloc.String.from("at + ", a);
+        payload_at.push_u64(c.payload_in(&w.types, t: t, a: a));
+        body.push_str("    let case = ");
+        body.push_str(load_call(w, g: g, t: disc_prim(n), at: "at").view());
+        body.push_str(" as u32;\n");
+        var i: usize = 0;
+        while i < n : (i += 1) {
+            let p = case_payload(w, t: t, i: i);
+            if i + 1 < n {
+                body.push_str("    if case == ");
+                body.push_u64(i as u64);
+                body.push_str(" {\n    ");
+            }
+            body.push_str("    return ");
+            if k == c.OPTION {
+                if p == c.NONE {
+                    body.push_str("none");
+                } else {
+                    body.push_str(load_call(w, g: g, t: p, at: payload_at.view()).view());
+                }
+            } else {
+                body.push_str(ty_name.view());
+                body.push_str(".");
+                body.push_str(case_name(w, t: t, i: i, a: a).view());
+                if p != c.NONE {
+                    body.push_str(" { value: ");
+                    body.push_str(load_call(w, g: g, t: p, at: payload_at.view()).view());
+                    body.push_str(" }");
+                }
+            }
+            body.push_str(";\n");
+            if i + 1 < n {
+                body.push_str("    }\n");
+            }
+        }
+    }
+    g.wants_a = wants;
+    var text = alloc.String.from("fn ", a);
+    text.push_str(name.view());
+    text.push_str("(at: usize");
+    if loads_alloc(w, t: t) {
+        text.push_str(", a: alloc.Allocator");
+    }
+    text.push_str(") -> ");
+    text.push_str(ty_name.view());
+    text.push_str(" {\n");
+    text.push_str(body.view());
+    text.push_str("}\n\n");
+    g.helpers.push_str(text.view());
+    return name;
+}
+
+/// The primitive type of kind k: the primitives come first in the type
+/// table, at 0x7F - k (wit.Wit's types).
+fn prim(k: u8) -> u32 {
+    return (0x7F - k) as u32;
+}
+
+/// The primitive a discriminant of n cases is read and written as.
+fn disc_prim(n: usize) -> u32 {
+    let s = discriminant(n);
+    if s.eq("u8") {
+        return prim(c.U8);
+    }
+    if s.eq("u16") {
+        return prim(c.U16);
+    }
+    return prim(c.U32);
+}
+
+fn hex(v: u32, a: alloc.Allocator) -> alloc.String {
+    let digits = "0123456789ABCDEF";
+    var s = alloc.String.init(a);
+    var started = false;
+    var shift: u32 = 32;
+    while shift > 0 {
+        shift -= 4;
+        let d = ((v >> shift) & 0xF) as usize;
+        if d != 0 or started or shift == 0 {
+            s.push_str(digits[d..d + 1]);
+            started = true;
+        }
+    }
+    return s;
+}
+
+/// A call of t's store_, writing value (a scalar, or a reference to what
+/// is not one) at the address at.
+fn store_call(w: &wit.Wit, g: &mut Gen, t: u32, value: str, at: str) -> alloc.String {
+    var s = store_fn(w, g: g, t: t);
+    s.push_str("(");
+    s.push_str(value);
+    s.push_str(", at: ");
+    s.push_str(at);
+    if stores_alloc(w, t: t) {
+        s.push_str(", a: a");
+        g.wants_a = true;
+    }
+    s.push_str(")");
+    return s;
+}
+
+/// The value of a place of type t as store_ takes it: itself when it is a
+/// scalar, else a reference to it.
+fn given(w: &wit.Wit, t: u32, place: str, a: alloc.Allocator) -> alloc.String {
+    if is_scalar(w, t: t) {
+        return alloc.String.from(place, a);
+    }
+    return reference(place, a: a);
+}
+
+/// A reference to place: x for x.*, &place otherwise.
+fn reference(place: str, a: alloc.Allocator) -> alloc.String {
+    if place.len() > 2 and place[place.len() - 2..place.len()].eq(".*") {
+        return alloc.String.from(place[0..place.len() - 2], a);
+    }
+    var s = alloc.String.from("&", a);
+    s.push_str(place);
+    return s;
+}
+
+/// The name of the function that writes a t at an address, written first
+/// when it is not yet.
+fn store_fn(w: &wit.Wit, g: &mut Gen, t: u32) -> alloc.String {
+    let a = g.a;
+    var name = alloc.String.from("store_", a);
+    name.push_str(spell(w, iface: g.iface, t: t, a: a).view());
+    if have(g, name: name.view()) {
+        return name;
+    }
+    mark(g, name: name.view());
+    let k = kind_of(w, t: t);
+    let ty_name = arche_type(w, g: g, t: t);
+    let wants = g.wants_a;
+    var body = alloc.String.init(a);
+    if arche_of(k).len() > 0 {
+        body.push_str("    unsafe {\n        // SAFETY: the caller's memory, where the host reads it.\n        ");
+        if k == c.BOOL {
+            body.push_str("ptr.from_addr(u8, at).* = bit_of(v) as u8;\n    }\n");
+        } else {
+            body.push_str("ptr.from_addr(");
+            body.push_str(arche_of(k));
+            body.push_str(", at).* = v;\n    }\n");
+        }
+    } else if k == c.STRING {
+        body.push_str("    ");
+        body.push_str(store_call(w, g: g, t: prim(c.U32), value: "address_of(v.view())", at: "at").view());
+        body.push_str(";\n    ");
+        body.push_str(store_call(w, g: g, t: prim(c.U32), value: "v.len() as u32", at: "at + 4").view());
+        body.push_str(";\n");
+    } else if k == c.LIST {
+        body.push_str("    ");
+        body.push_str(store_call(w, g: g, t: prim(c.U32), value: lay_call(w, g: g, t: t, place: "v", list: "v").view(), at: "at").view());
+        body.push_str(";\n    ");
+        body.push_str(store_call(w, g: g, t: prim(c.U32), value: "v.len() as u32", at: "at + 4").view());
+        body.push_str(";\n");
+    } else if k == c.RECORD or k == c.TUPLE {
+        let ty = &w.types.items()[t as usize];
+        let offs = offsets(w, t: t, a: a);
+        var i: usize = 0;
+        while i < ty.parts.len() : (i += 1) {
+            var place = alloc.String.from("v.", a);
+            if k == c.RECORD {
+                place.push_str(field_name(ty.names.items()[i].view(), a: a).view());
+            } else {
+                place.push_str("f");
+                place.push_u64(i as u64);
+            }
+            var at = alloc.String.from("at + ", a);
+            at.push_u64(offs.items()[i]);
+            let p = part(w, t: t, i: i);
+            body.push_str("    ");
+            body.push_str(store_call(w, g: g, t: p, value: given(w, t: p, place: place.view(), a: a).view(), at: at.view()).view());
+            body.push_str(";\n");
+        }
+    } else if k == c.FLAGS {
+        let ty = &w.types.items()[t as usize];
+        let words = ((ty.count + 31) / 32) as usize;
+        var word: usize = 0;
+        while word < words : (word += 1) {
+            body.push_str("    var w");
+            body.push_u64(word as u64);
+            body.push_str(": u32 = 0;\n");
+        }
+        var i: usize = 0;
+        while i < ty.names.len() : (i += 1) {
+            body.push_str("    if v.");
+            body.push_str(field_name(ty.names.items()[i].view(), a: a).view());
+            body.push_str(" {\n        w");
+            body.push_u64((i / 32) as u64);
+            body.push_str(" = w");
+            body.push_u64((i / 32) as u64);
+            body.push_str(" | 0x");
+            body.push_str(hex(bit(i), a: a).view());
+            body.push_str(";\n    }\n");
+        }
+        word = 0;
+        while word < words : (word += 1) {
+            var unit = prim(c.U32);
+            var cast = "";
+            if ty.count <= 8 {
+                unit = prim(c.U8);
+                cast = " as u8";
+            } else if ty.count <= 16 {
+                unit = prim(c.U16);
+                cast = " as u16";
+            }
+            var value = alloc.String.from("w", a);
+            value.push_u64(word as u64);
+            value.push_str(cast);
+            var at = alloc.String.from("at + ", a);
+            at.push_u64((4 * word) as u64);
+            body.push_str("    ");
+            body.push_str(store_call(w, g: g, t: unit, value: value.view(), at: at.view()).view());
+            body.push_str(";\n");
+        }
+    } else {
+        let n = case_count(w, t: t);
+        var payload_at = alloc.String.from("at + ", a);
+        payload_at.push_u64(c.payload_in(&w.types, t: t, a: a));
+        body.push_str("    match v {\n");
+        var i: usize = 0;
+        while i < n : (i += 1) {
+            let p = case_payload(w, t: t, i: i);
+            body.push_str("        ");
+            if k == c.OPTION {
+                if p == c.NONE {
+                    body.push_str("none");
+                } else {
+                    body.push_str("some(x)");
+                }
+            } else {
+                body.push_str(".");
+                body.push_str(case_name(w, t: t, i: i, a: a).view());
+                if p != c.NONE {
+                    body.push_str(" { value: x }");
+                }
+            }
+            body.push_str(" => {\n            ");
+            var number = alloc.String.init(a);
+            number.push_u64(i as u64);
+            body.push_str(store_call(w, g: g, t: disc_prim(n), value: number.view(), at: "at").view());
+            body.push_str(";\n");
+            if p != c.NONE {
+                body.push_str("            ");
+                body.push_str(store_call(w, g: g, t: p, value: given(w, t: p, place: "x.*", a: a).view(), at: payload_at.view()).view());
+                body.push_str(";\n");
+            }
+            body.push_str("        }\n");
+        }
+        body.push_str("    }\n");
+    }
+    g.wants_a = wants;
+    var text = alloc.String.from("fn ", a);
+    text.push_str(name.view());
+    text.push_str("(v: ");
+    if arche_of(k).len() == 0 {
+        text.push_str("&");
+    }
+    text.push_str(ty_name.view());
+    text.push_str(", at: usize");
+    if stores_alloc(w, t: t) {
+        text.push_str(", a: alloc.Allocator");
+    }
+    text.push_str(") {\n");
+    text.push_str(body.view());
+    text.push_str("}\n\n");
+    g.helpers.push_str(text.view());
+    return name;
+}
+
+/// Where a list of type t is laid out, as an expression: its own items
+/// when they are scalars, which Arche lays out as the canonical ABI does;
+/// else a copy, laid out by lay_. place is the list, list a reference to
+/// it.
+fn lay_call(w: &wit.Wit, g: &mut Gen, t: u32, place: str, list: str) -> alloc.String {
+    let a = g.a;
+    let e = part(w, t: t, i: 0);
+    if is_scalar(w, t: e) {
+        var s = slice_helper(w, g: g, t: e);
+        s.push_str("(");
+        s.push_str(place);
+        s.push_str(".items())");
+        return s;
+    }
+    g.wants_a = true;
+    var name = alloc.String.from("lay_", a);
+    name.push_str(spell(w, iface: g.iface, t: t, a: a).view());
+    var call = name.clone();
+    call.push_str("(");
+    call.push_str(list);
+    call.push_str(", a: a)");
+    if have(g, name: name.view()) {
+        return call;
+    }
+    mark(g, name: name.view());
+    let ty_name = arche_type(w, g: g, t: t);
+    let wants = g.wants_a;
+    let sz = size(w, t: e, a: a);
+    var text = alloc.String.from("/// Where v's items are, laid out as the canonical ABI lays them out, in\n/// a; 0 when there are none.\nfn ", a);
+    text.push_str(name.view());
+    text.push_str("(v: &");
+    text.push_str(ty_name.view());
+    text.push_str(", a: alloc.Allocator) -> u32 {\n    if v.len() == 0 {\n        return 0;\n    }\n");
+    text.push_str("    var buf = alloc.List(u64).init(a);\n    buf.grow_zeroed((v.len() * ");
+    text.push_u64(sz);
+    text.push_str(" + 7) / 8);\n    var base: usize = 0;\n    unsafe {\n        // SAFETY: only the address is taken.\n");
+    text.push_str("        base = (&buf.items()[0] as *u64).addr();\n    }\n    var i: usize = 0;\n    while i < v.len() : (i += 1) {\n        ");
+    var at = alloc.String.from("base + i * ", a);
+    at.push_u64(sz);
+    text.push_str(store_call(w, g: g, t: e, value: "&v.items()[i]", at: at.view()).view());
+    text.push_str(";\n    }\n    return base as u32;\n}\n\n");
+    g.wants_a = wants;
+    g.helpers.push_str(text.view());
+    return call;
+}
+
+/// The helper that says where a slice of scalars of type t is.
+fn slice_helper(w: &wit.Wit, g: &mut Gen, t: u32) -> alloc.String {
+    let a = g.a;
+    let et = arche_of(kind_of(w, t: t));
+    var name = alloc.String.from("address_of_", a);
+    name.push_str(et);
+    name.push_str("s");
+    if have(g, name: name.view()) {
+        return name;
+    }
+    mark(g, name: name.view());
+    var text = alloc.String.from("/// Where a list's items are, as the canonical ABI passes it; 0 for an\n/// empty one.\nfn ", a);
+    text.push_str(name.view());
+    text.push_str("(items: []");
+    text.push_str(et);
+    text.push_str(") -> u32 {\n    if items.len() == 0 {\n        return 0;\n    }\n    unsafe {\n");
+    text.push_str("        // SAFETY: only the address is taken.\n        return (&items[0] as *");
+    text.push_str(et);
+    text.push_str(").addr() as u32;\n    }\n}\n\n");
+    g.helpers.push_str(text.view());
+    return name;
+}
+
+// ---- params, lowered ------------------------------------------------------------------
+
+/// A flat value a raw import takes: what it is, and its core type.
+type Flat = struct {
+    expr: alloc.String,
+    ty: u8,
+}
+
+/// How a param's place reads: an owned value, or one of the views a
+/// wrapper takes for a string (`str`) and a list of scalars (`[]T`).
+const OWNED: u32 = 0;
+const VIEWED: u32 = 1;
+
+/// The flat values of the value at place, of type t, onto out, in their
+/// own core types; what must be done to have them, onto before, indented
+/// so; locals named after prefix and counted by counter.
+fn lower(w: &wit.Wit, g: &mut Gen, t: u32, place: str, how: u32, out: &mut alloc.List(Flat), before: &mut alloc.String, indent: str, prefix: str, counter: &mut u32) {
+    let a = g.a;
+    let k = kind_of(w, t: t);
+    if arche_of(k).len() > 0 {
+        var e = alloc.String.init(a);
+        var ty = c.FLAT_I32;
+        if k == c.BOOL {
+            e.push_str("bit_of(");
+            e.push_str(place);
+            e.push_str(")");
+        } else if k == c.U8 or k == c.U16 {
+            e.push_str(place);
+            e.push_str(" as u32");
+        } else if k == c.S8 or k == c.S16 or k == c.S32 {
+            e.push_str(place);
+            e.push_str(" as% u32");
+        } else if k == c.S64 {
+            e.push_str(place);
+            e.push_str(" as% u64");
+            ty = c.FLAT_I64;
+        } else {
+            e.push_str(place);
+            if k == c.U64 {
+                ty = c.FLAT_I64;
+            } else if k == c.F32 {
+                ty = c.FLAT_F32;
+            } else if k == c.F64 {
+                ty = c.FLAT_F64;
+            }
+        }
+        out.push(Flat { expr: e, ty: ty });
+        return;
+    }
+    if k == c.STRING {
+        var e = alloc.String.from("address_of(", a);
+        e.push_str(place);
+        if how == OWNED {
+            e.push_str(".view()");
+        }
+        e.push_str(")");
+        out.push(Flat { expr: e, ty: c.FLAT_I32 });
+        var n = alloc.String.from(place, a);
+        n.push_str(".len() as u32");
+        out.push(Flat { expr: n, ty: c.FLAT_I32 });
+        return;
+    }
+    if k == c.LIST {
+        var e = alloc.String.init(a);
+        if how == VIEWED {
+            e.push_str(slice_helper(w, g: g, t: part(w, t: t, i: 0)).view());
+            e.push_str("(");
+            e.push_str(place);
+            e.push_str(")");
+        } else {
+            e.push_str(lay_call(w, g: g, t: t, place: place, list: reference(place, a: a).view()).view());
+        }
+        out.push(Flat { expr: e, ty: c.FLAT_I32 });
+        var n = alloc.String.from(place, a);
+        n.push_str(".len() as u32");
+        out.push(Flat { expr: n, ty: c.FLAT_I32 });
+        return;
+    }
+    if k == c.RECORD or k == c.TUPLE {
+        let ty = &w.types.items()[t as usize];
+        var i: usize = 0;
+        while i < ty.parts.len() : (i += 1) {
+            var field = alloc.String.from(place, a);
+            field.push_str(".");
+            if k == c.RECORD {
+                field.push_str(field_name(ty.names.items()[i].view(), a: a).view());
+            } else {
+                field.push_str("f");
+                field.push_u64(i as u64);
+            }
+            lower(w, g: g, t: part(w, t: t, i: i), place: field.view(), how: OWNED, out: out, before: before, indent: indent, prefix: prefix, counter: counter);
+        }
+        return;
+    }
+    // Flags, enums and the variant-like: locals, set by what the value is.
+    let flats = flatten(w, t: t, a: a);
+    var locals = alloc.List(alloc.String).init(a);
+    for f in flats.items() {
+        var l = alloc.String.from(prefix, a);
+        l.push_str("_");
+        l.push_u64(counter.* as u64);
+        counter.* += 1;
+        before.push_str(indent);
+        before.push_str("var ");
+        before.push_str(l.view());
+        before.push_str(": ");
+        before.push_str(flat_name(f.*));
+        if f.* == c.FLAT_F32 or f.* == c.FLAT_F64 {
+            before.push_str(" = 0.0;\n");
+        } else {
+            before.push_str(" = 0;\n");
+        }
+        locals.push(l);
+    }
+    if k == c.FLAGS {
+        let ty = &w.types.items()[t as usize];
+        var i: usize = 0;
+        while i < ty.names.len() : (i += 1) {
+            let l = locals.items()[i / 32].view();
+            before.push_str(indent);
+            before.push_str("if ");
+            before.push_str(place);
+            before.push_str(".");
+            before.push_str(field_name(ty.names.items()[i].view(), a: a).view());
+            before.push_str(" {\n");
+            before.push_str(indent);
+            before.push_str("    ");
+            before.push_str(l);
+            before.push_str(" = ");
+            before.push_str(l);
+            before.push_str(" | 0x");
+            before.push_str(hex(bit(i), a: a).view());
+            before.push_str(";\n");
+            before.push_str(indent);
+            before.push_str("}\n");
+        }
+    } else {
+        let n = case_count(w, t: t);
+        before.push_str(indent);
+        before.push_str("match ");
+        before.push_str(reference(place, a: a).view());
+        before.push_str(" {\n");
+        var inner = alloc.String.from(indent, a);
+        inner.push_str("        ");
+        var i: usize = 0;
+        while i < n : (i += 1) {
+            let p = case_payload(w, t: t, i: i);
+            var bound = alloc.String.from(prefix, a);
+            bound.push_str("_x");
+            bound.push_u64(counter.* as u64);
+            counter.* += 1;
+            before.push_str(indent);
+            before.push_str("    ");
+            if k == c.OPTION {
+                if p == c.NONE {
+                    before.push_str("none");
+                } else {
+                    before.push_str("some(");
+                    before.push_str(bound.view());
+                    before.push_str(")");
+                }
+            } else {
+                before.push_str(".");
+                before.push_str(case_name(w, t: t, i: i, a: a).view());
+                if p != c.NONE {
+                    before.push_str(" { value: ");
+                    before.push_str(bound.view());
+                    before.push_str(" }");
+                }
+            }
+            before.push_str(" => {\n");
+            before.push_str(inner.view());
+            before.push_str(locals.items()[0].view());
+            before.push_str(" = ");
+            before.push_u64(i as u64);
+            before.push_str(";\n");
+            if p != c.NONE {
+                var payload = alloc.List(Flat).init(a);
+                var at = alloc.String.from(bound.view(), a);
+                at.push_str(".*");
+                lower(w, g: g, t: p, place: at.view(), how: OWNED, out: &mut payload, before: before, indent: inner.view(), prefix: prefix, counter: counter);
+                var j: usize = 0;
+                while j < payload.len() : (j += 1) {
+                    before.push_str(inner.view());
+                    before.push_str(locals.items()[j + 1].view());
+                    before.push_str(" = ");
+                    before.push_str(joined(payload.items()[j].expr.view(), from: payload.items()[j].ty, to: flats.items()[j + 1], a: a).view());
+                    before.push_str(";\n");
+                }
+            }
+            before.push_str(indent);
+            before.push_str("    }\n");
+        }
+        before.push_str(indent);
+        before.push_str("}\n");
+    }
+    var i: usize = 0;
+    while i < locals.len() : (i += 1) {
+        out.push(Flat { expr: alloc.String.from(locals.items()[i].view(), a), ty: flats.items()[i] });
+    }
+}
+
+/// expr, a core value of type from, as a slot of type to holds it, the two
+/// joined as the canonical ABI joins a variant's cases.
+fn joined(expr: str, from: u8, to: u8, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    if from == to {
+        s.push_str(expr);
+    } else if from == c.FLAT_F32 {
+        s.push_str("float.bits32(");
+        s.push_str(expr);
+        s.push_str(")");
+        if to == c.FLAT_I64 {
+            s.push_str(" as u64");
+        }
+    } else if from == c.FLAT_F64 {
+        s.push_str("float.bits64(");
+        s.push_str(expr);
+        s.push_str(")");
+    } else {
+        s.push_str("(");
+        s.push_str(expr);
+        s.push_str(") as u64");
+    }
+    return s;
+}
+
+// ---- functions ------------------------------------------------------------------------
 
 /// f's result's type, real; NONE for none.
 fn result(w: &wit.Wit, f: &wit.Func) -> u32 {
@@ -313,70 +1260,35 @@ fn result(w: &wit.Wit, f: &wit.Func) -> u32 {
     return wit.real(w, t: r);
 }
 
-/// What a module's helpers need: each is written once, if used.
-type Helpers = struct {
-    uses_alloc: bool,
-    uses_ptr: bool,
-    uses_bool: bool,
-    uses_str: bool,
-    uses_load_string: bool,
-    /// The scalar types of which a list is passed, as Arche says them.
-    slices: alloc.List(alloc.String),
-}
-
-/// Where a list's items are: the helper's name for items of type t.
-fn slice_helper(t: str, h: &mut Helpers, a: alloc.Allocator) -> alloc.String {
-    var known = false;
-    for s in h.slices.items() {
-        if s.view().eq(t) {
-            known = true;
-        }
-    }
-    if not known {
-        h.slices.push(alloc.String.from(t, a));
-    }
-    var name = alloc.String.from("address_of_", a);
-    name.push_str(t);
-    name.push_str("s");
-    return name;
-}
-
-/// The expression reading an element of type t at address at, inside
-/// unsafe code.
-fn load(w: &wit.Wit, t: u32, at: str, h: &mut Helpers, a: alloc.Allocator) -> alloc.String {
-    let k = kind_of(w, t: t);
-    var s = alloc.String.init(a);
-    if k == c.STRING {
-        h.uses_load_string = true;
-        s.push_str("load_string(");
-        s.push_str(at);
-        s.push_str(", a: a)");
-    } else if k == c.BOOL {
-        s.push_str("ptr.from_addr(u8, ");
-        s.push_str(at);
-        s.push_str(").* != 0");
-    } else {
-        s.push_str("ptr.from_addr(");
-        s.push_str(arche_of(k));
-        s.push_str(", ");
-        s.push_str(at);
-        s.push_str(").*");
-    }
-    return s;
-}
-
-/// Where an option's or result's payload is: past its discriminant, at
-/// its cases' alignment (wasm.component's payload_in, for the real types).
-fn payload(w: &wit.Wit, r: u32, a: alloc.Allocator) -> u64 {
-    var al: u64 = 1;
+/// Why f is not bound yet; empty when it is.
+fn unbound(w: &wit.Wit, f: &wit.Func, a: alloc.Allocator) -> alloc.String {
+    var why = alloc.String.init(a);
+    let ty = &w.types.items()[f.ty as usize];
     var i: usize = 0;
-    while i < w.types.items()[r as usize].parts.len() : (i += 1) {
-        let p = part(w, r: r, i: i);
-        if p != c.NONE and c.align_in(&w.types, t: p, a: a) > al {
-            al = c.align_in(&w.types, t: p, a: a);
+    while i < ty.parts.len() : (i += 1) {
+        let p = ty.parts.items()[i];
+        if p != c.NONE {
+            let no = unbindable(w, t: wit.real(w, t: p));
+            if no.len() > 0 {
+                why.push_str(no);
+                return why;
+            }
         }
     }
-    return al;
+    if listed(name: snake(f.name.view(), a: a).view(), words: KEYWORDS) {
+        why.push_str("its name is Arche's keyword");
+    }
+    return why;
+}
+
+/// Whether r, a function's result, is a result<T, string>: `?T` or bool,
+/// its error into why.
+fn says_why(w: &wit.Wit, r: u32) -> bool {
+    if r == c.NONE or kind_of(w, t: r) != c.RESULT {
+        return false;
+    }
+    let err_t = part(w, t: r, i: 1);
+    return err_t != c.NONE and kind_of(w, t: err_t) == c.STRING;
 }
 
 /// The two modules of interface i onto files; false, with why, when a
@@ -390,7 +1302,7 @@ fn bind_interface(w: &wit.Wit, i: u32, files: &mut alloc.List(File), why: &mut a
     var funcs = alloc.List(alloc.String).init(a);
     for f in it.funcs.items() {
         let s = snake(f.name.view(), a: a);
-        if listed(name: s.view(), words: OWN_FUNCTIONS) or s.view().starts_with("address_of") or s.view().eq(name.view()) or s.view().eq(raw_name.view()) {
+        if listed(name: s.view(), words: OWN_FUNCTIONS) or helper_like(s.view()) or s.view().eq(name.view()) or s.view().eq(raw_name.view()) {
             why.push_str("bindgen: ");
             why.push_str(id.view());
             why.push_str(" has a function named ");
@@ -400,15 +1312,14 @@ fn bind_interface(w: &wit.Wit, i: u32, files: &mut alloc.List(File), why: &mut a
         }
         funcs.push(s);
     }
+    var g = Gen { iface: i, decls: alloc.String.init(a), helpers: alloc.String.init(a), done: alloc.List(alloc.String).init(a), wants_a: false, a: a };
     var wrap = alloc.String.init(a);
     var raw = alloc.String.init(a);
     var notes = alloc.String.init(a);
-    var h = Helpers { uses_alloc: false, uses_ptr: false, uses_bool: false, uses_str: false, uses_load_string: false, slices: alloc.List(alloc.String).init(a) };
     var bound: usize = 0;
     var k: usize = 0;
     while k < it.funcs.len() : (k += 1) {
         let f = &it.funcs.items()[k];
-        let fname = funcs.items()[k].view();
         let no = unbound(w, f: f, a: a);
         if no.len() > 0 {
             notes.push_str("// not bound yet: ");
@@ -419,265 +1330,29 @@ fn bind_interface(w: &wit.Wit, i: u32, files: &mut alloc.List(File), why: &mut a
             continue;
         }
         bound += 1;
-        let ty = &w.types.items()[f.ty as usize];
-        let r = result(w, f: f);
-        var rk: u8 = 0;
-        if r != c.NONE {
-            rk = kind_of(w, t: r);
-        }
-        // Results of more than one flat value come back through memory.
-        let through_memory = r != c.NONE and (rk == c.STRING or rk == c.OPTION or rk == c.RESULT or rk == c.LIST);
-        let fails = r != c.NONE and rk == c.RESULT;
-        // The import's params, the wrapper's, what the wrapper passes, and
-        // what it does first.
-        var flat = alloc.String.init(a);
-        var typed = alloc.String.from("host: &mut std.Host", a);
-        var args = alloc.String.init(a);
-        var forward = alloc.String.init(a);
-        var before = alloc.String.init(a);
-        var needs_a = through_memory and not (rk == c.OPTION and kind_of(w, t: part(w, r: r, i: 0)) != c.STRING);
-        var strings = false;
-        var j: u32 = 0;
-        while j < ty.count : (j += 1) {
-            let p = wit.real(w, t: ty.parts.items()[j as usize]);
-            let pk = kind_of(w, t: p);
-            let pname = param_name(ty.names.items()[j as usize].view(), funcs: &funcs, a: a);
-            typed.push_str(", ");
-            typed.push_str(pname.view());
-            typed.push_str(": ");
-            if pk == c.STRING or pk == c.LIST {
-                strings = true;
-                add_flat(flat: &mut flat, forward: &mut forward, name: pname.view(), suffix: "_ptr", ty: "u32");
-                add_flat(flat: &mut flat, forward: &mut forward, name: pname.view(), suffix: "_len", ty: "u32");
-                add_arg(&mut args, name: pname.view(), suffix: "_ptr");
-            }
-            if pk == c.STRING {
-                h.uses_str = true;
-                typed.push_str("str");
-                args.push_str("address_of(");
-                args.push_str(pname.view());
-                args.push_str(")");
-            } else if pk == c.LIST and kind_of(w, t: part(w, r: p, i: 0)) == c.STRING {
-                // A list of strings: their addresses and lengths, in pairs.
-                h.uses_str = true;
-                h.uses_alloc = true;
-                needs_a = true;
-                // A slice cannot hold views, so the strings come in a list.
-                typed.push_str("&alloc.List(alloc.String)");
-                before.push_str("    var ");
-                before.push_str(pname.view());
-                before.push_str("_pairs = alloc.List(u32).init(a);\n    for ");
-                before.push_str(pname.view());
-                before.push_str("_item in ");
-                before.push_str(pname.view());
-                before.push_str(".items() {\n        ");
-                before.push_str(pname.view());
-                before.push_str("_pairs.push(address_of(");
-                before.push_str(pname.view());
-                before.push_str("_item.view()));\n        ");
-                before.push_str(pname.view());
-                before.push_str("_pairs.push(");
-                before.push_str(pname.view());
-                before.push_str("_item.len() as u32);\n    }\n");
-                args.push_str(slice_helper("u32", h: &mut h, a: a).view());
-                args.push_str("(");
-                args.push_str(pname.view());
-                args.push_str("_pairs.items())");
-            } else if pk == c.LIST {
-                let et = arche_of(kind_of(w, t: part(w, r: p, i: 0)));
-                typed.push_str("[]");
-                typed.push_str(et);
-                args.push_str(slice_helper(et, h: &mut h, a: a).view());
-                args.push_str("(");
-                args.push_str(pname.view());
-                args.push_str(")");
-            } else {
-                let arche = arche_of(pk);
-                let flat_ty = flat_of(pk);
-                typed.push_str(arche);
-                add_flat(flat: &mut flat, forward: &mut forward, name: pname.view(), suffix: "", ty: flat_ty);
-                add_arg(&mut args, name: pname.view(), suffix: "");
-                if arche.eq("bool") {
-                    h.uses_bool = true;
-                    args.push_str("bit_of(");
-                    args.push_str(pname.view());
-                    args.push_str(")");
-                } else if arche.eq(flat_ty) {
-                    args.push_str(pname.view());
-                } else {
-                    args.push_str(pname.view());
-                    args.push_str(" as ");
-                    args.push_str(flat_ty);
-                }
-            }
-            if pk == c.STRING or pk == c.LIST {
-                add_arg(&mut args, name: pname.view(), suffix: "_len");
-                args.push_str(pname.view());
-                args.push_str(".len() as u32");
-            }
-        }
-        // What the import returns, and what the wrapper does.
-        var flat_result = alloc.String.init(a);
-        var typed_result = alloc.String.init(a);
-        if fails {
-            h.uses_alloc = true;
-            typed.push_str(", why: &mut alloc.String");
-        }
-        if needs_a {
-            h.uses_alloc = true;
-            typed.push_str(", a: alloc.Allocator");
-        }
-        if through_memory {
-            h.uses_ptr = true;
-            add_flat(flat: &mut flat, forward: &mut forward, name: "ret", suffix: "", ty: "u32");
-            add_arg(&mut args, name: "ret", suffix: "");
-            args.push_str("(&area[0] as *u64).addr() as u32");
-            typed_result.push_str(" -> ");
-            if rk == c.STRING {
-                typed_result.push_str("alloc.String");
-            } else if rk == c.OPTION {
-                typed_result.push_str("?");
-                typed_result.push_str(element_type(kind_of(w, t: part(w, r: r, i: 0))));
-            } else if rk == c.LIST {
-                typed_result.push_str("alloc.List(");
-                typed_result.push_str(element_type(kind_of(w, t: part(w, r: r, i: 0))));
-                typed_result.push_str(")");
-            } else if part(w, r: r, i: 0) == c.NONE {
-                typed_result.push_str("bool");
-            } else {
-                typed_result.push_str("?");
-                typed_result.push_str(element_type(kind_of(w, t: part(w, r: r, i: 0))));
-            }
-        } else if r != c.NONE {
-            flat_result.push_str(" -> ");
-            flat_result.push_str(flat_of(rk));
-            typed_result.push_str(" -> ");
-            typed_result.push_str(arche_of(rk));
-        }
-        // The raw import and its forwarder.
-        raw.push_str("extern \"wasm:");
-        raw.push_str(id.view());
-        raw.push_str("\" fn ");
-        raw.push_str(fname);
-        raw.push_str("(");
-        raw.push_str(flat.view());
-        raw.push_str(")");
-        raw.push_str(flat_result.view());
-        raw.push_str(";\n\npub unsafe fn call_");
-        raw.push_str(fname);
-        raw.push_str("(");
-        raw.push_str(flat.view());
-        raw.push_str(")");
-        raw.push_str(flat_result.view());
-        raw.push_str(" {\n    ");
-        if flat_result.len() > 0 {
-            raw.push_str("return ");
-        }
-        raw.push_str(fname);
-        raw.push_str("(");
-        raw.push_str(forward.view());
-        raw.push_str(");\n}\n\n");
-        // The wrapper.
-        wrap.push_str("/// ");
-        wrap.push_str(f.name.view());
-        wrap.push_str(", imported from ");
-        wrap.push_str(id.view());
-        wrap.push_str(".\npub fn ");
-        wrap.push_str(fname);
-        wrap.push_str("(");
-        wrap.push_str(typed.view());
-        wrap.push_str(")");
-        wrap.push_str(typed_result.view());
-        wrap.push_str(" {\n");
-        wrap.push_str(before.view());
-        var call = alloc.String.from(raw_name.view(), a);
-        call.push_str(".call_");
-        call.push_str(fname);
-        call.push_str("(");
-        call.push_str(args.view());
-        call.push_str(")");
-        if through_memory {
-            if rk == c.LIST {
-                wrap.push_str("    var out = alloc.List(");
-                wrap.push_str(element_type(kind_of(w, t: part(w, r: r, i: 0))));
-                wrap.push_str(").init(a);\n");
-            }
-            wrap.push_str("    var area: [4]u64 = [0, 0, 0, 0];\n    unsafe {\n");
-            if strings {
-                wrap.push_str("        // SAFETY: area outlives the call, and the host reads what the params\n");
-                wrap.push_str("        // point at during it and keeps none; what it writes into area points\n");
-                wrap.push_str("        // into memory it asked cabi_realloc for.\n        ");
-            } else {
-                wrap.push_str("        // SAFETY: area outlives the call; what the host writes into it points\n");
-                wrap.push_str("        // into memory it asked cabi_realloc for.\n        ");
-            }
-            wrap.push_str(call.view());
-            wrap.push_str(";\n        let at = (&area[0] as *u64).addr() as usize;\n");
-            if rk == c.STRING {
-                h.uses_load_string = true;
-                wrap.push_str("        return load_string(at, a: a);\n");
-            } else if rk == c.LIST {
-                let e = part(w, r: r, i: 0);
-                var item = alloc.String.from("items + i * ", a);
-                item.push_u64(c.size_in(&w.types, t: e, a: a));
-                wrap.push_str("        let items = ptr.from_addr(u32, at).* as usize;\n");
-                wrap.push_str("        let n = ptr.from_addr(u32, at + 4).* as usize;\n");
-                wrap.push_str("        var i: usize = 0;\n        while i < n : (i += 1) {\n            out.push(");
-                wrap.push_str(load(w, t: e, at: item.view(), h: &mut h, a: a).view());
-                wrap.push_str(");\n        }\n");
-            } else {
-                var at_payload = alloc.String.from("at + ", a);
-                at_payload.push_u64(payload(w, r: r, a: a));
-                wrap.push_str("        if ptr.from_addr(u8, at).* ");
-                if rk == c.OPTION {
-                    wrap.push_str("== 0 {\n            return none;\n        }\n        return ");
-                    wrap.push_str(load(w, t: part(w, r: r, i: 0), at: at_payload.view(), h: &mut h, a: a).view());
-                    wrap.push_str(";\n");
-                } else {
-                    h.uses_load_string = true;
-                    wrap.push_str("!= 0 {\n            why.push_str(load_string(");
-                    wrap.push_str(at_payload.view());
-                    wrap.push_str(", a: a).view());\n");
-                    if part(w, r: r, i: 0) == c.NONE {
-                        wrap.push_str("            return false;\n        }\n        return true;\n");
-                    } else {
-                        wrap.push_str("            return none;\n        }\n        return ");
-                        wrap.push_str(load(w, t: part(w, r: r, i: 0), at: at_payload.view(), h: &mut h, a: a).view());
-                        wrap.push_str(";\n");
-                    }
-                }
-            }
-            wrap.push_str("    }\n");
-            if rk == c.LIST {
-                wrap.push_str("    return out;\n");
-            }
-            wrap.push_str("}\n\n");
-            continue;
-        }
-        wrap.push_str("    unsafe {\n");
-        if strings {
-            wrap.push_str("        // SAFETY: the host reads what the params point at during the call and\n        // keeps none of it.\n        ");
-        } else {
-            wrap.push_str("        // SAFETY: only scalars cross.\n        ");
-        }
-        if r != c.NONE {
-            wrap.push_str("return ");
-            wrap.push_str(lift(arche: arche_of(rk), call: call.view(), a: a).view());
-        } else {
-            wrap.push_str(call.view());
-        }
-        wrap.push_str(";\n    }\n}\n\n");
+        bind_function(w, g: &mut g, f: f, fname: funcs.items()[k].view(), funcs: &funcs, id: id.view(), raw_name: raw_name.view(), wrap: &mut wrap, raw: &mut raw);
     }
     // The wrapper module.
+    var body = alloc.String.init(a);
+    if notes.len() > 0 {
+        body.push_str(notes.view());
+        body.push_str("\n");
+    }
+    body.push_str(g.decls.view());
+    body.push_str(wrap.view());
+    body.push_str(g.helpers.view());
     var text = alloc.String.from("/// Generated by arche-wasm bindgen from ", a);
     text.push_str(id.view());
-    text.push_str(".\n/// Its functions with Arche's types; the imports themselves are in\n/// ");
+    text.push_str(".\n/// Its types, and its functions with Arche's types; the imports\n/// themselves are in ");
     text.push_str(raw_name.view());
     text.push_str(".arche. Do not edit: generate it again.\n");
-    if h.uses_alloc or h.uses_load_string {
+    if holds(s: body.view(), piece: "alloc.") {
         text.push_str("import alloc;\n");
     }
-    if h.uses_ptr {
+    if holds(s: body.view(), piece: "float.") {
+        text.push_str("import core.float;\n");
+    }
+    if holds(s: body.view(), piece: "ptr.") {
         text.push_str("import core.ptr;\n");
     }
     if bound > 0 {
@@ -686,38 +1361,13 @@ fn bind_interface(w: &wit.Wit, i: u32, files: &mut alloc.List(File), why: &mut a
         text.push_str(";\nimport std;\n");
     }
     text.push_str("\n");
-    if notes.len() > 0 {
-        text.push_str(notes.view());
-        text.push_str("\n");
-    }
-    text.push_str(wrap.view());
-    if h.uses_str {
+    text.push_str(body.view());
+    if holds(s: body.view(), piece: "address_of(") {
         text.push_str("/// Where a string's bytes are, as the canonical ABI passes it; 0 for an\n/// empty one.\n");
         text.push_str("fn address_of(text: str) -> u32 {\n    if text.len() == 0 {\n        return 0;\n    }\n    unsafe {\n");
         text.push_str("        // SAFETY: only the address is taken.\n        return (&text.bytes()[0] as *u8).addr() as u32;\n    }\n}\n\n");
     }
-    for s in h.slices.items() {
-        text.push_str("/// Where a list's items are, as the canonical ABI passes it; 0 for an\n/// empty one.\nfn address_of_");
-        text.push_str(s.view());
-        text.push_str("s(items: []");
-        text.push_str(s.view());
-        text.push_str(") -> u32 {\n    if items.len() == 0 {\n        return 0;\n    }\n    unsafe {\n");
-        text.push_str("        // SAFETY: only the address is taken.\n        return (&items[0] as *");
-        text.push_str(s.view());
-        text.push_str(").addr() as u32;\n    }\n}\n\n");
-    }
-    if h.uses_load_string {
-        text.push_str("/// The string whose address and length the host wrote at at, copied\n/// into a.\n");
-        text.push_str("fn load_string(at: usize, a: alloc.Allocator) -> alloc.String {\n    var bytes = alloc.List(u8).init(a);\n    unsafe {\n");
-        text.push_str("        // SAFETY: the host wrote the string's address and length at at, and its\n");
-        text.push_str("        // bytes in memory it asked cabi_realloc for.\n");
-        text.push_str("        let p = ptr.from_addr(u8, ptr.from_addr(u32, at).* as usize);\n");
-        text.push_str("        let n = ptr.from_addr(u32, at + 4).* as usize;\n");
-        text.push_str("        var i: usize = 0;\n        while i < n : (i += 1) {\n            bytes.push(p.add(i).*);\n        }\n    }\n");
-        text.push_str("    var out = alloc.String.init(a);\n    if not out.push_utf8(bytes.items()) {\n");
-        text.push_str("        panic(\"the host gave a string that is not UTF-8\");\n    }\n    return out;\n}\n\n");
-    }
-    if h.uses_bool {
+    if holds(s: body.view(), piece: "bit_of(") {
         text.push_str("/// A bool as the canonical ABI passes it.\nfn bit_of(on: bool) -> u32 {\n    if on {\n        return 1;\n    }\n    return 0;\n}\n\n");
     }
     files.push(File { name: module_file(name.view(), a: a), text: trimmed(text.view(), a: a) });
@@ -731,53 +1381,290 @@ fn bind_interface(w: &wit.Wit, i: u32, files: &mut alloc.List(File), why: &mut a
     return true;
 }
 
-fn add_flat(flat: &mut alloc.String, forward: &mut alloc.String, name: str, suffix: str, ty: str) {
+/// f's raw import and forwarder onto raw, its wrapper onto wrap.
+fn bind_function(w: &wit.Wit, g: &mut Gen, f: &wit.Func, fname: str, funcs: &alloc.List(alloc.String), id: str, raw_name: str, wrap: &mut alloc.String, raw: &mut alloc.String) {
+    let a = g.a;
+    g.wants_a = false;
+    let ty = &w.types.items()[f.ty as usize];
+    let r = result(w, f: f);
+    let fails = says_why(w, r: r);
+    let r_flat = flatten(w, t: r, a: a);
+    // Results of more than one flat value come back through memory.
+    let through_memory = r_flat.len() > 1;
+    // The wrapper's params, and the raw import's.
+    var typed = alloc.String.from("host: &mut std.Host", a);
+    var before = alloc.String.init(a);
+    var flats = alloc.List(Flat).init(a);
+    var names = alloc.List(alloc.String).init(a);
+    var places = alloc.List(alloc.String).init(a);
+    var hows = alloc.List(u32).init(a);
+    var j: usize = 0;
+    while j < ty.count as usize : (j += 1) {
+        let p = wit.real(w, t: ty.parts.items()[j]);
+        let pk = kind_of(w, t: p);
+        let pname = param_name(ty.names.items()[j].view(), funcs: funcs, a: a);
+        typed.push_str(", ");
+        typed.push_str(pname.view());
+        typed.push_str(": ");
+        var place = alloc.String.from(pname.view(), a);
+        var how = OWNED;
+        if arche_of(pk).len() > 0 {
+            typed.push_str(arche_of(pk));
+        } else if pk == c.STRING {
+            typed.push_str("str");
+            how = VIEWED;
+        } else if pk == c.LIST and is_scalar(w, t: part(w, t: p, i: 0)) {
+            typed.push_str("[]");
+            typed.push_str(arche_of(kind_of(w, t: part(w, t: p, i: 0))));
+            how = VIEWED;
+        } else {
+            typed.push_str("&");
+            typed.push_str(arche_type(w, g: g, t: p).view());
+            place.push_str(".*");
+        }
+        var counter: u32 = 0;
+        var prefix = alloc.String.from(pname.view(), a);
+        prefix.push_str("_l");
+        lower(w, g: g, t: p, place: place.view(), how: how, out: &mut flats, before: &mut before, indent: "    ", prefix: prefix.view(), counter: &mut counter);
+        names.push(pname);
+        places.push(place);
+        hows.push(how);
+    }
+    // Params of more than 16 flat values go through memory: a tuple of
+    // them all, laid out.
+    let in_memory = flats.len() > c.MAX_FLAT_PARAMS;
+    var flat_params = alloc.String.init(a);
+    var forward = alloc.String.init(a);
+    var args = alloc.String.init(a);
+    if in_memory {
+        g.wants_a = true;
+        before = alloc.String.init(a);
+        var at: u64 = 0;
+        var parts = alloc.String.init(a);
+        var j2: usize = 0;
+        while j2 < ty.count as usize : (j2 += 1) {
+            let p = wit.real(w, t: ty.parts.items()[j2]);
+            at = c.align_to(x: at, align: c.align_in(&w.types, t: p, a: a));
+            var slot = alloc.String.from("base + ", a);
+            slot.push_u64(at);
+            let place = places.items()[j2].view();
+            parts.push_str("    ");
+            if hows.items()[j2] == VIEWED {
+                // A string or a slice of scalars: where, and how long.
+                var where_ = alloc.String.init(a);
+                if kind_of(w, t: p) == c.STRING {
+                    where_.push_str("address_of(");
+                    where_.push_str(place);
+                    where_.push_str(")");
+                } else {
+                    where_.push_str(slice_helper(w, g: g, t: part(w, t: p, i: 0)).view());
+                    where_.push_str("(");
+                    where_.push_str(place);
+                    where_.push_str(")");
+                }
+                parts.push_str(store_call(w, g: g, t: prim(c.U32), value: where_.view(), at: slot.view()).view());
+                parts.push_str(";\n    ");
+                var n = alloc.String.from(place, a);
+                n.push_str(".len() as u32");
+                var slot4 = slot.clone();
+                slot4.push_str(" + 4");
+                parts.push_str(store_call(w, g: g, t: prim(c.U32), value: n.view(), at: slot4.view()).view());
+            } else {
+                parts.push_str(store_call(w, g: g, t: p, value: given(w, t: p, place: place, a: a).view(), at: slot.view()).view());
+            }
+            parts.push_str(";\n");
+            at += size(w, t: p, a: a);
+        }
+        before.push_str("    var buf = alloc.List(u64).init(a);\n    buf.grow_zeroed(");
+        before.push_u64((at + 7) / 8);
+        before.push_str(");\n    var base: usize = 0;\n    unsafe {\n        // SAFETY: only the address is taken.\n");
+        before.push_str("        base = (&buf.items()[0] as *u64).addr();\n    }\n");
+        before.push_str(parts.view());
+        add_flat(flat: &mut flat_params, forward: &mut forward, name: "args", ty: "u32");
+        add_arg(&mut args, name: "args");
+        args.push_str("base as u32");
+    } else {
+        var n: usize = 0;
+        while n < flats.len() : (n += 1) {
+            var slot = alloc.String.from("p", a);
+            slot.push_u64(n as u64);
+            add_flat(flat: &mut flat_params, forward: &mut forward, name: slot.view(), ty: flat_name(flats.items()[n].ty));
+            add_arg(&mut args, name: slot.view());
+            args.push_str(flats.items()[n].expr.view());
+        }
+    }
+    // What the import returns, and the wrapper.
+    var flat_result = alloc.String.init(a);
+    var typed_result = alloc.String.init(a);
+    var after = alloc.String.init(a);
+    var call = alloc.String.from(raw_name, a);
+    call.push_str(".call_");
+    call.push_str(fname);
+    call.push_str("(");
+    if through_memory {
+        add_flat(flat: &mut flat_params, forward: &mut forward, name: "ret", ty: "u32");
+        add_arg(&mut args, name: "ret");
+        args.push_str("(&area[0] as *u64).addr() as u32");
+    }
+    call.push_str(args.view());
+    call.push_str(")");
+    if r == c.NONE {
+        after.push_str("    unsafe {\n        // SAFETY: the host reads what the params point at during the call and\n        // keeps none of it.\n        ");
+        after.push_str(call.view());
+        after.push_str(";\n    }\n");
+    } else if not through_memory {
+        flat_result.push_str(" -> ");
+        flat_result.push_str(flat_name(r_flat.items()[0]));
+        typed_result.push_str(" -> ");
+        typed_result.push_str(arche_type(w, g: g, t: r).view());
+        let rk = kind_of(w, t: r);
+        if arche_of(rk).len() > 0 {
+            after.push_str("    unsafe {\n        // SAFETY: the host reads what the params point at during the call and\n        // keeps none of it.\n        return ");
+            after.push_str(lift(rk, call: call.view(), a: a).view());
+            after.push_str(";\n    }\n");
+        } else {
+            // One flat value of what is no scalar (an enum, flags, a record
+            // of one): read as the canonical ABI lays it out, from a cell.
+            after.push_str("    var cell: [1]u64 = [0];\n    unsafe {\n        // SAFETY: the host reads what the params point at during the call and\n        // keeps none of it.\n        cell[0] = ");
+            after.push_str(joined(call.view(), from: r_flat.items()[0], to: c.FLAT_I64, a: a).view());
+            after.push_str(";\n    }\n    var at: usize = 0;\n    unsafe {\n        // SAFETY: only the address is taken.\n        at = (&cell[0] as *u64).addr();\n    }\n    return ");
+            after.push_str(load_call(w, g: g, t: r, at: "at").view());
+            after.push_str(";\n");
+        }
+    } else {
+        let words = (size(w, t: r, a: a) + 7) / 8;
+        after.push_str("    var area: [");
+        after.push_u64(words);
+        after.push_str("]u64 = [0; ");
+        after.push_u64(words);
+        after.push_str("];\n    unsafe {\n        // SAFETY: area outlives the call, and the host reads what the params\n");
+        after.push_str("        // point at during it and keeps none; what it writes into area points\n");
+        after.push_str("        // into memory it asked cabi_realloc for.\n        ");
+        after.push_str(call.view());
+        after.push_str(";\n    }\n    var at: usize = 0;\n    unsafe {\n        // SAFETY: only the address is taken.\n        at = (&area[0] as *u64).addr();\n    }\n");
+        typed_result.push_str(" -> ");
+        if fails {
+            let ok_t = part(w, t: r, i: 0);
+            var err_at = alloc.String.from("at + ", a);
+            err_at.push_u64(c.payload_in(&w.types, t: r, a: a));
+            after.push_str("    if ");
+            after.push_str(load_call(w, g: g, t: disc_prim(2), at: "at").view());
+            after.push_str(" != 0 {\n        why.push_str(");
+            after.push_str(load_call(w, g: g, t: part(w, t: r, i: 1), at: err_at.view()).view());
+            after.push_str(".view());\n");
+            if ok_t == c.NONE {
+                typed_result.push_str("bool");
+                after.push_str("        return false;\n    }\n    return true;\n");
+            } else {
+                typed_result.push_str("?");
+                typed_result.push_str(arche_type(w, g: g, t: ok_t).view());
+                after.push_str("        return none;\n    }\n    return ");
+                after.push_str(load_call(w, g: g, t: ok_t, at: err_at.view()).view());
+                after.push_str(";\n");
+            }
+        } else {
+            typed_result.push_str(arche_type(w, g: g, t: r).view());
+            after.push_str("    return ");
+            after.push_str(load_call(w, g: g, t: r, at: "at").view());
+            after.push_str(";\n");
+        }
+    }
+    if fails {
+        typed.push_str(", why: &mut alloc.String");
+    }
+    if g.wants_a {
+        typed.push_str(", a: alloc.Allocator");
+    }
+    // The raw import and its forwarder.
+    raw.push_str("extern \"wasm:");
+    raw.push_str(id);
+    raw.push_str("\" fn ");
+    raw.push_str(fname);
+    raw.push_str("(");
+    raw.push_str(flat_params.view());
+    raw.push_str(")");
+    raw.push_str(flat_result.view());
+    raw.push_str(";\n\npub unsafe fn call_");
+    raw.push_str(fname);
+    raw.push_str("(");
+    raw.push_str(flat_params.view());
+    raw.push_str(")");
+    raw.push_str(flat_result.view());
+    raw.push_str(" {\n    ");
+    if flat_result.len() > 0 {
+        raw.push_str("return ");
+    }
+    raw.push_str(fname);
+    raw.push_str("(");
+    raw.push_str(forward.view());
+    raw.push_str(");\n}\n\n");
+    // The wrapper.
+    wrap.push_str("/// ");
+    wrap.push_str(f.name.view());
+    wrap.push_str(", imported from ");
+    wrap.push_str(id);
+    wrap.push_str(".\npub fn ");
+    wrap.push_str(fname);
+    wrap.push_str("(");
+    wrap.push_str(typed.view());
+    wrap.push_str(")");
+    wrap.push_str(typed_result.view());
+    wrap.push_str(" {\n");
+    wrap.push_str(before.view());
+    wrap.push_str(after.view());
+    wrap.push_str("}\n\n");
+}
+
+fn add_flat(flat: &mut alloc.String, forward: &mut alloc.String, name: str, ty: str) {
     if flat.len() > 0 {
         flat.push_str(", ");
         forward.push_str(", ");
     }
     flat.push_str(name);
-    flat.push_str(suffix);
     flat.push_str(": ");
     flat.push_str(ty);
     forward.push_str(name);
-    forward.push_str(suffix);
     forward.push_str(": ");
     forward.push_str(name);
-    forward.push_str(suffix);
 }
 
-fn add_arg(args: &mut alloc.String, name: str, suffix: str) {
+fn add_arg(args: &mut alloc.String, name: str) {
     if args.len() > 0 {
         args.push_str(", ");
     }
     args.push_str(name);
-    args.push_str(suffix);
     args.push_str(": ");
 }
 
-/// A scalar result from its flat value, as the canonical ABI lifts it.
-fn lift(arche: str, call: str, a: alloc.Allocator) -> alloc.String {
+/// A scalar result of kind k from its flat value, as the canonical ABI
+/// lifts it: the flat value's low bits, sign-extended for a signed kind.
+fn lift(k: u8, call: str, a: alloc.Allocator) -> alloc.String {
     var s = alloc.String.init(a);
-    if arche.eq("bool") {
+    if k == c.BOOL {
         s.push_str(call);
         s.push_str(" != 0");
-    } else if arche.eq("u8") or arche.eq("u16") {
+    } else if k == c.U8 {
         s.push_str("(");
         s.push_str(call);
-        if arche.eq("u8") {
-            s.push_str(" & 0xFF) as u8");
-        } else {
-            s.push_str(" & 0xFFFF) as u16");
-        }
-    } else if arche.eq("i8") {
-        s.push_str("(((");
+        s.push_str(" & 0xFF) as u8");
+    } else if k == c.U16 {
+        s.push_str("(");
         s.push_str(call);
-        s.push_str(" & 0xFF) ^ 0x80) - 0x80) as i8");
-    } else if arche.eq("i16") {
-        s.push_str("(((");
+        s.push_str(" & 0xFFFF) as u16");
+    } else if k == c.S8 {
+        s.push_str("((");
         s.push_str(call);
-        s.push_str(" & 0xFFFF) ^ 0x8000) - 0x8000) as i16");
+        s.push_str(" & 0xFF) as u8) as% i8");
+    } else if k == c.S16 {
+        s.push_str("((");
+        s.push_str(call);
+        s.push_str(" & 0xFFFF) as u16) as% i16");
+    } else if k == c.S32 {
+        s.push_str(call);
+        s.push_str(" as% i32");
+    } else if k == c.S64 {
+        s.push_str(call);
+        s.push_str(" as% i64");
     } else {
         s.push_str(call);
     }

@@ -1,9 +1,12 @@
-/// A mini-app that calls what arche-wasm bindgen binds of options, results
-/// and lists (docs/sprints.md S38), on the modules it makes of
+/// A mini-app that calls what arche-wasm bindgen binds of options, results,
+/// lists and records (docs/sprints.md S38), on the modules it makes of
 /// tests/nimadir/world.wit, which nimadir-check.sh generates next to this
 /// file: storage-set, storage-get and storage-keys; ui-choice, a list of
-/// strings; and dom's query-all, children, parent, get-attribute and
-/// set-markup, whose error is a string.
+/// strings; dom's query-all, children, parent, get-attribute and
+/// set-markup, whose error is a string; and of records, list-apps, a list
+/// of them, app-info, dom's bounds and events, fetch, which takes a record
+/// with a list of tuples and a list of bytes, and fetch-poll, an option of
+/// a result of a record.
 import alloc;
 import dom;
 import host_api;
@@ -53,16 +56,16 @@ fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
     said(host, what: "Visits", value: visits.view(), a: a);
     let missing = host_api.storage_get(host, key: "missing", a: a) orelse alloc.String.from("(none)", a);
     said(host, what: "Missing", value: missing.view(), a: a);
-    // The keys, in no order the two shells agree on: Nimadir's sorts them.
+    // The keys, in order of their bytes, whatever order they were set in.
     let keys = host_api.storage_keys(host, a: a);
-    count(host, what: "Keys", n: keys.len(), a: a);
-    var both: usize = 0;
+    var listed = alloc.String.init(a);
     for k in keys.items() {
-        if k.view().eq("frame") or k.view().eq("visits") {
-            both += 1;
+        if listed.len() > 0 {
+            listed.push_str(", ");
         }
+        listed.push_str(k.view());
     }
-    count(host, what: "Of them frame and visits", n: both, a: a);
+    said(host, what: "Keys", value: listed.view(), a: a);
     // A choice of three, from a list of strings.
     var colours = alloc.List(alloc.String).init(a);
     colours.push(alloc.String.from("Red", a));
@@ -83,12 +86,29 @@ fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
             said(host, what: "set-markup failed", value: bad.view(), a: a);
         }
     }
-    // Markup that cannot be read is refused, saying why, in words that are
-    // each shell's own.
+    // Markup that cannot be read is refused, saying why and where, and
+    // changes nothing; markup that can has its entities read, and its void
+    // elements need no closing tag.
     let probe = dom.create_element(host, tag: "div");
     var refused = alloc.String.init(a);
-    if not dom.set_markup(host, item: probe, markup: "</p>", why: &mut refused, a: a) and refused.len() > 0 {
-        host_api.ui_label(host, text: "Refused, saying why");
+    if not dom.set_markup(host, item: probe, markup: "</p>", why: &mut refused, a: a) {
+        said(host, what: "Refused", value: refused.view(), a: a);
+    }
+    var unclosed = alloc.String.init(a);
+    if not dom.set_markup(host, item: probe, markup: "<ul>\n  <li>open</ul>", why: &mut unclosed, a: a) {
+        said(host, what: "Refused", value: unclosed.view(), a: a);
+    }
+    var read = alloc.String.init(a);
+    if dom.set_markup(host, item: probe, markup: "<p title='a &amp; b' TITLE=c>x&lt;y<br>z&#x2014;<!-- no --><script>no()</script></p>", why: &mut read, a: a) {
+        let para = dom.children(host, item: probe, a: a);
+        if para.len() == 1 {
+            let title = dom.get_attribute(host, item: para.items()[0], name: "title", a: a) orelse alloc.String.from("(none)", a);
+            said(host, what: "Its title", value: title.view(), a: a);
+            count(host, what: "Its children", n: dom.children(host, item: para.items()[0], a: a).len(), a: a);
+            said(host, what: "Its text", value: dom.value(host, item: para.items()[0], a: a).view(), a: a);
+        }
+    } else {
+        said(host, what: "Refused", value: read.view(), a: a);
     }
     dom.release(host, item: probe);
     count(host, what: "Items", n: dom.query_all(host, scope: root, selector: "li", a: a).len(), a: a);
@@ -101,4 +121,59 @@ fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
     said(host, what: "Id", value: id.view(), a: a);
     let title = dom.get_attribute(host, item: state.list, name: "title", a: a) orelse alloc.String.from("(none)", a);
     said(host, what: "Title", value: title.view(), a: a);
+    records(state, host: host, a: a);
+}
+
+/// What is said of the calls that take or give records.
+fn records(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
+    // The registry's apps, the first of them, and what it says of one.
+    let apps = host_api.list_apps(host, a: a);
+    count(host, what: "Apps", n: apps.len(), a: a);
+    if apps.len() > 1 {
+        said(host, what: "Second app", value: apps.items()[1].name.view(), a: a);
+        said(host, what: "Its source", value: apps.items()[1].source.view(), a: a);
+        said(host, what: "It is", value: apps.items()[1].description.view(), a: a);
+    }
+    let info = host_api.app_info(host, source: "mini-apps/counter/counter.component.wasm", a: a);
+    count(host, what: "Its version, in bytes", n: info.version.len(), a: a);
+    count(host, what: "Its publisher, in bytes", n: info.publisher.len(), a: a);
+    // A node's box, before any layout: none. (Nimadir's headless shell
+    // lays the page out after a frame, and this one does not: the phone's
+    // shell does, and gives boxes.)
+    if state.frame == 1 {
+        match dom.bounds(host, item: state.list) {
+            some(r) => {
+                if r.width >= 0.0 and r.height >= 0.0 {
+                    host_api.ui_label(host, text: "The list has a box");
+                }
+            }
+            none => { host_api.ui_label(host, text: "The list has no box yet"); }
+        }
+    }
+    dom.listen(host, item: state.list, kind: "click");
+    let done = dom.events(host, a: a);
+    count(host, what: "Events", n: done.len(), a: a);
+    // A request: a method, an address, headers and a body.
+    var headers = alloc.List(host_api.TupleStringString).init(a);
+    headers.push(host_api.TupleStringString { f0: alloc.String.from("accept", a), f1: alloc.String.from("text/plain", a) });
+    headers.push(host_api.TupleStringString { f0: alloc.String.from("x-app", a), f1: alloc.String.from("arche", a) });
+    var body = alloc.List(u8).init(a);
+    for b in "ping".bytes() {
+        body.push(b.*);
+    }
+    let request = host_api.HttpRequest { method: alloc.String.from("POST", a), url: alloc.String.from("https://example.com/echo", a), headers: headers, body: body };
+    var refused = alloc.String.init(a);
+    match host_api.fetch(host, request: &request, why: &mut refused, a: a) {
+        some(_) => { host_api.ui_label(host, text: "Fetch started"); }
+        none => { said(host, what: "Fetch refused", value: refused.view(), a: a); }
+    }
+    match host_api.fetch_poll(host, request: 4242, a: a) {
+        some(answer) => {
+            match answer {
+                .Ok { value } => { count(host, what: "Answered with status", n: value.status as usize, a: a); }
+                .Err { value } => { said(host, what: "Failed", value: value.view(), a: a); }
+            }
+        }
+        none => { host_api.ui_label(host, text: "Request 4242: no answer yet"); }
+    }
 }

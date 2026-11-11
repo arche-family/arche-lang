@@ -1,0 +1,283 @@
+/// bindgen's test (docs/sprints.md S38): every kind of WIT type, given to
+/// a function of tests/echo/echo.wit and compared with what comes back.
+/// arche-wasm echo runs it, its imports giving back what they are given
+/// through the runtime's canonical ABI; nimadir-check.sh generates the
+/// echo module next to this file and holds what it says to expected.txt.
+import alloc;
+import echo;
+import std;
+
+type App = struct {
+    runs: u32,
+}
+
+fn said(host: &mut std.Host, name: str, same: bool, a: alloc.Allocator) {
+    var line = alloc.String.init(a);
+    if same {
+        line.push_str("ok ");
+    } else {
+        line.push_str("MISMATCH ");
+    }
+    line.push_str(name);
+    echo.say(host, line: line.view());
+}
+
+fn same_point(x: &echo.Point, y: &echo.Point) -> bool {
+    return x.x == y.x and x.y == y.y;
+}
+
+fn same_strings(x: &alloc.List(alloc.String), y: &alloc.List(alloc.String)) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.len() : (i += 1) {
+        if not x.items()[i].view().eq(y.items()[i].view()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn same_bytes(x: []u8, y: []u8) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.len() : (i += 1) {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn same_mixed(x: &echo.Mixed, y: &echo.Mixed) -> bool {
+    return x.flag == y.flag and x.small == y.small and x.short == y.short and x.wide == y.wide and x.big == y.big and x.huge == y.huge and x.ratio == y.ratio and x.precise == y.precise and x.letter == y.letter and x.name.view().eq(y.name.view()) and same_strings(x: &x.tags, y: &y.tags) and same_bytes(x: x.bytes.items(), y: y.bytes.items());
+}
+
+fn same_shape(x: &echo.Shape, y: &echo.Shape) -> bool {
+    match x {
+        .Dot => {
+            match y {
+                .Dot => { return true; }
+                _ => { return false; }
+            }
+        }
+        .Circle { value: r } => {
+            match y {
+                .Circle { value: s } => { return r.* == s.*; }
+                _ => { return false; }
+            }
+        }
+        .Named { value: n } => {
+            match y {
+                .Named { value: m } => { return n.view().eq(m.view()); }
+                _ => { return false; }
+            }
+        }
+        .Box { value: p } => {
+            match y {
+                .Box { value: q } => { return same_point(x: p, y: q); }
+                _ => { return false; }
+            }
+        }
+        .Many { value: ps } => {
+            match y {
+                .Many { value: qs } => {
+                    if ps.len() != qs.len() {
+                        return false;
+                    }
+                    var i: usize = 0;
+                    while i < ps.len() : (i += 1) {
+                        if not same_point(x: &ps.items()[i], y: &qs.items()[i]) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                _ => { return false; }
+            }
+        }
+    }
+}
+
+fn colour_number(c: &echo.Colour) -> u32 {
+    match c {
+        .Red => { return 0; }
+        .Green => { return 1; }
+        .Blue => { return 2; }
+    }
+}
+
+fn same_joined(x: &echo.Joined, y: &echo.Joined) -> bool {
+    match x {
+        .Small { value: v } => {
+            match y {
+                .Small { value: w } => { return v.* == w.*; }
+                _ => { return false; }
+            }
+        }
+        .Real { value: v } => {
+            match y {
+                .Real { value: w } => { return v.* == w.*; }
+                _ => { return false; }
+            }
+        }
+        .Wide { value: v } => {
+            match y {
+                .Wide { value: w } => { return v.* == w.*; }
+                _ => { return false; }
+            }
+        }
+        .Pair { value: v } => {
+            match y {
+                .Pair { value: w } => { return v.f0 == w.f0 and v.f1 == w.f1; }
+                _ => { return false; }
+            }
+        }
+    }
+}
+
+fn points(a: alloc.Allocator) -> alloc.List(echo.Point) {
+    var ps = alloc.List(echo.Point).init(a);
+    ps.push(echo.Point { x: 1, y: -2 });
+    ps.push(echo.Point { x: -300000, y: 400000 });
+    return ps;
+}
+
+fn init(host: &mut std.Host, a: alloc.Allocator) -> App {
+    // A record of scalars, flat both ways.
+    let p = echo.Point { x: -7, y: 2147483647 };
+    let p_back = echo.echo_point(host, p: &p);
+    said(host, name: "point", same: same_point(x: &p, y: &p_back), a: a);
+    // Every scalar, strings and lists: through memory.
+    var tags = alloc.List(alloc.String).init(a);
+    tags.push(alloc.String.from("first", a));
+    tags.push(alloc.String.from("", a));
+    tags.push(alloc.String.from("oʻzbek", a));
+    var bytes = alloc.List(u8).init(a);
+    bytes.push(0);
+    bytes.push(255);
+    bytes.push(7);
+    let m = echo.Mixed { flag: true, small: -128, short: -32768, wide: 65535, big: -9000000000000000000, huge: 18000000000000000000, ratio: -1.5, precise: 3.141592653589793, letter: 0x1F600, name: alloc.String.from("Salom, dunyo", a), tags: tags, bytes: bytes };
+    let m_back = echo.echo_mixed(host, m: &m, a: a);
+    said(host, name: "mixed", same: same_mixed(x: &m, y: &m_back), a: a);
+    // A variant's every case.
+    var shapes = alloc.List(echo.Shape).init(a);
+    shapes.push(echo.Shape.Dot);
+    shapes.push(echo.Shape.Circle { value: 2.25 });
+    shapes.push(echo.Shape.Named { value: alloc.String.from("ellipse", a) });
+    shapes.push(echo.Shape.Box { value: echo.Point { x: 3, y: 4 } });
+    shapes.push(echo.Shape.Many { value: points(a) });
+    var all_same = true;
+    for s in shapes.items() {
+        let back = echo.echo_shape(host, s: s, a: a);
+        if not same_shape(x: s, y: &back) {
+            all_same = false;
+        }
+    }
+    said(host, name: "shape, each case", same: all_same, a: a);
+    // A list of them.
+    let shapes_back = echo.echo_shapes(host, s: &shapes, a: a);
+    var list_same = shapes_back.len() == shapes.len();
+    var k: usize = 0;
+    while list_same and k < shapes.len() : (k += 1) {
+        list_same = same_shape(x: &shapes.items()[k], y: &shapes_back.items()[k]);
+    }
+    said(host, name: "shapes", same: list_same, a: a);
+    // An enum.
+    let blue = echo.Colour.Blue;
+    let blue_back = echo.echo_colour(host, c: &blue);
+    said(host, name: "colour", same: colour_number(&blue_back) == 2, a: a);
+    // Flags, of one word and of two.
+    let perms = echo.Perms { read: true, write: false, run: true };
+    let perms_back = echo.echo_perms(host, p: &perms);
+    said(host, name: "perms", same: perms_back.read and not perms_back.write and perms_back.run, a: a);
+    var lots = echo.Lots { f0: true, f1: false, f2: false, f3: false, f4: false, f5: false, f6: false, f7: false, f8: false, f9: false, f10: false, f11: false, f12: false, f13: false, f14: false, f15: false, f16: false, f17: false, f18: false, f19: false, f20: false, f21: false, f22: false, f23: false, f24: false, f25: false, f26: false, f27: false, f28: false, f29: false, f30: false, f31: true, f32_: true, f33: false, f34: false, f35: false, f36: false, f37: false, f38: false, f39: true };
+    let lots_back = echo.echo_lots(host, l: &lots);
+    said(host, name: "lots", same: lots_back.f0 and not lots_back.f1 and lots_back.f31 and lots_back.f32_ and not lots_back.f33 and lots_back.f39, a: a);
+    lots.f0 = false;
+    // A variant whose cases' flat values join.
+    var joins = alloc.List(echo.Joined).init(a);
+    joins.push(echo.Joined.Small { value: 200 });
+    joins.push(echo.Joined.Real { value: -0.375 });
+    joins.push(echo.Joined.Wide { value: 0xFFFFFFFF00000001 });
+    joins.push(echo.Joined.Pair { value: echo.TupleU32F64 { f0: 4000000000, f1: -2.5e300 } });
+    var joins_same = true;
+    for j in joins.items() {
+        let back = echo.echo_joined(host, j: j);
+        if not same_joined(x: j, y: &back) {
+            joins_same = false;
+        }
+    }
+    said(host, name: "joined, each case", same: joins_same, a: a);
+    // Options and results.
+    let some_point: ?echo.Point = some(echo.Point { x: 9, y: -9 });
+    var maybe_same = false;
+    match echo.echo_maybe(host, m: &some_point) {
+        some(q) => { maybe_same = q.x == 9 and q.y == -9; }
+        none => { }
+    }
+    let no_point: ?echo.Point = none;
+    match echo.echo_maybe(host, m: &no_point) {
+        some(_) => { maybe_same = false; }
+        none => { }
+    }
+    said(host, name: "maybe", same: maybe_same, a: a);
+    let good = echo.ResultPointColour.Ok { value: echo.Point { x: 5, y: 6 } };
+    let bad = echo.ResultPointColour.Err { value: echo.Colour.Green };
+    var outcome_same = false;
+    match echo.echo_outcome(host, r: &good) {
+        .Ok { value: q } => { outcome_same = q.x == 5 and q.y == 6; }
+        .Err { value: _ } => { }
+    }
+    match echo.echo_outcome(host, r: &bad) {
+        .Ok { value: _ } => { outcome_same = false; }
+        .Err { value: c } => { outcome_same = outcome_same and colour_number(&c) == 1; }
+    }
+    said(host, name: "outcome", same: outcome_same, a: a);
+    let nested: ?echo.ResultStringString = some(echo.ResultStringString.Err { value: alloc.String.from("why not", a) });
+    var nested_same = false;
+    match echo.echo_nested(host, r: &nested, a: a) {
+        some(r) => {
+            match r {
+                .Err { value: w } => { nested_same = w.view().eq("why not"); }
+                .Ok { value: _ } => { }
+            }
+        }
+        none => { }
+    }
+    said(host, name: "nested", same: nested_same, a: a);
+    // Signed scalars as params, a tuple back.
+    let signed = echo.echo_signed(host, a_: -100, b: -30000, c: -2000000000, d: -5);
+    said(host, name: "signed", same: signed.f0 == -100 and signed.f1 == -30000 and signed.f2 == -2000000000 and signed.f3 == -5, a: a);
+    // One flat value of what is no scalar.
+    let one = echo.One { v: 0xDEADBEEF };
+    said(host, name: "one", same: echo.echo_one(host, o: &one).v == 0xDEADBEEF, a: a);
+    said(host, name: "char", same: echo.echo_char(host, c: 0x10FFFF) == 0x10FFFF, a: a);
+    let flags: [4]bool = [true, false, false, true];
+    let bools = echo.echo_bools(host, b: flags[0..4], a: a);
+    said(host, name: "bools", same: bools.len() == 4 and bools.items()[0] and not bools.items()[1] and not bools.items()[2] and bools.items()[3], a: a);
+    // A function's own result<string, string>: ?T, its error into why.
+    var why = alloc.String.init(a);
+    let hello = echo.ResultStringString.Ok { value: alloc.String.from("hello", a) };
+    let says = echo.echo_says(host, r: &hello, why: &mut why, a: a) orelse alloc.String.from("(refused)", a);
+    var why_not = alloc.String.init(a);
+    let no = echo.ResultStringString.Err { value: alloc.String.from("no", a) };
+    let refused = echo.echo_says(host, r: &no, why: &mut why_not, a: a);
+    var refused_same = false;
+    match refused {
+        some(_) => { }
+        none => { refused_same = why_not.view().eq("no"); }
+    }
+    said(host, name: "says", same: says.view().eq("hello") and why.len() == 0 and refused_same, a: a);
+    // More than 16 flat values: the params through memory.
+    let wide = echo.echo_wide(host, a_: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12, m: 13, n: 14, o: 15, p: 0xFFFFFFFFFFFFFFFF, q: "last", a: a);
+    said(host, name: "wide", same: wide.f0 == 1 and wide.f7 == 8 and wide.f15 == 0xFFFFFFFFFFFFFFFF and wide.f16.view().eq("last"), a: a);
+    return App { runs: 0 };
+}
+
+fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
+    state.runs += 1;
+}

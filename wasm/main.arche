@@ -13,6 +13,10 @@
 ///                                        Arche modules through which an app
 ///                                        calls what the world imports
 ///                                        (bindgen.arche)
+///   arche-wasm echo <component.wasm>
+///                                        a component of bindgen's tests, its
+///                                        imports giving back what they are
+///                                        given (echo.arche)
 ///   arche-wasm core <component.wasm> <out.wasm>
 ///                                        a component's first core module, the
 ///                                        program's, as wit-component lays it out
@@ -21,6 +25,7 @@
 ///                                        module's handle (serve.arche)
 import alloc;
 import bindgen;
+import echo;
 import wasm.component;
 import wasm.encode;
 import wasm.exec;
@@ -39,6 +44,7 @@ fn usage(sys: &mut std.System) -> !void {
     sys.stderr.write("usage: arche-wasm spec [--jit] <script.json>...\n");
     sys.stderr.write("       arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>\n");
     sys.stderr.write("       arche-wasm bindgen <world.wit> <world> <out-dir>\n");
+    sys.stderr.write("       arche-wasm echo <component.wasm>\n");
     sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]...\n");
     sys.proc.exit(2);
 }
@@ -151,7 +157,26 @@ fn main(sys: &mut std.System) -> !void {
         try make_bindings(sys);
         return;
     }
+    if cmd.eq("echo") and sys.args.len() == 3 {
+        try run_echo(sys);
+        return;
+    }
     try usage(sys);
+}
+
+/// arche-wasm echo: the component's init run, what it says written out.
+fn run_echo(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let clock = &sys.clock;
+    let now = fn [clock] () -> u64 { return clock.monotonic_ns(); };
+    var why = alloc.String.init(a);
+    if not echo.run(&sys.fs, path: sys.args.get(2), now: &now, out: &mut sys.stdout, why: &mut why, a: a) {
+        sys.stdout.flush();
+        sys.stderr.write("arche-wasm: ");
+        sys.stderr.write(why.view());
+        sys.stderr.write("\n");
+        sys.proc.exit(1);
+    }
 }
 
 fn number(s: str) -> u32 {

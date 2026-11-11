@@ -517,7 +517,25 @@ Qilingani:
   - core instance'larning `start` funksiyalari component to'liq qurilgach, haqiqiy host bilan, birinchi export'dan oldin yuritiladi. .NET runtime'i shu yerda ishga tushadi va import'larni chaqiradi.
   Import turi mos kelmasa, endi "trapped" emas, "does not link" deyiladi. WebAssembly spec testlari: 27416 o'tdi, 0 xato. Python (componentize-py) ilovasi sinalmagan: uning build qilingan component'i bu yerda yo'q.
 
-Qolgani: record va record list'lari uchun binding'lar (`list-apps`, `app-info`, `fetch`, `fetch-poll`, `dom.bounds`, `dom.events`). `arche-wasm`ning Nimadir shell'i ikki joyda Nimadir'dan farq qiladi: `storage-keys` tartibi (Nimadir saralaydi) va yopilmagan teg'li `set-markup` (Nimadir rad etadi).
+- Bindgen endi WIT'ning hamma turini bog'laydi. U rekursiv generator bo'ldi: har tur uchun Arche turi va kerak bo'lganda `load_` (canonical ABI layout'idan o'qish), `store_` (unga yozish) va `lay_` (ro'yxatni joylash) funksiyalari bir martadan yoziladi.
+  - Turlar: record struct bo'ladi, tuple esa `f0, f1, …` maydonli struct. Variant `value` payload'li enum, enum enum, flags bool'lar struct'i (kalit so'z yoki tur nomi bo'lsa `_` qo'shiladi, masalan `f32_`). Boshqa tur ichidagi result `Ok`/`Err` enum bo'ladi.
+  - Parametrlar: skalyar, string va skalyar ro'yxatidan boshqasi reference bilan olinadi. Variant'lar canonical ABI join'lari bilan flat qilinadi (`core.float.bits32/bits64`). 16 dan ortiq flat parametr xotira orqali o'tadi.
+  - Natijalar: bitta flat'li skalyar bo'lmagan natija (enum, flags, bitta maydonli record) katakdan o'qiladi, ko'p flat'lisi xotiradan.
+  - Mavjud wrapper'larning API'si o'zgarmadi. Hali bog'lanmagani: resource va option ichidagi option.
+- Nimadir world'ida endi hamma funksiya bog'langan, `// not bound yet` qolmadi: `list-apps`, `app-info`, `fetch` (record ichida `list<tuple<string, string>>` va `list<u8>`), `fetch-poll` (`option<result<record, string>>`), `dom.bounds` va `dom.events`. `wasm/tests/arche-bindings` ularni chaqiradi va Nimadir'ning o'z shell'i bilan bir xil chiqadi (`expected.txt` shu shell'dan olingan).
+- `arche-wasm echo <component>` va `wasm/tests/echo`: `arche:test` paketining har funksiyasi berilganini runtime'ning canonical ABI'si orqali qaytaradi. `echo.wit`da hamma skalyarlar, string va ro'yxatlar bor. Bundan tashqari:
+  - variant'ning har holati, variant ro'yxati, join'li variant;
+  - enum, 3 va 40 bitli flags;
+  - option, xatosi string bo'lmagan result, `option<result<…>>`;
+  - ishorali skalyarlar tuple'da, bitta flat'li record, char, `list<bool>`;
+  - funksiyaning o'z `result<string, string>`i va 17 parametrli funksiya.
+  Ilova har qiymatni berib, qaytganini solishtiradi: 17 holatning hammasi bir xil qaytadi. Shunday qilib, Arche'da yozilgan lowering va lifting runtime'nikiga bog'lanadi; runtime esa Nimadir ilovalari va spec testlari orqali Wasmtime'ga bog'langan. `nimadir-check.sh` uni har safar yuritadi, CI'da component `wasm-tools validate`dan ham o'tadi.
+- `arche-wasm`ning Nimadir shell'i endi Nimadir bilan uch joyda bir xil:
+  - `storage-keys` baytlar bo'yicha saralangan (Nimadir'da `BTreeMap`);
+  - `set-markup` Nimadir'ning `markup.rs`idagi qoidalar bilan o'qiladi: avval butun matn, xato bo'lsa hujjat o'zgarmaydi va xabar qator va ustunni aytadi ("`</ul>` closes `<li>`, at line 2, column 11"). Yopilmagan teg, comment, `<!doctype>`, `script` va `style` (ichi bilan tashlanadi), void elementlar, `<x/>`, birinchi takroriy atribut va entity'lar (`&mdash;`, `&#x…;`, …) ham shu qoidalar bilan; element bo'lmagan tugun "is not an element";
+  - `fetch` Nimadir'ning tartibida rad etadi (oddiy http, manzil emas, xost yo'q, shu mashina yoki lokal tarmoq, keyin manifest'da tarmoq yo'q), `fetch-poll` esa noma'lum so'rovga "no request numbered N" xatosini beradi.
+
+Qolgani: headless `arche-wasm` sahifani joylashtirmaydi, shuning uchun unda `dom.bounds` doim `none`. Nimadir'ning headless shell'i kadrdan keyin joylashtiradi va quti beradi; telefonning UI server'i ham beradi (`page.arche`, `set_box`).
 
 ### S39. ARM64 JIT va aarch64 telefon
 

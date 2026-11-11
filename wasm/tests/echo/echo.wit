@@ -1,0 +1,94 @@
+package arche:test@0.1.0;
+
+/// What bindgen binds, each kind of type through a function that gives
+/// back what it is given (arche-wasm echo): the app compares the two.
+interface echo {
+    record point {
+        x: s32,
+        y: s32,
+    }
+
+    /// Every scalar, and strings and lists of them.
+    record mixed {
+        flag: bool,
+        small: s8,
+        short: s16,
+        wide: u16,
+        big: s64,
+        huge: u64,
+        ratio: f32,
+        precise: f64,
+        letter: char,
+        name: string,
+        tags: list<string>,
+        bytes: list<u8>,
+    }
+
+    variant shape {
+        dot,
+        circle(f32),
+        named(string),
+        box(point),
+        many(list<point>),
+    }
+
+    enum colour {
+        red,
+        green,
+        blue,
+    }
+
+    flags perms {
+        read,
+        write,
+        run,
+    }
+
+    /// More than 32: two words.
+    flags lots {
+        f0, f1, f2, f3, f4, f5, f6, f7, f8, f9,
+        f10, f11, f12, f13, f14, f15, f16, f17, f18, f19,
+        f20, f21, f22, f23, f24, f25, f26, f27, f28, f29,
+        f30, f31, f32, f33, f34, f35, f36, f37, f38, f39,
+    }
+
+    /// Cases whose flat values join: i32 with f32, and i64 with i32, f32
+    /// and f64.
+    variant joined {
+        small(u8),
+        real(f32),
+        wide(u64),
+        pair(tuple<u32, f64>),
+    }
+
+    /// One flat value of what is no scalar.
+    record one {
+        v: u32,
+    }
+
+    echo-point: func(p: point) -> point;
+    echo-mixed: func(m: mixed) -> mixed;
+    echo-shape: func(s: shape) -> shape;
+    echo-shapes: func(s: list<shape>) -> list<shape>;
+    echo-colour: func(c: colour) -> colour;
+    echo-perms: func(p: perms) -> perms;
+    echo-lots: func(l: lots) -> lots;
+    echo-joined: func(j: joined) -> joined;
+    echo-maybe: func(m: option<point>) -> option<point>;
+    echo-outcome: func(r: result<point, colour>) -> result<point, colour>;
+    echo-nested: func(r: option<result<string, string>>) -> option<result<string, string>>;
+    echo-signed: func(a: s8, b: s16, c: s32, d: s64) -> tuple<s8, s16, s32, s64>;
+    echo-one: func(o: one) -> one;
+    echo-char: func(c: char) -> char;
+    echo-bools: func(b: list<bool>) -> list<bool>;
+    echo-says: func(r: result<string, string>) -> result<string, string>;
+    /// More than 16 flat values: through memory.
+    echo-wide: func(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, i: u64, j: u64, k: u64, l: u64, m: u64, n: u64, o: u64, p: u64, q: string) -> tuple<u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, string>;
+    say: func(line: string);
+}
+
+world echo-app {
+    import echo;
+    export init: func();
+    export update: func();
+}

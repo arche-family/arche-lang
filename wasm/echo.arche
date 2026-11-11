@@ -1,0 +1,144 @@
+/// arche-wasm echo (docs/sprints.md S38): runs a component whose imports
+/// are bindgen's test, the interfaces of package arche:test. Each of their
+/// functions gives back what it was given, lifted and lowered again by the
+/// runtime's canonical ABI (wasm.component): one argument as itself, more
+/// as a tuple of them; `say` writes its line out. An app built against
+/// bindgen's modules of such a world calls each with a value and compares
+/// what comes back, so that bindgen's lowering and lifting, which are
+/// written as Arche, are held to the runtime's, which Nimadir's apps and
+/// the spec's tests hold to Wasmtime's.
+import alloc;
+import std;
+import wasm.component as c;
+import wasm.exec;
+
+/// The imports: what the app says, kept until it is written out.
+pub type Echo = struct {
+    pub lines: alloc.List(alloc.String),
+    pub a: alloc.Allocator,
+}
+
+/// A copy of val, in a.
+fn copy(val: &c.Val, a: alloc.Allocator) -> c.Val {
+    match val {
+        .Str { v } => { return c.Val.Str { v: alloc.String.from(v.view(), a) }; }
+        .List { items } => { return c.Val.List { items: copy_all(items, a: a) }; }
+        .Variant { case, payload } => { return c.Val.Variant { case: case.*, payload: copy_all(payload, a: a) }; }
+        .Unit => { return c.Val.Unit; }
+        .Bool { v } => { return c.Val.Bool { v: v.* }; }
+        .Int { v } => { return c.Val.Int { v: v.* }; }
+        .F32 { bits } => { return c.Val.F32 { bits: bits.* }; }
+        .F64 { bits } => { return c.Val.F64 { bits: bits.* }; }
+        .Char { v } => { return c.Val.Char { v: v.* }; }
+        .Flags { bits } => { return c.Val.Flags { bits: bits.* }; }
+    }
+}
+
+fn copy_all(items: &alloc.List(c.Val), a: alloc.Allocator) -> alloc.List(c.Val) {
+    var out = alloc.List(c.Val).init(a);
+    for v in items.items() {
+        out.push(copy(v, a: a));
+    }
+    return out;
+}
+
+impl c.Imports for Echo {
+    fn has(self: &Echo, instance: str, func: str) -> bool {
+        return instance.starts_with("arche:test/");
+    }
+
+    fn call(self: &mut Echo, instance: str, func: str, args: &alloc.List(c.Val), a: alloc.Allocator) -> exec.Trap!c.Val {
+        if func.eq("say") and args.len() == 1 {
+            match &args.items()[0] {
+                .Str { v } => { self.lines.push(alloc.String.from(v.view(), self.a)); }
+                _ => { }
+            }
+            return c.Val.Unit;
+        }
+        if args.len() == 0 {
+            return c.Val.Unit;
+        }
+        if args.len() == 1 {
+            return copy(&args.items()[0], a: a);
+        }
+        return c.Val.List { items: copy_all(args, a: a) };
+    }
+}
+
+/// A component and its imports: the host the store calls back.
+pub type EchoApp = struct {
+    pub comp: c.Component,
+    pub echo: Echo,
+}
+
+impl exec.Host for EchoApp {
+    fn call(self: &mut EchoApp, store: &mut exec.Store, id: u32, args: []u64, results: []mut u64) -> exec.Trap!void {
+        try c.handle(&self.comp, store, imports: &mut self.echo, id, args, results);
+    }
+}
+
+/// The component at path, its init called: what it said, a line each, onto
+/// out; false, with why, when it could not run.
+pub fn run(fs: &std.Fs, path: str, now: &dyn fn() -> u64, out: &mut std.Output, why: &mut alloc.String, a: alloc.Allocator) -> bool {
+    let bytes = match fs.read_bytes(path, a) {
+        ok(b) => { b }
+        err(_) => {
+            why.push_str("cannot read ");
+            why.push_str(path);
+            return false;
+        }
+    };
+    var store = exec.new_store(exec.default_limits(), a);
+    var echo = Echo { lines: alloc.List(alloc.String).init(a), a: a };
+    let comp = match c.instantiate(&mut store, now: now, bytes.items(), imports: &echo, a) {
+        ok(x) => { x }
+        err(_) => {
+            why.push_str("cannot instantiate it");
+            return false;
+        }
+    };
+    var app = EchoApp { comp: comp, echo: echo };
+    let starts = c.take_starts(&mut app.comp);
+    for f in starts.items() {
+        var none_results = alloc.List(u64).init(a);
+        let none_args: [0]u64 = [];
+        match exec.invoke(&mut store, &mut app, now, func: f.*, none_args[0..0], &mut none_results) {
+            ok(_) => { }
+            err(e) => {
+                why.push_str("its start trapped: ");
+                why.push_str(exec.message(e));
+                return false;
+            }
+        }
+    }
+    let none_args = alloc.List(c.Val).init(a);
+    let p = match c.prepare(&app.comp, &mut store, name: "init", &none_args) {
+        ok(x) => { x }
+        err(_) => {
+            why.push_str("it has no init");
+            return false;
+        }
+    };
+    var results = alloc.List(u64).init(a);
+    let r = exec.invoke(&mut store, &mut app, now, func: p.core, p.args.items(), &mut results);
+    for l in app.echo.lines.items() {
+        out.write(l.view());
+        out.write("\n");
+    }
+    match r {
+        ok(_) => { }
+        err(e) => {
+            why.push_str("init trapped: ");
+            why.push_str(exec.message(e));
+            return false;
+        }
+    }
+    match c.finish(&app.comp, &mut store, &p, &results) {
+        ok(_) => { }
+        err(_) => {
+            why.push_str("init's result could not be read");
+            return false;
+        }
+    }
+    return true;
+}

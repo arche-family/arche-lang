@@ -114,18 +114,21 @@ if ! "$wasm" bindgen "$apps/world.wit" mini-app "$work/arche-counter" > "$work/e
     head -20 "$work/err"
     failed=$((failed + 1))
 elif ! grep -qxF 'pub fn ui_label(host: &mut std.Host, text: str) {' "$work/arche-counter/host_api.arche" ||
-    ! grep -qxF 'extern "wasm:nimadir:shell/host-api@1.2.0" fn ui_button(text_ptr: u32, text_len: u32) -> u32;' "$work/arche-counter/host_api_raw.arche" ||
+    ! grep -qxF 'extern "wasm:nimadir:shell/host-api@1.2.0" fn ui_button(p0: u32, p1: u32) -> u32;' "$work/arche-counter/host_api_raw.arche" ||
     ! grep -qxF 'pub fn storage_get(host: &mut std.Host, key: str, a: alloc.Allocator) -> ?alloc.String {' "$work/arche-counter/host_api.arche" ||
-    ! grep -qxF '// not bound yet: list-apps: returns a list of records' "$work/arche-counter/host_api.arche" ||
+    ! grep -qxF 'pub fn list_apps(host: &mut std.Host, a: alloc.Allocator) -> alloc.List(AppEntry) {' "$work/arche-counter/host_api.arche" ||
+    ! grep -qxF 'pub fn fetch_poll(host: &mut std.Host, request: u32, a: alloc.Allocator) -> ?ResultHttpResponseString {' "$work/arche-counter/host_api.arche" ||
+    ! grep -qxF 'pub fn events(host: &mut std.Host, a: alloc.Allocator) -> alloc.List(Event) {' "$work/arche-counter/dom.arche" ||
+    grep -q 'not bound yet' "$work/arche-counter/host_api.arche" "$work/arche-counter/dom.arche" ||
     ! [ -f "$work/arche-counter/dom.arche" ] || ! [ -f "$work/arche-counter/dom_raw.arche" ]; then
     echo "FAIL bindgen generated other bindings:"
     head -30 "$work/arche-counter/host_api.arche"
     failed=$((failed + 1))
 else
     echo "PASS bindgen generates the bindings of host-api and dom"
-    # Options, results and lists (tests/arche-bindings): an app that calls
-    # every module bindgen generates says what Nimadir's shell says to it
-    # (expected.txt, by hand).
+    # Options, results, lists and records (tests/arche-bindings): an app
+    # that calls every module bindgen generates says what Nimadir's own
+    # shell says to it (expected.txt).
     mkdir -p "$work/arche-bindings"
     cp "$here/tests/arche-bindings/main.arche" "$here/tests/arche-bindings/package.arche" "$work/arche-bindings/"
     "$wasm" bindgen "$apps/world.wit" mini-app "$work/arche-bindings"
@@ -140,11 +143,11 @@ else
             "$wasm" nimadir "$work/arche-bindings.wasm" --frames 2 --input 1:0=2 $mode --registry "$apps/registry.list" > "$work/out" 2>&1 || true
             sh "$apps/normalize.sh" < "$work/out" > "$work/got"
             if ! diff -u "$here/tests/arche-bindings/expected.txt" "$work/got" > "$work/diff"; then
-                echo "FAIL the bindings' options, results and lists $mode: not what Nimadir says:"
+                echo "FAIL the bindings' options, results, lists and records $mode: not what Nimadir says:"
                 head -30 "$work/diff"
                 failed=$((failed + 1))
             else
-                echo "PASS the bindings' options, results and lists $mode: as Nimadir"
+                echo "PASS the bindings' options, results, lists and records $mode: as Nimadir"
             fi
         done
     fi
@@ -229,10 +232,30 @@ else
     done
 fi
 
+# Every kind of WIT type bindgen binds (tests/echo): an app given each,
+# through its bindings, to a function of echo.wit that arche-wasm echo
+# answers with what it was given, by the runtime's canonical ABI, and
+# compared with what comes back.
+mkdir -p "$work/echo"
+cp "$here/tests/echo/main.arche" "$here/tests/echo/package.arche" "$work/echo/"
+if ! "$wasm" bindgen "$here/tests/echo/echo.wit" echo-app "$work/echo" > "$work/err" 2>&1 ||
+    ! "$arche" --target wasm32-component build "$work/echo/main.arche" "$work/echo.core.wasm" >> "$work/err" 2>&1 ||
+    ! "$wasm" component "$work/echo.core.wasm" "$here/tests/echo/echo.wit" echo-app "$work/echo.wasm" >> "$work/err" 2>&1; then
+    echo "FAIL bindgen's types did not build:"
+    head -20 "$work/err"
+    failed=$((failed + 1))
+elif ! "$wasm" echo "$work/echo.wasm" > "$work/out" 2>&1 || ! diff -u "$here/tests/echo/expected.txt" "$work/out" > "$work/diff"; then
+    echo "FAIL bindgen's types do not come back as they went:"
+    head -30 "$work/diff" "$work/out"
+    failed=$((failed + 1))
+else
+    echo "PASS bindgen's records, variants, enums, flags, options, results and tuples come back as they went"
+fi
+
 # Every component the encoder made, validated by wasm-tools where there is
 # one; CI requires it (WASM_TOOLS_REQUIRED=1).
 if command -v wasm-tools > /dev/null 2>&1; then
-    for f in "$work"/mini-apps/*/*.component.wasm "$work/app.wasm" "$work/template.wasm"; do
+    for f in "$work"/mini-apps/*/*.component.wasm "$work/app.wasm" "$work/template.wasm" "$work/echo.wasm"; do
         if wasm-tools validate "$f" 2> "$work/err"; then
             echo "PASS wasm-tools validates $(basename "$f")"
         else
