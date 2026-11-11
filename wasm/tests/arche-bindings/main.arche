@@ -1,0 +1,104 @@
+/// A mini-app that calls what arche-wasm bindgen binds of options, results
+/// and lists (docs/sprints.md S38), on the modules it makes of
+/// tests/nimadir/world.wit, which nimadir-check.sh generates next to this
+/// file: storage-set, storage-get and storage-keys; ui-choice, a list of
+/// strings; and dom's query-all, children, parent, get-attribute and
+/// set-markup, whose error is a string.
+import alloc;
+import dom;
+import host_api;
+import std;
+
+type App = struct {
+    frame: u64,
+    choice: u32,
+    /// The page's list, made in the first frame.
+    list: u32,
+}
+
+fn init(host: &mut std.Host, a: alloc.Allocator) -> App {
+    var why = alloc.String.init(a);
+    if not host_api.storage_set(host, key: "visits", value: "1", why: &mut why, a: a) {
+        host_api.log(host, msg: why.view());
+    }
+    return App { frame: 0, choice: 1, list: 0 };
+}
+
+fn said(host: &mut std.Host, what: str, value: str, a: alloc.Allocator) {
+    var line = alloc.String.from(what, a);
+    line.push_str(": ");
+    line.push_str(value);
+    host_api.ui_label(host, text: line.view());
+}
+
+fn count(host: &mut std.Host, what: str, n: usize, a: alloc.Allocator) {
+    var line = alloc.String.from(what, a);
+    line.push_str(": ");
+    line.push_u64(n as u64);
+    host_api.ui_label(host, text: line.view());
+}
+
+fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
+    state.frame += 1;
+    // Storage: what is set comes back, and what is not is none.
+    var frame = alloc.String.init(a);
+    frame.push_u64(state.frame);
+    var why = alloc.String.init(a);
+    if not host_api.storage_set(host, key: "frame", value: frame.view(), why: &mut why, a: a) {
+        said(host, what: "storage-set failed", value: why.view(), a: a);
+    }
+    let kept = host_api.storage_get(host, key: "frame", a: a) orelse alloc.String.from("(none)", a);
+    said(host, what: "Kept", value: kept.view(), a: a);
+    let visits = host_api.storage_get(host, key: "visits", a: a) orelse alloc.String.from("(none)", a);
+    said(host, what: "Visits", value: visits.view(), a: a);
+    let missing = host_api.storage_get(host, key: "missing", a: a) orelse alloc.String.from("(none)", a);
+    said(host, what: "Missing", value: missing.view(), a: a);
+    // The keys, in no order the two shells agree on: Nimadir's sorts them.
+    let keys = host_api.storage_keys(host, a: a);
+    count(host, what: "Keys", n: keys.len(), a: a);
+    var both: usize = 0;
+    for k in keys.items() {
+        if k.view().eq("frame") or k.view().eq("visits") {
+            both += 1;
+        }
+    }
+    count(host, what: "Of them frame and visits", n: both, a: a);
+    // A choice of three, from a list of strings.
+    var colours = alloc.List(alloc.String).init(a);
+    colours.push(alloc.String.from("Red", a));
+    colours.push(alloc.String.from("Green", a));
+    colours.push(alloc.String.from("Blue", a));
+    state.choice = host_api.ui_choice(host, options: &colours, selected: state.choice, a: a);
+    if (state.choice as usize) < colours.len() {
+        said(host, what: "Picked", value: colours.items()[state.choice as usize].view(), a: a);
+    }
+    // The page: a list made once, then read back each frame.
+    let root = dom.root(host);
+    if state.list == 0 {
+        state.list = dom.create_element(host, tag: "ul");
+        dom.append_child(host, parent_: root, child: state.list);
+        dom.set_attribute(host, item: state.list, name: "id", value_: "colours");
+        var bad = alloc.String.init(a);
+        if not dom.set_markup(host, item: state.list, markup: "<li>Red</li><li>Green</li><li>Blue</li>", why: &mut bad, a: a) {
+            said(host, what: "set-markup failed", value: bad.view(), a: a);
+        }
+    }
+    // Markup that cannot be read is refused, saying why, in words that are
+    // each shell's own.
+    let probe = dom.create_element(host, tag: "div");
+    var refused = alloc.String.init(a);
+    if not dom.set_markup(host, item: probe, markup: "</p>", why: &mut refused, a: a) and refused.len() > 0 {
+        host_api.ui_label(host, text: "Refused, saying why");
+    }
+    dom.release(host, item: probe);
+    count(host, what: "Items", n: dom.query_all(host, scope: root, selector: "li", a: a).len(), a: a);
+    count(host, what: "Children", n: dom.children(host, item: state.list, a: a).len(), a: a);
+    let up = dom.parent(host, item: state.list) orelse 0;
+    if up == root {
+        host_api.ui_label(host, text: "Parent: the page");
+    }
+    let id = dom.get_attribute(host, item: state.list, name: "id", a: a) orelse alloc.String.from("(none)", a);
+    said(host, what: "Id", value: id.view(), a: a);
+    let title = dom.get_attribute(host, item: state.list, name: "title", a: a) orelse alloc.String.from("(none)", a);
+    said(host, what: "Title", value: title.view(), a: a);
+}

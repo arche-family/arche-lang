@@ -508,7 +508,10 @@ Qilingani:
 - `wasm/tests/arche-counter`: Nimadir'ning Rust counter'i Arche'da, generatsiya qilingan binding'lar ustida. Nimadir'ning `counter-script` holatiga Nimadir'ning o'z shell'i bergan javob bilan bir xil chiqadi: `arche-wasm`da interpreter va JIT bilan, Nimadir'ning Wasmtime'dagi shell'ida ham (lokal). `arche-app` esa host qaytargan matnni oladi ("Typed: Ada").
 - Encoder `cabi_realloc` imzosini tekshiradi: `(i32 i32 i32 i32) -> (i32)` bo'lmasa, rad etadi. CI'ning `wasm-runtime` job'i `wasm-tools`ni o'rnatadi va `nimadir-check.sh` encoder yasagan har component'ni `wasm-tools validate` bilan tekshiradi (`WASM_TOOLS_REQUIRED=1`).
 
-Qolgani: list, option, result, record va variant'lar uchun binding'lar (`storage-get`, `list-apps`, `dom.events` va boshqalar); ilova shabloni.
+- Binding'larga option (`?T`), list (natija `alloc.List(T)`, parametr `[]T` yoki `&alloc.List(alloc.String)`) va result (`?T` yoki `bool`, xato `why: &mut alloc.String`ga) qo'shildi. `wasm/tests/arche-bindings` storage, `ui-choice`, `dom.query-all`, `children`, `parent`, `get-attribute` va `set-markup`ni chaqiradi va Nimadir'ning o'z shell'i bergan natija bilan solishtiriladi. Arche counter endi count'ni storage'da saqlaydi va Rust'nikidek init'da log yozadi.
+- Ilova shabloni: `wasm/template` va `wasm/nimadir-app.sh <papka> <chiqish>`. Skript papkaning nusxasiga binding'larni generatsiya qiladi, build qiladi va component yasaydi; asl papkaga hech narsa yozmaydi. `nimadir-check.sh` shablonni shu skript bilan build qilib sinaydi.
+
+Qolgani: record va record list'lari uchun binding'lar (`list-apps`, `app-info`, `fetch`, `fetch-poll`, `dom.bounds`, `dom.events`). `arche-wasm`ning Nimadir shell'i ikki joyda Nimadir'dan farq qiladi: `storage-keys` tartibi (Nimadir saralaydi) va yopilmagan teg'li `set-markup` (Nimadir rad etadi).
 
 ### S39. ARM64 JIT va aarch64 telefon
 

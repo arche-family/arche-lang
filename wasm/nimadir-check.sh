@@ -113,44 +113,38 @@ if ! "$wasm" bindgen "$apps/world.wit" mini-app "$work/arche-counter" > "$work/e
     failed=$((failed + 1))
 elif ! grep -qxF 'pub fn ui_label(host: &mut std.Host, text: str) {' "$work/arche-counter/host_api.arche" ||
     ! grep -qxF 'extern "wasm:nimadir:shell/host-api@1.2.0" fn ui_button(text_ptr: u32, text_len: u32) -> u32;' "$work/arche-counter/host_api_raw.arche" ||
-    ! grep -qxF '// not bound yet: storage-get: returns an option' "$work/arche-counter/host_api.arche" ||
+    ! grep -qxF 'pub fn storage_get(host: &mut std.Host, key: str, a: alloc.Allocator) -> ?alloc.String {' "$work/arche-counter/host_api.arche" ||
+    ! grep -qxF '// not bound yet: list-apps: returns a list of records' "$work/arche-counter/host_api.arche" ||
     ! [ -f "$work/arche-counter/dom.arche" ] || ! [ -f "$work/arche-counter/dom_raw.arche" ]; then
     echo "FAIL bindgen generated other bindings:"
     head -30 "$work/arche-counter/host_api.arche"
     failed=$((failed + 1))
 else
     echo "PASS bindgen generates the bindings of host-api and dom"
-    # Every module it generates builds, and the encoder takes what they
-    # import.
-    "$wasm" bindgen "$apps/world.wit" mini-app "$work/bindings"
-    cp "$here/tests/arche-counter/package.arche" "$work/bindings/"
-    cat > "$work/bindings/main.arche" <<'EOF'
-import alloc;
-import dom;
-import host_api;
-import std;
-
-type S = struct {
-    root: u32,
-}
-
-fn init(host: &mut std.Host, a: alloc.Allocator) -> S {
-    return S { root: dom.root(host) };
-}
-
-fn update(state: &mut S, host: &mut std.Host, a: alloc.Allocator) {
-    let t = dom.create_text(host, text: "bound");
-    dom.append_child(host, parent_: state.root, child: t);
-    host_api.ui_label(host, text: dom.value(host, item: t, a: a).view());
-}
-EOF
-    if ! "$arche" --target wasm32-component build "$work/bindings/main.arche" "$work/bindings.core.wasm" > "$work/err" 2>&1 ||
-        ! "$wasm" component "$work/bindings.core.wasm" "$apps/world.wit" mini-app "$work/bindings.wasm" >> "$work/err" 2>&1; then
+    # Options, results and lists (tests/arche-bindings): an app that calls
+    # every module bindgen generates says what Nimadir's shell says to it
+    # (expected.txt, by hand).
+    mkdir -p "$work/arche-bindings"
+    cp "$here/tests/arche-bindings/main.arche" "$here/tests/arche-bindings/package.arche" "$work/arche-bindings/"
+    "$wasm" bindgen "$apps/world.wit" mini-app "$work/arche-bindings"
+    if ! "$arche" --target wasm32-component build "$work/arche-bindings/main.arche" "$work/arche-bindings.core.wasm" > "$work/err" 2>&1 ||
+        ! "$wasm" component "$work/arche-bindings.core.wasm" "$apps/world.wit" mini-app "$work/arche-bindings.wasm" >> "$work/err" 2>&1; then
         echo "FAIL the generated bindings did not build:"
         head -20 "$work/err"
         failed=$((failed + 1))
     else
-        echo "PASS the generated bindings build and are a component of the world"
+        for mode in "" --jit; do
+            # shellcheck disable=SC2086
+            "$wasm" nimadir "$work/arche-bindings.wasm" --frames 2 --input 1:0=2 $mode --registry "$apps/registry.list" > "$work/out" 2>&1 || true
+            sh "$apps/normalize.sh" < "$work/out" > "$work/got"
+            if ! diff -u "$here/tests/arche-bindings/expected.txt" "$work/got" > "$work/diff"; then
+                echo "FAIL the bindings' options, results and lists $mode: not what Nimadir says:"
+                head -30 "$work/diff"
+                failed=$((failed + 1))
+            else
+                echo "PASS the bindings' options, results and lists $mode: as Nimadir"
+            fi
+        done
     fi
     if ! "$arche" --target wasm32-component build "$work/arche-counter/main.arche" "$work/arche-counter.core.wasm" > "$work/err" 2>&1 ||
         ! "$wasm" component "$work/arche-counter.core.wasm" "$apps/world.wit" mini-app "$work/arche-counter.wasm" >> "$work/err" 2>&1; then
@@ -214,10 +208,29 @@ expect "runaway flooding the shell is stopped" 3 "stopped: host limit exceeded" 
 expect "a full store is said, not a trap" 0 "   [wasm log] runaway: storage is full: 1 MiB per app" -- "$apps/runaway.component.wasm" --frames 2 --script 1:3
 expect "an import the shell does not give is refused" 1 "arche-wasm: the component did not instantiate: imports what the shell does not give" -- "$apps/counter.component.wasm" --deny now-millis
 
+# The app template (template/, S38), built by nimadir-app.sh as an app
+# author would: its button counts.
+if ! ARCHE="$arche" ARCHE_WASM="$wasm" sh "$here/nimadir-app.sh" "$here/template" "$work/template.wasm" > "$work/err" 2>&1; then
+    echo "FAIL the template did not build:"
+    head -20 "$work/err"
+    failed=$((failed + 1))
+else
+    for mode in "" --jit; do
+        "$wasm" nimadir "$work/template.wasm" --script 1:0,2:0 --frames 4 $mode > "$work/out" 2>&1 || true
+        if grep -qxF '   label   : "Tapped 2 times"' "$work/out"; then
+            echo "PASS the template, built by nimadir-app.sh, counts its taps $mode"
+        else
+            echo "FAIL the template $mode:"
+            head -20 "$work/out"
+            failed=$((failed + 1))
+        fi
+    done
+fi
+
 # Every component the encoder made, validated by wasm-tools where there is
 # one; CI requires it (WASM_TOOLS_REQUIRED=1).
 if command -v wasm-tools > /dev/null 2>&1; then
-    for f in "$work"/mini-apps/*/*.component.wasm "$work/app.wasm"; do
+    for f in "$work"/mini-apps/*/*.component.wasm "$work/app.wasm" "$work/template.wasm"; do
         if wasm-tools validate "$f" 2> "$work/err"; then
             echo "PASS wasm-tools validates $(basename "$f")"
         else

@@ -1,0 +1,30 @@
+/// A Nimadir mini-app in Arche, to start from (docs/sprints.md S38).
+/// Built with `wasm/nimadir-app.sh <this-dir> app.component.wasm`, which
+/// generates the bindings host_api and dom next to a copy of it, and run
+/// with `arche-wasm nimadir app.component.wasm` or in Nimadir.
+///
+/// The app's state is a value of its own type: init makes it, once, and
+/// update draws a frame from it and changes it by what the user did. What
+/// the app may do is what its host gives: there is no other way out.
+import alloc;
+import host_api;
+import std;
+
+type App = struct {
+    taps: u32,
+}
+
+fn init(host: &mut std.Host, a: alloc.Allocator) -> App {
+    return App { taps: 0 };
+}
+
+fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
+    host_api.ui_heading(host, text: "Arche", level: 1);
+    var line = alloc.String.from("Tapped ", a);
+    line.push_u64(state.taps as u64);
+    line.push_str(" times");
+    host_api.ui_label(host, text: line.view());
+    if host_api.ui_button(host, text: "Tap") {
+        state.taps += 1;
+    }
+}
