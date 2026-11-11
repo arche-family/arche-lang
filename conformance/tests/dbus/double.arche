@@ -1,0 +1,56 @@
+// test: run
+// spec: dbus (D-Bus specification, wire format: DOUBLE)
+// stage0: skip
+// wasm: skip
+// stdout: doubles: 3 the same, after a byte, aligned to 8
+// stdout: skipped to the end: true
+import alloc;
+import core.float;
+import dbus;
+import std;
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let latitude: f64 = 41.311081;
+    let longitude: f64 = -69.240562;
+    let tiny: f64 = 0.000000001;
+    var w = dbus.writer(a);
+    dbus.put_byte(&mut w, v: 1);
+    dbus.put_f64(&mut w, v: latitude);
+    dbus.put_f64(&mut w, v: longitude);
+    dbus.put_f64(&mut w, v: tiny);
+    var h = dbus.header(dbus.SIGNAL, a: a);
+    h.path.push_str("/org/arche/X");
+    h.iface.push_str("org.arche.T");
+    h.member.push_str("Where");
+    h.signature.push_str("yddd");
+    let bytes = dbus.encode(&h, serial: 1, body: &w, a: a);
+    let m = try dbus.parse(bytes.items(), a: a);
+    var r = dbus.reader(&m, a: a);
+    _ = try dbus.get_byte(&mut r);
+    var same: u32 = 0;
+    if float.bits64(try dbus.get_f64(&mut r)) == float.bits64(latitude) {
+        same += 1;
+    }
+    if float.bits64(try dbus.get_f64(&mut r)) == float.bits64(longitude) {
+        same += 1;
+    }
+    if float.bits64(try dbus.get_f64(&mut r)) == float.bits64(tiny) {
+        same += 1;
+    }
+    sys.stdout.write("doubles: ");
+    sys.stdout.write_u64(same as u64);
+    sys.stdout.write(" the same, after a byte, aligned to 8\n");
+    var s = dbus.reader(&m, a: a);
+    try dbus.skip(&mut s, sig: "y");
+    var k: u32 = 0;
+    while k < 3 : (k += 1) {
+        try dbus.skip(&mut s, sig: "d");
+    }
+    sys.stdout.write("skipped to the end: ");
+    if dbus.more(&s, end: m.body.len()) {
+        sys.stdout.write("false\n");
+    } else {
+        sys.stdout.write("true\n");
+    }
+}

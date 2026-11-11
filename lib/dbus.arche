@@ -1,5 +1,5 @@
 /// D-Bus (docs/sprints.md S35): a client of the message bus, as the
-/// phone's services speak to ModemManager, iwd and PipeWire on Linux. A
+/// phone's services speak to ModemManager and iwd on Linux. A
 /// connection over a Unix socket, authenticated by EXTERNAL (the kernel
 /// tells the bus who connects), then messages: method calls and their
 /// returns and errors, and signals, both ways.
@@ -11,6 +11,7 @@
 /// one gives an error, never a panic (fuzz/dbus_fuzz.arche). Unix file
 /// descriptors are not passed.
 import alloc;
+import core.float;
 import std;
 
 pub type DbusError = error {
@@ -149,6 +150,11 @@ pub fn put_string(w: &mut Writer, s: str) {
 }
 
 /// A signature (g): its length in a byte, its bytes, a 0.
+/// A double ('d'), as its IEEE 754 bits.
+pub fn put_f64(w: &mut Writer, v: f64) {
+    put_u64(w, v: float.bits64(v));
+}
+
 pub fn put_signature(w: &mut Writer, s: str) {
     w.bytes.push(s.len() as u8);
     for b in s.bytes() {
@@ -266,6 +272,11 @@ pub fn get_i64(r: &mut Reader) -> DbusError!i64 {
 }
 
 /// A string, or an object path, which must be UTF-8 and end in its 0.
+pub fn get_f64(r: &mut Reader) -> DbusError!f64 {
+    let bits = try get_u64(r);
+    return float.from_bits64(bits);
+}
+
 pub fn get_string(r: &mut Reader, a: alloc.Allocator) -> DbusError!alloc.String {
     let n = (try get(r, size: 4)) as usize;
     return text_after(r, n: n, a: a);
@@ -853,6 +864,24 @@ fn receive(b: &mut Bus) -> DbusError!Message {
         try fill(b);
     }
     return DbusError.Disconnected;
+}
+
+/// The connection's socket, to wait on with poll(2) together with other
+/// things; next does not wait when ready says a message is already in.
+pub fn descriptor(b: &Bus) -> i64 {
+    return b.socket.descriptor();
+}
+
+/// Whether a whole message is already in, read or kept while a call
+/// waited: next gives it without reading the socket.
+pub fn ready(b: &Bus) -> bool {
+    if b.waiting.len() > 0 {
+        return true;
+    }
+    match message_length(b.inbox.items()) {
+        some(n) => { return b.inbox.len() as u64 >= n; }
+        none => { return false; }
+    }
 }
 
 /// The next message that came to this connection: a signal, or a call to
