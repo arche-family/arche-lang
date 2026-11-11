@@ -571,11 +571,13 @@ fn field_string(w: &mut Writer, code: u8, sig: str, value: str) {
 
 /// What a message to send says besides its body: its kind and flags, a
 /// return's or an error's call, and its fields; an empty one is left out.
+/// The sender is a bus's to set, on what it passes on.
 pub type Header = struct {
     pub kind: u32,
     pub flags: u32,
     pub reply_to: u32,
     pub destination: alloc.String,
+    pub sender: alloc.String,
     pub path: alloc.String,
     pub iface: alloc.String,
     pub member: alloc.String,
@@ -590,12 +592,38 @@ pub fn header(kind: u32, a: alloc.Allocator) -> Header {
         flags: 0,
         reply_to: 0,
         destination: alloc.String.init(a),
+        sender: alloc.String.init(a),
         path: alloc.String.init(a),
         iface: alloc.String.init(a),
         member: alloc.String.init(a),
         error_name: alloc.String.init(a),
         signature: alloc.String.init(a),
     };
+}
+
+/// The header of m, as it came: what a bus passes on, with its sender.
+pub fn header_of(m: &Message, a: alloc.Allocator) -> Header {
+    return Header {
+        kind: m.kind,
+        flags: m.flags,
+        reply_to: m.reply_to,
+        destination: alloc.String.from(m.destination.view(), a),
+        sender: alloc.String.from(m.sender.view(), a),
+        path: alloc.String.from(m.path.view(), a),
+        iface: alloc.String.from(m.iface.view(), a),
+        member: alloc.String.from(m.member.view(), a),
+        error_name: alloc.String.from(m.error_name.view(), a),
+        signature: alloc.String.from(m.signature.view(), a),
+    };
+}
+
+/// A body of bytes already written, as m's: to pass on as it is.
+pub fn body_of(m: &Message, a: alloc.Allocator) -> Writer {
+    var w = writer(a);
+    for b in m.body.items() {
+        w.bytes.push(b.*);
+    }
+    return w;
 }
 
 /// The bytes of a message with header h, serial serial, and body body.
@@ -619,6 +647,7 @@ pub fn encode(h: &Header, serial: u32, body: &Writer, a: alloc.Allocator) -> all
         put_u32(&mut w, v: h.reply_to);
     }
     field_string(&mut w, code: 6, sig: "s", value: h.destination.view());
+    field_string(&mut w, code: 7, sig: "s", value: h.sender.view());
     field_string(&mut w, code: 8, sig: "g", value: h.signature.view());
     end_array(&mut w, m: fields);
     pad(&mut w, align: 8);

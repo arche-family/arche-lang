@@ -6,19 +6,32 @@
 #   2. dbus-send calling an Arche service (dbus_check serve);
 #   3. the system bus's ModemManager asked for its modems, when there is
 #      one; MODEM_MANAGER_REQUIRED=1 makes its absence a failure.
-# Needs dbus-daemon and dbus-send.
+# Needs dbus-daemon and dbus-send. DBUS_BUS names another bus to try in
+# dbus-daemon's place for 1 and 2: a command that serves one at the path it
+# is given (arche-os's phone/dbusd).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 build=${WORK:-$here/../build/interop}
 mkdir -p "$build"
 work=$(mktemp -d)
+bus=""
+server=""
 cleanup() {
-    jobs -p | xargs -r kill 2>/dev/null || true
+    # The bus and the service, by their pids: a script's jobs are not
+    # listed in its EXIT trap, and a bus left running holds the output.
+    for p in $bus $server; do
+        kill "$p" 2>/dev/null || true
+    done
     rm -rf "$work"
 }
 trap cleanup EXIT
 "$here/../compiler/arche-build" "$here/dbus_check.arche" "$build/dbus_check"
-dbus-daemon --session --address="unix:path=$work/bus" --nofork &
+if [ -n "${DBUS_BUS:-}" ]; then
+    $DBUS_BUS "$work/bus" > "$work/bus.log" 2>&1 &
+else
+    dbus-daemon --session --address="unix:path=$work/bus" --nofork &
+fi
+bus=$!
 tries=0
 while [ ! -S "$work/bus" ] && [ "$tries" -lt 50 ]; do
     sleep 0.1
@@ -27,6 +40,7 @@ done
 "$build/dbus_check" echo "$work/bus"
 # dbus-send against the Arche service.
 "$build/dbus_check" serve "$work/bus" > "$work/serve.out" &
+server=$!
 tries=0
 while ! grep -q serving "$work/serve.out" 2>/dev/null && [ "$tries" -lt 50 ]; do
     sleep 0.1
