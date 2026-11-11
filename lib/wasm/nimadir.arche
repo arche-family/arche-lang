@@ -124,6 +124,23 @@ pub type Ui = struct {
     pub locale: alloc.String,
     pub time_zone: alloc.String,
     pub utc_offset: i32,
+    /// The network as the shell gives it: the origins the app's manifest
+    /// declares (none: it may reach nowhere), whether the shell fetches at
+    /// all, and whether it lets apps reach this machine and its local
+    /// network (a test's, as NIMADIR_ALLOW_LOCAL_NETWORK does).
+    pub origins: alloc.List(alloc.String),
+    pub online: bool,
+    pub allow_local: bool,
+    /// Requests the app made, for the shell to make (take_outgoing); the
+    /// numbers of those under way; the shell's answers (reply), each given
+    /// to the app once; the next request's number.
+    outgoing: alloc.List(Outgoing),
+    under_way: alloc.List(u32),
+    replies: alloc.List(Reply),
+    next_request: u32,
+    /// Whether storage-set or storage-remove changed the app's storage
+    /// since the shell last kept it.
+    pub storage_changed: bool,
     keys: alloc.List(alloc.String),
     values: alloc.List(alloc.String),
     nodes: alloc.List(Node),
@@ -175,6 +192,14 @@ pub fn new_ui(a: alloc.Allocator) -> Ui {
         locale: alloc.String.from("en-US", a),
         time_zone: alloc.String.init(a),
         utc_offset: 0,
+        origins: alloc.List(alloc.String).init(a),
+        online: false,
+        allow_local: false,
+        outgoing: alloc.List(Outgoing).init(a),
+        under_way: alloc.List(u32).init(a),
+        replies: alloc.List(Reply).init(a),
+        next_request: 1,
+        storage_changed: false,
         keys: alloc.List(alloc.String).init(a),
         values: alloc.List(alloc.String).init(a),
         nodes: alloc.List(Node).init(a),
@@ -369,7 +394,7 @@ fn url_of(args: &alloc.List(c.Val)) -> str {
 /// to anywhere but this machine, an address that is no http or https one
 /// or has no host, this machine or its local network, and, past those,
 /// an app that declares no network access.
-fn refusal(url: str, why: &mut alloc.String, a: alloc.Allocator) {
+fn refusal(ui: &Ui, url: str, size: usize, why: &mut alloc.String, a: alloc.Allocator) {
     if url.starts_with("http://") and not loopback(host_in(url[7..url.len()]), a: a) {
         why.push_str(url);
         why.push_str(" is plain http — the shell only fetches over https:// (this machine, localhost or 127.0.0.1, is the one exception)");
@@ -406,14 +431,215 @@ fn refusal(url: str, why: &mut alloc.String, a: alloc.Allocator) {
         why.push_str(" has no host");
         return;
     }
-    if local(host.view()[0..end]) {
-        why.push_str(scheme.view());
-        why.push_str("://");
-        why.push_str(host.view()[0..end]);
+    var origin = alloc.String.from(scheme.view(), a);
+    origin.push_str("://");
+    origin.push_str(host.view()[0..end]);
+    if local(host_in(host.view()[0..end])) and not ui.allow_local {
+        why.push_str(origin.view());
         why.push_str(" is this machine or its local network, which apps may not reach");
         return;
     }
-    why.push_str("this app declares no network access in its manifest");
+    if ui.origins.len() == 0 {
+        why.push_str("this app declares no network access in its manifest");
+        return;
+    }
+    var declared = false;
+    for o in ui.origins.items() {
+        if lower(o.view(), a: a).view().eq(origin.view()) {
+            declared = true;
+        }
+    }
+    if not declared {
+        why.push_str(origin.view());
+        why.push_str(" is not among the origins this app's manifest declares");
+        return;
+    }
+    if size > MAX_BODY {
+        why.push_str("a request body may be 8 MiB");
+        return;
+    }
+    if ui.under_way.len() >= 8 {
+        why.push_str("8 requests are already under way");
+        return;
+    }
+    if not ui.online {
+        why.push_str("no network in this shell");
+    }
+}
+
+/// The largest body of a request, and of an answer: 8 MiB, as Nimadir's.
+const MAX_BODY: usize = 8 << 20;
+
+/// A request's body's length, its record's fourth field.
+fn body_len(args: &alloc.List(c.Val)) -> usize {
+    match &args.items()[0] {
+        .List { items } => {
+            if items.len() > 3 {
+                match &items.items()[3] {
+                    .List { items: bytes } => { return bytes.len(); }
+                    _ => { }
+                }
+            }
+        }
+        _ => { }
+    }
+    return 0;
+}
+
+/// A request an app made, for the shell to make: its number; its method,
+/// address, headers (a name, then its value, and so on) and body.
+pub type Outgoing = struct {
+    pub id: u32,
+    pub method: alloc.String,
+    pub url: alloc.String,
+    pub headers: alloc.List(alloc.String),
+    pub body: alloc.List(u8),
+}
+
+/// The shell's answer to a request: a response (answered), its status,
+/// headers and body; or why there is none.
+pub type Reply = struct {
+    pub id: u32,
+    pub answered: bool,
+    pub status: u16,
+    pub headers: alloc.List(alloc.String),
+    pub body: alloc.List(u8),
+    pub why: alloc.String,
+}
+
+/// The request in fetch's args, as Outgoing, in a.
+fn outgoing_of(args: &alloc.List(c.Val), id: u32, a: alloc.Allocator) -> Outgoing {
+    var out = Outgoing { id: id, method: alloc.String.init(a), url: alloc.String.init(a), headers: alloc.List(alloc.String).init(a), body: alloc.List(u8).init(a) };
+    match &args.items()[0] {
+        .List { items } => {
+            if items.len() == 4 {
+                match &items.items()[0] {
+                    .Str { v } => { out.method.push_str(v.view()); }
+                    _ => { }
+                }
+                match &items.items()[1] {
+                    .Str { v } => { out.url.push_str(v.view()); }
+                    _ => { }
+                }
+                match &items.items()[2] {
+                    .List { items: pairs } => {
+                        for pair in pairs.items() {
+                            match pair {
+                                .List { items: two } => {
+                                    for half in two.items() {
+                                        match half {
+                                            .Str { v } => { out.headers.push(alloc.String.from(v.view(), a)); }
+                                            _ => { }
+                                        }
+                                    }
+                                }
+                                _ => { }
+                            }
+                        }
+                    }
+                    _ => { }
+                }
+                match &items.items()[3] {
+                    .List { items: bytes } => {
+                        for byte in bytes.items() {
+                            match byte {
+                                .Int { v } => { out.body.push((v.* & 0xFF) as u8); }
+                                _ => { }
+                            }
+                        }
+                    }
+                    _ => { }
+                }
+            }
+        }
+        _ => { }
+    }
+    return out;
+}
+
+/// A reply as fetch-poll gives it: ok with the http-response record, or
+/// err with why.
+fn reply_val(r: &Reply, a: alloc.Allocator) -> c.Val {
+    if not r.answered {
+        return done(r.why.view(), a);
+    }
+    var headers = alloc.List(c.Val).init(a);
+    var k: usize = 0;
+    while k + 1 < r.headers.len() : (k += 2) {
+        var pair = alloc.List(c.Val).init(a);
+        pair.push(str_val(r.headers.items()[k].view(), a));
+        pair.push(str_val(r.headers.items()[k + 1].view(), a));
+        headers.push(c.Val.List { items: pair });
+    }
+    var body = alloc.List(c.Val).init(a);
+    for byte in r.body.items() {
+        body.push(int_val(byte.* as u64));
+    }
+    var fields = alloc.List(c.Val).init(a);
+    fields.push(int_val(r.status as u64));
+    fields.push(c.Val.List { items: headers });
+    fields.push(c.Val.List { items: body });
+    var p = alloc.List(c.Val).init(a);
+    p.push(c.Val.List { items: fields });
+    return c.Val.Variant { case: 0, payload: p };
+}
+
+/// The requests the app made since this was last asked, for the shell to
+/// make; each is answered with reply.
+pub fn take_outgoing(ui: &mut Ui, a: alloc.Allocator) -> alloc.List(Outgoing) {
+    var out = alloc.List(Outgoing).init(a);
+    for o in ui.outgoing.items() {
+        var copy = Outgoing { id: o.id, method: alloc.String.from(o.method.view(), a), url: alloc.String.from(o.url.view(), a), headers: alloc.List(alloc.String).init(a), body: alloc.List(u8).init(a) };
+        for h in o.headers.items() {
+            copy.headers.push(alloc.String.from(h.view(), a));
+        }
+        for byte in o.body.items() {
+            copy.body.push(byte.*);
+        }
+        out.push(copy);
+    }
+    ui.outgoing.clear();
+    return out;
+}
+
+/// The shell's answer to request r.id, for fetch-poll to give.
+pub fn reply(ui: &mut Ui, r: Reply) {
+    var k: usize = 0;
+    while k < ui.under_way.len() : (k += 1) {
+        if ui.under_way.items()[k] == r.id {
+            ui.under_way.items_mut()[k] = 0;
+        }
+    }
+    var left = alloc.List(u32).init(ui.a);
+    for u in ui.under_way.items() {
+        if u.* != 0 {
+            left.push(u.*);
+        }
+    }
+    ui.under_way = left;
+    ui.replies.push(r);
+}
+
+/// The app's storage, live entries only, into keys and values, for the
+/// shell to keep.
+pub fn storage_entries(ui: &Ui, keys: &mut alloc.List(alloc.String), values: &mut alloc.List(alloc.String), a: alloc.Allocator) {
+    var i: usize = 0;
+    while i < ui.keys.len() : (i += 1) {
+        if ui.keys.items()[i].len() > 0 {
+            keys.push(alloc.String.from(ui.keys.items()[i].view(), a));
+            values.push(alloc.String.from(ui.values.items()[i].view(), a));
+        }
+    }
+}
+
+/// An entry of the app's storage as the shell kept it, put back before
+/// the app starts.
+pub fn storage_put(ui: &mut Ui, key: str, value: str) {
+    if key.len() == 0 {
+        return;
+    }
+    ui.keys.push(alloc.String.from(key, ui.a));
+    ui.values.push(alloc.String.from(value, ui.a));
 }
 
 /// s in lower case.
@@ -1064,6 +1290,7 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
                 ui.values.push(alloc.String.from(value, a));
             }
         }
+        ui.storage_changed = true;
         return done("", a);
     }
     if func.eq("storage-remove") {
@@ -1071,6 +1298,7 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
             some(i) => {
                 ui.keys.items_mut()[i] = alloc.String.init(a);
                 ui.values.items_mut()[i] = alloc.String.init(a);
+                ui.storage_changed = true;
             }
             none => { }
         }
@@ -1130,16 +1358,38 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
     }
     if func.eq("fetch") {
         // Refused as Nimadir's shell refuses it (host/src/net.rs), in its
-        // order; every app run here declares no network access, since no
-        // manifest is read.
+        // order; else made by the shell (take_outgoing), its number given.
         var why = alloc.String.init(a);
-        refusal(url_of(args), why: &mut why, a: a);
-        return done(why.view(), a);
+        refusal(ui, url: url_of(args), size: body_len(args), why: &mut why, a: a);
+        if why.len() > 0 {
+            return done(why.view(), a);
+        }
+        let id = ui.next_request;
+        ui.next_request += 1;
+        ui.outgoing.push(outgoing_of(args, id: id, a: ui.a));
+        ui.under_way.push(id);
+        var p = alloc.List(c.Val).init(a);
+        p.push(int_val(id as u64));
+        return c.Val.Variant { case: 0, payload: p };
     }
     if func.eq("fetch-poll") {
-        // No request is ever under way here.
+        // Its answer, once; none while it is under way.
+        let id = (int_arg(args, i: 0) & 0xFFFFFFFF) as u32;
+        var k: usize = 0;
+        while k < ui.replies.len() : (k += 1) {
+            if ui.replies.items()[k].id == id {
+                let answer = reply_val(&ui.replies.items()[k], a: a);
+                ui.replies.items_mut()[k].id = 0;
+                return some_val(answer, a);
+            }
+        }
+        for u in ui.under_way.items() {
+            if u.* == id {
+                return nothing(a);
+            }
+        }
         var why = alloc.String.from("no request numbered ", a);
-        why.push_u64(int_arg(args, i: 0));
+        why.push_u64(id as u64);
         return some_val(done(why.view(), a), a);
     }
     if func.eq("locale") {
