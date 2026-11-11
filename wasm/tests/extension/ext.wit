@@ -8,6 +8,21 @@ interface notes {
     cancel: func(id: u32);
 }
 
+/// Messages the embedder keeps, and where it is, when it knows: answers
+/// of a list and of an option, of records.
+interface inbox {
+    record message {
+        sender: string,
+        text: string,
+    }
+    record place {
+        latitude: f64,
+        longitude: f64,
+    }
+    list: func() -> list<message>;
+    located: func() -> option<place>;
+}
+
 /// Whether this update is the embedder's waking the app.
 interface wake {
     woken: func() -> bool;
@@ -17,4 +32,5 @@ world app {
     include nimadir:shell/mini-app@1.2.0;
     import notes;
     import wake;
+    import inbox;
 }

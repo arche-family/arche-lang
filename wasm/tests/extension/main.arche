@@ -1,8 +1,10 @@
 /// An app of a world that includes Nimadir's and imports more (ext.wit,
 /// nimadir-check.sh): woken, it posts a note; drawn, it shows the note's
-/// number, and its button cancels the note.
+/// number, how many messages the inbox has and whether it knows where it
+/// is, and its button cancels the note.
 import alloc;
 import host_api;
+import inbox;
 import notes;
 import std;
 import wake;
@@ -24,6 +26,13 @@ fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
     var line = alloc.String.from("Note ", a);
     line.push_u64(state.id as u64);
     host_api.ui_label(host, text: line.view());
+    var count = alloc.String.from("Messages ", a);
+    count.push_u64(inbox.list(host, a: a).len() as u64);
+    host_api.ui_label(host, text: count.view());
+    match inbox.located(host) {
+        some(_) => { host_api.ui_label(host, text: "Somewhere"); }
+        none => { host_api.ui_label(host, text: "Nowhere"); }
+    }
     if host_api.ui_button(host, text: "Cancel") {
         notes.cancel(host, id: state.id);
     }

@@ -46,7 +46,7 @@ fn usage(sys: &mut std.System) -> !void {
     sys.stderr.write("       arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>\n");
     sys.stderr.write("       arche-wasm bindgen <world.wit> <world> <out-dir>\n");
     sys.stderr.write("       arche-wasm echo <component.wasm>\n");
-    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]... [--add instance#func[=numbered|true|false|n]]... [--locale tag] [--time-zone name] [--utc-offset minutes]\n");
+    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]... [--add instance#func[=numbered|true|false|n|[]|none]]... [--locale tag] [--time-zone name] [--utc-offset minutes]\n");
     sys.proc.exit(2);
 }
 
@@ -354,8 +354,9 @@ type Who = struct {
 
 /// A function added to Nimadir's world, as --add says it:
 /// instance#func, answered with nothing; =numbered, with each call's
-/// number; =true, =false or =n, with that.
-fn add_spec(ui: &mut nimadir.Ui, given: str) -> bool {
+/// number; =true, =false or =n, with that; =[] with an empty list, =none
+/// with an option's none.
+fn add_spec(ui: &mut nimadir.Ui, given: str, a: alloc.Allocator) -> bool {
     let b = given.bytes();
     var hash: usize = 0;
     while hash < b.len() and b[hash] != '#' {
@@ -377,6 +378,10 @@ fn add_spec(ui: &mut nimadir.Ui, given: str) -> bool {
     let value = given[eq + 1..b.len()];
     if value.eq("numbered") {
         nimadir.add(ui, instance: instance, func: func, numbered: true, answer: component.Val.Unit);
+    } else if value.eq("[]") {
+        nimadir.add(ui, instance: instance, func: func, numbered: false, answer: component.Val.List { items: alloc.List(component.Val).init(a) });
+    } else if value.eq("none") {
+        nimadir.add(ui, instance: instance, func: func, numbered: false, answer: component.Val.Variant { case: 0, payload: alloc.List(component.Val).init(a) });
     } else if value.eq("true") or value.eq("false") {
         nimadir.add(ui, instance: instance, func: func, numbered: false, answer: component.Val.Bool { v: value.eq("true") });
     } else {
@@ -419,7 +424,7 @@ fn start_app(fs: &std.Fs, source: str, store: &mut exec.Store, now: &dyn fn() ->
         nimadir.deny(&mut ui, func: d.view());
     }
     for g in added.items() {
-        if not add_spec(&mut ui, given: g.view()) {
+        if not add_spec(&mut ui, given: g.view(), a: a) {
             why.push_str("not instance#func[=answer]: ");
             why.push_str(g.view());
             return none;

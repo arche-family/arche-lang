@@ -251,7 +251,7 @@ else
         fi
         for mode in "" --jit; do
             # shellcheck disable=SC2086
-            "$wasm" nimadir "$work/ext.wasm" $frames $mode --add 'test:ext/notes@0.1.0#post=numbered' --add 'test:ext/notes@0.1.0#cancel' --add "test:ext/wake@0.1.0#woken=$woken" > "$work/out" 2>&1 || true
+            "$wasm" nimadir "$work/ext.wasm" $frames $mode --add 'test:ext/notes@0.1.0#post=numbered' --add 'test:ext/notes@0.1.0#cancel' --add "test:ext/wake@0.1.0#woken=$woken" --add 'test:ext/inbox@0.1.0#list=[]' --add 'test:ext/inbox@0.1.0#located=none' > "$work/out" 2>&1 || true
             sh "$apps/normalize.sh" < "$work/out" > "$work/got"
             if diff -u "$expected" "$work/got" > "$work/diff"; then
                 echo "PASS an app of a world that includes Nimadir's, woken $woken $mode"
