@@ -35,6 +35,26 @@ pub fn mount(fs: &std.Fs, source: str, target: str, kind: str) -> InitError!void
     }
 }
 
+/// What is at source, a directory or a file, shown at target too (a bind
+/// mount): as the phone's first process puts the programs of the system
+/// slot it boots in place (arche-os T8).
+pub fn bind(fs: &std.Fs, source: str, target: str) -> InitError!void {
+    var src: [4096]u8 = [0; 4096];
+    var dst: [4096]u8 = [0; 4096];
+    if not linux.c_path(source, src[0..4096]) or not linux.c_path(target, dst[0..4096]) {
+        return InitError.Refused;
+    }
+    _ = fs;
+    var r: i64 = 0;
+    unsafe {
+        // SAFETY: two NUL-terminated paths; no type, MS_BIND (4096).
+        r = linux.syscall(linux.MOUNT, [linux.arg(u8, &src[0] as *u8), linux.arg(u8, &dst[0] as *u8), 0, 4096, 0, 0]);
+    }
+    if linux.errno(r) != 0 {
+        return InitError.Refused;
+    }
+}
+
 /// A child that ended: its process id, and its status as wait4 says it.
 pub type Ended = struct {
     pub pid: u32,
@@ -132,5 +152,18 @@ pub fn power_off(proc: &std.Proc) {
         // SAFETY: the magic numbers reboot(2) wants, and
         // LINUX_REBOOT_CMD_POWER_OFF.
         _ = linux.syscall(linux.REBOOT, [0xfee1dead, 0x28121969, 0x4321fedc, 0, 0, 0]);
+    }
+}
+
+/// The machine started again (arche-os T8: a system update applied, or
+/// one that failed rolled back). A process with the right to reboot may
+/// ask; any other is refused, and goes on.
+pub fn reboot(proc: &std.Proc) {
+    _ = proc;
+    unsafe {
+        // SAFETY: what is buffered written out first; then the magic
+        // numbers reboot(2) wants, and LINUX_REBOOT_CMD_RESTART.
+        a0rt_flush_all();
+        _ = linux.syscall(linux.REBOOT, [0xfee1dead, 0x28121969, 0x01234567, 0, 0, 0]);
     }
 }

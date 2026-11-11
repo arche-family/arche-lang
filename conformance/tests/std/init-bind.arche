@@ -1,0 +1,28 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: refused refused
+// wasm: skip
+// system: linux
+import core.utf8;
+import std;
+import std.init;
+
+// A bind mount of what is not there is refused, whoever asks: the source
+// a path that no file has, and a path too long to be one. (A bind that
+// is made needs the first process's rights, and is made by the phone's
+// init in QEMU, arche-os's tests/phone.sh.)
+fn main(sys: &mut std.System) -> !void {
+    match init.bind(&sys.fs, source: "/arche-no-such-folder/x", target: "/tmp") {
+        ok(_) => { sys.stdout.write("bound"); }
+        err(_) => { sys.stdout.write("refused"); }
+    }
+    sys.stdout.write(" ");
+    var long: [5000]u8 = ['a'; 5000];
+    long[0] = '/';
+    match init.bind(&sys.fs, source: "/tmp", target: utf8.as_str(long[0..5000])) {
+        ok(_) => { sys.stdout.write("bound"); }
+        err(_) => { sys.stdout.write("refused"); }
+    }
+    sys.stdout.write("\n");
+}
