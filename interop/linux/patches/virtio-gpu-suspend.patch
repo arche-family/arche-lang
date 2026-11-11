@@ -1,0 +1,278 @@
+virtio-gpu: suspend to RAM and resume (arche-os T5)
+
+Linux 6.12's virtio-gpu has no freeze and restore. Suspended to RAM in
+QEMU, the device is reset as the machine wakes, and virtio-pci resets it
+on resume besides: its queues are gone, and the host's resources with
+them. The driver goes on queueing into the dead queue, and once that is
+full the next screen update waits for room forever.
+
+Here, before suspending, the outputs are turned off, the queues drained
+and deleted; on resume the queues are found again, every classic 2D
+resource is made again on the host under its id with its pages attached,
+and the outputs turned on as they were, which transfers what they show.
+Linux after 6.12 has freeze and restore of its own, which make the
+resources again only after hibernation.
+
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.c
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.c
+@@ -37,6 +37,7 @@
+ #include <drm/drm_drv.h>
+ #include <drm/drm_fbdev_shmem.h>
+ #include <drm/drm_file.h>
++#include <drm/drm_modeset_helper.h>
+ 
+ #include "virtgpu_drv.h"
+ 
+@@ -134,6 +135,78 @@
+ 	schedule_work(&vgdev->config_changed_work);
+ }
+ 
++#ifdef CONFIG_PM_SLEEP
++/*
++ * Suspend to RAM: QEMU resets its devices as the machine wakes, and
++ * virtio-pci resets this one on resume besides, so its queues and the
++ * host's resources are gone then. Before, the outputs are turned off and
++ * the queues drained and deleted; after, the queues are found again, the
++ * resources made again (virtio_gpu_object_restore_all), and the outputs
++ * turned on as they were.
++ */
++static bool virtgpu_queue_drained(struct virtio_gpu_queue *q)
++{
++	return q->vq->num_free == virtqueue_get_vring_size(q->vq);
++}
++
++static int virtgpu_freeze(struct virtio_device *vdev)
++{
++	struct drm_device *dev = vdev->priv;
++	struct virtio_gpu_device *vgdev = dev->dev_private;
++	int error;
++
++	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
++		error = drm_mode_config_helper_suspend(dev);
++		if (error) {
++			DRM_ERROR("suspend error %d\n", error);
++			return error;
++		}
++	}
++
++	flush_work(&vgdev->obj_free_work);
++	flush_work(&vgdev->ctrlq.dequeue_work);
++	flush_work(&vgdev->cursorq.dequeue_work);
++	flush_work(&vgdev->config_changed_work);
++	wait_event_timeout(vgdev->ctrlq.ack_queue,
++			   virtgpu_queue_drained(&vgdev->ctrlq), 5 * HZ);
++	wait_event_timeout(vgdev->cursorq.ack_queue,
++			   virtgpu_queue_drained(&vgdev->cursorq), 5 * HZ);
++
++	virtio_reset_device(vdev);
++	vdev->config->del_vqs(vdev);
++	return 0;
++}
++
++static int virtgpu_restore(struct virtio_device *vdev)
++{
++	struct drm_device *dev = vdev->priv;
++	struct virtio_gpu_device *vgdev = dev->dev_private;
++	int error;
++
++	error = virtio_gpu_find_vqs(vgdev);
++	if (error) {
++		DRM_ERROR("failed to find virt queues\n");
++		return error;
++	}
++	virtio_device_ready(vdev);
++
++	error = virtio_gpu_object_restore_all(vgdev);
++	if (error) {
++		DRM_ERROR("failed to make the resources again\n");
++		return error;
++	}
++
++	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
++		error = drm_mode_config_helper_resume(dev);
++		if (error) {
++			DRM_ERROR("resume error %d\n", error);
++			return error;
++		}
++	}
++	return 0;
++}
++#endif
++
+ static struct virtio_device_id id_table[] = {
+ 	{ VIRTIO_ID_GPU, VIRTIO_DEV_ANY_ID },
+ 	{ 0 },
+@@ -160,7 +233,11 @@
+ 	.id_table = id_table,
+ 	.probe = virtio_gpu_probe,
+ 	.remove = virtio_gpu_remove,
+-	.config_changed = virtio_gpu_config_changed
++	.config_changed = virtio_gpu_config_changed,
++#ifdef CONFIG_PM_SLEEP
++	.freeze = virtgpu_freeze,
++	.restore = virtgpu_restore,
++#endif
+ };
+ 
+ module_virtio_driver(virtio_gpu_driver);
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -118,6 +118,10 @@
+ 
+ 	int uuid_state;
+ 	uuid_t uuid;
++
++	/* A classic 2D resource, made again on the host after a resume */
++	struct virtio_gpu_object_params params;
++	struct list_head restore_node;
+ };
+ #define gem_to_virtio_gpu_obj(gobj) \
+ 	container_of((gobj), struct virtio_gpu_object, base.base)
+@@ -286,6 +290,10 @@
+ 	spinlock_t obj_free_lock;
+ 	struct list_head obj_free_list;
+ 
++	/* the resources to make again after a suspend */
++	struct mutex obj_restore_lock;
++	struct list_head obj_restore_list;
++
+ 	struct virtio_gpu_drv_capset *capsets;
+ 	uint32_t num_capsets;
+ 	uint64_t capset_id_mask;
+@@ -316,6 +324,7 @@
+ 
+ /* virtgpu_kms.c */
+ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev);
++int virtio_gpu_find_vqs(struct virtio_gpu_device *vgdev);
+ void virtio_gpu_deinit(struct drm_device *dev);
+ void virtio_gpu_release(struct drm_device *dev);
+ int virtio_gpu_driver_open(struct drm_device *dev, struct drm_file *file);
+@@ -476,6 +485,7 @@
+ 
+ /* virtgpu_object.c */
+ void virtio_gpu_cleanup_object(struct virtio_gpu_object *bo);
++int virtio_gpu_object_restore_all(struct virtio_gpu_device *vgdev);
+ struct drm_gem_object *virtio_gpu_create_object(struct drm_device *dev,
+ 						size_t size);
+ int virtio_gpu_object_create(struct virtio_gpu_device *vgdev,
+--- a/drivers/gpu/drm/virtio/virtgpu_kms.c
++++ b/drivers/gpu/drm/virtio/virtgpu_kms.c
+@@ -117,15 +117,27 @@
+ 	vgdev->num_capsets = num_capsets;
+ }
+ 
+-int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
++/* The control and cursor queues, at probe and again on resume. */
++int virtio_gpu_find_vqs(struct virtio_gpu_device *vgdev)
+ {
+ 	struct virtqueue_info vqs_info[] = {
+ 		{ "control", virtio_gpu_ctrl_ack },
+ 		{ "cursor", virtio_gpu_cursor_ack },
+ 	};
+-	struct virtio_gpu_device *vgdev;
+-	/* this will expand later */
+ 	struct virtqueue *vqs[2];
++	int ret;
++
++	ret = virtio_find_vqs(vgdev->vdev, 2, vqs, vqs_info, NULL);
++	if (ret)
++		return ret;
++	vgdev->ctrlq.vq = vqs[0];
++	vgdev->cursorq.vq = vqs[1];
++	return 0;
++}
++
++int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
++{
++	struct virtio_gpu_device *vgdev;
+ 	u32 num_scanouts, num_capsets;
+ 	int ret = 0;
+ 
+@@ -160,6 +172,8 @@
+ 		  virtio_gpu_array_put_free_work);
+ 	INIT_LIST_HEAD(&vgdev->obj_free_list);
+ 	spin_lock_init(&vgdev->obj_free_lock);
++	INIT_LIST_HEAD(&vgdev->obj_restore_list);
++	mutex_init(&vgdev->obj_restore_lock);
+ 
+ #ifdef __LITTLE_ENDIAN
+ 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_VIRGL))
+@@ -209,13 +223,11 @@
+ 	DRM_INFO("features: %ccontext_init\n",
+ 		 vgdev->has_context_init ? '+' : '-');
+ 
+-	ret = virtio_find_vqs(vgdev->vdev, 2, vqs, vqs_info, NULL);
++	ret = virtio_gpu_find_vqs(vgdev);
+ 	if (ret) {
+ 		DRM_ERROR("failed to find virt queues\n");
+ 		goto err_vqs;
+ 	}
+-	vgdev->ctrlq.vq = vqs[0];
+-	vgdev->cursorq.vq = vqs[1];
+ 	ret = virtio_gpu_alloc_vbufs(vgdev);
+ 	if (ret) {
+ 		DRM_ERROR("failed to alloc vbufs\n");
+--- a/drivers/gpu/drm/virtio/virtgpu_object.c
++++ b/drivers/gpu/drm/virtio/virtgpu_object.c
+@@ -67,6 +67,10 @@
+ 
+ 	virtio_gpu_resource_id_put(vgdev, bo->hw_res_handle);
+ 	if (virtio_gpu_is_shmem(bo)) {
++		mutex_lock(&vgdev->obj_restore_lock);
++		if (!list_empty(&bo->restore_node))
++			list_del_init(&bo->restore_node);
++		mutex_unlock(&vgdev->obj_restore_lock);
+ 		drm_gem_shmem_free(&bo->base);
+ 	} else if (virtio_gpu_is_vram(bo)) {
+ 		struct virtio_gpu_object_vram *vram = to_virtio_gpu_vram(bo);
+@@ -129,6 +133,7 @@
+ 
+ 	dshmem = &shmem->base.base;
+ 	dshmem->base.funcs = &virtio_gpu_shmem_funcs;
++	INIT_LIST_HEAD(&shmem->base.restore_node);
+ 	return &dshmem->base;
+ }
+ 
+@@ -232,6 +237,11 @@
+ 		virtio_gpu_cmd_create_resource(vgdev, bo, params,
+ 					       objs, fence);
+ 		virtio_gpu_object_attach(vgdev, bo, ents, nents);
++		/* Kept, to be made again after a suspend resets the device */
++		bo->params = *params;
++		mutex_lock(&vgdev->obj_restore_lock);
++		list_add_tail(&bo->restore_node, &vgdev->obj_restore_list);
++		mutex_unlock(&vgdev->obj_restore_lock);
+ 	}
+ 
+ 	*bo_ptr = bo;
+@@ -247,3 +257,30 @@
+ 	drm_gem_shmem_free(shmem_obj);
+ 	return ret;
+ }
++
++/*
++ * After a resume, the device reset, the host has none of the guest's
++ * resources: each classic 2D one is made again, under its own id, and its
++ * pages attached again. What they show comes back with the next transfer
++ * (the planes' state, restored after this).
++ */
++int virtio_gpu_object_restore_all(struct virtio_gpu_device *vgdev)
++{
++	struct virtio_gpu_object *bo;
++	struct virtio_gpu_mem_entry *ents;
++	unsigned int nents;
++	int ret = 0;
++
++	mutex_lock(&vgdev->obj_restore_lock);
++	list_for_each_entry(bo, &vgdev->obj_restore_list, restore_node) {
++		ret = virtio_gpu_object_shmem_init(vgdev, bo, &ents, &nents);
++		if (ret)
++			break;
++		virtio_gpu_cmd_create_resource(vgdev, bo, &bo->params,
++					       NULL, NULL);
++		virtio_gpu_object_attach(vgdev, bo, ents, nents);
++	}
++	mutex_unlock(&vgdev->obj_restore_lock);
++	virtio_gpu_notify(vgdev);
++	return ret;
++}

@@ -2,11 +2,12 @@
 # The phone's Linux kernel for QEMU x86-64 (docs/sprints.md S35, arche-os
 # T1): mainline Linux, the version and hash below, from kernel.org,
 # configured as x86_64_defconfig and kvm_guest.config with phone.config on
-# top, everything built in. Built once into LINUX_DIR (default
-# build/linux), and again only when the version or the config changes.
-# Prints the bzImage's path.
+# top, everything built in, with the patches in patches/ (each says why
+# at its top). Built once into LINUX_DIR (default build/linux), and again
+# only when the version, the config or the patches change. Prints the
+# bzImage's path.
 #
-# Needs make, gcc, flex, bison, bc, perl and libelf's headers; KBUILD_TOOLS
+# Needs make, patch, gcc, flex, bison, bc, perl and libelf's headers; KBUILD_TOOLS
 # names a directory where they were unpacked without installing them
 # (usr/bin, usr/include, usr/lib/x86_64-linux-gnu), as on a machine
 # without root.
@@ -26,14 +27,25 @@ if ! echo "$sha256  $tarball" | sha256sum -c --status; then
     exit 1
 fi
 src=$dir/linux-$version
-stamp=$(cat "$here/phone.config" | sha256sum | cut -c1-16)
+patches=$(ls "$here"/patches/*.patch)
+patched=$(cat $patches | sha256sum | cut -c1-16)
+stamp=$(cat "$here/phone.config" $patches | sha256sum | cut -c1-16)
 image=$dir/bzImage-$version-$stamp
 if [ -f "$image" ]; then
     echo "$image"
     exit 0
 fi
+# The source as kernel.org gives it with the patches on it, unpacked
+# again when they change.
+if [ -d "$src" ] && [ "$(cat "$src/.arche-patches" 2>/dev/null)" != "$patched" ]; then
+    rm -rf "$src"
+fi
 if [ ! -d "$src" ]; then
     tar -xJf "$tarball" -C "$dir"
+    for p in $patches; do
+        patch -s -p1 -d "$src" < "$p"
+    done
+    echo "$patched" > "$src/.arche-patches"
 fi
 if [ -n "${KBUILD_TOOLS:-}" ]; then
     PATH=$KBUILD_TOOLS/usr/bin:$PATH
