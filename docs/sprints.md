@@ -535,6 +535,8 @@ Qilingani:
   - `set-markup` Nimadir'ning `markup.rs`idagi qoidalar bilan o'qiladi: avval butun matn, xato bo'lsa hujjat o'zgarmaydi va xabar qator va ustunni aytadi ("`</ul>` closes `<li>`, at line 2, column 11"). Yopilmagan teg, comment, `<!doctype>`, `script` va `style` (ichi bilan tashlanadi), void elementlar, `<x/>`, birinchi takroriy atribut va entity'lar (`&mdash;`, `&#x…;`, …) ham shu qoidalar bilan; element bo'lmagan tugun "is not an element";
   - `fetch` Nimadir'ning tartibida rad etadi (oddiy http, manzil emas, xost yo'q, shu mashina yoki lokal tarmoq, keyin manifest'da tarmoq yo'q), `fetch-poll` esa noma'lum so'rovga "no request numbered N" xatosini beradi.
 
+- `locale`, `time-zone` va `utc-offset` endi o'zgarmas emas: ularni embedder `Ui`ning maydonlari orqali beradi. `arche-wasm nimadir` `--locale`, `--time-zone` va `--utc-offset` flag'larini oladi, telefon esa "Asia/Tashkent" va +300 daqiqani beradi (status bar'dagidek). Nimadir bularni tizimdan oladi (`TZ`, `LANG`), shuning uchun headless solishtirishda Nimadir `TZ=Asia/Tashkent LANG=en_US.UTF-8` bilan yuritiladi. `set-text ""` Nimadir'dagidek text tuguni yaratmaydi.
+
 Qolgani: headless `arche-wasm` sahifani joylashtirmaydi, shuning uchun unda `dom.bounds` doim `none`. Nimadir'ning headless shell'i kadrdan keyin joylashtiradi va quti beradi; telefonning UI server'i ham beradi (`page.arche`, `set_box`).
 
 ### S39. ARM64 JIT va aarch64 telefon

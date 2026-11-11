@@ -4,6 +4,7 @@
 ///   arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...]
 ///       [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]...
 ///       [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]...
+///       [--locale tag] [--time-zone name] [--utc-offset minutes]
 ///                                        a Nimadir mini-app, with no window, as
 ///                                        Nimadir's headless runner runs it
 ///   arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>
@@ -45,7 +46,7 @@ fn usage(sys: &mut std.System) -> !void {
     sys.stderr.write("       arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>\n");
     sys.stderr.write("       arche-wasm bindgen <world.wit> <world> <out-dir>\n");
     sys.stderr.write("       arche-wasm echo <component.wasm>\n");
-    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]...\n");
+    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]... [--locale tag] [--time-zone name] [--utc-offset minutes]\n");
     sys.proc.exit(2);
 }
 
@@ -343,7 +344,15 @@ type Started = struct {
     size: u64,
 }
 
-fn start_app(fs: &std.Fs, source: str, store: &mut exec.Store, now: &dyn fn() -> u64, now_ms: i64, registry: &alloc.List(Entry), denied: &alloc.List(alloc.String), why: &mut alloc.String, a: alloc.Allocator) -> ?Started {
+/// Who the user is, as the shell says to the app: locale, time-zone and
+/// utc-offset's answers.
+type Who = struct {
+    locale: alloc.String,
+    time_zone: alloc.String,
+    utc_offset: i32,
+}
+
+fn start_app(fs: &std.Fs, source: str, store: &mut exec.Store, now: &dyn fn() -> u64, now_ms: i64, who: &Who, registry: &alloc.List(Entry), denied: &alloc.List(alloc.String), why: &mut alloc.String, a: alloc.Allocator) -> ?Started {
     let bytes = match fs.read_bytes(source, a) {
         ok(x) => { x }
         err(_) => {
@@ -353,6 +362,9 @@ fn start_app(fs: &std.Fs, source: str, store: &mut exec.Store, now: &dyn fn() ->
     };
     var ui = nimadir.new_ui(a);
     ui.now_ms = now_ms;
+    ui.locale = alloc.String.from(who.locale.view(), a);
+    ui.time_zone = alloc.String.from(who.time_zone.view(), a);
+    ui.utc_offset = who.utc_offset;
     for d in denied.items() {
         nimadir.deny(&mut ui, func: d.view());
     }
@@ -439,6 +451,7 @@ fn run_app(sys: &mut std.System) -> !void {
     var registry = alloc.List(Entry).init(a);
     var use_jit = false;
     var confirm = false;
+    var who = Who { locale: alloc.String.from("en-US", a), time_zone: alloc.String.init(a), utc_offset: 0 };
     var i: usize = 3;
     while i < sys.args.len() : (i += 1) {
         let arg = sys.args.get(i);
@@ -477,6 +490,20 @@ fn run_app(sys: &mut std.System) -> !void {
         } else if arg.eq("--deny") and more {
             denied.push(alloc.String.from(sys.args.get(i + 1), a));
             i += 1;
+        } else if arg.eq("--locale") and more {
+            who.locale = alloc.String.from(sys.args.get(i + 1), a);
+            i += 1;
+        } else if arg.eq("--time-zone") and more {
+            who.time_zone = alloc.String.from(sys.args.get(i + 1), a);
+            i += 1;
+        } else if arg.eq("--utc-offset") and more {
+            let text = sys.args.get(i + 1);
+            if text.starts_with("-") {
+                who.utc_offset = 0 - number(text[1..text.len()]) as i32;
+            } else {
+                who.utc_offset = number(text) as i32;
+            }
+            i += 1;
         } else if arg.eq("--jit") {
             use_jit = true;
         } else if arg.eq("--confirm") {
@@ -495,7 +522,7 @@ fn run_app(sys: &mut std.System) -> !void {
     if not sys.fs.exists(source.view()) {
         source = alloc.String.from(path, a);
     }
-    var app = match start_app(&sys.fs, source: source.view(), store: &mut store, now: &now, now_ms: (sys.clock.unix_ns() / 1000000) as i64, registry: &registry, denied: &denied, why: &mut why, a: a) {
+    var app = match start_app(&sys.fs, source: source.view(), store: &mut store, now: &now, now_ms: (sys.clock.unix_ns() / 1000000) as i64, who: &who, registry: &registry, denied: &denied, why: &mut why, a: a) {
         some(s) => {
             out.write("loaded ");
             out.write_u64(s.size);
@@ -616,7 +643,7 @@ fn run_app(sys: &mut std.System) -> !void {
             if go {
                 var next_store = new_store(use_jit, a: a);
                 var no = alloc.String.init(a);
-                match start_app(&sys.fs, source: target.view(), store: &mut next_store, now: &now, now_ms: (sys.clock.unix_ns() / 1000000) as i64, registry: &registry, denied: &denied, why: &mut no, a: a) {
+                match start_app(&sys.fs, source: target.view(), store: &mut next_store, now: &now, now_ms: (sys.clock.unix_ns() / 1000000) as i64, who: &who, registry: &registry, denied: &denied, why: &mut no, a: a) {
                     some(s) => {
                         app = s.app;
                         store = next_store;

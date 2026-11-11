@@ -118,6 +118,12 @@ pub type Ui = struct {
     /// The text field drawn last, for ui-submitted; NONE for none.
     last_field: u32,
     pub now_ms: i64,
+    /// Who the user is, as the shell that runs the app says: its language
+    /// and region (BCP 47), its time zone (IANA, "" for none said), and
+    /// how many minutes east of UTC that is now.
+    pub locale: alloc.String,
+    pub time_zone: alloc.String,
+    pub utc_offset: i32,
     keys: alloc.List(alloc.String),
     values: alloc.List(alloc.String),
     nodes: alloc.List(Node),
@@ -166,6 +172,9 @@ pub fn new_ui(a: alloc.Allocator) -> Ui {
         edits: alloc.List(alloc.String).init(a),
         last_field: NONE,
         now_ms: 0,
+        locale: alloc.String.from("en-US", a),
+        time_zone: alloc.String.init(a),
+        utc_offset: 0,
         keys: alloc.List(alloc.String).init(a),
         values: alloc.List(alloc.String).init(a),
         nodes: alloc.List(Node).init(a),
@@ -1134,13 +1143,13 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
         return some_val(done(why.view(), a), a);
     }
     if func.eq("locale") {
-        return str_val("en-US", a);
+        return str_val(ui.locale.view(), a);
     }
     if func.eq("time-zone") {
-        return str_val("", a);
+        return str_val(ui.time_zone.view(), a);
     }
     if func.eq("utc-offset") {
-        return int_val(0);
+        return int_val(ui.utc_offset as% u64);
     }
     if func.eq("app-info") {
         var fields = alloc.List(c.Val).init(a);
@@ -2065,10 +2074,14 @@ fn dom(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
         if ui.nodes.items()[node as usize].tag.len() == 0 {
             ui.nodes.items_mut()[node as usize].text = alloc.String.from(text_arg(args, i: 1), a);
         } else {
+            // An element's children replaced by one text; by none for "",
+            // as Nimadir's document does.
             clear_children(ui, n: node);
-            let t = try make_node(ui, tag: "");
-            ui.nodes.items_mut()[t as usize].text = alloc.String.from(text_arg(args, i: 1), a);
-            append(ui, parent: node, child: t);
+            if text_arg(args, i: 1).len() > 0 {
+                let t = try make_node(ui, tag: "");
+                ui.nodes.items_mut()[t as usize].text = alloc.String.from(text_arg(args, i: 1), a);
+                append(ui, parent: node, child: t);
+            }
         }
         return c.Val.Unit;
     }
