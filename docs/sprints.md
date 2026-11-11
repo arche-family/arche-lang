@@ -498,10 +498,10 @@ Keyin, telefon tarmog'i uchun (arche-os T5):
   `conformance/tests/dns` bularni tarmoqsiz, tayyor baytlar bilan, `lookup`ni esa javob bermaydigan server bilan tekshiradi.
 - `dbus`: `Header`da `sender` maydoni (7) bor, `header_of` va `body_of` esa xabarni kelganidek qaytaradi. Bus xabarni uzatishi uchun shu kerak; arche-os'ning `phone/dbusd`i shular ustida yozilgan. `interop/dbus.sh` `DBUS_BUS` bilan dbus-daemon o'rnida boshqa bus'ni ham sinaydi.
 - `std.init.start`: daemon'ni kutmasdan ishga tushiradi (fork va execve). Unga faqat berilgan muhit o'tadi, `reap` uni tugaganda yig'adi. `conformance/tests/std/init-start.arche` tekshiradi.
-- `phone.config`: Wi-Fi uchun simsiz tarmoq steki, `mac80211_hwsim` (QEMU'da Wi-Fi qurilmasi yo'q, hwsim ikki radio beradi) va iwd ishlatadigan kernel kriptosi (AF_ALG, kalitlar, Diffie-Hellman) qo'shildi. Batareya uchun `test_power` qo'shildi; uning qiymatlari kernel buyruq satridan beriladi.
+- `phone.config`: Wi-Fi uchun simsiz tarmoq steki, `mac80211_hwsim` (QEMU'da Wi-Fi qurilmasi yo'q, hwsim ikki radio beradi) va iwd ishlatadigan kernel kriptosi (AF_ALG, kalitlar, Diffie-Hellman) qo'shildi. Batareya uchun `test_power` qo'shildi; uning qiymatlari kernel buyruq satridan beriladi. Ovoz uchun ALSA, Intel HDA va uning generic codec'i yoqildi.
 - `kernel.sh` `interop/linux/patches/`dagi patch'larni qo'llaydi; ular o'zgarsa manba qayta ochiladi va image boshqa nom oladi. Birinchisi `virtio-gpu-suspend.patch`: 6.12'ning virtio-gpu drayveriga freeze va restore qo'shadi. Busiz suspend to RAM'dan keyin qurilma reset bo'ladi, drayver esa yo'qolgan navbatga yozishda davom etadi va ekran qotadi (arche-os T5).
 
-S35 yopildi. Hali yo'q, kerak bo'lganda qo'shiladigan narsalar: GPOS kerning va hinting; D-Bus orqali Unix file descriptor uzatish (PipeWire, T5); `std.drm`da page flip (UI server, T2).
+S35 yopildi. Hali yo'q, kerak bo'lganda qo'shiladigan narsalar: GPOS kerning va hinting; D-Bus orqali Unix file descriptor uzatish (hozircha hech kimga kerak emas: arche-os T5'da ovoz PipeWire'siz, ALSA ustida); `std.drm`da page flip (UI server, T2).
 
 **Qabul:** shrift golden image testlari har platformada bit-identical. PNG decoder PngSuite'dan o'tadi. D-Bus client `dbus-daemon` bilan interop qiladi va ModemManager'dan modem ro'yxatini oladi. QEMU x86-64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi (aarch64'da S39'da).
 

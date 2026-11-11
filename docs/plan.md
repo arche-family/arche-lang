@@ -231,7 +231,7 @@ Arche OS'ning birinchi mahsuloti telefon (OS rejasidagi "Mahsulot yo'nalishi" va
 
 - **Shrift:** TrueType parse va rasterizer (antialiasing bilan), glyph cache. Lotin va kirill (o'zbek tilining ikkala yozuvi, rus); murakkab skriptlar keyinroq.
 - **Rasm:** PNG decoder (deflate bilan); keyin JPEG.
-- **D-Bus client:** message format, autentifikatsiya, method call va signal'lar. Trek A'da ModemManager, iwd va PipeWire bilan gaplashish uchun; Trek B'da kerak emas.
+- **D-Bus client:** message format, autentifikatsiya, method call va signal'lar. Trek A'da ModemManager va iwd bilan gaplashish uchun; Trek B'da kerak emas.
 - **Fuzzing:** shrift, PNG va D-Bus parser'lari boshidan fuzz qilinadi: ular tashqi ma'lumotni o'qiydi.
 
 Qabul: shrift rasterizer'i bir xil matnni har platformada bit-identical chizadi (golden image testlari). PNG decoder PngSuite'dan o'tadi. D-Bus client Linux'dagi `dbus-daemon` bilan interop qiladi va ModemManager'dan modem ro'yxatini oladi.
