@@ -1,0 +1,23 @@
+// test: run
+// spec: crypto (RFC 8018; RFC 7914 §11's vectors)
+// stage0: skip
+// stdout: 55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783
+// stdout: 4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56a1d425a1225833549adb841b51c9b3176a272bdebba1d078478f62b397f33c8d
+// stdout: f190efee0ee072a594c091a48be054bd
+import std;
+import crypto.hmac;
+import _hex;
+
+// PBKDF2-HMAC-SHA-256 as RFC 7914 gives it: one round, and 80000; then a
+// PIN's key, 50000 rounds, its first 16 bytes, as Python's hashlib says.
+fn main(sys: &mut std.System) -> !void {
+    var a: [64]u8 = [0; 64];
+    hmac.pbkdf2_sha256(password: "passwd".bytes(), salt: "salt".bytes(), iterations: 1, a[0..64]);
+    _hex.hex(&mut sys.stdout, a[0..64]);
+    var b: [64]u8 = [0; 64];
+    hmac.pbkdf2_sha256(password: "Password".bytes(), salt: "NaCl".bytes(), iterations: 80000, b[0..64]);
+    _hex.hex(&mut sys.stdout, b[0..64]);
+    var c: [16]u8 = [0; 16];
+    hmac.pbkdf2_sha256(password: "1234".bytes(), salt: "arche-pin-salt".bytes(), iterations: 50000, c[0..16]);
+    _hex.hex(&mut sys.stdout, c[0..16]);
+}

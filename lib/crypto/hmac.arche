@@ -1,4 +1,5 @@
-/// HMAC (RFC 2104) with SHA-256 and SHA-384, and HKDF (RFC 5869) on them.
+/// HMAC (RFC 2104) with SHA-256 and SHA-384, HKDF (RFC 5869) on them, and
+/// PBKDF2 (RFC 8018) with HMAC-SHA-256.
 import crypto.sha2;
 
 /// HMAC-SHA-256, fed in pieces.
@@ -101,6 +102,39 @@ pub fn hmac_sha384(key: []u8, data: []u8) -> [48]u8 {
     var h = HmacSha384.init(key);
     h.update(data);
     return h.finish();
+}
+
+/// PBKDF2 (RFC 8018) with HMAC-SHA-256: a key from a password and a salt,
+/// worked iterations times over (arche-os T8, a PIN's), into out. The
+/// password's HMAC is keyed once and copied for each round.
+pub fn pbkdf2_sha256(password: []u8, salt: []u8, iterations: u32, out: []mut u8) {
+    let keyed = HmacSha256.init(password);
+    var done: usize = 0;
+    var block: u32 = 1;
+    while done < out.len() {
+        var h = keyed;
+        h.update(salt);
+        let index: [4]u8 = [(block >> 24) as% u8, (block >> 16) as% u8, (block >> 8) as% u8, block as% u8];
+        h.update(index[0..4]);
+        var u = h.finish();
+        var t = u;
+        var round: u32 = 1;
+        while round < iterations : (round += 1) {
+            var next = keyed;
+            next.update(u[0..32]);
+            u = next.finish();
+            var k: usize = 0;
+            while k < 32 : (k += 1) {
+                t[k] ^= u[k];
+            }
+        }
+        var i: usize = 0;
+        while i < 32 and done < out.len() : (i += 1) {
+            out[done] = t[i];
+            done += 1;
+        }
+        block += 1;
+    }
 }
 
 /// HKDF-Extract with SHA-256: the pseudorandom key.
