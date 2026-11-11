@@ -31,6 +31,34 @@ export("init") fn init() {
     rt.keep_app(made: made, host: host);
 }
 
+/// The canonical ABI's allocator: memory for what the host gives the
+/// program, a string or a list, in the program's own memory, which lasts
+/// the run as the program's allocator's does. A grown block keeps what
+/// was in it. align is at most 16, which every block has.
+export("cabi_realloc") fn cabi_realloc(old: u32, old_size: u32, align: u32, new_size: u32) -> u32 {
+    if new_size == 0 {
+        return align;
+    }
+    let at = rt.take_zeroed(new_size as u64);
+    var keep = old_size;
+    if keep > new_size {
+        keep = new_size;
+    }
+    if old != 0 and keep > 0 {
+        unsafe {
+            // SAFETY: old is a block this function gave, old_size long, and
+            // at a new one, new_size long; they do not overlap.
+            let from = ptr.from_addr(u8, old as usize);
+            let to = ptr.from_addr(u8, at as usize) as *mut u8;
+            var i: usize = 0;
+            while i < keep as usize : (i += 1) {
+                to.add(i).* = from.add(i).*;
+            }
+        }
+    }
+    return at as u32;
+}
+
 export("update") fn update() {
     unsafe {
         // SAFETY: what init kept.

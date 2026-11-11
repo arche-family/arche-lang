@@ -1,30 +1,60 @@
 /// A Nimadir mini-app written in Arche (docs/sprints.md S38), the first:
 /// built with --target wasm32-component, made a component of Nimadir's
-/// world by arche-wasm's encoder, it draws a label and how many frames it
-/// has drawn. nimadir-check.sh runs it.
+/// world by arche-wasm's encoder, it draws a label, how many frames it
+/// has drawn, and a field whose text the host hands back in the program's
+/// memory, through cabi_realloc (lib/std-component.arche), and the app
+/// keeps. nimadir-check.sh runs it.
 import alloc;
+import core.ptr;
 import std;
 
 extern "wasm:nimadir:shell/host-api@1.2.0" fn ui_label(text: u32, len: u32);
+extern "wasm:nimadir:shell/host-api@1.2.0" fn ui_text_edit(text: u32, len: u32, ret: u32);
 
 type App = struct {
     frames: u64,
+    name: alloc.String,
 }
 
-/// A label of text: its bytes' address and length, as the canonical ABI
-/// passes a string.
-fn label(host: &mut std.Host, text: str) {
-    if text.len() == 0 {
-        return;
+/// Where a string's bytes are, as the canonical ABI passes it; 0 for an
+/// empty one.
+fn address(s: str) -> u32 {
+    if s.len() == 0 {
+        return 0;
     }
     unsafe {
-        // SAFETY: the host reads the bytes during the call and keeps none.
-        ui_label(text: (&text.bytes()[0] as *u8).addr() as u32, len: text.len() as u32);
+        // SAFETY: only the address is taken.
+        return (&s.bytes()[0] as *u8).addr() as u32;
     }
+}
+
+fn label(host: &mut std.Host, text: str) {
+    unsafe {
+        // SAFETY: the host reads the bytes during the call and keeps none.
+        ui_label(text: address(text), len: text.len() as u32);
+    }
+}
+
+/// A field holding text: what the user made of it, copied into a. The
+/// host writes the text's address and length into area, the text itself
+/// in memory it asked cabi_realloc for.
+fn text_edit(host: &mut std.Host, text: str, a: alloc.Allocator) -> alloc.String {
+    var area: [2]u32 = [0, 0];
+    var out = alloc.String.init(a);
+    unsafe {
+        // SAFETY: area outlives the call; what the host wrote is in memory.
+        ui_text_edit(text: address(text), len: text.len() as u32, ret: (&area[0] as *u32).addr() as u32);
+        let p = ptr.from_addr(u8, area[0] as usize);
+        var i: usize = 0;
+        while i < area[1] as usize : (i += 1) {
+            out.push_ascii(p.add(i).*);
+        }
+    }
+    return out;
 }
 
 fn init(host: &mut std.Host, a: alloc.Allocator) -> App {
-    return App { frames: 0 };
+    return App { frames: 0, name: alloc.String.init(a) };
 }
 
 fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
@@ -34,4 +64,8 @@ fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
     line.push_str("Kadr: ");
     line.push_u64(state.frames);
     label(host, text: line.view());
+    state.name = text_edit(host, text: state.name.view(), a: a);
+    var typed = alloc.String.from("Typed: ", a);
+    typed.push_str(state.name.view());
+    label(host, text: typed.view());
 }

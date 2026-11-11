@@ -1216,6 +1216,47 @@ fn is_component(m: &ir.Module) -> bool {
     return m.triple.view().eq("wasm32-unknown-unknown");
 }
 
+/// Whether a component's program exports f: a function it names itself
+/// (export("name") fn), not the runtime's or the compiler's (a0...),
+/// which only the module's own code calls.
+fn exported_by_component(f: &ir.Function) -> bool {
+    return not f.stub and not f.internal and f.name.len() > 0 and not f.name.view().starts_with("a0");
+}
+
+/// Whether f's signature as the canonical ABI has it differs from the
+/// module's, where every integer is an i64: an export of it then goes
+/// through a wrapper that converts.
+fn needs_canonical(f: &ir.Function) -> bool {
+    var k: usize = 0;
+    while k < f.params.len() : (k += 1) {
+        if import_type(f.params[k]) != wasm_type(f.params[k]) {
+            return true;
+        }
+    }
+    return f.ret != ir.Ty.Void and import_type(f.ret) != wasm_type(f.ret);
+}
+
+/// The wrapper an export of f goes through: its arguments as the
+/// canonical ABI gives them, widened; its result narrowed.
+fn canonical_wrapper(g: &mut Gen, f: &ir.Function, callee: u32) -> alloc.List(u8) {
+    var body = alloc.List(u8).init(g.a);
+    // No locals but the parameters.
+    body.push(0);
+    var k: usize = 0;
+    while k < f.params.len() : (k += 1) {
+        wc.op_u(&mut body, wc.LOCAL_GET, k as u32);
+        if import_type(f.params[k]) == wc.TYPE_I32 {
+            wc.op(&mut body, wc.I64_EXTEND_I32_U);
+        }
+    }
+    wc.op_u(&mut body, wc.CALL, callee);
+    if f.ret != ir.Ty.Void and import_type(f.ret) == wc.TYPE_I32 {
+        wc.op(&mut body, wc.I32_WRAP_I64);
+    }
+    body.push(wc.END);
+    return body;
+}
+
 fn resolve_externals(g: &mut Gen, m: &ir.Module, imports: &mut alloc.List(u8)) {
     let component = is_component(m);
     let es = m.externals.items();
@@ -1333,9 +1374,22 @@ pub fn module(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> 
     var codes = alloc.List(u8).init(a);
     var names = alloc.List(u8).init(a);
     var start_index = NONE;
-    wc.uleb(&mut functions, defined as u64);
-    wc.uleb(&mut codes, defined as u64);
-    wc.uleb(&mut names, defined as u64);
+    // A component's exports whose canonical signature differs from the
+    // module's get a wrapper each, numbered after the defined functions.
+    let component = is_component(m);
+    var wrapped = alloc.List(u32).init(a);
+    if component {
+        i = 0;
+        while i < fs.len() : (i += 1) {
+            if exported_by_component(&fs[i]) and needs_canonical(&fs[i]) {
+                wrapped.push(i as u32);
+            }
+        }
+    }
+    let functions_count = defined + wrapped.len() as u32;
+    wc.uleb(&mut functions, functions_count as u64);
+    wc.uleb(&mut codes, functions_count as u64);
+    wc.uleb(&mut names, functions_count as u64);
     i = 0;
     while i < fs.len() : (i += 1) {
         if fs[i].stub {
@@ -1351,7 +1405,19 @@ pub fn module(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> 
             start_index = g.fn_index[i];
         }
     }
-    let component = is_component(m);
+    var w: usize = 0;
+    while w < wrapped.len() : (w += 1) {
+        let f = &fs[wrapped[w] as usize];
+        wc.uleb(&mut functions, import_function_type(&mut g, f.params.items(), ret: f.ret) as u64);
+        let body = canonical_wrapper(&mut g, f, callee: g.fn_index[wrapped[w] as usize]);
+        wc.uleb(&mut codes, body.len() as u64);
+        wc.put_bytes(&mut codes, body.items());
+        wc.uleb(&mut names, (g.import_count + defined + w as u32) as u64);
+        var wname = alloc.String.init(a);
+        wname.push_str(f.name.view());
+        wname.push_str("_canonical");
+        wc.put_name(&mut names, wname.view());
+    }
     if g.problem.len() == 0 and start_index == NONE and not component {
         g.problem.push_str("no _start: this program does not import std");
     }
@@ -1407,10 +1473,17 @@ pub fn module(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> 
     if component {
         i = 0;
         while i < fs.len() : (i += 1) {
-            if not fs[i].stub and not fs[i].internal and fs[i].name.len() > 0 {
+            if exported_by_component(&fs[i]) {
+                var index = g.fn_index[i];
+                var w2: usize = 0;
+                while w2 < wrapped.len() : (w2 += 1) {
+                    if wrapped[w2] == i as u32 {
+                        index = g.import_count + defined + w2 as u32;
+                    }
+                }
                 wc.put_name(&mut export_list, fs[i].name.view());
                 export_list.push(0);
-                wc.uleb(&mut export_list, g.fn_index[i] as u64);
+                wc.uleb(&mut export_list, index as u64);
                 export_count += 1;
             }
         }
