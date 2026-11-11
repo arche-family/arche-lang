@@ -1,11 +1,14 @@
 # Nimadir's mini-apps, as built
 
-Five components of [Nimadir](https://github.com/Nodirbek-Abdulaxadov/nimadir)
+Six components of [Nimadir](https://github.com/Nodirbek-Abdulaxadov/nimadir)
 (commit ee1e1ab, `mini-apps/*/*.component.wasm`), kept here as they were built
 so that `nimadir-check.sh` runs them unrebuilt: `counter`, `hello`, `gallery`
 and `store` are apps, `runaway` is the shell's test of its limits. They are
 Rust, compiled to `wasm32-unknown-unknown` and made components by
 `wit-component`, against `wit/world.wit` (`nimadir:shell@1.2.0`).
+`counter-cs` is the counter in C#, built by .NET NativeAOT: it brings .NET's
+runtime, which imports WASI 0.2 (streams, clocks, environment, exit, random,
+filesystem) and starts from a core start function.
 
 `world.wit` is its contract, `nimadir:shell@1.2.0`, as Nimadir has it.
 `registry.list` is Nimadir's registry at that commit (`apps.json`, in the

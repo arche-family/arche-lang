@@ -1,0 +1,288 @@
+// test: run
+// spec: wit (Component Model, WASI 0.2's host functions)
+// stage0: skip
+// wasm: skip
+// stdout: has streams@0.2.6 write: true
+// stdout: has streams@0.2.0 check-write: true
+// stdout: has streams@0.3.0 write: false
+// stdout: has streams write: false
+// stdout: has exit@0.2.0 exit-with-code: false
+// stdout: has sockets/tcp@0.2.0 bind: false
+// stdout: has error@0.2.0 to-debug-string: false
+// stdout: has nimadir host-api log: false
+// stdout: get-stdin: 1
+// stdout: get-stdout: 2
+// stdout: get-stderr: 3
+// stdout: get-terminal-stdout: case 0()
+// stdout: get-environment: []
+// stdout: get-directories: []
+// stdout: subscribe: 4
+// stdout: subscribe-duration: 5
+// stdout: subscribe-instant: 6
+// stdout: block: unit
+// stdout: check-write stdout: case 0(65536)
+// stdout: write stdout: case 0()
+// stdout: write stderr: case 0()
+// stdout: write stdout: case 0()
+// stdout: write stderr: case 0()
+// stdout: blocking-flush: case 0()
+// stdout: line: stdout: hello
+// stdout: line: stderr: oops
+// stdout: line: stdout: world
+// stdout: line: stderr: tail ?
+// stdout: replaced: true
+// stdout: drained again: 0
+// stdout: check-write stdin: trap host error
+// stdout: write to 9: trap host error
+// stdout: monotonic now: 1500000000
+// stdout: monotonic now, clock back: 1500000000
+// stdout: monotonic now, later: 2000000000
+// stdout: wall-clock now: [1234, 567000000]
+// stdout: stat: case 1(case 3())
+// stdout: read-via-stream: case 1(case 3())
+// stdout: random: [90, 118, 249, 78, 247, 250, 88, 179, 210, 44]
+// stdout: random again, same seed: true
+// stdout: random 1 MiB: 1048576
+// stdout: random past 1 MiB: trap host limit exceeded
+// stdout: exit: trap host error
+// stdout: write 65530: case 0()
+// stdout: check-write after 65530: case 0(6)
+// stdout: write 7: trap host error
+// stdout: write 6: case 0()
+// stdout: check-write full: case 1(case 1())
+// stdout: write full: case 1(case 1())
+// stdout: long line: 65544
+import alloc;
+import std;
+import wasm.component as c;
+import wasm.exec;
+import wasm.wasip2;
+
+fn show(v: &c.Val, out: &mut alloc.String) {
+    match v {
+        .Unit => { out.push_str("unit"); }
+        .Bool { v: b } => {
+            if b.* {
+                out.push_str("true");
+            } else {
+                out.push_str("false");
+            }
+        }
+        .Int { v: x } => { out.push_u64(x.*); }
+        .Str { v: s } => {
+            out.push_str("\"");
+            out.push_str(s.view());
+            out.push_str("\"");
+        }
+        .List { items } => {
+            out.push_str("[");
+            var first = true;
+            for x in items.items() {
+                if not first {
+                    out.push_str(", ");
+                }
+                first = false;
+                show(x, out: out);
+            }
+            out.push_str("]");
+        }
+        .Variant { case: k, payload } => {
+            out.push_str("case ");
+            out.push_u64(k.* as u64);
+            out.push_str("(");
+            var first = true;
+            for x in payload.items() {
+                if not first {
+                    out.push_str(", ");
+                }
+                first = false;
+                show(x, out: out);
+            }
+            out.push_str(")");
+        }
+        _ => { out.push_str("other"); }
+    }
+}
+
+/// One integer argument: a handle, a duration, a length.
+fn one(x: u64, a: alloc.Allocator) -> alloc.List(c.Val) {
+    var l = alloc.List(c.Val).init(a);
+    l.push(c.Val.Int { v: x });
+    return l;
+}
+
+/// self, then the bytes of text as list<u8>.
+fn write_args(h: u64, text: []u8, a: alloc.Allocator) -> alloc.List(c.Val) {
+    var bytes = alloc.List(c.Val).init(a);
+    for b in text {
+        bytes.push(c.Val.Int { v: b.* as u64 });
+    }
+    var l = alloc.List(c.Val).init(a);
+    l.push(c.Val.Int { v: h });
+    l.push(c.Val.List { items: bytes });
+    return l;
+}
+
+/// what: and what calling func of instance gave.
+fn try_call(w: &mut wasip2.Wasi, what: str, instance: str, func: str, args: &alloc.List(c.Val), now_ms: i64, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.from(what, a);
+    s.push_str(": ");
+    match wasip2.call(w, instance: instance, func: func, args: args, now_ms: now_ms, a: a) {
+        ok(v) => { show(&v, out: &mut s); }
+        err(t) => {
+            s.push_str("trap ");
+            s.push_str(exec.message(t));
+        }
+    }
+    s.push_str("\n");
+    return s;
+}
+
+/// what: and what writing text to the stream h gave.
+fn write_to(w: &mut wasip2.Wasi, what: str, h: u64, text: []u8, a: alloc.Allocator) -> alloc.String {
+    let args = write_args(h, text: text, a: a);
+    return try_call(w, what: what, instance: "wasi:io/streams@0.2.6", func: "[method]output-stream.write", args: &args, now_ms: 0, a: a);
+}
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn has_line(out: &mut std.Output, what: str, instance: str, func: str) {
+    out.write("has ");
+    out.write(what);
+    out.write(": ");
+    out.write(yes(wasip2.has(instance: instance, func: func)));
+    out.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let out = &mut sys.stdout;
+    has_line(out, what: "streams@0.2.6 write", instance: "wasi:io/streams@0.2.6", func: "[method]output-stream.write");
+    has_line(out, what: "streams@0.2.0 check-write", instance: "wasi:io/streams@0.2.0", func: "[method]output-stream.check-write");
+    has_line(out, what: "streams@0.3.0 write", instance: "wasi:io/streams@0.3.0", func: "[method]output-stream.write");
+    has_line(out, what: "streams write", instance: "wasi:io/streams", func: "[method]output-stream.write");
+    has_line(out, what: "exit@0.2.0 exit-with-code", instance: "wasi:cli/exit@0.2.0", func: "exit-with-code");
+    has_line(out, what: "sockets/tcp@0.2.0 bind", instance: "wasi:sockets/tcp@0.2.0", func: "[method]tcp-socket.start-bind");
+    has_line(out, what: "error@0.2.0 to-debug-string", instance: "wasi:io/error@0.2.0", func: "[method]error.to-debug-string");
+    has_line(out, what: "nimadir host-api log", instance: "nimadir:shell/host-api@1.2.0", func: "log");
+
+    var w = wasip2.new_wasi(seed: 7, a);
+    let none_args = alloc.List(c.Val).init(a);
+    out.write(try_call(&mut w, what: "get-stdin", instance: "wasi:cli/stdin@0.2.6", func: "get-stdin", args: &none_args, now_ms: 0, a: a).view());
+    out.write(try_call(&mut w, what: "get-stdout", instance: "wasi:cli/stdout@0.2.6", func: "get-stdout", args: &none_args, now_ms: 0, a: a).view());
+    out.write(try_call(&mut w, what: "get-stderr", instance: "wasi:cli/stderr@0.2.0", func: "get-stderr", args: &none_args, now_ms: 0, a: a).view());
+    out.write(try_call(&mut w, what: "get-terminal-stdout", instance: "wasi:cli/terminal-stdout@0.2.6", func: "get-terminal-stdout", args: &none_args, now_ms: 0, a: a).view());
+    out.write(try_call(&mut w, what: "get-environment", instance: "wasi:cli/environment@0.2.6", func: "get-environment", args: &none_args, now_ms: 0, a: a).view());
+    out.write(try_call(&mut w, what: "get-directories", instance: "wasi:filesystem/preopens@0.2.6", func: "get-directories", args: &none_args, now_ms: 0, a: a).view());
+
+    let stdout_self = one(2, a: a);
+    let stderr_self = one(3, a: a);
+    let stdin_self = one(1, a: a);
+    let forty = one(40, a: a);
+    out.write(try_call(&mut w, what: "subscribe", instance: "wasi:io/streams@0.2.6", func: "[method]output-stream.subscribe", args: &stdout_self, now_ms: 0, a: a).view());
+    out.write(try_call(&mut w, what: "subscribe-duration", instance: "wasi:clocks/monotonic-clock@0.2.6", func: "subscribe-duration", args: &forty, now_ms: 0, a: a).view());
+    out.write(try_call(&mut w, what: "subscribe-instant", instance: "wasi:clocks/monotonic-clock@0.2.6", func: "subscribe-instant", args: &forty, now_ms: 0, a: a).view());
+    let pollable = one(4, a: a);
+    out.write(try_call(&mut w, what: "block", instance: "wasi:io/poll@0.2.6", func: "[method]pollable.block", args: &pollable, now_ms: 0, a: a).view());
+
+    let streams = "wasi:io/streams@0.2.6";
+    out.write(try_call(&mut w, what: "check-write stdout", instance: streams, func: "[method]output-stream.check-write", args: &stdout_self, now_ms: 0, a: a).view());
+    out.write(write_to(&mut w, what: "write stdout", h: 2, text: "hello\nwor".bytes(), a: a).view());
+    out.write(write_to(&mut w, what: "write stderr", h: 3, text: "oops\r\n  \n".bytes(), a: a).view());
+    out.write(write_to(&mut w, what: "write stdout", h: 2, text: "ld\n".bytes(), a: a).view());
+    let bad: [6]u8 = ['t', 'a', 'i', 'l', ' ', 0xFF];
+    out.write(write_to(&mut w, what: "write stderr", h: 3, text: bad[0..6], a: a).view());
+    out.write(try_call(&mut w, what: "blocking-flush", instance: streams, func: "[method]output-stream.blocking-flush", args: &stderr_self, now_ms: 0, a: a).view());
+    var lines = alloc.List(alloc.String).init(a);
+    wasip2.drain(&mut w, lines: &mut lines);
+    for l in lines.items() {
+        out.write("line: ");
+        // The last line's U+FFFD, as ? here.
+        let b = l.view().bytes();
+        if b.len() >= 3 and b[b.len() - 3] == 0xEF and b[b.len() - 2] == 0xBF and b[b.len() - 1] == 0xBD {
+            out.write(l.view()[0..l.len() - 3]);
+            out.write("?");
+        } else {
+            out.write(l.view());
+        }
+        out.write("\n");
+    }
+    out.write("replaced: ");
+    out.write(yes(lines.items()[3].view().eq("stderr: tail \u{FFFD}")));
+    out.write("\n");
+    var again = alloc.List(alloc.String).init(a);
+    wasip2.drain(&mut w, lines: &mut again);
+    out.write("drained again: ");
+    out.write_u64(again.len() as u64);
+    out.write("\n");
+    out.write(try_call(&mut w, what: "check-write stdin", instance: streams, func: "[method]output-stream.check-write", args: &stdin_self, now_ms: 0, a: a).view());
+    out.write(write_to(&mut w, what: "write to 9", h: 9, text: "x".bytes(), a: a).view());
+
+    let mono = "wasi:clocks/monotonic-clock@0.2.6";
+    out.write(try_call(&mut w, what: "monotonic now", instance: mono, func: "now", args: &none_args, now_ms: 1500, a: a).view());
+    out.write(try_call(&mut w, what: "monotonic now, clock back", instance: mono, func: "now", args: &none_args, now_ms: 1000, a: a).view());
+    out.write(try_call(&mut w, what: "monotonic now, later", instance: mono, func: "now", args: &none_args, now_ms: 2000, a: a).view());
+    out.write(try_call(&mut w, what: "wall-clock now", instance: "wasi:clocks/wall-clock@0.2.6", func: "now", args: &none_args, now_ms: 1234567, a: a).view());
+
+    let descriptor = one(5, a: a);
+    out.write(try_call(&mut w, what: "stat", instance: "wasi:filesystem/types@0.2.6", func: "[method]descriptor.stat", args: &descriptor, now_ms: 0, a: a).view());
+    out.write(try_call(&mut w, what: "read-via-stream", instance: "wasi:filesystem/types@0.2.0", func: "[method]descriptor.read-via-stream", args: &descriptor, now_ms: 0, a: a).view());
+
+    let random = "wasi:random/random@0.2.6";
+    let ten = one(10, a: a);
+    let first = try_call(&mut w, what: "random", instance: random, func: "get-random-bytes", args: &ten, now_ms: 0, a: a);
+    out.write(first.view());
+    var w2 = wasip2.new_wasi(seed: 7, a);
+    let second = try_call(&mut w2, what: "random", instance: random, func: "get-random-bytes", args: &ten, now_ms: 0, a: a);
+    out.write("random again, same seed: ");
+    out.write(yes(first.view().eq(second.view())));
+    out.write("\n");
+    let mib = one(1048576, a: a);
+    match wasip2.call(&mut w, instance: random, func: "get-random-bytes", args: &mib, now_ms: 0, a: a) {
+        ok(v) => {
+            match v {
+                .List { items } => {
+                    out.write("random 1 MiB: ");
+                    out.write_u64(items.len() as u64);
+                    out.write("\n");
+                }
+                _ => { out.write("random 1 MiB: not a list\n"); }
+            }
+        }
+        err(t) => {
+            out.write("random 1 MiB: ");
+            out.write(exec.message(t));
+            out.write("\n");
+        }
+    }
+    let past = one(1048577, a: a);
+    out.write(try_call(&mut w, what: "random past 1 MiB", instance: random, func: "get-random-bytes", args: &past, now_ms: 0, a: a).view());
+
+    var status = alloc.List(c.Val).init(a);
+    status.push(c.Val.Variant { case: 0, payload: alloc.List(c.Val).init(a) });
+    out.write(try_call(&mut w, what: "exit", instance: "wasi:cli/exit@0.2.6", func: "exit", args: &status, now_ms: 0, a: a).view());
+
+    // A stream holds 64 KiB over its life; past it, it is closed.
+    var w3 = wasip2.new_wasi(seed: 7, a);
+    var many = alloc.List(u8).init(a);
+    var i: u32 = 0;
+    while i < 65530 : (i += 1) {
+        many.push('x');
+    }
+    out.write(write_to(&mut w3, what: "write 65530", h: 3, text: many.items(), a: a).view());
+    out.write(try_call(&mut w3, what: "check-write after 65530", instance: streams, func: "[method]output-stream.check-write", args: &stderr_self, now_ms: 0, a: a).view());
+    out.write(write_to(&mut w3, what: "write 7", h: 3, text: "1234567".bytes(), a: a).view());
+    out.write(write_to(&mut w3, what: "write 6", h: 3, text: "123456".bytes(), a: a).view());
+    out.write(try_call(&mut w3, what: "check-write full", instance: streams, func: "[method]output-stream.check-write", args: &stderr_self, now_ms: 0, a: a).view());
+    out.write(write_to(&mut w3, what: "write full", h: 3, text: "z".bytes(), a: a).view());
+    var full = alloc.List(alloc.String).init(a);
+    wasip2.drain(&mut w3, lines: &mut full);
+    out.write("long line: ");
+    out.write_u64(full.items()[0].len() as u64);
+    out.write("\n");
+}

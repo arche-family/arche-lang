@@ -32,6 +32,13 @@ pub const ENUM: u8 = 0x6D;
 pub const OPTION: u8 = 0x6B;
 pub const RESULT: u8 = 0x6A;
 pub const FUNC: u8 = 0x40;
+/// A handle to a resource, owned or borrowed: a u32 the host chose, which
+/// crosses as one (the host's own numbers; the guest holds them opaque).
+pub const OWN: u8 = 0x69;
+pub const BORROW: u8 = 0x68;
+/// A resource type an instance exports: each declaration a type of its
+/// own.
+pub const RESOURCE: u8 = 0x3F;
 pub const INSTANCE: u8 = 0x42;
 
 /// No type: a case without a payload, a function without a result.
@@ -124,7 +131,20 @@ pub type Component = struct {
     lowered: alloc.List(Lowered),
     export_names: alloc.List(alloc.String),
     export_funcs: alloc.List(u32),
+    /// The types instance types export (resources, and others named with
+    /// eq): by the instance type, the name, the type.
+    type_exports: alloc.List(TypeExport),
+    /// The core instances' start functions, by address, in order: run by
+    /// run_starts with the embedder's host before anything else, since
+    /// they may call the component's imports.
+    starts: alloc.List(u32),
     a: alloc.Allocator,
+}
+
+type TypeExport = struct {
+    instance_type: u32,
+    name: alloc.String,
+    type_id: u32,
 }
 
 /// A host for the core instances' start functions and for realloc, which
@@ -233,6 +253,15 @@ fn deftype(c: &mut Component, r: &mut m.Reader, b: []u8, scope: &mut alloc.List(
         c.types.items_mut()[t as usize].count = n;
         return t;
     }
+    if kind == OWN or kind == BORROW {
+        let t = new_type(c, kind);
+        let i = try read_u32(r, b);
+        if i as usize >= scope.len() {
+            return ComponentError.Invalid;
+        }
+        c.types.items_mut()[t as usize].parts.push(scope.items()[i as usize]);
+        return t;
+    }
     if kind == LIST or kind == OPTION {
         let t = new_type(c, kind);
         let part = try valtype(c, r, b, scope);
@@ -303,14 +332,21 @@ fn deftype(c: &mut Component, r: &mut m.Reader, b: []u8, scope: &mut alloc.List(
                     c.types.items_mut()[t as usize].parts.push(id);
                 } else if desc == 0x03 {
                     let bound = try read_byte(r, b);
-                    if bound != 0x00 {
-                        return ComponentError.Unsupported;
+                    var exported = NONE;
+                    if bound == 0x00 {
+                        let same = try read_u32(r, b);
+                        if same as usize >= inner.len() {
+                            return ComponentError.Invalid;
+                        }
+                        exported = inner.items()[same as usize];
+                    } else if bound == 0x01 {
+                        // (sub resource): a resource of the instance's own.
+                        exported = new_type(c, RESOURCE);
+                    } else {
+                        return ComponentError.Malformed;
                     }
-                    let same = try read_u32(r, b);
-                    if same as usize >= inner.len() {
-                        return ComponentError.Invalid;
-                    }
-                    inner.push(inner.items()[same as usize]);
+                    inner.push(exported);
+                    c.type_exports.push(TypeExport { instance_type: t, name: name, type_id: exported });
                 } else {
                     return ComponentError.Unsupported;
                 }
@@ -346,7 +382,7 @@ fn join(x: u8, y: u8) -> u8 {
 pub fn flatten_in(types: &alloc.List(CType), t: u32, out: &mut alloc.List(u8), a: alloc.Allocator) {
     let ty = &types.items()[t as usize];
     let k = ty.kind;
-    if k == BOOL or k == S8 or k == U8 or k == S16 or k == U16 or k == S32 or k == U32 or k == CHAR or k == ENUM {
+    if k == BOOL or k == S8 or k == U8 or k == S16 or k == U16 or k == S32 or k == U32 or k == CHAR or k == ENUM or k == OWN or k == BORROW {
         out.push(FLAT_I32);
     } else if k == S64 or k == U64 {
         out.push(FLAT_I64);
@@ -450,7 +486,7 @@ pub fn align_in(types: &alloc.List(CType), t: u32, a: alloc.Allocator) -> u64 {
     if k == S16 or k == U16 {
         return 2;
     }
-    if k == S32 or k == U32 or k == F32 or k == CHAR or k == STRING or k == LIST {
+    if k == S32 or k == U32 or k == F32 or k == CHAR or k == STRING or k == LIST or k == OWN or k == BORROW {
         return 4;
     }
     if k == S64 or k == U64 or k == F64 {
@@ -503,7 +539,7 @@ pub fn size_in(types: &alloc.List(CType), t: u32, a: alloc.Allocator) -> u64 {
     if k == S16 or k == U16 {
         return 2;
     }
-    if k == S32 or k == U32 or k == F32 or k == CHAR {
+    if k == S32 or k == U32 or k == F32 or k == CHAR or k == OWN or k == BORROW {
         return 4;
     }
     if k == S64 or k == U64 or k == F64 or k == STRING or k == LIST {
@@ -687,7 +723,7 @@ fn scalar(k: u8, v: u64) -> Val {
     if k == S32 {
         return Val.Int { v: sext(v, bits: 32) };
     }
-    if k == U32 {
+    if k == U32 or k == OWN or k == BORROW {
         return Val.Int { v: v & 0xFFFFFFFF };
     }
     if k == F32 {
@@ -1079,6 +1115,8 @@ pub fn instantiate(s: &mut exec.Store, now: &dyn fn() -> u64, bytes: []u8, impor
         lowered: alloc.List(Lowered).init(a),
         export_names: alloc.List(alloc.String).init(a),
         export_funcs: alloc.List(u32).init(a),
+        type_exports: alloc.List(TypeExport).init(a),
+        starts: alloc.List(u32).init(a),
         a: a,
     };
     var code: u8 = BOOL;
@@ -1216,8 +1254,21 @@ fn core_instance(c: &mut Component, s: &mut exec.Store, now: &dyn fn() -> u64, r
                 return ComponentError.Unlinkable;
             }
         }
-        var host = NoHost { calls: 0 };
-        let inst = exec.instantiate(s, &mut host, now, module: module, externs.items()) catch return ComponentError.Trapped;
+        let inst = match exec.instantiate_without_start(s, now, module: module, imports: externs.items()) {
+            ok(x) => { x }
+            err(e) => {
+                // A core import of another type than what is given it is
+                // a component that does not link, not one that trapped.
+                if e == exec.Trap.Unlinkable {
+                    return ComponentError.Unlinkable;
+                }
+                return ComponentError.Trapped;
+            }
+        };
+        match exec.start_of(s, instance: inst) {
+            some(f) => { c.starts.push(f); }
+            none => { }
+        }
         c.core_instances.push(CoreInstance { real: true, instance: inst, names: alloc.List(alloc.String).init(a), externs: alloc.List(exec.Extern).init(a) });
         return;
     }
@@ -1268,6 +1319,22 @@ fn alias(c: &mut Component, s: &exec.Store, r: &mut m.Reader, b: []u8) -> Compon
         push_core(c, e: e);
         return;
     }
+    if target == 0x00 and sort == 0x03 {
+        // A type an imported instance exports: a resource, mostly.
+        let ii = try read_u32(r, b);
+        let name = try read_name(r, b, c.a);
+        if ii as usize >= c.instances.len() {
+            return ComponentError.Invalid;
+        }
+        let it = c.instances.items()[ii as usize].type_id;
+        for e in c.type_exports.items() {
+            if e.instance_type == it and e.name.view().eq(name.view()) {
+                c.scope.push(e.type_id);
+                return;
+            }
+        }
+        return ComponentError.Invalid;
+    }
     if target == 0x00 and sort == 0x01 {
         let ii = try read_u32(r, b);
         let name = try read_name(r, b, c.a);
@@ -1283,6 +1350,22 @@ fn alias(c: &mut Component, s: &exec.Store, r: &mut m.Reader, b: []u8) -> Compon
 
 fn canon(c: &mut Component, s: &mut exec.Store, r: &mut m.Reader, b: []u8) -> ComponentError!void {
     let op = try read_byte(r, b);
+    if op == 0x03 {
+        // resource.drop of a resource the host gave: a core function of
+        // the handle that tells the host nothing yet; the host keeps no
+        // state a dropped handle would free.
+        let ti = try read_u32(r, b);
+        if ti as usize >= c.scope.len() {
+            return ComponentError.Invalid;
+        }
+        var params = alloc.List(u8).init(c.a);
+        params.push(FLAT_I32);
+        let results = alloc.List(u8).init(c.a);
+        let addr = exec.add_host_func(s, params: params.items(), results: results.items(), id: c.lowered.len() as u32);
+        c.lowered.push(Lowered { func: NONE, memory: 0, realloc: NONE });
+        c.core_funcs.push(addr);
+        return;
+    }
     let zero = try read_byte(r, b);
     if zero != 0x00 or op > 0x01 {
         return ComponentError.Unsupported;
@@ -1344,6 +1427,10 @@ pub fn handle(c: &Component, s: &mut exec.Store, imports: &mut dyn Imports, id: 
         return exec.Trap.HostTrap;
     }
     let lw = c.lowered.items()[id as usize];
+    if lw.func == NONE {
+        // A resource dropped.
+        return;
+    }
     let f = &c.funcs.items()[lw.func as usize];
     let ft = &c.types.items()[f.type_id as usize];
     var flat = alloc.List(u8).init(c.a);
@@ -1384,6 +1471,17 @@ pub fn handle(c: &Component, s: &mut exec.Store, imports: &mut dyn Imports, id: 
     var out = alloc.List(u64).init(c.a);
     try lower_flat(c, s, memory: lw.memory, realloc: lw.realloc, t: rt, x: &result, out: &mut out);
     results[0] = out.items()[0];
+}
+
+/// The core instances' start functions not run yet, in order, taken: the
+/// embedder runs them with its host before it calls an export.
+pub fn take_starts(c: &mut Component) -> alloc.List(u32) {
+    var out = alloc.List(u32).init(c.a);
+    for f in c.starts.items() {
+        out.push(f.*);
+    }
+    c.starts.clear();
+    return out;
 }
 
 /// Whether the component exports a function of this name.

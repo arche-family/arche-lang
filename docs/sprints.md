@@ -511,6 +511,12 @@ Qilingani:
 - Binding'larga option (`?T`), list (natija `alloc.List(T)`, parametr `[]T` yoki `&alloc.List(alloc.String)`) va result (`?T` yoki `bool`, xato `why: &mut alloc.String`ga) qo'shildi. `wasm/tests/arche-bindings` storage, `ui-choice`, `dom.query-all`, `children`, `parent`, `get-attribute` va `set-markup`ni chaqiradi va Nimadir'ning o'z shell'i bergan natija bilan solishtiriladi. Arche counter endi count'ni storage'da saqlaydi va Rust'nikidek init'da log yozadi.
 - Ilova shabloni: `wasm/template` va `wasm/nimadir-app.sh <papka> <chiqish>`. Skript papkaning nusxasiga binding'larni generatsiya qiladi, build qiladi va component yasaydi; asl papkaga hech narsa yozmaydi. `nimadir-check.sh` shablonni shu skript bilan build qilib sinaydi.
 
+- Boshqa tillardagi ilovalar: Nimadir'ning C# (.NET NativeAOT) counter'i qayta build qilinmasdan ishlaydi va Nimadir'ning o'z shell'i bilan bir xil chiqadi (interpreter va JIT). Buning uchun runtime'ga uchta narsa qo'shildi:
+  - Component Model resource'lari: `own`/`borrow`, instance turlarining `(sub resource)` export'lari, import qilingan instance'dan tur alias'i, canon `resource.drop`;
+  - `lib/wasm/wasip2.arche`: WASI 0.2 ning .NET ishlatadigan qismi. stdout va stderr log'ga yoziladi; soat; bo'sh environment va preopen'lar; terminal yo'q; `exit` trap qiladi; deterministik random;
+  - core instance'larning `start` funksiyalari component to'liq qurilgach, haqiqiy host bilan, birinchi export'dan oldin yuritiladi. .NET runtime'i shu yerda ishga tushadi va import'larni chaqiradi.
+  Import turi mos kelmasa, endi "trapped" emas, "does not link" deyiladi. WebAssembly spec testlari: 27416 o'tdi, 0 xato. Python (componentize-py) ilovasi sinalmagan: uning build qilingan component'i bu yerda yo'q.
+
 Qolgani: record va record list'lari uchun binding'lar (`list-apps`, `app-info`, `fetch`, `fetch-poll`, `dom.bounds`, `dom.events`). `arche-wasm`ning Nimadir shell'i ikki joyda Nimadir'dan farq qiladi: `storage-keys` tartibi (Nimadir saralaydi) va yopilmagan teg'li `set-markup` (Nimadir rad etadi).
 
 ### S39. ARM64 JIT va aarch64 telefon

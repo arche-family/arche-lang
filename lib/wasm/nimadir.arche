@@ -9,6 +9,7 @@ import alloc;
 import image.png;
 import wasm.component as c;
 import wasm.exec;
+import wasm.wasip2;
 
 pub const FRAME_BUDGET_NS: u64 = 1000000000;
 pub const INIT_BUDGET_NS: u64 = 10000000000;
@@ -28,6 +29,8 @@ pub const MAX_EVENTS: usize = 256;
 
 const HOST_API: str = "nimadir:shell/host-api@1.2.0";
 const DOM: str = "nimadir:shell/dom@1.2.0";
+/// What a runtime's randomness (wasi:random) starts from: "nimadir!".
+const WASI_SEED: u64 = 0x6E696D6164697221;
 
 const HOST_FUNCS: str = " log ui-label ui-button ui-text-edit ui-heading ui-search-field ui-tile now-millis list-apps open-app request-frame storage-get storage-set storage-remove storage-keys ui-begin ui-end ui-checkbox ui-choice ui-separator ui-progress ui-submitted image-load ui-image fetch fetch-poll locale time-zone utc-offset app-info ";
 const DOM_FUNCS: str = " root create-element create-text append-child insert-before remove release set-text set-attribute remove-attribute get-attribute toggle-class set-style set-markup query-all parent children value focus bounds add-stylesheet remove-stylesheet listen unlisten events ";
@@ -145,6 +148,8 @@ pub type Ui = struct {
     pub exceeded: bool,
     /// Functions this shell keeps from the app, to see it refused.
     denied: alloc.List(alloc.String),
+    /// What a runtime the app is built on reaches through WASI.
+    wasi: wasip2.Wasi,
     a: alloc.Allocator,
 }
 
@@ -179,6 +184,7 @@ pub fn new_ui(a: alloc.Allocator) -> Ui {
         sent_cmds: 0,
         exceeded: false,
         denied: alloc.List(alloc.String).init(a),
+        wasi: wasip2.new_wasi(seed: WASI_SEED, a),
         a: a,
     };
     // Node 0 is no node; 1 is the page's body.
@@ -1629,6 +1635,9 @@ impl c.Imports for Ui {
                 return false;
             }
         }
+        if instance.starts_with("wasi:") {
+            return wasip2.has(instance: instance, func: func);
+        }
         var list = "";
         if instance.eq(HOST_API) {
             list = HOST_FUNCS;
@@ -1653,6 +1662,9 @@ impl c.Imports for Ui {
         if instance.eq(DOM) {
             return try dom(self, func: func, args: args);
         }
+        if instance.starts_with("wasi:") {
+            return try wasip2.call(&mut self.wasi, instance: instance, func: func, args: args, now_ms: self.now_ms, a: a);
+        }
         return try host_api(self, func: func, args: args);
     }
 }
@@ -1670,6 +1682,19 @@ impl exec.Host for App {
     }
 }
 
+/// What the app wrote to stdout and stderr, into its logs a line at a
+/// time, made visible as log's are; as Nimadir's shell does with stderr
+/// after each call.
+fn take_output(ui: &mut Ui) {
+    var lines = alloc.List(alloc.String).init(ui.a);
+    wasip2.drain(&mut ui.wasi, lines: &mut lines);
+    for l in lines.items() {
+        var line = alloc.String.init(ui.a);
+        visible(l.view(), out: &mut line);
+        ui.logs.push(line);
+    }
+}
+
 /// The shell's limits for a store of apps.
 pub fn limits() -> exec.Limits {
     var l = exec.default_limits();
@@ -1680,12 +1705,32 @@ pub fn limits() -> exec.Limits {
 
 /// Calls the app's export name (init or update), within budget_ns of now.
 pub fn run(app: &mut App, store: &mut exec.Store, now: &dyn fn() -> u64, name: str, budget_ns: u64) -> exec.Trap!void {
+    // The core instances' start functions first, once, within the budget:
+    // a language's runtime may start there, calling the imports.
+    let starts = c.take_starts(&mut app.comp);
+    if starts.len() > 0 {
+        store.deadline_ns = now() + budget_ns;
+        for f in starts.items() {
+            var none_results = alloc.List(u64).init(app.ui.a);
+            let none_args: [0]u64 = [];
+            let started = exec.invoke(store, app, now, func: f.*, none_args[0..0], &mut none_results);
+            match started {
+                ok(_) => { }
+                err(e) => {
+                    store.deadline_ns = 0;
+                    return e;
+                }
+            }
+        }
+        store.deadline_ns = 0;
+    }
     let none_args = alloc.List(c.Val).init(app.ui.a);
     let p = try c.prepare(&app.comp, store, name: name, &none_args);
     var results = alloc.List(u64).init(app.ui.a);
     store.deadline_ns = now() + budget_ns;
     let r = exec.invoke(store, app, now, func: p.core, p.args.items(), &mut results);
     store.deadline_ns = 0;
+    take_output(&mut app.ui);
     if name.eq("update") {
         // Taps and submits were this frame's; groups the app left open
         // close here, so a shell always sees them balanced.

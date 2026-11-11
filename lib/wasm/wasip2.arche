@@ -1,0 +1,374 @@
+/// The host's side of the WASI 0.2 functions a headless app's runtime
+/// imports (.NET NativeAOT's, for one), giving it nothing it could reach
+/// past the app: no environment, no files, no terminal. What it writes to
+/// stdout and stderr becomes log lines, as Nimadir's shell makes a guest's
+/// stderr (host/src/host.rs, drain_stderr); its clocks are the shell's
+/// time; its randomness is seeded, so a run repeats.
+///
+/// Resources are handles this host numbers: stdin, stdout and stderr are
+/// fixed, so a write says which stream it is to, and pollables count up
+/// from after them. Dropping one costs the host nothing.
+import alloc;
+import core.rand;
+import core.utf8;
+import wasm.component as c;
+import wasm.exec;
+
+pub const STDIN: u64 = 1;
+pub const STDOUT: u64 = 2;
+pub const STDERR: u64 = 3;
+/// What a guest may write to stdout, and to stderr, over its life: 64 KiB
+/// each, as Nimadir's shell gives stderr. Past it the stream is closed.
+pub const STREAM_CAPACITY: u64 = 64 << 10;
+/// The most get-random-bytes gives at once; asking more traps.
+pub const MAX_RANDOM_BYTES: u64 = 1 << 20;
+
+/// filesystem's error-code bad-descriptor, and stream-error's closed.
+const BAD_DESCRIPTOR: u32 = 3;
+const CLOSED: u32 = 1;
+const LAST_HANDLE: u64 = 0xFFFFFFFF;
+
+/// The functions given, each " instance#function " with the instance's
+/// name without its version.
+const FUNCS: str = " wasi:io/poll#[method]pollable.block wasi:io/streams#[method]output-stream.check-write wasi:io/streams#[method]output-stream.write wasi:io/streams#[method]output-stream.blocking-flush wasi:io/streams#[method]output-stream.subscribe wasi:cli/environment#get-environment wasi:cli/exit#exit wasi:cli/stdin#get-stdin wasi:cli/stdout#get-stdout wasi:cli/stderr#get-stderr wasi:cli/terminal-stdin#get-terminal-stdin wasi:cli/terminal-stdout#get-terminal-stdout wasi:cli/terminal-stderr#get-terminal-stderr wasi:clocks/monotonic-clock#now wasi:clocks/monotonic-clock#subscribe-instant wasi:clocks/monotonic-clock#subscribe-duration wasi:clocks/wall-clock#now wasi:filesystem/preopens#get-directories wasi:filesystem/types#[method]descriptor.read-via-stream wasi:filesystem/types#[method]descriptor.write-via-stream wasi:filesystem/types#[method]descriptor.append-via-stream wasi:filesystem/types#[method]descriptor.get-flags wasi:filesystem/types#[method]descriptor.stat wasi:filesystem/types#[method]descriptor.metadata-hash wasi:random/random#get-random-bytes ";
+
+/// The host's WASI state for one app.
+pub type Wasi = struct {
+    /// The handle a new pollable gets.
+    next: u64,
+    /// What the monotonic clock said last, in ns: it never goes back.
+    last_ns: u64,
+    rng: rand.Seeded,
+    /// Each output stream's line not ended yet, and the bytes it took.
+    stdout_line: alloc.List(u8),
+    stderr_line: alloc.List(u8),
+    stdout_used: u64,
+    stderr_used: u64,
+    /// The lines written, until drain takes them.
+    lines: alloc.List(alloc.String),
+    a: alloc.Allocator,
+}
+
+/// WASI for an app whose random bytes come from seed.
+pub fn new_wasi(seed: u64, a: alloc.Allocator) -> Wasi {
+    return Wasi {
+        next: STDERR + 1,
+        last_ns: 0,
+        rng: rand.Seeded.init(seed),
+        stdout_line: alloc.List(u8).init(a),
+        stderr_line: alloc.List(u8).init(a),
+        stdout_used: 0,
+        stderr_used: 0,
+        lines: alloc.List(alloc.String).init(a),
+        a: a,
+    };
+}
+
+/// The instance's name without its version, when the version is 0.2's;
+/// empty for any other.
+fn base_of(instance: str) -> str {
+    let b = instance.bytes();
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        if b[i] == '@' {
+            if instance[i + 1..b.len()].starts_with("0.2.") {
+                return instance[0..i];
+            }
+            return "";
+        }
+    }
+    return "";
+}
+
+/// Whether this host gives the function func of instance.
+pub fn has(instance: str, func: str) -> bool {
+    let base = base_of(instance);
+    if base.len() == 0 {
+        return false;
+    }
+    // " base#func " in FUNCS.
+    let l = FUNCS.bytes();
+    let n = base.len() + 1 + func.len();
+    var i: usize = 0;
+    while i + n + 2 <= l.len() : (i += 1) {
+        if l[i] == ' ' and l[i + n + 1] == ' ' and l[i + 1 + base.len()] == '#' and FUNCS[i + 1..i + 1 + base.len()].eq(base) and FUNCS[i + 2 + base.len()..i + 1 + n].eq(func) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---- values -------------------------------------------------------------------------
+
+fn int_arg(args: &alloc.List(c.Val), i: usize) -> u64 {
+    if i >= args.len() {
+        return 0;
+    }
+    match &args.items()[i] {
+        .Int { v } => { return v.*; }
+        _ => { return 0; }
+    }
+}
+
+/// A case with no payload: an enum's, none, ok of _.
+fn bare(tag: u32, a: alloc.Allocator) -> c.Val {
+    return c.Val.Variant { case: tag, payload: alloc.List(c.Val).init(a) };
+}
+
+/// A case with v: some, ok, err.
+fn holding(tag: u32, v: c.Val, a: alloc.Allocator) -> c.Val {
+    var p = alloc.List(c.Val).init(a);
+    p.push(v);
+    return c.Val.Variant { case: tag, payload: p };
+}
+
+fn empty_list(a: alloc.Allocator) -> c.Val {
+    return c.Val.List { items: alloc.List(c.Val).init(a) };
+}
+
+/// result<_, stream-error>'s err of closed.
+fn closed(a: alloc.Allocator) -> c.Val {
+    return holding(tag: 1, v: bare(tag: CLOSED, a), a);
+}
+
+/// A new pollable, or any resource the host keeps nothing for.
+fn new_handle(w: &mut Wasi) -> exec.Trap!c.Val {
+    if w.next > LAST_HANDLE {
+        return exec.Trap.HostLimit;
+    }
+    let h = w.next;
+    w.next += 1;
+    return c.Val.Int { v: h };
+}
+
+// ---- streams ------------------------------------------------------------------------
+
+/// The bytes valid UTF-8 as they are, each byte that is not as U+FFFD.
+fn lossy(b: []u8, out: &mut alloc.String) {
+    var i: usize = 0;
+    while i < b.len() {
+        match utf8.decode(b, at: i) {
+            some(d) => {
+                _ = out.push_utf8(b[i..i + d.len]);
+                i += d.len;
+            }
+            none => {
+                out.push_str("\u{FFFD}");
+                i += 1;
+            }
+        }
+    }
+}
+
+fn blank(s: str) -> bool {
+    for b in s.bytes() {
+        if b.* != ' ' and b.* != '\t' and b.* != '\n' and b.* != '\r' and b.* != 0x0B and b.* != 0x0C {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn pending(w: &Wasi, h: u64) -> []u8 {
+    if h == STDOUT {
+        return w.stdout_line.items();
+    }
+    return w.stderr_line.items();
+}
+
+/// The line of the stream h ends, by a newline when ended: kept, unless it
+/// is blank. A "\r\n" ends a line as "\n" does.
+fn end_line(w: &mut Wasi, h: u64, ended: bool) {
+    var line = alloc.String.init(w.a);
+    var prefix = "stderr: ";
+    if h == STDOUT {
+        prefix = "stdout: ";
+    }
+    line.push_str(prefix);
+    let b = pending(w, h: h);
+    var n = b.len();
+    if ended and n > 0 and b[n - 1] == '\r' {
+        n -= 1;
+    }
+    lossy(b[0..n], out: &mut line);
+    if h == STDOUT {
+        w.stdout_line.clear();
+    } else {
+        w.stderr_line.clear();
+    }
+    if not blank(line.view()[prefix.len()..line.len()]) {
+        w.lines.push(line);
+    }
+}
+
+fn put(w: &mut Wasi, h: u64, byte: u8) {
+    if byte == '\n' {
+        end_line(w, h: h, ended: true);
+    } else if h == STDOUT {
+        w.stdout_line.push(byte);
+    } else {
+        w.stderr_line.push(byte);
+    }
+}
+
+/// What a guest may still write to the stream h.
+fn room(w: &Wasi, h: u64) -> u64 {
+    if h == STDOUT {
+        return STREAM_CAPACITY - w.stdout_used;
+    }
+    return STREAM_CAPACITY - w.stderr_used;
+}
+
+fn output_stream(w: &mut Wasi, func: str, args: &alloc.List(c.Val), a: alloc.Allocator) -> exec.Trap!c.Val {
+    let h = int_arg(args, i: 0);
+    if h != STDOUT and h != STDERR {
+        // The only output streams this host gave are these two.
+        return exec.Trap.HostTrap;
+    }
+    if func.eq("[method]output-stream.subscribe") {
+        return try new_handle(w);
+    }
+    if func.eq("[method]output-stream.blocking-flush") {
+        return bare(tag: 0, a);
+    }
+    let left = room(w, h: h);
+    if func.eq("[method]output-stream.check-write") {
+        if left == 0 {
+            return closed(a);
+        }
+        return holding(tag: 0, v: c.Val.Int { v: left }, a);
+    }
+    // [method]output-stream.write
+    if left == 0 {
+        return closed(a);
+    }
+    if args.len() < 2 {
+        return exec.Trap.HostTrap;
+    }
+    match &args.items()[1] {
+        .List { items } => {
+            // More than check-write allowed: WASI has the host trap.
+            if items.len() as u64 > left {
+                return exec.Trap.HostTrap;
+            }
+            if h == STDOUT {
+                w.stdout_used += items.len() as u64;
+            } else {
+                w.stderr_used += items.len() as u64;
+            }
+            for v in items.items() {
+                match v {
+                    .Int { v: x } => { put(w, h: h, byte: x.* as% u8); }
+                    _ => { return exec.Trap.HostTrap; }
+                }
+            }
+        }
+        _ => { return exec.Trap.HostTrap; }
+    }
+    return bare(tag: 0, a);
+}
+
+/// What was written to stdout and stderr since drain last took it, into
+/// lines: each "stdout: " or "stderr: " and a line, its bytes that are not
+/// UTF-8 as U+FFFD, blank lines left out. A line not ended yet ends here,
+/// as Nimadir's shell ends it after each call.
+pub fn drain(w: &mut Wasi, lines: &mut alloc.List(alloc.String)) {
+    if w.stdout_line.len() > 0 {
+        end_line(w, h: STDOUT, ended: false);
+    }
+    if w.stderr_line.len() > 0 {
+        end_line(w, h: STDERR, ended: false);
+    }
+    for l in w.lines.items() {
+        lines.push(l.clone());
+    }
+    w.lines.clear();
+}
+
+// ---- the rest -----------------------------------------------------------------------
+
+/// The shell's time in ns, never less than the last time asked.
+fn monotonic(w: &mut Wasi, now_ms: i64) -> u64 {
+    if now_ms > 0 and (now_ms as u64) * 1000000 > w.last_ns {
+        w.last_ns = (now_ms as u64) * 1000000;
+    }
+    return w.last_ns;
+}
+
+fn random_bytes(w: &mut Wasi, len: u64, a: alloc.Allocator) -> exec.Trap!c.Val {
+    if len > MAX_RANDOM_BYTES {
+        return exec.Trap.HostLimit;
+    }
+    var items = alloc.List(c.Val).init(a);
+    var word: u64 = 0;
+    var i: u64 = 0;
+    while i < len : (i += 1) {
+        if i % 8 == 0 {
+            word = w.rng.next_u64();
+        }
+        items.push(c.Val.Int { v: word & 0xFF });
+        word = word >> 8;
+    }
+    return c.Val.List { items: items };
+}
+
+/// Calls the function func of instance, one has gives, with the time the
+/// shell says it is.
+pub fn call(w: &mut Wasi, instance: str, func: str, args: &alloc.List(c.Val), now_ms: i64, a: alloc.Allocator) -> exec.Trap!c.Val {
+    if not has(instance: instance, func: func) {
+        return exec.Trap.HostTrap;
+    }
+    let base = base_of(instance);
+    if base.eq("wasi:io/poll") {
+        // [method]pollable.block: what a pollable waits for is ready now.
+        return c.Val.Unit;
+    }
+    if base.eq("wasi:io/streams") {
+        return try output_stream(w, func: func, args: args, a: a);
+    }
+    if base.eq("wasi:cli/environment") or base.eq("wasi:filesystem/preopens") {
+        return empty_list(a);
+    }
+    if base.eq("wasi:cli/exit") {
+        // The app has ended itself; the host stops it, as from any host
+        // function that will not go on.
+        return exec.Trap.HostTrap;
+    }
+    if base.eq("wasi:cli/stdin") {
+        return c.Val.Int { v: STDIN };
+    }
+    if base.eq("wasi:cli/stdout") {
+        return c.Val.Int { v: STDOUT };
+    }
+    if base.eq("wasi:cli/stderr") {
+        return c.Val.Int { v: STDERR };
+    }
+    if base.starts_with("wasi:cli/terminal-") {
+        // Not a terminal.
+        return bare(tag: 0, a);
+    }
+    if base.eq("wasi:clocks/monotonic-clock") {
+        if func.eq("now") {
+            return c.Val.Int { v: monotonic(w, now_ms: now_ms) };
+        }
+        return try new_handle(w);
+    }
+    if base.eq("wasi:clocks/wall-clock") {
+        var ms: u64 = 0;
+        if now_ms > 0 {
+            ms = now_ms as u64;
+        }
+        var fields = alloc.List(c.Val).init(a);
+        fields.push(c.Val.Int { v: ms / 1000 });
+        fields.push(c.Val.Int { v: (ms % 1000) * 1000000 });
+        return c.Val.List { items: fields };
+    }
+    if base.eq("wasi:filesystem/types") {
+        // No descriptor is ever given.
+        return holding(tag: 1, v: bare(tag: BAD_DESCRIPTOR, a), a);
+    }
+    if base.eq("wasi:random/random") {
+        return try random_bytes(w, len: int_arg(args, i: 0), a: a);
+    }
+    return exec.Trap.HostTrap;
+}

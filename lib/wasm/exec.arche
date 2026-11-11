@@ -327,6 +327,31 @@ fn eval_const(s: &Store, instance: u32, c: m.Const) -> u64 {
 /// them; its index. Elements and data are written in order, then start
 /// runs; a trap on the way leaves what was written before it.
 pub fn instantiate(s: &mut Store, host: &mut dyn Host, now: &dyn fn() -> u64, module: u32, imports: []Extern) -> Trap!u32 {
+    let index = try instantiate_without_start(s, now, module: module, imports: imports);
+    match start_of(s, instance: index) {
+        some(f) => {
+            var results = alloc.List(u64).init(s.a);
+            let none_args: [0]u64 = [];
+            try invoke(s, host, now, func: f, none_args[0..0], &mut results);
+        }
+        none => { }
+    }
+    return index;
+}
+
+/// The function an instance's module starts it with, by its address.
+pub fn start_of(s: &Store, instance: u32) -> ?u32 {
+    let module = s.instances.items()[instance as usize].module;
+    if not s.modules.items()[module as usize].has_start {
+        return none;
+    }
+    return s.instances.items()[instance as usize].funcs.items()[s.modules.items()[module as usize].start as usize];
+}
+
+/// An instance of module, as instantiate makes it, but without running its
+/// start function, which start_of gives: for an embedder whose host is
+/// not whole until more instances are made (a component's).
+pub fn instantiate_without_start(s: &mut Store, now: &dyn fn() -> u64, module: u32, imports: []Extern) -> Trap!u32 {
     let a = s.a;
     var inst = Instance {
         module: module,
@@ -502,12 +527,6 @@ pub fn instantiate(s: &mut Store, host: &mut dyn Host, now: &dyn fn() -> u64, mo
             try memory_init(s, instance: index, data: k as u32, dst: offset, src: 0, n: d.len as u64);
             s.instances.items_mut()[index as usize].dropped.items_mut()[k] = true;
         }
-    }
-    if s.modules.items()[module as usize].has_start {
-        let f = s.instances.items()[index as usize].funcs.items()[s.modules.items()[module as usize].start as usize];
-        var results = alloc.List(u64).init(a);
-        let none_args: [0]u64 = [];
-        try invoke(s, host, now, func: f, none_args[0..0], &mut results);
     }
     return index;
 }

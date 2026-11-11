@@ -19,7 +19,7 @@ failed=0
 # run alike from one directory.
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-for app in counter hello store gallery runaway; do
+for app in counter counter-cs hello store gallery runaway; do
     mkdir -p "$work/mini-apps/$app"
     cp "$apps/$app.component.wasm" "$work/mini-apps/$app/"
 done
@@ -60,6 +60,8 @@ grep -v '^#' "$apps/cases.txt" | {
 failed=$(cat "$work/failed")
 }
 check_cases ""
+# counter-cs is not encoded again: its program imports WASI, which
+# Nimadir's world does not have; it runs as .NET's toolchain made it.
 for app in counter hello store gallery runaway; do
     "$wasm" core "$apps/$app.component.wasm" "$work/$app.core.wasm"
     "$wasm" component "$work/$app.core.wasm" "$apps/world.wit" mini-app "$work/mini-apps/$app/$app.component.wasm"
