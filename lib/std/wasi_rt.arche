@@ -66,6 +66,10 @@ type State = struct {
     failure: Buffer,
     preopen_count: u32,
     preopens: [16]Preopen,
+    /// A component's (std-component.arche): its state, and the host it is
+    /// given, as their addresses; 0 before init.
+    app_state: u64,
+    app_host: u64,
 }
 
 fn state() -> &mut State {
@@ -78,6 +82,21 @@ fn state() -> &mut State {
 
 fn align16(n: u64) -> u64 {
     return (n + 15) / 16 * 16;
+}
+
+/// A component's state and host, kept between its exports' calls.
+pub fn app_state() -> u64 {
+    return state().app_state;
+}
+
+pub fn app_host() -> u64 {
+    return state().app_host;
+}
+
+pub fn keep_app(made: u64, host: u64) {
+    let st = state();
+    st.app_state = made;
+    st.app_host = host;
 }
 
 /// Bytes from the top of the heap, zero as memory.grow gives them.

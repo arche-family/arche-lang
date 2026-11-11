@@ -1295,6 +1295,67 @@ fn entry(l: &mut Lower) {
     _ = emit(l, ret);
 }
 
+/// A component's program (spec/arche.md §10.3). a0_component_init makes the
+/// app's state with the root module's init, in memory that lasts, and gives
+/// its address; a0_component_update gives it to update, each frame. The
+/// program's own allocator (handle 0) is theirs. The world's bindings
+/// export what calls them (lib/wasm/guest.arche).
+fn component_init(l: &mut Lower) {
+    let di = l.c.items[0].get(l.c.names.intern("init")) orelse 0;
+    let fi = l.c.decls[di as usize].fn_index;
+    let state_t = l.c.fns[fi as usize].ret;
+    var e = ir.new_function("a0_component_init", ir.Ty.Ptr, l.a);
+    e.internal = false;
+    e.params.push(ir.Ty.Ptr);
+    l.f = e;
+    l.block = 0;
+    var p = ir.inst(ir.Op.Param, ir.Ty.Ptr);
+    p.imm = 0;
+    let host = emit(l, p);
+    var sizes = args0(l);
+    sizes.push(konst(l, ir.Ty.I64, 0));
+    sizes.push(konst(l, ir.Ty.I64, layout.layout(&l.c, state_t).size));
+    let mem = call_runtime(l, "a0rt_alloc_in", ir.Ty.Ptr, &sizes);
+    var args = args0(l);
+    if returns_in_memory(&l.c, state_t) {
+        args.push(mem);
+        args.push(host);
+        args.push(konst(l, ir.Ty.I64, 0));
+        _ = call_with(l, fi, false, ir.Ty.Void, &args);
+    } else {
+        args.push(host);
+        args.push(konst(l, ir.Ty.I64, 0));
+        let r = call_with(l, fi, false, ret_ty(&l.c, state_t), &args);
+        store(l, value: r, addr: mem);
+    }
+    var ret = ir.inst(ir.Op.Ret, ir.Ty.Void);
+    ret.a = mem;
+    _ = emit(l, ret);
+}
+
+fn component_update(l: &mut Lower) {
+    let du = l.c.items[0].get(l.c.names.intern("update")) orelse 0;
+    let fu = l.c.decls[du as usize].fn_index;
+    var u = ir.new_function("a0_component_update", ir.Ty.Void, l.a);
+    u.internal = false;
+    u.params.push(ir.Ty.Ptr);
+    u.params.push(ir.Ty.Ptr);
+    l.f = u;
+    l.block = 0;
+    var p0 = ir.inst(ir.Op.Param, ir.Ty.Ptr);
+    p0.imm = 0;
+    let state = emit(l, p0);
+    var p1 = ir.inst(ir.Op.Param, ir.Ty.Ptr);
+    p1.imm = 1;
+    let h = emit(l, p1);
+    var uargs = args0(l);
+    uargs.push(state);
+    uargs.push(h);
+    uargs.push(konst(l, ir.Ty.I64, 0));
+    _ = call_with(l, fu, false, ir.Ty.Void, &uargs);
+    _ = emit(l, ir.inst(ir.Op.RetVoid, ir.Ty.Void));
+}
+
 /// The names of the program's errors, by number, for the runtime.
 fn error_names(l: &mut Lower) {
     var entries = alloc.List(u32).init(l.a);
@@ -1392,6 +1453,7 @@ pub fn lower(c: ck.Checker) -> ir.Module {
             l.m.triple.push_str("wasm32-wasip1");
             hosted = true;
         }
+        .WasmComponent => { l.m.triple.push_str("wasm32-unknown-unknown"); }
         .LinuxRiscv64 => {
             l.m.triple.push_str("riscv64-unknown-linux-gnu");
             hosted = true;
@@ -1422,6 +1484,16 @@ pub fn lower(c: ck.Checker) -> ir.Module {
             l.m.fn_attrs.push_str(features[fi].view());
         }
         l.m.fn_attrs.push_str("\"");
+    }
+    if program.component(l.c.p.target) and not l.c.p.tests and not l.c.p.no_main {
+        component_init(&mut l);
+        let made = l.f;
+        l.m.functions.push(made);
+        l.f = ir.new_function("", ir.Ty.Void, a);
+        component_update(&mut l);
+        let updated = l.f;
+        l.m.functions.push(updated);
+        l.f = ir.new_function("", ir.Ty.Void, a);
     }
     if hosted {
         entry(&mut l);

@@ -1580,7 +1580,24 @@ fn call(l: &mut lw.Lower, n: cst.NodeId) -> lw.Val {
             args.push(value(l, arg_node(l, n, i)).v);
         }
         var name = alloc.String.init(l.a);
-        name.push_str(l.c.names.text(l.c.decls[d as usize].name));
+        let abi = ck.fn_attribute(&l.c, d, "extern");
+        if abi.view().starts_with("wasm:") {
+            // A WebAssembly import: wasm:module#field, the field the name
+            // with - for _ (compiler/wasm/gen.arche).
+            name.push_str(abi.view());
+            name.push_str("#");
+            let fname = l.c.names.text(l.c.decls[d as usize].name);
+            var k: usize = 0;
+            while k < fname.len() : (k += 1) {
+                if fname[k] == '_' {
+                    name.push_str("-");
+                } else {
+                    name.push_str(fname[k..k + 1]);
+                }
+            }
+        } else {
+            name.push_str(l.c.names.text(l.c.decls[d as usize].name));
+        }
         let rt = lw.ret_ty(&l.c, info.ret);
         let r = lw.call_runtime(l, name.view(), rt, &args);
         return result_of(l, t, r: r, sret: ck.NONE);

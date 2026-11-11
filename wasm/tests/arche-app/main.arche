@@ -1,0 +1,37 @@
+/// A Nimadir mini-app written in Arche (docs/sprints.md S38), the first:
+/// built with --target wasm32-component, made a component of Nimadir's
+/// world by arche-wasm's encoder, it draws a label and how many frames it
+/// has drawn. nimadir-check.sh runs it.
+import alloc;
+import std;
+
+extern "wasm:nimadir:shell/host-api@1.2.0" fn ui_label(text: u32, len: u32);
+
+type App = struct {
+    frames: u64,
+}
+
+/// A label of text: its bytes' address and length, as the canonical ABI
+/// passes a string.
+fn label(host: &mut std.Host, text: str) {
+    if text.len() == 0 {
+        return;
+    }
+    unsafe {
+        // SAFETY: the host reads the bytes during the call and keeps none.
+        ui_label(text: (&text.bytes()[0] as *u8).addr() as u32, len: text.len() as u32);
+    }
+}
+
+fn init(host: &mut std.Host, a: alloc.Allocator) -> App {
+    return App { frames: 0 };
+}
+
+fn update(state: &mut App, host: &mut std.Host, a: alloc.Allocator) {
+    state.frames += 1;
+    label(host, text: "Salom, Arche'dan!");
+    var line = alloc.String.init(a);
+    line.push_str("Kadr: ");
+    line.push_u64(state.frames);
+    label(host, text: line.view());
+}

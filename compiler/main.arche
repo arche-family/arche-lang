@@ -862,7 +862,7 @@ fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, o
         }
     }
     // WebAssembly is this compiler's own backend's alone.
-    if opts.target == program.Target.WasiWasm32 {
+    if program.wasm(opts.target) {
         if opts.release {
             err_out.write("arche: release builds are not for WebAssembly yet\n");
             return Failure.BadUsage;
@@ -1350,7 +1350,7 @@ fn main(sys: &mut std.System) -> !void {
             match program.target_by_name(sys.args.get(first)) {
                 some(t) => { opts.target = t; }
                 none => {
-                    sys.stderr.write("arche: unknown target; the targets are linux-x86_64, linux-aarch64, linux-riscv64, wasm32-wasi, windows-x86_64, freestanding-x86_64, freestanding-riscv64 and freestanding-aarch64\n");
+                    sys.stderr.write("arche: unknown target; the targets are linux-x86_64, linux-aarch64, linux-riscv64, wasm32-wasi, wasm32-component, windows-x86_64, freestanding-x86_64, freestanding-riscv64 and freestanding-aarch64\n");
                     return Failure.BadUsage;
                 }
             }

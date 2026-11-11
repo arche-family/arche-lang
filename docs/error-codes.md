@@ -68,7 +68,7 @@ Every diagnostic of the Arche compiler has a stable code. A code never changes m
 | `E0310` | A field, method, variant or error that the type does not have. |
 | `E0311` | A module that has no item with this name. |
 | `E0312` | A method with the name of a field or variant of its type. |
-| `E0313` | No `main`, or `main` not declared as `fn main(sys: &mut std.System) -> !void`. |
+| `E0313` | No `main`, or `main` not declared as `fn main(sys: &mut std.System) -> !void`; for `wasm32-component`, no `init` and `update` of the shape §10.3 gives. |
 
 ## Types and expressions
 
@@ -178,7 +178,7 @@ Reserved for the full language (spec/arche.md); assigned as the compiler impleme
 | `E0921` | An operation that needs `unsafe` outside an `unsafe` block or `unsafe fn`: a raw pointer made, read, written, offset or turned into a view, or an `unsafe fn` called (§10.1). |
 | `E0922` | An `asm` operand that is not `in`, `out`, `inout` or `clobber`, whose value is not an integer, `bool` or pointer, that writes a place it cannot, or a `%N` without an operand (§10.2). |
 | `E0923` | A `naked fn` with parameters or a result, or whose body is not one `asm` statement (§10.2). |
-| `E0924` | A foreign function with another calling convention than `"c"`, or one that takes or returns something other than integers, `bool`s, floats and raw pointers (§10.1). |
+| `E0924` | A foreign function with another calling convention than `"c"` (or `"wasm:module"` on WebAssembly), or one that takes or returns something other than integers, `bool`s, floats and raw pointers (§10.1). |
 | `E0925` | An `align(N)` whose `N` is not a power of two from 1 to 4096, or one on a field of a packed struct (§10.2). |
 | `E0926` | A view of a field of a packed struct, which may be unaligned (§10.2). |
 | `E0927` | An atomic operation whose ordering is not written as a constant, is one the operation cannot have, or whose type it does not work on (§10.2). |

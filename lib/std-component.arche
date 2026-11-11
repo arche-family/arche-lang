@@ -1,0 +1,39 @@
+/// std for a component's program (wasm32-component, docs/sprints.md S38):
+/// no operating system, only the host its world gives. It holds the
+/// runtime (std.wasi_rt, whose WASI calls the compiler's backend refuses
+/// here) and the exports a component's world calls: init makes the app's
+/// state with the root module's init and keeps it, update gives it to the
+/// root module's update. The world's bindings import std, so that a
+/// program built on them has these.
+import core;
+import core.ptr;
+import std.wasi_rt as rt;
+
+/// The compiler's: the root module's init and update, called with the
+/// host's address, and the state's (compiler/lower/lower.arche).
+extern "c" fn a0_component_init(host: *mut u8) -> u64;
+extern "c" fn a0_component_update(made: u64, host: *mut u8);
+
+/// The host a world's functions are reached through: nothing but a token
+/// that a program holds, for the bindings' functions to take.
+pub type Host = struct {
+    unique: core.Unique,
+}
+
+export("init") fn init() {
+    rt.start();
+    let host = rt.take_zeroed(16);
+    var made: u64 = 0;
+    unsafe {
+        // SAFETY: memory just taken for the host, which lasts the run.
+        made = a0_component_init(ptr.from_addr(u8, host as usize) as *mut u8);
+    }
+    rt.keep_app(made: made, host: host);
+}
+
+export("update") fn update() {
+    unsafe {
+        // SAFETY: what init kept.
+        a0_component_update(rt.app_state(), ptr.from_addr(u8, rt.app_host() as usize) as *mut u8);
+    }
+}

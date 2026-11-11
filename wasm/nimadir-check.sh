@@ -78,6 +78,40 @@ else
     echo "PASS a world without ui-button is refused for the counter"
 fi
 
+# An app written in Arche (tests/arche-app, S38): built for wasm32-component
+# by the compiler, made a component by the encoder, it keeps its state
+# between frames and allocates.
+arche=${ARCHE:-$here/../compiler/build/arche}
+if ! "$arche" --target wasm32-component build "$here/tests/arche-app/main.arche" "$work/app.core.wasm" > "$work/err" 2>&1 ||
+    ! "$wasm" component "$work/app.core.wasm" "$apps/world.wit" mini-app "$work/app.wasm" >> "$work/err" 2>&1; then
+    echo "FAIL the Arche app did not build:"
+    head -20 "$work/err"
+    failed=$((failed + 1))
+else
+    for mode in "" --jit; do
+        "$wasm" nimadir "$work/app.wasm" --frames 3 $mode > "$work/out" 2>&1 || true
+        if grep -qxF '   label   : "Kadr: 3"' "$work/out" && [ "$(grep -c 'Salom, Arche' "$work/out")" -eq 3 ]; then
+            echo "PASS the Arche app counts its frames $mode"
+        else
+            echo "FAIL the Arche app $mode:"
+            head -20 "$work/out"
+            failed=$((failed + 1))
+        fi
+    done
+fi
+
+# A component's root module without update is refused (E0313).
+if "$arche" --target wasm32-component build "$here/tests/arche-app-no-update/main.arche" "$work/no-update.wasm" > "$work/err" 2>&1; then
+    echo "FAIL a component without update was built"
+    failed=$((failed + 1))
+elif ! grep -q 'error\[E0313\]' "$work/err"; then
+    echo "FAIL a component without update, said:"
+    head -5 "$work/err"
+    failed=$((failed + 1))
+else
+    echo "PASS a component without update is refused (E0313)"
+fi
+
 # expect <description> <status> <line that must appear> -- <arche-wasm args>...
 expect() {
     what=$1

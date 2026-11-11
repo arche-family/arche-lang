@@ -2758,9 +2758,15 @@ fn check_extern(c: &mut Checker, d: u32, info: FnInfo) {
     let decl = c.decls[d as usize];
     let s = token_span(c, decl.name_token);
     let abi = fn_attribute(c, d, "extern");
-    if not abi.view().eq("c") {
+    // "wasm:module": a WebAssembly program's import from that module, of
+    // the function's name with - for _ (spec/arche.md §10.1).
+    let wasm_import = abi.view().starts_with("wasm:") and abi.len() > 5;
+    if wasm_import and not program.wasm(c.p.target) {
         let abi_span = span_of(c, child(c, decl.node, 0));
-        report(c, codes.BAD_EXTERN, abi_span, "the only foreign calling convention is \"c\"");
+        report(c, codes.BAD_EXTERN, abi_span, "a \"wasm:\" foreign function is a WebAssembly program's import: build for wasm32-wasi or wasm32-component");
+    } else if not abi.view().eq("c") and not wasm_import {
+        let abi_span = span_of(c, child(c, decl.node, 0));
+        report(c, codes.BAD_EXTERN, abi_span, "the foreign calling conventions are \"c\" and, for WebAssembly, \"wasm:module\"");
     }
     var fine = true;
     var i = info.params_start;
@@ -3197,9 +3203,45 @@ fn find_panic_handler(c: &mut Checker) {
     c.panic_handler = d;
 }
 
+/// A component's root module (spec/arche.md §10.3): `fn init(host: &mut H,
+/// a: alloc.Allocator) -> T` makes the app's state, and `fn update(state:
+/// &mut T, host: &mut H, a: alloc.Allocator)` is each frame's, H the host
+/// its world's bindings give.
+fn check_component_root(c: &mut Checker) {
+    c.module = 0;
+    let at = diag.Span { start: 0, len: 0 };
+    let want = "a component's root module has 'fn init(host: &mut H, a: alloc.Allocator) -> T' and 'fn update(state: &mut T, host: &mut H, a: alloc.Allocator)'";
+    let di = find_item(c, 0, c.names.intern("init")) orelse NONE;
+    let du = find_item(c, 0, c.names.intern("update")) orelse NONE;
+    if di == NONE or du == NONE or c.decls[di as usize].kind != DeclKind.Fn or c.decls[du as usize].kind != DeclKind.Fn or c.decls[di as usize].generic or c.decls[du as usize].generic {
+        report(c, codes.BAD_MAIN, at, want);
+        return;
+    }
+    let fi = c.fns[c.decls[di as usize].fn_index as usize];
+    let fu = c.fns[c.decls[du as usize].fn_index as usize];
+    var fine = fi.params_len == 2 and fu.params_len == 3;
+    if fine {
+        let host = c.params[fi.params_start as usize].type_id;
+        let state = fi.ret;
+        let sk = c.t.kind(state);
+        fine = c.t.kind(host) == ty.Kind.Ref and c.t.get(host).mutable and is_allocator(c, c.params[(fi.params_start + 1) as usize].type_id) and sk != ty.Kind.Void and sk != ty.Kind.Noreturn and sk != ty.Kind.ErrorUnion;
+        let us = c.params[fu.params_start as usize].type_id;
+        fine = fine and c.t.kind(us) == ty.Kind.Ref and c.t.get(us).mutable and c.t.elem(us) == state;
+        fine = fine and c.params[(fu.params_start + 1) as usize].type_id == host and is_allocator(c, c.params[(fu.params_start + 2) as usize].type_id);
+        fine = fine and c.t.kind(fu.ret) == ty.Kind.Void;
+    }
+    if not fine {
+        report(c, codes.BAD_MAIN, token_span(c, c.decls[di as usize].name_token), want);
+    }
+}
+
 fn check_main(c: &mut Checker) {
     if c.p.tests or c.p.no_main {
         return; // the test runner is the entry, or a module is checked alone
+    }
+    if program.component(c.p.target) {
+        check_component_root(c);
+        return;
     }
     if program.freestanding(&c.p) {
         // No main: the program's own entry, exported, starts it.

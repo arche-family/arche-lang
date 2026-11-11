@@ -43,8 +43,16 @@ const ASK_MEMORY_SIZE: str = "a0rt_wasm_memory_size";
 const ASK_HEAP_BASE: str = "a0rt_wasm_heap_base";
 const ASK_ERROR_NAMES: str = "a0rt_wasm_error_names";
 
-/// How an extern fn is reached.
-type Reach = enum { Function, Import, MemoryGrow, MemorySize, HeapBase, ErrorNames, Missing }
+/// How an extern fn is reached. A component's program (wasm32-component)
+/// has no WASI: each WASI call is Refused, answering EBADF, and proc_exit
+/// is a Trap.
+type Reach = enum { Function, Import, MemoryGrow, MemorySize, HeapBase, ErrorNames, Refused, Trap, Missing }
+
+/// WASI's "bad file descriptor": what a component's program hears from WASI.
+const EBADF: u64 = 8;
+/// An import of the module named after "wasm:", of the field after '#'
+/// (extern "wasm:module" fn, spec/arche.md §10.1).
+const WASM_PREFIX: str = "wasm:";
 
 type Gen = struct {
     r: ra.Ranges,
@@ -561,7 +569,7 @@ fn gen_call(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, i: ir.Inst) {
         return;
     }
     var q = i.args_start;
-    while q < i.args_start + i.args_len : (q += 1) {
+    while q < i.args_start + i.args_len and reach != Reach.Refused and reach != Reach.Trap : (q += 1) {
         let v = f.args[q as usize];
         push(g, f, v);
         if reach == Reach.Import or reach == Reach.MemoryGrow {
@@ -604,6 +612,8 @@ fn gen_call(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, i: ir.Inst) {
                 wc.op(&mut g.code, wc.I64_EXTEND_I32_U);
             }
             .HeapBase => { wc.i64_const(&mut g.code, g.heap_base); }
+            .Refused => { wc.i64_const(&mut g.code, EBADF); }
+            .Trap => { g.code.push(wc.UNREACHABLE); }
             .ErrorNames => {
                 var at: u64 = 0;
                 if g.table_at.len() > 0 {
@@ -1201,7 +1211,13 @@ fn build_data(g: &mut Gen, m: &ir.Module) -> alloc.List(u8) {
 }
 
 /// How each extern is reached, and the imports they make.
+/// Whether the module is a component's program: no WASI, no _start.
+fn is_component(m: &ir.Module) -> bool {
+    return m.triple.view().eq("wasm32-unknown-unknown");
+}
+
 fn resolve_externals(g: &mut Gen, m: &ir.Module, imports: &mut alloc.List(u8)) {
+    let component = is_component(m);
     let es = m.externals.items();
     let fs = m.functions.items();
     var x: usize = 0;
@@ -1215,8 +1231,25 @@ fn resolve_externals(g: &mut Gen, m: &ir.Module, imports: &mut alloc.List(u8)) {
                 reach = Reach.Function;
             }
         }
+        var hash: usize = 0;
+        while hash < name.len() and name[hash] != '#' {
+            hash += 1;
+        }
         if reach == Reach.Function {
             // Its index is known once all the imports are: filled in below.
+        } else if component and name.eq("wasi_proc_exit") {
+            reach = Reach.Trap;
+        } else if component and name.starts_with(WASI_PREFIX) {
+            reach = Reach.Refused;
+        } else if name.starts_with(WASM_PREFIX) and hash < name.len() {
+            reach = Reach.Import;
+            index = g.import_count;
+            g.import_count += 1;
+            let ty_index = import_function_type(g, es[x].params.items(), ret: es[x].ret);
+            wc.put_name(imports, name[WASM_PREFIX.len()..hash]);
+            wc.put_name(imports, name[hash + 1..name.len()]);
+            imports.push(0);
+            wc.uleb(imports, ty_index as u64);
         } else if name.starts_with(WASI_PREFIX) {
             reach = Reach.Import;
             index = g.import_count;
@@ -1318,7 +1351,8 @@ pub fn module(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> 
             start_index = g.fn_index[i];
         }
     }
-    if g.problem.len() == 0 and start_index == NONE {
+    let component = is_component(m);
+    if g.problem.len() == 0 and start_index == NONE and not component {
         g.problem.push_str("no _start: this program does not import std");
     }
     if g.problem.len() > 0 {
@@ -1366,14 +1400,32 @@ pub fn module(m: &ir.Module, problem: &mut alloc.String, a: alloc.Allocator) -> 
     wc.i64_const(&mut globals, DATA_BASE);
     globals.push(wc.END);
     wc.section(&mut out, 6, &globals);
+    // A WASI program exports _start; a component's program, each function
+    // it gives a name of its own (export("name") fn) and the runtime's.
+    var export_list = alloc.List(u8).init(a);
+    var export_count: u32 = 1;
+    if component {
+        i = 0;
+        while i < fs.len() : (i += 1) {
+            if not fs[i].stub and not fs[i].internal and fs[i].name.len() > 0 {
+                wc.put_name(&mut export_list, fs[i].name.view());
+                export_list.push(0);
+                wc.uleb(&mut export_list, g.fn_index[i] as u64);
+                export_count += 1;
+            }
+        }
+    } else {
+        wc.put_name(&mut export_list, "_start");
+        export_list.push(0);
+        wc.uleb(&mut export_list, start_index as u64);
+        export_count += 1;
+    }
+    wc.put_name(&mut export_list, "memory");
+    export_list.push(2);
+    export_list.push(0);
     var exports = alloc.List(u8).init(a);
-    exports.push(2);
-    wc.put_name(&mut exports, "_start");
-    exports.push(0);
-    wc.uleb(&mut exports, start_index as u64);
-    wc.put_name(&mut exports, "memory");
-    exports.push(2);
-    exports.push(0);
+    wc.uleb(&mut exports, export_count as u64);
+    wc.put_bytes(&mut exports, export_list.items());
     wc.section(&mut out, 7, &exports);
     var elements = alloc.List(u8).init(a);
     elements.push(1);
