@@ -7,6 +7,7 @@
 /// shell says which.
 import alloc;
 import core.utf8;
+import image.jpeg;
 import image.png;
 import std;
 import wasm.component as c;
@@ -1388,12 +1389,29 @@ fn load_image(ui: &mut Ui, bytes: []u8, why: &mut alloc.String) {
             is_png = false;
         }
     }
-    if not is_png {
-        why.push_str("not an image this shell reads (PNG)");
+    let is_jpeg = bytes.len() >= 3 and bytes[0] == 0xFF and bytes[1] == 0xD8 and bytes[2] == 0xFF;
+    if not is_png and not is_jpeg {
+        why.push_str("not an image this shell reads (PNG or JPEG)");
         return;
     }
-    let w = be32(bytes, at: 16);
-    let h = be32(bytes, at: 20);
+    var w: u32 = 0;
+    var h: u32 = 0;
+    if is_png {
+        w = be32(bytes, at: 16);
+        h = be32(bytes, at: 20);
+    } else {
+        // A JPEG's size, from its frame header, before any pixel.
+        match jpeg.info(bytes) {
+            ok(found) => {
+                w = found.width;
+                h = found.height;
+            }
+            err(_) => {
+                why.push_str("not an image this shell reads (PNG or JPEG)");
+                return;
+            }
+        }
+    }
     if w > MAX_IMAGE_SIDE or h > MAX_IMAGE_SIDE {
         why.push_str("image is ");
         why.push_u64(w as u64);
@@ -1404,6 +1422,16 @@ fn load_image(ui: &mut Ui, bytes: []u8, why: &mut alloc.String) {
     }
     if ui.pixels + (w as u64) * (h as u64) > MAX_APP_PIXELS {
         why.push_str("an app's images may hold 8 megapixels in all");
+        return;
+    }
+    if is_jpeg {
+        match jpeg.decode(bytes, max_pixels: (w as u64) * (h as u64), ui.a) {
+            ok(img) => {
+                ui.pixels += (img.width as u64) * (img.height as u64);
+                ui.pictures.push(img);
+            }
+            err(_) => { why.push_str("could not decode the image"); }
+        }
         return;
     }
     match png.decode(bytes, max_pixels: (w as u64) * (h as u64), ui.a) {
