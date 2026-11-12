@@ -1,0 +1,230 @@
+// test: run
+// spec: image.jpeg (damaged)
+// stage0: skip
+// stdout: info of exif-6.jpg: 30x20, colour, orientation 6
+// stdout: info of progressive-grey.jpg: 29x35, grey, progressive
+// stdout: empty: Malformed
+// stdout: not a JPEG: Malformed
+// stdout: SOI alone: Malformed
+// stdout: cut in the header: Malformed
+// stdout: cut in the scan: 64x48 7018763258841067030
+// stdout: progressive, cut in its scans: 51x37 8868300582689950792
+// stdout: 65535x65535: TooLarge
+// stdout: 12-bit samples: Unsupported
+// stdout: lossless: Unsupported
+// stdout: arithmetic coding: Unsupported
+// stdout: 4 components: Unsupported
+// stdout: sampling 3 against 2: Unsupported
+// stdout: no quantization table: Malformed
+// stdout: a Huffman code of all 1 bits: Malformed
+// stdout: a scan before the frame: Malformed
+// stdout: q75-420.jpg again: 64x48 17559069756058718894
+// stdout: changed: 2000 inputs, 1245 decoded, no panic
+import alloc;
+import core.rand;
+import image.jpeg;
+import image.png;
+import std;
+
+// Damaged JPEGs, made here from _jpeg's good ones: each is refused with
+// the error that names what is wrong, or, cut in its entropy-coded data,
+// decoded as libjpeg decodes it, the rest of the scan's coefficients zero:
+// the baseline file's hash is Pillow's for the same bytes and an EOI
+// (make.py). The progressive one is not libjpeg's, which smooths blocks
+// whose coefficients never arrived whole; this module does not. The
+// decoder that refused them decodes a good file as before. Then bytes of
+// a baseline and a progressive file changed at random: decoded or
+// refused, never a panic (fuzz/jpeg_fuzz.arche does this at length).
+
+/// FNV-1a of the bytes.
+fn hash(bytes: []u8) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h = (h ^ (b.* as u64)) *% 0x100000001b3;
+    }
+    return h;
+}
+
+fn read(sys: &mut std.System, name: str) -> !alloc.List(u8) {
+    var path = alloc.String.init(sys.alloc);
+    path.push_str("_jpeg/");
+    path.push_str(name);
+    return try sys.fs.read_bytes(path.view(), sys.alloc);
+}
+
+/// A copy of the first n bytes.
+fn copy(b: []u8, n: usize, a: alloc.Allocator) -> alloc.List(u8) {
+    var c = alloc.List(u8).init(a);
+    var i: usize = 0;
+    while i < n and i < b.len() : (i += 1) {
+        c.push(b[i]);
+    }
+    return c;
+}
+
+/// Where the first segment with marker m starts, at its 0xFF; the header's
+/// segments only.
+fn segment(b: []u8, m: u8) -> usize {
+    var at: usize = 2;
+    while at + 4 <= b.len() {
+        if b[at + 1] == m {
+            return at;
+        }
+        if b[at + 1] == 0xDA {
+            return 0;
+        }
+        at += 2 + ((b[at + 2] as usize) << 8) + (b[at + 3] as usize);
+    }
+    return 0;
+}
+
+fn show(sys: &mut std.System, dec: &mut jpeg.Decoder, img: &mut png.Image, what: str, bytes: []u8) {
+    let out = &mut sys.stdout;
+    out.write(what);
+    out.write(": ");
+    match dec.decode(bytes, max_pixels: 1 << 20, into: img) {
+        ok(_) => {
+            out.write_u64(img.width as u64);
+            out.write("x");
+            out.write_u64(img.height as u64);
+            out.write(" ");
+            out.write_u64(hash(img.rgba.items()));
+        }
+        err(e) => {
+            if e == jpeg.JpegError.Malformed {
+                out.write("Malformed");
+            } else if e == jpeg.JpegError.TooLarge {
+                out.write("TooLarge");
+            } else {
+                out.write("Unsupported");
+            }
+        }
+    }
+    out.write("\n");
+}
+
+fn show_info(sys: &mut std.System, name: str) -> !void {
+    let bytes = try read(sys, name: name);
+    let info = try jpeg.info(bytes.items());
+    let out = &mut sys.stdout;
+    out.write("info of ");
+    out.write(name);
+    out.write(": ");
+    out.write_u64(info.width as u64);
+    out.write("x");
+    out.write_u64(info.height as u64);
+    if info.components == 1 {
+        out.write(", grey");
+    } else {
+        out.write(", colour");
+    }
+    if info.orientation != 1 {
+        out.write(", orientation ");
+        out.write_u64(info.orientation as u64);
+    }
+    if info.progressive {
+        out.write(", progressive");
+    }
+    out.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    try show_info(sys, name: "exif-6.jpg");
+    try show_info(sys, name: "progressive-grey.jpg");
+    var dec = jpeg.Decoder.init(sys.alloc);
+    var img = png.Image { width: 0, height: 0, rgba: alloc.List(u8).init(sys.alloc) };
+    let good = try read(sys, name: "q75-420.jpg");
+    let g = good.items();
+    let prog = try read(sys, name: "progressive-420.jpg");
+
+    show(sys, dec: &mut dec, img: &mut img, what: "empty", bytes: g[0..0]);
+    var c = copy(g, n: g.len(), sys.alloc);
+    c.items_mut()[0] = 0;
+    show(sys, dec: &mut dec, img: &mut img, what: "not a JPEG", bytes: c.items());
+    show(sys, dec: &mut dec, img: &mut img, what: "SOI alone", bytes: g[0..2]);
+    show(sys, dec: &mut dec, img: &mut img, what: "cut in the header", bytes: g[0..300]);
+    show(sys, dec: &mut dec, img: &mut img, what: "cut in the scan", bytes: g[0..900]);
+    show(sys, dec: &mut dec, img: &mut img, what: "progressive, cut in its scans", bytes: prog.items()[0..900]);
+
+    let sof = segment(g, m: 0xC0);
+    c = copy(g, n: g.len(), sys.alloc);
+    c.items_mut()[sof + 5] = 0xFF;
+    c.items_mut()[sof + 6] = 0xFF;
+    c.items_mut()[sof + 7] = 0xFF;
+    c.items_mut()[sof + 8] = 0xFF;
+    show(sys, dec: &mut dec, img: &mut img, what: "65535x65535", bytes: c.items());
+    c = copy(g, n: g.len(), sys.alloc);
+    c.items_mut()[sof + 4] = 12;
+    show(sys, dec: &mut dec, img: &mut img, what: "12-bit samples", bytes: c.items());
+    c = copy(g, n: g.len(), sys.alloc);
+    c.items_mut()[sof + 1] = 0xC3;
+    show(sys, dec: &mut dec, img: &mut img, what: "lossless", bytes: c.items());
+    c = copy(g, n: g.len(), sys.alloc);
+    c.items_mut()[sof + 1] = 0xC9;
+    show(sys, dec: &mut dec, img: &mut img, what: "arithmetic coding", bytes: c.items());
+    c = copy(g, n: g.len(), sys.alloc);
+    c.items_mut()[sof + 9] = 4;
+    show(sys, dec: &mut dec, img: &mut img, what: "4 components", bytes: c.items());
+    // Y sampled 2x2, Cb 3x1: 3 does not divide the largest across, which
+    // is 3 now, nor does Y's 2.
+    c = copy(g, n: g.len(), sys.alloc);
+    c.items_mut()[sof + 14] = 0x31;
+    show(sys, dec: &mut dec, img: &mut img, what: "sampling 3 against 2", bytes: c.items());
+    // Each DQT made an APP15, which is passed over.
+    c = copy(g, n: g.len(), sys.alloc);
+    var dqt = segment(c.items(), m: 0xDB);
+    while dqt != 0 {
+        c.items_mut()[dqt + 1] = 0xEF;
+        dqt = segment(c.items(), m: 0xDB);
+    }
+    show(sys, dec: &mut dec, img: &mut img, what: "no quantization table", bytes: c.items());
+    // The DC luminance table's one code of 2 bits made a second one of 1
+    // bit: the codes 0 and 1, the second all 1 bits.
+    c = copy(g, n: g.len(), sys.alloc);
+    let dht = segment(g, m: 0xC4);
+    c.items_mut()[dht + 5] = 2;
+    c.items_mut()[dht + 6] = 0;
+    show(sys, dec: &mut dec, img: &mut img, what: "a Huffman code of all 1 bits", bytes: c.items());
+    // SOI, then the scan's header.
+    let sos = segment(g, m: 0xDA);
+    c = copy(g, n: 2, sys.alloc);
+    var i = sos;
+    while i < g.len() : (i += 1) {
+        c.push(g[i]);
+    }
+    show(sys, dec: &mut dec, img: &mut img, what: "a scan before the frame", bytes: c.items());
+
+    show(sys, dec: &mut dec, img: &mut img, what: "q75-420.jpg again", bytes: g);
+
+    // Bytes changed at random, one to four of them, or a run of noise.
+    var gen = rand.Seeded.init(9);
+    var decoded: u64 = 0;
+    var k: u32 = 0;
+    while k < 2000 : (k += 1) {
+        var src = g;
+        if k % 2 == 1 {
+            src = prog.items();
+        }
+        var m = copy(src, n: src.len(), sys.alloc);
+        let changes = gen.below(4) + 1;
+        var j: u64 = 0;
+        while j < changes : (j += 1) {
+            let at = gen.below(m.len() as u64) as usize;
+            m.items_mut()[at] = (gen.next_u64() & 0xFF) as u8;
+        }
+        if gen.below(8) == 0 {
+            let at = gen.below(m.len() as u64) as usize;
+            var r = at;
+            while r < at + 64 and r < m.len() : (r += 1) {
+                m.items_mut()[r] = (gen.next_u64() & 0xFF) as u8;
+            }
+        }
+        match dec.decode(m.items(), max_pixels: 1 << 20, into: &mut img) {
+            ok(_) => { decoded += 1; }
+            err(_) => { }
+        }
+    }
+    sys.stdout.write("changed: 2000 inputs, ");
+    sys.stdout.write_u64(decoded);
+    sys.stdout.write(" decoded, no panic\n");
+}

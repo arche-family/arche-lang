@@ -1,0 +1,2326 @@
+/// JPEG images (arche-os docs/sprints.md T9: the camera's photos, and its
+/// video, Motion-JPEG in AVI, which the Photos app plays), decoded to
+/// image.png's Image, 8-bit RGBA, and encoded from one.
+///
+/// decode reads sequential JPEG, baseline and extended (SOF0, SOF1), and
+/// progressive JPEG (SOF2), Huffman-coded, of 8-bit samples: one component
+/// (grey) or three (YCbCr, or RGB when an Adobe marker or the component ids
+/// say so, as libjpeg decides), sampled at any factors that divide the
+/// largest: 4:4:4, 4:2:2, 4:2:0, 4:4:0 and 4:1:1 among them. Restart
+/// markers are followed; a Motion-JPEG frame that leaves out the standard
+/// Huffman tables gets them. APPn and COM segments are passed over, but
+/// for JFIF's and Adobe's markers and Exif's orientation, which info and
+/// Decoder.decode give and nothing applies.
+///
+/// The arithmetic is libjpeg-turbo's default, integer and exact: its
+/// jpeg_idct_islow, its fancy upsampling and its YCbCr tables, so the
+/// pixels are libjpeg-turbo's, bit for bit (conformance/tests/image/
+/// jpeg.arche compares them with Pillow's). So is its leniency: data that
+/// ends early decodes as zeros, and a code that no table has as symbol 0.
+/// Not read: arithmetic coding, lossless and hierarchical JPEG, samples of
+/// 12 or 16 bits, two or four components (CMYK); nor is the block
+/// smoothing libjpeg gives a progressive image whose low coefficients
+/// never arrive whole: one cut short decodes a little unlike libjpeg's.
+///
+/// A JPEG comes from outside, so every read is checked and the pixels it
+/// may have are bounded: a broken file gives an error or an image, never a
+/// panic (fuzz/jpeg_fuzz.arche).
+///
+/// encode writes baseline JPEG as libjpeg-turbo does with its defaults and
+/// a quality: a JFIF marker, the standard tables scaled by the quality,
+/// 4:2:0 (or 4:2:2, 4:4:4), jpeg_fdct_islow, the standard Huffman codes;
+/// byte for byte what Pillow writes. An Encoder keeps its tables and
+/// buffers from frame to frame, so that a video allocates nothing after
+/// its first frame.
+import alloc;
+import image.png;
+
+/// Why a JPEG is refused, or an image cannot be encoded.
+pub type JpegError = error {
+    /// Not a JPEG, or one that breaks its rules; for encode, a size of 0
+    /// or fewer pixels than the size says.
+    Malformed,
+    /// A JPEG of a kind this module does not read: arithmetic coding,
+    /// lossless or hierarchical, samples of 12 or 16 bits, neither one nor
+    /// three components, or sampling factors that do not divide.
+    Unsupported,
+    /// More pixels than the caller allows, or than a JPEG can hold.
+    TooLarge,
+}
+
+/// What a JPEG's header says.
+pub type Info = struct {
+    pub width: u32,
+    pub height: u32,
+    /// 1 (grey) or 3 (colour).
+    pub components: u32,
+    /// Whether it is progressive (SOF2) rather than sequential.
+    pub progressive: bool,
+    /// Exif's orientation, 1 to 8: 1 as it is, 3 turned half round, 6 to
+    /// be turned a quarter clockwise, 8 anticlockwise, and 2, 4, 5 and 7
+    /// those mirrored. 1 when the file says nothing.
+    pub orientation: u32,
+}
+
+/// How an encoder samples colour: S420 halves Cb and Cr both ways, as
+/// libjpeg and the camera do by default; S422 across only; S444 keeps them
+/// whole.
+pub type Subsampling = enum {
+    S420,
+    S422,
+    S444,
+}
+
+/// More scans than this in one file are refused: each may cost a pass over
+/// the image, and no encoder writes a hundredth of it.
+const MAX_SCANS: u32 = 1000;
+
+// ---- tables ---------------------------------------------------------------------------
+
+/// The zigzag order: the k-th coefficient a block codes is its
+/// natural_order()[k]-th in rows. Sixteen more 63s take a run past the end
+/// of a block in a damaged file, as libjpeg's jpeg_natural_order does.
+fn natural_order() -> [80]u8 {
+    return [
+        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+        12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+        35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+        58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+        63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63,
+    ];
+}
+
+/// The quantization tables of ITU T.81 Annex K.1, in rows: luminance, or
+/// chrominance.
+fn std_quant(chroma: bool) -> [64]u8 {
+    if chroma {
+        return [
+            17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99,
+            24, 26, 56, 99, 99, 99, 99, 99, 47, 66, 99, 99, 99, 99, 99, 99,
+            99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+            99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+        ];
+    }
+    return [
+        16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55,
+        14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62,
+        18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92,
+        49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
+    ];
+}
+
+/// How many bytes std_huffman(which) has: its 16 counts and its symbols.
+fn std_huffman_len(which: u32) -> usize {
+    if which == 0 or which == 2 {
+        return 28;
+    }
+    return 178;
+}
+
+/// The Huffman tables of ITU T.81 Annex K.3, as a DHT segment gives one
+/// after its class and number: how many codes of each length, 1 to 16,
+/// then the symbols. which: 0 DC luminance, 1 AC luminance, 2 DC
+/// chrominance, 3 AC chrominance; the bytes past std_huffman_len are 0.
+fn std_huffman(which: u32) -> [178]u8 {
+    var t: [178]u8 = [0; 178];
+    if which == 0 {
+        let dc: [28]u8 = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        var i: usize = 0;
+        while i < 28 : (i += 1) {
+            t[i] = dc[i];
+        }
+        return t;
+    }
+    if which == 2 {
+        let dc: [28]u8 = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        var i: usize = 0;
+        while i < 28 : (i += 1) {
+            t[i] = dc[i];
+        }
+        return t;
+    }
+    if which == 1 {
+        return [
+            0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125,
+            1, 2, 3, 0, 4, 17, 5, 18, 33, 49, 65, 6, 19, 81, 97, 7,
+            34, 113, 20, 50, 129, 145, 161, 8, 35, 66, 177, 193, 21, 82, 209, 240,
+            36, 51, 98, 114, 130, 9, 10, 22, 23, 24, 25, 26, 37, 38, 39, 40,
+            41, 42, 52, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73,
+            74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103, 104, 105,
+            106, 115, 116, 117, 118, 119, 120, 121, 122, 131, 132, 133, 134, 135, 136, 137,
+            138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165, 166, 167,
+            168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197,
+            198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 225, 226,
+            227, 228, 229, 230, 231, 232, 233, 234, 241, 242, 243, 244, 245, 246, 247, 248,
+            249, 250,
+        ];
+    }
+    return [
+        0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 119,
+        0, 1, 2, 3, 17, 4, 5, 33, 49, 6, 18, 65, 81, 7, 97, 113,
+        19, 34, 50, 129, 8, 20, 66, 145, 161, 177, 193, 9, 35, 51, 82, 240,
+        21, 98, 114, 209, 10, 22, 36, 52, 225, 37, 241, 23, 24, 25, 26, 38,
+        39, 40, 41, 42, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72,
+        73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103, 104,
+        105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 130, 131, 132, 133, 134, 135,
+        136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165,
+        166, 167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195,
+        196, 197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218,
+        226, 227, 228, 229, 230, 231, 232, 233, 234, 242, 243, 244, 245, 246, 247, 248,
+        249, 250,
+    ];
+}
+
+// ---- Huffman decoding -----------------------------------------------------------------
+
+/// A Huffman table to decode with, derived as libjpeg's jdhuff does (ITU
+/// T.81 F.2.2.3): the codes in order of length, and a table of the next
+/// nine bits for the short ones.
+type Huffman = struct {
+    /// Whether a DHT segment, or the standard table, gave it.
+    defined: bool,
+    /// Whether every symbol is at most 15, as a DC table's must be.
+    dc_ok: bool,
+    /// By the next nine bits: the code's length times 256 plus its symbol,
+    /// or 0 when the code is longer than nine bits.
+    fast: [512]u16,
+    /// The largest code of each length, -1 when there is none.
+    maxcode: [17]i32,
+    /// What turns a code of each length into its symbol's place.
+    offset: [17]i32,
+    /// The symbols in the order of their codes.
+    symbols: [256]u8,
+}
+
+/// A table that no segment has given.
+fn empty_huffman() -> Huffman {
+    return Huffman { defined: false, dc_ok: true, fast: [0; 512], maxcode: [-1; 17], offset: [0; 17], symbols: [0; 256] };
+}
+
+/// The table that spec, 16 counts and then exactly their symbols, gives.
+/// As libjpeg, at most 256 codes, and none of all 1 bits.
+fn make_huffman(spec: []u8) -> JpegError!Huffman {
+    var t = empty_huffman();
+    if spec.len() < 16 {
+        return JpegError.Malformed;
+    }
+    var total: usize = 0;
+    var last: usize = 0;
+    var l: usize = 1;
+    while l <= 16 : (l += 1) {
+        let n = spec[l - 1] as usize;
+        total += n;
+        if n > 0 {
+            last = l;
+        }
+    }
+    if total > 256 or spec.len() != 16 + total {
+        return JpegError.Malformed;
+    }
+    var code: i32 = 0;
+    var k: usize = 0;
+    l = 1;
+    while l <= last : (l += 1) {
+        let n = spec[l - 1] as usize;
+        if n > 0 {
+            t.offset[l] = (k as i32) - code;
+            var i: usize = 0;
+            while i < n : (i += 1) {
+                if code >= (1 << (l as u32)) {
+                    return JpegError.Malformed;
+                }
+                let sym = spec[16 + k];
+                t.symbols[k] = sym;
+                if sym > 15 {
+                    t.dc_ok = false;
+                }
+                if l <= 9 {
+                    let shift = (9 - l) as u32;
+                    let base = (code as usize) << shift;
+                    let entry = ((l as u32) << 8) | (sym as u32);
+                    var f: usize = 0;
+                    while f < (1 << shift) : (f += 1) {
+                        t.fast[base + f] = entry as u16;
+                    }
+                }
+                code += 1;
+                k += 1;
+            }
+            t.maxcode[l] = code - 1;
+        }
+        if code >= (1 << (l as u32)) {
+            return JpegError.Malformed;
+        }
+        code = code << 1;
+    }
+    t.defined = true;
+    return t;
+}
+
+/// Reads a scan's entropy-coded data, most significant bit first: a 0xFF
+/// is data when 0x00 follows it (and when more 0xFF and then 0x00 do, as
+/// libjpeg takes them), and a marker otherwise, where the data ends.
+type Bits = struct {
+    /// The bits read ahead; the low count of them are still to be used.
+    acc: u64,
+    count: u32,
+    /// The next byte to read.
+    at: usize,
+    /// The data reached a marker, or the end: no byte comes after.
+    ended: bool,
+    /// A bit was wanted past the end, and was taken as 0; libjpeg's
+    /// insufficient_data, which leaves the rest of the segment zero.
+    short: bool,
+}
+
+/// At least 57 bits in b, or every bit the data has left.
+fn fill_bits(b: &mut Bits, d: []u8) {
+    while b.count <= 56 {
+        if b.ended {
+            return;
+        }
+        if b.at >= d.len() {
+            b.ended = true;
+            return;
+        }
+        let c = d[b.at];
+        if c == 0xFF {
+            var k = b.at + 1;
+            while k < d.len() and d[k] == 0xFF {
+                k += 1;
+            }
+            if k < d.len() and d[k] == 0 {
+                b.at = k + 1;
+            } else {
+                // A marker, or the end: leave it to whoever reads markers.
+                b.at = k - 1;
+                b.ended = true;
+                return;
+            }
+        } else {
+            b.at += 1;
+        }
+        b.acc = (b.acc << 8) | (c as u64);
+        b.count += 8;
+    }
+}
+
+/// The next n bits, n at most 16; zeros past the end of the data.
+fn get_bits(b: &mut Bits, d: []u8, n: u32) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    if b.count < n {
+        fill_bits(b, d);
+        if b.count < n {
+            b.short = true;
+            b.acc = b.acc << (n - b.count);
+            b.count = n;
+        }
+    }
+    b.count -= n;
+    return ((b.acc >> b.count) & ((1 << n) - 1)) as u32;
+}
+
+/// The next symbol of table t. A code that t does not have reads 17 bits
+/// and gives 0, as libjpeg's jpeg_huff_decode does.
+fn decode_symbol(b: &mut Bits, d: []u8, t: &Huffman) -> u32 {
+    if b.count < 9 {
+        fill_bits(b, d);
+    }
+    if b.count >= 9 {
+        let e = t.fast[((b.acc >> (b.count - 9)) & 511) as usize];
+        if e != 0 {
+            b.count -= (e >> 8) as u32;
+            return (e & 255) as u32;
+        }
+    }
+    var code: i32 = 0;
+    var l: usize = 1;
+    while l <= 16 : (l += 1) {
+        code = (code << 1) | (get_bits(b, d, n: 1) as i32);
+        if code <= t.maxcode[l] {
+            let i = code + t.offset[l];
+            if i < 0 or i > 255 {
+                return 0;
+            }
+            return t.symbols[i as usize] as u32;
+        }
+    }
+    _ = get_bits(b, d, n: 1);
+    return 0;
+}
+
+/// A value of s bits as coded (ITU T.81 F.2.2.1): the lower half of them
+/// the negative values.
+fn extend(r: u32, s: u32) -> i32 {
+    if s == 0 {
+        return 0;
+    }
+    if r < (1 << (s - 1)) {
+        return (r as i32) - ((1 << s) - 1);
+    }
+    return r as i32;
+}
+
+/// A restart: the bits left are dropped and the next marker is found. An
+/// RSTn is passed and the data goes on; any other is left to be read, and
+/// the segment after it is empty, as libjpeg's resync does in the end.
+fn restart_bits(b: &mut Bits, d: []u8) {
+    b.acc = 0;
+    b.count = 0;
+    var i = b.at;
+    while i < d.len() {
+        if d[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        var k = i + 1;
+        while k < d.len() and d[k] == 0xFF {
+            k += 1;
+        }
+        if k >= d.len() {
+            break;
+        }
+        if d[k] == 0 {
+            i = k + 1;
+            continue;
+        }
+        if d[k] >= 0xD0 and d[k] <= 0xD7 {
+            b.at = k + 1;
+            b.ended = false;
+            b.short = false;
+            return;
+        }
+        b.at = k - 1;
+        b.ended = true;
+        return;
+    }
+    b.at = d.len();
+    b.ended = true;
+}
+
+// ---- the inverse DCT ------------------------------------------------------------------
+
+/// A sample from the inverse DCT's output x, as libjpeg's range_limit
+/// table gives it: x + 128 kept within 0..255, the low ten bits of x
+/// alone deciding, so a wild value wraps as it does there.
+fn range_limit(x: i32) -> u8 {
+    let i = x & 1023;
+    if i < 128 {
+        return (i + 128) as u8;
+    }
+    if i < 512 {
+        return 255;
+    }
+    if i < 896 {
+        return 0;
+    }
+    return (i - 896) as u8;
+}
+
+/// libjpeg's jpeg_idct_islow: the coefficients c, in rows, times their
+/// quantization steps q, inverse transformed (Loeffler, Ligtenberg and
+/// Moschytz, in 13-bit fixed point) into 8x8 samples of out, rows stride
+/// apart from at. Wrapping arithmetic, so that a damaged file cannot trap;
+/// a JPEG of 8-bit samples never comes near the limits.
+fn idct_islow(c: &[64]i32, q: &[64]i32, out: []mut u8, at: usize, stride: usize) {
+    var ws: [64]i32 = [0; 64];
+    var col: usize = 0;
+    while col < 8 : (col += 1) {
+        if c.*[8 + col] == 0 and c.*[16 + col] == 0 and c.*[24 + col] == 0 and c.*[32 + col] == 0 and c.*[40 + col] == 0 and c.*[48 + col] == 0 and c.*[56 + col] == 0 {
+            let dc = (c.*[col] *% q.*[col]) << 2;
+            ws[col] = dc;
+            ws[8 + col] = dc;
+            ws[16 + col] = dc;
+            ws[24 + col] = dc;
+            ws[32 + col] = dc;
+            ws[40 + col] = dc;
+            ws[48 + col] = dc;
+            ws[56 + col] = dc;
+            continue;
+        }
+        let e2 = c.*[16 + col] *% q.*[16 + col];
+        let e6 = c.*[48 + col] *% q.*[48 + col];
+        let z1 = (e2 +% e6) *% 4433;
+        let tmp2 = z1 +% e6 *% -15137;
+        let tmp3 = z1 +% e2 *% 6270;
+        let e0 = c.*[col] *% q.*[col];
+        let e4 = c.*[32 + col] *% q.*[32 + col];
+        let tmp0 = (e0 +% e4) << 13;
+        let tmp1 = (e0 -% e4) << 13;
+        let tmp10 = tmp0 +% tmp3;
+        let tmp13 = tmp0 -% tmp3;
+        let tmp11 = tmp1 +% tmp2;
+        let tmp12 = tmp1 -% tmp2;
+        let o7 = c.*[56 + col] *% q.*[56 + col];
+        let o5 = c.*[40 + col] *% q.*[40 + col];
+        let o3 = c.*[24 + col] *% q.*[24 + col];
+        let o1 = c.*[8 + col] *% q.*[8 + col];
+        let odd = idct_odd(i0: o7, i1: o5, i2: o3, i3: o1);
+        ws[col] = (tmp10 +% odd[3] +% 1024) >> 11;
+        ws[56 + col] = (tmp10 -% odd[3] +% 1024) >> 11;
+        ws[8 + col] = (tmp11 +% odd[2] +% 1024) >> 11;
+        ws[48 + col] = (tmp11 -% odd[2] +% 1024) >> 11;
+        ws[16 + col] = (tmp12 +% odd[1] +% 1024) >> 11;
+        ws[40 + col] = (tmp12 -% odd[1] +% 1024) >> 11;
+        ws[24 + col] = (tmp13 +% odd[0] +% 1024) >> 11;
+        ws[32 + col] = (tmp13 -% odd[0] +% 1024) >> 11;
+    }
+    var row: usize = 0;
+    while row < 8 : (row += 1) {
+        let w = row * 8;
+        let o = at + row * stride;
+        if ws[w + 1] == 0 and ws[w + 2] == 0 and ws[w + 3] == 0 and ws[w + 4] == 0 and ws[w + 5] == 0 and ws[w + 6] == 0 and ws[w + 7] == 0 {
+            let v = range_limit((ws[w] +% 16) >> 5);
+            var k: usize = 0;
+            while k < 8 : (k += 1) {
+                out[o + k] = v;
+            }
+            continue;
+        }
+        let z1 = (ws[w + 2] +% ws[w + 6]) *% 4433;
+        let tmp2 = z1 +% ws[w + 6] *% -15137;
+        let tmp3 = z1 +% ws[w + 2] *% 6270;
+        let tmp0 = (ws[w] +% ws[w + 4]) << 13;
+        let tmp1 = (ws[w] -% ws[w + 4]) << 13;
+        let tmp10 = tmp0 +% tmp3;
+        let tmp13 = tmp0 -% tmp3;
+        let tmp11 = tmp1 +% tmp2;
+        let tmp12 = tmp1 -% tmp2;
+        let odd = idct_odd(i0: ws[w + 7], i1: ws[w + 5], i2: ws[w + 3], i3: ws[w + 1]);
+        let half: i32 = 1 << 17;
+        out[o] = range_limit((tmp10 +% odd[3] +% half) >> 18);
+        out[o + 7] = range_limit((tmp10 -% odd[3] +% half) >> 18);
+        out[o + 1] = range_limit((tmp11 +% odd[2] +% half) >> 18);
+        out[o + 6] = range_limit((tmp11 -% odd[2] +% half) >> 18);
+        out[o + 2] = range_limit((tmp12 +% odd[1] +% half) >> 18);
+        out[o + 5] = range_limit((tmp12 -% odd[1] +% half) >> 18);
+        out[o + 3] = range_limit((tmp13 +% odd[0] +% half) >> 18);
+        out[o + 4] = range_limit((tmp13 -% odd[0] +% half) >> 18);
+    }
+}
+
+/// The odd part of jpeg_idct_islow (its figure 8): i0..i3 are the inputs
+/// 7, 5, 3 and 1; the results its tmp0..tmp3.
+fn idct_odd(i0: i32, i1: i32, i2: i32, i3: i32) -> [4]i32 {
+    let z5 = (i0 +% i2 +% i1 +% i3) *% 9633;
+    let z1 = (i0 +% i3) *% -7373;
+    let z2 = (i1 +% i2) *% -20995;
+    let z3 = (i0 +% i2) *% -16069 +% z5;
+    let z4 = (i1 +% i3) *% -3196 +% z5;
+    return [i0 *% 2446 +% z1 +% z3, i1 *% 16819 +% z2 +% z4, i2 *% 25172 +% z2 +% z3, i3 *% 12299 +% z1 +% z4];
+}
+
+// ---- decoding blocks ------------------------------------------------------------------
+
+/// One block of a sequential scan (ITU T.81 F.2.2): its DC difference,
+/// added to pred, and its AC coefficients, into blk in rows.
+fn sequential_block(b: &mut Bits, d: []u8, dct: &Huffman, act: &Huffman, nat: &[80]u8, pred: &mut i32, blk: &mut [64]i32) {
+    var i: usize = 0;
+    while i < 64 : (i += 1) {
+        blk.*[i] = 0;
+    }
+    let s = decode_symbol(b, d, t: dct);
+    var diff: i32 = 0;
+    if s > 0 {
+        diff = extend(r: get_bits(b, d, n: s), s: s);
+    }
+    pred.* = pred.* +% diff;
+    blk.*[0] = (pred.* as% i16) as i32;
+    var k: u32 = 1;
+    while k < 64 : (k += 1) {
+        let rs = decode_symbol(b, d, t: act);
+        let run = rs >> 4;
+        let size = rs & 15;
+        if size != 0 {
+            k += run;
+            blk.*[nat.*[k as usize] as usize] = extend(r: get_bits(b, d, n: size), s: size);
+        } else {
+            if run != 15 {
+                break;
+            }
+            k += 15;
+        }
+    }
+}
+
+/// A progressive scan's first DC bits of a block (ITU T.81 G.1.2.1).
+fn dc_first(b: &mut Bits, d: []u8, t: &Huffman, pred: &mut i32, al: u32, blk: []mut i16) {
+    let s = decode_symbol(b, d, t: t);
+    var diff: i32 = 0;
+    if s > 0 {
+        diff = extend(r: get_bits(b, d, n: s), s: s);
+    }
+    pred.* = pred.* +% diff;
+    blk[0] = (pred.* << al) as% i16;
+}
+
+/// A progressive scan's next DC bit of a block: the bit al of the value.
+fn dc_refine(b: &mut Bits, d: []u8, al: u32, blk: []mut i16) {
+    if get_bits(b, d, n: 1) != 0 {
+        let one: i32 = 1;
+        blk[0] = blk[0] | ((one << al) as% i16);
+    }
+}
+
+/// What a progressive scan reads: coefficients ss to se of each block,
+/// and the bit al of them, after the bits above ah.
+type Band = struct {
+    ss: u32,
+    se: u32,
+    ah: u32,
+    al: u32,
+}
+
+/// A progressive scan's first bits of AC coefficients ss to se of a block
+/// (ITU T.81 G.1.2.2), or one block of an end-of-band run.
+fn ac_first(b: &mut Bits, d: []u8, t: &Huffman, band: &Band, eobrun: &mut u32, nat: &[80]u8, blk: []mut i16) {
+    if eobrun.* > 0 {
+        eobrun.* -= 1;
+        return;
+    }
+    var k = band.ss;
+    while k <= band.se : (k += 1) {
+        let rs = decode_symbol(b, d, t: t);
+        let run = rs >> 4;
+        let size = rs & 15;
+        if size != 0 {
+            k += run;
+            let v = extend(r: get_bits(b, d, n: size), s: size);
+            blk[nat.*[k as usize] as usize] = (v << band.al) as% i16;
+        } else if run == 15 {
+            k += 15;
+        } else {
+            var n: u32 = 1 << run;
+            if run > 0 {
+                n += get_bits(b, d, n: run);
+            }
+            eobrun.* = n - 1;
+            break;
+        }
+    }
+}
+
+/// The correction bit of an already nonzero coefficient: when it is 1 the
+/// magnitude grows by p1, unless that bit is in it already.
+fn refine_coefficient(b: &mut Bits, d: []u8, blk: []mut i16, pos: usize, p1: i16) {
+    if get_bits(b, d, n: 1) != 0 {
+        let c = blk[pos];
+        if (c & p1) == 0 {
+            if c >= 0 {
+                blk[pos] = c +% p1;
+            } else {
+                blk[pos] = c -% p1;
+            }
+        }
+    }
+}
+
+/// A progressive scan's next bit of AC coefficients ss to se of a block
+/// (ITU T.81 G.1.2.3): coefficients that become nonzero, and a correction
+/// bit for each that was already; libjpeg's decode_mcu_AC_refine.
+fn ac_refine(b: &mut Bits, d: []u8, t: &Huffman, band: &Band, eobrun: &mut u32, nat: &[80]u8, blk: []mut i16) {
+    let one: i32 = 1;
+    let p1 = (one << band.al) as% i16;
+    var k = band.ss;
+    if eobrun.* == 0 {
+        while k <= band.se : (k += 1) {
+            let rs = decode_symbol(b, d, t: t);
+            var run = (rs >> 4) as i32;
+            let size = rs & 15;
+            var v: i16 = 0;
+            if size != 0 {
+                if get_bits(b, d, n: 1) != 0 {
+                    v = p1;
+                } else {
+                    v = 0 -% p1;
+                }
+            } else if run != 15 {
+                var n: u32 = 1 << (run as u32);
+                if run > 0 {
+                    n += get_bits(b, d, n: run as u32);
+                }
+                eobrun.* = n;
+                break;
+            }
+            // Past the coefficients already nonzero, each refined, and run
+            // zero ones; the new one, if any, goes where that ends.
+            while k <= band.se {
+                let pos = nat.*[k as usize] as usize;
+                if blk[pos] != 0 {
+                    refine_coefficient(b, d, blk: blk, pos: pos, p1: p1);
+                } else {
+                    run -= 1;
+                    if run < 0 {
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            if size != 0 {
+                blk[nat.*[k as usize] as usize] = v;
+            }
+        }
+    }
+    if eobrun.* > 0 {
+        while k <= band.se : (k += 1) {
+            let pos = nat.*[k as usize] as usize;
+            if blk[pos] != 0 {
+                refine_coefficient(b, d, blk: blk, pos: pos, p1: p1);
+            }
+        }
+        eobrun.* -= 1;
+    }
+}
+
+// ---- upsampling and colour ------------------------------------------------------------
+
+/// Where a component is and how it is sampled.
+type Component = struct {
+    /// Its id, as scans name it.
+    id: u32,
+    /// Its sampling factors, 1 to 4.
+    h: u32,
+    v: u32,
+    /// Its quantization table's number, 0 to 3.
+    tq: u32,
+    /// The steps of that table, in rows, as they were when a scan first
+    /// read the component (libjpeg latches them so).
+    q: [64]i32,
+    latched: bool,
+    /// The samples across and down that are the image's.
+    cw: u32,
+    ch: u32,
+    /// The blocks across and down that the frame's MCUs cover.
+    bw: u32,
+    bh: u32,
+    /// Where its samples, (bw * 8) x (bh * 8), start in Decoder.samples,
+    /// and its coefficients, bw * bh blocks of 64, in Decoder.coefs.
+    plane: usize,
+    coef: usize,
+    /// The last DC value, to which the next difference is added.
+    pred: i32,
+    /// Whether a scan has read it.
+    seen: bool,
+    /// The tables of the scan that reads it: DC and AC, 0 to 3.
+    dc: usize,
+    ac: usize,
+}
+
+/// A component that no frame has given yet.
+fn empty_component() -> Component {
+    return Component { id: 0, h: 1, v: 1, tq: 0, q: [0; 64], latched: false, cw: 0, ch: 0, bw: 0, bh: 0, plane: 0, coef: 0, pred: 0, seen: false, dc: 0, ac: 0 };
+}
+
+/// Row y of component c at the image's size, into out (as wide as the
+/// image): as it is, or upsampled by hx across and vy down. Twice across,
+/// twice down or both are libjpeg-turbo's fancy upsampling, a triangle
+/// filter, 3/4 of the nearer sample and 1/4 of the other, its edges the
+/// samples repeated; other factors repeat each sample, as it does.
+fn upsample_row(c: &Component, samples: []u8, y: usize, hx: usize, vy: usize, out: []mut u8) {
+    let stride = (c.bw as usize) * 8;
+    let cw = c.cw as usize;
+    let ch = c.ch as usize;
+    let w = out.len();
+    if hx == 1 and vy == 1 {
+        let row = c.plane + y * stride;
+        var x: usize = 0;
+        while x < w : (x += 1) {
+            out[x] = samples[row + x];
+        }
+        return;
+    }
+    // The nearer row and the other, for vertical filtering.
+    let i = y / vy;
+    var far = i;
+    if vy == 2 {
+        if y % 2 == 0 {
+            if i > 0 {
+                far = i - 1;
+            }
+        } else if i + 1 < ch {
+            far = i + 1;
+        }
+    }
+    let near_at = c.plane + i * stride;
+    let far_at = c.plane + far * stride;
+    if hx == 2 and vy == 1 and cw > 2 {
+        var x: usize = 0;
+        while x < w : (x += 1) {
+            let j = x / 2;
+            let v3 = (samples[near_at + j] as u32) * 3;
+            if x % 2 == 0 {
+                var o = j;
+                if j > 0 {
+                    o = j - 1;
+                }
+                out[x] = ((v3 + (samples[near_at + o] as u32) + 1) >> 2) as u8;
+            } else {
+                var o = j;
+                if j + 1 < cw {
+                    o = j + 1;
+                }
+                out[x] = ((v3 + (samples[near_at + o] as u32) + 2) >> 2) as u8;
+            }
+        }
+        return;
+    }
+    if hx == 1 and vy == 2 {
+        var bias: u32 = 2;
+        if y % 2 == 0 {
+            bias = 1;
+        }
+        var x: usize = 0;
+        while x < w : (x += 1) {
+            out[x] = (((samples[near_at + x] as u32) * 3 + (samples[far_at + x] as u32) + bias) >> 2) as u8;
+        }
+        return;
+    }
+    if hx == 2 and vy == 2 and cw > 2 {
+        var x: usize = 0;
+        while x < w : (x += 1) {
+            let j = x / 2;
+            let sum3 = ((samples[near_at + j] as u32) * 3 + (samples[far_at + j] as u32)) * 3;
+            if x % 2 == 0 {
+                var o = j;
+                if j > 0 {
+                    o = j - 1;
+                }
+                let other = (samples[near_at + o] as u32) * 3 + (samples[far_at + o] as u32);
+                out[x] = ((sum3 + other + 8) >> 4) as u8;
+            } else {
+                var o = j;
+                if j + 1 < cw {
+                    o = j + 1;
+                }
+                let other = (samples[near_at + o] as u32) * 3 + (samples[far_at + o] as u32);
+                out[x] = ((sum3 + other + 7) >> 4) as u8;
+            }
+        }
+        return;
+    }
+    var x: usize = 0;
+    while x < w : (x += 1) {
+        out[x] = samples[near_at + x / hx];
+    }
+}
+
+/// A value kept within 0..255.
+fn clamp_sample(x: i32) -> u8 {
+    if x < 0 {
+        return 0;
+    }
+    if x > 255 {
+        return 255;
+    }
+    return x as u8;
+}
+
+// ---- reading markers ------------------------------------------------------------------
+
+/// The big-endian 16 bits at at; the caller has checked that they are
+/// there.
+fn be16(b: []u8, at: usize) -> u32 {
+    return ((b[at] as u32) << 8) | (b[at + 1] as u32);
+}
+
+/// The next marker from at on: what lies before it is passed over, as
+/// libjpeg's next_marker does, and so is each 0xFF 0x00. at is left after
+/// the marker's code; 0 when the bytes end first.
+fn next_marker(b: []u8, at: &mut usize) -> u32 {
+    var i = at.*;
+    while true {
+        while i < b.len() and b[i] != 0xFF {
+            i += 1;
+        }
+        while i < b.len() and b[i] == 0xFF {
+            i += 1;
+        }
+        if i >= b.len() {
+            at.* = b.len();
+            return 0;
+        }
+        let c = b[i];
+        i += 1;
+        if c != 0 {
+            at.* = i;
+            return c as u32;
+        }
+    }
+}
+
+/// Whether b holds text at at.
+fn has_text(b: []u8, at: usize, text: str) -> bool {
+    let t = text.bytes();
+    if at > b.len() or b.len() - at < t.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < t.len() : (i += 1) {
+        if b[at + i] != t[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// 16 bits of a TIFF structure at at, little-endian or big; 0 when they
+/// are not there.
+fn tiff16(t: []u8, at: usize, little: bool) -> u32 {
+    if at > t.len() or t.len() - at < 2 {
+        return 0;
+    }
+    if little {
+        return (t[at] as u32) | ((t[at + 1] as u32) << 8);
+    }
+    return ((t[at] as u32) << 8) | (t[at + 1] as u32);
+}
+
+/// 32 bits of a TIFF structure at at; 0 when they are not there.
+fn tiff32(t: []u8, at: usize, little: bool) -> u32 {
+    if at > t.len() or t.len() - at < 4 {
+        return 0;
+    }
+    let hi = tiff16(t, at: at, little: little);
+    let lo = tiff16(t, at: at + 2, little: little);
+    if little {
+        return (lo << 16) | hi;
+    }
+    return (hi << 16) | lo;
+}
+
+/// The orientation (tag 0x0112) in the first IFD of an Exif APP1 segment's
+/// body; 1 when there is none, or the segment is not Exif.
+fn exif_orientation(body: []u8) -> u32 {
+    if not has_text(body, at: 0, text: "Exif\x00\x00") {
+        return 1;
+    }
+    let t = body[6..body.len()];
+    var little = false;
+    if has_text(t, at: 0, text: "II") {
+        little = true;
+    } else if not has_text(t, at: 0, text: "MM") {
+        return 1;
+    }
+    if tiff16(t, at: 2, little: little) != 42 {
+        return 1;
+    }
+    let ifd = tiff32(t, at: 4, little: little) as usize;
+    let n = tiff16(t, at: ifd, little: little) as usize;
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        let e = ifd + 2 + 12 * i;
+        if e > t.len() or t.len() - e < 12 {
+            return 1;
+        }
+        if tiff16(t, at: e, little: little) == 0x0112 {
+            let v = tiff16(t, at: e + 8, little: little);
+            if tiff16(t, at: e + 2, little: little) == 3 and v >= 1 and v <= 8 {
+                return v;
+            }
+            return 1;
+        }
+    }
+    return 1;
+}
+
+/// What a JPEG's header says, read up to its frame header; its scans are
+/// not decoded.
+pub fn info(bytes: []u8) -> JpegError!Info {
+    if bytes.len() < 4 or bytes[0] != 0xFF or bytes[1] != 0xD8 {
+        return JpegError.Malformed;
+    }
+    var at: usize = 2;
+    var orientation: u32 = 1;
+    var exif = false;
+    while true {
+        let m = next_marker(bytes, at: &mut at);
+        if m == 0 or m == 0xD9 or m == 0xDA {
+            return JpegError.Malformed;
+        }
+        if (m >= 0xD0 and m <= 0xD7) or m == 0x01 {
+            continue;
+        }
+        if bytes.len() - at < 2 {
+            return JpegError.Malformed;
+        }
+        let len = be16(bytes, at: at) as usize;
+        if len < 2 or len > bytes.len() - at {
+            return JpegError.Malformed;
+        }
+        let body = bytes[at + 2..at + len];
+        at += len;
+        if m == 0xE1 and not exif and has_text(body, at: 0, text: "Exif\x00\x00") {
+            orientation = exif_orientation(body);
+            exif = true;
+        } else if m == 0xC0 or m == 0xC1 or m == 0xC2 {
+            if body.len() < 6 {
+                return JpegError.Malformed;
+            }
+            let p = body[0];
+            if p == 12 or p == 16 {
+                return JpegError.Unsupported;
+            }
+            let width = be16(body, at: 3);
+            let height = be16(body, at: 1);
+            let count = body[5] as u32;
+            if p != 8 or width == 0 or count == 0 {
+                return JpegError.Malformed;
+            }
+            if height == 0 or (count != 1 and count != 3) {
+                return JpegError.Unsupported;
+            }
+            return Info { width: width, height: height, components: count, progressive: m == 0xC2, orientation: orientation };
+        } else if m >= 0xC3 and m <= 0xCF and m != 0xC4 and m != 0xCC {
+            return JpegError.Unsupported;
+        }
+    }
+}
+
+// ---- the decoder ----------------------------------------------------------------------
+
+/// A scan's header: its components, by their place in the frame, and the
+/// band of coefficients it codes.
+type Scan = struct {
+    count: usize,
+    comps: [4]usize,
+    band: Band,
+}
+
+/// Decodes JPEG images, one after another, keeping its buffers: a
+/// Motion-JPEG video's frames, all of one size, need memory only for the
+/// first.
+pub type Decoder = struct {
+    /// natural_order(), kept at hand.
+    natural: [80]u8,
+    /// DC tables 0 to 3, then AC tables 0 to 3.
+    huff: [8]Huffman,
+    /// Quantization tables 0 to 3, 64 steps each in rows, and which of
+    /// them a DQT segment has given.
+    quant: [256]i32,
+    quant_defined: [4]bool,
+    /// The frame's components, count of them, once framed.
+    comps: [3]Component,
+    count: usize,
+    framed: bool,
+    progressive: bool,
+    /// The image's size in pixels.
+    width: u32,
+    height: u32,
+    /// The largest sampling factors, across and down.
+    hmax: u32,
+    vmax: u32,
+    /// MCUs across and down.
+    mcux: u32,
+    mcuy: u32,
+    /// MCUs between restart markers; 0 for none.
+    restart: u32,
+    /// What the markers said: JFIF's, Adobe's and its transform, Exif's
+    /// orientation.
+    jfif: bool,
+    adobe: bool,
+    transform: u32,
+    orientation: u32,
+    exif: bool,
+    /// Every component's samples, and in a progressive frame every
+    /// component's coefficients.
+    samples: alloc.List(u8),
+    coefs: alloc.List(i16),
+    /// A row of each component at the image's size.
+    rows: alloc.List(u8),
+
+    /// A decoder whose buffers come from a.
+    pub fn init(a: alloc.Allocator) -> Decoder {
+        let blank = empty_huffman();
+        let c = empty_component();
+        return Decoder {
+            natural: natural_order(),
+            huff: [blank; 8],
+            quant: [0; 256],
+            quant_defined: [false; 4],
+            comps: [c; 3],
+            count: 0,
+            framed: false,
+            progressive: false,
+            width: 0,
+            height: 0,
+            hmax: 1,
+            vmax: 1,
+            mcux: 0,
+            mcuy: 0,
+            restart: 0,
+            jfif: false,
+            adobe: false,
+            transform: 0,
+            orientation: 1,
+            exif: false,
+            samples: alloc.List(u8).init(a),
+            coefs: alloc.List(i16).init(a),
+            rows: alloc.List(u8).init(a),
+        };
+    }
+
+    /// bytes, a JPEG of at most max_pixels pixels, decoded into into,
+    /// which takes its size; what its header says.
+    pub fn decode(self: &mut Decoder, bytes: []u8, max_pixels: u64, into: &mut png.Image) -> JpegError!Info {
+        self.forget();
+        if bytes.len() < 4 or bytes[0] != 0xFF or bytes[1] != 0xD8 {
+            return JpegError.Malformed;
+        }
+        var at: usize = 2;
+        var scans: u32 = 0;
+        while true {
+            let m = next_marker(bytes, at: &mut at);
+            if m == 0 or m == 0xD9 {
+                break;
+            }
+            if (m >= 0xD0 and m <= 0xD7) or m == 0x01 {
+                continue;
+            }
+            if bytes.len() - at < 2 {
+                return JpegError.Malformed;
+            }
+            let len = be16(bytes, at: at) as usize;
+            if len < 2 or len > bytes.len() - at {
+                return JpegError.Malformed;
+            }
+            let body = bytes[at + 2..at + len];
+            at += len;
+            if m == 0xC0 or m == 0xC1 or m == 0xC2 {
+                if self.framed {
+                    return JpegError.Malformed;
+                }
+                try self.read_frame(body, progressive: m == 0xC2, max_pixels: max_pixels);
+            } else if m == 0xC4 {
+                try self.read_huffman(body);
+            } else if m == 0xDB {
+                try self.read_quant(body);
+            } else if m == 0xDD {
+                if body.len() != 2 {
+                    return JpegError.Malformed;
+                }
+                self.restart = be16(body, at: 0);
+            } else if m == 0xDA {
+                if not self.framed {
+                    return JpegError.Malformed;
+                }
+                scans += 1;
+                if scans > MAX_SCANS {
+                    return JpegError.Malformed;
+                }
+                let s = try self.read_scan(body);
+                if self.progressive {
+                    at = self.progressive_scan(bytes, start: at, s: &s);
+                } else {
+                    at = self.sequential_scan(bytes, start: at, s: &s);
+                }
+            } else if m >= 0xE0 and m <= 0xEF {
+                self.read_app(m, body);
+            } else if m == 0xFE or m == 0xDC or m == 0xCC {
+                // A comment, the number of lines (the frame has it
+                // already), arithmetic conditioning: nothing to use.
+            } else if m >= 0xC3 and m <= 0xCF {
+                return JpegError.Unsupported;
+            } else {
+                return JpegError.Malformed;
+            }
+        }
+        if scans == 0 {
+            return JpegError.Malformed;
+        }
+        if self.progressive {
+            self.transform_all();
+        } else {
+            self.fill_unseen();
+        }
+        self.output(into);
+        return Info { width: self.width, height: self.height, components: self.count as u32, progressive: self.progressive, orientation: self.orientation };
+    }
+
+    /// Every table and setting of the last image forgotten; the buffers
+    /// kept.
+    fn forget(self: &mut Decoder) {
+        let blank = empty_huffman();
+        var i: usize = 0;
+        while i < 8 : (i += 1) {
+            self.huff[i] = blank;
+        }
+        self.quant_defined = [false; 4];
+        let c = empty_component();
+        self.comps = [c; 3];
+        self.count = 0;
+        self.framed = false;
+        self.progressive = false;
+        self.restart = 0;
+        self.jfif = false;
+        self.adobe = false;
+        self.transform = 0;
+        self.orientation = 1;
+        self.exif = false;
+    }
+
+    /// A frame header (SOF0, SOF1 or SOF2): the size, the components and
+    /// their sampling; the buffers made ready for it.
+    fn read_frame(self: &mut Decoder, body: []u8, progressive: bool, max_pixels: u64) -> JpegError!void {
+        if body.len() < 6 {
+            return JpegError.Malformed;
+        }
+        let p = body[0];
+        if p == 12 or p == 16 {
+            return JpegError.Unsupported;
+        }
+        if p != 8 {
+            return JpegError.Malformed;
+        }
+        let height = be16(body, at: 1);
+        let width = be16(body, at: 3);
+        let count = body[5] as usize;
+        if width == 0 or count == 0 {
+            return JpegError.Malformed;
+        }
+        if height == 0 or (count != 1 and count != 3) {
+            return JpegError.Unsupported;
+        }
+        if body.len() != 6 + 3 * count {
+            return JpegError.Malformed;
+        }
+        if (width as u64) * (height as u64) > max_pixels {
+            return JpegError.TooLarge;
+        }
+        var hmax: u32 = 1;
+        var vmax: u32 = 1;
+        var i: usize = 0;
+        while i < count : (i += 1) {
+            let at = 6 + 3 * i;
+            var c = empty_component();
+            c.id = body[at] as u32;
+            c.h = (body[at + 1] >> 4) as u32;
+            c.v = (body[at + 1] & 15) as u32;
+            c.tq = body[at + 2] as u32;
+            if c.h < 1 or c.h > 4 or c.v < 1 or c.v > 4 or c.tq > 3 {
+                return JpegError.Malformed;
+            }
+            var k: usize = 0;
+            while k < i : (k += 1) {
+                if self.comps[k].id == c.id {
+                    return JpegError.Malformed;
+                }
+            }
+            if c.h > hmax {
+                hmax = c.h;
+            }
+            if c.v > vmax {
+                vmax = c.v;
+            }
+            self.comps[i] = c;
+        }
+        self.width = width;
+        self.height = height;
+        self.count = count;
+        self.progressive = progressive;
+        self.hmax = hmax;
+        self.vmax = vmax;
+        self.mcux = (width + 8 * hmax - 1) / (8 * hmax);
+        self.mcuy = (height + 8 * vmax - 1) / (8 * vmax);
+        var samples: usize = 0;
+        var coefs: usize = 0;
+        i = 0;
+        while i < count : (i += 1) {
+            let h = self.comps[i].h;
+            let v = self.comps[i].v;
+            if hmax % h != 0 or vmax % v != 0 {
+                return JpegError.Unsupported;
+            }
+            self.comps[i].cw = (width * h + hmax - 1) / hmax;
+            self.comps[i].ch = (height * v + vmax - 1) / vmax;
+            self.comps[i].bw = self.mcux * h;
+            self.comps[i].bh = self.mcuy * v;
+            let blocks = (self.comps[i].bw as usize) * (self.comps[i].bh as usize);
+            self.comps[i].plane = samples;
+            self.comps[i].coef = coefs;
+            samples += blocks * 64;
+            if progressive {
+                coefs += blocks * 64;
+            }
+        }
+        if self.samples.len() < samples {
+            self.samples.clear();
+            self.samples.grow_zeroed(samples);
+        }
+        if self.coefs.len() < coefs {
+            self.coefs.clear();
+            self.coefs.grow_zeroed(coefs);
+        } else {
+            let all = self.coefs.items_mut();
+            var k: usize = 0;
+            while k < coefs : (k += 1) {
+                all[k] = 0;
+            }
+        }
+        self.framed = true;
+    }
+
+    /// A DHT segment: one Huffman table or more.
+    fn read_huffman(self: &mut Decoder, body: []u8) -> JpegError!void {
+        var at: usize = 0;
+        while at < body.len() {
+            if body.len() - at < 17 {
+                return JpegError.Malformed;
+            }
+            let class = body[at] >> 4;
+            let slot = body[at] & 15;
+            if class > 1 or slot > 3 {
+                return JpegError.Malformed;
+            }
+            var total: usize = 0;
+            var i: usize = 0;
+            while i < 16 : (i += 1) {
+                total += body[at + 1 + i] as usize;
+            }
+            if total > 256 or body.len() - at - 17 < total {
+                return JpegError.Malformed;
+            }
+            let t = try make_huffman(body[at + 1..at + 17 + total]);
+            self.huff[(class as usize) * 4 + (slot as usize)] = t;
+            at += 17 + total;
+        }
+    }
+
+    /// A DQT segment: one quantization table or more, of 8 or 16 bits.
+    fn read_quant(self: &mut Decoder, body: []u8) -> JpegError!void {
+        var at: usize = 0;
+        while at < body.len() {
+            let wide = body[at] >> 4;
+            let slot = (body[at] & 15) as usize;
+            if wide > 1 or slot > 3 {
+                return JpegError.Malformed;
+            }
+            var size: usize = 64;
+            if wide == 1 {
+                size = 128;
+            }
+            if body.len() - at - 1 < size {
+                return JpegError.Malformed;
+            }
+            var k: usize = 0;
+            while k < 64 : (k += 1) {
+                var v = body[at + 1 + k] as i32;
+                if wide == 1 {
+                    v = be16(body, at: at + 1 + 2 * k) as i32;
+                }
+                self.quant[slot * 64 + (self.natural[k] as usize)] = v;
+            }
+            self.quant_defined[slot] = true;
+            at += 1 + size;
+        }
+    }
+
+    /// An APPn segment: JFIF's, Adobe's and Exif's say something.
+    fn read_app(self: &mut Decoder, m: u32, body: []u8) {
+        if m == 0xE0 and body.len() >= 14 and has_text(body, at: 0, text: "JFIF\x00") {
+            self.jfif = true;
+        } else if m == 0xEE and body.len() >= 12 and has_text(body, at: 0, text: "Adobe") {
+            self.adobe = true;
+            self.transform = body[11] as u32;
+        } else if m == 0xE1 and not self.exif and has_text(body, at: 0, text: "Exif\x00\x00") {
+            self.orientation = exif_orientation(body);
+            self.exif = true;
+        }
+    }
+
+    /// A scan header: its components, their tables, and in a progressive
+    /// frame its band, checked as libjpeg checks them. A table it needs that
+    /// no segment gave is the standard one when it is table 0 or 1, as a
+    /// Motion-JPEG frame expects; each component's quantization table is
+    /// latched the first time.
+    fn read_scan(self: &mut Decoder, body: []u8) -> JpegError!Scan {
+        if body.len() < 1 {
+            return JpegError.Malformed;
+        }
+        let n = body[0] as usize;
+        if n < 1 or n > 4 or body.len() != 4 + 2 * n {
+            return JpegError.Malformed;
+        }
+        var s = Scan { count: n, comps: [0; 4], band: Band { ss: 0, se: 63, ah: 0, al: 0 } };
+        let tail = 1 + 2 * n;
+        let band = Band { ss: body[tail] as u32, se: body[tail + 1] as u32, ah: (body[tail + 2] >> 4) as u32, al: (body[tail + 2] & 15) as u32 };
+        if self.progressive {
+            var bad = band.ah != 0 and band.al + 1 != band.ah;
+            if band.ss == 0 {
+                bad = bad or band.se != 0;
+            } else {
+                bad = bad or band.ss > band.se or band.se > 63 or n != 1;
+            }
+            if bad or band.al > 13 {
+                return JpegError.Malformed;
+            }
+            s.band = band;
+        }
+        var blocks: u32 = 0;
+        var i: usize = 0;
+        while i < n : (i += 1) {
+            let id = body[1 + 2 * i] as u32;
+            let tables = body[2 + 2 * i];
+            var found = self.count;
+            var k: usize = 0;
+            while k < self.count : (k += 1) {
+                if self.comps[k].id == id {
+                    found = k;
+                }
+            }
+            // A sequential frame codes each component in one scan; another
+            // would cost a pass over the image for nothing.
+            if found == self.count or (not self.progressive and self.comps[found].seen) {
+                return JpegError.Malformed;
+            }
+            k = 0;
+            while k < i : (k += 1) {
+                if s.comps[k] == found {
+                    return JpegError.Malformed;
+                }
+            }
+            s.comps[i] = found;
+            let dc = (tables >> 4) as usize;
+            let ac = (tables & 15) as usize;
+            if dc > 3 or ac > 3 {
+                return JpegError.Malformed;
+            }
+            self.comps[found].dc = dc;
+            self.comps[found].ac = ac;
+            let needs_dc = not self.progressive or (band.ss == 0 and band.ah == 0);
+            let needs_ac = not self.progressive or band.ss > 0;
+            if needs_dc {
+                try self.need_table(slot: dc);
+                if not self.huff[dc].dc_ok {
+                    return JpegError.Malformed;
+                }
+            }
+            if needs_ac {
+                try self.need_table(slot: 4 + ac);
+            }
+            if not self.comps[found].latched {
+                let tq = self.comps[found].tq as usize;
+                if not self.quant_defined[tq] {
+                    return JpegError.Malformed;
+                }
+                var j: usize = 0;
+                while j < 64 : (j += 1) {
+                    self.comps[found].q[j] = self.quant[tq * 64 + j];
+                }
+                self.comps[found].latched = true;
+            }
+            self.comps[found].seen = true;
+            blocks += self.comps[found].h * self.comps[found].v;
+        }
+        if n > 1 and blocks > 10 {
+            return JpegError.Malformed;
+        }
+        return s;
+    }
+
+    /// Huffman table slot (DC 0 to 3, AC 4 to 7) defined, by the standard
+    /// table when a frame leaves table 0 or 1 out.
+    fn need_table(self: &mut Decoder, slot: usize) -> JpegError!void {
+        if self.huff[slot].defined {
+            return;
+        }
+        var which: u32 = 0;
+        if slot == 0 {
+            which = 0;
+        } else if slot == 4 {
+            which = 1;
+        } else if slot == 1 {
+            which = 2;
+        } else if slot == 5 {
+            which = 3;
+        } else {
+            return JpegError.Malformed;
+        }
+        let spec = std_huffman(which);
+        self.huff[slot] = try make_huffman(spec[0..std_huffman_len(which)]);
+    }
+
+    /// A sequential scan's data from start on, decoded and inverse
+    /// transformed into the samples; where the data ends.
+    fn sequential_scan(self: &mut Decoder, d: []u8, start: usize, s: &Scan) -> usize {
+        var b = Bits { acc: 0, count: 0, at: start, ended: false, short: false };
+        var blk: [64]i32 = [0; 64];
+        var k: usize = 0;
+        while k < s.count : (k += 1) {
+            self.comps[s.comps[k]].pred = 0;
+        }
+        var todo = self.restart;
+        if s.count == 1 {
+            let ci = s.comps[0];
+            let across = (self.comps[ci].cw + 7) / 8;
+            let down = (self.comps[ci].ch + 7) / 8;
+            var by: u32 = 0;
+            while by < down : (by += 1) {
+                var bx: u32 = 0;
+                while bx < across : (bx += 1) {
+                    if self.restart > 0 {
+                        if todo == 0 {
+                            restart_bits(&mut b, d);
+                            todo = self.restart;
+                            self.comps[ci].pred = 0;
+                        }
+                        todo -= 1;
+                    }
+                    let skip = b.short;
+                    self.sequential_one(&mut b, d, ci: ci, bx: bx, by: by, skip: skip, blk: &mut blk);
+                }
+            }
+            return b.at;
+        }
+        var my: u32 = 0;
+        while my < self.mcuy : (my += 1) {
+            var mx: u32 = 0;
+            while mx < self.mcux : (mx += 1) {
+                if self.restart > 0 {
+                    if todo == 0 {
+                        restart_bits(&mut b, d);
+                        todo = self.restart;
+                        k = 0;
+                        while k < s.count : (k += 1) {
+                            self.comps[s.comps[k]].pred = 0;
+                        }
+                    }
+                    todo -= 1;
+                }
+                let skip = b.short;
+                k = 0;
+                while k < s.count : (k += 1) {
+                    let ci = s.comps[k];
+                    let h = self.comps[ci].h;
+                    let v = self.comps[ci].v;
+                    var j: u32 = 0;
+                    while j < v : (j += 1) {
+                        var i: u32 = 0;
+                        while i < h : (i += 1) {
+                            self.sequential_one(&mut b, d, ci: ci, bx: mx * h + i, by: my * v + j, skip: skip, blk: &mut blk);
+                        }
+                    }
+                }
+            }
+        }
+        return b.at;
+    }
+
+    /// Block (bx, by) of component ci, decoded (or zero when the data has
+    /// run out) and inverse transformed into its samples.
+    fn sequential_one(self: &mut Decoder, b: &mut Bits, d: []u8, ci: usize, bx: u32, by: u32, skip: bool, blk: &mut [64]i32) {
+        if skip {
+            var i: usize = 0;
+            while i < 64 : (i += 1) {
+                blk.*[i] = 0;
+            }
+        } else {
+            let dc = self.comps[ci].dc;
+            let ac = 4 + self.comps[ci].ac;
+            sequential_block(b, d, dct: &self.huff[dc], act: &self.huff[ac], nat: &self.natural, pred: &mut self.comps[ci].pred, blk: blk);
+        }
+        let stride = (self.comps[ci].bw as usize) * 8;
+        let at = self.comps[ci].plane + (by as usize) * 8 * stride + (bx as usize) * 8;
+        idct_islow(c: blk, q: &self.comps[ci].q, out: self.samples.items_mut(), at: at, stride: stride);
+    }
+
+    /// A progressive scan's data from start on, into the coefficients;
+    /// where the data ends.
+    fn progressive_scan(self: &mut Decoder, d: []u8, start: usize, s: &Scan) -> usize {
+        var b = Bits { acc: 0, count: 0, at: start, ended: false, short: false };
+        var eobrun: u32 = 0;
+        var k: usize = 0;
+        while k < s.count : (k += 1) {
+            self.comps[s.comps[k]].pred = 0;
+        }
+        var todo = self.restart;
+        if s.count == 1 {
+            let ci = s.comps[0];
+            let across = (self.comps[ci].cw + 7) / 8;
+            let down = (self.comps[ci].ch + 7) / 8;
+            var by: u32 = 0;
+            while by < down : (by += 1) {
+                var bx: u32 = 0;
+                while bx < across : (bx += 1) {
+                    if self.restart > 0 {
+                        if todo == 0 {
+                            restart_bits(&mut b, d);
+                            todo = self.restart;
+                            self.comps[ci].pred = 0;
+                            eobrun = 0;
+                        }
+                        todo -= 1;
+                    }
+                    if not b.short or (s.band.ss == 0 and s.band.ah > 0) {
+                        self.progressive_one(&mut b, d, ci: ci, bx: bx, by: by, band: &s.band, eobrun: &mut eobrun);
+                    }
+                }
+            }
+            return b.at;
+        }
+        var my: u32 = 0;
+        while my < self.mcuy : (my += 1) {
+            var mx: u32 = 0;
+            while mx < self.mcux : (mx += 1) {
+                if self.restart > 0 {
+                    if todo == 0 {
+                        restart_bits(&mut b, d);
+                        todo = self.restart;
+                        k = 0;
+                        while k < s.count : (k += 1) {
+                            self.comps[s.comps[k]].pred = 0;
+                        }
+                        eobrun = 0;
+                    }
+                    todo -= 1;
+                }
+                // DC refinement reads on past the end, as libjpeg's does:
+                // zeros change nothing.
+                if b.short and not (s.band.ss == 0 and s.band.ah > 0) {
+                    continue;
+                }
+                k = 0;
+                while k < s.count : (k += 1) {
+                    let ci = s.comps[k];
+                    let h = self.comps[ci].h;
+                    let v = self.comps[ci].v;
+                    var j: u32 = 0;
+                    while j < v : (j += 1) {
+                        var i: u32 = 0;
+                        while i < h : (i += 1) {
+                            self.progressive_one(&mut b, d, ci: ci, bx: mx * h + i, by: my * v + j, band: &s.band, eobrun: &mut eobrun);
+                        }
+                    }
+                }
+            }
+        }
+        return b.at;
+    }
+
+    /// Block (bx, by) of component ci, its coefficients taken further by a
+    /// progressive scan of band.
+    fn progressive_one(self: &mut Decoder, b: &mut Bits, d: []u8, ci: usize, bx: u32, by: u32, band: &Band, eobrun: &mut u32) {
+        let at = self.comps[ci].coef + ((by as usize) * (self.comps[ci].bw as usize) + (bx as usize)) * 64;
+        let blk = self.coefs.items_mut()[at..at + 64];
+        if band.ss == 0 {
+            if band.ah == 0 {
+                dc_first(b, d, t: &self.huff[self.comps[ci].dc], pred: &mut self.comps[ci].pred, al: band.al, blk: blk);
+            } else {
+                dc_refine(b, d, al: band.al, blk: blk);
+            }
+        } else if band.ah == 0 {
+            ac_first(b, d, t: &self.huff[4 + self.comps[ci].ac], band: band, eobrun: eobrun, nat: &self.natural, blk: blk);
+        } else {
+            ac_refine(b, d, t: &self.huff[4 + self.comps[ci].ac], band: band, eobrun: eobrun, nat: &self.natural, blk: blk);
+        }
+    }
+
+    /// A progressive frame's coefficients inverse transformed into its
+    /// samples, every block the image shows.
+    fn transform_all(self: &mut Decoder) {
+        var blk: [64]i32 = [0; 64];
+        var ci: usize = 0;
+        while ci < self.count : (ci += 1) {
+            let across = (self.comps[ci].cw + 7) / 8;
+            let down = (self.comps[ci].ch + 7) / 8;
+            let stride = (self.comps[ci].bw as usize) * 8;
+            var by: u32 = 0;
+            while by < down : (by += 1) {
+                var bx: u32 = 0;
+                while bx < across : (bx += 1) {
+                    let from = self.comps[ci].coef + ((by as usize) * (self.comps[ci].bw as usize) + (bx as usize)) * 64;
+                    let coefs = self.coefs.items();
+                    var i: usize = 0;
+                    while i < 64 : (i += 1) {
+                        blk[i] = coefs[from + i] as i32;
+                    }
+                    let at = self.comps[ci].plane + (by as usize) * 8 * stride + (bx as usize) * 8;
+                    idct_islow(c: &blk, q: &self.comps[ci].q, out: self.samples.items_mut(), at: at, stride: stride);
+                }
+            }
+        }
+    }
+
+    /// A component no scan read, mid grey: its coefficients all zero, as
+    /// libjpeg leaves them.
+    fn fill_unseen(self: &mut Decoder) {
+        var ci: usize = 0;
+        while ci < self.count : (ci += 1) {
+            if not self.comps[ci].seen {
+                let from = self.comps[ci].plane;
+                let n = (self.comps[ci].bw as usize) * (self.comps[ci].bh as usize) * 64;
+                let all = self.samples.items_mut();
+                var i: usize = 0;
+                while i < n : (i += 1) {
+                    all[from + i] = 128;
+                }
+            }
+        }
+    }
+
+    /// The samples upsampled and turned into RGBA, row by row, as
+    /// libjpeg-turbo's jdcolor does: YCbCr by its tables (ITU-R BT.601, full
+    /// range, as JFIF says), RGB as it is, grey into all three.
+    fn output(self: &mut Decoder, into: &mut png.Image) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        into.width = self.width;
+        into.height = self.height;
+        let n = w * h * 4;
+        if into.rgba.len() != n {
+            into.rgba.clear();
+            into.rgba.grow_zeroed(n);
+        }
+        if self.rows.len() < 3 * w {
+            self.rows.clear();
+            self.rows.grow_zeroed(3 * w);
+        }
+        // libjpeg's choice for three components: JFIF says YCbCr, then
+        // Adobe's transform, then the ids R, G and B.
+        var rgb = false;
+        if self.count == 3 and not self.jfif {
+            if self.adobe {
+                rgb = self.transform == 0;
+            } else {
+                rgb = self.comps[0].id == 82 and self.comps[1].id == 71 and self.comps[2].id == 66;
+            }
+        }
+        var y: usize = 0;
+        while y < h : (y += 1) {
+            var ci: usize = 0;
+            while ci < self.count : (ci += 1) {
+                let hx = (self.hmax / self.comps[ci].h) as usize;
+                let vy = (self.vmax / self.comps[ci].v) as usize;
+                upsample_row(&self.comps[ci], self.samples.items(), y: y, hx: hx, vy: vy, out: self.rows.items_mut()[ci * w..ci * w + w]);
+            }
+            let rows = self.rows.items();
+            let px = into.rgba.items_mut();
+            var o = y * w * 4;
+            var x: usize = 0;
+            if self.count == 1 {
+                while x < w : (x += 1) {
+                    let g = rows[x];
+                    px[o] = g;
+                    px[o + 1] = g;
+                    px[o + 2] = g;
+                    px[o + 3] = 255;
+                    o += 4;
+                }
+            } else if rgb {
+                while x < w : (x += 1) {
+                    px[o] = rows[x];
+                    px[o + 1] = rows[w + x];
+                    px[o + 2] = rows[2 * w + x];
+                    px[o + 3] = 255;
+                    o += 4;
+                }
+            } else {
+                while x < w : (x += 1) {
+                    let yy = rows[x] as i32;
+                    let cb = (rows[w + x] as i32) - 128;
+                    let cr = (rows[2 * w + x] as i32) - 128;
+                    px[o] = clamp_sample(yy + ((91881 * cr + 32768) >> 16));
+                    px[o + 1] = clamp_sample(yy + ((-22554 * cb + 32768 - 46802 * cr) >> 16));
+                    px[o + 2] = clamp_sample(yy + ((116130 * cb + 32768) >> 16));
+                    px[o + 3] = 255;
+                    o += 4;
+                }
+            }
+        }
+    }
+}
+
+/// bytes, a JPEG of at most max_pixels pixels, as RGBA.
+pub fn decode(bytes: []u8, max_pixels: u64, a: alloc.Allocator) -> JpegError!png.Image {
+    var dec = Decoder.init(a);
+    var img = png.Image { width: 0, height: 0, rgba: alloc.List(u8).init(a) };
+    _ = try dec.decode(bytes, max_pixels: max_pixels, into: &mut img);
+    return img;
+}
+
+// ---- the encoder ----------------------------------------------------------------------
+
+/// libjpeg's jpeg_fdct_islow, in place: 8x8 samples less 128, in rows,
+/// into their DCT coefficients, scaled up by 8.
+fn fdct_islow(blk: &mut [64]i32) {
+    var row: usize = 0;
+    while row < 8 : (row += 1) {
+        let p = row * 8;
+        let r = fdct_pass(i0: blk.*[p], i1: blk.*[p + 1], i2: blk.*[p + 2], i3: blk.*[p + 3], i4: blk.*[p + 4], i5: blk.*[p + 5], i6: blk.*[p + 6], i7: blk.*[p + 7], first: true);
+        var k: usize = 0;
+        while k < 8 : (k += 1) {
+            blk.*[p + k] = r[k];
+        }
+    }
+    var col: usize = 0;
+    while col < 8 : (col += 1) {
+        let r = fdct_pass(i0: blk.*[col], i1: blk.*[8 + col], i2: blk.*[16 + col], i3: blk.*[24 + col], i4: blk.*[32 + col], i5: blk.*[40 + col], i6: blk.*[48 + col], i7: blk.*[56 + col], first: false);
+        var k: usize = 0;
+        while k < 8 : (k += 1) {
+            blk.*[8 * k + col] = r[k];
+        }
+    }
+}
+
+/// One pass of jpeg_fdct_islow over eight values: the rows' (first),
+/// which scales up by 4, or the columns', which takes that away.
+fn fdct_pass(i0: i32, i1: i32, i2: i32, i3: i32, i4: i32, i5: i32, i6: i32, i7: i32, first: bool) -> [8]i32 {
+    let tmp0 = i0 + i7;
+    let tmp7 = i0 - i7;
+    let tmp1 = i1 + i6;
+    let tmp6 = i1 - i6;
+    let tmp2 = i2 + i5;
+    let tmp5 = i2 - i5;
+    let tmp3 = i3 + i4;
+    let tmp4 = i3 - i4;
+    let tmp10 = tmp0 + tmp3;
+    let tmp13 = tmp0 - tmp3;
+    let tmp11 = tmp1 + tmp2;
+    let tmp12 = tmp1 - tmp2;
+    var shift: u32 = 15;
+    if first {
+        shift = 11;
+    }
+    let half: i32 = 1 << (shift - 1);
+    var out: [8]i32 = [0; 8];
+    if first {
+        out[0] = (tmp10 + tmp11) << 2;
+        out[4] = (tmp10 - tmp11) << 2;
+    } else {
+        out[0] = (tmp10 + tmp11 + 2) >> 2;
+        out[4] = (tmp10 - tmp11 + 2) >> 2;
+    }
+    let z1 = (tmp12 + tmp13) * 4433;
+    out[2] = (z1 + tmp13 * 6270 + half) >> shift;
+    out[6] = (z1 + tmp12 * -15137 + half) >> shift;
+    let z5 = (tmp4 + tmp6 + tmp5 + tmp7) * 9633;
+    let y1 = (tmp4 + tmp7) * -7373;
+    let y2 = (tmp5 + tmp6) * -20995;
+    let y3 = (tmp4 + tmp6) * -16069 + z5;
+    let y4 = (tmp5 + tmp7) * -3196 + z5;
+    out[7] = (tmp4 * 2446 + y1 + y3 + half) >> shift;
+    out[5] = (tmp5 * 16819 + y2 + y4 + half) >> shift;
+    out[3] = (tmp6 * 25172 + y2 + y3 + half) >> shift;
+    out[1] = (tmp7 * 12299 + y1 + y4 + half) >> shift;
+    return out;
+}
+
+/// libjpeg-turbo's compute_reciprocal for a step of divisor (a table's step
+/// times 8): its reciprocal, the correction added before multiplying by
+/// it, and the shift after, so that each coefficient is divided and
+/// rounded as its quantize does.
+fn reciprocal(divisor: u32) -> [3]u32 {
+    var b: u32 = 0;
+    var x = divisor;
+    while x > 1 {
+        x = x >> 1;
+        b += 1;
+    }
+    var r = 16 + b;
+    let one: u64 = 1;
+    var fq = (one << r) / (divisor as u64);
+    let fr = (one << r) % (divisor as u64);
+    var c = divisor / 2;
+    if fr == 0 {
+        fq = fq >> 1;
+        r -= 1;
+    } else if fr <= (divisor / 2) as u64 {
+        c += 1;
+    } else {
+        fq += 1;
+    }
+    return [fq as u32, c, r];
+}
+
+/// Writes bits most significant first, a 0x00 after each 0xFF.
+type Writer = struct {
+    acc: u64,
+    count: u32,
+}
+
+/// The low n bits of value, n at most 16, onto out.
+fn put_bits(w: &mut Writer, out: &mut alloc.List(u8), value: u32, n: u32) {
+    if n == 0 {
+        return;
+    }
+    w.acc = (w.acc << n) | ((value & ((1 << n) - 1)) as u64);
+    w.count += n;
+    while w.count >= 8 {
+        w.count -= 8;
+        let byte = ((w.acc >> w.count) & 255) as u8;
+        out.push(byte);
+        if byte == 0xFF {
+            out.push(0);
+        }
+    }
+}
+
+/// How many bits a magnitude takes: its category in ITU T.81 F.1.2.
+fn bit_length(v: u32) -> u32 {
+    var n: u32 = 0;
+    var x = v;
+    while x > 0 {
+        x = x >> 1;
+        n += 1;
+    }
+    return n;
+}
+
+/// A segment's marker and length, onto out; len counts the two bytes of
+/// the length.
+fn put_segment(out: &mut alloc.List(u8), marker: u8, len: u32) {
+    out.push(0xFF);
+    out.push(marker);
+    out.push((len >> 8) as% u8);
+    out.push(len as% u8);
+}
+
+/// Encodes images as baseline JPEG, one after another, at one quality and
+/// sampling, keeping its tables and buffers: a video's frames, all of one
+/// size, allocate nothing after the first.
+pub type Encoder = struct {
+    /// How Cb and Cr are sampled.
+    sampling: Subsampling,
+    /// natural_order(), kept at hand.
+    natural: [80]u8,
+    /// The two quantization tables, luminance then chrominance, in the
+    /// zigzag order DQT writes.
+    zigzag: [128]u8,
+    /// For each table and coefficient, in rows: reciprocal's three values.
+    recip: [128]u32,
+    corr: [128]u32,
+    shift: [128]u32,
+    /// The standard Huffman codes and their lengths by symbol: DC
+    /// luminance, AC luminance, DC chrominance, AC chrominance, 256 each.
+    codes: [1024]u16,
+    sizes: [1024]u8,
+    /// A row of MCUs at full resolution: Y, Cb and Cr; then Cb and Cr
+    /// downsampled.
+    luma: alloc.List(u8),
+    blue: alloc.List(u8),
+    red: alloc.List(u8),
+    blue_small: alloc.List(u8),
+    red_small: alloc.List(u8),
+
+    /// An encoder at quality, 1 (smallest) to 100 (best), scaling the
+    /// standard tables as libjpeg's jpeg_set_quality does, its steps kept
+    /// at most 255 for baseline; sampling chooses the chroma's resolution.
+    pub fn init(quality: u32, sampling: Subsampling, a: alloc.Allocator) -> Encoder {
+        var e = Encoder {
+            sampling: sampling,
+            natural: natural_order(),
+            zigzag: [0; 128],
+            recip: [0; 128],
+            corr: [0; 128],
+            shift: [0; 128],
+            codes: [0; 1024],
+            sizes: [0; 1024],
+            luma: alloc.List(u8).init(a),
+            blue: alloc.List(u8).init(a),
+            red: alloc.List(u8).init(a),
+            blue_small: alloc.List(u8).init(a),
+            red_small: alloc.List(u8).init(a),
+        };
+        var q = quality;
+        if q < 1 {
+            q = 1;
+        }
+        if q > 100 {
+            q = 100;
+        }
+        var scale: u32 = 200 - 2 * q;
+        if q < 50 {
+            scale = 5000 / q;
+        }
+        var t: usize = 0;
+        while t < 2 : (t += 1) {
+            let base = std_quant(t == 1);
+            var i: usize = 0;
+            while i < 64 : (i += 1) {
+                var v = ((base[i] as u32) * scale + 50) / 100;
+                if v < 1 {
+                    v = 1;
+                }
+                if v > 255 {
+                    v = 255;
+                }
+                let r = reciprocal(v * 8);
+                e.recip[t * 64 + i] = r[0];
+                e.corr[t * 64 + i] = r[1];
+                e.shift[t * 64 + i] = r[2];
+            }
+            i = 0;
+            while i < 64 : (i += 1) {
+                let at = e.natural[i] as usize;
+                var v = ((base[at] as u32) * scale + 50) / 100;
+                if v < 1 {
+                    v = 1;
+                }
+                if v > 255 {
+                    v = 255;
+                }
+                e.zigzag[t * 64 + i] = v as u8;
+            }
+        }
+        var which: u32 = 0;
+        while which < 4 : (which += 1) {
+            let spec = std_huffman(which);
+            var code: u32 = 0;
+            var k: usize = 16;
+            var l: usize = 1;
+            while l <= 16 : (l += 1) {
+                var n: u32 = 0;
+                while n < spec[l - 1] as u32 : (n += 1) {
+                    let at = (which as usize) * 256 + (spec[k] as usize);
+                    e.codes[at] = code as u16;
+                    e.sizes[at] = l as u8;
+                    code += 1;
+                    k += 1;
+                }
+                code = code << 1;
+            }
+        }
+        return e;
+    }
+
+    /// img as a baseline JPEG, appended to out; its alpha is dropped.
+    pub fn encode(self: &mut Encoder, img: &png.Image, out: &mut alloc.List(u8)) -> JpegError!void {
+        try self.encode_pixels(img.rgba.items(), width: img.width, height: img.height, channels: 4, out: out);
+    }
+
+    /// width x height pixels, row by row, channels bytes each (3 for RGB, 4
+    /// for RGBA, whose alpha is dropped), as a baseline JPEG appended to
+    /// out. A size JPEG cannot hold, or pixels fewer than it says, is
+    /// Malformed.
+    pub fn encode_pixels(self: &mut Encoder, pixels: []u8, width: u32, height: u32, channels: u32, out: &mut alloc.List(u8)) -> JpegError!void {
+        if width == 0 or height == 0 or (channels != 3 and channels != 4) {
+            return JpegError.Malformed;
+        }
+        if width > 65535 or height > 65535 {
+            return JpegError.TooLarge;
+        }
+        if (pixels.len() as u64) < (width as u64) * (height as u64) * (channels as u64) {
+            return JpegError.Malformed;
+        }
+        var hmax: u32 = 1;
+        var vmax: u32 = 1;
+        match self.sampling {
+            .S420 => {
+                hmax = 2;
+                vmax = 2;
+            }
+            .S422 => {
+                hmax = 2;
+            }
+            .S444 => { }
+        }
+        self.headers(out, width: width, height: height, hmax: hmax, vmax: vmax);
+        let mcux = (width + 8 * hmax - 1) / (8 * hmax);
+        let mcuy = (height + 8 * vmax - 1) / (8 * vmax);
+        let sw = (mcux * 8 * hmax) as usize;
+        let sh = (8 * vmax) as usize;
+        if self.luma.len() < sw * sh {
+            self.luma.clear();
+            self.luma.grow_zeroed(sw * sh);
+            self.blue.clear();
+            self.blue.grow_zeroed(sw * sh);
+            self.red.clear();
+            self.red.grow_zeroed(sw * sh);
+        }
+        let cw = (mcux * 8) as usize;
+        if self.blue_small.len() < cw * 8 {
+            self.blue_small.clear();
+            self.blue_small.grow_zeroed(cw * 8);
+            self.red_small.clear();
+            self.red_small.grow_zeroed(cw * 8);
+        }
+        // Blocks of Y that are the image's; the rest of an MCU's are
+        // libjpeg's dummy blocks, its last DC and nothing else.
+        let ywb = (width + 7) / 8;
+        let yhb = (height + 7) / 8;
+        var w = Writer { acc: 0, count: 0 };
+        var preds: [3]i32 = [0, 0, 0];
+        var blk: [64]i32 = [0; 64];
+        var my: u32 = 0;
+        while my < mcuy : (my += 1) {
+            self.convert_strip(pixels, width: width, height: height, channels: channels, top: my * 8 * vmax, rows: sh, stride: sw);
+            if hmax == 2 {
+                self.downsample_strip(height: height, vmax: vmax, top_row: my * 8, stride: sw, small: cw);
+            }
+            var mx: u32 = 0;
+            while mx < mcux : (mx += 1) {
+                var last_dc: i32 = 0;
+                var j: u32 = 0;
+                while j < vmax : (j += 1) {
+                    var i: u32 = 0;
+                    while i < hmax : (i += 1) {
+                        let bx = mx * hmax + i;
+                        let by = my * vmax + j;
+                        if bx < ywb and by < yhb {
+                            load_block(self.luma.items(), at: (j as usize) * 8 * sw + (bx as usize) * 8, stride: sw, blk: &mut blk);
+                            fdct_islow(&mut blk);
+                            self.quantize(&mut blk, table: 0);
+                            last_dc = blk[0];
+                        } else {
+                            blk = [0; 64];
+                            blk[0] = last_dc;
+                        }
+                        self.huffman_block(&mut w, out: out, blk: &blk, pred: &mut preds[0], dc: 0, ac: 256);
+                    }
+                }
+                var c: usize = 1;
+                while c < 3 : (c += 1) {
+                    if hmax == 2 {
+                        var small = self.blue_small.items();
+                        if c == 2 {
+                            small = self.red_small.items();
+                        }
+                        load_block(small, at: (mx as usize) * 8, stride: cw, blk: &mut blk);
+                    } else {
+                        var full = self.blue.items();
+                        if c == 2 {
+                            full = self.red.items();
+                        }
+                        load_block(full, at: (mx as usize) * 8, stride: sw, blk: &mut blk);
+                    }
+                    fdct_islow(&mut blk);
+                    self.quantize(&mut blk, table: 1);
+                    self.huffman_block(&mut w, out: out, blk: &blk, pred: &mut preds[c], dc: 512, ac: 768);
+                }
+            }
+        }
+        // libjpeg pads the last byte with 1 bits.
+        if w.count > 0 {
+            put_bits(&mut w, out: out, value: 0x7F, n: 8 - w.count);
+        }
+        out.push(0xFF);
+        out.push(0xD9);
+    }
+
+    /// SOI, JFIF's APP0, the two tables, the frame header, the four Huffman
+    /// tables and the scan header, as libjpeg writes them.
+    fn headers(self: &Encoder, out: &mut alloc.List(u8), width: u32, height: u32, hmax: u32, vmax: u32) {
+        out.push(0xFF);
+        out.push(0xD8);
+        // JFIF 1.01, no units, an aspect of 1:1, no thumbnail.
+        put_segment(out, marker: 0xE0, len: 16);
+        let jfif: [14]u8 = [0x4A, 0x46, 0x49, 0x46, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0];
+        for b in jfif[0..14] {
+            out.push(b.*);
+        }
+        var t: usize = 0;
+        while t < 2 : (t += 1) {
+            put_segment(out, marker: 0xDB, len: 67);
+            out.push(t as u8);
+            var i: usize = 0;
+            while i < 64 : (i += 1) {
+                out.push(self.zigzag[t * 64 + i]);
+            }
+        }
+        put_segment(out, marker: 0xC0, len: 17);
+        out.push(8);
+        out.push((height >> 8) as% u8);
+        out.push(height as% u8);
+        out.push((width >> 8) as% u8);
+        out.push(width as% u8);
+        out.push(3);
+        out.push(1);
+        out.push(((hmax << 4) | vmax) as u8);
+        out.push(0);
+        out.push(2);
+        out.push(0x11);
+        out.push(1);
+        out.push(3);
+        out.push(0x11);
+        out.push(1);
+        var which: u32 = 0;
+        while which < 4 : (which += 1) {
+            let spec = std_huffman(which);
+            let n = std_huffman_len(which);
+            put_segment(out, marker: 0xC4, len: (n + 3) as u32);
+            // DC luminance 0x00, AC luminance 0x10, DC chrominance 0x01, AC
+            // chrominance 0x11.
+            out.push((((which & 1) << 4) | (which >> 1)) as u8);
+            var i: usize = 0;
+            while i < n : (i += 1) {
+                out.push(spec[i]);
+            }
+        }
+        put_segment(out, marker: 0xDA, len: 12);
+        let sos: [10]u8 = [3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0];
+        for b in sos[0..10] {
+            out.push(b.*);
+        }
+    }
+
+    /// The rows top.. of the image, rows of them, as Y, Cb and Cr at full
+    /// resolution (libjpeg-turbo's rgb_ycc_convert), stride samples a row:
+    /// past the image's right edge and bottom its last column and row
+    /// repeated, as libjpeg pads them.
+    fn convert_strip(self: &mut Encoder, pixels: []u8, width: u32, height: u32, channels: u32, top: u32, rows: usize, stride: usize) {
+        let w = width as usize;
+        let ch = channels as usize;
+        let ys = self.luma.items_mut();
+        let cbs = self.blue.items_mut();
+        let crs = self.red.items_mut();
+        var r: usize = 0;
+        while r < rows : (r += 1) {
+            var gy = top as usize + r;
+            if gy >= height as usize {
+                gy = height as usize - 1;
+            }
+            let src = gy * w * ch;
+            let dst = r * stride;
+            var x: usize = 0;
+            while x < w : (x += 1) {
+                let p = src + x * ch;
+                let rr = pixels[p] as i32;
+                let gg = pixels[p + 1] as i32;
+                let bb = pixels[p + 2] as i32;
+                ys[dst + x] = ((19595 * rr + 38470 * gg + 7471 * bb + 32768) >> 16) as u8;
+                cbs[dst + x] = ((-11059 * rr - 21709 * gg + 32768 * bb + 8421375) >> 16) as u8;
+                crs[dst + x] = ((32768 * rr - 27439 * gg - 5329 * bb + 8421375) >> 16) as u8;
+            }
+            while x < stride : (x += 1) {
+                ys[dst + x] = ys[dst + w - 1];
+                cbs[dst + x] = cbs[dst + w - 1];
+                crs[dst + x] = crs[dst + w - 1];
+            }
+        }
+    }
+
+    /// Cb and Cr of the strip whose chroma starts at row top_row, halved
+    /// across (and down when vmax is 2) as libjpeg's h2v1_downsample and
+    /// h2v2_downsample do, rounding by turns up and down; chroma rows past
+    /// the image's are its last one repeated.
+    fn downsample_strip(self: &mut Encoder, height: u32, vmax: u32, top_row: u32, stride: usize, small: usize) {
+        let last = (height + vmax - 1) / vmax - 1;
+        var r: u32 = 0;
+        while r < 8 : (r += 1) {
+            var g = top_row + r;
+            if g > last {
+                g = last;
+            }
+            let lr = (g - top_row) as usize;
+            var c: usize = 0;
+            while c < 2 : (c += 1) {
+                var full = self.blue.items();
+                var out = self.blue_small.items_mut();
+                if c == 1 {
+                    full = self.red.items();
+                    out = self.red_small.items_mut();
+                }
+                var x: usize = 0;
+                if vmax == 2 {
+                    let a0 = 2 * lr * stride;
+                    let a1 = a0 + stride;
+                    while x < small : (x += 1) {
+                        let s = (full[a0 + 2 * x] as u32) + (full[a0 + 2 * x + 1] as u32) + (full[a1 + 2 * x] as u32) + (full[a1 + 2 * x + 1] as u32);
+                        out[(r as usize) * small + x] = ((s + 1 + (x as u32 & 1)) >> 2) as u8;
+                    }
+                } else {
+                    let a0 = lr * stride;
+                    while x < small : (x += 1) {
+                        let s = (full[a0 + 2 * x] as u32) + (full[a0 + 2 * x + 1] as u32);
+                        out[(r as usize) * small + x] = ((s + (x as u32 & 1)) >> 1) as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The coefficients of blk, in rows, divided by the steps of table 0
+    /// (luminance) or 1 and rounded, as libjpeg-turbo's quantize does.
+    fn quantize(self: &Encoder, blk: &mut [64]i32, table: usize) {
+        var i: usize = 0;
+        while i < 64 : (i += 1) {
+            let t = table * 64 + i;
+            let v = blk.*[i];
+            var m: u64 = 0;
+            if v < 0 {
+                m = (0 - v) as u64;
+            } else {
+                m = v as u64;
+            }
+            let q = (((m + (self.corr[t] as u64)) * (self.recip[t] as u64)) >> self.shift[t]) as i32;
+            if v < 0 {
+                blk.*[i] = 0 - q;
+            } else {
+                blk.*[i] = q;
+            }
+        }
+    }
+
+    /// A quantized block's DC difference from pred and its AC run lengths,
+    /// in the Huffman codes of tables dc and ac (places in codes and
+    /// sizes), as libjpeg's encode_one_block writes them.
+    fn huffman_block(self: &Encoder, w: &mut Writer, out: &mut alloc.List(u8), blk: &[64]i32, pred: &mut i32, dc: usize, ac: usize) {
+        let diff = blk.*[0] - pred.*;
+        pred.* = blk.*[0];
+        var mag = diff;
+        var bits = diff;
+        if diff < 0 {
+            mag = 0 - diff;
+            bits = diff - 1;
+        }
+        let n = bit_length(mag as u32);
+        put_bits(w, out: out, value: self.codes[dc + n as usize] as u32, n: self.sizes[dc + n as usize] as u32);
+        put_bits(w, out: out, value: bits as% u32, n: n);
+        var run: u32 = 0;
+        var k: usize = 1;
+        while k < 64 : (k += 1) {
+            var v = blk.*[self.natural[k] as usize];
+            if v == 0 {
+                run += 1;
+                continue;
+            }
+            while run > 15 {
+                put_bits(w, out: out, value: self.codes[ac + 0xF0] as u32, n: self.sizes[ac + 0xF0] as u32);
+                run -= 16;
+            }
+            // The standard tables reach 10 bits; nothing of 8-bit samples
+            // goes past them but at quality 100, where it is kept within.
+            if v > 1023 {
+                v = 1023;
+            }
+            if v < -1023 {
+                v = -1023;
+            }
+            var m = v;
+            var b = v;
+            if v < 0 {
+                m = 0 - v;
+                b = v - 1;
+            }
+            let size = bit_length(m as u32);
+            let sym = ac + ((run << 4) | size) as usize;
+            put_bits(w, out: out, value: self.codes[sym] as u32, n: self.sizes[sym] as u32);
+            put_bits(w, out: out, value: b as% u32, n: size);
+            run = 0;
+        }
+        if run > 0 {
+            put_bits(w, out: out, value: self.codes[ac] as u32, n: self.sizes[ac] as u32);
+        }
+    }
+}
+
+/// An 8x8 block of samples from at, rows stride apart, less 128, into blk.
+fn load_block(s: []u8, at: usize, stride: usize, blk: &mut [64]i32) {
+    var r: usize = 0;
+    while r < 8 : (r += 1) {
+        let o = at + r * stride;
+        var k: usize = 0;
+        while k < 8 : (k += 1) {
+            blk.*[r * 8 + k] = (s[o + k] as i32) - 128;
+        }
+    }
+}
+
+/// img as a baseline JPEG at quality (1 to 100), its colour at 4:2:0.
+pub fn encode(img: &png.Image, quality: u32, a: alloc.Allocator) -> JpegError!alloc.List(u8) {
+    var e = Encoder.init(quality, sampling: Subsampling.S420, a: a);
+    var out = alloc.List(u8).init(a);
+    try e.encode(img, out: &mut out);
+    return out;
+}

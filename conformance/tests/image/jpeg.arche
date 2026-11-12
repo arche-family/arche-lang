@@ -1,0 +1,128 @@
+// test: run
+// spec: image.jpeg
+// stage0: skip
+// stdout: q75-420.jpg 64x48 17559069756058718894
+// stdout: q75-420-odd.jpg 35x27 1728728557136557470
+// stdout: q50-422-odd.jpg 45x31 7011276974971387968
+// stdout: q90-444-odd.jpg 37x29 13143738136903211577
+// stdout: q100-444.jpg 24x16 409969151102310552
+// stdout: q5-420.jpg 40x24 15527082901296114679
+// stdout: grey.jpg 41x23 8673274605476115023
+// stdout: tiny-1x1.jpg 1x1 11047178588169845073
+// stdout: tiny-3x3.jpg 3x3 7804166027687767707
+// stdout: tiny-4x9-422.jpg 4x9 362760456987718005
+// stdout: optimized.jpg 48x32 13017386285672644404
+// stdout: restart-blocks.jpg 56x40 13074195232576480564
+// stdout: restart-rows.jpg 40x40 6931421734769738486
+// stdout: rgb-adobe.jpg 32x24 10170840395516941255
+// stdout: sof1-16bit.jpg 32x24 14587165161231759037
+// stdout: comment-icc.jpg 24x24 17682831688787127715
+// stdout: exif-6.jpg 30x20 o6 5420664069941347334
+// stdout: exif-8-mm.jpg 20x30 o8 3853351658136105043
+// stdout: progressive-420.jpg 51x37 p 17346426477069842644
+// stdout: progressive-444.jpg 33x25 p 7406526455582189852
+// stdout: progressive-422-restart.jpg 48x32 p 18139813240532530956
+// stdout: progressive-grey.jpg 29x35 p 2708121538451078413
+// stdout: progressive-optimized.jpg 40x30 p 5142851213465884612
+// stdout: sof1.jpg 64x48 17559069756058718894
+// stdout: ffmpeg-422.jpg 48x32 6373398884879848586
+// stdout: mjpeg-no-dht.jpg 48x32 6373398884879848586
+// stdout: w-440.jpg 37x29 15515349890051119819
+// stdout: w-411.jpg 45x21 9514632869835330605
+// stdout: w-310.jpg 31x19 3962217513187347533
+// stdout: w-grey-22.jpg 27x18 13240368695520965514
+// stdout: w-420-restart-1.jpg 40x24 11407136892613015677
+// stdout: w-444-restart-5.jpg 43x17 2469120610914443673
+import alloc;
+import image.jpeg;
+import image.png;
+import std;
+
+// The JPEG files of _jpeg (make.sh), each decoded and its RGBA pixels
+// hashed: the hashes are those of Pillow's decoding, libjpeg-turbo's, so
+// every pixel is libjpeg-turbo's. Baseline at qualities 5 to 100, 4:2:0,
+// 4:2:2 and 4:4:4 at odd sizes, grey, images of 1x1 to 4x9 pixels,
+// optimized Huffman tables, restart markers every few MCUs and every row,
+// RGB with Adobe's marker, SOF1 with 16-bit tables, COM and ICC segments,
+// Exif's orientation little- and big-endian, progressive (spectral
+// selection and successive approximation, with restarts, grey, optimized
+// tables), ffmpeg's MJPEG with and without its Huffman tables, and from
+// make.py's own encoder 4:4:0, 4:1:1, factors of 3, grey sampled 2x2 and
+// restart intervals of 1 and 5 MCUs. One decoder decodes them all, one
+// after another, as a video's frames are.
+
+/// FNV-1a of the bytes, as make.py hashes Pillow's.
+fn hash(bytes: []u8) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h = (h ^ (b.* as u64)) *% 0x100000001b3;
+    }
+    return h;
+}
+
+fn show(sys: &mut std.System, dec: &mut jpeg.Decoder, img: &mut png.Image, name: str) -> !void {
+    var path = alloc.String.init(sys.alloc);
+    path.push_str("_jpeg/");
+    path.push_str(name);
+    let bytes = try sys.fs.read_bytes(path.view(), sys.alloc);
+    let out = &mut sys.stdout;
+    out.write(name);
+    match dec.decode(bytes.items(), max_pixels: 1 << 20, into: img) {
+        ok(info) => {
+            out.write(" ");
+            out.write_u64(img.width as u64);
+            out.write("x");
+            out.write_u64(img.height as u64);
+            if info.orientation != 1 {
+                out.write(" o");
+                out.write_u64(info.orientation as u64);
+            }
+            if info.progressive {
+                out.write(" p");
+            }
+            out.write(" ");
+            out.write_u64(hash(img.rgba.items()));
+        }
+        err(_) => {
+            out.write(" refused");
+        }
+    }
+    out.write("\n");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    var dec = jpeg.Decoder.init(sys.alloc);
+    var img = png.Image { width: 0, height: 0, rgba: alloc.List(u8).init(sys.alloc) };
+    try show(sys, dec: &mut dec, img: &mut img, name: "q75-420.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "q75-420-odd.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "q50-422-odd.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "q90-444-odd.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "q100-444.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "q5-420.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "grey.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "tiny-1x1.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "tiny-3x3.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "tiny-4x9-422.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "optimized.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "restart-blocks.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "restart-rows.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "rgb-adobe.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "sof1-16bit.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "comment-icc.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "exif-6.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "exif-8-mm.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "progressive-420.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "progressive-444.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "progressive-422-restart.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "progressive-grey.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "progressive-optimized.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "sof1.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "ffmpeg-422.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "mjpeg-no-dht.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "w-440.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "w-411.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "w-310.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "w-grey-22.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "w-420-restart-1.jpg");
+    try show(sys, dec: &mut dec, img: &mut img, name: "w-444-restart-5.jpg");
+}

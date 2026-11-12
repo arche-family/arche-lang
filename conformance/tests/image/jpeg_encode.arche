@@ -1,0 +1,226 @@
+// test: run
+// spec: image.jpeg (encode)
+// stage0: skip
+// stdout: 64x48 q75 4:2:0: 1065 bytes, hash 6262438155713484692, PSNR 26.78 dB
+// stdout: 37x29 q90 4:4:4: 1374 bytes, hash 8568414085147626463, PSNR 33.42 dB
+// stdout: 45x31 q50 4:2:2: 840 bytes, hash 15824321808529916726, PSNR 25.47 dB
+// stdout: 35x27 q100 4:2:0: 1938 bytes, hash 851808575483981248, PSNR 26.09 dB
+// stdout: 1x1 q1 4:2:0: 630 bytes, hash 13168128286940196253, PSNR 26.41 dB
+// stdout: 17x9 q20 4:2:0: 664 bytes, hash 16018005537883554262, PSNR 16.37 dB
+// stdout: 320x180 q85 4:2:0: 5149 bytes, hash 11027328351340928303, PSNR 34.40 dB
+// stdout: 640x360 q75 4:2:0: 10837 bytes, hash 14264724410934580745, PSNR 36.34 dB
+// stdout: 640x360 q75 4:4:4: 17180 bytes, hash 16295801484224241964, PSNR 39.26 dB
+// stdout: RGB as RGBA: the same bytes
+// stdout: frames 1, 2, 1 by one encoder: the first and the third the same bytes
+// stdout: 0x4: Malformed
+// stdout: 70000x1: TooLarge
+// stdout: 8x8 from 255 bytes: Malformed
+import alloc;
+import core.float;
+import core.math;
+import image.jpeg;
+import image.png;
+import std;
+
+// Pictures encoded by jpeg.Encoder at qualities 1 to 100, 4:2:0, 4:2:2
+// and 4:4:4, odd sizes among them, and a 640x360 video frame; each file's
+// size and hash are those of Pillow's encoding of the same picture
+// (_jpeg/make.py), so the bytes are libjpeg-turbo's, one for one. Each is
+// decoded back by jpeg.decode and its PSNR against the picture printed, as
+// make.py computes it from Pillow's decoding. RGB pixels encode as their
+// RGBA do; an encoder reused frame to frame writes each frame as a fresh
+// one would; a size JPEG cannot hold, or too few pixels, is refused.
+
+/// The picture of make.py's pattern: red and green ramps with a little
+/// texture, blue falling off from the middle, and a red disc there.
+fn pattern(w: u32, h: u32, a: alloc.Allocator) -> png.Image {
+    var img = png.Image { width: w, height: h, rgba: alloc.List(u8).init(a) };
+    var y: u32 = 0;
+    while y < h : (y += 1) {
+        var x: u32 = 0;
+        while x < w : (x += 1) {
+            var dx: u32 = 0;
+            if x >= w / 2 {
+                dx = x - w / 2;
+            } else {
+                dx = w / 2 - x;
+            }
+            var dy: u32 = 0;
+            if y >= h / 2 {
+                dy = y - h / 2;
+            } else {
+                dy = h / 2 - y;
+            }
+            let d2 = dx * dx + dy * dy;
+            if 16 * d2 < h * h {
+                img.rgba.push(230);
+                img.rgba.push(40);
+                img.rgba.push(60);
+            } else {
+                img.rgba.push((x * 255 / w) as u8);
+                img.rgba.push(math.clamp(x: (y * 255 / h + (x * 7 + y * 13) % 9) as i64, lo: 0, hi: 255) as u8);
+                img.rgba.push((255 - math.clamp(x: (d2 * 255 / ((w * w + h * h) / 4 + 1)) as i64, lo: 0, hi: 255)) as u8);
+            }
+            img.rgba.push(255);
+        }
+    }
+    return img;
+}
+
+/// FNV-1a of the bytes, as make.py hashes Pillow's.
+fn hash(bytes: []u8) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h = (h ^ (b.* as u64)) *% 0x100000001b3;
+    }
+    return h;
+}
+
+/// The natural logarithm of x > 0: x is m times 2 to the e, m in [1, 2),
+/// and ln m is 2 atanh((m - 1) / (m + 1)), whose series converges fast.
+fn ln(x: f64) -> f64 {
+    let bits = float.bits64(x);
+    let e = (((bits >> 52) & 0x7FF) as i64) - 1023;
+    let m = float.from_bits64((bits & 0xFFFFFFFFFFFFF) | 0x3FF0000000000000);
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    var term = t;
+    var sum: f64 = 0.0;
+    var k: f64 = 1.0;
+    while k < 60.0 : (k = k + 2.0) {
+        sum = sum + term / k;
+        term = term * t2;
+    }
+    return (e as f64) * 0.6931471805599453 + 2.0 * sum;
+}
+
+/// PSNR of b against a over red, green and blue, in hundredths of a dB,
+/// rounded as make.py rounds it.
+fn psnr(a: []u8, b: []u8) -> u64 {
+    var sse: u64 = 0;
+    var n: u64 = 0;
+    var i: usize = 0;
+    while i < a.len() : (i += 1) {
+        if i % 4 != 3 {
+            var d = (a[i] as i64) - (b[i] as i64);
+            if d < 0 {
+                d = 0 - d;
+            }
+            sse += (d * d) as u64;
+            n += 1;
+        }
+    }
+    let db = 10.0 * ln(65025.0 * (n as f64) / (sse as f64)) / 2.302585092994046;
+    return math.floor(db * 100.0 + 0.5) as u64;
+}
+
+fn one(sys: &mut std.System, w: u32, h: u32, quality: u32, sampling: jpeg.Subsampling) -> !void {
+    let img = pattern(w: w, h: h, sys.alloc);
+    var e = jpeg.Encoder.init(quality, sampling: sampling, a: sys.alloc);
+    var data = alloc.List(u8).init(sys.alloc);
+    try e.encode(&img, out: &mut data);
+    let back = try jpeg.decode(data.items(), max_pixels: 1 << 20, sys.alloc);
+    let p = psnr(a: img.rgba.items(), b: back.rgba.items());
+    let out = &mut sys.stdout;
+    out.write_u64(w as u64);
+    out.write("x");
+    out.write_u64(h as u64);
+    out.write(" q");
+    out.write_u64(quality as u64);
+    match sampling {
+        .S420 => {
+            out.write(" 4:2:0: ");
+        }
+        .S422 => {
+            out.write(" 4:2:2: ");
+        }
+        .S444 => {
+            out.write(" 4:4:4: ");
+        }
+    }
+    out.write_u64(data.len() as u64);
+    out.write(" bytes, hash ");
+    out.write_u64(hash(data.items()));
+    out.write(", PSNR ");
+    out.write_u64(p / 100);
+    out.write(".");
+    out.write_u64(p / 10 % 10);
+    out.write_u64(p % 10);
+    out.write(" dB\n");
+}
+
+/// The error's name, or "encoded".
+fn outcome(r: jpeg.JpegError!void) -> str {
+    match r {
+        ok(_) => {
+            return "encoded";
+        }
+        err(e) => {
+            if e == jpeg.JpegError.Malformed {
+                return "Malformed";
+            }
+            if e == jpeg.JpegError.TooLarge {
+                return "TooLarge";
+            }
+            return "Unsupported";
+        }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    try one(sys, w: 64, h: 48, quality: 75, sampling: jpeg.Subsampling.S420);
+    try one(sys, w: 37, h: 29, quality: 90, sampling: jpeg.Subsampling.S444);
+    try one(sys, w: 45, h: 31, quality: 50, sampling: jpeg.Subsampling.S422);
+    try one(sys, w: 35, h: 27, quality: 100, sampling: jpeg.Subsampling.S420);
+    try one(sys, w: 1, h: 1, quality: 1, sampling: jpeg.Subsampling.S420);
+    try one(sys, w: 17, h: 9, quality: 20, sampling: jpeg.Subsampling.S420);
+    try one(sys, w: 320, h: 180, quality: 85, sampling: jpeg.Subsampling.S420);
+    try one(sys, w: 640, h: 360, quality: 75, sampling: jpeg.Subsampling.S420);
+    try one(sys, w: 640, h: 360, quality: 75, sampling: jpeg.Subsampling.S444);
+    let out = &mut sys.stdout;
+
+    // RGB, three bytes a pixel, as its RGBA.
+    let img = pattern(w: 50, h: 30, sys.alloc);
+    var rgb = alloc.List(u8).init(sys.alloc);
+    var i: usize = 0;
+    while i < img.rgba.len() : (i += 1) {
+        if i % 4 != 3 {
+            rgb.push(img.rgba.items()[i]);
+        }
+    }
+    var e = jpeg.Encoder.init(80, sampling: jpeg.Subsampling.S420, a: sys.alloc);
+    var from_rgba = alloc.List(u8).init(sys.alloc);
+    try e.encode(&img, out: &mut from_rgba);
+    var from_rgb = alloc.List(u8).init(sys.alloc);
+    try e.encode_pixels(rgb.items(), width: 50, height: 30, channels: 3, out: &mut from_rgb);
+    if hash(from_rgba.items()) == hash(from_rgb.items()) and from_rgba.len() == from_rgb.len() {
+        out.write("RGB as RGBA: the same bytes\n");
+    } else {
+        out.write("RGB as RGBA: other bytes\n");
+    }
+
+    // Frames of another size and picture between: nothing of them stays.
+    let other = pattern(w: 77, h: 13, sys.alloc);
+    var first = alloc.List(u8).init(sys.alloc);
+    var second = alloc.List(u8).init(sys.alloc);
+    var third = alloc.List(u8).init(sys.alloc);
+    try e.encode(&img, out: &mut first);
+    try e.encode(&other, out: &mut second);
+    try e.encode(&img, out: &mut third);
+    if hash(first.items()) == hash(third.items()) and hash(first.items()) == hash(from_rgba.items()) {
+        out.write("frames 1, 2, 1 by one encoder: the first and the third the same bytes\n");
+    } else {
+        out.write("frames 1, 2, 1 by one encoder: other bytes\n");
+    }
+
+    var sink = alloc.List(u8).init(sys.alloc);
+    out.write("0x4: ");
+    out.write(outcome(e.encode_pixels(rgb.items(), width: 0, height: 4, channels: 3, out: &mut sink)));
+    out.write("\n70000x1: ");
+    var wide = alloc.List(u8).init(sys.alloc);
+    wide.grow_zeroed(70000 * 3);
+    out.write(outcome(e.encode_pixels(wide.items(), width: 70000, height: 1, channels: 3, out: &mut sink)));
+    out.write("\n8x8 from 255 bytes: ");
+    out.write(outcome(e.encode_pixels(wide.items()[0..255], width: 8, height: 8, channels: 4, out: &mut sink)));
+    out.write("\n");
+}
