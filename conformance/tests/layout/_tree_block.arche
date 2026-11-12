@@ -1,0 +1,490 @@
+// A tree for the block and float tests: _tree.arche's, whose nodes with
+// children are block containers laid out by compute.block, as Nimadir's
+// tree (host/src/dom/layout.rs) lays out a block: through the cache, with
+// the parent's block context when a block container lays out a child in
+// its formatting context. The out-of-flow pass (compute.oof) is not run:
+// candidates surface to the root, where a test prints them. The oracle
+// (/tmp/layout-port/oracle-block) is the same tree over taffy 0.15.
+import std;
+import alloc;
+import layout.compute as compute;
+import layout.compute.block as block;
+import layout.compute.float as fl;
+import layout.compute.leaf as leaf;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import layout.tree.cache as tcache;
+import _show;
+
+/// What a leaf holds.
+pub type Content = enum {
+    /// Nothing: zero.
+    Empty,
+    /// A box of a fixed size, as an image.
+    Fixed { width: f32, height: f32 },
+    /// Text `width` wide on one line, wrapping into lines `line` high.
+    Text { width: f32, line: f32 },
+}
+
+/// One node.
+pub type Node = struct {
+    /// Its style.
+    pub style: sty.Style,
+    /// What it holds, for a leaf.
+    pub content: Content,
+    /// Its children.
+    pub children: alloc.List(lt.NodeId),
+    /// The out-of-flow boxes it is the containing block of.
+    pub hoisted: alloc.List(lt.NodeId),
+    /// Its layout cache.
+    pub cache: tcache.Cache,
+    /// Its layout before rounding.
+    pub unrounded: lt.Layout,
+    /// Its rounded layout.
+    pub final_layout: lt.Layout,
+}
+
+/// The tree.
+pub type TestTree = struct {
+    /// The nodes; a NodeId is an index.
+    pub nodes: alloc.List(Node),
+    /// Where everything goes.
+    pub a: alloc.Allocator,
+    /// The names of grid lines and areas.
+    pub names: alloc.Interner,
+    /// How many times a layout ran uncached.
+    pub computed: u32,
+    /// How many times a leaf was measured.
+    pub measured: u32,
+
+    /// An empty tree.
+    pub fn init(a: alloc.Allocator) -> TestTree {
+        return TestTree { nodes: alloc.List(Node).init(a), a: a, names: alloc.Interner.init(a), computed: 0, measured: 0 };
+    }
+
+    /// Adds a node.
+    pub fn add(self: &mut TestTree, style: sty.Style, content: Content) -> lt.NodeId {
+        let id = lt.NodeId.from_usize(self.nodes.len());
+        self.nodes.push(Node {
+            style: style,
+            content: content,
+            children: alloc.List(lt.NodeId).init(self.a),
+            hoisted: alloc.List(lt.NodeId).init(self.a),
+            cache: tcache.Cache.new(),
+            unrounded: lt.Layout.new(),
+            final_layout: lt.Layout.new(),
+        });
+        return id;
+    }
+
+    /// Makes child the last child of parent.
+    pub fn add_child(self: &mut TestTree, parent: lt.NodeId, child: lt.NodeId) {
+        self.nodes[parent.to_usize()].children.push(child);
+    }
+
+    /// Lays out a node as Nimadir's Tree::compute does: hidden layout for a
+    /// hidden run, else the cache in front of the algorithm, with the block
+    /// context when inherited (taffy's Some) and without (None).
+    fn compute(self: &mut TestTree, node_id: lt.NodeId, inputs: lt.LayoutInput, inherited: bool, bfc: &mut block.BlockFormattingContext, block_ctx: &mut block.BlockContext) -> lt.LayoutOutput {
+        if inputs.run_mode == lt.RunMode.PerformHiddenLayout {
+            return compute.compute_hidden_layout(self, node_id);
+        }
+        // compute.compute_cached_layout, written out, so that the block
+        // context reaches the algorithm.
+        match self.cache_get(node_id, &inputs) {
+            some(cached) => { return cached; }
+            none => { }
+        }
+        let computed = self.compute_uncached(node_id, inputs, inherited, bfc, block_ctx);
+        self.cache_store(node_id, &inputs, computed.clone());
+        return computed;
+    }
+
+    /// The algorithm for the node: hidden, block or leaf.
+    fn compute_uncached(self: &mut TestTree, node: lt.NodeId, input: lt.LayoutInput, inherited: bool, bfc: &mut block.BlockFormattingContext, block_ctx: &mut block.BlockContext) -> lt.LayoutOutput {
+        self.computed += 1;
+        let i = node.to_usize();
+        if self.nodes[i].style.display == sty.Display.None {
+            return compute.compute_hidden_layout(self, node);
+        }
+        if self.nodes[i].children.len() > 0 {
+            if inherited {
+                return block.compute_block_layout_in(self, node, input, bfc, block_ctx);
+            }
+            return block.compute_block_layout(self, node, input);
+        }
+        let content = self.nodes[i].content;
+        var count: u32 = 0;
+        let output = leaf.compute_leaf_layout(input, &self.nodes.items()[i].style, fn [content, &mut count](known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+            count += 1;
+            return measure(content, known, available);
+        });
+        self.measured += count;
+        return output;
+    }
+
+    /// The node's unrounded layout.
+    pub fn unrounded_of(self: &TestTree, id: lt.NodeId) -> lt.Layout {
+        return self.nodes[id.to_usize()].unrounded;
+    }
+
+    /// The node's final layout.
+    pub fn final_of(self: &TestTree, id: lt.NodeId) -> lt.Layout {
+        return self.nodes[id.to_usize()].final_layout;
+    }
+}
+
+impl lt.LayoutTree for TestTree {
+    fn child_count(self: &TestTree, parent_node_id: lt.NodeId) -> usize {
+        return self.nodes[parent_node_id.to_usize()].children.len();
+    }
+
+    fn get_child_id(self: &TestTree, parent_node_id: lt.NodeId, child_index: usize) -> lt.NodeId {
+        return self.nodes[parent_node_id.to_usize()].children.items()[child_index];
+    }
+
+    fn get_style(self: &TestTree, node_id: lt.NodeId) -> &sty.Style {
+        return &self.nodes.items()[node_id.to_usize()].style;
+    }
+
+    fn set_unrounded_layout(self: &mut TestTree, node_id: lt.NodeId, layout: &lt.Layout) {
+        self.nodes[node_id.to_usize()].unrounded = layout.*;
+    }
+
+    fn compute_child_layout(self: &mut TestTree, node_id: lt.NodeId, inputs: lt.LayoutInput) -> lt.LayoutOutput {
+        var no_bfc = block.BlockFormattingContext.new(self.a);
+        var no_ctx = block.BlockContext.root();
+        return self.compute(node_id, inputs, inherited: false, &mut no_bfc, &mut no_ctx);
+    }
+
+    fn compute_block_child_layout(self: &mut TestTree, node_id: lt.NodeId, inputs: lt.LayoutInput, bfc: &mut block.BlockFormattingContext, block_ctx: &mut block.BlockContext) -> lt.LayoutOutput {
+        return self.compute(node_id, inputs, inherited: true, bfc, block_ctx);
+    }
+
+    fn clear_hoisted_children(self: &mut TestTree, node_id: lt.NodeId) {
+        self.nodes[node_id.to_usize()].hoisted.clear();
+    }
+
+    fn add_hoisted_children(self: &mut TestTree, node_id: lt.NodeId, hoisted: []lt.NodeId) {
+        for h in hoisted {
+            self.nodes[node_id.to_usize()].hoisted.push(h.*);
+        }
+    }
+
+    fn cache_get(self: &mut TestTree, node_id: lt.NodeId, input: &lt.LayoutInput) -> ?lt.LayoutOutput {
+        return self.nodes[node_id.to_usize()].cache.get(input);
+    }
+
+    fn cache_store(self: &mut TestTree, node_id: lt.NodeId, input: &lt.LayoutInput, layout_output: lt.LayoutOutput) {
+        self.nodes[node_id.to_usize()].cache.store(input, layout_output);
+    }
+
+    fn cache_clear(self: &mut TestTree, node_id: lt.NodeId) {
+        _ = self.nodes[node_id.to_usize()].cache.clear();
+    }
+
+    fn get_unrounded_layout(self: &TestTree, node_id: lt.NodeId) -> lt.Layout {
+        return self.nodes[node_id.to_usize()].unrounded;
+    }
+
+    fn set_final_layout(self: &mut TestTree, node_id: lt.NodeId, layout: &lt.Layout) {
+        self.nodes[node_id.to_usize()].final_layout = layout.*;
+    }
+
+    fn is_out_of_flow(self: &TestTree, node_id: lt.NodeId) -> bool {
+        let st = &self.nodes.items()[node_id.to_usize()].style;
+        return st.display != sty.Display.None and st.position.is_out_of_flow();
+    }
+
+    fn hoisted_child_count(self: &TestTree, node_id: lt.NodeId) -> usize {
+        return self.nodes[node_id.to_usize()].hoisted.len();
+    }
+
+    fn get_hoisted_child_id(self: &TestTree, node_id: lt.NodeId, index: usize) -> lt.NodeId {
+        return self.nodes[node_id.to_usize()].hoisted.items()[index];
+    }
+
+    fn allocator(self: &TestTree) -> alloc.Allocator {
+        return self.a;
+    }
+
+    fn ident_text(self: &TestTree, ident: alloc.Symbol) -> str {
+        return self.names.text(ident);
+    }
+}
+
+/// What a leaf's content measures as, given what is known: a fixed box its
+/// size; text its width, wrapped at the available width into lines.
+pub fn measure(content: Content, known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+    match known.width {
+        some(w) => {
+            match known.height {
+                some(h) => { return geo.Size(f32) { width: w, height: h }; }
+                none => { }
+            }
+        }
+        none => { }
+    }
+    var width: f32 = 0.0;
+    var height: f32 = 0.0;
+    match content {
+        .Empty => { }
+        .Fixed { width: fw, height: fh } => {
+            width = fw;
+            height = fh;
+        }
+        .Text { width: tw, line } => {
+            var room = tw;
+            match available.width {
+                .Definite { value } => { room = value; }
+                .MinContent => { room = line; }
+                .MaxContent => { }
+            }
+            match known.width {
+                some(w) => { room = w; }
+                none => { }
+            }
+            width = tw;
+            if room < tw {
+                width = room;
+            }
+            if width <= 0.0 {
+                width = 0.0;
+                height = tw;
+            } else {
+                height = (tw / width).ceil() * line;
+            }
+        }
+    }
+    return geo.Size(f32) { width: known.width orelse width, height: known.height orelse height };
+}
+
+/// A block style: Style.default with display block.
+pub fn blk(a: alloc.Allocator) -> sty.Style {
+    var s = sty.Style.default(a);
+    s.display = sty.Display.Block;
+    return s;
+}
+
+/// name, a dot, a prefix and a number, as the oracle names a node.
+fn node_name(name: str, prefix: str, index: usize, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.from(name, a);
+    s.push_str(".");
+    s.push_str(prefix);
+    s.push_u64(index as u64);
+    return s;
+}
+
+/// Every node's unrounded layout, `name.i`.
+pub fn show_nodes(out: &mut std.Output, t: &TestTree, name: str) {
+    var index: usize = 0;
+    while index < t.nodes.len() : (index += 1) {
+        let label = node_name(name: name, prefix: "", index, t.a);
+        _show.layout_line(out, label.view(), t.nodes.items()[index].unrounded);
+    }
+}
+
+/// Every node's rounded layout, `name.ri`.
+pub fn show_final(out: &mut std.Output, t: &TestTree, name: str) {
+    var index: usize = 0;
+    while index < t.nodes.len() : (index += 1) {
+        let label = node_name(name: name, prefix: "r", index, t.a);
+        _show.layout_line(out, label.view(), t.nodes.items()[index].final_layout);
+    }
+}
+
+/// " " and an f32.
+fn num(out: &mut std.Output, x: f32) {
+    out.write(" ");
+    out.write_f32(x);
+}
+
+/// " " and an f32, or " none".
+fn opt_num(out: &mut std.Output, x: ?f32) {
+    match x {
+        some(v) => { num(out, v); }
+        none => { out.write(" none"); }
+    }
+}
+
+/// " " and a segment index, or " none".
+fn opt_index(out: &mut std.Output, x: ?usize) {
+    match x {
+        some(v) => {
+            out.write(" ");
+            out.write_u64(v as u64);
+        }
+        none => { out.write(" none"); }
+    }
+}
+
+/// The name of a static-position edge.
+fn edge_name(e: lt.AxisStaticEdge) -> str {
+    match e {
+        .Start => { return "start"; }
+        .Center => { return "center"; }
+        .End => { return "end"; }
+    }
+}
+
+/// The name of an alignment safety.
+fn safety_name(s: sty.AlignmentSafety) -> str {
+    match s {
+        .Default => { return "default"; }
+        .Unsafe => { return "unsafe"; }
+        .Safe => { return "safe"; }
+    }
+}
+
+/// A static position in one axis: area, keyword, safety, fallback.
+fn axis_pos(out: &mut std.Output, p: lt.AxisStaticPosition) {
+    num(out, p.area.start);
+    num(out, p.area.end);
+    out.write(" ");
+    out.write(edge_name(p.align.keyword));
+    out.write(" ");
+    out.write(safety_name(p.align.safety));
+    out.write(" ");
+    out.write(edge_name(p.align.fallback));
+}
+
+/// A node's output: size, overflow, collapsed margins, collapse through,
+/// baseline, positioning area and candidates, as the oracle writes it.
+pub fn show_output(out: &mut std.Output, name: str, o: &lt.LayoutOutput) {
+    out.write(name);
+    out.write(" out");
+    num(out, o.size.width);
+    num(out, o.size.height);
+    out.write(" | over");
+    num(out, o.scrollable_overflow_rect.left);
+    num(out, o.scrollable_overflow_rect.right);
+    num(out, o.scrollable_overflow_rect.top);
+    num(out, o.scrollable_overflow_rect.bottom);
+    out.write(" | margins");
+    num(out, o.top_margin.resolve());
+    num(out, o.bottom_margin.resolve());
+    out.write(" | through ");
+    if o.margins_can_collapse_through {
+        out.write("true");
+    } else {
+        out.write("false");
+    }
+    out.write(" | base");
+    opt_num(out, o.baselines.first);
+    out.write(" | area");
+    match o.oof_positioning_area {
+        some(area) => {
+            num(out, area.size.width);
+            num(out, area.size.height);
+            num(out, area.offset.x);
+            num(out, area.offset.y);
+        }
+        none => { out.write(" none"); }
+    }
+    out.write(" | cands ");
+    out.write_u64(o.oof_candidates.len() as u64);
+    out.write("\n");
+    var index: usize = 0;
+    while index < o.oof_candidates.len() : (index += 1) {
+        let c = o.oof_candidates.get(index);
+        out.write(name);
+        out.write(" cand ");
+        out.write_u64(c.node.value);
+        out.write(" ");
+        out.write_u64(c.order as u64);
+        if c.position == sty.Position.Absolute {
+            out.write(" absolute");
+        } else if c.position == sty.Position.Fixed {
+            out.write(" fixed");
+        } else {
+            out.write(" other");
+        }
+        out.write(" | x");
+        axis_pos(out, c.static_position.x);
+        out.write(" | y");
+        axis_pos(out, c.static_position.y);
+        out.write("\n");
+    }
+}
+
+/// A BfcSlot, as the oracle writes it.
+pub fn show_slot(out: &mut std.Output, name: str, s: fl.BfcSlot) {
+    out.write(name);
+    out.write(" bfc");
+    opt_index(out, s.segment_id);
+    num(out, s.x);
+    num(out, s.y);
+    num(out, s.border_width);
+    num(out, s.stretch_width);
+    out.write("\n");
+}
+
+/// A ContentSlot, as the oracle writes it.
+pub fn show_content_slot(out: &mut std.Output, name: str, s: fl.ContentSlot) {
+    out.write(name);
+    out.write(" content");
+    opt_index(out, s.segment_id);
+    num(out, s.x);
+    num(out, s.y);
+    num(out, s.width);
+    num(out, s.height);
+    out.write("\n");
+}
+
+/// A LayoutInput, every field given.
+pub fn layout_input(run_mode: lt.RunMode, sizing_mode: lt.SizingMode, known: geo.Size(?f32), parent: geo.Size(?f32), available: geo.Size(sty.AvailableSpace), axis: lt.RequestedAxis, collapsible: geo.Line(bool)) -> lt.LayoutInput {
+    return lt.LayoutInput {
+        run_mode: run_mode,
+        sizing_mode: sizing_mode,
+        axis: axis,
+        known_dimensions: known,
+        known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+        parent_size: parent,
+        available_space: available,
+        vertical_margins_are_collapsible: collapsible,
+    };
+}
+
+/// A float's placement: `name place x y`.
+pub fn show_place(out: &mut std.Output, name: str, p: geo.Point(f32)) {
+    out.write(name);
+    out.write(" place");
+    num(out, p.x);
+    num(out, p.y);
+    out.write("\n");
+}
+
+/// One value: `label value`.
+pub fn show_value(out: &mut std.Output, label: str, value: f32) {
+    out.write(label);
+    num(out, value);
+    out.write("\n");
+}
+
+/// " true" or " false".
+fn flag(out: &mut std.Output, b: bool) {
+    if b {
+        out.write(" true");
+    } else {
+        out.write(" false");
+    }
+}
+
+/// A float context's state: whether it has floats, active ones below y,
+/// the clear thresholds (left, right, both) and the number of floats on
+/// each side.
+pub fn show_state(out: &mut std.Output, name: str, fc: &fl.FloatContext, y: f32) {
+    out.write(name);
+    out.write(" state");
+    flag(out, fc.has_floats());
+    flag(out, fc.has_active_floats(y));
+    opt_num(out, fc.cleared_threshold(sty.Clear.Left));
+    opt_num(out, fc.cleared_threshold(sty.Clear.Right));
+    opt_num(out, fc.cleared_threshold(sty.Clear.Both));
+    out.write(" ");
+    out.write_u64(fc.left_floats().len() as u64);
+    out.write(" ");
+    out.write_u64(fc.right_floats().len() as u64);
+    out.write("\n");
+}

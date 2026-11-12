@@ -1,0 +1,198 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: P1.0 place 0.0 0.0
+// stdout: P1.1 place 220.0 0.0
+// stdout: P1.2 place 100.0 30.0
+// stdout: P1.3 place 250.0 30.0
+// stdout: P1.4 state true true 50.0 100.0 100.0 2 2
+// stdout: P1.5 bfc 0 100.0 0.0 120.0 120.0
+// stdout: P1.6 bfc 1 250.0 30.0 0.0 0.0
+// stdout: P1.7 bfc 0 100.0 0.0 120.0 120.0
+// stdout: P1.8 content 0 100.0 10.0 120.0 inf
+// stdout: P1.9 content none 0.0 50.0 300.0 inf
+// stdout: P1.10 state true false 50.0 100.0 100.0 2 2
+// stdout: P2.0 place 10.0 5.0
+// stdout: P2.1 place 280.0 5.0
+// stdout: P2.2 place 10.0 45.0
+// stdout: P2.3 place 330.0 65.0
+// stdout: P2.4 place 10.0 65.0
+// stdout: P2.5 bfc none 10.0 75.0 370.0 370.0
+// stdout: P2.6 bfc 1 110.0 20.0 170.0 170.0
+// stdout: P2.7 content none 10.0 75.0 370.0 inf
+// stdout: P2.8 state true true 75.0 75.0 75.0 3 2
+// stdout: P3.0 place 0.0 0.0
+// stdout: P3.1 place 0.0 10.0
+// stdout: P3.2 place 0.0 10.0
+// stdout: P3.3 place 140.0 20.0
+// stdout: P3.4 place 140.0 30.0
+// stdout: P3.5 state true true 20.0 40.0 40.0 3 2
+// stdout: P3.6 bfc 0 0.0 0.0 200.0 200.0
+// stdout: P3.7 bfc none 0.0 100.0 200.0 200.0
+// stdout: P4.0 place 0.0 0.0
+// stdout: P4.1 place 200.0 20.0
+// stdout: P4.2 place 150.0 20.0
+// stdout: P4.3 place 100.0 60.0
+// stdout: P4.4 place 266.7 60.0
+// stdout: P4.5 bfc 1 100.0 25.0 50.0 50.0
+// stdout: P4.6 bfc 2 100.0 50.0 50.0 50.0
+// stdout: P4.7 content 3 220.0 60.0 46.7 inf
+// stdout: P4.8 state true true 100.0 72.7 100.0 2 3
+// stdout: W1 intrinsic 220.0
+// stdout: W2 intrinsic 150.0
+// stdout: W3 intrinsic 120.0
+// stdout: W4 intrinsic 60.0
+// compute.float's FloatContext and FloatIntrinsicWidthCalculator on their
+// own, as taffy's are: sequences of floats placed into segments (wrapping,
+// clearing, zero-sized, inside containing block insets), the slots it finds
+// for boxes with a formatting context and for content beside the floats,
+// its clear thresholds, and the intrinsic width of floats under each kind
+// of available space. The expected lines are taffy 0.15's own, from the
+// same calls in Rust.
+import std;
+import alloc;
+import layout.compute.float as fl;
+import layout.geometry as geo;
+import layout.style as sty;
+import _tree_block;
+
+/// Case P1: floats on both sides wrap into segments
+fn case_p1(out: &mut std.Output, a: alloc.Allocator) {
+    var fc = fl.FloatContext.new(a);
+    fc.set_width(300.0);
+    let p0 = fc.place_floated_box(geo.Size(f32) { width: 100.0, height: 50.0 }, 0.0, [0.0, 0.0], sty.FloatDirection.Left, sty.Clear.None);
+    _tree_block.show_place(out, "P1.0", p0);
+    let p1 = fc.place_floated_box(geo.Size(f32) { width: 80.0, height: 30.0 }, 0.0, [0.0, 0.0], sty.FloatDirection.Right, sty.Clear.None);
+    _tree_block.show_place(out, "P1.1", p1);
+    let p2 = fc.place_floated_box(geo.Size(f32) { width: 150.0, height: 20.0 }, 0.0, [0.0, 0.0], sty.FloatDirection.Left, sty.Clear.None);
+    _tree_block.show_place(out, "P1.2", p2);
+    let p3 = fc.place_floated_box(geo.Size(f32) { width: 50.0, height: 70.0 }, 0.0, [0.0, 0.0], sty.FloatDirection.Right, sty.Clear.None);
+    _tree_block.show_place(out, "P1.3", p3);
+    _tree_block.show_state(out, "P1.4", &fc, 10.0);
+    let b5 = fc.find_bfc_slot(0.0, containing_block_insets: [0.0, 0.0], margins: [0.0, 0.0], sty.Direction.Ltr, sty.Clear.None, none);
+    _tree_block.show_slot(out, "P1.5", b5);
+    let b6 = fc.find_bfc_slot(0.0, containing_block_insets: [0.0, 0.0], margins: [0.0, 0.0], sty.Direction.Ltr, sty.Clear.None, some(0));
+    _tree_block.show_slot(out, "P1.6", b6);
+    let b7 = fc.find_bfc_slot(0.0, containing_block_insets: [0.0, 0.0], margins: [5.0, -10.0], sty.Direction.Rtl, sty.Clear.None, none);
+    _tree_block.show_slot(out, "P1.7", b7);
+    let c8 = fc.find_content_slot(10.0, [0.0, 0.0], sty.Clear.None, none);
+    _tree_block.show_content_slot(out, "P1.8", c8);
+    let c9 = fc.find_content_slot(10.0, [0.0, 0.0], sty.Clear.Left, none);
+    _tree_block.show_content_slot(out, "P1.9", c9);
+    _tree_block.show_state(out, "P1.10", &fc, 1000.0);
+}
+
+/// Case P2: clearing floats and containing block insets
+fn case_p2(out: &mut std.Output, a: alloc.Allocator) {
+    var fc = fl.FloatContext.new(a);
+    fc.set_width(400.0);
+    let p0 = fc.place_floated_box(geo.Size(f32) { width: 100.0, height: 40.0 }, 5.0, [10.0, 20.0], sty.FloatDirection.Left, sty.Clear.None);
+    _tree_block.show_place(out, "P2.0", p0);
+    let p1 = fc.place_floated_box(geo.Size(f32) { width: 100.0, height: 60.0 }, 0.0, [10.0, 20.0], sty.FloatDirection.Right, sty.Clear.None);
+    _tree_block.show_place(out, "P2.1", p1);
+    let p2 = fc.place_floated_box(geo.Size(f32) { width: 50.0, height: 10.0 }, 0.0, [10.0, 20.0], sty.FloatDirection.Left, sty.Clear.Left);
+    _tree_block.show_place(out, "P2.2", p2);
+    let p3 = fc.place_floated_box(geo.Size(f32) { width: 50.0, height: 10.0 }, 0.0, [10.0, 20.0], sty.FloatDirection.Right, sty.Clear.Both);
+    _tree_block.show_place(out, "P2.3", p3);
+    let p4 = fc.place_floated_box(geo.Size(f32) { width: 300.0, height: 10.0 }, 0.0, [10.0, 20.0], sty.FloatDirection.Left, sty.Clear.None);
+    _tree_block.show_place(out, "P2.4", p4);
+    let b5 = fc.find_bfc_slot(0.0, containing_block_insets: [10.0, 20.0], margins: [0.0, 0.0], sty.Direction.Ltr, sty.Clear.Both, none);
+    _tree_block.show_slot(out, "P2.5", b5);
+    let b6 = fc.find_bfc_slot(20.0, containing_block_insets: [10.0, 20.0], margins: [-5.0, 30.0], sty.Direction.Ltr, sty.Clear.None, none);
+    _tree_block.show_slot(out, "P2.6", b6);
+    let c7 = fc.find_content_slot(0.0, [10.0, 20.0], sty.Clear.Right, none);
+    _tree_block.show_content_slot(out, "P2.7", c7);
+    _tree_block.show_state(out, "P2.8", &fc, 0.0);
+}
+
+/// Case P3: zero-sized floats and floats wider than the context
+fn case_p3(out: &mut std.Output, a: alloc.Allocator) {
+    var fc = fl.FloatContext.new(a);
+    fc.set_width(200.0);
+    let p0 = fc.place_floated_box(geo.Size(f32) { width: 0.0, height: 20.0 }, 0.0, [0.0, 0.0], sty.FloatDirection.Left, sty.Clear.None);
+    _tree_block.show_place(out, "P3.0", p0);
+    let p1 = fc.place_floated_box(geo.Size(f32) { width: 30.0, height: 0.0 }, 10.0, [0.0, 0.0], sty.FloatDirection.Left, sty.Clear.None);
+    _tree_block.show_place(out, "P3.1", p1);
+    let p2 = fc.place_floated_box(geo.Size(f32) { width: 250.0, height: 10.0 }, 0.0, [0.0, 0.0], sty.FloatDirection.Left, sty.Clear.None);
+    _tree_block.show_place(out, "P3.2", p2);
+    let p3 = fc.place_floated_box(geo.Size(f32) { width: 60.0, height: 10.0 }, 0.0, [0.0, 0.0], sty.FloatDirection.Right, sty.Clear.None);
+    _tree_block.show_place(out, "P3.3", p3);
+    let p4 = fc.place_floated_box(geo.Size(f32) { width: 60.0, height: 10.0 }, 0.0, [0.0, 0.0], sty.FloatDirection.Right, sty.Clear.Right);
+    _tree_block.show_place(out, "P3.4", p4);
+    _tree_block.show_state(out, "P3.5", &fc, 5.0);
+    let b6 = fc.find_bfc_slot(0.0, containing_block_insets: [0.0, 0.0], margins: [0.0, 0.0], sty.Direction.Ltr, sty.Clear.None, none);
+    _tree_block.show_slot(out, "P3.6", b6);
+    let b7 = fc.find_bfc_slot(100.0, containing_block_insets: [0.0, 0.0], margins: [0.0, 0.0], sty.Direction.Ltr, sty.Clear.None, none);
+    _tree_block.show_slot(out, "P3.7", b7);
+}
+
+/// Case P4: floats placed into the middle of segments
+fn case_p4(out: &mut std.Output, a: alloc.Allocator) {
+    var fc = fl.FloatContext.new(a);
+    fc.set_width(300.0);
+    let p0 = fc.place_floated_box(geo.Size(f32) { width: 100.0, height: 100.0 }, 0.0, [0.0, 0.0], sty.FloatDirection.Left, sty.Clear.None);
+    _tree_block.show_place(out, "P4.0", p0);
+    let p1 = fc.place_floated_box(geo.Size(f32) { width: 100.0, height: 30.0 }, 20.0, [0.0, 0.0], sty.FloatDirection.Right, sty.Clear.None);
+    _tree_block.show_place(out, "P4.1", p1);
+    let p2 = fc.place_floated_box(geo.Size(f32) { width: 50.0, height: 40.0 }, 10.0, [0.0, 0.0], sty.FloatDirection.Right, sty.Clear.None);
+    _tree_block.show_place(out, "P4.2", p2);
+    let p3 = fc.place_floated_box(geo.Size(f32) { width: 120.0, height: 15.0 }, 0.0, [0.0, 0.0], sty.FloatDirection.Left, sty.Clear.None);
+    _tree_block.show_place(out, "P4.3", p3);
+    let p4 = fc.place_floated_box(geo.Size(f32) { width: 33.3, height: 12.7 }, 0.0, [0.0, 0.0], sty.FloatDirection.Right, sty.Clear.None);
+    _tree_block.show_place(out, "P4.4", p4);
+    let b5 = fc.find_bfc_slot(25.0, containing_block_insets: [0.0, 0.0], margins: [0.0, 0.0], sty.Direction.Ltr, sty.Clear.None, none);
+    _tree_block.show_slot(out, "P4.5", b5);
+    let b6 = fc.find_bfc_slot(25.0, containing_block_insets: [0.0, 0.0], margins: [0.0, 0.0], sty.Direction.Ltr, sty.Clear.None, some(1));
+    _tree_block.show_slot(out, "P4.6", b6);
+    let c7 = fc.find_content_slot(25.0, [0.0, 0.0], sty.Clear.None, some(2));
+    _tree_block.show_content_slot(out, "P4.7", c7);
+    _tree_block.show_state(out, "P4.8", &fc, 99.0);
+}
+
+/// Case W1: max-content: widths add up per side
+fn case_w1(out: &mut std.Output, a: alloc.Allocator) {
+    var c = fl.FloatIntrinsicWidthCalculator.new(sty.AvailableSpace.MaxContent);
+    c.add_float(100.0, sty.FloatDirection.Left, sty.Clear.None);
+    c.add_float(50.0, sty.FloatDirection.Left, sty.Clear.None);
+    c.add_float(70.0, sty.FloatDirection.Right, sty.Clear.None);
+    c.add_float(30.0, sty.FloatDirection.Left, sty.Clear.Left);
+    _tree_block.show_value(out, "W1 intrinsic", c.result());
+}
+
+/// Case W2: min-content: the widest
+fn case_w2(out: &mut std.Output, a: alloc.Allocator) {
+    var c = fl.FloatIntrinsicWidthCalculator.new(sty.AvailableSpace.MinContent);
+    c.add_float(100.0, sty.FloatDirection.Left, sty.Clear.None);
+    c.add_float(150.0, sty.FloatDirection.Right, sty.Clear.None);
+    c.add_float(30.0, sty.FloatDirection.Left, sty.Clear.Both);
+    _tree_block.show_value(out, "W2 intrinsic", c.result());
+}
+
+/// Case W3: definite: clamped by the space, not below the widest
+fn case_w3(out: &mut std.Output, a: alloc.Allocator) {
+    var c = fl.FloatIntrinsicWidthCalculator.new(sty.AvailableSpace.definite(120.0));
+    c.add_float(100.0, sty.FloatDirection.Left, sty.Clear.None);
+    c.add_float(50.0, sty.FloatDirection.Left, sty.Clear.None);
+    c.add_float(70.0, sty.FloatDirection.Right, sty.Clear.Right);
+    _tree_block.show_value(out, "W3 intrinsic", c.result());
+}
+
+/// Case W4: definite and narrower than the widest
+fn case_w4(out: &mut std.Output, a: alloc.Allocator) {
+    var c = fl.FloatIntrinsicWidthCalculator.new(sty.AvailableSpace.definite(40.0));
+    c.add_float(60.0, sty.FloatDirection.Left, sty.Clear.None);
+    c.add_float(50.0, sty.FloatDirection.Right, sty.Clear.None);
+    _tree_block.show_value(out, "W4 intrinsic", c.result());
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    case_p1(&mut sys.stdout, a);
+    case_p2(&mut sys.stdout, a);
+    case_p3(&mut sys.stdout, a);
+    case_p4(&mut sys.stdout, a);
+    case_w1(&mut sys.stdout, a);
+    case_w2(&mut sys.stdout, a);
+    case_w3(&mut sys.stdout, a);
+    case_w4(&mut sys.stdout, a);
+}

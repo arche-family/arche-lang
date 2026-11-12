@@ -1,27 +1,56 @@
-/// compute.block: taffy 0.15's compute/block.rs, block layout.
-///
-/// Only the two context types are here yet, because LayoutTree's
-/// compute_block_child_layout names them; the algorithm (compute_block_layout
-/// and the rest of block.rs) is still to be ported into this module.
+/// compute.block: taffy 0.15's compute/block.rs, the CSS block layout of a
+/// block container whose children are all block-level: margin collapsing,
+/// auto margins, text-align and justify-self, box-sizing, scrollbars,
+/// overflow, the block formatting context and its floats (compute.float),
+/// and absolute children as out-of-flow candidates for compute.oof.
 ///
 /// taffy's BlockContext holds `&mut BlockFormattingContext`; a view cannot
 /// be a field in Arche, so the formatting context travels beside it: every
 /// function that reaches the floats takes `bfc: &mut BlockFormattingContext`
 /// next to `block_ctx: &mut BlockContext`, and sub_context makes the
-/// child's context without it.
+/// child's context without it. taffy's `Option<&mut BlockContext>` cannot
+/// be a value either, so compute_block_layout is the call without a context
+/// (None) and compute_block_layout_in the call with one (Some).
+///
+/// Every f32 operation is taffy's, in taffy's order; `x.max(y)` is
+/// `util.f32_max(a: x, b: y)`, a constant written as `a` (see layout.util),
+/// and `a += b - c` is `a = a + (b - c)`.
 import alloc;
+import layout.compute.common.alignment as calign;
+import layout.compute.common.scrollable_overflow as cso;
+import layout.compute.common.sizing_keyword as ksz;
+import layout.compute.float as fl;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
 import layout.util;
 
-/// What is shared by the blocks of one block formatting context: the floats
-/// (BlockFormattingContext). The float context (compute/float.rs) is still
-/// to be ported into it.
-pub type BlockFormattingContext = struct {
-    /// Where its lists go.
-    a: alloc.Allocator,
+/// compute_block_align_content_offset: the block-axis offset align-content
+/// gives the in-flow content of a block container, from the free space
+/// between its content box and its content. The whole stack of in-flow
+/// content is one alignment subject, so the distribution keywords (space-*,
+/// stretch) take their single-subject fallbacks. Inline formatting contexts
+/// (line boxes), laid out outside taffy, use it too.
+pub fn compute_block_align_content_offset(align_content: sty.AlignContent, free_space: f32) -> f32 {
+    let keyword = calign.apply_alignment_fallback(free_space, 1, align_content);
+    return calign.compute_alignment_offset(free_space: free_space, 1, gap: 0.0, keyword, layout_is_flex_reversed: false, is_first: true);
+}
 
-    /// BlockFormattingContext::new.
+/// What the blocks of one block formatting context share: its floats
+/// (BlockFormattingContext). It holds lists, so it is move-only.
+pub type BlockFormattingContext = struct {
+    /// The floats of the context.
+    float_context: fl.FloatContext,
+
+    /// BlockFormattingContext::new: no floats, its lists in memory from a.
     pub fn new(a: alloc.Allocator) -> BlockFormattingContext {
-        return BlockFormattingContext { a: a };
+        return BlockFormattingContext { float_context: fl.FloatContext.new(a) };
+    }
+
+    /// root_block_context: the context of the formatting context's root
+    /// block (BlockContext.root; the formatting context goes beside it).
+    pub fn root_block_context(self: &BlockFormattingContext) -> BlockContext {
+        return BlockContext.root();
     }
 }
 
@@ -38,10 +67,13 @@ pub type BlockContext = struct {
     pub float_content_contribution: f32,
     /// Whether it is the root of its formatting context.
     pub is_root: bool,
-    /// Whether a float adjoining the current margin strut was placed on
-    /// each side.
+    /// Whether a float was placed, on each side, whose position adjoins the
+    /// block's current margin-collapse strut (margins collapsing into the
+    /// strut can still move it). Such floats force clearance on cleared
+    /// elements whose margins adjoin the same strut.
     pub adjoining_floats: [2]bool,
-    /// adjoining_floats when in-flow content was first committed.
+    /// adjoining_floats when in-flow content was first committed in the
+    /// block (which resolves its top margin strut); none before.
     pub top_adjoining_floats: ?[2]bool,
 
     /// BlockFormattingContext::root_block_context: the context of the
@@ -59,7 +91,9 @@ pub type BlockContext = struct {
     }
 
     /// The context of a child block, additional_y_offset below and insets
-    /// in from this one.
+    /// in from this one. Floats adjoining this block's current strut also
+    /// adjoin the child's top strut (when its top margin collapses with its
+    /// first child's, which is checked apart).
     pub fn sub_context(self: &BlockContext, additional_y_offset: f32, insets: [2]f32) -> BlockContext {
         let child_insets: [2]f32 = [self.insets[0] + insets[0], self.insets[1] + insets[1]];
         return BlockContext {
@@ -76,5 +110,1542 @@ pub type BlockContext = struct {
     /// Whether this block is its formatting context's root.
     pub fn is_bfc_root(self: &BlockContext) -> bool {
         return self.is_root;
+    }
+
+    /// Sets the width of the whole formatting context, against which
+    /// positions from its right (right floats) resolve. Blocks inside it
+    /// make sub-contexts with insets instead.
+    pub fn set_width(self: &mut BlockContext, bfc: &mut BlockFormattingContext, available_width: f32) {
+        bfc.float_context.set_width(available_width);
+    }
+
+    /// Sets the x insets of the content box: the border box's plus
+    /// content_box_x_insets (padding, border and scrollbar gutter).
+    pub fn apply_content_box_inset(self: &mut BlockContext, content_box_x_insets: [2]f32) {
+        self.content_box_insets[0] = self.insets[0] + content_box_x_insets[0];
+        self.content_box_insets[1] = self.insets[1] + content_box_x_insets[1];
+    }
+
+    /// Whether the formatting context holds floats.
+    pub fn has_floats(self: &BlockContext, bfc: &BlockFormattingContext) -> bool {
+        return bfc.float_context.has_floats();
+    }
+
+    /// Whether a float of the formatting context reaches below min_y (from
+    /// this block's border-top).
+    pub fn has_active_floats(self: &BlockContext, bfc: &BlockFormattingContext, min_y: f32) -> bool {
+        return bfc.float_context.has_active_floats(min_y + self.y_offset);
+    }
+
+    /// Places a floated box (its margin box) at or below min_y; gives its
+    /// position from this block's border box.
+    pub fn place_floated_box(self: &mut BlockContext, bfc: &mut BlockFormattingContext, floated_box: geo.Size(f32), min_y: f32, direction: sty.FloatDirection, clear: sty.Clear, adjoins_unresolved_strut: bool) -> geo.Point(f32) {
+        if adjoins_unresolved_strut {
+            self.adjoining_floats[direction.index()] = true;
+        }
+        var pos = bfc.float_context.place_floated_box(floated_box, min_y + self.y_offset, self.content_box_insets, direction, clear);
+        pos.y = pos.y - self.y_offset;
+        pos.x = pos.x - self.insets[0];
+
+        self.float_content_contribution = util.f32_max(a: self.float_content_contribution, b: pos.y + floated_box.height);
+
+        return pos;
+    }
+
+    /// A slot beside the floats for non-floated content, from this block's
+    /// border box.
+    pub fn find_content_slot(self: &BlockContext, bfc: &BlockFormattingContext, min_y: f32, clear: sty.Clear, after: ?usize) -> fl.ContentSlot {
+        var slot = bfc.float_context.find_content_slot(min_y + self.y_offset, self.content_box_insets, clear, after);
+        slot.y = slot.y - self.y_offset;
+        slot.x = slot.x - self.insets[0];
+        return slot;
+    }
+
+    /// A slot beside the floats for a box that establishes an independent
+    /// formatting context (its border box must not overlap them), from
+    /// this block's border box.
+    pub fn find_bfc_slot(self: &BlockContext, bfc: &BlockFormattingContext, min_y: f32, margins: [2]f32, direction: sty.Direction, clear: sty.Clear, after: ?usize) -> fl.BfcSlot {
+        var slot = bfc.float_context.find_bfc_slot(min_y + self.y_offset, containing_block_insets: self.content_box_insets, margins: margins, direction, clear, after);
+        slot.y = slot.y - self.y_offset;
+        slot.x = slot.x - self.insets[0];
+        return slot;
+    }
+
+    /// The bottom of the lowest float that clear clears, from this block's
+    /// border-top.
+    pub fn cleared_threshold(self: &BlockContext, bfc: &BlockFormattingContext, clear: sty.Clear) -> ?f32 {
+        match bfc.float_context.cleared_threshold(clear) {
+            some(threshold) => { return threshold - self.y_offset; }
+            none => { return none; }
+        }
+    }
+
+    /// Whether a float adjoining the current margin-collapse strut was
+    /// placed on the side(s) clear names.
+    pub fn has_adjoining_float(self: &BlockContext, clear: sty.Clear) -> bool {
+        match clear {
+            .Left => { return self.adjoining_floats[0]; }
+            .Right => { return self.adjoining_floats[1]; }
+            .Both => { return self.adjoining_floats[0] or self.adjoining_floats[1]; }
+            .None => { return false; }
+        }
+    }
+
+    /// Merges the adjoining-float flags a child block passes up.
+    fn merge_adjoining_floats(self: &mut BlockContext, flags: [2]bool) {
+        self.adjoining_floats[0] = self.adjoining_floats[0] or flags[0];
+        self.adjoining_floats[1] = self.adjoining_floats[1] or flags[1];
+    }
+
+    /// Records that in-flow content was committed in the block, which
+    /// resolves the position of the current strut: floats placed before no
+    /// longer adjoin it. The flags of the block's top strut are frozen at
+    /// the first commit.
+    fn commit_strut(self: &mut BlockContext) {
+        match self.top_adjoining_floats {
+            some(_) => { }
+            none => { self.top_adjoining_floats = some(self.adjoining_floats); }
+        }
+        self.adjoining_floats = [false, false];
+    }
+
+    /// The adjoining-float flags of the block's top margin strut: floats
+    /// placed while its position was unresolved (taffy's
+    /// top_adjoining_floats(), a field's name here).
+    fn top_adjoining_float_flags(self: &BlockContext) -> [2]bool {
+        return self.top_adjoining_floats orelse self.adjoining_floats;
+    }
+
+    /// Adds the height descendant floats take in a child, from this block's
+    /// border-top.
+    pub fn add_child_floated_content_height_contribution(self: &mut BlockContext, child_contribution: f32) {
+        self.float_content_contribution = util.f32_max(a: self.float_content_contribution, b: child_contribution);
+    }
+
+    /// The height descendant floats take.
+    pub fn floated_content_height_contribution(self: &BlockContext) -> f32 {
+        return self.float_content_contribution;
+    }
+}
+
+/// What the algorithm keeps of each child as it goes (BlockItem). It holds
+/// the child's out-of-flow candidates, so it is move-only.
+type BlockItem = struct {
+    /// The child.
+    node_id: lt.NodeId,
+    /// Its order among the children that generate boxes: the order they
+    /// are placed in.
+    order: u32,
+    /// Whether it is a table, which is not stretched.
+    is_table: bool,
+    /// Whether it is a compressible replaced element, whose auto width is
+    /// its intrinsic size rather than a stretch.
+    is_compressible_replaced: bool,
+    /// Whether it is a block or inline box in the same formatting context.
+    is_in_same_bfc: bool,
+    /// Its float.
+    float: sty.Float,
+    /// Its clear.
+    clear: sty.Clear,
+    /// Its size style, for the sizing keywords (min-content, max-content,
+    /// fit-content, fit-content(...), stretch). In the block axis only
+    /// stretch needs resolving: the intrinsic keywords are the content
+    /// size, which an auto height already is.
+    size_style: geo.Size(sty.Dimension),
+    /// Its base size.
+    size: geo.Size(?f32),
+    /// Its least size.
+    min_size: geo.Size(?f32),
+    /// Its largest size.
+    max_size: geo.Size(?f32),
+    /// Its overflow.
+    overflow: geo.Point(sty.Overflow),
+    /// Its contain.
+    contain: sty.Contain,
+    /// The width of its scrollbars.
+    scrollbar_width: f32,
+    /// Its position.
+    position: sty.Position,
+    /// Its direction (for self-start and self-end).
+    direction: sty.Direction,
+    /// Its align-self (for the static position of an out-of-flow item).
+    align_self: ?sty.AlignSelf,
+    /// Its justify-self (to align an in-flow item, and for the static
+    /// position of an out-of-flow one).
+    justify_self: ?sty.AlignSelf,
+    /// Its inset.
+    inset: geo.Rect(sty.LengthPercentageAuto),
+    /// Its margin.
+    margin: geo.Rect(sty.LengthPercentageAuto),
+    /// Its padding.
+    padding: geo.Rect(f32),
+    /// Its border.
+    border: geo.Rect(f32),
+    /// Its padding and border in each axis.
+    padding_border_sum: geo.Size(f32),
+    /// Its border box size, once computed.
+    computed_size: geo.Size(f32),
+    /// Its static position: with padding, border, margins and scrollbar
+    /// gutters, without inset.
+    static_position: geo.Point(f32),
+    /// Whether margins collapse through it.
+    can_be_collapsed_through: bool,
+    /// The layout of an in-flow or floated item, held back from
+    /// set_unrounded_layout so that align-content can still move it.
+    final_layout: ?lt.Layout,
+    /// Out-of-flow candidates from its subtree, from its border box until
+    /// they are moved to the container's.
+    oof_candidates: lt.OofCandidates,
+}
+
+/// What laying out the in-flow children gives
+/// (perform_final_layout_on_in_flow_children's tuple).
+type InFlowLayout = struct {
+    /// The scrollable overflow of the children.
+    inflow_overflow_rect: geo.Rect(f32),
+    /// The height of the content, the container's padding and border in.
+    content_height: f32,
+    /// The margins the container's top margin collapses with.
+    first_child_top_margin_set: lt.CollapsibleMarginSet,
+    /// The margins the container's bottom margin collapses with.
+    last_child_bottom_margin_set: lt.CollapsibleMarginSet,
+    /// The first baseline.
+    first_baseline: ?f32,
+}
+
+/// compute_block_layout without a block context (taffy's `block_ctx:
+/// None`): the node gets a formatting context of its own.
+pub fn compute_block_layout(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, inputs: lt.LayoutInput) -> lt.LayoutOutput {
+    var unused_bfc = BlockFormattingContext.new(tree.allocator());
+    var unused_ctx = BlockContext.root();
+    return compute_block_layout_impl(tree, node_id, inputs, inherited: false, &mut unused_bfc, &mut unused_ctx);
+}
+
+/// compute_block_layout with a block context (taffy's `block_ctx:
+/// Some(...)`): the node is laid out in its parent's formatting context
+/// bfc, unless it establishes a new one.
+pub fn compute_block_layout_in(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, inputs: lt.LayoutInput, bfc: &mut BlockFormattingContext, block_ctx: &mut BlockContext) -> lt.LayoutOutput {
+    return compute_block_layout_impl(tree, node_id, inputs, inherited: true, bfc, block_ctx);
+}
+
+/// compute_block_layout: the sizes the styles decide, the short cuts of a
+/// size-only run, then compute_inner in the inherited formatting context
+/// (when inherited and the node does not establish one) or a new one.
+fn compute_block_layout_impl(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, inputs: lt.LayoutInput, inherited: bool, bfc: &mut BlockFormattingContext, block_ctx: &mut BlockContext) -> lt.LayoutOutput {
+    let known_dimensions = inputs.known_dimensions;
+    let parent_size = inputs.parent_size;
+    let run_mode = inputs.run_mode;
+    let style = tree.get_style(node_id);
+
+    // Read early, as taffy does.
+    let overflow = style.overflow;
+    let is_scroll_container = overflow.x.is_scroll_container() or overflow.y.is_scroll_container();
+    let contain = style.contain;
+    // css-align-3 §5.1.1: an align-content other than normal makes a block
+    // container establish an independent formatting context, and so do
+    // layout and paint containment (css-contain-2).
+    let establishes_new_bfc = is_scroll_container
+        or style.align_content.keyword != sty.AlignContentKeyword.Normal
+        or contain.establishes_independent_formatting_context();
+    let aspect_ratio = style.aspect_ratio;
+    let padding = style.padding.resolve_or_zero(parent_size.width);
+    let border = style.border.resolve_or_zero(parent_size.width);
+    let padding_border_size = padding.add(border).sum_axes();
+    var box_sizing_adjustment = geo.size_zero();
+    if style.box_sizing == sty.BoxSizing.ContentBox {
+        box_sizing_adjustment = padding_border_size;
+    }
+    let min_size = style.min_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    let max_size = style.max_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    var clamped_style_size = geo.size_none();
+    if inputs.sizing_mode == lt.SizingMode.InherentSize {
+        clamped_style_size = style.size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment).maybe_clamp(min: min_size, max: max_size);
+    }
+
+    // A min and a max in an axis with max <= min decide its size.
+    let min_max_definite_size = geo.Size(?f32) {
+        width: min_if_at_most_max(min: min_size.width, max: max_size.width),
+        height: min_if_at_most_max(min: min_size.height, max: max_size.height),
+    };
+
+    let styled_based_known_dimensions = known_dimensions.fallback(min_max_definite_size).fallback(clamped_style_size).maybe_max_f(padding_border_size);
+
+    // A size-only run whose size the styles decide is done.
+    if run_mode == lt.RunMode.ComputeSize {
+        match styled_based_known_dimensions.width {
+            some(width) => {
+                match styled_based_known_dimensions.height {
+                    some(height) => { return lt.LayoutOutput.from_outer_size(geo.Size(f32) { width: width, height: height }); }
+                    none => { }
+                }
+            }
+            none => { }
+        }
+
+        // So is one for the width only, when the width is known.
+        if inputs.axis == lt.RequestedAxis.Horizontal {
+            match styled_based_known_dimensions.width {
+                some(width) => { return lt.LayoutOutput.from_outer_size(geo.Size(f32) { width: width, height: 0.0 }); }
+                none => { }
+            }
+        }
+    }
+
+    // The inherited formatting context, or a new one.
+    var inner_inputs = inputs;
+    inner_inputs.known_dimensions = styled_based_known_dimensions;
+    var output = lt.LayoutOutput.hidden();
+    if inherited and not establishes_new_bfc {
+        output = compute_inner(tree, node_id, inner_inputs, bfc, block_ctx);
+    } else {
+        var root_bfc = BlockFormattingContext.new(tree.allocator());
+        var root_ctx = root_bfc.root_block_context();
+        output = compute_inner(tree, node_id, inner_inputs, &mut root_bfc, &mut root_ctx);
+    }
+
+    // Layout containment suppresses the box's baseline.
+    if contain.suppresses_baseline() {
+        output.baselines = lt.Baselines.none_set();
+    }
+
+    return output;
+}
+
+/// compute_inner: the block layout of the node in a formatting context.
+fn compute_inner(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, inputs: lt.LayoutInput, bfc: &mut BlockFormattingContext, block_ctx: &mut BlockContext) -> lt.LayoutOutput {
+    let input_known_dimensions = inputs.known_dimensions;
+    let parent_size = inputs.parent_size;
+    let available_space = inputs.available_space;
+    let run_mode = inputs.run_mode;
+    let vertical_margins_are_collapsible = inputs.vertical_margins_are_collapsible;
+
+    let style = tree.get_style(node_id);
+    let raw_padding = style.padding;
+    let raw_border = style.border;
+    let raw_margin = style.margin;
+    let aspect_ratio = style.aspect_ratio;
+    let padding = raw_padding.resolve_or_zero(parent_size.width);
+    let border = raw_border.resolve_or_zero(parent_size.width);
+    let direction = style.direction;
+
+    // Scrollbar gutters, for overflow: scroll. The axes are swapped, as a
+    // node that scrolls vertically needs room across.
+    var gutter_x: f32 = 0.0;
+    if style.overflow.y == sty.Overflow.Scroll {
+        gutter_x = style.scrollbar_width;
+    }
+    var gutter_y: f32 = 0.0;
+    if style.overflow.x == sty.Overflow.Scroll {
+        gutter_y = style.scrollbar_width;
+    }
+    var scrollbar_gutter = geo.Rect(f32) { left: 0.0, right: gutter_x, top: 0.0, bottom: gutter_y };
+    if direction == sty.Direction.Rtl {
+        scrollbar_gutter = geo.Rect(f32) { left: gutter_x, right: 0.0, top: 0.0, bottom: gutter_y };
+    }
+    let padding_border = padding.add(border);
+    let padding_border_size = padding_border.sum_axes();
+    let content_box_inset = padding_border.add(scrollbar_gutter);
+
+    // The content box insets of the block context.
+    block_ctx.apply_content_box_inset([content_box_inset.left, content_box_inset.right]);
+
+    var box_sizing_adjustment = geo.size_zero();
+    if style.box_sizing == sty.BoxSizing.ContentBox {
+        box_sizing_adjustment = padding_border_size;
+    }
+    let size = style.size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    let min_size = style.min_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    let max_size = style.max_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+
+    // css-sizing-4: a definite size in one axis makes the other definite
+    // through aspect-ratio. Only an axis newly filled is taken (and
+    // clamped); a known size stays as the parent resolved it.
+    let derived = input_known_dimensions.maybe_apply_aspect_ratio(aspect_ratio).maybe_clamp(min: min_size, max: max_size);
+    let known_dimensions = geo.Size(?f32) {
+        width: util.opt_or(value: input_known_dimensions.width, alt: derived.width),
+        height: util.opt_or(value: input_known_dimensions.height, alt: derived.height),
+    };
+    var percentage_basis_height: ?f32 = none;
+    if inputs.known_dimensions_are_definite.height {
+        percentage_basis_height = known_dimensions.height;
+    }
+    let percentage_basis_dimensions = geo.Size(?f32) { width: known_dimensions.width, height: percentage_basis_height };
+    let container_content_box_size = percentage_basis_dimensions.maybe_sub_f(content_box_inset.sum_axes());
+
+    let overflow = style.overflow;
+    let is_scroll_container = overflow.x.is_scroll_container() or overflow.y.is_scroll_container();
+    let establishes_new_bfc = is_scroll_container
+        or style.align_content.keyword != sty.AlignContentKeyword.Normal
+        or style.contain.establishes_independent_formatting_context();
+    let position = style.position;
+
+    // Margin collapsing: whether a child's margins could collapse through
+    // each of this box's block-axis edges (no new formatting context, and
+    // neither border nor padding on that side).
+    let children_margins_adjoin_own_edges = geo.Line(bool) {
+        start: vertical_margins_are_collapsible.start
+            and not establishes_new_bfc
+            and not position.is_out_of_flow()
+            and padding.top == 0.0
+            and border.top == 0.0,
+        end: vertical_margins_are_collapsible.end
+            and not establishes_new_bfc
+            and not position.is_out_of_flow()
+            and padding.bottom == 0.0
+            and border.bottom == 0.0,
+    };
+    let own_margins_collapse_with_children = geo.Line(bool) {
+        start: children_margins_adjoin_own_edges.start,
+        end: children_margins_adjoin_own_edges.end and util.is_none(size.height),
+    };
+    let has_styles_preventing_being_collapsed_through = not style.is_block()
+        or block_ctx.is_bfc_root()
+        or establishes_new_bfc
+        or position.is_out_of_flow()
+        or padding.top > 0.0
+        or padding.bottom > 0.0
+        or border.top > 0.0
+        or border.bottom > 0.0;
+
+    let text_align = style.text_align;
+    let align_content = style.align_content;
+    let justify_items = style.justify_items;
+
+    // 1. The items.
+    var items = generate_item_list(tree, node_id, container_content_box_size);
+
+    // 2. The container's width.
+    var container_outer_width: f32 = 0.0;
+    match known_dimensions.width {
+        some(width) => { container_outer_width = width; }
+        none => {
+            let available_width = available_space.width.maybe_sub_f(content_box_inset.horizontal_axis_sum());
+            let intrinsic_width = determine_content_based_container_width(tree, items.items(), available_width) + content_box_inset.horizontal_axis_sum();
+            container_outer_width = util.f32_maybe_max(util.f32_maybe_clamp(intrinsic_width, min: min_size.width, max: max_size.width), some(padding_border_size.width));
+        }
+    }
+
+    // A size-only run with both dimensions known is done.
+    if run_mode == lt.RunMode.ComputeSize {
+        match known_dimensions.height {
+            some(container_outer_height) => { return lt.LayoutOutput.from_outer_size(geo.Size(f32) { width: container_outer_width, height: container_outer_height }); }
+            none => { }
+        }
+    }
+
+    // So is one for the width only.
+    if run_mode == lt.RunMode.ComputeSize and inputs.axis == lt.RequestedAxis.Horizontal {
+        return lt.LayoutOutput.from_outer_size(geo.Size(f32) { width: container_outer_width, height: 0.0 });
+    }
+
+    // Under ContentSize the container's own height and min-height are
+    // ignored, so they are no percentage basis for the children either
+    // (css-flexbox: the content size suggestion must not depend on the
+    // item's specified height).
+    var styled_percentage_height: ?f32 = none;
+    if inputs.sizing_mode == lt.SizingMode.InherentSize {
+        styled_percentage_height = util.maybe_max(lhs: size.height, rhs: min_size.height);
+    }
+    let container_percentage_resolution_height = util.opt_or(value: percentage_basis_dimensions.height, alt: styled_percentage_height);
+
+    // 3. The final layout of the items, and the content's height.
+    //
+    // Percentage padding and border resolve against the containing block's
+    // width (parent_size), not the box's own; they differ only for a box
+    // that is not stretched. Without a parent size (the root) the box's own
+    // width serves.
+    let percentage_resolution_width = util.unwrap_or(parent_size.width, container_outer_width);
+    let resolved_padding = raw_padding.resolve_or_zero(some(percentage_resolution_width));
+    let resolved_border = raw_border.resolve_or_zero(some(percentage_resolution_width));
+    let resolved_content_box_inset = resolved_padding.add(resolved_border).add(scrollbar_gutter);
+    let in_flow = perform_final_layout_on_in_flow_children(
+        tree,
+        run_mode,
+        &mut items,
+        container_outer_width,
+        container_percentage_resolution_height,
+        content_box_inset: content_box_inset,
+        resolved_content_box_inset: resolved_content_box_inset,
+        resolved_border: resolved_border,
+        text_align,
+        justify_items,
+        direction,
+        own_margins_collapse_with_children: own_margins_collapse_with_children,
+        children_margins_adjoin_own_edges: children_margins_adjoin_own_edges,
+        is_scroll_container,
+        bfc,
+        block_ctx,
+    );
+    var inflow_overflow_rect = in_flow.inflow_overflow_rect;
+    var intrinsic_outer_height = in_flow.content_height;
+    let first_child_top_margin_set = in_flow.first_child_top_margin_set;
+    let last_child_bottom_margin_set = in_flow.last_child_bottom_margin_set;
+    var first_baseline = in_flow.first_baseline;
+
+    // A formatting context's root holds its floats.
+    if block_ctx.is_bfc_root() or establishes_new_bfc {
+        intrinsic_outer_height = util.f32_max(a: intrinsic_outer_height, b: block_ctx.floated_content_height_contribution());
+    }
+
+    let container_outer_height = util.f32_maybe_max(util.unwrap_or(known_dimensions.height, util.f32_maybe_clamp(intrinsic_outer_height, min: min_size.height, max: max_size.height)), some(padding_border_size.height));
+    let final_outer_size = geo.Size(f32) { width: container_outer_width, height: container_outer_height };
+
+    // CSS2 §8.3.1: the bottom margin of an auto-height block collapses with
+    // its last in-flow child's only if its min-height is below its used
+    // height. When min-height decides the height the child's margin no
+    // longer adjoins the box's bottom edge and stays inside (max-height
+    // has no such effect).
+    var height_constrained_by_min_height = false;
+    match min_size.height {
+        some(h) => { height_constrained_by_min_height = h > 0.0 and h >= container_outer_height; }
+        none => { }
+    }
+    let own_bottom_margin_collapses_with_children = own_margins_collapse_with_children.end and not height_constrained_by_min_height;
+
+    // align-content on the in-flow and floated items, whose layouts were
+    // held back for it. The whole stack of in-flow children is one
+    // alignment subject: the distribution keywords take their
+    // single-subject fallbacks, and the group moves by one offset.
+    if align_content.keyword != sty.AlignContentKeyword.Normal {
+        let container_inner_height = container_outer_height - resolved_content_box_inset.vertical_axis_sum();
+        let inflow_content_height = intrinsic_outer_height - resolved_content_box_inset.vertical_axis_sum();
+        let free_space = container_inner_height - inflow_content_height;
+        let group_offset = compute_block_align_content_offset(align_content, free_space);
+        match first_baseline {
+            some(baseline) => { first_baseline = some(baseline + group_offset); }
+            none => { }
+        }
+        for item in items.items_mut() {
+            match &mut item.final_layout {
+                some(layout) => { layout.location.y = layout.location.y + group_offset; }
+                none => { }
+            }
+            // The static positions of out-of-flow children move with the
+            // in-flow content.
+            if item.position.is_out_of_flow() {
+                item.static_position.y = item.static_position.y + group_offset;
+            }
+        }
+        var any_in_flow = false;
+        for item in items.items() {
+            if is_some_layout(item.final_layout) {
+                any_in_flow = true;
+            }
+        }
+        if any_in_flow {
+            inflow_overflow_rect = geo.rect_zero();
+            for item in items.items() {
+                match item.final_layout {
+                    some(layout) => {
+                        var contribution_location = geo.Point(f32) {
+                            x: layout.location.x - resolved_border.left,
+                            y: layout.location.y - resolved_border.top,
+                        };
+                        if direction.is_rtl() {
+                            contribution_location = geo.Point(f32) {
+                                x: container_outer_width - (layout.location.x + layout.size.width) - resolved_border.right,
+                                y: layout.location.y - resolved_border.top,
+                            };
+                        }
+                        inflow_overflow_rect = inflow_overflow_rect.union(cso.compute_scrollable_overflow_contribution(contribution_location, layout.size, layout.scrollable_overflow_rect, item.overflow, item.contain, is_scroll_container));
+                    }
+                    none => { }
+                }
+            }
+        }
+    }
+
+    // Whether margins collapse through the node.
+    var all_in_flow_children_can_be_collapsed_through = true;
+    for item in items.items() {
+        if item.float.is_floated() {
+            continue;
+        }
+        if not (item.position.is_out_of_flow() or item.can_be_collapsed_through) {
+            all_in_flow_children_can_be_collapsed_through = false;
+            break;
+        }
+    }
+    // CSS2 §8.3.1: margins collapse through a box only if its used height
+    // is zero, so height, min-height and max-height count by what they
+    // resolve to.
+    let can_be_collapsed_through = not has_styles_preventing_being_collapsed_through
+        and container_outer_height == 0.0
+        and all_in_flow_children_can_be_collapsed_through;
+
+    var top_margin = first_child_top_margin_set;
+    if not own_margins_collapse_with_children.start {
+        let margin_top = raw_margin.top.resolve_or_zero(parent_size.width);
+        top_margin = lt.CollapsibleMarginSet.from_margin(margin_top);
+    }
+    var bottom_margin = last_child_bottom_margin_set;
+    if not own_bottom_margin_collapses_with_children {
+        let margin_bottom = raw_margin.bottom.resolve_or_zero(parent_size.width);
+        bottom_margin = lt.CollapsibleMarginSet.from_margin(margin_bottom);
+    }
+
+    var output = lt.LayoutOutput {
+        size: final_outer_size,
+        scrollable_overflow_rect: geo.rect_zero(),
+        baselines: lt.Baselines.from_first(first_baseline),
+        top_margin: top_margin,
+        bottom_margin: bottom_margin,
+        margins_can_collapse_through: can_be_collapsed_through,
+        oof_candidates: lt.OofCandidates.new(),
+        oof_positioning_area: none,
+    };
+
+    // A size-only run is done; the margin collapsing outputs go with it, as
+    // parent blocks need them for their own intrinsic height.
+    if run_mode == lt.RunMode.ComputeSize {
+        return output;
+    }
+
+    // The held-back layouts of the children, into the tree.
+    for item in items.items() {
+        match item.final_layout {
+            some(layout) => { tree.set_unrounded_layout(item.node_id, &layout); }
+            none => { }
+        }
+    }
+
+    // 4. The out-of-flow candidates in document order: the out-of-flow
+    // children, and those surfaced from the subtrees of in-flow children.
+    // The out-of-flow pass (compute.oof) lays them out after this.
+    let a = tree.allocator();
+    var candidates = lt.OofCandidates.new();
+    for item in items.items_mut() {
+        if item.position.is_out_of_flow() {
+            // The static-position rectangle of an out-of-flow child of a
+            // block container spans the content box inline, and is a line
+            // of zero height at its hypothetical position in the block
+            // axis; its self-alignment aligns it there (css-position-3).
+            let inline_area = geo.Line(f32) {
+                start: resolved_content_box_inset.left,
+                end: container_outer_width - resolved_content_box_inset.right,
+            };
+            let block_area = geo.Line(f32) { start: item.static_position.y, end: item.static_position.y };
+            // No justify-self takes the container's justify-items; block
+            // containers have no align-items, so no align-self is normal.
+            let justify_self = (item.justify_self orelse justify_items).resolve_self_relative(item_direction: item.direction, container_direction: direction, axis_is_inline: true);
+            let align_self = (item.align_self orelse sty.AlignItems.normal()).resolve_self_relative(item_direction: item.direction, container_direction: direction, axis_is_inline: false);
+            candidates.push(lt.OofCandidate {
+                node: item.node_id,
+                order: item.order,
+                position: item.position,
+                static_position: geo.Point(lt.AxisStaticPosition) {
+                    x: lt.AxisStaticPosition.from_alignment(justify_self, inline_area, direction.is_rtl()),
+                    y: lt.AxisStaticPosition.from_alignment(align_self, block_area, false),
+                },
+            }, a);
+        } else if not item.oof_candidates.is_empty() {
+            // From the item's border box to the container's.
+            match item.final_layout {
+                some(layout) => { item.oof_candidates.translate(layout.location); }
+                none => { }
+            }
+            candidates.append(&mut item.oof_candidates);
+        }
+    }
+
+    let absolute_position_inset = resolved_border.add(scrollbar_gutter);
+    let absolute_position_area = final_outer_size.sub(absolute_position_inset.sum_axes());
+    let absolute_position_offset = geo.Point(f32) { x: absolute_position_inset.left, y: absolute_position_inset.top };
+    output.oof_candidates = candidates;
+    output.oof_positioning_area = some(lt.OofPositioningArea { size: absolute_position_area, offset: absolute_position_offset });
+
+    // A scroll container's own end padding is part of its scrollable
+    // overflow, so it goes into the in-flow overflow; other boxes' does
+    // not.
+    if is_scroll_container {
+        if direction.is_rtl() {
+            inflow_overflow_rect.right = inflow_overflow_rect.right + resolved_padding.left;
+        } else {
+            inflow_overflow_rect.right = inflow_overflow_rect.right + resolved_padding.right;
+        }
+        inflow_overflow_rect.bottom = inflow_overflow_rect.bottom + resolved_padding.bottom;
+    }
+    output.scrollable_overflow_rect = inflow_overflow_rect;
+
+    // 5. The hidden children's hidden layout.
+    let len = tree.child_count(node_id);
+    var order: usize = 0;
+    while order < len : (order += 1) {
+        let child = tree.get_child_id(node_id, order);
+        if tree.get_style(child).box_generation_mode() == sty.BoxGenerationMode.None {
+            let hidden_layout = lt.Layout.with_order(order as u32);
+            tree.set_unrounded_layout(child, &hidden_layout);
+            _ = lt.perform_child_layout(tree, child, known_dimensions: geo.size_none(), parent_size: geo.size_none(), geo.size_max_content(), lt.SizingMode.InherentSize, geo.line_false());
+        }
+    }
+
+    return output;
+}
+
+/// generate_item_list: a BlockItem for each child that generates a box.
+fn generate_item_list(tree: &dyn lt.LayoutTree, node: lt.NodeId, node_inner_size: geo.Size(?f32)) -> alloc.List(BlockItem) {
+    var items = alloc.List(BlockItem).init(tree.allocator());
+    let count = tree.child_count(node);
+    var order: u32 = 0;
+    var index: usize = 0;
+    while index < count : (index += 1) {
+        let child_node_id = tree.get_child_id(node, index);
+        let child_style = tree.get_style(child_node_id);
+        if child_style.box_generation_mode() == sty.BoxGenerationMode.None {
+            continue;
+        }
+        let aspect_ratio = child_style.aspect_ratio;
+        let padding = child_style.padding.resolve_or_zero(node_inner_size.width);
+        let border = child_style.border.resolve_or_zero(node_inner_size.width);
+        let pb_sum = padding.add(border).sum_axes();
+        var box_sizing_adjustment = geo.size_zero();
+        if child_style.box_sizing == sty.BoxSizing.ContentBox {
+            box_sizing_adjustment = pb_sum;
+        }
+
+        let position = child_style.position;
+        let overflow = child_style.overflow;
+
+        let float = child_style.float;
+        let is_not_floated = float == sty.Float.None;
+
+        let is_block = child_style.is_block();
+        let is_table = child_style.is_table();
+        let is_compressible_replaced = child_style.is_compressible_replaced();
+        let is_scroll_container = overflow.x.is_scroll_container() or overflow.y.is_scroll_container();
+        let contain = child_style.contain;
+
+        let is_in_same_bfc = is_block
+            and not is_table
+            and not position.is_out_of_flow()
+            and is_not_floated
+            and not is_scroll_container
+            and not contain.establishes_independent_formatting_context()
+            and child_style.align_content.keyword == sty.AlignContentKeyword.Normal;
+
+        items.push(BlockItem {
+            node_id: child_node_id,
+            order: order,
+            is_table: is_table,
+            is_compressible_replaced: is_compressible_replaced,
+            is_in_same_bfc: is_in_same_bfc,
+            float: float,
+            clear: child_style.clear,
+            size_style: child_style.size,
+            size: child_style.size.maybe_resolve(node_inner_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment),
+            min_size: child_style.min_size.maybe_resolve(node_inner_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment),
+            max_size: child_style.max_size.maybe_resolve(node_inner_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment),
+            overflow: overflow,
+            contain: contain,
+            scrollbar_width: child_style.scrollbar_width,
+            position: position,
+            direction: child_style.direction,
+            align_self: child_style.align_self,
+            justify_self: child_style.justify_self,
+            inset: child_style.inset,
+            margin: child_style.margin,
+            padding: padding,
+            border: border,
+            padding_border_sum: pb_sum,
+
+            // Computed later.
+            computed_size: geo.size_zero(),
+            static_position: geo.point_zero(),
+            can_be_collapsed_through: false,
+            final_layout: none,
+            oof_candidates: lt.OofCandidates.new(),
+        });
+        order += 1;
+    }
+    return items;
+}
+
+/// resolve_stretch_height: the height of an item whose height style is
+/// stretch; none for any other style (the intrinsic keywords are the
+/// content size, which an auto height already is). Each block-axis margin
+/// is taken off unless margins_treated_as_zero flags it: a block-level box
+/// stretched in a container without border or padding on that side, and
+/// without a new formatting context, treats a margin that could collapse
+/// through that edge as zero (csswg-drafts#11044, #13260).
+fn resolve_stretch_height(height_style: sty.Dimension, container_inner_height: ?f32, item_margin: geo.Rect(f32), margins_treated_as_zero: geo.Line(bool)) -> ?f32 {
+    if not height_style.is_stretch() {
+        return none;
+    }
+    var height = container_inner_height orelse return none;
+    if not margins_treated_as_zero.start {
+        height = height - item_margin.top;
+    }
+    if not margins_treated_as_zero.end {
+        height = height - item_margin.bottom;
+    }
+    return height;
+}
+
+/// determine_content_based_container_width: the width of the content, for
+/// a container whose width is not known.
+fn determine_content_based_container_width(tree: &mut dyn lt.LayoutTree, items: []BlockItem, available_width: sty.AvailableSpace) -> f32 {
+    let available_space = geo.Size(sty.AvailableSpace) { width: available_width, height: sty.AvailableSpace.MinContent };
+
+    var max_child_width: f32 = 0.0;
+    var float_contribution = fl.FloatIntrinsicWidthCalculator.new(available_width);
+    for item in items {
+        if item.position.is_out_of_flow() {
+            continue;
+        }
+        let known_dimensions = item.size.maybe_clamp(min: item.min_size, max: item.max_size);
+
+        let item_x_margin_sum = item.margin.resolve_or_zero(available_space.width.into_option()).horizontal_axis_sum();
+        var width: f32 = 0.0;
+        match known_dimensions.width {
+            some(known_width) => { width = known_width; }
+            none => {
+                var item_available_width = available_space.width.maybe_sub_f(item_x_margin_sum);
+                match ksz.resolve_sizing_keyword(item.size_style.width, stretch_size: none, percent_resolution_basis: none) {
+                    some(resolution) => {
+                        match resolution {
+                            .Measure { space } => { item_available_width = space; }
+                            .Exact { size } => { item_available_width = sty.AvailableSpace.Definite { value: size }; }
+                        }
+                    }
+                    none => { }
+                }
+                width = lt.measure_child_size(
+                    tree,
+                    item.node_id,
+                    known_dimensions: known_dimensions,
+                    parent_size: geo.size_none(),
+                    geo.Size(sty.AvailableSpace) { width: item_available_width, height: available_space.height },
+                    lt.SizingMode.InherentSize,
+                    geo.AbsoluteAxis.Horizontal,
+                    // As when the item is laid out (see the cache).
+                    collapsible_if(item.is_in_same_bfc),
+                );
+            }
+        }
+
+        let outer_width = util.f32_max(a: width, b: item.padding_border_sum.width) + item_x_margin_sum;
+
+        match item.float.float_direction() {
+            some(float_direction) => {
+                float_contribution.add_float(outer_width, float_direction, item.clear);
+                continue;
+            }
+            none => { }
+        }
+
+        max_child_width = util.f32_max(a: max_child_width, b: outer_width);
+    }
+
+    max_child_width = util.f32_max(a: max_child_width, b: float_contribution.result());
+
+    return max_child_width;
+}
+
+/// perform_final_layout_on_in_flow_children: each child's final size and
+/// position (held back in final_layout), margins collapsed, floats placed.
+fn perform_final_layout_on_in_flow_children(
+    tree: &mut dyn lt.LayoutTree,
+    run_mode: lt.RunMode,
+    items: &mut alloc.List(BlockItem),
+    container_outer_width: f32,
+    container_percentage_resolution_height: ?f32,
+    content_box_inset: geo.Rect(f32),
+    resolved_content_box_inset: geo.Rect(f32),
+    resolved_border: geo.Rect(f32),
+    text_align: sty.TextAlign,
+    justify_items: sty.AlignItems,
+    direction: sty.Direction,
+    own_margins_collapse_with_children: geo.Line(bool),
+    children_margins_adjoin_own_edges: geo.Line(bool),
+    is_scroll_container: bool,
+    bfc: &mut BlockFormattingContext,
+    block_ctx: &mut BlockContext,
+) -> InFlowLayout {
+    // The inner width for sizing the children, from the resolved insets.
+    let container_inner_width = util.f32_max(a: 0.0, b: container_outer_width - resolved_content_box_inset.horizontal_axis_sum());
+    let inner_percentage_resolution_height = util.maybe_sub_f(container_percentage_resolution_height, resolved_content_box_inset.vertical_axis_sum());
+    let parent_size = geo.Size(?f32) { width: some(container_inner_width), height: inner_percentage_resolution_height };
+    // Block flow's vertical available space is indefinite (MaxContent),
+    // not a min-content constraint.
+    let available_space = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.Definite { value: container_inner_width }, height: sty.AvailableSpace.MaxContent };
+
+    if block_ctx.is_bfc_root() {
+        block_ctx.set_width(bfc, container_outer_width);
+        block_ctx.apply_content_box_inset([resolved_content_box_inset.left, resolved_content_box_inset.right]);
+    }
+
+    // When this block's top margin does not collapse with its children's,
+    // its strut is resolved here, and floats adjoining an ancestor's strut
+    // do not adjoin it.
+    if not own_margins_collapse_with_children.start {
+        block_ctx.commit_strut();
+    }
+
+    var inflow_overflow_rect = geo.rect_zero();
+    var committed_y_offset = resolved_content_box_inset.top;
+    var y_offset_for_absolute = resolved_content_box_inset.top;
+    var first_child_top_margin_set = lt.CollapsibleMarginSet.zero();
+    var active_collapsible_margin_set = lt.CollapsibleMarginSet.zero();
+    var is_collapsing_with_first_margin_set = true;
+    var first_baseline: ?f32 = none;
+    // Whether the active set holds the margins of a self-collapsing element
+    // with clearance: they collapse with the margins of the following
+    // siblings, but not with the parent's bottom margin.
+    var active_margin_set_has_clearance = false;
+
+    var has_active_floats = block_ctx.has_active_floats(bfc, committed_y_offset);
+
+    for item in items.items_mut() {
+        if item.position.is_out_of_flow() {
+            var static_x = resolved_content_box_inset.left;
+            if direction == sty.Direction.Rtl {
+                static_x = container_outer_width - resolved_content_box_inset.right;
+            }
+            item.static_position = geo.Point(f32) { x: static_x, y: y_offset_for_absolute };
+            continue;
+        }
+
+        let item_margin = geo.Rect(?f32) {
+            left: item.margin.left.resolve_to_option(container_inner_width),
+            right: item.margin.right.resolve_to_option(container_inner_width),
+            top: item.margin.top.resolve_to_option(container_inner_width),
+            bottom: item.margin.bottom.resolve_to_option(container_inner_width),
+        };
+        let item_non_auto_margin = geo.Rect(f32) {
+            left: util.unwrap_or(item_margin.left, 0.0),
+            right: util.unwrap_or(item_margin.right, 0.0),
+            top: util.unwrap_or(item_margin.top, 0.0),
+            bottom: util.unwrap_or(item_margin.bottom, 0.0),
+        };
+        let item_non_auto_x_margin_sum = item_non_auto_margin.horizontal_axis_sum();
+
+        var scrollbar_size = geo.size_zero();
+        if item.overflow.y == sty.Overflow.Scroll {
+            scrollbar_size.width = item.scrollbar_width;
+        }
+        if item.overflow.x == sty.Overflow.Scroll {
+            scrollbar_size.height = item.scrollbar_width;
+        }
+
+        // A floated box.
+        match item.float.float_direction() {
+            some(float_direction) => {
+                has_active_floats = true;
+
+                // A float of auto width is shrink-to-fit (fit-content): the
+                // available space clamped between its min-content and
+                // max-content sizes.
+                let available_width = util.f32_max(a: 0.0, b: container_inner_width - item_non_auto_x_margin_sum);
+                var item_known_width: ?f32 = none;
+                var item_available_width = sty.AvailableSpace.Definite { value: available_width };
+                match ksz.resolve_sizing_keyword(item.size_style.width, stretch_size: some(available_width), percent_resolution_basis: some(container_inner_width)) {
+                    some(resolution) => {
+                        match resolution {
+                            .Measure { space } => { item_available_width = space; }
+                            .Exact { size } => {
+                                item_known_width = some(size);
+                                item_available_width = sty.AvailableSpace.Definite { value: size };
+                            }
+                        }
+                    }
+                    none => { }
+                }
+                // The margins of a float never collapse.
+                let item_known_height = resolve_stretch_height(item.size_style.height, inner_percentage_resolution_height, item_non_auto_margin, geo.line_false());
+                var item_layout = lt.perform_child_layout(
+                    tree,
+                    item.node_id,
+                    known_dimensions: geo.Size(?f32) { width: item_known_width, height: item_known_height },
+                    parent_size: parent_size,
+                    geo.Size(sty.AvailableSpace) { width: item_available_width, height: sty.AvailableSpace.MaxContent },
+                    lt.SizingMode.InherentSize,
+                    // A float establishes a new formatting context: its
+                    // margins do not collapse with its children's.
+                    geo.line_false(),
+                );
+                item.oof_candidates = item_layout.oof_candidates.take();
+                let margin_box = item_layout.size.add(item_non_auto_margin.sum_axes());
+
+                // A float between collapsing margins is placed as if it had
+                // an otherwise empty anonymous block parent in the flow, so
+                // the pending margins count toward its least y, unless they
+                // collapse with the container's own top margin and so apply
+                // outside it. Then the float's position is not resolved yet:
+                // later siblings' margins can still collapse into the strut
+                // and move it, and such floats force clearance on cleared
+                // elements whose margins adjoin the same strut.
+                let adjoins_unresolved_strut = is_collapsing_with_first_margin_set and own_margins_collapse_with_children.start;
+                var y_offset_for_float = committed_y_offset + active_collapsible_margin_set.resolve();
+                if adjoins_unresolved_strut {
+                    y_offset_for_float = committed_y_offset;
+                }
+
+                var location = block_ctx.place_floated_box(bfc, margin_box, y_offset_for_float, float_direction, item.clear, adjoins_unresolved_strut);
+
+                // From the margin box the placement gives to the border box.
+                location.y = location.y + item_non_auto_margin.top;
+                location.x = location.x + item_non_auto_margin.left;
+
+                // Held back, as in-flow items are, for align-content.
+                item.final_layout = some(lt.Layout {
+                    order: item.order,
+                    location: location,
+                    size: item_layout.size,
+                    scrollable_overflow_rect: item_layout.scrollable_overflow_rect,
+                    scrollbar_size: scrollbar_size,
+                    border: item.border,
+                    padding: item.padding,
+                    margin: item_non_auto_margin,
+                });
+
+                var contribution_location = geo.Point(f32) { x: location.x - resolved_border.left, y: location.y - resolved_border.top };
+                if direction.is_rtl() {
+                    contribution_location = geo.Point(f32) {
+                        x: container_outer_width - (location.x + item_layout.size.width) - resolved_border.right,
+                        y: location.y - resolved_border.top,
+                    };
+                }
+                inflow_overflow_rect = inflow_overflow_rect.union(cso.compute_scrollable_overflow_contribution(contribution_location, item_layout.size, item_layout.scrollable_overflow_rect, item.overflow, item.contain, is_scroll_container));
+
+                continue;
+            }
+            none => { }
+        }
+
+        // A box that does not float.
+
+        var y_margin_offset: f32 = 0.0;
+        var item_avoids_floats = false;
+        var item_pushed_below_float = false;
+
+        var stretch_width: f32 = 0.0;
+        var float_avoiding_position = geo.point_zero();
+        var float_avoiding_width: f32 = 0.0;
+        if item.is_in_same_bfc {
+            stretch_width = util.f32_max(a: 0.0, b: container_inner_width - item_non_auto_x_margin_sum);
+        } else {
+            // y_margin_offset of a child in another formatting context.
+            if not is_collapsing_with_first_margin_set or not own_margins_collapse_with_children.start {
+                y_margin_offset = active_collapsible_margin_set.collapse_with_margin(item_non_auto_margin.top).resolve();
+            }
+            let min_y = committed_y_offset + y_margin_offset;
+
+            // The flag, and the float context itself: floats placed in the
+            // subtree of an earlier in-flow sibling (in the same context)
+            // are not in the flag.
+            if has_active_floats or block_ctx.has_active_floats(bfc, min_y) {
+                let x_margins: [2]f32 = [item_non_auto_margin.left, item_non_auto_margin.right];
+                // An auto width is at least the negated margin sum, so that
+                // the margin box is not negative (CSS2 §10.3.3).
+                let min_auto_width = -item_non_auto_x_margin_sum;
+
+                // The highest slot at or below min_y with room for the
+                // border box, which must not overlap a float.
+                var slot_segment: ?usize = none;
+                var slot = block_ctx.find_bfc_slot(bfc, min_y, x_margins, direction, item.clear, slot_segment);
+                while true {
+                    let segment_id = slot.segment_id orelse break;
+                    let width = util.f32_maybe_clamp(util.unwrap_or(item.size.width, util.f32_max(a: 0.0, b: util.f32_max(a: slot.stretch_width, b: min_auto_width))), min: item.min_size.width, max: item.max_size.width);
+                    if width <= slot.border_width + fl.fit_tolerance() {
+                        break;
+                    }
+                    slot_segment = some(segment_id);
+                    slot = block_ctx.find_bfc_slot(bfc, min_y, x_margins, direction, item.clear, slot_segment);
+                }
+
+                // An item moved down past floats "separates from the float":
+                // as with clearance, its top margin no longer collapses with
+                // the parent's.
+                if slot.y > min_y {
+                    item_pushed_below_float = true;
+                }
+
+                has_active_floats = is_some_index(slot.segment_id);
+                item_avoids_floats = true;
+                stretch_width = util.f32_max(a: 0.0, b: util.f32_max(a: slot.stretch_width, b: min_auto_width));
+                float_avoiding_position = geo.Point(f32) { x: slot.x, y: slot.y };
+                float_avoiding_width = slot.border_width;
+            } else if not has_active_floats {
+                stretch_width = util.f32_max(a: 0.0, b: container_inner_width - item_non_auto_x_margin_sum);
+                float_avoiding_position = geo.Point(f32) { x: resolved_content_box_inset.left, y: min_y };
+                float_avoiding_width = container_inner_width;
+            } else {
+                unreachable();
+            }
+        }
+
+        // justify-self on an in-flow block-level box (css-align-3 §6.1.1).
+        // None takes the container's justify-items; normal lays the box out
+        // by the block rules, and so does stretch, which differs from
+        // normal only for tables and replaced boxes.
+        let justify_self = (item.justify_self orelse justify_items).resolve_self_relative(item_direction: item.direction, container_direction: direction, axis_is_inline: true);
+        let is_stretch = justify_self.keyword == sty.AlignItemsKeyword.Stretch;
+        // The justify-self when it is neither normal nor stretch.
+        var non_stretch_justify_self: ?sty.AlignItems = none;
+        if justify_self.keyword != sty.AlignItemsKeyword.Normal and justify_self.keyword != sty.AlignItemsKeyword.Stretch {
+            non_stretch_justify_self = some(justify_self);
+        }
+
+        // Tables and compressible replaced elements, unless stretched,
+        // resolve their own width (CSS2 §10.3.4).
+        var known_dimensions = geo.size_none();
+        if not ((item.is_table or item.is_compressible_replaced) and not is_stretch) {
+            // The auto width of a block-level box whose justify-self is
+            // neither normal nor stretch is fit-content, not stretch.
+            var width_style = item.size_style.width;
+            if is_some_alignment(non_stretch_justify_self) and item.size_style.width.is_auto() {
+                width_style = sty.Dimension.fit_content();
+            }
+
+            // A sizing keyword width resolves directly, or by measuring the
+            // item in the available space the keyword gives.
+            var keyword_width: ?f32 = none;
+            match ksz.resolve_sizing_keyword(width_style, stretch_size: some(stretch_width), percent_resolution_basis: some(container_inner_width)) {
+                some(resolution) => {
+                    match resolution {
+                        .Exact { size } => { keyword_width = some(size); }
+                        .Measure { space } => {
+                            keyword_width = some(lt.measure_child_size(
+                                tree,
+                                item.node_id,
+                                known_dimensions: geo.size_none(),
+                                parent_size: parent_size,
+                                geo.Size(sty.AvailableSpace) { width: space, height: sty.AvailableSpace.MaxContent },
+                                lt.SizingMode.InherentSize,
+                                geo.AbsoluteAxis.Horizontal,
+                                // As when the item is laid out (see the cache).
+                                collapsible_if(item.is_in_same_bfc),
+                            ));
+                        }
+                    }
+                }
+                none => { }
+            }
+
+            let keyword_height = resolve_stretch_height(item.size_style.height, inner_percentage_resolution_height, item_non_auto_margin, children_margins_adjoin_own_edges);
+
+            let sized = geo.Size(?f32) {
+                width: some(util.f32_maybe_clamp(util.unwrap_or(util.opt_or(value: item.size.width, alt: keyword_width), stretch_width), min: item.min_size.width, max: item.max_size.width)),
+                height: util.opt_or(value: item.size.height, alt: keyword_height),
+            };
+            known_dimensions = sized.maybe_clamp(min: item.min_size, max: item.max_size);
+        }
+
+        var item_available_space = available_space;
+        item_available_space.width = sty.AvailableSpace.Definite { value: stretch_width };
+        let child_inputs = lt.LayoutInput {
+            run_mode: run_mode,
+            sizing_mode: lt.SizingMode.InherentSize,
+            axis: lt.RequestedAxis.Both,
+            known_dimensions: known_dimensions,
+            known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+            parent_size: parent_size,
+            available_space: item_available_space,
+            vertical_margins_are_collapsible: collapsible_if(item.is_in_same_bfc),
+        };
+
+        let clear_threshold = block_ctx.cleared_threshold(bfc, item.clear);
+        let clear_pos = util.unwrap_or(clear_threshold, util.neg_infinity());
+
+        // The height floats take in a child of the same formatting context,
+        // from its border-top; added to the parent's once the child's
+        // position is known.
+        var child_float_contribution = util.neg_infinity();
+
+        var item_layout = lt.LayoutOutput.hidden();
+        if item.is_in_same_bfc {
+            // A replaced element may have no known width (its measure
+            // function sizes it, not a stretch).
+            let width = util.f32_max(a: util.unwrap_or(known_dimensions.width, stretch_width), b: item.padding_border_sum.width);
+
+            let inset_left = item_non_auto_margin.left + content_box_inset.left;
+            let inset_right = container_outer_width - width - inset_left;
+            let insets: [2]f32 = [inset_left, inset_right];
+
+            // The child's position is estimated from its top margin
+            // collapsed with the margins before it (its own margins that
+            // collapse through it are not known yet).
+            let estimated_y = committed_y_offset + active_collapsible_margin_set.collapse_with_margin(item_non_auto_margin.top).resolve();
+            var child_block_ctx = block_ctx.sub_context(util.f32_max(a: estimated_y, b: clear_pos), insets);
+            item_layout = tree.compute_block_child_layout(item.node_id, child_inputs, bfc, &mut child_block_ctx);
+
+            // The floats of the child's context.
+            child_float_contribution = child_block_ctx.floated_content_height_contribution();
+            let child_top_adjoining_floats = child_block_ctx.top_adjoining_float_flags();
+            // Floats placed while the child's top strut was unresolved
+            // adjoin this block's current strut too.
+            block_ctx.merge_adjoining_floats(child_top_adjoining_floats);
+        } else {
+            item_layout = tree.compute_child_layout(item.node_id, child_inputs);
+        }
+        item.oof_candidates = item_layout.oof_candidates.take();
+        let final_size = item_layout.size;
+
+        let top_margin_set = item_layout.top_margin.collapse_with_margin(util.unwrap_or(item_margin.top, 0.0));
+        let bottom_margin_set = item_layout.bottom_margin.collapse_with_margin(util.unwrap_or(item_margin.bottom, 0.0));
+
+        // Auto margins take the free space. Vertical auto margins of a
+        // relatively positioned block are zero (CSS2 §10.3).
+        let free_x_space = util.f32_max(a: 0.0, b: stretch_width - final_size.width);
+        var auto_margin_count: u8 = 0;
+        if util.is_none(item_margin.left) {
+            auto_margin_count += 1;
+        }
+        if util.is_none(item_margin.right) {
+            auto_margin_count += 1;
+        }
+        var x_axis_auto_margin_size: f32 = 0.0;
+        if auto_margin_count > 0 {
+            x_axis_auto_margin_size = free_x_space / (auto_margin_count as f32);
+        }
+        let resolved_margin = geo.Rect(f32) {
+            left: util.unwrap_or(item_margin.left, x_axis_auto_margin_size),
+            right: util.unwrap_or(item_margin.right, x_axis_auto_margin_size),
+            top: util.unwrap_or(item_margin.top, 0.0),
+            bottom: util.unwrap_or(item_margin.bottom, 0.0),
+        };
+
+        // The item's inset.
+        let inset_percentage_basis = geo.Size(?f32) { width: some(container_inner_width), height: inner_percentage_resolution_height };
+        let inset = geo.Rect(?f32) {
+            left: item.inset.left.maybe_resolve(inset_percentage_basis.width),
+            right: item.inset.right.maybe_resolve(inset_percentage_basis.width),
+            top: item.inset.top.maybe_resolve(inset_percentage_basis.height),
+            bottom: item.inset.bottom.maybe_resolve(inset_percentage_basis.height),
+        };
+        var inset_offset = geo.point_zero();
+        if item.position == sty.Position.Relative {
+            if direction.is_rtl() {
+                inset_offset.x = util.unwrap_or(util.opt_or(value: negated(inset.right), alt: inset.left), 0.0);
+            } else {
+                inset_offset.x = util.unwrap_or(util.opt_or(value: inset.left, alt: negated(inset.right)), 0.0);
+            }
+            inset_offset.y = util.unwrap_or(util.opt_or(value: inset.top, alt: negated(inset.bottom)), 0.0);
+        }
+
+        // y_margin_offset of a child in the same formatting context.
+        if item.is_in_same_bfc and (not is_collapsing_with_first_margin_set or not own_margins_collapse_with_children.start) {
+            y_margin_offset = active_collapsible_margin_set.collapse_with_set(top_margin_set).resolve();
+        }
+
+        // Clearance (CSS2.2 §9.5.2): when the hypothetical position of the
+        // item's top border edge (with ordinary margin collapsing) is not
+        // past the bottom of the floats it clears, its border edge goes to
+        // max(float bottom, hypothetical position).
+        var has_clearance = false;
+        if item.is_in_same_bfc {
+            match clear_threshold {
+                some(threshold) => {
+                    // The hypothetical position always holds the item's
+                    // collapsed top margins, even when they collapse with
+                    // the container's own top margin (and apply outside it):
+                    // they still move the container, and the item, against
+                    // the floats.
+                    let hypothetical_y = committed_y_offset + active_collapsible_margin_set.collapse_with_set(top_margin_set).resolve();
+                    // A float adjoining the strut the item's top margin
+                    // would collapse into forces clearance: collapsing would
+                    // pull the float down with the item.
+                    let forced_clearance = block_ctx.has_adjoining_float(item.clear);
+                    if forced_clearance or hypothetical_y < threshold {
+                        has_clearance = true;
+                        // Clearance stops the item's top margin collapsing
+                        // with the margins before it. When those collapse
+                        // with the container's own top margin they apply
+                        // outside (moving it down), so the cleared position
+                        // inside is that much less.
+                        var escaped_margin: f32 = 0.0;
+                        if is_collapsing_with_first_margin_set and own_margins_collapse_with_children.start {
+                            escaped_margin = active_collapsible_margin_set.resolve();
+                        }
+                        y_margin_offset = threshold - committed_y_offset - escaped_margin;
+                    }
+                }
+                none => { }
+            }
+        }
+
+        item.computed_size = item_layout.size;
+        item.can_be_collapsed_through = item_layout.margins_can_collapse_through and not has_clearance;
+        if item.is_in_same_bfc {
+            let uncleared_y = committed_y_offset + active_collapsible_margin_set.resolve();
+            var static_x = resolved_content_box_inset.left;
+            if direction == sty.Direction.Rtl {
+                static_x = container_outer_width - resolved_content_box_inset.right - final_size.width;
+            }
+            item.static_position = geo.Point(f32) { x: static_x, y: util.f32_max(a: uncleared_y, b: clear_pos) };
+        } else {
+            var static_x = float_avoiding_position.x;
+            if direction == sty.Direction.Rtl {
+                static_x = float_avoiding_position.x + float_avoiding_width - final_size.width;
+            }
+            item.static_position = geo.Point(f32) { x: static_x, y: float_avoiding_position.y };
+        }
+        var location = geo.point_zero();
+        if item.is_in_same_bfc {
+            var location_x = resolved_content_box_inset.left + inset_offset.x + resolved_margin.left;
+            if direction == sty.Direction.Rtl {
+                location_x = container_outer_width - resolved_content_box_inset.right - final_size.width - resolved_margin.right + inset_offset.x;
+            }
+            location = geo.Point(f32) { x: location_x, y: committed_y_offset + y_margin_offset + inset_offset.y };
+        } else {
+            // An item beside floats has its non-auto margins in the slot's
+            // position and width already (margins may overlap floats), so
+            // only the auto part of its margins is added here.
+            var extra_margin_left = resolved_margin.left;
+            var extra_margin_right = resolved_margin.right;
+            if item_avoids_floats {
+                extra_margin_left = resolved_margin.left - item_non_auto_margin.left;
+                extra_margin_right = resolved_margin.right - item_non_auto_margin.right;
+            }
+            var location_x = float_avoiding_position.x + extra_margin_left + inset_offset.x;
+            if direction == sty.Direction.Rtl {
+                location_x = float_avoiding_position.x + float_avoiding_width - final_size.width - extra_margin_right + inset_offset.x;
+            }
+            location = geo.Point(f32) { x: location_x, y: float_avoiding_position.y + inset_offset.y };
+        }
+
+        // The child's floats are placed from its border-top, so its
+        // collapsed position, not its relative offset, is added.
+        if item.is_in_same_bfc {
+            block_ctx.add_child_floated_content_height_contribution(location.y - inset_offset.y + child_float_contribution);
+        }
+
+        // Alignment. justify-self aligns the margin box in its alignment
+        // container and wins over the legacy text-align, but auto margins,
+        // which took the free space already, win over justify-self.
+        let has_auto_x_margin = util.is_none(item_margin.left) or util.is_none(item_margin.right);
+        let item_outer_width = item_layout.size.width + resolved_margin.horizontal_axis_sum();
+        var justified = false;
+        match non_stretch_justify_self {
+            some(item_justify_self) => {
+                if not has_auto_x_margin {
+                    justified = true;
+                    // The alignment container is the containing block; for a
+                    // box with an independent formatting context beside a
+                    // float, the room the float leaves (the slot is inset by
+                    // the item's margins already).
+                    var container_start = resolved_content_box_inset.left;
+                    var justify_free_x_space = container_inner_width - item_outer_width;
+                    if item_avoids_floats {
+                        container_start = float_avoiding_position.x - resolved_margin.left;
+                        justify_free_x_space = float_avoiding_width - item_layout.size.width;
+                    }
+
+                    var keyword = item_justify_self.keyword;
+                    if item_justify_self.safety == sty.AlignmentSafety.Safe and justify_free_x_space < 0.0 {
+                        keyword = sty.AlignItemsKeyword.Start;
+                    }
+                    var offset: f32 = 0.0;
+                    if keyword == sty.AlignItemsKeyword.Center {
+                        offset = justify_free_x_space / 2.0;
+                    } else {
+                        let align_to_end = keyword == sty.AlignItemsKeyword.End or keyword == sty.AlignItemsKeyword.FlexEnd or keyword == sty.AlignItemsKeyword.SelfEnd;
+                        if align_to_end != direction.is_rtl() {
+                            offset = justify_free_x_space;
+                        }
+                    }
+                    location.x = container_start + resolved_margin.left + inset_offset.x + offset;
+                }
+            }
+            none => { }
+        }
+        if not justified and not is_some_alignment(non_stretch_justify_self) and item_outer_width < container_inner_width {
+            let text_align_free_x_space = container_inner_width - item_outer_width;
+            match text_align {
+                .Auto => { }
+                .LegacyLeft => {
+                    // Left aligned by default in ltr.
+                    if direction == sty.Direction.Rtl {
+                        location.x = location.x - text_align_free_x_space;
+                    }
+                }
+                .LegacyRight => {
+                    // Right aligned by default in rtl.
+                    if direction == sty.Direction.Ltr {
+                        location.x = location.x + text_align_free_x_space;
+                    }
+                }
+                .LegacyCenter => {
+                    if direction == sty.Direction.Ltr {
+                        location.x = location.x + text_align_free_x_space / 2.0;
+                    } else {
+                        location.x = location.x - text_align_free_x_space / 2.0;
+                    }
+                }
+            }
+        }
+
+        // A block container's first baseline is that of its first in-flow
+        // child with one. A scroll container's comes from its content as if
+        // scrolled to the start, clamped to its border box; without one it
+        // is its border box's bottom (csswg-drafts#7660).
+        if util.is_none(first_baseline) {
+            var child_baseline = item_layout.baselines.first;
+            if item.overflow.y.is_scroll_container() {
+                child_baseline = some(util.f32_max(a: 0.0, b: util.f32_min(a: util.unwrap_or(item_layout.baselines.first, item_layout.size.height), b: item_layout.size.height)));
+            }
+            match child_baseline {
+                some(baseline) => { first_baseline = some(location.y + baseline); }
+                none => { }
+            }
+        }
+
+        // The used auto margins hold the offsets that avoid floats, unlike
+        // the alignment margins above.
+        var used_margin = resolved_margin;
+        if item_avoids_floats {
+            if util.is_none(item_margin.left) {
+                used_margin.left = used_margin.left + (float_avoiding_position.x - resolved_content_box_inset.left);
+            }
+            if util.is_none(item_margin.right) {
+                used_margin.right = used_margin.right + (container_outer_width - resolved_content_box_inset.right - float_avoiding_position.x - float_avoiding_width);
+            }
+        }
+
+        // Held back for align-content, committed by compute_inner.
+        item.final_layout = some(lt.Layout {
+            order: item.order,
+            location: location,
+            size: item_layout.size,
+            scrollable_overflow_rect: item_layout.scrollable_overflow_rect,
+            scrollbar_size: scrollbar_size,
+            border: item.border,
+            padding: item.padding,
+            margin: used_margin,
+        });
+
+        var contribution_location = geo.Point(f32) { x: location.x - resolved_border.left, y: location.y - resolved_border.top };
+        if direction.is_rtl() {
+            contribution_location = geo.Point(f32) {
+                x: container_outer_width - (location.x + final_size.width) - resolved_border.right,
+                y: location.y - resolved_border.top,
+            };
+        }
+        inflow_overflow_rect = inflow_overflow_rect.union(cso.compute_scrollable_overflow_contribution(contribution_location, final_size, item_layout.scrollable_overflow_rect, item.overflow, item.contain, is_scroll_container));
+
+        // first_child_top_margin_set. The top margin of an item with
+        // clearance does not collapse with the container's, so clearance
+        // ends the collapsing without adding the item's own margins; an
+        // item that separated from a float ends it too.
+        if is_collapsing_with_first_margin_set and item_pushed_below_float {
+            is_collapsing_with_first_margin_set = false;
+        }
+        if is_collapsing_with_first_margin_set and has_clearance {
+            is_collapsing_with_first_margin_set = false;
+        } else if is_collapsing_with_first_margin_set {
+            if item.can_be_collapsed_through {
+                first_child_top_margin_set = first_child_top_margin_set.collapse_with_set(top_margin_set).collapse_with_set(bottom_margin_set);
+            } else {
+                first_child_top_margin_set = first_child_top_margin_set.collapse_with_set(top_margin_set);
+                is_collapsing_with_first_margin_set = false;
+            }
+        }
+
+        // active_collapsible_margin_set.
+        if item.can_be_collapsed_through {
+            active_collapsible_margin_set = active_collapsible_margin_set.collapse_with_set(top_margin_set).collapse_with_set(bottom_margin_set);
+            y_offset_for_absolute = committed_y_offset + item_layout.size.height + y_margin_offset;
+        } else {
+            committed_y_offset = location.y - inset_offset.y + item_layout.size.height;
+            // A self-collapsing item with clearance is not collapsed through
+            // (its margins do not collapse with those before it), but its
+            // top and bottom margins still collapse with each other and with
+            // those after it: its border edge stays at the cleared position
+            // and its collapsed margin reaches below, the edge sitting `top
+            // margin` inside it.
+            if has_clearance and item_layout.margins_can_collapse_through {
+                committed_y_offset = committed_y_offset - top_margin_set.resolve();
+                active_collapsible_margin_set = top_margin_set.collapse_with_set(bottom_margin_set);
+                active_margin_set_has_clearance = true;
+            } else {
+                active_collapsible_margin_set = bottom_margin_set;
+                active_margin_set_has_clearance = false;
+            }
+            y_offset_for_absolute = committed_y_offset + active_collapsible_margin_set.resolve();
+            // Committed in-flow content resolves the current strut, so the
+            // floats placed before it no longer force clearance.
+            block_ctx.commit_strut();
+        }
+    }
+
+    // The margins of a self-collapsing element with clearance do not
+    // collapse with the parent's bottom margin: they lengthen its content.
+    var last_child_bottom_margin_set = active_collapsible_margin_set;
+    if active_margin_set_has_clearance {
+        last_child_bottom_margin_set = lt.CollapsibleMarginSet.zero();
+    }
+    var bottom_y_margin_offset: f32 = 0.0;
+    if active_margin_set_has_clearance {
+        bottom_y_margin_offset = active_collapsible_margin_set.resolve();
+    } else if not own_margins_collapse_with_children.end {
+        bottom_y_margin_offset = last_child_bottom_margin_set.resolve();
+    }
+
+    committed_y_offset = committed_y_offset + (resolved_content_box_inset.bottom + bottom_y_margin_offset);
+    let content_height = util.f32_max(a: 0.0, b: committed_y_offset);
+    return InFlowLayout {
+        inflow_overflow_rect: inflow_overflow_rect,
+        content_height: content_height,
+        first_child_top_margin_set: first_child_top_margin_set,
+        last_child_bottom_margin_set: last_child_bottom_margin_set,
+        first_baseline: first_baseline,
+    };
+}
+
+/// min when both are some and max <= min, else none.
+fn min_if_at_most_max(min: ?f32, max: ?f32) -> ?f32 {
+    match min {
+        some(lo) => {
+            match max {
+                some(hi) => {
+                    if hi <= lo {
+                        return lo;
+                    }
+                }
+                none => { }
+            }
+        }
+        none => { }
+    }
+    return none;
+}
+
+/// value.map(|v| -v).
+fn negated(value: ?f32) -> ?f32 {
+    match value {
+        some(v) => { return -v; }
+        none => { return none; }
+    }
+}
+
+/// Line::TRUE when the margins may collapse, else Line::FALSE.
+fn collapsible_if(collapsible: bool) -> geo.Line(bool) {
+    if collapsible {
+        return geo.line_true();
+    }
+    return geo.line_false();
+}
+
+/// Whether an optional layout is some.
+fn is_some_layout(layout: ?lt.Layout) -> bool {
+    match layout {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
+/// Whether an optional segment index is some.
+fn is_some_index(index: ?usize) -> bool {
+    match index {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
+/// Whether an optional alignment is some.
+fn is_some_alignment(alignment: ?sty.AlignItems) -> bool {
+    match alignment {
+        some(_) => { return true; }
+        none => { return false; }
     }
 }
