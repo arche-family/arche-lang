@@ -75,6 +75,15 @@ pub fn linux_file(t: Target) -> str {
     return "std/linux.arche";
 }
 
+/// The file of the library's wasm.jit_arch for a target: the WASM JIT's
+/// machine code is the processor's (lib/wasm/jit.arche).
+pub fn jit_arch_file(t: Target) -> str {
+    if t == Target.LinuxAarch64 or t == Target.FreestandingAarch64 {
+        return "wasm/jit_arch-aarch64.arche";
+    }
+    return "wasm/jit_arch.arche";
+}
+
 /// The options of one compilation, from the command line.
 pub type Options = struct {
     /// The library's directory, ending with '/'.
@@ -641,6 +650,8 @@ pub fn load(fs: &std.Fs, path: str, text: alloc.String, a: alloc.Allocator, opts
                     r.file.push_str(std_file(p.target));
                 } else if written.eq("std.linux") {
                     r.file.push_str(linux_file(p.target));
+                } else if written.eq("wasm.jit_arch") {
+                    r.file.push_str(jit_arch_file(p.target));
                 } else {
                     r.file.push_str(ip.file.view());
                 }

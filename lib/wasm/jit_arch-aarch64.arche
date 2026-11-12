@@ -1,0 +1,831 @@
+/// The baseline JIT's machine code for ARM64 (lib/wasm/jit.arche): the
+/// module wasm.jit_arch on an ARM64 target (compiler/program.arche). It
+/// compiles what the x86-64 one does (jit_arch.arche), the same way. The
+/// frame's values are at x19, the memory at x20 and its size in x21, the
+/// context at x22, all four kept across calls by AAPCS64; x0, x1, x2 and
+/// x17, v0 and v1 are scratch, and x16 holds where the entry stub jumps. An
+/// instruction is a 32-bit word, little-endian.
+import alloc;
+import wasm.jit;
+import wasm.module as m;
+import wasm.validate as vd;
+
+/// The registers: scratch, the address of an offset no instruction holds,
+/// what the context names, and the frame and link registers.
+const X0: u32 = 0;
+const X1: u32 = 1;
+const X2: u32 = 2;
+const X16: u32 = 16;
+const X17: u32 = 17;
+const FRAME: u32 = 19;
+const MEM: u32 = 20;
+const MEM_SIZE: u32 = 21;
+const CTX: u32 = 22;
+const FP: u32 = 29;
+const LR: u32 = 30;
+/// The zero register, or the stack pointer, as the instruction reads it.
+const ZR: u32 = 31;
+
+/// Conditions of b.cond and cset.
+const EQ: u32 = 0x0;
+const NE: u32 = 0x1;
+const HS: u32 = 0x2;
+const LO: u32 = 0x3;
+const MI: u32 = 0x4;
+const HI: u32 = 0x8;
+const LS: u32 = 0x9;
+const GE: u32 = 0xA;
+const LT: u32 = 0xB;
+const GT: u32 = 0xC;
+const LE: u32 = 0xD;
+
+/// The 64-bit form of an instruction that has both: its sf bit.
+const SF: u32 = 0x80000000;
+
+/// Three-register data processing, 32-bit forms: op | rm << 16 | rn << 5 | rd.
+const ADD: u32 = 0x0B000000;
+const SUB: u32 = 0x4B000000;
+const SUBS: u32 = 0x6B000000;
+const AND: u32 = 0x0A000000;
+const ORR: u32 = 0x2A000000;
+const EOR: u32 = 0x4A000000;
+const MUL: u32 = 0x1B007C00;
+const LSLV: u32 = 0x1AC02000;
+const LSRV: u32 = 0x1AC02400;
+const ASRV: u32 = 0x1AC02800;
+const RORV: u32 = 0x1AC02C00;
+
+/// Loads and stores at [rn + unsigned offset], the offset scaled by the size.
+const LDR_X: u32 = 0xF9400000;
+const STR_X: u32 = 0xF9000000;
+const LDR_W: u32 = 0xB9400000;
+const STR_W: u32 = 0xB9000000;
+const LDRSW: u32 = 0xB9800000;
+const LDRSB_W: u32 = 0x39C00000;
+const LDRSB_X: u32 = 0x39800000;
+const LDRSH_W: u32 = 0x79C00000;
+const LDRSH_X: u32 = 0x79800000;
+const LDR_S: u32 = 0xBD400000;
+const LDR_D: u32 = 0xFD400000;
+
+/// Loads and stores at [rn + rm]: rm << 16 | rn << 5 | rt.
+const LDR_X_RR: u32 = 0xF8606800;
+const LDR_W_RR: u32 = 0xB8606800;
+const LDRH_RR: u32 = 0x78606800;
+const LDRB_RR: u32 = 0x38606800;
+const LDRSW_RR: u32 = 0xB8A06800;
+const LDRSH_W_RR: u32 = 0x78E06800;
+const LDRSH_X_RR: u32 = 0x78A06800;
+const LDRSB_W_RR: u32 = 0x38E06800;
+const LDRSB_X_RR: u32 = 0x38A06800;
+const STR_X_RR: u32 = 0xF8206800;
+const STR_W_RR: u32 = 0xB8206800;
+const STRH_RR: u32 = 0x78206800;
+const STRB_RR: u32 = 0x38206800;
+
+/// Scalar floating point, single precision; the double one has bit 22 too.
+const FDOUBLE: u32 = 0x00400000;
+const FADD: u32 = 0x1E202800;
+const FSUB: u32 = 0x1E203800;
+const FMUL: u32 = 0x1E200800;
+const FDIV: u32 = 0x1E201800;
+const FCMP: u32 = 0x1E202000;
+const FSQRT: u32 = 0x1E21C000;
+const FRINTN: u32 = 0x1E244000;
+const FRINTP: u32 = 0x1E24C000;
+const FRINTM: u32 = 0x1E254000;
+const FRINTZ: u32 = 0x1E25C000;
+/// fcvt d, s and fcvt s, d.
+const FCVT_DS: u32 = 0x1E22C000;
+const FCVT_SD: u32 = 0x1E624000;
+/// fmov w, s; with SF and FDOUBLE, fmov x, d.
+const FMOV_GF: u32 = 0x1E260000;
+/// scvtf and ucvtf s, w; SF for an x source, FDOUBLE for a d result.
+const SCVTF: u32 = 0x1E220000;
+const UCVTF: u32 = 0x1E230000;
+
+// ---- writing instructions --------------------------------------------------------------
+
+/// Appends one instruction.
+fn ins(x: &mut jit.Asm, w: u32) {
+    x.bytes.push((w & 0xFF) as u8);
+    x.bytes.push(((w >> 8) & 0xFF) as u8);
+    x.bytes.push(((w >> 16) & 0xFF) as u8);
+    x.bytes.push(((w >> 24) & 0xFF) as u8);
+}
+
+/// Where the next instruction goes.
+fn here(x: &jit.Asm) -> u32 {
+    return x.bytes.len() as u32;
+}
+
+/// The instruction at at.
+fn word_at(x: &jit.Asm, at: u32) -> u32 {
+    let b = x.bytes.items();
+    let i = at as usize;
+    return (b[i] as u32) | ((b[i + 1] as u32) << 8) | ((b[i + 2] as u32) << 16) | ((b[i + 3] as u32) << 24);
+}
+
+/// Writes the instruction at at again.
+fn set_word(x: &mut jit.Asm, at: u32, w: u32) {
+    let b = x.bytes.items_mut();
+    let i = at as usize;
+    b[i] = (w & 0xFF) as u8;
+    b[i + 1] = ((w >> 8) & 0xFF) as u8;
+    b[i + 2] = ((w >> 16) & 0xFF) as u8;
+    b[i + 3] = ((w >> 24) & 0xFF) as u8;
+}
+
+/// The sf bit when wide.
+fn sf(wide: bool) -> u32 {
+    if wide {
+        return SF;
+    }
+    return 0;
+}
+
+/// FDOUBLE when double.
+fn fd(double: bool) -> u32 {
+    if double {
+        return FDOUBLE;
+    }
+    return 0;
+}
+
+/// op rd, rn, rm, of 32 bits or, wide, 64.
+fn rrr(x: &mut jit.Asm, wide: bool, op: u32, d: u32, n: u32, rm: u32) {
+    ins(x, w: sf(wide) | op | (rm << 16) | (n << 5) | d);
+}
+
+/// mov reg, v: movz, then movk for each other 16 bits that are not zero; a
+/// 32-bit register, not wide, is zero above.
+fn mov_imm(x: &mut jit.Asm, wide: bool, reg: u32, v: u64) {
+    var parts: u32 = 2;
+    if wide {
+        parts = 4;
+    }
+    var first = true;
+    var hw: u32 = 0;
+    while hw < parts : (hw += 1) {
+        let part = ((v >> (16 * hw as u64)) & 0xFFFF) as u32;
+        if part == 0 and not (first and hw == parts - 1) {
+            continue;
+        }
+        if first {
+            // movz
+            ins(x, w: sf(wide) | 0x52800000 | (hw << 21) | (part << 5) | reg);
+            first = false;
+        } else {
+            // movk
+            ins(x, w: sf(wide) | 0x72800000 | (hw << 21) | (part << 5) | reg);
+        }
+    }
+}
+
+/// mov rd, rm, 64-bit: orr rd, xzr, rm.
+fn mov_rr(x: &mut jit.Asm, d: u32, rm: u32) {
+    rrr(x, wide: true, op: ORR, d: d, n: ZR, rm: rm);
+}
+
+/// A load or store of 1 << scale bytes between reg and [base + off]: the
+/// unsigned offset form when off fits it, the address in x17 when not.
+fn mem_op(x: &mut jit.Asm, op: u32, scale: u32, reg: u32, base: u32, off: u32) {
+    let size: u32 = 1 << scale;
+    if off % size == 0 and (off >> scale) < 4096 {
+        ins(x, w: op | ((off >> scale) << 10) | (base << 5) | reg);
+        return;
+    }
+    mov_imm(x, wide: true, reg: X17, v: off as u64);
+    rrr(x, wide: true, op: ADD, d: X17, n: base, rm: X17);
+    ins(x, w: op | (X17 << 5) | reg);
+}
+
+/// ldr of 8 bytes, or 4 zero-extended, from [base + off].
+fn load(x: &mut jit.Asm, wide: bool, reg: u32, base: u32, off: u32) {
+    if wide {
+        mem_op(x, op: LDR_X, scale: 3, reg: reg, base: base, off: off);
+    } else {
+        mem_op(x, op: LDR_W, scale: 2, reg: reg, base: base, off: off);
+    }
+}
+
+/// str of 8 bytes, or 4, to [base + off].
+fn store(x: &mut jit.Asm, wide: bool, reg: u32, base: u32, off: u32) {
+    if wide {
+        mem_op(x, op: STR_X, scale: 3, reg: reg, base: base, off: off);
+    } else {
+        mem_op(x, op: STR_W, scale: 2, reg: reg, base: base, off: off);
+    }
+}
+
+/// The slot of the frame's value h: [x19 + 8h].
+fn slot(h: u32) -> u32 {
+    return 8 * h;
+}
+
+/// The context's field: [x22 + 8 field].
+fn ctx(field: u32) -> u32 {
+    return 8 * field;
+}
+
+/// b to a pc of the function, patched when all of it is written.
+fn b_pc(x: &mut jit.Asm, pc: u32) {
+    x.fixups.push(here(x));
+    x.targets.push(pc);
+    ins(x, w: 0x14000000);
+}
+
+/// b to a pc, skipped when w0 is zero (or, skip_nonzero, when it is not)
+/// by a cbz or cbnz over it: b reaches the whole region, which a cbz's 1 MiB
+/// may not.
+fn b_pc_unless(x: &mut jit.Asm, skip_nonzero: bool, pc: u32) {
+    var op: u32 = 0x34000000;
+    if skip_nonzero {
+        op = 0x35000000;
+    }
+    ins(x, w: op | (2 << 5) | X0);
+    b_pc(x, pc: pc);
+}
+
+/// b.cond forward within the code being written: its position.
+fn bcond_fwd(x: &mut jit.Asm, cond: u32) -> u32 {
+    let at = here(x);
+    ins(x, w: 0x54000000 | cond);
+    return at;
+}
+
+/// cbz (or cbnz) of w0 forward: its position.
+fn cbz_fwd(x: &mut jit.Asm, nonzero: bool) -> u32 {
+    let at = here(x);
+    var op: u32 = 0x34000000;
+    if nonzero {
+        op = 0x35000000;
+    }
+    ins(x, w: op | X0);
+    return at;
+}
+
+/// b forward within the code being written: its position.
+fn b_fwd(x: &mut jit.Asm) -> u32 {
+    let at = here(x);
+    ins(x, w: 0x14000000);
+    return at;
+}
+
+/// Points the branch at at to here: a b's 26 bits of distance, or a
+/// b.cond's, cbz's or cbnz's 19, which reach 1 MiB, more than the code they
+/// skip.
+fn patch_here(x: &mut jit.Asm, at: u32) {
+    let rel = (here(x) - at) >> 2;
+    let w = word_at(x, at: at);
+    if w & 0xFC000000 == 0x14000000 {
+        set_word(x, at: at, w: 0x14000000 | (rel & 0x3FFFFFF));
+    } else {
+        set_word(x, at: at, w: (w & 0xFF00001F) | ((rel & 0x7FFFF) << 5));
+    }
+}
+
+/// b to an absolute offset of the region, from code that will sit at base.
+fn b_abs(x: &mut jit.Asm, base: u32, to: u32) {
+    let rel = (to -% (base + here(x))) >> 2;
+    ins(x, w: 0x14000000 | (rel & 0x3FFFFFF));
+}
+
+/// cset wd, cond: csinc wd, wzr, wzr, the inverse condition.
+fn cset(x: &mut jit.Asm, d: u32, cond: u32) {
+    ins(x, w: 0x1A9F07E0 | ((cond ^ 1) << 12) | d);
+}
+
+// ---- the stubs -------------------------------------------------------------------------
+
+/// The region's start: entry(ctx in x0) saves the frame record and the
+/// registers it uses that AAPCS64 keeps, 48 bytes so that sp stays aligned
+/// to 16, loads the context and jumps to its resume address; the exit, at
+/// the returned offset, restores them and returns with x0.
+pub fn stubs(x: &mut jit.Asm) -> u32 {
+    // stp x29, x30, [sp, #-48]!
+    ins(x, w: 0xA9800000 | ((0x80 - 6) << 15) | (LR << 10) | (ZR << 5) | FP);
+    // mov x29, sp
+    ins(x, w: 0x91000000 | (ZR << 5) | FP);
+    // stp x19, x20, [sp, #16]; stp x21, x22, [sp, #32]
+    ins(x, w: 0xA9000000 | (2 << 15) | (MEM << 10) | (ZR << 5) | FRAME);
+    ins(x, w: 0xA9000000 | (4 << 15) | (CTX << 10) | (ZR << 5) | MEM_SIZE);
+    mov_rr(x, d: CTX, rm: X0);
+    load(x, wide: true, reg: FRAME, base: CTX, off: ctx(jit.CTX_FRAME));
+    load(x, wide: true, reg: MEM, base: CTX, off: ctx(jit.CTX_MEM));
+    load(x, wide: true, reg: MEM_SIZE, base: CTX, off: ctx(jit.CTX_MEM_SIZE));
+    load(x, wide: true, reg: X16, base: CTX, off: ctx(jit.CTX_RESUME));
+    // br x16
+    ins(x, w: 0xD61F0000 | (X16 << 5));
+    let back = here(x);
+    // ldp x21, x22, [sp, #32]; ldp x19, x20, [sp, #16]
+    ins(x, w: 0xA9400000 | (4 << 15) | (CTX << 10) | (ZR << 5) | MEM_SIZE);
+    ins(x, w: 0xA9400000 | (2 << 15) | (MEM << 10) | (ZR << 5) | FRAME);
+    // ldp x29, x30, [sp], #48
+    ins(x, w: 0xA8C00000 | (6 << 15) | (LR << 10) | (ZR << 5) | FP);
+    // ret
+    ins(x, w: 0xD65F03C0);
+    return back;
+}
+
+// ---- compiling -------------------------------------------------------------------------
+
+/// An exit to exec.arche: where to go on (pc), the height, and why.
+fn exit(x: &mut jit.Asm, base: u32, exit_at: u32, kind: u64, pc: u32, h: u32) {
+    mov_imm(x, wide: true, reg: X0, v: pc as u64);
+    store(x, wide: true, reg: X0, base: CTX, off: ctx(jit.CTX_PC));
+    mov_imm(x, wide: true, reg: X0, v: h as u64);
+    store(x, wide: true, reg: X0, base: CTX, off: ctx(jit.CTX_SP));
+    mov_imm(x, wide: true, reg: X0, v: kind);
+    b_abs(x, base: base, to: exit_at);
+}
+
+/// Copies keep values from below h to height to (a branch's move).
+fn move_values(x: &mut jit.Asm, h: u32, keep: u32, to: u32) {
+    if h - keep == to {
+        return;
+    }
+    var i: u32 = 0;
+    while i < keep : (i += 1) {
+        load(x, wide: true, reg: X0, base: FRAME, off: slot(h - keep + i));
+        store(x, wide: true, reg: X0, base: FRAME, off: slot(to + i));
+    }
+}
+
+/// i32 or i64 compare of the two below h, cset, into the lower one's slot.
+fn compare(x: &mut jit.Asm, wide: bool, cond: u32, h: u32) {
+    load(x, wide: wide, reg: X0, base: FRAME, off: slot(h - 2));
+    load(x, wide: wide, reg: X1, base: FRAME, off: slot(h - 1));
+    rrr(x, wide: wide, op: SUBS, d: ZR, n: X0, rm: X1);
+    set_result(x, cond: cond, h: h - 2);
+}
+
+/// w0 = cond, zero-extended, into the slot h.
+fn set_result(x: &mut jit.Asm, cond: u32, h: u32) {
+    cset(x, d: X0, cond: cond);
+    store(x, wide: true, reg: X0, base: FRAME, off: slot(h));
+}
+
+/// A float of either width from the slot h into v reg.
+fn load_float(x: &mut jit.Asm, double: bool, reg: u32, h: u32) {
+    if double {
+        mem_op(x, op: LDR_D, scale: 3, reg: reg, base: FRAME, off: slot(h));
+    } else {
+        mem_op(x, op: LDR_S, scale: 2, reg: reg, base: FRAME, off: slot(h));
+    }
+}
+
+/// Two floats below h into v0 and v1.
+fn load_floats(x: &mut jit.Asm, double: bool, h: u32) {
+    load_float(x, double: double, reg: 0, h: h - 2);
+    load_float(x, double: double, reg: 1, h: h - 1);
+}
+
+/// v0, a float of either width, into the slot h, zero above an f32.
+fn store_float(x: &mut jit.Asm, double: bool, h: u32) {
+    // fmov w0, s0 / fmov x0, d0
+    ins(x, w: sf(double) | fd(double) | FMOV_GF | X0);
+    store(x, wide: true, reg: X0, base: FRAME, off: slot(h));
+}
+
+/// A float instruction of v registers: op | rm << 16 | rn << 5 | rd.
+fn fop(x: &mut jit.Asm, double: bool, op: u32, d: u32, n: u32, rm: u32) {
+    ins(x, w: fd(double) | op | (rm << 16) | (n << 5) | d);
+}
+
+/// Compiles function fi of an instance's module: code and heights from
+/// validation, globals the store's addresses of the instance's globals, and
+/// the region's offsets where this code will go and where the exit is.
+pub fn compile(f: &m.Func, globals: []u32, global_stride: u32, global_value: u32, base: u32, exit_at: u32, x: &mut jit.Asm, a: alloc.Allocator) -> jit.Compiled {
+    let code = f.code.items();
+    let heights = f.heights.items();
+    var out = jit.Compiled { resume: alloc.List(u32).init(a) };
+    var i: usize = 0;
+    while i < code.len() : (i += 1) {
+        out.resume.push(m.UNREACHED);
+    }
+    x.fixups.clear();
+    x.targets.clear();
+    var pc: usize = 0;
+    while pc < code.len() {
+        let n = jit.length(code, pc: pc);
+        let h = heights[pc];
+        let op = code[pc];
+        let next = (pc + n) as u32;
+        if h == m.UNREACHED {
+            pc += n;
+            continue;
+        }
+        out.resume.items_mut()[pc] = base + here(x);
+        var done = true;
+        if op == 0x41 {
+            mov_imm(x, wide: false, reg: X0, v: code[pc + 1] as u64);
+            store(x, wide: true, reg: X0, base: FRAME, off: slot(h));
+        } else if op == 0x42 {
+            mov_imm(x, wide: true, reg: X0, v: (code[pc + 1] as u64) | ((code[pc + 2] as u64) << 32));
+            store(x, wide: true, reg: X0, base: FRAME, off: slot(h));
+        } else if op == 0x20 {
+            load(x, wide: true, reg: X0, base: FRAME, off: slot(code[pc + 1]));
+            store(x, wide: true, reg: X0, base: FRAME, off: slot(h));
+        } else if op == 0x21 or op == 0x22 {
+            load(x, wide: true, reg: X0, base: FRAME, off: slot(h - 1));
+            store(x, wide: true, reg: X0, base: FRAME, off: slot(code[pc + 1]));
+        } else if op == 0x23 or op == 0x24 {
+            let g = globals[code[pc + 1] as usize];
+            load(x, wide: true, reg: X1, base: CTX, off: ctx(jit.CTX_GLOBALS));
+            let at = g * global_stride + global_value;
+            if op == 0x23 {
+                load(x, wide: true, reg: X0, base: X1, off: at);
+                store(x, wide: true, reg: X0, base: FRAME, off: slot(h));
+            } else {
+                load(x, wide: true, reg: X0, base: FRAME, off: slot(h - 1));
+                store(x, wide: true, reg: X0, base: X1, off: at);
+            }
+        } else if op == 0x1A {
+            // drop: the height is all.
+        } else if op == 0x1B {
+            load(x, wide: false, reg: X0, base: FRAME, off: slot(h - 1));
+            let keep = cbz_fwd(x, nonzero: true);
+            load(x, wide: true, reg: X0, base: FRAME, off: slot(h - 2));
+            store(x, wide: true, reg: X0, base: FRAME, off: slot(h - 3));
+            patch_here(x, at: keep);
+        } else if op == 0xD0 {
+            mov_imm(x, wide: true, reg: X0, v: m.NULL_REF);
+            store(x, wide: true, reg: X0, base: FRAME, off: slot(h));
+        } else if op == 0xD1 {
+            mov_imm(x, wide: true, reg: X1, v: m.NULL_REF);
+            load(x, wide: true, reg: X0, base: FRAME, off: slot(h - 1));
+            rrr(x, wide: true, op: SUBS, d: ZR, n: X0, rm: X1);
+            set_result(x, cond: EQ, h: h - 1);
+        } else if op == vd.OP_TICK {
+            // The fuel, one less; on zero, a look at the clock.
+            load(x, wide: true, reg: X0, base: CTX, off: ctx(jit.CTX_FUEL));
+            // subs x0, x0, #1
+            ins(x, w: 0xF1000400 | (X0 << 5) | X0);
+            store(x, wide: true, reg: X0, base: CTX, off: ctx(jit.CTX_FUEL));
+            let more = bcond_fwd(x, cond: NE);
+            exit(x, base: base, exit_at: exit_at, kind: jit.EXIT_TICK, pc: next, h: h);
+            patch_here(x, at: more);
+        } else if op == vd.OP_JUMP {
+            b_pc(x, pc: code[pc + 1]);
+        } else if op == vd.OP_BR {
+            move_values(x, h: h, keep: code[pc + 2], to: code[pc + 3]);
+            b_pc(x, pc: code[pc + 1]);
+        } else if op == vd.OP_BR_IF or op == vd.OP_IF_FALSE {
+            load(x, wide: false, reg: X0, base: FRAME, off: slot(h - 1));
+            // br_if goes when it is not zero, if_false when it is.
+            b_pc_unless(x, skip_nonzero: op == vd.OP_IF_FALSE, pc: code[pc + 1]);
+        } else if op == vd.OP_BR_IF_MOVE {
+            load(x, wide: false, reg: X0, base: FRAME, off: slot(h - 1));
+            // cbnz w0 over a b past the move, which may be long.
+            ins(x, w: 0x35000000 | (2 << 5) | X0);
+            let skip = b_fwd(x);
+            move_values(x, h: h - 1, keep: code[pc + 2], to: code[pc + 3]);
+            b_pc(x, pc: code[pc + 1]);
+            patch_here(x, at: skip);
+        } else if op == vd.OP_RETURN {
+            exit(x, base: base, exit_at: exit_at, kind: jit.EXIT_RETURN, pc: pc as u32, h: h);
+        } else if op == 0x10 {
+            mov_imm(x, wide: true, reg: X0, v: code[pc + 1] as u64);
+            store(x, wide: true, reg: X0, base: CTX, off: ctx(jit.CTX_ARG));
+            exit(x, base: base, exit_at: exit_at, kind: jit.EXIT_CALL, pc: next, h: h);
+        } else if op == 0x3F {
+            // lsr x0, x21, #16
+            ins(x, w: 0xD350FC00 | (MEM_SIZE << 5) | X0);
+            store(x, wide: true, reg: X0, base: FRAME, off: slot(h));
+        } else if op >= 0x28 and op <= 0x3E {
+            done = memory_op(x, op: op, offset: code[pc + 1], h: h, base: base, exit_at: exit_at, pc: pc as u32);
+        } else if op >= 0x45 and op <= 0xC4 {
+            done = numeric_op(x, op: op, h: h);
+        } else {
+            done = false;
+        }
+        if not done {
+            // The interpreter does it.
+            exit(x, base: base, exit_at: exit_at, kind: jit.EXIT_SLOW, pc: pc as u32, h: h);
+        }
+        pc += n;
+    }
+    // Branches to pcs, now that every pc has its place.
+    var k: usize = 0;
+    while k < x.fixups.len() : (k += 1) {
+        let at = x.fixups.items()[k];
+        let target = out.resume.items()[x.targets.items()[k] as usize] - base;
+        let rel = (target -% at) >> 2;
+        set_word(x, at: at, w: 0x14000000 | (rel & 0x3FFFFFF));
+    }
+    return out;
+}
+
+/// A load or store: the address checked against the memory's size, which
+/// goes back to the interpreter, to trap, when it does not fit.
+fn memory_op(x: &mut jit.Asm, op: u32, offset: u32, h: u32, base: u32, exit_at: u32, pc: u32) -> bool {
+    var size: u32 = 4;
+    var addr_slot = h - 1;
+    if op >= 0x36 {
+        addr_slot = h - 2;
+        if op == 0x37 or op == 0x39 {
+            size = 8;
+        } else if op == 0x3A or op == 0x3C {
+            size = 1;
+        } else if op == 0x3B or op == 0x3D {
+            size = 2;
+        }
+    } else if op == 0x29 or op == 0x2B {
+        size = 8;
+    } else if op == 0x2C or op == 0x2D or op == 0x30 or op == 0x31 {
+        size = 1;
+    } else if op == 0x2E or op == 0x2F or op == 0x32 or op == 0x33 {
+        size = 2;
+    }
+    // As on x86-64, where a displacement holds no more: the interpreter's.
+    if offset > 0x7FFFFFFF - 8 {
+        return false;
+    }
+    // x1: the address, zero-extended; x2: its end, against x21.
+    load(x, wide: false, reg: X1, base: FRAME, off: slot(addr_slot));
+    mov_imm(x, wide: true, reg: X2, v: (offset + size) as u64);
+    rrr(x, wide: true, op: ADD, d: X2, n: X1, rm: X2);
+    rrr(x, wide: true, op: SUBS, d: ZR, n: X2, rm: MEM_SIZE);
+    let fits = bcond_fwd(x, cond: LS);
+    exit(x, base: base, exit_at: exit_at, kind: jit.EXIT_SLOW, pc: pc, h: h);
+    patch_here(x, at: fits);
+    // The access, at [x20 + x1], x1 the address and the offset.
+    if offset != 0 {
+        mov_imm(x, wide: true, reg: X2, v: offset as u64);
+        rrr(x, wide: true, op: ADD, d: X1, n: X1, rm: X2);
+    }
+    var o: u32 = 0;
+    if op >= 0x36 {
+        load(x, wide: true, reg: X0, base: FRAME, off: slot(h - 1));
+        o = STR_W_RR;
+        if size == 8 {
+            o = STR_X_RR;
+        } else if size == 2 {
+            o = STRH_RR;
+        } else if size == 1 {
+            o = STRB_RR;
+        }
+        ins(x, w: o | (X1 << 16) | (MEM << 5) | X0);
+        return true;
+    }
+    // Loads into x0, extended as the op says.
+    if op == 0x28 or op == 0x2A or op == 0x35 {
+        o = LDR_W_RR;
+    } else if op == 0x29 or op == 0x2B {
+        o = LDR_X_RR;
+    } else if op == 0x2C {
+        o = LDRSB_W_RR;
+    } else if op == 0x2D or op == 0x31 {
+        o = LDRB_RR;
+    } else if op == 0x2E {
+        o = LDRSH_W_RR;
+    } else if op == 0x2F or op == 0x33 {
+        o = LDRH_RR;
+    } else if op == 0x30 {
+        o = LDRSB_X_RR;
+    } else if op == 0x32 {
+        o = LDRSH_X_RR;
+    } else {
+        // i64.load32_s
+        o = LDRSW_RR;
+    }
+    ins(x, w: o | (X1 << 16) | (MEM << 5) | X0);
+    store(x, wide: true, reg: X0, base: FRAME, off: slot(addr_slot));
+    return true;
+}
+
+/// The numeric instructions the JIT does itself, those of the x86-64 one;
+/// false for the others.
+fn numeric_op(x: &mut jit.Asm, op: u32, h: u32) -> bool {
+    // i32 and i64 compares.
+    if op == 0x45 or op == 0x50 {
+        let wide = op == 0x50;
+        load(x, wide: wide, reg: X0, base: FRAME, off: slot(h - 1));
+        // cmp x0, #0
+        ins(x, w: sf(wide) | 0x7100001F | (X0 << 5));
+        set_result(x, cond: EQ, h: h - 1);
+        return true;
+    }
+    if (op >= 0x46 and op <= 0x4F) or (op >= 0x51 and op <= 0x5A) {
+        var k = op - 0x46;
+        let wide = op >= 0x51;
+        if wide {
+            k = op - 0x51;
+        }
+        var cond = EQ;
+        if k == 1 { cond = NE; }
+        if k == 2 { cond = LT; }
+        if k == 3 { cond = LO; }
+        if k == 4 { cond = GT; }
+        if k == 5 { cond = HI; }
+        if k == 6 { cond = LE; }
+        if k == 7 { cond = LS; }
+        if k == 8 { cond = GE; }
+        if k == 9 { cond = HS; }
+        compare(x, wide: wide, cond: cond, h: h);
+        return true;
+    }
+    // Float compares: fcmp, which an unordered pair leaves as C and V, so
+    // that only ne holds for a NaN.
+    if op >= 0x5B and op <= 0x66 {
+        let double = op >= 0x61;
+        var k = op - 0x5B;
+        if double {
+            k = op - 0x61;
+        }
+        load_floats(x, double: double, h: h);
+        fop(x, double: double, op: FCMP, d: 0, n: 0, rm: 1);
+        var cond = EQ;
+        if k == 1 { cond = NE; }
+        if k == 2 { cond = MI; }
+        if k == 3 { cond = GT; }
+        if k == 4 { cond = LS; }
+        if k == 5 { cond = GE; }
+        set_result(x, cond: cond, h: h - 2);
+        return true;
+    }
+    // Integer arithmetic: add, sub, mul, and, or, xor, shifts, rotates; the
+    // shifts take their count modulo the width, as WebAssembly's do.
+    if (op >= 0x6A and op <= 0x6C) or (op >= 0x71 and op <= 0x78) or (op >= 0x7C and op <= 0x7E) or (op >= 0x83 and op <= 0x8A) {
+        let wide = op >= 0x7C;
+        var k = op;
+        if wide {
+            k = op - 0x7C + 0x6A;
+        }
+        load(x, wide: wide, reg: X0, base: FRAME, off: slot(h - 2));
+        load(x, wide: wide, reg: X1, base: FRAME, off: slot(h - 1));
+        var o = ADD;
+        if k == 0x6B { o = SUB; }
+        if k == 0x6C { o = MUL; }
+        if k == 0x71 { o = AND; }
+        if k == 0x72 { o = ORR; }
+        if k == 0x73 { o = EOR; }
+        if k == 0x74 { o = LSLV; }
+        if k == 0x75 { o = ASRV; }
+        if k == 0x76 { o = LSRV; }
+        if k == 0x77 or k == 0x78 { o = RORV; }
+        if k == 0x77 {
+            // rotl by n is rotr by -n.
+            rrr(x, wide: wide, op: SUB, d: X1, n: ZR, rm: X1);
+        }
+        rrr(x, wide: wide, op: o, d: X0, n: X0, rm: X1);
+        store(x, wide: true, reg: X0, base: FRAME, off: slot(h - 2));
+        return true;
+    }
+    // Float arithmetic: add, sub, mul, div.
+    if (op >= 0x92 and op <= 0x95) or (op >= 0xA0 and op <= 0xA3) {
+        let double = op >= 0xA0;
+        var k = op - 0x92;
+        if double {
+            k = op - 0xA0;
+        }
+        load_floats(x, double: double, h: h);
+        var o = FADD;
+        if k == 1 { o = FSUB; }
+        if k == 2 { o = FMUL; }
+        if k == 3 { o = FDIV; }
+        fop(x, double: double, op: o, d: 0, n: 0, rm: 1);
+        store_float(x, double: double, h: h - 2);
+        return true;
+    }
+    // sqrt, and ceil, floor, trunc and nearest (ties to even) by frint.
+    if op == 0x91 or op == 0x9F or (op >= 0x8D and op <= 0x90) or (op >= 0x9B and op <= 0x9E) {
+        let double = op >= 0x99;
+        load_float(x, double: double, reg: 0, h: h - 1);
+        var o = FSQRT;
+        if op != 0x91 and op != 0x9F {
+            var k = op - 0x8D;
+            if double {
+                k = op - 0x9B;
+            }
+            o = FRINTP;
+            if k == 1 { o = FRINTM; }
+            if k == 2 { o = FRINTZ; }
+            if k == 3 { o = FRINTN; }
+        }
+        fop(x, double: double, op: o, d: 0, n: 0, rm: 0);
+        store_float(x, double: double, h: h - 1);
+        return true;
+    }
+    // abs and neg: bits.
+    if op == 0x8B or op == 0x8C or op == 0x99 or op == 0x9A {
+        let wide = op == 0x99 or op == 0x9A;
+        load(x, wide: true, reg: X0, base: FRAME, off: slot(h - 1));
+        var mask: u64 = 0x7FFFFFFF;
+        var o = AND;
+        if op == 0x8C {
+            mask = 0x80000000;
+            o = EOR;
+        } else if op == 0x99 {
+            mask = 0x7FFFFFFFFFFFFFFF;
+        } else if op == 0x9A {
+            mask = 0x8000000000000000;
+            o = EOR;
+        }
+        mov_imm(x, wide: wide, reg: X1, v: mask);
+        rrr(x, wide: wide, op: o, d: X0, n: X0, rm: X1);
+        store(x, wide: true, reg: X0, base: FRAME, off: slot(h - 1));
+        return true;
+    }
+    // wrap, extend, reinterpret, and sign extension.
+    if op == 0xA7 or op == 0xAD {
+        load(x, wide: false, reg: X0, base: FRAME, off: slot(h - 1));
+        store(x, wide: true, reg: X0, base: FRAME, off: slot(h - 1));
+        return true;
+    }
+    if op == 0xAC or op == 0xC4 {
+        mem_op(x, op: LDRSW, scale: 2, reg: X0, base: FRAME, off: slot(h - 1));
+        store(x, wide: true, reg: X0, base: FRAME, off: slot(h - 1));
+        return true;
+    }
+    if op >= 0xBC and op <= 0xBF {
+        return true;
+    }
+    if op >= 0xC0 and op <= 0xC3 {
+        // ldrsb or ldrsh into w0 (zero above) or x0.
+        if op == 0xC0 {
+            mem_op(x, op: LDRSB_W, scale: 0, reg: X0, base: FRAME, off: slot(h - 1));
+        } else if op == 0xC1 {
+            mem_op(x, op: LDRSH_W, scale: 1, reg: X0, base: FRAME, off: slot(h - 1));
+        } else if op == 0xC2 {
+            mem_op(x, op: LDRSB_X, scale: 0, reg: X0, base: FRAME, off: slot(h - 1));
+        } else {
+            mem_op(x, op: LDRSH_X, scale: 1, reg: X0, base: FRAME, off: slot(h - 1));
+        }
+        store(x, wide: true, reg: X0, base: FRAME, off: slot(h - 1));
+        return true;
+    }
+    // promote and demote.
+    if op == 0xBB or op == 0xB6 {
+        let double_in = op == 0xB6;
+        load_float(x, double: double_in, reg: 0, h: h - 1);
+        if double_in {
+            ins(x, w: FCVT_SD);
+        } else {
+            ins(x, w: FCVT_DS);
+        }
+        store_float(x, double: not double_in, h: h - 1);
+        return true;
+    }
+    // Integers to floats, but u64, which the x86-64 JIT leaves to the
+    // interpreter.
+    if op == 0xB2 or op == 0xB3 or op == 0xB4 or op == 0xB7 or op == 0xB8 or op == 0xB9 {
+        let double = op >= 0xB7;
+        var o = SCVTF;
+        if op == 0xB3 or op == 0xB8 {
+            o = UCVTF;
+        }
+        let wide = op == 0xB4 or op == 0xB9;
+        load(x, wide: wide, reg: X0, base: FRAME, off: slot(h - 1));
+        ins(x, w: sf(wide) | fd(double) | o | (X0 << 5) | 0);
+        store_float(x, double: double, h: h - 1);
+        return true;
+    }
+    return false;
+}
+
+// ---- running it ------------------------------------------------------------------------
+
+/// Calls the entry stub at entry, the context in x0, as AAPCS64 calls a
+/// function; what the machine code came back for, in x0.
+pub unsafe fn enter(entry: u64, context: u64) -> u64 {
+    var arg = context;
+    // SAFETY: the caller's (jit.enter): entry is the region's entry stub,
+    // which keeps what AAPCS64 keeps and returns to here with blr's link;
+    // the code it runs only touches what the context names, and of what
+    // AAPCS64 lets a call change, only the registers this names. LLVM
+    // knows x30 as lr: a clobber of "x30" it would not see.
+    asm("blr %1", inout("x0") arg, in(reg) entry,
+        clobber("x1"), clobber("x2"), clobber("x3"), clobber("x4"), clobber("x5"), clobber("x6"), clobber("x7"), clobber("x8"),
+        clobber("x9"), clobber("x10"), clobber("x11"), clobber("x12"), clobber("x13"), clobber("x14"), clobber("x15"),
+        clobber("x16"), clobber("x17"), clobber("lr"), clobber("q0"), clobber("q1"), clobber("cc"));
+    return arg;
+}
+
+/// Makes the size bytes of code just written at at what the processor
+/// fetches: each data cache line cleaned to where instruction fetch sees
+/// it, then each instruction cache line invalidated, as Linux's
+/// __flush_icache_range does, the line sizes from CTR_EL0.
+pub unsafe fn sync(at: u64, size: u64) {
+    if size == 0 {
+        return;
+    }
+    var ctr: u64 = 0;
+    asm("mrs %0, ctr_el0", out(reg) ctr);
+    let word: u64 = 4;
+    let dline = word << ((ctr >> 16) & 0xF);
+    let iline = word << (ctr & 0xF);
+    let end = at + size;
+    var p = at & ~(dline - 1);
+    while p < end : (p += dline) {
+        asm("dc cvau, %0", in(reg) p);
+    }
+    asm("dsb ish");
+    p = at & ~(iline - 1);
+    while p < end : (p += iline) {
+        asm("ic ivau, %0", in(reg) p);
+    }
+    asm("dsb ish");
+    asm("isb");
+}

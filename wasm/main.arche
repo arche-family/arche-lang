@@ -60,8 +60,8 @@ fn code_region() -> u64 {
     var at: i64 = 0;
     unsafe {
         // SAFETY: mmap of fresh anonymous memory; nothing else holds it.
-        // 9 is mmap; 7 read, write and execute; 0x22 private and anonymous.
-        at = linux.syscall(9, [0, JIT_SIZE as i64, 7, 0x22, -1, 0]);
+        // mmap; 7 read, write and execute; 0x22 private and anonymous.
+        at = linux.syscall(linux.MMAP, [0, JIT_SIZE as i64, 7, 0x22, -1, 0]);
     }
     if at < 0 {
         return 0;

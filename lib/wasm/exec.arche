@@ -1483,7 +1483,8 @@ fn slow_op(s: &mut Store, inst: u32, op: u32, x: u32, y: u32, sp: &mut usize, pc
 // ---- the JIT ----------------------------------------------------------------------------
 
 /// Machine code from now on, in the region of size bytes at base, which the
-/// embedder made readable, writable and executable. x86-64 only.
+/// embedder made readable, writable and executable. x86-64 and ARM64
+/// (jit.arche).
 pub fn enable_jit(s: &mut Store, base: u64, size: u64) {
     var x = jit.new_asm(s.a);
     let exit_at = jit.stubs(&mut x);
@@ -1508,6 +1509,7 @@ fn write_code(s: &mut Store, bytes: []u8) {
         while i < bytes.len() : (i += 1) {
             p.add(i).* = bytes[i];
         }
+        jit.sync(at: s.jit_base + s.jit_used, size: bytes.len() as u64);
     }
     s.jit_used += bytes.len() as u64;
 }
@@ -1565,14 +1567,12 @@ fn enter_jit(s: &mut Store, inst: u32, fp: usize, resume: u32) -> u64 {
     c[jit.CTX_GLOBALS as usize] = globals_at;
     let entry = s.jit_base + jit.ENTRY as u64;
     var status: u64 = 0;
-    var arg = ctx_at;
     unsafe {
         // SAFETY: entry is the region's entry stub, which keeps what the
-        // System V ABI keeps and returns to here; the code it runs only
-        // touches what the context names.
-        asm("call *%1", out("rax") status, in(reg) entry, inout("rdi") arg,
-            clobber("rcx"), clobber("rdx"), clobber("rsi"), clobber("r8"), clobber("r9"), clobber("r10"), clobber("r11"),
-            clobber("xmm0"), clobber("xmm1"));
+        // platform's calling convention keeps and returns to here; the code
+        // it runs, written and synced by write_code, only touches what the
+        // context names.
+        status = jit.enter(entry: entry, context: ctx_at);
     }
     s.fuel = s.jit_ctx.items()[jit.CTX_FUEL as usize] as u32;
     return status;

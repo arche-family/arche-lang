@@ -82,6 +82,12 @@ jobs:
         run: cd compiler && CLANG=false LLD=false ARCHE_BACKEND=own ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
       - name: Conformance tests in QEMU, in a release build
         run: cd compiler && ARCHE_FLAGS=--release ARCHE_TARGET=linux-${{ matrix.arch }} ../conformance/runner/build/runner --arch ${{ matrix.arch }} --timeout 120 --compiler ./arche-build ../conformance/tests
+      - name: The WebAssembly spec's tests in QEMU, in the interpreter and with the ARM64 JIT (S39)
+        if: matrix.arch == 'aarch64'
+        run: |
+          mkdir -p wasm/build
+          (cd wasm && ARCHE_TARGET=linux-aarch64 ARCHE_QEMU=qemu-aarch64-static ../compiler/arche-build main.arche "$PWD/build/arche-wasm-aarch64")
+          sh wasm/spec.sh wasm/build/arche-wasm-aarch64
       - name: A real font drawn as on x86-64, bit for bit; PngSuite decoded as there
         run: ARCHE_TARGET=linux-${{ matrix.arch }} ./interop/font.sh && ARCHE_TARGET=linux-${{ matrix.arch }} ./interop/png.sh
       - name: The ABI suite, each module by each backend

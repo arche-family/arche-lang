@@ -41,4 +41,17 @@ else
     set -- "$json"/*/*.json
 fi
 "$wasm" spec "$@"
-"$wasm" spec --jit "$@"
+# With the JIT, which must have run: without a code region from the system,
+# arche-wasm runs everything in the interpreter and says nothing of machine
+# code.
+status=0
+out=$("$wasm" spec --jit "$@") || status=$?
+printf '%s\n' "$out"
+[ "$status" -eq 0 ] || exit "$status"
+case $out in
+*"machine code ran"*) ;;
+*)
+    echo "spec.sh: the JIT did not run" >&2
+    exit 1
+    ;;
+esac
