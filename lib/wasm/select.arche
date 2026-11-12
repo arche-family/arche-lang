@@ -1,0 +1,554 @@
+/// Whether an element matches a selector, for the cascade and for
+/// query-all, as Nimadir's shell matches (host/src/dom/select.rs).
+///
+/// Matching runs right to left, from the element up and back through its
+/// siblings, and a descendant combinator may have to try every ancestor. A
+/// guest writes the selectors, so two things bound it: a selector has at
+/// most css.MAX_COMPOUNDS parts (longer ones are refused when read), and
+/// one match may take MAX_STEPS steps before it is given up as no match.
+import alloc;
+import wasm.css;
+
+/// The most elements one match may visit.
+const MAX_STEPS: u32 = 10000;
+
+/// The page, as selectors see it: nodes numbered from 1 (0 is none), each
+/// an element, with a tag, or a run of text, with an empty one; its parent,
+/// its children in order, and its attributes in order.
+pub type Doc = interface {
+    /// How many node numbers there are; some may name no node.
+    fn doc_size(self: &Self) -> u32;
+    /// Whether n is a node, made and not released.
+    fn doc_alive(self: &Self, n: u32) -> bool;
+    /// An element's tag, as the selectors' are in lower case; "" for text.
+    fn doc_tag(self: &Self, n: u32) -> str;
+    /// A run of text's text.
+    fn doc_text(self: &Self, n: u32) -> str;
+    /// n's parent; 0 for none.
+    fn doc_parent(self: &Self, n: u32) -> u32;
+    /// n's children, in order.
+    fn doc_children(self: &Self, n: u32) -> []u32;
+    /// How many attributes n has.
+    fn doc_attr_count(self: &Self, n: u32) -> usize;
+    /// The name of n's attribute k, in lower case.
+    fn doc_attr_name(self: &Self, n: u32, k: usize) -> str;
+    /// The value of n's attribute k.
+    fn doc_attr_value(self: &Self, n: u32, k: usize) -> str;
+}
+
+/// What the user is doing to the page, for :hover, :active and :focus:
+/// the element under the pointer, the one pressed, the one with the
+/// keyboard; 0 for none.
+pub type State = struct {
+    pub hovered: u32,
+    pub pressed: u32,
+    pub focused: u32,
+}
+
+/// Each element's place among its parent's element children, and how many
+/// there are, by node number: worked out once per styling, so that
+/// :nth-child over a long list is not quadratic. (0, 1) for a node that is
+/// no one's child.
+pub type Places = struct {
+    index: alloc.List(u32),
+    count: alloc.List(u32),
+}
+
+/// Whether n is an element.
+pub fn is_element(doc: &dyn Doc, n: u32) -> bool {
+    return n != 0 and n < doc.doc_size() and doc.doc_alive(n) and doc.doc_tag(n).len() > 0;
+}
+
+/// The places of every element of doc.
+pub fn places_of(doc: &dyn Doc, a: alloc.Allocator) -> Places {
+    var p = Places { index: alloc.List(u32).init(a), count: alloc.List(u32).init(a) };
+    let size = doc.doc_size();
+    var n: u32 = 0;
+    while n < size : (n += 1) {
+        p.index.push(0);
+        p.count.push(1);
+    }
+    n = 1;
+    while n < size : (n += 1) {
+        if not doc.doc_alive(n) {
+            continue;
+        }
+        var count: u32 = 0;
+        for c in doc.doc_children(n) {
+            if is_element(doc, n: c.*) {
+                count += 1;
+            }
+        }
+        var i: u32 = 0;
+        for c in doc.doc_children(n) {
+            if is_element(doc, n: c.*) {
+                p.index.items_mut()[c.* as usize] = i;
+                p.count.items_mut()[c.* as usize] = count;
+                i += 1;
+            }
+        }
+    }
+    return p;
+}
+
+/// The number of n's attribute name, if it has one.
+pub fn attr_at(doc: &dyn Doc, n: u32, name: str) -> ?usize {
+    let count = doc.doc_attr_count(n);
+    var k: usize = 0;
+    while k < count : (k += 1) {
+        if doc.doc_attr_name(n, k: k).eq(name) {
+            return k;
+        }
+    }
+    return none;
+}
+
+/// Whether n has the attribute name.
+pub fn has_attr(doc: &dyn Doc, n: u32, name: str) -> bool {
+    match attr_at(doc, n: n, name: name) {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
+/// Whether n's attribute name is value.
+fn attr_is(doc: &dyn Doc, n: u32, name: str, value: str) -> bool {
+    match attr_at(doc, n: n, name: name) {
+        some(k) => { return doc.doc_attr_value(n, k: k).eq(value); }
+        none => { return false; }
+    }
+}
+
+/// Whether the space-separated words of text include word.
+fn has_word(text: str, word: str) -> bool {
+    let b = text.bytes();
+    var i: usize = 0;
+    while i < b.len() {
+        while i < b.len() and space_at(text, at: i) > 0 {
+            i += space_at(text, at: i);
+        }
+        var end = i;
+        while end < b.len() and space_at(text, at: end) == 0 {
+            end += char_len(b, at: end);
+        }
+        if end > i and text[i..end].eq(word) {
+            return true;
+        }
+        i = end;
+    }
+    return false;
+}
+
+/// How many bytes the UTF-8 character at b[at] takes.
+fn char_len(b: []u8, at: usize) -> usize {
+    var end = at + 1;
+    while end < b.len() and (b[end] & 0xC0) == 0x80 {
+        end += 1;
+    }
+    return end - at;
+}
+
+/// Whether x and y are the same bytes.
+fn bytes_eq(x: []u8, y: []u8) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < x.len() : (i += 1) {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The length of the white space character at byte at of text, or 0 when
+/// it is not one (Rust's split_whitespace's white space).
+fn space_at(text: str, at: usize) -> usize {
+    let b = text.bytes();
+    let c = b[at];
+    if c < 0x80 {
+        if css.is_space(c as u32) {
+            return 1;
+        }
+        return 0;
+    }
+    var end = at + 1;
+    while end < b.len() and (b[end] & 0xC0) == 0x80 {
+        end += 1;
+    }
+    var cp: u32 = 0;
+    if end - at == 2 {
+        cp = (((c & 0x1F) as u32) << 6) | (b[at + 1] & 0x3F) as u32;
+    } else if end - at == 3 {
+        cp = (((c & 0x0F) as u32) << 12) | (((b[at + 1] & 0x3F) as u32) << 6) | (b[at + 2] & 0x3F) as u32;
+    } else {
+        return 0;
+    }
+    if css.is_space(cp) {
+        return end - at;
+    }
+    return 0;
+}
+
+/// Whether n's class attribute has the class name.
+pub fn has_class(doc: &dyn Doc, n: u32, name: str) -> bool {
+    match attr_at(doc, n: n, name: "class") {
+        some(k) => { return has_word(text: doc.doc_attr_value(n, k: k), word: name); }
+        none => { return false; }
+    }
+}
+
+/// text without white space at either end.
+fn trimmed(text: str) -> str {
+    var i: usize = 0;
+    var j = text.len();
+    while i < j and space_at(text, at: i) > 0 {
+        i += space_at(text, at: i);
+    }
+    while j > i {
+        var k = j - 1;
+        while k > i and (text.bytes()[k] & 0xC0) == 0x80 {
+            k -= 1;
+        }
+        if space_at(text, at: k) == 0 {
+            break;
+        }
+        j = k;
+    }
+    return text[i..j];
+}
+
+/// Whether n is an input whose type, trimmed and in any case, is kind.
+fn input_of(doc: &dyn Doc, n: u32, kind: str) -> bool {
+    if not doc.doc_tag(n).eq("input") {
+        return false;
+    }
+    match attr_at(doc, n: n, name: "type") {
+        some(k) => { return css.eq_ignore_case(x: trimmed(doc.doc_attr_value(n, k: k)), y: kind); }
+        none => { return false; }
+    }
+}
+
+/// A checkbox or a radio: its value is whether it is checked.
+pub fn is_toggle(doc: &dyn Doc, n: u32) -> bool {
+    return input_of(doc, n: n, kind: "checkbox") or input_of(doc, n: n, kind: "radio");
+}
+
+/// Holds a value the user edits: a text input of any kind, a range, a
+/// textarea.
+pub fn is_field(doc: &dyn Doc, n: u32) -> bool {
+    let tag = doc.doc_tag(n);
+    return (tag.eq("input") and not is_toggle(doc, n: n)) or tag.eq("textarea");
+}
+
+/// What takes the keyboard: a field, a toggle, a select, a button, a link.
+pub fn is_focusable(doc: &dyn Doc, n: u32) -> bool {
+    let tag = doc.doc_tag(n);
+    return is_field(doc, n: n) or is_toggle(doc, n: n) or tag.eq("select") or tag.eq("button") or tag.eq("a");
+}
+
+/// Whether a checkbox or radio is checked: it has a checked attribute that
+/// is not "false" (HTML's boolean attributes are true by being there).
+pub fn is_checked(doc: &dyn Doc, n: u32) -> bool {
+    match attr_at(doc, n: n, name: "checked") {
+        some(k) => { return not css.eq_ignore_case(x: trimmed(doc.doc_attr_value(n, k: k)), y: "false"); }
+        none => { return false; }
+    }
+}
+
+/// Whether n is ancestor or under it.
+fn within(doc: &dyn Doc, n: u32, ancestor: u32) -> bool {
+    var at = n;
+    while at != 0 {
+        if at == ancestor {
+            return true;
+        }
+        at = doc.doc_parent(at);
+    }
+    return false;
+}
+
+/// Disabled itself, or inside something disabled.
+fn disabled(doc: &dyn Doc, n: u32) -> bool {
+    var at = n;
+    while at != 0 {
+        if doc.doc_tag(at).len() > 0 and has_attr(doc, n: at, name: "disabled") {
+            return true;
+        }
+        at = doc.doc_parent(at);
+    }
+    return false;
+}
+
+/// n's parent, when it is an element; 0 otherwise.
+fn parent_element(doc: &dyn Doc, n: u32) -> u32 {
+    let p = doc.doc_parent(n);
+    if is_element(doc, n: p) {
+        return p;
+    }
+    return 0;
+}
+
+/// The element before n among its parent's children; 0 for none.
+fn previous_element(doc: &dyn Doc, n: u32) -> u32 {
+    let p = doc.doc_parent(n);
+    if p == 0 {
+        return 0;
+    }
+    let siblings = doc.doc_children(p);
+    var at = siblings.len();
+    var i: usize = 0;
+    while i < siblings.len() : (i += 1) {
+        if siblings[i] == n {
+            at = i;
+            break;
+        }
+    }
+    if at == siblings.len() {
+        return 0;
+    }
+    while at > 0 : (at -= 1) {
+        if is_element(doc, n: siblings[at - 1]) {
+            return siblings[at - 1];
+        }
+    }
+    return 0;
+}
+
+/// What one match is given: the page, the user's state and the places.
+pub type Ctx = struct {
+    pub state: State,
+    pub places: Places,
+}
+
+/// Whether element n matches sel.
+pub fn matches(doc: &dyn Doc, cx: &Ctx, sel: &css.Selector, n: u32) -> bool {
+    if sel.compounds.len() > css.MAX_COMPOUNDS {
+        return false;
+    }
+    var steps: u32 = 0;
+    return from(doc, cx: cx, sel: sel, i: 0, n: n, steps: &mut steps);
+}
+
+/// Whether n matches compound i of sel, and what is left matches around it.
+fn from(doc: &dyn Doc, cx: &Ctx, sel: &css.Selector, i: usize, n: u32, steps: &mut u32) -> bool {
+    steps.* += 1;
+    if steps.* > MAX_STEPS or not compound_matches(doc, cx: cx, c: &sel.compounds.items()[i], n: n) {
+        return false;
+    }
+    if i + 1 == sel.compounds.len() {
+        return true;
+    }
+    let comb = sel.combinators.items()[i];
+    if comb == css.CHILD {
+        let p = parent_element(doc, n: n);
+        return p != 0 and from(doc, cx: cx, sel: sel, i: i + 1, n: p, steps: steps);
+    }
+    if comb == css.DESCENDANT {
+        var at = parent_element(doc, n: n);
+        while at != 0 {
+            if from(doc, cx: cx, sel: sel, i: i + 1, n: at, steps: steps) {
+                return true;
+            }
+            if steps.* > MAX_STEPS {
+                return false;
+            }
+            at = parent_element(doc, n: at);
+        }
+        return false;
+    }
+    if comb == css.NEXT {
+        let p = previous_element(doc, n: n);
+        return p != 0 and from(doc, cx: cx, sel: sel, i: i + 1, n: p, steps: steps);
+    }
+    var at = previous_element(doc, n: n);
+    while at != 0 {
+        if from(doc, cx: cx, sel: sel, i: i + 1, n: at, steps: steps) {
+            return true;
+        }
+        if steps.* > MAX_STEPS {
+            return false;
+        }
+        at = previous_element(doc, n: at);
+    }
+    return false;
+}
+
+/// Whether element n is what compound c asks.
+pub fn compound_matches(doc: &dyn Doc, cx: &Ctx, c: &css.Compound, n: u32) -> bool {
+    if not is_element(doc, n: n) {
+        return false;
+    }
+    if c.has_tag and not c.tag.view().eq(doc.doc_tag(n)) {
+        return false;
+    }
+    if c.has_id and not attr_is(doc, n: n, name: "id", value: c.id.view()) {
+        return false;
+    }
+    for cl in c.classes.items() {
+        if not has_class(doc, n: n, name: cl.view()) {
+            return false;
+        }
+    }
+    for at in c.attrs.items() {
+        if not attr_matches(doc, n: n, sel: at) {
+            return false;
+        }
+    }
+    for p in c.pseudos.items() {
+        if not pseudo_matches(doc, cx: cx, p: p, n: n) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether element n is in the state p names.
+fn pseudo_matches(doc: &dyn Doc, cx: &Ctx, p: &css.Pseudo, n: u32) -> bool {
+    let k = p.kind;
+    let st = cx.state;
+    if k == css.PSEUDO_HOVER {
+        return st.hovered != 0 and within(doc, n: st.hovered, ancestor: n);
+    }
+    if k == css.PSEUDO_ACTIVE {
+        return st.pressed != 0 and within(doc, n: st.pressed, ancestor: n);
+    }
+    if k == css.PSEUDO_FOCUS {
+        return st.focused != 0 and st.focused == n;
+    }
+    if k == css.PSEUDO_FOCUS_WITHIN {
+        return st.focused != 0 and within(doc, n: st.focused, ancestor: n);
+    }
+    if k == css.PSEUDO_DISABLED {
+        return disabled(doc, n: n);
+    }
+    if k == css.PSEUDO_ENABLED {
+        return is_focusable(doc, n: n) and not disabled(doc, n: n);
+    }
+    if k == css.PSEUDO_CHECKED {
+        return is_toggle(doc, n: n) and is_checked(doc, n: n);
+    }
+    if k == css.PSEUDO_ROOT {
+        return n == 1;
+    }
+    if k == css.PSEUDO_EMPTY {
+        for c in doc.doc_children(n) {
+            if not doc.doc_alive(c.*) or doc.doc_tag(c.*).len() > 0 or doc.doc_text(c.*).len() > 0 {
+                return false;
+            }
+        }
+        return true;
+    }
+    let index = cx.places.index.items()[n as usize];
+    let count = cx.places.count.items()[n as usize];
+    if k == css.PSEUDO_FIRST_CHILD {
+        return index == 0;
+    }
+    if k == css.PSEUDO_LAST_CHILD {
+        return index + 1 == count;
+    }
+    if k == css.PSEUDO_ONLY_CHILD {
+        return count == 1;
+    }
+    if k == css.PSEUDO_NTH_CHILD {
+        return nth_matches(step: p.step as i64, b: p.offset as i64, pos: index as i64 + 1);
+    }
+    if k == css.PSEUDO_NTH_LAST_CHILD {
+        return nth_matches(step: p.step as i64, b: p.offset as i64, pos: (count - index) as i64);
+    }
+    if k == css.PSEUDO_NOT {
+        for inner in p.inner.items() {
+            if compound_matches(doc, cx: cx, c: inner, n: n) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // :placeholder-shown
+    if not is_field(doc, n: n) or not has_attr(doc, n: n, name: "placeholder") {
+        return false;
+    }
+    match attr_at(doc, n: n, name: "value") {
+        some(v) => { return doc.doc_attr_value(n, k: v).len() == 0; }
+        none => { return true; }
+    }
+}
+
+/// Whether position pos (from 1) is a * m + b for some m >= 0.
+fn nth_matches(step: i64, b: i64, pos: i64) -> bool {
+    if step == 0 {
+        return pos == b;
+    }
+    let m = pos - b;
+    return m % step == 0 and m / step >= 0;
+}
+
+/// Whether n's attribute is what sel asks.
+fn attr_matches(doc: &dyn Doc, n: u32, sel: &css.AttrSel) -> bool {
+    let k = attr_at(doc, n: n, name: sel.name.view()) orelse return false;
+    let v = doc.doc_attr_value(n, k: k);
+    let w = sel.value.view();
+    let op = sel.op;
+    if op == css.ATTR_EXISTS {
+        return true;
+    }
+    if op == css.ATTR_EQUALS {
+        return v.eq(w);
+    }
+    if op == css.ATTR_WORD {
+        return has_word(text: v, word: w);
+    }
+    if op == css.ATTR_DASH {
+        return v.eq(w) or (v.starts_with(w) and v.len() > w.len() and v.bytes()[w.len()] == '-');
+    }
+    if w.len() == 0 or w.len() > v.len() {
+        return false;
+    }
+    if op == css.ATTR_PREFIX {
+        return v.starts_with(w);
+    }
+    let vb = v.bytes();
+    let wb = w.bytes();
+    if op == css.ATTR_SUFFIX {
+        return bytes_eq(x: vb[vb.len() - wb.len()..vb.len()], y: wb);
+    }
+    var i: usize = 0;
+    while i + wb.len() <= vb.len() : (i += 1) {
+        if bytes_eq(x: vb[i..i + wb.len()], y: wb) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The elements under scope (itself left out) that match the selector
+/// list text, in document order; none for a list that cannot be read.
+pub fn query_all(doc: &dyn Doc, scope: u32, text: str, state: State, a: alloc.Allocator) -> alloc.List(u32) {
+    var out = alloc.List(u32).init(a);
+    let tokens = css.tokenize(text, a);
+    let list = css.selectors(css.trim(tokens.items()), a) orelse return out;
+    let cx = Ctx { state: state, places: places_of(doc, a: a) };
+    var stack = alloc.List(u32).init(a);
+    push_children(doc, n: scope, stack: &mut stack);
+    while stack.len() > 0 {
+        let n = stack.pop() orelse break;
+        for s in list.items() {
+            if matches(doc, cx: &cx, sel: s, n: n) {
+                out.push(n);
+                break;
+            }
+        }
+        push_children(doc, n: n, stack: &mut stack);
+    }
+    return out;
+}
+
+/// n's children onto stack, last first, so that the first is taken first.
+fn push_children(doc: &dyn Doc, n: u32, stack: &mut alloc.List(u32)) {
+    let kids = doc.doc_children(n);
+    var i = kids.len();
+    while i > 0 : (i -= 1) {
+        stack.push(kids[i - 1]);
+    }
+}

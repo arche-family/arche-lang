@@ -10,7 +10,10 @@ import core.utf8;
 import image.png;
 import std;
 import wasm.component as c;
+import wasm.css;
 import wasm.exec;
+import wasm.select;
+import wasm.style;
 import wasm.wasip2;
 
 pub const FRAME_BUDGET_NS: u64 = 1000000000;
@@ -154,6 +157,9 @@ pub type Ui = struct {
     sheets: u32,
     /// The stylesheets added, by number less one; a removed one is empty.
     sheet_texts: alloc.List(alloc.String),
+    /// The stylesheets read: the host's own (style.ua_text) first, then
+    /// the app's, by number; a removed one has no rules.
+    parsed: alloc.List(css.Sheet),
     /// Where the shell laid each node out last: x, y, width, height, in
     /// logical pixels; a width below 0 for none.
     boxes: alloc.List(Box),
@@ -470,6 +476,7 @@ pub fn new_ui(a: alloc.Allocator) -> Ui {
         events: alloc.List(Event).init(a),
         sheets: 0,
         sheet_texts: alloc.List(alloc.String).init(a),
+        parsed: alloc.List(css.Sheet).init(a),
         boxes: alloc.List(Box).init(a),
         focused: 0,
         open_request: alloc.String.init(a),
@@ -494,6 +501,8 @@ pub fn new_ui(a: alloc.Allocator) -> Ui {
     // Node 0 is no node; 1 is the page's body.
     _ = new_node(&mut ui, tag: "none");
     _ = new_node(&mut ui, tag: "body");
+    let ua = style.ua_text(a);
+    ui.parsed.push(css.parse(ua.view(), a));
     return ui;
 }
 
@@ -1916,15 +1925,15 @@ fn set_style(ui: &mut Ui, n: u32, property: str, value: str) {
     var out = alloc.String.init(ui.a);
     match attr_index(&ui.nodes.items()[n as usize], name: "style") {
         some(k) => {
-            let style = alloc.String.from(ui.nodes.items()[n as usize].values.items()[k].view(), ui.a);
-            let b = style.view().bytes();
+            let declared = alloc.String.from(ui.nodes.items()[n as usize].values.items()[k].view(), ui.a);
+            let b = declared.view().bytes();
             var d0: usize = 0;
             while d0 < b.len() {
                 var d1 = d0;
                 while d1 < b.len() and b[d1] != ';' {
                     d1 += 1;
                 }
-                let decl = style.view()[d0..d1];
+                let decl = declared.view()[d0..d1];
                 var colon: usize = 0;
                 while colon < decl.len() and decl.bytes()[colon] != ':' {
                     colon += 1;
@@ -2571,12 +2580,28 @@ fn dom(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
     if func.eq("add-stylesheet") {
         ui.sheets += 1;
         ui.sheet_texts.push(alloc.String.from(text_arg(args, i: 0), a));
+        // Read now; what it cannot say goes to the app's log, as a
+        // browser's console would have it.
+        let sheet = css.parse(text_arg(args, i: 0), ui.a);
+        for w in sheet.warnings.items() {
+            var line = alloc.String.from("css: ", a);
+            visible(w.view(), out: &mut line);
+            ui.logs.push(line);
+        }
+        if sheet.more_warnings > 0 {
+            var line = alloc.String.from("css: and ", a);
+            line.push_u64(sheet.more_warnings as u64);
+            line.push_str(" more skipped");
+            ui.logs.push(line);
+        }
+        ui.parsed.push(sheet);
         return int_val(ui.sheets as u64);
     }
     if func.eq("remove-stylesheet") {
         let k = int_arg(args, i: 0);
         if k >= 1 and k <= ui.sheet_texts.len() as u64 {
             ui.sheet_texts.items_mut()[(k - 1) as usize] = alloc.String.init(a);
+            ui.parsed.items_mut()[k as usize] = css.empty_sheet(ui.a);
         }
         return c.Val.Unit;
     }
@@ -2719,8 +2744,10 @@ fn dom(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
         return done(why.view(), a);
     }
     if func.eq("query-all") {
-        var found = alloc.List(u32).init(a);
-        query(ui, scope: node, n: node, sel: text_arg(args, i: 1).bytes(), out: &mut found);
+        // As the cascade matches (wasm.select), from the elements under
+        // the node, in document order.
+        let doc: &Ui = ui;
+        let found = select.query_all(doc, scope: node, text: text_arg(args, i: 1), state: state_of(doc), a: a);
         return node_list(&found, a);
     }
     if func.eq("parent") {
@@ -2978,6 +3005,59 @@ pub fn parent_of(ui: &Ui, n: u32) -> u32 {
 /// spaces, as a stylesheet's rule says it.
 pub fn matches_selector(ui: &Ui, n: u32, selector: str) -> bool {
     return matches(ui, n: n, sel: selector.bytes(), scope: 0);
+}
+
+/// The page as selectors and the cascade see it (wasm.select): node 0 is
+/// none, and a node released is no node.
+impl select.Doc for Ui {
+    fn doc_size(self: &Ui) -> u32 {
+        return self.nodes.len() as u32;
+    }
+
+    fn doc_alive(self: &Ui, n: u32) -> bool {
+        return n > 0 and (n as usize) < self.nodes.len() and self.nodes.items()[n as usize].alive;
+    }
+
+    fn doc_tag(self: &Ui, n: u32) -> str {
+        return self.nodes.items()[n as usize].tag.view();
+    }
+
+    fn doc_text(self: &Ui, n: u32) -> str {
+        return self.nodes.items()[n as usize].text.view();
+    }
+
+    fn doc_parent(self: &Ui, n: u32) -> u32 {
+        return self.nodes.items()[n as usize].parent;
+    }
+
+    fn doc_children(self: &Ui, n: u32) -> []u32 {
+        return self.nodes.items()[n as usize].children.items();
+    }
+
+    fn doc_attr_count(self: &Ui, n: u32) -> usize {
+        return self.nodes.items()[n as usize].names.len();
+    }
+
+    fn doc_attr_name(self: &Ui, n: u32, k: usize) -> str {
+        return self.nodes.items()[n as usize].names.items()[k].view();
+    }
+
+    fn doc_attr_value(self: &Ui, n: u32, k: usize) -> str {
+        return self.nodes.items()[n as usize].values.items()[k].view();
+    }
+}
+
+/// What the user is doing to the page, as selectors see it: a shell with
+/// no pointer hovers and presses nothing; the keyboard is where it is.
+fn state_of(ui: &Ui) -> select.State {
+    return select.State { hovered: 0, pressed: 0, focused: ui.focused };
+}
+
+/// Every element of the page styled for a page shown on env: the host's
+/// sheet, the app's sheets in order, each element's style attribute
+/// (wasm.style). What the layout lays out, and what --styles prints.
+pub fn compute_styles(ui: &Ui, env: css.Env, a: alloc.Allocator) -> style.Styles {
+    return style.compute(ui, sheets: ui.parsed.items(), env: env, state: state_of(ui), a: a);
 }
 
 /// How many stylesheets were added; stylesheet(i) is the ith, from 0,
@@ -3487,6 +3567,39 @@ pub fn live_nodes(ui: &Ui) -> u32 {
 /// The page, a node a line, as Nimadir's headless runner prints it:
 /// `#5 input#q.big [type="search"] value="" (focused) {input}`.
 pub fn write_outline(ui: &Ui, n: u32, depth: u32, out: &mut alloc.String) {
+    write_line(ui, n: n, depth: depth, out: out);
+    out.push_str("\n");
+    for x in ui.nodes.items()[n as usize].children.items() {
+        write_outline(ui, n: x.*, depth: depth + 1, out: out);
+    }
+}
+
+/// The page as write_outline prints it, each element followed by what its
+/// rules set (style.describe), as Nimadir's headless runner prints it with
+/// --styles: `#3 h1 | font-size: 28px; font-weight: 700`. (A node's box,
+/// with --boxes, goes before the bar, once the page is laid out.)
+pub fn write_styled_outline(ui: &Ui, styles: &style.Styles, n: u32, depth: u32, out: &mut alloc.String, a: alloc.Allocator) {
+    write_line(ui, n: n, depth: depth, out: out);
+    if style.has_style(styles, n: n) {
+        let parent = ui.nodes.items()[n as usize].parent;
+        var said = alloc.String.init(a);
+        style.describe(style: style.style_of(styles, n: n), parent: style.style_of(styles, n: parent), tag: ui.nodes.items()[n as usize].tag.view(), out: &mut said, a: a);
+        if said.len() > 0 {
+            out.push_str(" | ");
+            out.push_str(said.view());
+        }
+    }
+    out.push_str("\n");
+    for x in ui.nodes.items()[n as usize].children.items() {
+        write_styled_outline(ui, styles: styles, n: x.*, depth: depth + 1, out: out, a: a);
+    }
+}
+
+/// One node's line of the outline, without its end: its number, then a
+/// run of text quoted, or an element's tag, id and classes as a selector
+/// would name them, its other attributes, a control's live state, what it
+/// listens for.
+fn write_line(ui: &Ui, n: u32, depth: u32, out: &mut alloc.String) {
     let node = &ui.nodes.items()[n as usize];
     pad(out, depth: depth);
     out.push_str("#");
@@ -3494,7 +3607,6 @@ pub fn write_outline(ui: &Ui, n: u32, depth: u32, out: &mut alloc.String) {
     out.push_str(" ");
     if node.tag.len() == 0 {
         quoted(node.text.view(), out: out);
-        out.push_str("\n");
         return;
     }
     out.push_str(node.tag.view());
@@ -3580,9 +3692,5 @@ pub fn write_outline(ui: &Ui, n: u32, depth: u32, out: &mut alloc.String) {
             out.push_str(node.listens.items()[j].view());
         }
         out.push_str("}");
-    }
-    out.push_str("\n");
-    for x in node.children.items() {
-        write_outline(ui, n: x.*, depth: depth + 1, out: out);
     }
 }

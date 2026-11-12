@@ -1,0 +1,2052 @@
+/// CSS as Nimadir's shell reads it (host/src/dom/css.rs, ADR-4): a
+/// tokenizer, then stylesheets (rules, selectors, @media) with each
+/// declaration kept as tokens until the page is styled, when var() can be
+/// put in and the value read for its property (wasm.style).
+///
+/// A subset, and forgiving the way browsers are: a rule that cannot be read
+/// is skipped with a warning, and the rest of the sheet still applies.
+/// Blocks are found by counting brackets, and @media nests at most
+/// MAX_MEDIA_NESTING deep. Numbers are f32, read as Rust reads them (the
+/// nearest, ties to even) and written as Nimadir writes them (number).
+import alloc;
+import core.float;
+import core.utf8;
+
+/// How deep @media blocks may nest inside each other.
+const MAX_MEDIA_NESTING: usize = 4;
+
+/// How many warnings one sheet logs before it only counts them.
+pub const MAX_WARNINGS: usize = 8;
+
+/// The most compound selectors one selector may chain: `a b c ...` 32 deep.
+pub const MAX_COMPOUNDS: usize = 32;
+
+/// A token's kind: a name (IDENT), a name and its `(` (FUNCTION, the
+/// arguments follow, then RPAREN), `@name`, `#name`, a quoted string, a
+/// number, a percentage, a number and its unit (lowercase), one other
+/// character (DELIM), punctuation, and a run of white space.
+pub const IDENT: u8 = 1;
+pub const FUNCTION: u8 = 2;
+pub const AT_KEYWORD: u8 = 3;
+pub const HASH: u8 = 4;
+pub const STR: u8 = 5;
+pub const NUMBER: u8 = 6;
+pub const PERCENTAGE: u8 = 7;
+pub const DIMENSION: u8 = 8;
+pub const DELIM: u8 = 9;
+pub const COLON: u8 = 10;
+pub const SEMICOLON: u8 = 11;
+pub const COMMA: u8 = 12;
+pub const LBRACE: u8 = 13;
+pub const RBRACE: u8 = 14;
+pub const LPAREN: u8 = 15;
+pub const RPAREN: u8 = 16;
+pub const LBRACKET: u8 = 17;
+pub const RBRACKET: u8 = 18;
+pub const SPACE: u8 = 19;
+
+/// No character: past the end of the text.
+const NO_CHAR: u32 = 0xFFFFFFFF;
+
+/// One token: its kind, the number of a NUMBER, PERCENTAGE or DIMENSION,
+/// the character of a DELIM, and the text of an IDENT, FUNCTION,
+/// AT_KEYWORD, HASH or STR, or the unit of a DIMENSION.
+pub type Token = struct {
+    pub kind: u8,
+    pub n: f32,
+    pub ch: u32,
+    pub text: alloc.String,
+}
+
+/// A run of tokens of a list, from..to.
+pub type Span = struct {
+    pub from: usize,
+    pub to: usize,
+}
+
+/// A token of a kind with no text and no number.
+pub fn plain(kind: u8, a: alloc.Allocator) -> Token {
+    return Token { kind: kind, n: 0.0, ch: 0, text: alloc.String.init(a) };
+}
+
+/// A token of a kind with text.
+fn named(kind: u8, text: alloc.String) -> Token {
+    return Token { kind: kind, n: 0.0, ch: 0, text: text };
+}
+
+/// A token of a kind with a number.
+fn numeric_token(kind: u8, n: f32, a: alloc.Allocator) -> Token {
+    return Token { kind: kind, n: n, ch: 0, text: alloc.String.init(a) };
+}
+
+/// A copy of t.
+pub fn clone_token(t: &Token) -> Token {
+    return Token { kind: t.kind, n: t.n, ch: t.ch, text: t.text.clone() };
+}
+
+/// Whether t is a DELIM of the character ch.
+pub fn is_delim(t: &Token, ch: u8) -> bool {
+    return t.kind == DELIM and t.ch == ch as u32;
+}
+
+/// Whether t is an IDENT, ASCII case aside, of name.
+pub fn is_ident(t: &Token, name: str) -> bool {
+    return t.kind == IDENT and eq_ignore_case(x: t.text.view(), y: name);
+}
+
+/// Whether two tokens are the same: kind, number, character and text, as
+/// Rust's derived equality compares them.
+pub fn same(x: &Token, y: &Token) -> bool {
+    if x.kind != y.kind {
+        return false;
+    }
+    if x.kind == NUMBER or x.kind == PERCENTAGE {
+        return x.n == y.n;
+    }
+    if x.kind == DIMENSION {
+        return x.n == y.n and x.text.view().eq(y.text.view());
+    }
+    if x.kind == DELIM {
+        return x.ch == y.ch;
+    }
+    if x.kind <= STR {
+        return x.text.view().eq(y.text.view());
+    }
+    return true;
+}
+
+/// Whether x and y are equal with ASCII letters' case aside.
+pub fn eq_ignore_case(x: str, y: str) -> bool {
+    let p = x.bytes();
+    let q = y.bytes();
+    if p.len() != q.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < p.len() : (i += 1) {
+        if lower_byte(p[i]) != lower_byte(q[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// An ASCII letter in lower case; any other byte as it is.
+pub fn lower_byte(b: u8) -> u8 {
+    if b >= 'A' and b <= 'Z' {
+        return b + 32;
+    }
+    return b;
+}
+
+/// text with its ASCII letters in lower case.
+pub fn lowercase(text: str, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    let b = text.bytes();
+    var i: usize = 0;
+    while i < b.len() {
+        if b[i] < 0x80 {
+            out.push_ascii(lower_byte(b[i]));
+            i += 1;
+        } else {
+            var end = i + 1;
+            while end < b.len() and (b[end] & 0xC0) == 0x80 {
+                end += 1;
+            }
+            out.push_str(text[i..end]);
+            i = end;
+        }
+    }
+    return out;
+}
+
+/// The character cp, UTF-8, at the end of out.
+pub fn push_char(out: &mut alloc.String, cp: u32) {
+    var buf: [4]u8 = [0; 4];
+    let size = utf8.encode(cp, buf[0..4]);
+    if size == 0 {
+        out.push_str("\u{FFFD}");
+        return;
+    }
+    _ = out.push_utf8(buf[0..size]);
+}
+
+// ---- tokens back to text -------------------------------------------------
+
+/// Tokens written back as CSS, for warnings and for printing values.
+pub fn to_css(tokens: []Token, out: &mut alloc.String) {
+    for t in tokens {
+        let k = t.kind;
+        if k == IDENT {
+            out.push_str(t.text.view());
+        } else if k == FUNCTION {
+            out.push_str(t.text.view());
+            out.push_str("(");
+        } else if k == AT_KEYWORD {
+            out.push_str("@");
+            out.push_str(t.text.view());
+        } else if k == HASH {
+            out.push_str("#");
+            out.push_str(t.text.view());
+        } else if k == STR {
+            quote_debug(t.text.view(), out: out);
+        } else if k == NUMBER {
+            write_number(t.n, out: out);
+        } else if k == PERCENTAGE {
+            write_number(t.n, out: out);
+            out.push_str("%");
+        } else if k == DIMENSION {
+            write_number(t.n, out: out);
+            out.push_str(t.text.view());
+        } else if k == DELIM {
+            push_char(out, cp: t.ch);
+        } else if k == COLON {
+            out.push_str(":");
+        } else if k == SEMICOLON {
+            out.push_str(";");
+        } else if k == COMMA {
+            out.push_str(",");
+        } else if k == LBRACE {
+            out.push_str("{");
+        } else if k == RBRACE {
+            out.push_str("}");
+        } else if k == LPAREN {
+            out.push_str("(");
+        } else if k == RPAREN {
+            out.push_str(")");
+        } else if k == LBRACKET {
+            out.push_str("[");
+        } else if k == RBRACKET {
+            out.push_str("]");
+        } else {
+            out.push_str(" ");
+        }
+    }
+}
+
+/// s quoted as Rust's Debug quotes a string: \" and \\, \n, \r, \t and
+/// \0, and other characters that do not print as \u{...}.
+pub fn quote_debug(s: str, out: &mut alloc.String) {
+    out.push_str("\"");
+    let b = s.bytes();
+    var i: usize = 0;
+    while i < b.len() {
+        var end = i + 1;
+        while end < b.len() and (b[end] & 0xC0) == 0x80 {
+            end += 1;
+        }
+        var cp: u32 = b[i] as u32;
+        match utf8.decode(b, at: i) {
+            some(d) => { cp = d.code; }
+            none => { }
+        }
+        if cp == '"' as u32 {
+            out.push_str("\\\"");
+        } else if cp == '\\' as u32 {
+            out.push_str("\\\\");
+        } else if cp == '\n' as u32 {
+            out.push_str("\\n");
+        } else if cp == '\r' as u32 {
+            out.push_str("\\r");
+        } else if cp == '\t' as u32 {
+            out.push_str("\\t");
+        } else if cp == 0 {
+            out.push_str("\\0");
+        } else if not printable(cp) {
+            out.push_str("\\u{");
+            push_hex(out, v: cp);
+            out.push_str("}");
+        } else {
+            out.push_str(s[i..end]);
+        }
+        i = end;
+    }
+    out.push_str("\"");
+}
+
+/// Whether Rust prints cp as it is in a string's Debug: not a control,
+/// format or separator character, nor a combining mark.
+fn printable(cp: u32) -> bool {
+    if cp < 0x20 or (cp >= 0x7F and cp < 0xA0) or cp == 0xAD {
+        return false;
+    }
+    if (cp >= 0x300 and cp <= 0x36F) or cp == 0x61C or cp == 0x180E or (cp >= 0x200B and cp <= 0x200F) or (cp >= 0x2028 and cp <= 0x202E) {
+        return false;
+    }
+    if (cp >= 0x2060 and cp <= 0x206F) or cp == 0xFEFF or (cp >= 0xFFF9 and cp <= 0xFFFB) {
+        return false;
+    }
+    return true;
+}
+
+/// v in lower-case hex, without leading zeros.
+fn push_hex(out: &mut alloc.String, v: u32) {
+    let digits = "0123456789abcdef";
+    var shift: u32 = 28;
+    var started = false;
+    while true {
+        let d = (v >> shift) & 0xF;
+        if d != 0 or started or shift == 0 {
+            out.push_ascii(digits.bytes()[d as usize]);
+            started = true;
+        }
+        if shift == 0 {
+            break;
+        }
+        shift -= 4;
+    }
+}
+
+
+// ---- numbers ---------------------------------------------------------------
+
+/// A number as Nimadir writes it: a whole one below 10^9 as an integer,
+/// any other with four decimals (rounded to the nearest, ties to even, as
+/// Rust's `{:.4}` does), then without trailing zeros or point.
+pub fn write_number(n: f32, out: &mut alloc.String) {
+    let whole = n.trunc();
+    if n - whole == 0.0 and n.abs() < 1000000000.0 {
+        out.push_i64(n as i64);
+        return;
+    }
+    var buf: [64]u8 = [0; 64];
+    var end = fixed4(n, buf: buf[0..64]);
+    while end > 0 and buf[end - 1] == '0' {
+        end -= 1;
+    }
+    while end > 0 and buf[end - 1] == '.' {
+        end -= 1;
+    }
+    var i: usize = 0;
+    while i < end : (i += 1) {
+        out.push_ascii(buf[i]);
+    }
+}
+
+/// n with exactly four decimals, as Rust's `{:.4}` writes it, into buf;
+/// how many bytes. The value is exact: an f32 is m * 2^e, so n * 10^4 is
+/// a whole number when e >= 0 (at most 2^142), and is rounded with the
+/// bits shifted out otherwise.
+fn fixed4(n: f32, buf: []mut u8) -> usize {
+    let bits = float.bits32(n);
+    let negative = (bits >> 31) != 0;
+    let exp = (bits >> 23) & 0xFF;
+    let frac = bits & 0x7FFFFF;
+    var at: usize = 0;
+    if exp == 0xFF {
+        var word = "inf";
+        if frac != 0 {
+            word = "NaN";
+        } else if negative {
+            word = "-inf";
+        }
+        for b in word.bytes() {
+            buf[at] = b.*;
+            at += 1;
+        }
+        return at;
+    }
+    var m: u64 = frac as u64;
+    var e: i64 = -149;
+    if exp != 0 {
+        m = m | 0x800000;
+        e = exp as i64 - 150;
+    }
+    // r = round(|n| * 10^4), in five 32-bit limbs, least significant first.
+    var r: [5]u32 = [0; 5];
+    if e >= 0 {
+        r[0] = (m & 0xFFFFFFFF) as u32;
+        var k: i64 = 0;
+        while k < e : (k += 1) {
+            var carry: u32 = 0;
+            var j: usize = 0;
+            while j < 5 : (j += 1) {
+                let v = r[j];
+                r[j] = (v << 1) | carry;
+                carry = v >> 31;
+            }
+        }
+        var carry: u64 = 0;
+        var j: usize = 0;
+        while j < 5 : (j += 1) {
+            let v = (r[j] as u64) * 10000 + carry;
+            r[j] = (v & 0xFFFFFFFF) as u32;
+            carry = v >> 32;
+        }
+    } else {
+        let big = m * 10000;
+        let k = -e;
+        var q: u64 = 0;
+        if k < 40 {
+            q = big >> (k as u64);
+            let rest = big - (q << (k as u64));
+            let one: u64 = 1;
+            let half = one << ((k - 1) as u64);
+            if rest > half or (rest == half and (q & 1) == 1) {
+                q += 1;
+            }
+        }
+        r[0] = (q & 0xFFFFFFFF) as u32;
+        r[1] = (q >> 32) as u32;
+    }
+    // Its decimal digits, least significant first.
+    var digits: [48]u8 = [0; 48];
+    var count: usize = 0;
+    while true {
+        var rem: u64 = 0;
+        var j: usize = 5;
+        var zero = true;
+        while j > 0 : (j -= 1) {
+            let v = (rem << 32) | r[j - 1] as u64;
+            r[j - 1] = (v / 10) as u32;
+            rem = v % 10;
+            if r[j - 1] != 0 {
+                zero = false;
+            }
+        }
+        digits[count] = '0' + (rem as u8);
+        count += 1;
+        if zero {
+            break;
+        }
+    }
+    while count < 5 {
+        digits[count] = '0';
+        count += 1;
+    }
+    if negative {
+        buf[at] = '-';
+        at += 1;
+    }
+    var i = count;
+    while i > 4 : (i -= 1) {
+        buf[at] = digits[i - 1];
+        at += 1;
+    }
+    buf[at] = '.';
+    at += 1;
+    while i > 0 : (i -= 1) {
+        buf[at] = digits[i - 1];
+        at += 1;
+    }
+    return at;
+}
+
+/// A natural number in base 2^32, least significant limb first, for
+/// reading a number exactly.
+type Big = struct {
+    limbs: alloc.List(u32),
+}
+
+/// 2^k.
+fn pow2(k: u64) -> u64 {
+    let one: u64 = 1;
+    return one << k;
+}
+
+/// Zero.
+fn big_zero(a: alloc.Allocator) -> Big {
+    return Big { limbs: alloc.List(u32).init(a) };
+}
+
+/// x without its leading zero limbs.
+fn big_trim(x: &mut Big) {
+    while x.limbs.len() > 0 and x.limbs.items()[x.limbs.len() - 1] == 0 {
+        _ = x.limbs.pop();
+    }
+}
+
+/// x = x * m + add.
+fn big_mul_add(x: &mut Big, m: u32, add: u32) {
+    var carry: u64 = add as u64;
+    var i: usize = 0;
+    while i < x.limbs.len() : (i += 1) {
+        let v = (x.limbs.items()[i] as u64) * (m as u64) + carry;
+        x.limbs.items_mut()[i] = (v & 0xFFFFFFFF) as u32;
+        carry = v >> 32;
+    }
+    if carry > 0 {
+        x.limbs.push(carry as u32);
+    }
+}
+
+/// How many bits x takes.
+fn big_bits(x: &Big) -> u64 {
+    let n = x.limbs.len();
+    if n == 0 {
+        return 0;
+    }
+    var top = x.limbs.items()[n - 1];
+    var bits: u64 = 0;
+    while top > 0 : (bits += 1) {
+        top = top >> 1;
+    }
+    return (n as u64 - 1) * 32 + bits;
+}
+
+/// x * 2^k, as a new number.
+fn big_shl(x: &Big, k: u64, a: alloc.Allocator) -> Big {
+    var out = big_zero(a);
+    let words = (k / 32) as usize;
+    let bits = (k % 32) as u32;
+    var i: usize = 0;
+    while i < words : (i += 1) {
+        out.limbs.push(0);
+    }
+    var carry: u32 = 0;
+    i = 0;
+    while i < x.limbs.len() : (i += 1) {
+        let v = x.limbs.items()[i];
+        if bits == 0 {
+            out.limbs.push(v);
+        } else {
+            out.limbs.push((v << bits) | carry);
+            carry = v >> (32 - bits);
+        }
+    }
+    if carry > 0 {
+        out.limbs.push(carry);
+    }
+    big_trim(&mut out);
+    return out;
+}
+
+/// -1, 0 or 1 as x is less than, equal to or greater than y.
+fn big_compare(x: &Big, y: &Big) -> i32 {
+    if x.limbs.len() != y.limbs.len() {
+        if x.limbs.len() < y.limbs.len() {
+            return -1;
+        }
+        return 1;
+    }
+    var i = x.limbs.len();
+    while i > 0 : (i -= 1) {
+        let p = x.limbs.items()[i - 1];
+        let q = y.limbs.items()[i - 1];
+        if p != q {
+            if p < q {
+                return -1;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/// x = x - y, for x >= y.
+fn big_sub(x: &mut Big, y: &Big) {
+    var borrow: u64 = 0;
+    var i: usize = 0;
+    while i < x.limbs.len() : (i += 1) {
+        var yv: u64 = 0;
+        if i < y.limbs.len() {
+            yv = y.limbs.items()[i] as u64;
+        }
+        let xv = x.limbs.items()[i] as u64;
+        let need = yv + borrow;
+        if xv >= need {
+            x.limbs.items_mut()[i] = (xv - need) as u32;
+            borrow = 0;
+        } else {
+            x.limbs.items_mut()[i] = (xv + 4294967296 - need) as u32;
+            borrow = 1;
+        }
+    }
+    big_trim(x);
+}
+
+/// The quotient n / d, which is below 2^64; n becomes the remainder.
+fn big_divide(n: &mut Big, d: &Big, a: alloc.Allocator) -> u64 {
+    var q: u64 = 0;
+    var bit: u64 = 64;
+    while bit > 0 : (bit -= 1) {
+        let shifted = big_shl(d, bit - 1, a);
+        if big_compare(x: n, y: &shifted) >= 0 {
+            big_sub(n, &shifted);
+            q = q | pow2(bit - 1);
+        }
+    }
+    return q;
+}
+
+/// The f32 bits of num / den, rounded to the nearest, ties to even.
+fn round_f32(num: &Big, den: &Big, a: alloc.Allocator) -> u32 {
+    if num.limbs.len() == 0 {
+        return 0;
+    }
+    let p: i64 = 24;
+    let emin: i64 = -126;
+    // e such that num / den / 2^e has p bits: q = floor(num * 2^-e / den).
+    var e = big_bits(num) as i64 - big_bits(den) as i64 - p;
+    var q: u64 = 0;
+    var rem = big_zero(a);
+    var d2 = big_zero(a);
+    var tries: u32 = 0;
+    while tries < 4 : (tries += 1) {
+        if e < emin - p + 1 {
+            e = emin - p + 1;
+        }
+        if e <= 0 {
+            rem = big_shl(num, (-e) as u64, a);
+            d2 = big_shl(den, 0, a);
+        } else {
+            rem = big_shl(num, 0, a);
+            d2 = big_shl(den, e as u64, a);
+        }
+        q = big_divide(&mut rem, &d2, a);
+        if q >= pow2(p as u64) {
+            e += 1;
+            continue;
+        }
+        if q < pow2((p - 1) as u64) and e > emin - p + 1 {
+            e -= 1;
+            continue;
+        }
+        break;
+    }
+    let twice = big_shl(&rem, 1, a);
+    let c = big_compare(x: &twice, y: &d2);
+    if c > 0 or (c == 0 and q % 2 == 1) {
+        q += 1;
+        if q == pow2(p as u64) {
+            q = q >> 1;
+            e += 1;
+        }
+    }
+    if q < pow2(23) {
+        return q as u32;
+    }
+    let biased = e + p - 1 + 127;
+    if biased >= 255 {
+        return 0x7F800000;
+    }
+    return (((biased as u64) << 23) | (q - pow2(23))) as u32;
+}
+
+/// Whether b is an ASCII digit.
+fn is_digit(b: u8) -> bool {
+    return b >= '0' and b <= '9';
+}
+
+/// A number as Rust's f32 parse reads it: an optional sign, then digits
+/// with a point and an exponent, or inf, infinity or nan in any case; the
+/// nearest f32, ties to even. none for text that is not one.
+pub fn parse_float(text: str, a: alloc.Allocator) -> ?f32 {
+    let b = text.bytes();
+    var i: usize = 0;
+    var negative = false;
+    if i < b.len() and (b[i] == '+' or b[i] == '-') {
+        negative = b[i] == '-';
+        i += 1;
+    }
+    let rest = text[i..text.len()];
+    var special: u32 = 0;
+    if eq_ignore_case(x: rest, y: "inf") or eq_ignore_case(x: rest, y: "infinity") {
+        special = 0x7F800000;
+    } else if eq_ignore_case(x: rest, y: "nan") {
+        special = 0x7FC00000;
+    }
+    if special != 0 {
+        if negative {
+            special = special | 0x80000000;
+        }
+        return float.from_bits32(special);
+    }
+    // The digits as one number, up to 19 of them exactly; the rest only
+    // matter as more digits, or as nonzero ones (as the compiler's float
+    // literals, compiler/sema/floats.arche, read them).
+    var mantissa: u64 = 0;
+    var kept: u32 = 0;
+    var exp10: i64 = 0;
+    var any_digit = false;
+    var digits = big_zero(a);
+    var ndigits: i64 = 0;
+    while i < b.len() and is_digit(b[i]) : (i += 1) {
+        any_digit = true;
+        let d = (b[i] - '0') as u32;
+        if digits.limbs.len() > 0 or d != 0 {
+            ndigits += 1;
+        }
+        if ndigits <= 800 {
+            big_mul_add(&mut digits, m: 10, add: d);
+            if kept < 19 {
+                mantissa = mantissa * 10 + d as u64;
+                if mantissa > 0 {
+                    kept += 1;
+                }
+            } else {
+                kept = 99;
+            }
+        } else {
+            exp10 += 1;
+        }
+    }
+    if i < b.len() and b[i] == '.' {
+        i += 1;
+        while i < b.len() and is_digit(b[i]) : (i += 1) {
+            any_digit = true;
+            let d = (b[i] - '0') as u32;
+            if digits.limbs.len() > 0 or d != 0 {
+                ndigits += 1;
+            }
+            if ndigits <= 800 {
+                big_mul_add(&mut digits, m: 10, add: d);
+                exp10 -= 1;
+                if kept < 19 {
+                    mantissa = mantissa * 10 + d as u64;
+                    if mantissa > 0 {
+                        kept += 1;
+                    }
+                } else {
+                    kept = 99;
+                }
+            }
+        }
+    }
+    if not any_digit {
+        return none;
+    }
+    if i < b.len() and (b[i] == 'e' or b[i] == 'E') {
+        i += 1;
+        var exp_negative = false;
+        if i < b.len() and (b[i] == '+' or b[i] == '-') {
+            exp_negative = b[i] == '-';
+            i += 1;
+        }
+        if i >= b.len() or not is_digit(b[i]) {
+            return none;
+        }
+        var e: i64 = 0;
+        while i < b.len() and is_digit(b[i]) : (i += 1) {
+            if e < 100000 {
+                e = e * 10 + (b[i] - '0') as i64;
+            }
+        }
+        if exp_negative {
+            e = -e;
+        }
+        exp10 += e;
+    }
+    if i != b.len() {
+        return none;
+    }
+    var result: f32 = 0.0;
+    big_trim(&mut digits);
+    if digits.limbs.len() == 0 {
+        result = 0.0;
+    } else if kept <= 19 and mantissa < 16777216 and exp10 >= -10 and exp10 <= 10 {
+        // Both exact as f32, so one rounding gives the nearest (Clinger).
+        var scale: f32 = 1.0;
+        var k: i64 = 0;
+        while k < exp10 or k < -exp10 : (k += 1) {
+            scale = scale * 10.0;
+        }
+        if exp10 >= 0 {
+            result = (mantissa as f32) * scale;
+        } else {
+            result = (mantissa as f32) / scale;
+        }
+    } else if ndigits + exp10 > 400 {
+        result = float.from_bits32(0x7F800000);
+    } else if ndigits + exp10 < -400 {
+        result = 0.0;
+    } else {
+        var den = big_zero(a);
+        den.limbs.push(1);
+        while exp10 > 0 : (exp10 -= 1) {
+            big_mul_add(&mut digits, m: 10, add: 0);
+        }
+        while exp10 < 0 : (exp10 += 1) {
+            big_mul_add(&mut den, m: 10, add: 0);
+        }
+        result = float.from_bits32(round_f32(num: &digits, den: &den, a: a));
+    }
+    if negative {
+        return -result;
+    }
+    return result;
+}
+
+// ---- the tokenizer ---------------------------------------------------------
+
+/// Whether c is white space, as Rust's char::is_whitespace says.
+pub fn is_space(c: u32) -> bool {
+    if c == 0x20 or (c >= 0x9 and c <= 0xD) {
+        return true;
+    }
+    if c < 0x80 or c == NO_CHAR {
+        return false;
+    }
+    return c == 0x85 or c == 0xA0 or c == 0x1680 or (c >= 0x2000 and c <= 0x200A) or c == 0x2028 or c == 0x2029 or c == 0x202F or c == 0x205F or c == 0x3000;
+}
+
+/// Whether c may start a name: a letter, `_`, or any character past ASCII.
+fn name_start(c: u32) -> bool {
+    if c == NO_CHAR {
+        return false;
+    }
+    return (c >= 'a' as u32 and c <= 'z' as u32) or (c >= 'A' as u32 and c <= 'Z' as u32) or c == '_' as u32 or c >= 0x80;
+}
+
+/// Whether c may be in a name: what starts one, a digit, or `-`.
+fn name_char(c: u32) -> bool {
+    return name_start(c) or (c >= '0' as u32 and c <= '9' as u32) or c == '-' as u32;
+}
+
+/// Whether c is an ASCII digit.
+fn digit_char(c: u32) -> bool {
+    return c >= '0' as u32 and c <= '9' as u32;
+}
+
+/// Whether c is an ASCII hex digit.
+fn hex_char(c: u32) -> bool {
+    return digit_char(c) or (c >= 'a' as u32 and c <= 'f' as u32) or (c >= 'A' as u32 and c <= 'F' as u32);
+}
+
+/// The character at i, or NO_CHAR past the end.
+fn char_at(cs: []u32, i: usize) -> u32 {
+    if i < cs.len() {
+        return cs[i];
+    }
+    return NO_CHAR;
+}
+
+/// The characters of text, as code points.
+fn chars_of(text: str, a: alloc.Allocator) -> alloc.List(u32) {
+    var out = alloc.List(u32).init(a);
+    let b = text.bytes();
+    var i: usize = 0;
+    while i < b.len() {
+        match utf8.decode(b, at: i) {
+            some(d) => {
+                out.push(d.code);
+                i += d.len;
+            }
+            none => {
+                out.push(0xFFFD);
+                i += 1;
+            }
+        }
+    }
+    return out;
+}
+
+/// What a backslash escapes, from just after it: a hex code point (one
+/// space after it taken too), or the character itself; into out, and
+/// where it ends.
+fn escape(cs: []u32, from: usize, out: &mut alloc.String) -> usize {
+    var i = from;
+    var code: u32 = 0;
+    while i < cs.len() and i - from < 6 and hex_char(cs[i]) {
+        let c = cs[i];
+        var d: u32 = 0;
+        if digit_char(c) {
+            d = c - '0' as u32;
+        } else if c >= 'a' as u32 {
+            d = c - 'a' as u32 + 10;
+        } else {
+            d = c - 'A' as u32 + 10;
+        }
+        code = code * 16 + d;
+        i += 1;
+    }
+    if i > from {
+        if is_space(char_at(cs, i: i)) {
+            i += 1;
+        }
+        if code > 0x10FFFF or (code >= 0xD800 and code <= 0xDFFF) {
+            code = 0xFFFD;
+        }
+        push_char(out, cp: code);
+        return i;
+    }
+    push_char(out, cp: cs[i]);
+    return i + 1;
+}
+
+/// A quoted string from just after its opening quote, into out; where it
+/// ended. An unclosed one ends at the line, as in a browser.
+fn quoted_string(cs: []u32, from: usize, quote: u32, out: &mut alloc.String) -> usize {
+    var i = from;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == quote {
+            return i + 1;
+        }
+        if c == '\\' as u32 and i + 1 < cs.len() {
+            i = escape(cs, from: i + 1, out: out);
+            continue;
+        }
+        if c == '\n' as u32 {
+            return i;
+        }
+        push_char(out, cp: c);
+        i += 1;
+    }
+    return i;
+}
+
+/// A name from i, escapes read, into out; where it ended.
+fn name_at(cs: []u32, from: usize, out: &mut alloc.String) -> usize {
+    var i = from;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\\' as u32 and i + 1 < cs.len() {
+            i = escape(cs, from: i + 1, out: out);
+        } else if name_char(c) {
+            push_char(out, cp: c);
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    return i;
+}
+
+/// A number from i: sign, digits, a point and digits, an exponent; its
+/// value (0 for one too large to be finite) and where it ended.
+fn number_at(cs: []u32, from: usize, value: &mut f32, a: alloc.Allocator) -> usize {
+    var i = from;
+    let c0 = char_at(cs, i: i);
+    if c0 == '+' as u32 or c0 == '-' as u32 {
+        i += 1;
+    }
+    while digit_char(char_at(cs, i: i)) {
+        i += 1;
+    }
+    if char_at(cs, i: i) == '.' as u32 and digit_char(char_at(cs, i: i + 1)) {
+        i += 1;
+        while digit_char(char_at(cs, i: i)) {
+            i += 1;
+        }
+    }
+    let ce = char_at(cs, i: i);
+    if ce == 'e' as u32 or ce == 'E' as u32 {
+        var j = i + 1;
+        let cs1 = char_at(cs, i: j);
+        if cs1 == '+' as u32 or cs1 == '-' as u32 {
+            j += 1;
+        }
+        if digit_char(char_at(cs, i: j)) {
+            i = j;
+            while digit_char(char_at(cs, i: i)) {
+                i += 1;
+            }
+        }
+    }
+    var text = alloc.String.init(a);
+    var k = from;
+    while k < i : (k += 1) {
+        text.push_ascii(cs[k] as u8);
+    }
+    let n = parse_float(text.view(), a) orelse 0.0;
+    if n - n != 0.0 {
+        value.* = 0.0;
+    } else {
+        value.* = n;
+    }
+    return i;
+}
+
+/// CSS split into tokens. Comments go; runs of white space become one
+/// SPACE.
+pub fn tokenize(text: str, a: alloc.Allocator) -> alloc.List(Token) {
+    let chars = chars_of(text, a);
+    let cs = chars.items();
+    var out = alloc.List(Token).init(a);
+    var i: usize = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        let next = char_at(cs, i: i + 1);
+        // Comments.
+        if c == '/' as u32 and next == '*' as u32 {
+            i += 2;
+            while i < cs.len() and not (cs[i] == '*' as u32 and char_at(cs, i: i + 1) == '/' as u32) {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if is_space(c) {
+            while is_space(char_at(cs, i: i)) {
+                i += 1;
+            }
+            if out.len() == 0 or out.items()[out.len() - 1].kind != SPACE {
+                out.push(plain(SPACE, a));
+            }
+            continue;
+        }
+        if c == '"' as u32 or c == '\'' as u32 {
+            var s = alloc.String.init(a);
+            i = quoted_string(cs, from: i + 1, quote: c, out: &mut s);
+            out.push(named(STR, s));
+            continue;
+        }
+        let starts_number = digit_char(c) or (c == '.' as u32 and digit_char(next)) or ((c == '+' as u32 or c == '-' as u32) and (digit_char(next) or (next == '.' as u32 and digit_char(char_at(cs, i: i + 2)))));
+        if starts_number {
+            var n: f32 = 0.0;
+            i = number_at(cs, from: i, value: &mut n, a: a);
+            let after = char_at(cs, i: i);
+            if after == '%' as u32 {
+                out.push(numeric_token(PERCENTAGE, n, a));
+                i += 1;
+            } else if name_start(after) or (after == '-' as u32 and name_start(char_at(cs, i: i + 1))) {
+                var unit = alloc.String.init(a);
+                i = name_at(cs, from: i, out: &mut unit);
+                out.push(Token { kind: DIMENSION, n: n, ch: 0, text: lowercase(unit.view(), a) });
+            } else {
+                out.push(numeric_token(NUMBER, n, a));
+            }
+            continue;
+        }
+        let starts_name = name_start(c) or c == '\\' as u32 or (c == '-' as u32 and (name_start(next) or next == '-' as u32));
+        if starts_name {
+            var word = alloc.String.init(a);
+            let end = name_at(cs, from: i, out: &mut word);
+            if end == i {
+                // A backslash that ends the text: Nimadir's shell would
+                // read it as an empty name forever; here it is a DELIM.
+                out.push(Token { kind: DELIM, n: 0.0, ch: c, text: alloc.String.init(a) });
+                i += 1;
+                continue;
+            }
+            i = end;
+            if char_at(cs, i: i) == '(' as u32 {
+                out.push(named(FUNCTION, lowercase(word.view(), a)));
+                i += 1;
+            } else {
+                out.push(named(IDENT, word));
+            }
+            continue;
+        }
+        if c == '@' as u32 and (name_start(next) or next == '-' as u32) {
+            var word = alloc.String.init(a);
+            i = name_at(cs, from: i + 1, out: &mut word);
+            out.push(named(AT_KEYWORD, lowercase(word.view(), a)));
+            continue;
+        }
+        if c == '#' as u32 and (name_char(next) or next == '\\' as u32) {
+            var word = alloc.String.init(a);
+            i = name_at(cs, from: i + 1, out: &mut word);
+            out.push(named(HASH, word));
+            continue;
+        }
+        var kind = DELIM;
+        if c == ':' as u32 {
+            kind = COLON;
+        } else if c == ';' as u32 {
+            kind = SEMICOLON;
+        } else if c == ',' as u32 {
+            kind = COMMA;
+        } else if c == '{' as u32 {
+            kind = LBRACE;
+        } else if c == '}' as u32 {
+            kind = RBRACE;
+        } else if c == '(' as u32 {
+            kind = LPAREN;
+        } else if c == ')' as u32 {
+            kind = RPAREN;
+        } else if c == '[' as u32 {
+            kind = LBRACKET;
+        } else if c == ']' as u32 {
+            kind = RBRACKET;
+        }
+        if kind == DELIM {
+            out.push(Token { kind: DELIM, n: 0.0, ch: c, text: alloc.String.init(a) });
+        } else {
+            out.push(plain(kind, a));
+        }
+        i += 1;
+    }
+    return out;
+}
+
+// ---- brackets, lists and blocks --------------------------------------------
+
+/// The kind of token that closes one of kind k; 0 when k opens nothing.
+fn closer_of(k: u8) -> u8 {
+    if k == FUNCTION or k == LPAREN {
+        return RPAREN;
+    }
+    if k == LBRACE {
+        return RBRACE;
+    }
+    if k == LBRACKET {
+        return RBRACKET;
+    }
+    return 0;
+}
+
+/// Whether a token of kind k opens a bracket.
+pub fn opens(k: u8) -> bool {
+    return closer_of(k) != 0;
+}
+
+/// Whether a token of kind k closes a bracket.
+pub fn closes(k: u8) -> bool {
+    return k == RPAREN or k == RBRACE or k == RBRACKET;
+}
+
+/// From an opening bracket at start, the index of the token that closes
+/// it, or the end, for one never closed.
+pub fn matching(tokens: []Token, start: usize, a: alloc.Allocator) -> usize {
+    var stack = alloc.List(u8).init(a);
+    var i = start;
+    while i < tokens.len() : (i += 1) {
+        let k = tokens[i].kind;
+        let close = closer_of(k);
+        if close != 0 {
+            stack.push(close);
+        } else if stack.len() > 0 and stack.items()[stack.len() - 1] == k {
+            _ = stack.pop();
+            if stack.len() == 0 {
+                return i;
+            }
+        }
+    }
+    return tokens.len();
+}
+
+/// The parts of tokens between the tokens like sep where no bracket is
+/// open.
+pub fn split_top(tokens: []Token, sep: &Token, a: alloc.Allocator) -> alloc.List(Span) {
+    var parts = alloc.List(Span).init(a);
+    var depth: usize = 0;
+    var from: usize = 0;
+    var i: usize = 0;
+    while i < tokens.len() : (i += 1) {
+        let k = tokens[i].kind;
+        if opens(k) {
+            depth += 1;
+        } else if closes(k) and depth > 0 {
+            depth -= 1;
+        }
+        if depth == 0 and same(x: &tokens[i], y: sep) {
+            parts.push(Span { from: from, to: i });
+            from = i + 1;
+        }
+    }
+    parts.push(Span { from: from, to: tokens.len() });
+    return parts;
+}
+
+/// tokens without the SPACE at either end.
+pub fn trim(tokens: []Token) -> []Token {
+    var start: usize = 0;
+    while start < tokens.len() and tokens[start].kind == SPACE {
+        start += 1;
+    }
+    var end = tokens.len();
+    while end > start and tokens[end - 1].kind == SPACE {
+        end -= 1;
+    }
+    return tokens[start..end];
+}
+
+/// A copy of tokens.
+pub fn copy_tokens(tokens: []Token, a: alloc.Allocator) -> alloc.List(Token) {
+    var out = alloc.List(Token).init(a);
+    for t in tokens {
+        out.push(clone_token(t));
+    }
+    return out;
+}
+
+// ---- declarations ----------------------------------------------------------
+
+/// One `property: value`, the value as tokens, read when the page is
+/// styled. The name is in lower case, except a custom property's
+/// (`--Name`), which is as written.
+pub type Declaration = struct {
+    pub name: alloc.String,
+    pub value: alloc.List(Token),
+    pub important: bool,
+}
+
+/// The declarations of a block, or of a style attribute.
+pub fn declarations(tokens: []Token, a: alloc.Allocator) -> alloc.List(Declaration) {
+    var out = alloc.List(Declaration).init(a);
+    let semicolon = plain(SEMICOLON, a);
+    let parts = split_top(tokens, sep: &semicolon, a: a);
+    for p in parts.items() {
+        let part = trim(tokens[p.from..p.to]);
+        if part.len() == 0 or part[0].kind != IDENT {
+            continue;
+        }
+        let rest = trim(part[1..part.len()]);
+        if rest.len() == 0 or rest[0].kind != COLON {
+            continue;
+        }
+        var v = trim(rest[1..rest.len()]);
+        var important = false;
+        let n = v.len();
+        if n >= 2 and is_delim(&v[n - 2], ch: '!') {
+            if is_ident(&v[n - 1], name: "important") {
+                important = true;
+                v = trim(v[0..n - 2]);
+            }
+        } else if n >= 3 and is_delim(&v[n - 3], ch: '!') and v[n - 2].kind == SPACE {
+            if is_ident(&v[n - 1], name: "important") {
+                important = true;
+                v = trim(v[0..n - 3]);
+            }
+        }
+        // A custom property may be empty; nothing else may.
+        let property = part[0].text.view();
+        let custom = property.starts_with("--");
+        if v.len() == 0 and not custom {
+            continue;
+        }
+        var name = alloc.String.from(property, a);
+        if not custom {
+            name = lowercase(property, a);
+        }
+        out.push(Declaration { name: name, value: copy_tokens(v, a: a), important: important });
+    }
+    return out;
+}
+
+/// An inline style: `padding: 4px; color: red`.
+pub fn inline(text: str, a: alloc.Allocator) -> alloc.List(Declaration) {
+    let tokens = tokenize(text, a);
+    return declarations(tokens.items(), a);
+}
+
+// ---- selectors -------------------------------------------------------------
+
+/// How a compound stands to the one before it, right to left: `a b`,
+/// `a > b`, `a + b`, `a ~ b`.
+pub const DESCENDANT: u8 = 1;
+pub const CHILD: u8 = 2;
+pub const NEXT: u8 = 3;
+pub const LATER: u8 = 4;
+
+/// What an attribute selector asks of the value: that there is one, that
+/// it is the text, has it as one of its space-separated words, is it or
+/// starts with it and `-`, starts with it, ends with it, or contains it.
+pub const ATTR_EXISTS: u8 = 0;
+pub const ATTR_EQUALS: u8 = 1;
+pub const ATTR_WORD: u8 = 2;
+pub const ATTR_DASH: u8 = 3;
+pub const ATTR_PREFIX: u8 = 4;
+pub const ATTR_SUFFIX: u8 = 5;
+pub const ATTR_CONTAINS: u8 = 6;
+
+/// `[name]`, `[name=value]` and the like; the name in lower case.
+pub type AttrSel = struct {
+    pub name: alloc.String,
+    pub op: u8,
+    pub value: alloc.String,
+}
+
+/// The pseudo-classes this host reads.
+pub const PSEUDO_HOVER: u8 = 1;
+pub const PSEUDO_ACTIVE: u8 = 2;
+pub const PSEUDO_FOCUS: u8 = 3;
+pub const PSEUDO_FOCUS_WITHIN: u8 = 4;
+pub const PSEUDO_DISABLED: u8 = 5;
+pub const PSEUDO_ENABLED: u8 = 6;
+pub const PSEUDO_CHECKED: u8 = 7;
+pub const PSEUDO_ROOT: u8 = 8;
+pub const PSEUDO_EMPTY: u8 = 9;
+pub const PSEUDO_FIRST_CHILD: u8 = 10;
+pub const PSEUDO_LAST_CHILD: u8 = 11;
+pub const PSEUDO_ONLY_CHILD: u8 = 12;
+pub const PSEUDO_NTH_CHILD: u8 = 13;
+pub const PSEUDO_NTH_LAST_CHILD: u8 = 14;
+pub const PSEUDO_NOT: u8 = 15;
+pub const PSEUDO_PLACEHOLDER: u8 = 16;
+
+/// A pseudo-class: its kind, an+b of :nth-child and :nth-last-child, and
+/// the simple compounds :not lists.
+pub type Pseudo = struct {
+    pub kind: u8,
+    pub step: i32,
+    pub offset: i32,
+    pub inner: alloc.List(Compound),
+}
+
+/// What one element must be: `button.primary:hover`. The tag is in lower
+/// case.
+pub type Compound = struct {
+    pub has_tag: bool,
+    pub tag: alloc.String,
+    pub has_id: bool,
+    pub id: alloc.String,
+    pub classes: alloc.List(alloc.String),
+    pub attrs: alloc.List(AttrSel),
+    pub pseudos: alloc.List(Pseudo),
+}
+
+/// A complex selector, kept right to left: compounds[0] is the element
+/// the rule styles, and combinators[i] says how compounds[i + 1] stands to
+/// compounds[i]. The specificity packs ids, then classes, attributes and
+/// pseudo-classes, then tags, ten bits each, so that a plain comparison
+/// orders them.
+pub type Selector = struct {
+    pub compounds: alloc.List(Compound),
+    pub combinators: alloc.List(u8),
+    pub specificity: u32,
+}
+
+/// Specificity as three counts.
+type Spec = struct {
+    ids: u32,
+    classes: u32,
+    tags: u32,
+}
+
+/// Whether x is more specific than y.
+fn spec_greater(x: Spec, y: Spec) -> bool {
+    if x.ids != y.ids {
+        return x.ids > y.ids;
+    }
+    if x.classes != y.classes {
+        return x.classes > y.classes;
+    }
+    return x.tags > y.tags;
+}
+
+/// A compound that asks nothing.
+fn empty_compound(a: alloc.Allocator) -> Compound {
+    return Compound { has_tag: false, tag: alloc.String.init(a), has_id: false, id: alloc.String.init(a), classes: alloc.List(alloc.String).init(a), attrs: alloc.List(AttrSel).init(a), pseudos: alloc.List(Pseudo).init(a) };
+}
+
+/// c's specificity; :not counts as the most specific of what it lists.
+fn compound_spec(c: &Compound) -> Spec {
+    var s = Spec { ids: 0, classes: (c.classes.len() + c.attrs.len()) as u32, tags: 0 };
+    if c.has_id {
+        s.ids = 1;
+    }
+    if c.has_tag {
+        s.tags = 1;
+    }
+    for p in c.pseudos.items() {
+        if p.kind == PSEUDO_NOT {
+            var most = Spec { ids: 0, classes: 0, tags: 0 };
+            for inner in p.inner.items() {
+                let x = compound_spec(inner);
+                if spec_greater(x: x, y: most) {
+                    most = x;
+                }
+            }
+            s.ids += most.ids;
+            s.classes += most.classes;
+            s.tags += most.tags;
+        } else {
+            s.classes += 1;
+        }
+    }
+    return s;
+}
+
+/// A selector list, `h1, .title > span`: none if any of it cannot be
+/// read, which drops the whole rule, as in a browser.
+pub fn selectors(tokens: []Token, a: alloc.Allocator) -> ?alloc.List(Selector) {
+    var out = alloc.List(Selector).init(a);
+    let comma = plain(COMMA, a);
+    let parts = split_top(tokens, sep: &comma, a: a);
+    for p in parts.items() {
+        let s = selector(trim(tokens[p.from..p.to]), a) orelse return none;
+        out.push(s);
+    }
+    return out;
+}
+
+/// One complex selector; none for one that cannot be read.
+pub fn selector(tokens: []Token, a: alloc.Allocator) -> ?Selector {
+    if tokens.len() == 0 {
+        return none;
+    }
+    var compounds = alloc.List(Compound).init(a);
+    var combinators = alloc.List(u8).init(a);
+    var current = empty_compound(a);
+    var has_current = false;
+    var pending: u8 = 0;
+    var i: usize = 0;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        var comb: u8 = 0;
+        if t.kind == SPACE {
+            comb = DESCENDANT;
+        } else if is_delim(t, ch: '>') {
+            comb = CHILD;
+        } else if is_delim(t, ch: '+') {
+            comb = NEXT;
+        } else if is_delim(t, ch: '~') {
+            comb = LATER;
+        }
+        if comb != 0 {
+            if has_current {
+                compounds.push(current);
+                current = empty_compound(a);
+                has_current = false;
+                pending = comb;
+            } else if comb != DESCENDANT {
+                // `a > b`: the spaces around it said descendant first.
+                if pending == DESCENDANT {
+                    pending = comb;
+                } else {
+                    return none;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if not has_current {
+            if pending != 0 {
+                combinators.push(pending);
+                pending = 0;
+            } else if compounds.len() > 0 {
+                return none;
+            }
+        }
+        has_current = true;
+        let used = simple(&mut current, tokens: tokens[i..tokens.len()], a: a) orelse return none;
+        i += used;
+    }
+    if not has_current {
+        return none;
+    }
+    compounds.push(current);
+    if compounds.len() > MAX_COMPOUNDS {
+        return none;
+    }
+    // Right to left.
+    var rev_compounds = alloc.List(Compound).init(a);
+    while compounds.len() > 0 {
+        let c = compounds.pop() orelse break;
+        rev_compounds.push(c);
+    }
+    var rev_combinators = alloc.List(u8).init(a);
+    while combinators.len() > 0 {
+        let c = combinators.pop() orelse break;
+        rev_combinators.push(c);
+    }
+    var total = Spec { ids: 0, classes: 0, tags: 0 };
+    for c in rev_compounds.items() {
+        let s = compound_spec(c);
+        total.ids += s.ids;
+        total.classes += s.classes;
+        total.tags += s.tags;
+    }
+    let packed = (min_u32(x: total.ids, y: 1023) << 20) | (min_u32(x: total.classes, y: 1023) << 10) | min_u32(x: total.tags, y: 1023);
+    return Selector { compounds: rev_compounds, combinators: rev_combinators, specificity: packed };
+}
+
+/// The smaller of x and y.
+fn min_u32(x: u32, y: u32) -> u32 {
+    if x < y {
+        return x;
+    }
+    return y;
+}
+
+/// One simple selector into c; how many tokens it took, or none for one
+/// that cannot be read.
+fn simple(c: &mut Compound, tokens: []Token, a: alloc.Allocator) -> ?usize {
+    let t = &tokens[0];
+    if t.kind == IDENT and not c.has_tag {
+        c.has_tag = true;
+        c.tag = lowercase(t.text.view(), a);
+        return 1;
+    }
+    if is_delim(t, ch: '*') {
+        return 1;
+    }
+    if t.kind == HASH and not c.has_id {
+        c.has_id = true;
+        c.id = t.text.clone();
+        return 1;
+    }
+    if is_delim(t, ch: '.') {
+        if tokens.len() > 1 and tokens[1].kind == IDENT {
+            c.classes.push(tokens[1].text.clone());
+            return 2;
+        }
+        return none;
+    }
+    if t.kind == LBRACKET {
+        let end = matching(tokens, start: 0, a: a);
+        if end >= tokens.len() {
+            return none;
+        }
+        let sel = attribute(trim(tokens[1..end]), a) orelse return none;
+        c.attrs.push(sel);
+        return end + 1;
+    }
+    if t.kind == COLON {
+        if tokens.len() < 2 {
+            return none;
+        }
+        let second = &tokens[1];
+        if second.kind == IDENT {
+            let p = pseudo(second.text.view(), args: tokens[0..0], has_args: false, a: a) orelse return none;
+            c.pseudos.push(p);
+            return 2;
+        }
+        if second.kind == FUNCTION {
+            let end = matching(tokens, start: 1, a: a);
+            if end >= tokens.len() {
+                return none;
+            }
+            let p = pseudo(second.text.view(), args: trim(tokens[2..end]), has_args: true, a: a) orelse return none;
+            c.pseudos.push(p);
+            return end + 1;
+        }
+        // `::before` and the like: a box this host does not make.
+        return none;
+    }
+    return none;
+}
+
+/// The inside of `[...]`.
+fn attribute(tokens: []Token, a: alloc.Allocator) -> ?AttrSel {
+    if tokens.len() == 0 or tokens[0].kind != IDENT {
+        return none;
+    }
+    let attr_name = lowercase(tokens[0].text.view(), a);
+    let rest = trim(tokens[1..tokens.len()]);
+    if rest.len() == 0 {
+        return AttrSel { name: attr_name, op: ATTR_EXISTS, value: alloc.String.init(a) };
+    }
+    var op: u8 = 0;
+    var from: usize = 0;
+    if is_delim(&rest[0], ch: '=') {
+        op = ATTR_EQUALS;
+        from = 1;
+    } else if rest.len() >= 2 and rest[0].kind == DELIM and is_delim(&rest[1], ch: '=') {
+        let c = rest[0].ch;
+        if c == '~' as u32 {
+            op = ATTR_WORD;
+        } else if c == '|' as u32 {
+            op = ATTR_DASH;
+        } else if c == '^' as u32 {
+            op = ATTR_PREFIX;
+        } else if c == '$' as u32 {
+            op = ATTR_SUFFIX;
+        } else if c == '*' as u32 {
+            op = ATTR_CONTAINS;
+        } else {
+            return none;
+        }
+        from = 2;
+    } else {
+        return none;
+    }
+    let v = trim(rest[from..rest.len()]);
+    var text = alloc.String.init(a);
+    if v.len() == 1 and (v[0].kind == IDENT or v[0].kind == STR) {
+        text = v[0].text.clone();
+    } else if v.len() == 3 and (v[0].kind == IDENT or v[0].kind == STR) and v[1].kind == SPACE and v[2].kind == IDENT {
+        // `[i]` and `[s]` flags are not read; the value alone is.
+        text = v[0].text.clone();
+    } else if v.len() == 1 and v[0].kind == NUMBER {
+        write_number(v[0].n, out: &mut text);
+    } else {
+        return none;
+    }
+    return AttrSel { name: attr_name, op: op, value: text };
+}
+
+/// A pseudo-class by its name, with its arguments when it is a function.
+fn pseudo(word: str, args: []Token, has_args: bool, a: alloc.Allocator) -> ?Pseudo {
+    let k = lowercase(word, a);
+    let w = k.view();
+    var kind: u8 = 0;
+    if not has_args {
+        if w.eq("hover") {
+            kind = PSEUDO_HOVER;
+        } else if w.eq("active") {
+            kind = PSEUDO_ACTIVE;
+        } else if w.eq("focus") or w.eq("focus-visible") {
+            kind = PSEUDO_FOCUS;
+        } else if w.eq("focus-within") {
+            kind = PSEUDO_FOCUS_WITHIN;
+        } else if w.eq("disabled") {
+            kind = PSEUDO_DISABLED;
+        } else if w.eq("enabled") {
+            kind = PSEUDO_ENABLED;
+        } else if w.eq("checked") {
+            kind = PSEUDO_CHECKED;
+        } else if w.eq("root") {
+            kind = PSEUDO_ROOT;
+        } else if w.eq("empty") {
+            kind = PSEUDO_EMPTY;
+        } else if w.eq("first-child") {
+            kind = PSEUDO_FIRST_CHILD;
+        } else if w.eq("last-child") {
+            kind = PSEUDO_LAST_CHILD;
+        } else if w.eq("only-child") {
+            kind = PSEUDO_ONLY_CHILD;
+        } else if w.eq("placeholder-shown") {
+            kind = PSEUDO_PLACEHOLDER;
+        } else {
+            return none;
+        }
+        return Pseudo { kind: kind, step: 0, offset: 0, inner: alloc.List(Compound).init(a) };
+    }
+    if w.eq("nth-child") or w.eq("nth-last-child") {
+        var step: i32 = 0;
+        var offset: i32 = 0;
+        if not nth(args, step: &mut step, offset: &mut offset, a: a) {
+            return none;
+        }
+        kind = PSEUDO_NTH_CHILD;
+        if w.eq("nth-last-child") {
+            kind = PSEUDO_NTH_LAST_CHILD;
+        }
+        return Pseudo { kind: kind, step: step, offset: offset, inner: alloc.List(Compound).init(a) };
+    }
+    if w.eq("not") {
+        var inner = alloc.List(Compound).init(a);
+        let comma = plain(COMMA, a);
+        let parts = split_top(args, sep: &comma, a: a);
+        for sp in parts.items() {
+            let part = trim(args[sp.from..sp.to]);
+            if part.len() == 0 {
+                return none;
+            }
+            var c = empty_compound(a);
+            var i: usize = 0;
+            while i < part.len() {
+                let used = simple(&mut c, tokens: part[i..part.len()], a: a) orelse return none;
+                i += used;
+            }
+            inner.push(c);
+        }
+        return Pseudo { kind: PSEUDO_NOT, step: 0, offset: 0, inner: inner };
+    }
+    return none;
+}
+
+/// `an+b` for :nth-child: odd, even, 3, 2n, 2n+1, -n+3, into step and
+/// offset; whether it could be read. Read back into text first, because the
+/// tokenizer splits it oddly (`2n-1` is one dimension with the unit `n-1`,
+/// `2n+1` a dimension and a number), and a number after the n part can only
+/// have had a sign in front of it.
+fn nth(tokens: []Token, step: &mut i32, offset: &mut i32, a: alloc.Allocator) -> bool {
+    var text = alloc.String.init(a);
+    for t in tokens {
+        if t.kind == SPACE {
+            continue;
+        }
+        if t.kind == NUMBER {
+            let v = text.view();
+            let signed = v.len() > 0 and (v.bytes()[v.len() - 1] == '+' or v.bytes()[v.len() - 1] == '-');
+            if v.len() > 0 and not signed and t.n >= 0.0 {
+                text.push_str("+");
+            }
+            write_number(t.n, out: &mut text);
+        } else if t.kind == DIMENSION {
+            write_number(t.n, out: &mut text);
+            text.push_str(t.text.view());
+        } else if t.kind == IDENT {
+            text.push_str(t.text.view());
+        } else if t.kind == DELIM {
+            push_char(&mut text, cp: t.ch);
+        } else {
+            return false;
+        }
+    }
+    let low = lowercase(text.view(), a);
+    let s = low.view();
+    if s.eq("odd") {
+        step.* = 2;
+        offset.* = 1;
+        return true;
+    }
+    if s.eq("even") {
+        step.* = 2;
+        offset.* = 0;
+        return true;
+    }
+    var n_at = s.len();
+    var i: usize = 0;
+    while i < s.len() : (i += 1) {
+        if s.bytes()[i] == 'n' {
+            n_at = i;
+            break;
+        }
+    }
+    if n_at == s.len() {
+        let b = parse_i32(s) orelse return false;
+        step.* = 0;
+        offset.* = b;
+        return true;
+    }
+    let head = s[0..n_at];
+    var x: i32 = 0;
+    if head.len() == 0 or head.eq("+") {
+        x = 1;
+    } else if head.eq("-") {
+        x = -1;
+    } else {
+        x = parse_i32(head) orelse return false;
+    }
+    var tail = s[n_at + 1..s.len()];
+    var y: i32 = 0;
+    if tail.len() > 0 {
+        if tail.starts_with("+") {
+            tail = tail[1..tail.len()];
+        }
+        y = parse_i32(tail) orelse return false;
+    }
+    step.* = x;
+    offset.* = y;
+    return true;
+}
+
+/// A whole number as Rust's i32 parse reads it: an optional sign, then
+/// decimal digits, in range.
+pub fn parse_i32(s: str) -> ?i32 {
+    let b = s.bytes();
+    var i: usize = 0;
+    var negative = false;
+    if i < b.len() and (b[i] == '+' or b[i] == '-') {
+        negative = b[i] == '-';
+        i += 1;
+    }
+    if i >= b.len() {
+        return none;
+    }
+    var v: i64 = 0;
+    while i < b.len() : (i += 1) {
+        if not is_digit(b[i]) {
+            return none;
+        }
+        v = v * 10 + (b[i] - '0') as i64;
+        if v > 2147483648 {
+            return none;
+        }
+    }
+    if negative {
+        v = -v;
+    }
+    if v > 2147483647 {
+        return none;
+    }
+    return v as i32;
+}
+
+// ---- @media ----------------------------------------------------------------
+
+/// What the page is shown on, for @media: its size, whether the system is
+/// dark, and whether a mouse can hover (false on a touch screen).
+pub type Env = struct {
+    pub width: f32,
+    pub height: f32,
+    pub dark: bool,
+    pub hover: bool,
+}
+
+/// The page Nimadir's shell assumes: 800 by 600, light, with a mouse.
+pub fn default_env() -> Env {
+    return Env { width: 800.0, height: 600.0, dark: false, hover: true };
+}
+
+/// A media feature: the system's dark theme, a width or height bound, the
+/// orientation, a hovering pointer; one this host does not know is never
+/// true.
+const FEATURE_UNKNOWN: u8 = 0;
+const FEATURE_DARK: u8 = 1;
+const FEATURE_MIN_WIDTH: u8 = 2;
+const FEATURE_MAX_WIDTH: u8 = 3;
+const FEATURE_MIN_HEIGHT: u8 = 4;
+const FEATURE_MAX_HEIGHT: u8 = 5;
+const FEATURE_PORTRAIT: u8 = 6;
+const FEATURE_HOVER: u8 = 7;
+
+/// One feature: its kind, and its length or its yes or no.
+type Feature = struct {
+    kind: u8,
+    size: f32,
+    yes: bool,
+}
+
+/// One media query: whether it is negated, whether it names a media type
+/// this host is not (print), and its features.
+type MediaQuery = struct {
+    negated: bool,
+    other_type: bool,
+    features: alloc.List(Feature),
+}
+
+/// A media query list: true when any query in it is.
+pub type Media = struct {
+    queries: alloc.List(MediaQuery),
+}
+
+/// Whether m is true of env.
+pub fn media_matches(m: &Media, env: &Env) -> bool {
+    for q in m.queries.items() {
+        var yes = not q.other_type;
+        for f in q.features.items() {
+            var holds = false;
+            let k = f.kind;
+            if k == FEATURE_DARK {
+                holds = env.dark == f.yes;
+            } else if k == FEATURE_MIN_WIDTH {
+                holds = env.width >= f.size;
+            } else if k == FEATURE_MAX_WIDTH {
+                holds = env.width <= f.size;
+            } else if k == FEATURE_MIN_HEIGHT {
+                holds = env.height >= f.size;
+            } else if k == FEATURE_MAX_HEIGHT {
+                holds = env.height <= f.size;
+            } else if k == FEATURE_PORTRAIT {
+                holds = (env.height >= env.width) == f.yes;
+            } else if k == FEATURE_HOVER {
+                holds = env.hover == f.yes;
+            }
+            if not holds {
+                yes = false;
+            }
+        }
+        if yes != q.negated {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A media query list from @media's prelude.
+fn media(tokens: []Token, a: alloc.Allocator) -> Media {
+    var queries = alloc.List(MediaQuery).init(a);
+    let comma = plain(COMMA, a);
+    let parts = split_top(tokens, sep: &comma, a: a);
+    for sp in parts.items() {
+        let part = trim(tokens[sp.from..sp.to]);
+        var q = MediaQuery { negated: false, other_type: false, features: alloc.List(Feature).init(a) };
+        var i: usize = 0;
+        while i < part.len() : (i += 1) {
+            let t = &part[i];
+            if t.kind == SPACE {
+                continue;
+            }
+            if t.kind == IDENT {
+                let w = t.text.view();
+                if eq_ignore_case(x: w, y: "not") {
+                    q.negated = true;
+                } else if eq_ignore_case(x: w, y: "only") or eq_ignore_case(x: w, y: "and") or eq_ignore_case(x: w, y: "all") or eq_ignore_case(x: w, y: "screen") {
+                } else {
+                    q.other_type = true;
+                }
+                continue;
+            }
+            if t.kind == LPAREN {
+                let end = matching(part, start: i, a: a);
+                var stop = end;
+                if stop > part.len() {
+                    stop = part.len();
+                }
+                q.features.push(feature(trim(part[i + 1..stop]), a));
+                i = end;
+                continue;
+            }
+            q.features.push(Feature { kind: FEATURE_UNKNOWN, size: 0.0, yes: false });
+        }
+        queries.push(q);
+    }
+    return Media { queries: queries };
+}
+
+/// One feature, the inside of `(...)`.
+fn feature(tokens: []Token, a: alloc.Allocator) -> Feature {
+    let colon = plain(COLON, a);
+    let parts = split_top(tokens, sep: &colon, a: a);
+    let first = parts.items()[0];
+    let head = trim(tokens[first.from..first.to]);
+    var fname = alloc.String.init(a);
+    if head.len() > 0 and head[0].kind == IDENT {
+        fname = lowercase(head[0].text.view(), a);
+    }
+    var v = tokens[0..0];
+    if parts.len() > 1 {
+        let second = parts.items()[1];
+        v = trim(tokens[second.from..second.to]);
+    }
+    var word = alloc.String.init(a);
+    if v.len() > 0 and v[0].kind == IDENT {
+        word = lowercase(v[0].text.view(), a);
+    }
+    // A length: px, em or rem (16px), or a bare 0.
+    var has_px = false;
+    var px: f32 = 0.0;
+    if v.len() == 1 and v[0].kind == DIMENSION and v[0].text.view().eq("px") {
+        has_px = true;
+        px = v[0].n;
+    } else if v.len() == 1 and v[0].kind == DIMENSION and (v[0].text.view().eq("em") or v[0].text.view().eq("rem")) {
+        has_px = true;
+        px = v[0].n * 16.0;
+    } else if v.len() == 1 and v[0].kind == NUMBER and v[0].n == 0.0 {
+        has_px = true;
+    }
+    let n = fname.view();
+    let wd = word.view();
+    var f = Feature { kind: FEATURE_UNKNOWN, size: 0.0, yes: false };
+    if n.eq("prefers-color-scheme") and wd.eq("dark") {
+        f = Feature { kind: FEATURE_DARK, size: 0.0, yes: true };
+    } else if n.eq("prefers-color-scheme") and wd.eq("light") {
+        f = Feature { kind: FEATURE_DARK, size: 0.0, yes: false };
+    } else if n.eq("orientation") and wd.eq("portrait") {
+        f = Feature { kind: FEATURE_PORTRAIT, size: 0.0, yes: true };
+    } else if n.eq("orientation") and wd.eq("landscape") {
+        f = Feature { kind: FEATURE_PORTRAIT, size: 0.0, yes: false };
+    } else if (n.eq("hover") or n.eq("any-hover")) and wd.eq("hover") {
+        f = Feature { kind: FEATURE_HOVER, size: 0.0, yes: true };
+    } else if (n.eq("hover") or n.eq("any-hover")) and wd.eq("none") {
+        f = Feature { kind: FEATURE_HOVER, size: 0.0, yes: false };
+    } else if n.eq("pointer") and wd.eq("fine") {
+        f = Feature { kind: FEATURE_HOVER, size: 0.0, yes: true };
+    } else if n.eq("pointer") and wd.eq("coarse") {
+        f = Feature { kind: FEATURE_HOVER, size: 0.0, yes: false };
+    } else if has_px and n.eq("min-width") {
+        f = Feature { kind: FEATURE_MIN_WIDTH, size: px, yes: false };
+    } else if has_px and n.eq("max-width") {
+        f = Feature { kind: FEATURE_MAX_WIDTH, size: px, yes: false };
+    } else if has_px and n.eq("min-height") {
+        f = Feature { kind: FEATURE_MIN_HEIGHT, size: px, yes: false };
+    } else if has_px and n.eq("max-height") {
+        f = Feature { kind: FEATURE_MAX_HEIGHT, size: px, yes: false };
+    }
+    return f;
+}
+
+// ---- sheets ----------------------------------------------------------------
+
+/// One rule: its selectors, its declarations, and every @media it sits in
+/// (by number in the sheet's medias), all of which must match.
+pub type Rule = struct {
+    pub selectors: alloc.List(Selector),
+    pub declarations: alloc.List(Declaration),
+    pub media: alloc.List(u32),
+}
+
+/// A stylesheet read: its rules, the @media lists they name, what was
+/// skipped and why (for the app's log), and how many warnings there were
+/// past MAX_WARNINGS.
+pub type Sheet = struct {
+    pub rules: alloc.List(Rule),
+    pub medias: alloc.List(Media),
+    pub warnings: alloc.List(alloc.String),
+    pub more_warnings: usize,
+}
+
+/// A sheet with nothing in it.
+pub fn empty_sheet(a: alloc.Allocator) -> Sheet {
+    return Sheet { rules: alloc.List(Rule).init(a), medias: alloc.List(Media).init(a), warnings: alloc.List(alloc.String).init(a), more_warnings: 0 };
+}
+
+/// A warning kept, or counted past MAX_WARNINGS.
+fn warn(sheet: &mut Sheet, what: alloc.String) {
+    if sheet.warnings.len() < MAX_WARNINGS {
+        sheet.warnings.push(what);
+    } else {
+        sheet.more_warnings += 1;
+    }
+}
+
+/// Whether every @media rule sits in is true of env.
+pub fn rule_applies(sheet: &Sheet, rule: &Rule, env: &Env) -> bool {
+    for m in rule.media.items() {
+        if not media_matches(&sheet.medias.items()[m.* as usize], env: env) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A stylesheet, read.
+pub fn parse(text: str, a: alloc.Allocator) -> Sheet {
+    let tokens = tokenize(text, a);
+    var sheet = empty_sheet(a);
+    let none_yet = alloc.List(u32).init(a);
+    rules(tokens.items(), within: none_yet.items(), nesting: 0, sheet: &mut sheet, a: a);
+    return sheet;
+}
+
+/// The rules in tokens, inside the @media lists within.
+fn rules(tokens: []Token, within: []u32, nesting: usize, sheet: &mut Sheet, a: alloc.Allocator) {
+    var i: usize = 0;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        if t.kind == SPACE or t.kind == SEMICOLON {
+            i += 1;
+            continue;
+        }
+        if t.kind == AT_KEYWORD {
+            // The prelude runs to the block or the semicolon.
+            let start = i + 1;
+            var j = start;
+            while j < tokens.len() and tokens[j].kind != LBRACE and tokens[j].kind != SEMICOLON {
+                j += 1;
+            }
+            let at_name = t.text.view();
+            if j >= tokens.len() or tokens[j].kind != LBRACE {
+                if not at_name.eq("charset") {
+                    var w = alloc.String.from("skipped @", a);
+                    w.push_str(at_name);
+                    w.push_str(": not read by this host");
+                    warn(sheet, what: w);
+                }
+                i = j + 1;
+                continue;
+            }
+            let end = matching(tokens, start: j, a: a);
+            var stop = end;
+            if stop > tokens.len() {
+                stop = tokens.len();
+            }
+            if at_name.eq("media") and nesting < MAX_MEDIA_NESTING {
+                var inner = alloc.List(u32).init(a);
+                for m in within {
+                    inner.push(m.*);
+                }
+                inner.push(sheet.medias.len() as u32);
+                sheet.medias.push(media(trim(tokens[start..j]), a));
+                rules(tokens[j + 1..stop], within: inner.items(), nesting: nesting + 1, sheet: sheet, a: a);
+            } else {
+                var w = alloc.String.from("skipped @", a);
+                w.push_str(at_name);
+                w.push_str(": not read by this host");
+                warn(sheet, what: w);
+            }
+            i = end + 1;
+            continue;
+        }
+        var j = i;
+        while j < tokens.len() and tokens[j].kind != LBRACE {
+            j += 1;
+        }
+        if j >= tokens.len() {
+            var w = alloc.String.from("skipped `", a);
+            to_css(trim(tokens[i..tokens.len()]), out: &mut w);
+            w.push_str("`: no block");
+            warn(sheet, what: w);
+            return;
+        }
+        let end = matching(tokens, start: j, a: a);
+        var stop = end;
+        if stop > tokens.len() {
+            stop = tokens.len();
+        }
+        let prelude = trim(tokens[i..j]);
+        match selectors(prelude, a) {
+            some(list) => {
+                var media_of = alloc.List(u32).init(a);
+                for m in within {
+                    media_of.push(m.*);
+                }
+                sheet.rules.push(Rule { selectors: list, declarations: declarations(tokens[j + 1..stop], a), media: media_of });
+            }
+            none => {
+                var w = alloc.String.from("skipped `", a);
+                to_css(prelude, out: &mut w);
+                w.push_str("`: a selector this host does not read");
+                warn(sheet, what: w);
+            }
+        }
+        i = end + 1;
+    }
+}

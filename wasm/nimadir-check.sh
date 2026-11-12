@@ -8,6 +8,8 @@
 # limits: a second a frame, 512 MiB of memory, and what a frame may send.
 # An app that imports what the shell does not give is refused. Each runs
 # in the interpreter, and again with the JIT (--jit).
+# A case's arguments are read as the shell reads them, so that a quoted
+# one, a stylesheet typed into the probe, keeps its spaces.
 # Usage: nimadir-check.sh <arche-wasm>
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
@@ -19,7 +21,7 @@ failed=0
 # run alike from one directory.
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-for app in counter counter-cs hello store gallery runaway; do
+for app in counter counter-cs hello store gallery runaway probe todo; do
     mkdir -p "$work/mini-apps/$app"
     cp "$apps/$app.component.wasm" "$work/mini-apps/$app/"
 done
@@ -28,12 +30,14 @@ done
 # Then again with each app's program taken out of its component and made a
 # component again by arche-wasm's own encoder (lib/wasm/encode.arche).
 check_cases() {
+label=$1
 grep -v '^#' "$apps/cases.txt" | {
     while read -r name args; do
         [ -n "$name" ] || continue
+        eval "set -- $args"
         for mode in "" --jit; do
             # shellcheck disable=SC2086
-            if ! (cd "$work" && "$wasm" nimadir $args $mode --registry "$apps/registry.list") > "$work/out" 2>&1; then
+            if ! (cd "$work" && "$wasm" nimadir "$@" $mode --registry "$apps/registry.list") > "$work/out" 2>&1; then
                 echo "FAIL $name $mode: arche-wasm failed:"
                 head -20 "$work/out"
                 failed=$((failed + 1))
@@ -41,17 +45,17 @@ grep -v '^#' "$apps/cases.txt" | {
             fi
             sh "$apps/normalize.sh" < "$work/out" > "$work/got"
             cp "$apps/expected/$name.txt" "$work/want"
-            if [ -n "$1" ]; then
+            if [ -n "$label" ]; then
                 # The components are this encoder's, not wit-component's: their
                 # sizes are their own.
                 sed -i 's/loaded [0-9]* bytes/loaded N bytes/' "$work/got" "$work/want"
             fi
             if ! diff -u "$work/want" "$work/got" > "$work/diff"; then
-                echo "FAIL $name $mode $1: not what Nimadir says:"
+                echo "FAIL $name $mode $label: not what Nimadir says:"
                 head -30 "$work/diff"
                 failed=$((failed + 1))
             else
-                echo "PASS $name $mode $1: as Nimadir"
+                echo "PASS $name $mode $label: as Nimadir"
             fi
         done
     done
@@ -62,7 +66,7 @@ failed=$(cat "$work/failed")
 check_cases ""
 # counter-cs is not encoded again: its program imports WASI, which
 # Nimadir's world does not have; it runs as .NET's toolchain made it.
-for app in counter hello store gallery runaway; do
+for app in counter hello store gallery runaway probe todo; do
     "$wasm" core "$apps/$app.component.wasm" "$work/$app.core.wasm"
     "$wasm" component "$work/$app.core.wasm" "$apps/world.wit" mini-app "$work/mini-apps/$app/$app.component.wasm"
 done

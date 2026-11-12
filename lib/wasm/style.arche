@@ -1,0 +1,3188 @@
+/// The cascade, as Nimadir's shell computes it (host/src/dom/style.rs,
+/// ADR-4): which declarations reach each element, in what order, and the
+/// computed style they leave it with.
+///
+/// Three origins, as on the web: the host's user-agent sheet (ua_text),
+/// the app's sheets in the order added, and each element's inline style.
+/// Within them, !important first, then specificity, then order. Inherited
+/// properties start from the parent's values; custom properties (--x)
+/// inherit too, and var() is put in before a value is read. Relative units
+/// are resolved here, so layout sees pixels, and percentages, which only
+/// layout can resolve. describe says what an element's rules set, as
+/// Nimadir's headless runner prints it (--styles).
+import alloc;
+import wasm.css;
+import wasm.select;
+import wasm.values;
+
+/// The most tokens one value may grow to as var()s are put in: a custom
+/// property can name another twice, which names another twice, and so on.
+const MAX_VALUE_TOKENS: usize = 4096;
+
+/// How deep var() may refer through other variables.
+const MAX_VAR_DEPTH: usize = 16;
+
+/// The host's own stylesheet, Nimadir's UA_CSS: what every element looks
+/// like before the app says otherwise, in the system's light or dark
+/// theme. The colors are the window's palette, exposed as variables the
+/// app may use as well: --nimadir-text, --nimadir-accent, ...
+pub fn ua_text(a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str(":root {\n");
+    s.push_str("  --nimadir-bg: #ffffff; --nimadir-surface: #f1f3f4; --nimadir-border: #dadce0;\n");
+    s.push_str("  --nimadir-text: #202124; --nimadir-muted: #5f6368; --nimadir-accent: #1a73e8;\n");
+    s.push_str("  --nimadir-accent-text: #ffffff; --nimadir-accent-wash: #e8f0fe;\n");
+    s.push_str("  --nimadir-danger: #d93025; --nimadir-field: #ffffff;\n");
+    s.push_str("  color: var(--nimadir-text); font-size: 15px; line-height: 1.4;\n");
+    s.push_str("}\n");
+    s.push_str("@media (prefers-color-scheme: dark) {\n");
+    s.push_str("  :root {\n");
+    s.push_str("    --nimadir-bg: #202124; --nimadir-surface: #303134; --nimadir-border: #5f6368;\n");
+    s.push_str("    --nimadir-text: #e8eaed; --nimadir-muted: #9aa0a6; --nimadir-accent: #8ab4f8;\n");
+    s.push_str("    --nimadir-accent-text: #202124; --nimadir-accent-wash: #2a374f;\n");
+    s.push_str("    --nimadir-danger: #f28b82; --nimadir-field: #202124;\n");
+    s.push_str("  }\n");
+    s.push_str("}\n");
+    s.push_str("h1 { font-size: 2em; font-weight: 700; margin: 0.67em 0; line-height: 1.2; }\n");
+    s.push_str("h2 { font-size: 1.5em; font-weight: 700; margin: 0.75em 0; line-height: 1.25; }\n");
+    s.push_str("h3 { font-size: 1.25em; font-weight: 700; margin: 0.8em 0; }\n");
+    s.push_str("h4 { font-size: 1.1em; font-weight: 700; margin: 0.9em 0; }\n");
+    s.push_str("h5, h6 { font-size: 1em; font-weight: 700; margin: 1em 0; }\n");
+    s.push_str("p, blockquote, figure, pre, dl { margin: 0 0 0.8em; }\n");
+    s.push_str("blockquote { padding-left: 12px; border-left: 3px solid var(--nimadir-border); color: var(--nimadir-muted); }\n");
+    s.push_str("ul, ol { margin: 0 0 0.8em; padding-left: 24px; }\n");
+    s.push_str("ol { list-style-type: decimal; }\n");
+    s.push_str("b, strong, th { font-weight: 700; }\n");
+    s.push_str("i, em, cite { font-style: italic; }\n");
+    s.push_str("u, ins { text-decoration: underline; }\n");
+    s.push_str("s, del, strike { text-decoration: line-through; }\n");
+    s.push_str("small { font-size: 0.85em; }\n");
+    s.push_str("code, kbd, pre, samp { font-family: monospace; }\n");
+    s.push_str("pre { white-space: pre; }\n");
+    s.push_str("mark { background: #fde293; color: #202124; }\n");
+    s.push_str("a { color: var(--nimadir-accent); text-decoration: underline; cursor: pointer; }\n");
+    s.push_str("hr { border: none; border-top: 1px solid var(--nimadir-border); margin: 8px 0; }\n");
+    s.push_str("button {\n");
+    s.push_str("  padding: 8px 16px; border-radius: 8px; border: 1px solid var(--nimadir-border);\n");
+    s.push_str("  background: var(--nimadir-surface); color: var(--nimadir-text);\n");
+    s.push_str("  font-weight: 600; cursor: pointer; text-align: center;\n");
+    s.push_str("}\n");
+    s.push_str("button:hover { background: var(--nimadir-accent-wash); }\n");
+    s.push_str("button:active { border-color: var(--nimadir-accent); }\n");
+    s.push_str("input, textarea {\n");
+    s.push_str("  padding: 8px 10px; border: 1px solid var(--nimadir-border); border-radius: 8px;\n");
+    s.push_str("  background: var(--nimadir-field); color: var(--nimadir-text); cursor: text;\n");
+    s.push_str("}\n");
+    s.push_str("/* As in browsers: a search field set to 100% fits, padding and all. */\n");
+    s.push_str("input[type=search] { box-sizing: border-box; }\n");
+    s.push_str("input:focus, textarea:focus, select:focus { border-color: var(--nimadir-accent); }\n");
+    s.push_str("select {\n");
+    s.push_str("  padding: 8px 32px 8px 10px; border: 1px solid var(--nimadir-border); border-radius: 8px;\n");
+    s.push_str("  background: var(--nimadir-field); color: var(--nimadir-text); cursor: pointer;\n");
+    s.push_str("}\n");
+    s.push_str("input[type=checkbox], input[type=radio] {\n");
+    s.push_str("  width: 18px; height: 18px; padding: 0; margin: 0 4px 0 0; cursor: pointer;\n");
+    s.push_str("  border: 2px solid var(--nimadir-muted); border-radius: 4px;\n");
+    s.push_str("}\n");
+    s.push_str("input[type=radio] { border-radius: 50%; }\n");
+    s.push_str("input[type=checkbox]:checked, input[type=radio]:checked {\n");
+    s.push_str("  background: var(--nimadir-accent); border-color: var(--nimadir-accent);\n");
+    s.push_str("}\n");
+    s.push_str("input[type=range] { padding: 0; border: none; height: 20px; background: transparent; }\n");
+    s.push_str("textarea { min-height: 64px; }\n");
+    s.push_str("progress { width: 160px; height: 8px; border-radius: 4px; background: var(--nimadir-surface); color: var(--nimadir-accent); }\n");
+    s.push_str("table { border-spacing: 0; }\n");
+    s.push_str("td, th { padding: 4px 8px; }\n");
+    s.push_str("/* `hidden` hides, whatever display a sheet gives the element: a browser lets\n");
+    s.push_str("   `.card { display: flex }` undo it, which is a trap, not a feature. */\n");
+    s.push_str("[hidden] { display: none !important; }\n");
+    s.push_str(":disabled { opacity: 0.5; cursor: default; }\n");
+    return s;
+}
+
+// ---- keywords --------------------------------------------------------------
+
+/// Each keyword property's values, by number: the constants below, in the
+/// order of the table that spells them (keyword_name).
+pub const DISPLAY_NONE: u8 = 0;
+pub const DISPLAY_BLOCK: u8 = 1;
+pub const DISPLAY_INLINE: u8 = 2;
+pub const DISPLAY_INLINE_BLOCK: u8 = 3;
+pub const DISPLAY_FLEX: u8 = 4;
+pub const DISPLAY_INLINE_FLEX: u8 = 5;
+pub const DISPLAY_GRID: u8 = 6;
+pub const DISPLAY_INLINE_GRID: u8 = 7;
+pub const DISPLAY_LIST_ITEM: u8 = 8;
+pub const DISPLAY_CONTENTS: u8 = 9;
+pub const DISPLAYS: str = "none block inline inline-block flex inline-flex grid inline-grid list-item contents";
+
+pub const POSITION_STATIC: u8 = 0;
+pub const POSITION_RELATIVE: u8 = 1;
+pub const POSITION_ABSOLUTE: u8 = 2;
+pub const POSITION_FIXED: u8 = 3;
+pub const POSITION_STICKY: u8 = 4;
+pub const POSITIONS: str = "static relative absolute fixed sticky";
+
+pub const OVERFLOW_VISIBLE: u8 = 0;
+pub const OVERFLOW_HIDDEN: u8 = 1;
+pub const OVERFLOW_CLIP: u8 = 2;
+pub const OVERFLOW_SCROLL: u8 = 3;
+pub const OVERFLOW_AUTO: u8 = 4;
+pub const OVERFLOWS: str = "visible hidden clip scroll auto";
+
+pub const FLEX_ROW: u8 = 0;
+pub const FLEX_ROW_REVERSE: u8 = 1;
+pub const FLEX_COLUMN: u8 = 2;
+pub const FLEX_COLUMN_REVERSE: u8 = 3;
+pub const FLEX_DIRECTIONS: str = "row row-reverse column column-reverse";
+
+pub const WRAP_NOWRAP: u8 = 0;
+pub const WRAP_WRAP: u8 = 1;
+pub const WRAP_REVERSE: u8 = 2;
+pub const FLEX_WRAPS: str = "nowrap wrap wrap-reverse";
+
+/// One spelling for every alignment property; each reads the ones that
+/// mean something to it.
+pub const ALIGN_NORMAL: u8 = 0;
+pub const ALIGN_AUTO: u8 = 1;
+pub const ALIGN_START: u8 = 2;
+pub const ALIGN_END: u8 = 3;
+pub const ALIGN_FLEX_START: u8 = 4;
+pub const ALIGN_FLEX_END: u8 = 5;
+pub const ALIGN_SELF_START: u8 = 6;
+pub const ALIGN_SELF_END: u8 = 7;
+pub const ALIGN_LEFT: u8 = 8;
+pub const ALIGN_RIGHT: u8 = 9;
+pub const ALIGN_CENTER: u8 = 10;
+pub const ALIGN_STRETCH: u8 = 11;
+pub const ALIGN_BASELINE: u8 = 12;
+pub const ALIGN_SPACE_BETWEEN: u8 = 13;
+pub const ALIGN_SPACE_AROUND: u8 = 14;
+pub const ALIGN_SPACE_EVENLY: u8 = 15;
+pub const ALIGNS: str = "normal auto start end flex-start flex-end self-start self-end left right center stretch baseline space-between space-around space-evenly";
+
+pub const BOX_CONTENT: u8 = 0;
+pub const BOX_BORDER: u8 = 1;
+pub const BOX_SIZINGS: str = "content-box border-box";
+
+pub const TEXT_START: u8 = 0;
+pub const TEXT_END: u8 = 1;
+pub const TEXT_LEFT: u8 = 2;
+pub const TEXT_RIGHT: u8 = 3;
+pub const TEXT_CENTER: u8 = 4;
+pub const TEXT_JUSTIFY: u8 = 5;
+pub const TEXT_ALIGNS: str = "start end left right center justify";
+
+pub const WS_NORMAL: u8 = 0;
+pub const WS_NOWRAP: u8 = 1;
+pub const WS_PRE: u8 = 2;
+pub const WS_PRE_WRAP: u8 = 3;
+pub const WS_PRE_LINE: u8 = 4;
+pub const WHITE_SPACES: str = "normal nowrap pre pre-wrap pre-line";
+
+pub const TRANSFORM_NONE: u8 = 0;
+pub const TRANSFORM_UPPERCASE: u8 = 1;
+pub const TRANSFORM_LOWERCASE: u8 = 2;
+pub const TRANSFORM_CAPITALIZE: u8 = 3;
+pub const TEXT_TRANSFORMS: str = "none uppercase lowercase capitalize";
+
+pub const FLOAT_NONE: u8 = 0;
+pub const FLOAT_LEFT: u8 = 1;
+pub const FLOAT_RIGHT: u8 = 2;
+pub const FLOATS: str = "none left right";
+
+pub const CLEAR_NONE: u8 = 0;
+pub const CLEAR_LEFT: u8 = 1;
+pub const CLEAR_RIGHT: u8 = 2;
+pub const CLEAR_BOTH: u8 = 3;
+pub const CLEARS: str = "none left right both";
+
+pub const BORDER_NONE: u8 = 0;
+pub const BORDER_HIDDEN: u8 = 1;
+pub const BORDER_SOLID: u8 = 2;
+pub const BORDER_DASHED: u8 = 3;
+pub const BORDER_DOTTED: u8 = 4;
+pub const BORDER_DOUBLE: u8 = 5;
+pub const BORDER_GROOVE: u8 = 6;
+pub const BORDER_RIDGE: u8 = 7;
+pub const BORDER_INSET: u8 = 8;
+pub const BORDER_OUTSET: u8 = 9;
+pub const BORDER_STYLES: str = "none hidden solid dashed dotted double groove ridge inset outset";
+
+pub const CURSOR_AUTO: u8 = 0;
+pub const CURSOR_DEFAULT: u8 = 1;
+pub const CURSOR_POINTER: u8 = 2;
+pub const CURSOR_TEXT: u8 = 3;
+pub const CURSOR_NOT_ALLOWED: u8 = 4;
+pub const CURSOR_GRAB: u8 = 5;
+pub const CURSOR_GRABBING: u8 = 6;
+pub const CURSOR_MOVE: u8 = 7;
+pub const CURSOR_WAIT: u8 = 8;
+pub const CURSOR_PROGRESS: u8 = 9;
+pub const CURSOR_HELP: u8 = 10;
+pub const CURSOR_CROSSHAIR: u8 = 11;
+pub const CURSOR_NONE: u8 = 12;
+pub const CURSORS: str = "auto default pointer text not-allowed grab grabbing move wait progress help crosshair none";
+
+pub const LIST_DISC: u8 = 0;
+pub const LIST_CIRCLE: u8 = 1;
+pub const LIST_SQUARE: u8 = 2;
+pub const LIST_DECIMAL: u8 = 3;
+pub const LIST_NONE: u8 = 4;
+pub const LIST_STYLES: str = "disc circle square decimal none";
+
+pub const VISIBLE: u8 = 0;
+pub const HIDDEN: u8 = 1;
+pub const COLLAPSE: u8 = 2;
+pub const VISIBILITIES: str = "visible hidden collapse";
+
+pub const OVERFLOW_TEXT_CLIP: u8 = 0;
+pub const OVERFLOW_TEXT_ELLIPSIS: u8 = 1;
+pub const TEXT_OVERFLOWS: str = "clip ellipsis";
+
+pub const EVENTS_AUTO: u8 = 0;
+pub const EVENTS_NONE: u8 = 1;
+pub const POINTER_EVENTS: str = "auto none";
+
+pub const FIT_FILL: u8 = 0;
+pub const FIT_CONTAIN: u8 = 1;
+pub const FIT_COVER: u8 = 2;
+pub const FIT_NONE: u8 = 3;
+pub const FIT_SCALE_DOWN: u8 = 4;
+pub const OBJECT_FITS: str = "fill contain cover none scale-down";
+
+/// The number of word in table, a space-separated list, any case; none
+/// when it is not there.
+pub fn keyword_index(table: str, word: str) -> ?u8 {
+    if word.len() == 0 {
+        return none;
+    }
+    let b = table.bytes();
+    var i: usize = 0;
+    var k: u8 = 0;
+    while i < b.len() : (k += 1) {
+        var end = i;
+        while end < b.len() and b[end] != ' ' {
+            end += 1;
+        }
+        if css.eq_ignore_case(x: table[i..end], y: word) {
+            return k;
+        }
+        i = end + 1;
+    }
+    return none;
+}
+
+/// Keyword k of table, as CSS spells it.
+pub fn keyword_name(table: str, k: u8) -> str {
+    let b = table.bytes();
+    var i: usize = 0;
+    var n: u8 = 0;
+    while i < b.len() : (n += 1) {
+        var end = i;
+        while end < b.len() and b[end] != ' ' {
+            end += 1;
+        }
+        if n == k {
+            return table[i..end];
+        }
+        i = end + 1;
+    }
+    return "";
+}
+
+// ---- the computed style ----------------------------------------------------
+
+/// line-height: normal (1.25 times the font size), a multiple of the font
+/// size (inherited as the multiple), or pixels.
+pub const LINE_NORMAL: u8 = 0;
+pub const LINE_FACTOR: u8 = 1;
+pub const LINE_PX: u8 = 2;
+
+/// A line height: its kind, and the factor or the pixels.
+pub type LineHeight = struct {
+    pub kind: u8,
+    pub v: f32,
+}
+
+/// The line height in pixels, for a font of size pixels.
+pub fn line_height_px(lh: LineHeight, size: f32) -> f32 {
+    if lh.kind == LINE_NORMAL {
+        return size * 1.25;
+    }
+    if lh.kind == LINE_FACTOR {
+        return size * lh.v;
+    }
+    return lh.v;
+}
+
+/// Whether two line heights are the same.
+fn line_height_eq(x: LineHeight, y: LineHeight) -> bool {
+    return x.kind == y.kind and (x.kind == LINE_NORMAL or x.v == y.v);
+}
+
+/// One grid track's size: a length, fr, auto, min-content, max-content,
+/// minmax() of two tracks (sub), fit-content() of a length.
+pub const TRACK_FIXED: u8 = 0;
+pub const TRACK_FR: u8 = 1;
+pub const TRACK_AUTO: u8 = 2;
+pub const TRACK_MIN_CONTENT: u8 = 3;
+pub const TRACK_MAX_CONTENT: u8 = 4;
+pub const TRACK_MINMAX: u8 = 5;
+pub const TRACK_FIT_CONTENT: u8 = 6;
+
+/// A track: its kind, the length of a fixed or fit-content one, the fr of
+/// an fr one, and minmax()'s two tracks.
+pub type Track = struct {
+    pub kind: u8,
+    pub len: values.Length,
+    pub fr: f32,
+    pub sub: alloc.List(Track),
+}
+
+/// repeat()'s count: a number, auto-fill or auto-fit.
+pub const REPEAT_COUNT: u8 = 0;
+pub const REPEAT_AUTO_FILL: u8 = 1;
+pub const REPEAT_AUTO_FIT: u8 = 2;
+
+/// One entry of grid-template-columns: one track, or repeat() of tracks.
+pub type TrackEntry = struct {
+    pub repeat: bool,
+    pub count_kind: u8,
+    pub count: u16,
+    pub tracks: alloc.List(Track),
+}
+
+/// One end of a grid item's placement: auto, a line's number, span n.
+pub const LINE_AUTO: u8 = 0;
+pub const LINE_INDEX: u8 = 1;
+pub const LINE_SPAN: u8 = 2;
+
+/// A grid line: its kind and number.
+pub type Line = struct {
+    pub kind: u8,
+    pub n: i32,
+}
+
+/// A grid item's placement along one axis.
+pub type Placement = struct {
+    pub start: Line,
+    pub end: Line,
+}
+
+/// auto / auto.
+pub fn auto_placement() -> Placement {
+    return Placement { start: Line { kind: LINE_AUTO, n: 0 }, end: Line { kind: LINE_AUTO, n: 0 } };
+}
+
+/// Whether two placements are the same.
+fn placement_eq(x: Placement, y: Placement) -> bool {
+    return x.start.kind == y.start.kind and x.start.n == y.start.n and x.end.kind == y.end.kind and x.end.n == y.end.n;
+}
+
+/// One stop of a gradient: its color and, when the sheet said, where it
+/// sits, 0 to 1.
+pub type Stop = struct {
+    pub color: u32,
+    pub has_at: bool,
+    pub at: f32,
+}
+
+/// linear-gradient(): CSS's angle (0 points up, 90 right) and the stops.
+pub type Gradient = struct {
+    pub angle: f32,
+    pub stops: alloc.List(Stop),
+}
+
+/// box-shadow's first shadow; with no color of its own it is currentcolor
+/// until finish puts it in.
+pub type Shadow = struct {
+    pub x: f32,
+    pub y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub has_color: bool,
+    pub color: u32,
+    pub inset: bool,
+}
+
+/// text-decoration's lines, as flags.
+pub const UNDERLINE: u8 = 1;
+pub const LINE_THROUGH: u8 = 2;
+pub const OVERLINE: u8 = 4;
+
+/// An element's computed style, every field of Nimadir's Style. Sides are
+/// top, right, bottom, left; corners top-left, top-right, bottom-right,
+/// bottom-left (a percentage is of the box's shorter side); overflow and
+/// gap are x then y, and row then column. min_width and min_height auto
+/// are 0, max_width and max_height auto are none. A border color is
+/// currentcolor (border_current) until finish puts the color in; has_*
+/// says whether an optional one is there. The first group is the box, not
+/// inherited; from color on, text, inherited; vars is the element's custom
+/// properties, a scope of the styling's Vars.
+pub type Style = struct {
+    pub display: u8,
+    pub position: u8,
+    pub inset: [4]values.Length,
+    pub width: values.Length,
+    pub height: values.Length,
+    pub min_width: values.Length,
+    pub min_height: values.Length,
+    pub max_width: values.Length,
+    pub max_height: values.Length,
+    pub margin: [4]values.Length,
+    pub padding: [4]values.Length,
+    pub border_width: [4]f32,
+    pub border_style: [4]u8,
+    pub border_color: [4]u32,
+    pub border_current: [4]bool,
+    pub radius: [4]values.Length,
+    pub box_sizing: u8,
+    pub overflow: [2]u8,
+    pub flex_direction: u8,
+    pub flex_wrap: u8,
+    pub justify_content: u8,
+    pub align_items: u8,
+    pub align_self: u8,
+    pub align_content: u8,
+    pub justify_items: u8,
+    pub justify_self: u8,
+    pub flex_grow: f32,
+    pub flex_shrink: f32,
+    pub flex_basis: values.Length,
+    pub order: i32,
+    pub gap: [2]values.Length,
+    pub grid_template_columns: alloc.List(TrackEntry),
+    pub grid_template_rows: alloc.List(TrackEntry),
+    pub grid_auto_columns: alloc.List(Track),
+    pub grid_auto_rows: alloc.List(Track),
+    pub grid_auto_flow_column: bool,
+    pub grid_auto_flow_dense: bool,
+    pub grid_column: Placement,
+    pub grid_row: Placement,
+    pub has_aspect_ratio: bool,
+    pub aspect_ratio: f32,
+    pub float: u8,
+    pub clear: u8,
+    pub has_z_index: bool,
+    pub z_index: i32,
+    pub background: u32,
+    pub has_gradient: bool,
+    pub gradient: Gradient,
+    pub opacity: f32,
+    pub has_shadow: bool,
+    pub shadow: Shadow,
+    pub text_overflow: u8,
+    pub object_fit: u8,
+    pub color: u32,
+    pub font_size: f32,
+    pub font_weight: u16,
+    pub italic: bool,
+    pub monospace: bool,
+    pub line_height: LineHeight,
+    pub text_align: u8,
+    pub white_space: u8,
+    pub text_transform: u8,
+    pub letter_spacing: f32,
+    pub text_decoration: u8,
+    pub visibility: u8,
+    pub cursor: u8,
+    pub list_style: u8,
+    pub pointer_events: u8,
+    pub vars: u32,
+}
+
+/// Every property at its initial value.
+pub fn initial(a: alloc.Allocator) -> Style {
+    let z = values.zero();
+    let au = values.auto();
+    return Style {
+        display: DISPLAY_INLINE,
+        position: POSITION_STATIC,
+        inset: [au; 4],
+        width: au,
+        height: au,
+        min_width: au,
+        min_height: au,
+        max_width: au,
+        max_height: au,
+        margin: [z; 4],
+        padding: [z; 4],
+        border_width: [0.0; 4],
+        border_style: [BORDER_NONE; 4],
+        border_color: [values.BLACK; 4],
+        border_current: [true; 4],
+        radius: [z; 4],
+        box_sizing: BOX_CONTENT,
+        overflow: [OVERFLOW_VISIBLE; 2],
+        flex_direction: FLEX_ROW,
+        flex_wrap: WRAP_NOWRAP,
+        justify_content: ALIGN_NORMAL,
+        align_items: ALIGN_NORMAL,
+        align_self: ALIGN_AUTO,
+        align_content: ALIGN_NORMAL,
+        justify_items: ALIGN_NORMAL,
+        justify_self: ALIGN_AUTO,
+        flex_grow: 0.0,
+        flex_shrink: 1.0,
+        flex_basis: au,
+        order: 0,
+        gap: [z; 2],
+        grid_template_columns: alloc.List(TrackEntry).init(a),
+        grid_template_rows: alloc.List(TrackEntry).init(a),
+        grid_auto_columns: alloc.List(Track).init(a),
+        grid_auto_rows: alloc.List(Track).init(a),
+        grid_auto_flow_column: false,
+        grid_auto_flow_dense: false,
+        grid_column: auto_placement(),
+        grid_row: auto_placement(),
+        has_aspect_ratio: false,
+        aspect_ratio: 0.0,
+        float: FLOAT_NONE,
+        clear: CLEAR_NONE,
+        has_z_index: false,
+        z_index: 0,
+        background: values.TRANSPARENT,
+        has_gradient: false,
+        gradient: Gradient { angle: 180.0, stops: alloc.List(Stop).init(a) },
+        opacity: 1.0,
+        has_shadow: false,
+        shadow: Shadow { x: 0.0, y: 0.0, blur: 0.0, spread: 0.0, has_color: false, color: 0, inset: false },
+        text_overflow: OVERFLOW_TEXT_CLIP,
+        object_fit: FIT_FILL,
+        color: values.BLACK,
+        font_size: 16.0,
+        font_weight: 400,
+        italic: false,
+        monospace: false,
+        line_height: LineHeight { kind: LINE_NORMAL, v: 0.0 },
+        text_align: TEXT_START,
+        white_space: WS_NORMAL,
+        text_transform: TRANSFORM_NONE,
+        letter_spacing: 0.0,
+        text_decoration: 0,
+        visibility: VISIBLE,
+        cursor: CURSOR_AUTO,
+        list_style: LIST_DISC,
+        pointer_events: EVENTS_AUTO,
+        vars: 0,
+    };
+}
+
+/// A child of parent: inherited properties from it, the rest initial, and
+/// the display its tag has before any sheet says otherwise.
+pub fn child_of(parent: &Style, tag: str, a: alloc.Allocator) -> Style {
+    var s = initial(a);
+    copy_inherited(&mut s, from: parent);
+    s.display = default_display(tag);
+    return s;
+}
+
+/// The inherited properties of p into s.
+fn copy_inherited(s: &mut Style, from: &Style) {
+    s.color = from.color;
+    s.font_size = from.font_size;
+    s.font_weight = from.font_weight;
+    s.italic = from.italic;
+    s.monospace = from.monospace;
+    s.line_height = from.line_height;
+    s.text_align = from.text_align;
+    s.white_space = from.white_space;
+    s.text_transform = from.text_transform;
+    s.letter_spacing = from.letter_spacing;
+    s.text_decoration = from.text_decoration;
+    s.visibility = from.visibility;
+    s.cursor = from.cursor;
+    s.list_style = from.list_style;
+    s.pointer_events = from.pointer_events;
+    s.vars = from.vars;
+}
+
+/// Whether the element flows as text rather than being laid out as a box.
+pub fn is_inline(s: &Style) -> bool {
+    return s.display == DISPLAY_INLINE;
+}
+
+/// What a tag is before any stylesheet: text-level tags flow inline, a tag
+/// with no meaning here is a block (a div), and the rest are blocks too.
+pub fn default_display(tag: str) -> u8 {
+    if one_of(word: tag, list: "span a b strong i em u s del ins strike code kbd samp small sub sup mark abbr cite q time var label br") {
+        return DISPLAY_INLINE;
+    }
+    if one_of(word: tag, list: "button input textarea select img progress") {
+        return DISPLAY_INLINE_BLOCK;
+    }
+    if tag.eq("li") {
+        return DISPLAY_LIST_ITEM;
+    }
+    if one_of(word: tag, list: "head script style template title meta link option optgroup") {
+        return DISPLAY_NONE;
+    }
+    return DISPLAY_BLOCK;
+}
+
+/// Whether word is one of the space-separated words of list, exactly.
+fn one_of(word: str, list: str) -> bool {
+    if word.len() == 0 {
+        return false;
+    }
+    let b = list.bytes();
+    var i: usize = 0;
+    while i < b.len() {
+        var end = i;
+        while end < b.len() and b[end] != ' ' {
+            end += 1;
+        }
+        if list[i..end].eq(word) {
+            return true;
+        }
+        i = end + 1;
+    }
+    return false;
+}
+
+// ---- custom properties -----------------------------------------------------
+
+/// The custom properties of a styling, in scopes: an element that declares
+/// some has a scope of its own, whose parent is the scope it inherited; one
+/// that declares none shares its parent's. A scope's entries are together,
+/// first to first + count, and a later one of a name hides an earlier one,
+/// as a map's insert does. Scope 0 is the empty one at the top.
+pub type Vars = struct {
+    parent: alloc.List(u32),
+    first: alloc.List(u32),
+    count: alloc.List(u32),
+    names: alloc.List(alloc.String),
+    values: alloc.List(alloc.List(css.Token)),
+}
+
+/// Vars with only the empty scope.
+fn new_vars(a: alloc.Allocator) -> Vars {
+    var v = Vars { parent: alloc.List(u32).init(a), first: alloc.List(u32).init(a), count: alloc.List(u32).init(a), names: alloc.List(alloc.String).init(a), values: alloc.List(alloc.List(css.Token)).init(a) };
+    v.parent.push(0);
+    v.first.push(0);
+    v.count.push(0);
+    return v;
+}
+
+/// The entry of name seen from scope, if any.
+fn lookup(vars: &Vars, scope: u32, name: str) -> ?usize {
+    var s = scope;
+    while true {
+        let first = vars.first.items()[s as usize] as usize;
+        var k = vars.count.items()[s as usize] as usize;
+        while k > 0 : (k -= 1) {
+            if vars.names.items()[first + k - 1].view().eq(name) {
+                return first + k - 1;
+            }
+        }
+        if s == 0 {
+            break;
+        }
+        s = vars.parent.items()[s as usize];
+    }
+    return none;
+}
+
+/// Whether value names a variable.
+fn has_var(value: []css.Token) -> bool {
+    for t in value {
+        if t.kind == css.FUNCTION and t.text.view().eq("var") {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// value with every var(--x, fallback) put in, onto out; false if one names
+/// a variable that is not set and gives no fallback, or the value grows
+/// past MAX_VALUE_TOKENS.
+fn substitute(value: []css.Token, vars: &Vars, scope: u32, depth: usize, out: &mut alloc.List(css.Token), a: alloc.Allocator) -> bool {
+    if not has_var(value) {
+        for t in value {
+            out.push(css.clone_token(t));
+        }
+        return true;
+    }
+    if depth > MAX_VAR_DEPTH {
+        return false;
+    }
+    var i: usize = 0;
+    while i < value.len() {
+        let t = &value[i];
+        if t.kind == css.FUNCTION and t.text.view().eq("var") {
+            // Its arguments, to the matching bracket.
+            var nest: usize = 1;
+            var j = i + 1;
+            while j < value.len() {
+                let k = value[j].kind;
+                if k == css.FUNCTION or k == css.LPAREN {
+                    nest += 1;
+                } else if k == css.RPAREN {
+                    nest -= 1;
+                    if nest == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            var stop = j;
+            if stop > value.len() {
+                stop = value.len();
+            }
+            let args = value[i + 1..stop];
+            let comma = css.plain(css.COMMA, a);
+            let parts = css.split_top(args, sep: &comma, a: a);
+            let p0 = parts.items()[0];
+            let var_name = css.trim(args[p0.from..p0.to]);
+            var found: usize = 0;
+            var has_found = false;
+            if var_name.len() == 1 and var_name[0].kind == css.IDENT {
+                match lookup(vars, scope: scope, name: var_name[0].text.view()) {
+                    some(k) => {
+                        found = k;
+                        has_found = true;
+                    }
+                    none => { }
+                }
+            }
+            if has_found {
+                if not substitute(vars.values.items()[found].items(), vars: vars, scope: scope, depth: depth + 1, out: out, a: a) {
+                    return false;
+                }
+            } else if parts.len() > 1 {
+                var at = args.len();
+                var c: usize = 0;
+                while c < args.len() : (c += 1) {
+                    if args[c].kind == css.COMMA {
+                        at = c;
+                        break;
+                    }
+                }
+                var from = at + 1;
+                if from > args.len() {
+                    from = args.len();
+                }
+                if not substitute(css.trim(args[from..args.len()]), vars: vars, scope: scope, depth: depth + 1, out: out, a: a) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            if out.len() > MAX_VALUE_TOKENS {
+                return false;
+            }
+            i = j + 1;
+            continue;
+        }
+        out.push(css.clone_token(t));
+        if out.len() > MAX_VALUE_TOKENS {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// ---- the cascade -----------------------------------------------------------
+
+/// Where a declaration stands in the cascade: important, origin,
+/// specificity, order; sorted, the last wins. Then where it is: the sheet
+/// (INLINE for the element's style attribute), the rule, the declaration.
+type Found = struct {
+    important: u8,
+    origin: u8,
+    spec: u32,
+    order: u32,
+    sheet: u32,
+    rule: u32,
+    decl: u32,
+}
+
+/// The origins: the host's sheet, the app's, the element's own.
+const ORIGIN_UA: u8 = 0;
+const ORIGIN_AUTHOR: u8 = 1;
+const ORIGIN_INLINE: u8 = 2;
+
+/// The sheet number of an element's style attribute.
+const INLINE: u32 = 0xFFFFFFFF;
+
+/// Whether x sorts after y.
+fn found_after(x: Found, y: Found) -> bool {
+    if x.important != y.important {
+        return x.important > y.important;
+    }
+    if x.origin != y.origin {
+        return x.origin > y.origin;
+    }
+    if x.spec != y.spec {
+        return x.spec > y.spec;
+    }
+    return x.order > y.order;
+}
+
+/// found sorted, stably: equal ones keep their order.
+fn sort_found(found: &mut alloc.List(Found), a: alloc.Allocator) {
+    let n = found.len();
+    var tmp = alloc.List(Found).init(a);
+    for f in found.items() {
+        tmp.push(f.*);
+    }
+    var width: usize = 1;
+    while width < n : (width *= 2) {
+        var lo: usize = 0;
+        while lo < n : (lo += 2 * width) {
+            var mid = lo + width;
+            if mid > n {
+                mid = n;
+            }
+            var hi = lo + 2 * width;
+            if hi > n {
+                hi = n;
+            }
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while k < hi : (k += 1) {
+                let src = found.items();
+                if i < mid and (j >= hi or not found_after(x: src[i], y: src[j])) {
+                    tmp.items_mut()[k] = src[i];
+                    i += 1;
+                } else {
+                    tmp.items_mut()[k] = src[j];
+                    j += 1;
+                }
+            }
+        }
+        var c: usize = 0;
+        while c < n : (c += 1) {
+            found.items_mut()[c] = tmp.items()[c];
+        }
+    }
+}
+
+/// Every element's computed style: list[at[n]] is node n's; at[n] is 0,
+/// list[0] the initial style, for a node that was not styled. vars holds
+/// the custom properties the styles' vars name.
+pub type Styles = struct {
+    pub at: alloc.List(u32),
+    pub list: alloc.List(Style),
+    pub vars: Vars,
+}
+
+/// Whether node n was styled: an element in the page.
+pub fn has_style(styles: &Styles, n: u32) -> bool {
+    return (n as usize) < styles.at.len() and styles.at.items()[n as usize] != 0;
+}
+
+/// Node n's computed style; the initial one for a node not styled.
+pub fn style_of(styles: &Styles, n: u32) -> &Style {
+    var k: u32 = 0;
+    if (n as usize) < styles.at.len() {
+        k = styles.at.items()[n as usize];
+    }
+    return &styles.list.items()[k as usize];
+}
+
+/// Every element of the page under node 1 styled for a page shown on env:
+/// sheets[0] is the host's sheet, the rest are the app's in order.
+pub fn compute(doc: &dyn select.Doc, sheets: []css.Sheet, env: css.Env, state: select.State, a: alloc.Allocator) -> Styles {
+    var styles = Styles { at: alloc.List(u32).init(a), list: alloc.List(Style).init(a), vars: new_vars(a) };
+    let size = doc.doc_size();
+    var n: u32 = 0;
+    while n < size : (n += 1) {
+        styles.at.push(0);
+    }
+    styles.list.push(initial(a));
+    let init = initial(a);
+    let cx = select.Ctx { state: state, places: select.places_of(doc, a: a) };
+    var rem: f32 = 16.0;
+    // The page in document order, so that a parent is styled first.
+    var stack = alloc.List(u32).init(a);
+    stack.push(1);
+    while stack.len() > 0 {
+        let id = stack.pop() orelse break;
+        let kids = doc.doc_children(id);
+        var c = kids.len();
+        while c > 0 : (c -= 1) {
+            stack.push(kids[c - 1]);
+        }
+        if not select.is_element(doc, n: id) {
+            continue;
+        }
+        let parent_node = doc.doc_parent(id);
+        var parent_at: u32 = 0;
+        if (parent_node as usize) < styles.at.len() {
+            parent_at = styles.at.items()[parent_node as usize];
+        }
+        var style = child_of(&styles.list.items()[parent_at as usize], tag: doc.doc_tag(id), a: a);
+        let parent = &styles.list.items()[parent_at as usize];
+
+        // What applies, in cascade order.
+        var found = alloc.List(Found).init(a);
+        var order: u32 = 0;
+        var si: usize = 0;
+        while si < sheets.len() : (si += 1) {
+            let sheet = &sheets[si];
+            var origin = ORIGIN_AUTHOR;
+            if si == 0 {
+                origin = ORIGIN_UA;
+            }
+            var ri: usize = 0;
+            while ri < sheet.rules.len() : (ri += 1) {
+                let rule = &sheet.rules.items()[ri];
+                let applies = css.rule_applies(sheet, rule: rule, env: &env);
+                for sel in rule.selectors.items() {
+                    if applies and select.matches(doc, cx: &cx, sel: sel, n: id) {
+                        var di: usize = 0;
+                        while di < rule.declarations.len() : (di += 1) {
+                            var imp: u8 = 0;
+                            if rule.declarations.items()[di].important {
+                                imp = 1;
+                            }
+                            found.push(Found { important: imp, origin: origin, spec: sel.specificity, order: order, sheet: si as u32, rule: ri as u32, decl: di as u32 });
+                        }
+                    }
+                    order += 1;
+                }
+            }
+        }
+        var inline_decls = alloc.List(css.Declaration).init(a);
+        match select.attr_at(doc, n: id, name: "style") {
+            some(k) => { inline_decls = css.inline(doc.doc_attr_value(id, k: k), a); }
+            none => { }
+        }
+        var ii: usize = 0;
+        while ii < inline_decls.len() : (ii += 1) {
+            var imp: u8 = 0;
+            if inline_decls.items()[ii].important {
+                imp = 1;
+            }
+            found.push(Found { important: imp, origin: ORIGIN_INLINE, spec: 0xFFFFFFFF, order: 0, sheet: INLINE, rule: 0, decl: ii as u32 });
+        }
+        sort_found(&mut found, a: a);
+
+        // Custom properties first: every other value may refer to them.
+        var fresh = false;
+        for f in found.items() {
+            var resolved = alloc.List(css.Token).init(a);
+            var custom_name = alloc.String.init(a);
+            if f.sheet == INLINE {
+                let d = &inline_decls.items()[f.decl as usize];
+                if d.name.view().starts_with("--") {
+                    custom_name = d.name.clone();
+                    if not fresh {
+                        open_scope(&mut styles.vars, style: &mut style);
+                        fresh = true;
+                    }
+                    if not substitute(d.value.items(), vars: &styles.vars, scope: style.vars, depth: 0, out: &mut resolved, a: a) {
+                        resolved = alloc.List(css.Token).init(a);
+                    }
+                }
+            } else {
+                let d = &sheets[f.sheet as usize].rules.items()[f.rule as usize].declarations.items()[f.decl as usize];
+                if d.name.view().starts_with("--") {
+                    custom_name = d.name.clone();
+                    if not fresh {
+                        open_scope(&mut styles.vars, style: &mut style);
+                        fresh = true;
+                    }
+                    if not substitute(d.value.items(), vars: &styles.vars, scope: style.vars, depth: 0, out: &mut resolved, a: a) {
+                        resolved = alloc.List(css.Token).init(a);
+                    }
+                }
+            }
+            if custom_name.len() > 0 {
+                styles.vars.names.push(custom_name);
+                styles.vars.values.push(resolved);
+                styles.vars.count.items_mut()[style.vars as usize] += 1;
+            }
+        }
+
+        var vcx = values.Ctx { em: parent.font_size, rem: rem, vw: env.width, vh: env.height };
+        // Then what other values are relative to: the font size, for em,
+        // and the color, for currentcolor.
+        var pass: u32 = 0;
+        while pass < 2 : (pass += 1) {
+            if pass == 1 {
+                vcx.em = style.font_size;
+                if id == 1 {
+                    rem = style.font_size;
+                    vcx.rem = rem;
+                }
+            }
+            for f in found.items() {
+                if f.sheet == INLINE {
+                    let d = &inline_decls.items()[f.decl as usize];
+                    take(&mut style, parent: parent, init: &init, d: d, pass: pass, vars: &styles.vars, cx: vcx, a: a);
+                } else {
+                    let d = &sheets[f.sheet as usize].rules.items()[f.rule as usize].declarations.items()[f.decl as usize];
+                    take(&mut style, parent: parent, init: &init, d: d, pass: pass, vars: &styles.vars, cx: vcx, a: a);
+                }
+            }
+        }
+        finish(&mut style);
+        styles.at.items_mut()[id as usize] = styles.list.len() as u32;
+        styles.list.push(style);
+    }
+    return styles;
+}
+
+/// A scope of its own for style's custom properties, under the one it
+/// inherited.
+fn open_scope(vars: &mut Vars, style: &mut Style) {
+    vars.parent.push(style.vars);
+    vars.first.push(vars.names.len() as u32);
+    vars.count.push(0);
+    style.vars = (vars.parent.len() - 1) as u32;
+}
+
+/// Whether property name is one the first pass applies: what other values
+/// are relative to.
+fn first_pass(name: str) -> bool {
+    return name.eq("font-size") or name.eq("font") or name.eq("color");
+}
+
+/// Declaration d applied to s, if it belongs to this pass (0: font-size,
+/// font and color; 1: the rest but custom properties), with its var()s put
+/// in; one that names a variable not set changes nothing.
+fn take(s: &mut Style, parent: &Style, init: &Style, d: &css.Declaration, pass: u32, vars: &Vars, cx: values.Ctx, a: alloc.Allocator) {
+    let name = d.name.view();
+    if name.starts_with("--") or first_pass(name) != (pass == 0) {
+        return;
+    }
+    if has_var(d.value.items()) {
+        var resolved = alloc.List(css.Token).init(a);
+        if not substitute(d.value.items(), vars: vars, scope: s.vars, depth: 0, out: &mut resolved, a: a) {
+            return;
+        }
+        apply(s, parent: parent, init: init, name: name, value: resolved.items(), cx: cx, a: a);
+    } else {
+        apply(s, parent: parent, init: init, name: name, value: d.value.items(), cx: cx, a: a);
+    }
+}
+
+/// What is left once every declaration is in: currentcolor put in, and no
+/// border where its style is none or hidden.
+fn finish(s: &mut Style) {
+    var i: usize = 0;
+    while i < 4 : (i += 1) {
+        if s.border_current[i] {
+            s.border_color[i] = s.color;
+            s.border_current[i] = false;
+        }
+        if s.border_style[i] == BORDER_NONE or s.border_style[i] == BORDER_HIDDEN {
+            s.border_width[i] = 0.0;
+        }
+    }
+    if s.has_shadow and not s.shadow.has_color {
+        s.shadow.color = s.color;
+        s.shadow.has_color = true;
+    }
+}
+
+// ---- reading one declaration -----------------------------------------------
+
+/// Whether x equals word, any case.
+fn eqi(x: str, word: str) -> bool {
+    return css.eq_ignore_case(x: x, y: word);
+}
+
+/// The 1 to 4 values of margin, padding and their kind, as top, right,
+/// bottom, left: which value each side takes; none for another count.
+fn spread(count: usize) -> ?[4]usize {
+    if count == 1 {
+        return [0, 0, 0, 0];
+    }
+    if count == 2 {
+        return [0, 1, 0, 1];
+    }
+    if count == 3 {
+        return [0, 1, 2, 1];
+    }
+    if count == 4 {
+        return [0, 1, 2, 3];
+    }
+    return none;
+}
+
+/// Each word of value as a length (auto allowed when with_auto), spread to
+/// four sides; none if one is not a length or there are not 1 to 4.
+fn quad_lengths(value: []css.Token, w: []css.Span, with_auto: bool, cx: values.Ctx, a: alloc.Allocator) -> ?[4]values.Length {
+    var got: [4]values.Length = [values.zero(); 4];
+    var i: usize = 0;
+    while i < w.len() : (i += 1) {
+        let t = value[w[i].from..w[i].to];
+        var l = values.zero();
+        if with_auto {
+            l = values.parse_length(t, cx: cx, a: a) orelse return none;
+        } else {
+            l = values.parse_length_percent(t, cx: cx, a: a) orelse return none;
+        }
+        if i < 4 {
+            got[i] = l;
+        }
+    }
+    let at = spread(w.len()) orelse return none;
+    return [got[at[0]], got[at[1]], got[at[2]], got[at[3]]];
+}
+
+/// A border width: thin, medium, thick, or a length not below 0.
+fn border_width_of(t: []css.Token, cx: values.Ctx, a: alloc.Allocator) -> ?f32 {
+    let k = values.keyword_text(t);
+    if eqi(x: k, word: "thin") {
+        return 1.0;
+    }
+    if eqi(x: k, word: "medium") {
+        return 3.0;
+    }
+    if eqi(x: k, word: "thick") {
+        return 5.0;
+    }
+    let v = values.parse_px(t, cx: cx, a: a) orelse return none;
+    if v >= 0.0 {
+        return v;
+    }
+    return none;
+}
+
+/// The parts of `1px solid red`, in any order; what is left out is medium,
+/// none and currentcolor. none if a word is none of them.
+type BorderParts = struct {
+    width: f32,
+    style: u8,
+    has_color: bool,
+    color: u32,
+}
+
+/// border's words read.
+fn border_parts(value: []css.Token, w: []css.Span, cx: values.Ctx, current: u32, a: alloc.Allocator) -> ?BorderParts {
+    var p = BorderParts { width: 3.0, style: BORDER_NONE, has_color: false, color: 0 };
+    for sp in w {
+        let t = value[sp.from..sp.to];
+        match keyword_index(table: BORDER_STYLES, word: values.keyword_text(t)) {
+            some(st) => {
+                p.style = st;
+                continue;
+            }
+            none => { }
+        }
+        match border_width_of(t, cx: cx, a: a) {
+            some(wd) => {
+                p.width = wd;
+                continue;
+            }
+            none => { }
+        }
+        p.color = values.parse_color(t, current: current, a: a) orelse return none;
+        p.has_color = true;
+    }
+    return p;
+}
+
+/// The alignment the last word names: `safe center` keeps its center.
+fn align_of(value: []css.Token, w: []css.Span) -> ?u8 {
+    if w.len() == 0 {
+        return none;
+    }
+    let last = w[w.len() - 1];
+    return keyword_index(table: ALIGNS, word: values.keyword_text(value[last.from..last.to]));
+}
+
+/// A whole number, from a number or calc() of one.
+fn integer(t: []css.Token, a: alloc.Allocator) -> ?i32 {
+    let n = values.parse_number(t, a) orelse return none;
+    if n - n.trunc() == 0.0 and n.abs() < 1000000000.0 {
+        return n as i32;
+    }
+    return none;
+}
+
+/// normal as 0, or what read gives: a length or a percentage.
+fn gap_of(t: []css.Token, cx: values.Ctx, a: alloc.Allocator) -> ?values.Length {
+    if values.is_keyword(t, word: "normal") {
+        return values.zero();
+    }
+    return values.parse_length_percent(t, cx: cx, a: a);
+}
+
+/// Declaration name: value applied to s. Unknown properties and values
+/// that cannot be read change nothing, as in a browser.
+fn apply(s: &mut Style, parent: &Style, init: &Style, name: str, value: []css.Token, cx: values.Ctx, a: alloc.Allocator) {
+    let wl = values.words(value, a);
+    let w = wl.items();
+    let kw = values.keyword_text(value);
+    // The global keywords, for every property.
+    if eqi(x: kw, word: "inherit") {
+        copy_property(s, from: parent, name: name, a: a);
+        return;
+    }
+    if eqi(x: kw, word: "initial") {
+        copy_property(s, from: init, name: name, a: a);
+        return;
+    }
+    if eqi(x: kw, word: "unset") or eqi(x: kw, word: "revert") or eqi(x: kw, word: "revert-layer") {
+        if is_inherited(name) {
+            copy_property(s, from: parent, name: name, a: a);
+        } else {
+            copy_property(s, from: init, name: name, a: a);
+        }
+        return;
+    }
+    let current = s.color;
+    if name.eq("display") {
+        if kw.len() > 0 {
+            if one_of(word: lowered(kw, a: a).view(), list: "flow-root table table-row-group table-header-group table-footer-group table-caption table-cell") {
+                s.display = DISPLAY_BLOCK;
+            } else if eqi(x: kw, word: "table-row") {
+                s.display = DISPLAY_FLEX;
+            } else if eqi(x: kw, word: "inline-table") {
+                s.display = DISPLAY_INLINE_BLOCK;
+            } else {
+                s.display = keyword_index(table: DISPLAYS, word: kw) orelse s.display;
+            }
+        } else if w.len() == 2 {
+            // `block flex` and the like: the inner display decides.
+            let inline = eqi(x: values.keyword_text(value[w[0].from..w[0].to]), word: "inline");
+            match keyword_index(table: DISPLAYS, word: values.keyword_text(value[w[1].from..w[1].to])) {
+                some(d) => {
+                    if not inline {
+                        s.display = d;
+                    } else if d == DISPLAY_FLEX {
+                        s.display = DISPLAY_INLINE_FLEX;
+                    } else if d == DISPLAY_GRID {
+                        s.display = DISPLAY_INLINE_GRID;
+                    } else if d == DISPLAY_BLOCK {
+                        s.display = DISPLAY_INLINE_BLOCK;
+                    }
+                }
+                none => { }
+            }
+        }
+        return;
+    }
+    if name.eq("position") {
+        s.position = keyword_index(table: POSITIONS, word: kw) orelse s.position;
+        return;
+    }
+    let side = side_of_inset(name);
+    if side < 4 {
+        s.inset[side] = values.parse_length(value, cx: cx, a: a) orelse s.inset[side];
+        return;
+    }
+    if name.eq("inset") {
+        s.inset = quad_lengths(value, w: w, with_auto: true, cx: cx, a: a) orelse s.inset;
+        return;
+    }
+    if name.eq("width") {
+        s.width = values.parse_length(value, cx: cx, a: a) orelse s.width;
+        return;
+    }
+    if name.eq("height") {
+        s.height = values.parse_length(value, cx: cx, a: a) orelse s.height;
+        return;
+    }
+    if name.eq("min-width") {
+        s.min_width = values.parse_length(value, cx: cx, a: a) orelse s.min_width;
+        return;
+    }
+    if name.eq("min-height") {
+        s.min_height = values.parse_length(value, cx: cx, a: a) orelse s.min_height;
+        return;
+    }
+    if name.eq("max-width") {
+        s.max_width = none_or_length(value, cx: cx, a: a) orelse s.max_width;
+        return;
+    }
+    if name.eq("max-height") {
+        s.max_height = none_or_length(value, cx: cx, a: a) orelse s.max_height;
+        return;
+    }
+    if name.eq("margin") {
+        s.margin = quad_lengths(value, w: w, with_auto: true, cx: cx, a: a) orelse s.margin;
+        return;
+    }
+    if name.eq("padding") {
+        s.padding = quad_lengths(value, w: w, with_auto: false, cx: cx, a: a) orelse s.padding;
+        return;
+    }
+    if name.eq("margin-block") or name.eq("margin-inline") or name.eq("padding-block") or name.eq("padding-inline") {
+        let margin = name.starts_with("margin");
+        if w.len() == 0 or w.len() > 2 {
+            // Every word read first, as Nimadir does, but the count decides.
+            return;
+        }
+        var got: [2]values.Length = [values.zero(); 2];
+        var i: usize = 0;
+        while i < w.len() : (i += 1) {
+            let t = value[w[i].from..w[i].to];
+            if margin {
+                got[i] = values.parse_length(t, cx: cx, a: a) orelse return;
+            } else {
+                got[i] = values.parse_length_percent(t, cx: cx, a: a) orelse return;
+            }
+        }
+        if w.len() == 1 {
+            got[1] = got[0];
+        }
+        let block = name.eq("margin-block") or name.eq("padding-block");
+        if margin and block {
+            s.margin[0] = got[0];
+            s.margin[2] = got[1];
+        } else if margin {
+            s.margin[3] = got[0];
+            s.margin[1] = got[1];
+        } else if block {
+            s.padding[0] = got[0];
+            s.padding[2] = got[1];
+        } else {
+            s.padding[3] = got[0];
+            s.padding[1] = got[1];
+        }
+        return;
+    }
+    if name.eq("border") {
+        let p = border_parts(value, w: w, cx: cx, current: current, a: a) orelse return;
+        s.border_width = [p.width; 4];
+        s.border_style = [p.style; 4];
+        s.border_color = [p.color; 4];
+        s.border_current = [not p.has_color; 4];
+        return;
+    }
+    if name.eq("border-width") {
+        var got: [4]f32 = [0.0; 4];
+        var i: usize = 0;
+        while i < w.len() : (i += 1) {
+            let v = border_width_of(value[w[i].from..w[i].to], cx: cx, a: a) orelse return;
+            if i < 4 {
+                got[i] = v;
+            }
+        }
+        let at = spread(w.len()) orelse return;
+        s.border_width = [got[at[0]], got[at[1]], got[at[2]], got[at[3]]];
+        return;
+    }
+    if name.eq("border-style") {
+        var got: [4]u8 = [0; 4];
+        var i: usize = 0;
+        while i < w.len() : (i += 1) {
+            let v = keyword_index(table: BORDER_STYLES, word: values.keyword_text(value[w[i].from..w[i].to])) orelse return;
+            if i < 4 {
+                got[i] = v;
+            }
+        }
+        let at = spread(w.len()) orelse return;
+        s.border_style = [got[at[0]], got[at[1]], got[at[2]], got[at[3]]];
+        return;
+    }
+    if name.eq("border-color") {
+        var got: [4]u32 = [0; 4];
+        var i: usize = 0;
+        while i < w.len() : (i += 1) {
+            let v = values.parse_color(value[w[i].from..w[i].to], current: current, a: a) orelse return;
+            if i < 4 {
+                got[i] = v;
+            }
+        }
+        let at = spread(w.len()) orelse return;
+        s.border_color = [got[at[0]], got[at[1]], got[at[2]], got[at[3]]];
+        s.border_current = [false; 4];
+        return;
+    }
+    if name.eq("border-radius") {
+        // Elliptical corners (a / b) keep their first radius.
+        var count = w.len();
+        var i: usize = 0;
+        while i < w.len() : (i += 1) {
+            if w[i].to - w[i].from == 1 and css.is_delim(&value[w[i].from], ch: '/') {
+                count = i;
+                break;
+            }
+        }
+        s.radius = quad_lengths(value, w: w[0..count], with_auto: false, cx: cx, a: a) orelse s.radius;
+        return;
+    }
+    let corner = corner_of(name);
+    if corner < 4 {
+        if w.len() > 0 {
+            s.radius[corner] = values.parse_length_percent(value[w[0].from..w[0].to], cx: cx, a: a) orelse s.radius[corner];
+        }
+        return;
+    }
+    if name.eq("box-sizing") {
+        s.box_sizing = keyword_index(table: BOX_SIZINGS, word: kw) orelse s.box_sizing;
+        return;
+    }
+    if name.eq("overflow") {
+        var got: [2]u8 = [0; 2];
+        var i: usize = 0;
+        while i < w.len() : (i += 1) {
+            let v = keyword_index(table: OVERFLOWS, word: values.keyword_text(value[w[i].from..w[i].to])) orelse return;
+            if i < 2 {
+                got[i] = v;
+            }
+        }
+        if w.len() == 1 {
+            s.overflow = [got[0], got[0]];
+        } else if w.len() == 2 {
+            s.overflow = [got[0], got[1]];
+        }
+        return;
+    }
+    if name.eq("overflow-x") {
+        s.overflow[0] = keyword_index(table: OVERFLOWS, word: kw) orelse s.overflow[0];
+        return;
+    }
+    if name.eq("overflow-y") {
+        s.overflow[1] = keyword_index(table: OVERFLOWS, word: kw) orelse s.overflow[1];
+        return;
+    }
+    if name.eq("flex-direction") {
+        s.flex_direction = keyword_index(table: FLEX_DIRECTIONS, word: kw) orelse s.flex_direction;
+        return;
+    }
+    if name.eq("flex-wrap") {
+        s.flex_wrap = keyword_index(table: FLEX_WRAPS, word: kw) orelse s.flex_wrap;
+        return;
+    }
+    if name.eq("flex-flow") {
+        for sp in w {
+            let k = values.keyword_text(value[sp.from..sp.to]);
+            match keyword_index(table: FLEX_DIRECTIONS, word: k) {
+                some(d) => { s.flex_direction = d; }
+                none => {
+                    s.flex_wrap = keyword_index(table: FLEX_WRAPS, word: k) orelse s.flex_wrap;
+                }
+            }
+        }
+        return;
+    }
+    if name.eq("justify-content") {
+        s.justify_content = align_of(value, w: w) orelse s.justify_content;
+        return;
+    }
+    if name.eq("align-items") {
+        s.align_items = align_of(value, w: w) orelse s.align_items;
+        return;
+    }
+    if name.eq("align-self") {
+        s.align_self = align_of(value, w: w) orelse s.align_self;
+        return;
+    }
+    if name.eq("align-content") {
+        s.align_content = align_of(value, w: w) orelse s.align_content;
+        return;
+    }
+    if name.eq("justify-items") {
+        s.justify_items = align_of(value, w: w) orelse s.justify_items;
+        return;
+    }
+    if name.eq("justify-self") {
+        s.justify_self = align_of(value, w: w) orelse s.justify_self;
+        return;
+    }
+    if name.eq("place-items") or name.eq("place-content") or name.eq("place-self") {
+        if w.len() != 1 and w.len() != 2 {
+            return;
+        }
+        let x = align_of(value, w: w[0..1]) orelse return;
+        let y = align_of(value, w: w[w.len() - 1..w.len()]) orelse return;
+        if name.eq("place-items") {
+            s.align_items = x;
+            s.justify_items = y;
+        } else if name.eq("place-content") {
+            s.align_content = x;
+            s.justify_content = y;
+        } else {
+            s.align_self = x;
+            s.justify_self = y;
+        }
+        return;
+    }
+    if name.eq("flex") {
+        flex(s, value: value, w: w, cx: cx, a: a);
+        return;
+    }
+    if name.eq("flex-grow") or name.eq("flex-shrink") {
+        let n = values.parse_number(value, a) orelse return;
+        if n >= 0.0 {
+            if name.eq("flex-grow") {
+                s.flex_grow = n;
+            } else {
+                s.flex_shrink = n;
+            }
+        }
+        return;
+    }
+    if name.eq("flex-basis") {
+        match values.parse_length(value, cx: cx, a: a) {
+            some(l) => { s.flex_basis = l; }
+            none => {
+                if eqi(x: kw, word: "content") {
+                    s.flex_basis = values.auto();
+                }
+            }
+        }
+        return;
+    }
+    if name.eq("order") {
+        s.order = integer(value, a: a) orelse s.order;
+        return;
+    }
+    if name.eq("gap") or name.eq("grid-gap") {
+        var got: [2]values.Length = [values.zero(); 2];
+        var i: usize = 0;
+        while i < w.len() : (i += 1) {
+            let v = gap_of(value[w[i].from..w[i].to], cx: cx, a: a) orelse return;
+            if i < 2 {
+                got[i] = v;
+            }
+        }
+        if w.len() == 1 {
+            s.gap = [got[0], got[0]];
+        } else if w.len() == 2 {
+            s.gap = [got[0], got[1]];
+        }
+        return;
+    }
+    if name.eq("row-gap") or name.eq("grid-row-gap") {
+        s.gap[0] = gap_of(value, cx: cx, a: a) orelse s.gap[0];
+        return;
+    }
+    if name.eq("column-gap") or name.eq("grid-column-gap") {
+        s.gap[1] = gap_of(value, cx: cx, a: a) orelse s.gap[1];
+        return;
+    }
+    if name.eq("grid-template-columns") {
+        let list = track_list(value, w: w, cx: cx, a: a) orelse return;
+        s.grid_template_columns = list;
+        return;
+    }
+    if name.eq("grid-template-rows") {
+        let list = track_list(value, w: w, cx: cx, a: a) orelse return;
+        s.grid_template_rows = list;
+        return;
+    }
+    if name.eq("grid-auto-columns") or name.eq("grid-auto-rows") {
+        var list = alloc.List(Track).init(a);
+        for sp in w {
+            let t = track(value[sp.from..sp.to], cx: cx, a: a) orelse return;
+            list.push(t);
+        }
+        if name.eq("grid-auto-columns") {
+            s.grid_auto_columns = list;
+        } else {
+            s.grid_auto_rows = list;
+        }
+        return;
+    }
+    if name.eq("grid-auto-flow") {
+        var column = false;
+        var dense = false;
+        for sp in w {
+            let k = values.keyword_text(value[sp.from..sp.to]);
+            if k.len() == 0 {
+                return;
+            }
+            if eqi(x: k, word: "column") {
+                column = true;
+            }
+            if eqi(x: k, word: "dense") {
+                dense = true;
+            }
+        }
+        if w.len() > 0 {
+            s.grid_auto_flow_column = column;
+            s.grid_auto_flow_dense = dense;
+        }
+        return;
+    }
+    if name.eq("grid-column") {
+        s.grid_column = placement(value, a: a) orelse s.grid_column;
+        return;
+    }
+    if name.eq("grid-row") {
+        s.grid_row = placement(value, a: a) orelse s.grid_row;
+        return;
+    }
+    if name.eq("grid-column-start") {
+        s.grid_column.start = line(value, a: a) orelse s.grid_column.start;
+        return;
+    }
+    if name.eq("grid-column-end") {
+        s.grid_column.end = line(value, a: a) orelse s.grid_column.end;
+        return;
+    }
+    if name.eq("grid-row-start") {
+        s.grid_row.start = line(value, a: a) orelse s.grid_row.start;
+        return;
+    }
+    if name.eq("grid-row-end") {
+        s.grid_row.end = line(value, a: a) orelse s.grid_row.end;
+        return;
+    }
+    if name.eq("grid-area") {
+        // row-start / column-start / row-end / column-end, by number.
+        let slash = css.Token { kind: css.DELIM, n: 0.0, ch: '/' as u32, text: alloc.String.init(a) };
+        let parts = css.split_top(value, sep: &slash, a: a);
+        var lines: [4]Line = [Line { kind: LINE_AUTO, n: 0 }; 4];
+        var i: usize = 0;
+        for p in parts.items() {
+            let l = line(css.trim(value[p.from..p.to]), a: a) orelse return;
+            if i < 4 {
+                lines[i] = l;
+            }
+            i += 1;
+        }
+        s.grid_row = Placement { start: lines[0], end: lines[2] };
+        s.grid_column = Placement { start: lines[1], end: lines[3] };
+        return;
+    }
+    if name.eq("aspect-ratio") {
+        let slash = css.Token { kind: css.DELIM, n: 0.0, ch: '/' as u32, text: alloc.String.init(a) };
+        let parts = css.split_top(value, sep: &slash, a: a);
+        var has = false;
+        var r: f32 = 0.0;
+        if parts.len() == 1 {
+            let only = css.trim(value[parts.items()[0].from..parts.items()[0].to]);
+            if not values.is_keyword(only, word: "auto") {
+                match values.parse_number(only, a) {
+                    some(x) => {
+                        has = true;
+                        r = x;
+                    }
+                    none => { }
+                }
+            }
+        } else if parts.len() == 2 {
+            let p0 = parts.items()[0];
+            let p1 = parts.items()[1];
+            match values.parse_number(css.trim(value[p0.from..p0.to]), a) {
+                some(x) => {
+                    match values.parse_number(css.trim(value[p1.from..p1.to]), a) {
+                        some(y) => {
+                            if y > 0.0 {
+                                has = true;
+                                r = x / y;
+                            }
+                        }
+                        none => { }
+                    }
+                }
+                none => { }
+            }
+        } else {
+            return;
+        }
+        s.has_aspect_ratio = has and r > 0.0 and values.finite(r);
+        if s.has_aspect_ratio {
+            s.aspect_ratio = r;
+        } else {
+            s.aspect_ratio = 0.0;
+        }
+        return;
+    }
+    if name.eq("float") {
+        s.float = keyword_index(table: FLOATS, word: kw) orelse s.float;
+        return;
+    }
+    if name.eq("clear") {
+        s.clear = keyword_index(table: CLEARS, word: kw) orelse s.clear;
+        return;
+    }
+    if name.eq("z-index") {
+        if eqi(x: kw, word: "auto") {
+            s.has_z_index = false;
+            s.z_index = 0;
+        } else {
+            match integer(value, a: a) {
+                some(z) => {
+                    s.has_z_index = true;
+                    s.z_index = z;
+                }
+                none => { }
+            }
+        }
+        return;
+    }
+    if name.eq("background-color") {
+        s.background = values.parse_color(value, current: current, a: a) orelse s.background;
+        return;
+    }
+    if name.eq("background") or name.eq("background-image") {
+        background(s, name: name, value: value, w: w, kw: kw, current: current, a: a);
+        return;
+    }
+    if name.eq("opacity") {
+        var o: f32 = 0.0;
+        if value.len() == 1 and value[0].kind == css.PERCENTAGE {
+            o = value[0].n / 100.0;
+        } else {
+            o = values.parse_number(value, a) orelse return;
+        }
+        s.opacity = values.clamp(v: o, lo: 0.0, hi: 1.0);
+        return;
+    }
+    if name.eq("box-shadow") {
+        if eqi(x: kw, word: "none") {
+            s.has_shadow = false;
+            return;
+        }
+        // The first shadow of a list; the rest are not drawn.
+        let comma = css.plain(css.COMMA, a);
+        let parts = css.split_top(value, sep: &comma, a: a);
+        let p0 = parts.items()[0];
+        let first = css.trim(value[p0.from..p0.to]);
+        let fw = values.words(first, a);
+        match shadow(first, w: fw.items(), cx: cx, current: current, a: a) {
+            some(sh) => {
+                s.shadow = sh;
+                s.has_shadow = true;
+            }
+            none => { }
+        }
+        return;
+    }
+    if name.eq("text-overflow") {
+        s.text_overflow = keyword_index(table: TEXT_OVERFLOWS, word: kw) orelse s.text_overflow;
+        return;
+    }
+    if name.eq("object-fit") {
+        s.object_fit = keyword_index(table: OBJECT_FITS, word: kw) orelse s.object_fit;
+        return;
+    }
+    if name.eq("color") {
+        s.color = values.parse_color(value, current: parent.color, a: a) orelse s.color;
+        return;
+    }
+    if name.eq("font-size") {
+        s.font_size = font_size(value, parent: parent.font_size, cx: cx, a: a) orelse s.font_size;
+        return;
+    }
+    if name.eq("font-weight") {
+        s.font_weight = font_weight(value, parent: parent.font_weight, a: a) orelse s.font_weight;
+        return;
+    }
+    if name.eq("font-style") {
+        if w.len() > 0 {
+            let k = values.keyword_text(value[w[0].from..w[0].to]);
+            if eqi(x: k, word: "italic") or eqi(x: k, word: "oblique") {
+                s.italic = true;
+            } else if eqi(x: k, word: "normal") {
+                s.italic = false;
+            }
+        }
+        return;
+    }
+    if name.eq("font-family") {
+        s.monospace = monospace(value, a: a);
+        return;
+    }
+    if name.eq("font") {
+        font(s, parent: parent, value: value, w: w, cx: cx, a: a);
+        return;
+    }
+    if name.eq("line-height") {
+        s.line_height = line_height(value, cx: cx, a: a) orelse s.line_height;
+        return;
+    }
+    if name.eq("text-align") {
+        s.text_align = keyword_index(table: TEXT_ALIGNS, word: kw) orelse s.text_align;
+        return;
+    }
+    if name.eq("white-space") or name.eq("white-space-collapse") {
+        if eqi(x: kw, word: "break-spaces") or eqi(x: kw, word: "preserve") {
+            s.white_space = WS_PRE_WRAP;
+        } else if eqi(x: kw, word: "collapse") {
+            s.white_space = WS_NORMAL;
+        } else {
+            s.white_space = keyword_index(table: WHITE_SPACES, word: kw) orelse s.white_space;
+        }
+        return;
+    }
+    if name.eq("text-wrap") or name.eq("text-wrap-mode") {
+        if eqi(x: kw, word: "nowrap") {
+            s.white_space = WS_NOWRAP;
+        } else if eqi(x: kw, word: "wrap") and s.white_space == WS_NOWRAP {
+            s.white_space = WS_NORMAL;
+        }
+        return;
+    }
+    if name.eq("text-transform") {
+        s.text_transform = keyword_index(table: TEXT_TRANSFORMS, word: kw) orelse s.text_transform;
+        return;
+    }
+    if name.eq("letter-spacing") {
+        if eqi(x: kw, word: "normal") {
+            s.letter_spacing = 0.0;
+        } else {
+            s.letter_spacing = values.parse_px(value, cx: cx, a: a) orelse s.letter_spacing;
+        }
+        return;
+    }
+    if name.eq("text-decoration") or name.eq("text-decoration-line") {
+        var flags: u8 = 0;
+        var understood = false;
+        for sp in w {
+            let k = values.keyword_text(value[sp.from..sp.to]);
+            if eqi(x: k, word: "none") {
+                understood = true;
+            } else if eqi(x: k, word: "underline") {
+                flags = flags | UNDERLINE;
+                understood = true;
+            } else if eqi(x: k, word: "line-through") {
+                flags = flags | LINE_THROUGH;
+                understood = true;
+            } else if eqi(x: k, word: "overline") {
+                flags = flags | OVERLINE;
+                understood = true;
+            }
+        }
+        if understood {
+            s.text_decoration = flags;
+        }
+        return;
+    }
+    if name.eq("visibility") {
+        s.visibility = keyword_index(table: VISIBILITIES, word: kw) orelse s.visibility;
+        return;
+    }
+    if name.eq("cursor") {
+        // The last word of a fallback list is the keyword.
+        let comma = css.plain(css.COMMA, a);
+        let parts = css.split_top(value, sep: &comma, a: a);
+        let last = parts.items()[parts.len() - 1];
+        s.cursor = keyword_index(table: CURSORS, word: values.keyword_text(css.trim(value[last.from..last.to]))) orelse s.cursor;
+        return;
+    }
+    if name.eq("list-style") or name.eq("list-style-type") {
+        for sp in w {
+            s.list_style = keyword_index(table: LIST_STYLES, word: values.keyword_text(value[sp.from..sp.to])) orelse s.list_style;
+        }
+        return;
+    }
+    if name.eq("pointer-events") {
+        s.pointer_events = keyword_index(table: POINTER_EVENTS, word: kw) orelse s.pointer_events;
+        return;
+    }
+    if name.starts_with("border-") {
+        border_side(s, rest: name[7..name.len()], value: value, w: w, cx: cx, current: current, a: a);
+    } else if name.starts_with("margin-") {
+        let i = side_index(name[7..name.len()]);
+        if i < 4 {
+            s.margin[i] = values.parse_length(value, cx: cx, a: a) orelse s.margin[i];
+        }
+    } else if name.starts_with("padding-") {
+        let i = side_index(name[8..name.len()]);
+        if i < 4 {
+            s.padding[i] = values.parse_length_percent(value, cx: cx, a: a) orelse s.padding[i];
+        }
+    }
+}
+
+/// text in lower case.
+fn lowered(text: str, a: alloc.Allocator) -> alloc.String {
+    return css.lowercase(text, a);
+}
+
+/// top, right, bottom or left as an index into inset; 4 for another name.
+fn side_of_inset(name: str) -> usize {
+    if name.eq("top") {
+        return 0;
+    }
+    if name.eq("right") {
+        return 1;
+    }
+    if name.eq("bottom") {
+        return 2;
+    }
+    if name.eq("left") {
+        return 3;
+    }
+    return 4;
+}
+
+/// border-top-left-radius and the like as an index into radius; 4 for
+/// another name.
+fn corner_of(name: str) -> usize {
+    if name.eq("border-top-left-radius") {
+        return 0;
+    }
+    if name.eq("border-top-right-radius") {
+        return 1;
+    }
+    if name.eq("border-bottom-right-radius") {
+        return 2;
+    }
+    if name.eq("border-bottom-left-radius") {
+        return 3;
+    }
+    return 4;
+}
+
+/// top, inline-start, ... as an index into top, right, bottom, left; 4 for
+/// another word.
+fn side_index(side: str) -> usize {
+    if side.eq("top") or side.eq("block-start") {
+        return 0;
+    }
+    if side.eq("right") or side.eq("inline-end") {
+        return 1;
+    }
+    if side.eq("bottom") or side.eq("block-end") {
+        return 2;
+    }
+    if side.eq("left") or side.eq("inline-start") {
+        return 3;
+    }
+    return 4;
+}
+
+/// none as auto, or a length.
+fn none_or_length(t: []css.Token, cx: values.Ctx, a: alloc.Allocator) -> ?values.Length {
+    if values.is_keyword(t, word: "none") {
+        return values.auto();
+    }
+    return values.parse_length(t, cx: cx, a: a);
+}
+
+/// border-top, border-left-color, ...: rest is what follows border-.
+fn border_side(s: &mut Style, rest: str, value: []css.Token, w: []css.Span, cx: values.Ctx, current: u32, a: alloc.Allocator) {
+    // The side, and the part after it: border-top-width.
+    var dash = rest.len();
+    var i: usize = 0;
+    while i < rest.len() : (i += 1) {
+        if rest.bytes()[i] == '-' {
+            dash = i;
+            break;
+        }
+    }
+    var side_word = rest;
+    var part = "";
+    var has_part = false;
+    if dash < rest.len() and side_index(rest[0..dash]) < 4 {
+        side_word = rest[0..dash];
+        part = rest[dash + 1..rest.len()];
+        has_part = true;
+    }
+    let k = side_index(side_word);
+    if k >= 4 {
+        return;
+    }
+    if not has_part {
+        let p = border_parts(value, w: w, cx: cx, current: current, a: a) orelse return;
+        s.border_width[k] = p.width;
+        s.border_style[k] = p.style;
+        s.border_color[k] = p.color;
+        s.border_current[k] = not p.has_color;
+        return;
+    }
+    if part.eq("width") {
+        s.border_width[k] = border_width_of(value, cx: cx, a: a) orelse s.border_width[k];
+    } else if part.eq("style") {
+        s.border_style[k] = keyword_index(table: BORDER_STYLES, word: values.keyword_text(value)) orelse s.border_style[k];
+    } else if part.eq("color") {
+        match values.parse_color(value, current: current, a: a) {
+            some(c) => {
+                s.border_color[k] = c;
+                s.border_current[k] = false;
+            }
+            none => { }
+        }
+    }
+}
+
+/// flex: none | auto | <grow> [<shrink>] [<basis>].
+fn flex(s: &mut Style, value: []css.Token, w: []css.Span, cx: values.Ctx, a: alloc.Allocator) {
+    if w.len() == 1 {
+        let k = values.keyword_text(value[w[0].from..w[0].to]);
+        if eqi(x: k, word: "none") {
+            s.flex_grow = 0.0;
+            s.flex_shrink = 0.0;
+            s.flex_basis = values.auto();
+            return;
+        }
+        if eqi(x: k, word: "auto") {
+            s.flex_grow = 1.0;
+            s.flex_shrink = 1.0;
+            s.flex_basis = values.auto();
+            return;
+        }
+    }
+    var numbers = alloc.List(f32).init(a);
+    var has_basis = false;
+    var basis = values.zero();
+    for sp in w {
+        let t = value[sp.from..sp.to];
+        match values.parse_number(t, a) {
+            some(n) => { numbers.push(n); }
+            none => {
+                basis = values.parse_length(t, cx: cx, a: a) orelse return;
+                has_basis = true;
+            }
+        }
+    }
+    if numbers.len() == 0 {
+        return;
+    }
+    var shrink: f32 = 1.0;
+    if numbers.len() > 1 {
+        shrink = numbers.items()[1];
+    }
+    // flex: 1 is 1 1 0, not 1 1 auto.
+    s.flex_grow = values.fmax(x: numbers.items()[0], y: 0.0);
+    s.flex_shrink = values.fmax(x: shrink, y: 0.0);
+    if has_basis {
+        s.flex_basis = basis;
+    } else {
+        s.flex_basis = values.zero();
+    }
+}
+
+/// One grid track: auto, min-content, max-content, Nfr, minmax(a, b),
+/// fit-content(l), or a length or percentage.
+fn track(t: []css.Token, cx: values.Ctx, a: alloc.Allocator) -> ?Track {
+    let k = values.keyword_text(t);
+    if k.len() > 0 {
+        var kind: u8 = 0;
+        if eqi(x: k, word: "auto") {
+            kind = TRACK_AUTO;
+        } else if eqi(x: k, word: "min-content") {
+            kind = TRACK_MIN_CONTENT;
+        } else if eqi(x: k, word: "max-content") {
+            kind = TRACK_MAX_CONTENT;
+        } else {
+            return none;
+        }
+        return Track { kind: kind, len: values.auto(), fr: 0.0, sub: alloc.List(Track).init(a) };
+    }
+    if t.len() == 1 and t[0].kind == css.DIMENSION and t[0].text.view().eq("fr") and t[0].n >= 0.0 {
+        return Track { kind: TRACK_FR, len: values.auto(), fr: t[0].n, sub: alloc.List(Track).init(a) };
+    }
+    if t.len() >= 2 and t[0].kind == css.FUNCTION and t[0].text.view().eq("minmax") {
+        let inner = t[1..t.len() - 1];
+        let comma = css.plain(css.COMMA, a);
+        let parts = css.split_top(inner, sep: &comma, a: a);
+        if parts.len() != 2 {
+            return none;
+        }
+        let p0 = parts.items()[0];
+        let p1 = parts.items()[1];
+        let lo = track(css.trim(inner[p0.from..p0.to]), cx: cx, a: a) orelse return none;
+        let hi = track(css.trim(inner[p1.from..p1.to]), cx: cx, a: a) orelse return none;
+        var sub = alloc.List(Track).init(a);
+        sub.push(lo);
+        sub.push(hi);
+        return Track { kind: TRACK_MINMAX, len: values.auto(), fr: 0.0, sub: sub };
+    }
+    if t.len() >= 2 and t[0].kind == css.FUNCTION and t[0].text.view().eq("fit-content") {
+        let l = values.parse_length_percent(css.trim(t[1..t.len() - 1]), cx: cx, a: a) orelse return none;
+        return Track { kind: TRACK_FIT_CONTENT, len: l, fr: 0.0, sub: alloc.List(Track).init(a) };
+    }
+    if t.len() == 1 and t[0].kind == css.FUNCTION and (t[0].text.view().eq("minmax") or t[0].text.view().eq("fit-content")) {
+        // The name and nothing after it: nothing to take a bracket from.
+        return none;
+    }
+    let l = values.parse_length_percent(t, cx: cx, a: a) orelse return none;
+    return Track { kind: TRACK_FIXED, len: l, fr: 0.0, sub: alloc.List(Track).init(a) };
+}
+
+/// grid-template-columns: none, or tracks and repeat()s. Line names in
+/// brackets are skipped.
+fn track_list(value: []css.Token, w: []css.Span, cx: values.Ctx, a: alloc.Allocator) -> ?alloc.List(TrackEntry) {
+    var out = alloc.List(TrackEntry).init(a);
+    if w.len() == 1 and values.is_keyword(value[w[0].from..w[0].to], word: "none") {
+        return out;
+    }
+    for sp in w {
+        let t = value[sp.from..sp.to];
+        if t[0].kind == css.LBRACKET {
+            continue;
+        }
+        if t[0].kind == css.FUNCTION and t[0].text.view().eq("repeat") {
+            if t.len() < 2 {
+                return none;
+            }
+            let inner = t[1..t.len() - 1];
+            var at = inner.len();
+            var i: usize = 0;
+            while i < inner.len() : (i += 1) {
+                if inner[i].kind == css.COMMA {
+                    at = i;
+                    break;
+                }
+            }
+            if at == inner.len() {
+                return none;
+            }
+            let count = css.trim(inner[0..at]);
+            var count_kind = REPEAT_COUNT;
+            var n: u16 = 0;
+            if values.is_keyword(count, word: "auto-fill") {
+                count_kind = REPEAT_AUTO_FILL;
+            } else if values.is_keyword(count, word: "auto-fit") {
+                count_kind = REPEAT_AUTO_FIT;
+            } else {
+                let c = integer(count, a: a) orelse return none;
+                if c < 1 or c > 1000 {
+                    return none;
+                }
+                n = c as u16;
+            }
+            let body = css.trim(inner[at + 1..inner.len()]);
+            let bw = values.words(body, a);
+            var tracks = alloc.List(Track).init(a);
+            for bs in bw.items() {
+                let x = body[bs.from..bs.to];
+                if x[0].kind == css.LBRACKET {
+                    continue;
+                }
+                let one = track(x, cx: cx, a: a) orelse return none;
+                tracks.push(one);
+            }
+            if tracks.len() == 0 {
+                return none;
+            }
+            out.push(TrackEntry { repeat: true, count_kind: count_kind, count: n, tracks: tracks });
+            continue;
+        }
+        let one = track(t, cx: cx, a: a) orelse return none;
+        var tracks = alloc.List(Track).init(a);
+        tracks.push(one);
+        out.push(TrackEntry { repeat: false, count_kind: REPEAT_COUNT, count: 0, tracks: tracks });
+    }
+    return out;
+}
+
+/// One grid line: auto, 3, -1, span 2.
+fn line(t: []css.Token, a: alloc.Allocator) -> ?Line {
+    let wl = values.words(t, a);
+    let w = wl.items();
+    if w.len() == 1 {
+        let one = t[w[0].from..w[0].to];
+        if values.is_keyword(one, word: "auto") {
+            return Line { kind: LINE_AUTO, n: 0 };
+        }
+        let n = integer(one, a: a) orelse return none;
+        if n != 0 and n >= -10000 and n <= 10000 {
+            return Line { kind: LINE_INDEX, n: n };
+        }
+        return none;
+    }
+    if w.len() == 2 and values.is_keyword(t[w[0].from..w[0].to], word: "span") {
+        let n = integer(t[w[1].from..w[1].to], a: a) orelse return none;
+        if n >= 1 and n <= 10000 {
+            return Line { kind: LINE_SPAN, n: n };
+        }
+    }
+    return none;
+}
+
+/// grid-column: 1 / 3, span 2, 2 / span 2.
+fn placement(t: []css.Token, a: alloc.Allocator) -> ?Placement {
+    let slash = css.Token { kind: css.DELIM, n: 0.0, ch: '/' as u32, text: alloc.String.init(a) };
+    let parts = css.split_top(t, sep: &slash, a: a);
+    if parts.len() == 1 {
+        let p0 = parts.items()[0];
+        let start = line(css.trim(t[p0.from..p0.to]), a: a) orelse return none;
+        return Placement { start: start, end: Line { kind: LINE_AUTO, n: 0 } };
+    }
+    if parts.len() == 2 {
+        let p0 = parts.items()[0];
+        let p1 = parts.items()[1];
+        let start = line(css.trim(t[p0.from..p0.to]), a: a) orelse return none;
+        let end = line(css.trim(t[p1.from..p1.to]), a: a) orelse return none;
+        return Placement { start: start, end: end };
+    }
+    return none;
+}
+
+/// background and background-image: a color and a gradient, wherever they
+/// sit among the other background values, which this host does not draw.
+fn background(s: &mut Style, name: str, value: []css.Token, w: []css.Span, kw: str, current: u32, a: alloc.Allocator) {
+    let whole = name.eq("background");
+    if eqi(x: kw, word: "none") {
+        s.has_gradient = false;
+        s.gradient.stops = alloc.List(Stop).init(a);
+        if whole {
+            s.background = values.TRANSPARENT;
+        }
+        return;
+    }
+    var has_col = false;
+    var col: u32 = 0;
+    var has_grad = false;
+    var grad = Gradient { angle: 180.0, stops: alloc.List(Stop).init(a) };
+    for sp in w {
+        let t = value[sp.from..sp.to];
+        match values.parse_color(t, current: current, a: a) {
+            some(c) => {
+                col = c;
+                has_col = true;
+            }
+            none => {
+                match linear_gradient(t, current: current, a: a) {
+                    some(g) => {
+                        grad = g;
+                        has_grad = true;
+                    }
+                    none => { }
+                }
+            }
+        }
+    }
+    if whole {
+        if not has_col and not has_grad {
+            return;
+        }
+        if has_col {
+            s.background = col;
+        } else {
+            s.background = values.TRANSPARENT;
+        }
+    }
+    s.has_gradient = has_grad;
+    s.gradient = grad;
+}
+
+/// linear-gradient(...): an angle or `to <side>`, then color stops.
+fn linear_gradient(t: []css.Token, current: u32, a: alloc.Allocator) -> ?Gradient {
+    if t.len() < 2 or t[0].kind != css.FUNCTION or not t[0].text.view().eq("linear-gradient") {
+        return none;
+    }
+    let inner = t[1..t.len() - 1];
+    let comma = css.plain(css.COMMA, a);
+    let parts = css.split_top(inner, sep: &comma, a: a);
+    var angle: f32 = 180.0;
+    var stops_from: usize = 0;
+    let p0 = parts.items()[0];
+    let first = css.trim(inner[p0.from..p0.to]);
+    let fwl = values.words(first, a);
+    let fw = fwl.items();
+    if first.len() == 1 and first[0].kind == css.DIMENSION {
+        let u = first[0].text.view();
+        let n = first[0].n;
+        if u.eq("deg") {
+            angle = n;
+        } else if u.eq("turn") {
+            angle = n * 360.0;
+        } else if u.eq("rad") {
+            angle = values.to_degrees(n);
+        } else if u.eq("grad") {
+            angle = n * 0.9;
+        } else {
+            return none;
+        }
+        stops_from = 1;
+    } else if fw.len() > 0 and values.is_keyword(first[fw[0].from..fw[0].to], word: "to") {
+        var right = false;
+        var left = false;
+        var bottom = false;
+        var top = false;
+        var i: usize = 1;
+        while i < fw.len() : (i += 1) {
+            let k = values.keyword_text(first[fw[i].from..fw[i].to]);
+            if eqi(x: k, word: "right") {
+                right = true;
+            } else if eqi(x: k, word: "left") {
+                left = true;
+            } else if eqi(x: k, word: "bottom") {
+                bottom = true;
+            } else if eqi(x: k, word: "top") {
+                top = true;
+            }
+        }
+        // atan2(x, -y) in degrees, x and y each -1, 0 or 1: a multiple
+        // of 45 exactly, as Rust's f32 arithmetic leaves it.
+        var x: i32 = 0;
+        if right {
+            x = 1;
+        } else if left {
+            x = -1;
+        }
+        var y: i32 = 0;
+        if bottom {
+            y = 1;
+        } else if top {
+            y = -1;
+        }
+        angle = 180.0;
+        if x == 0 and y == -1 {
+            angle = 0.0;
+        } else if x == 1 and y == 0 {
+            angle = 90.0;
+        } else if x == -1 and y == 0 {
+            angle = -90.0;
+        } else if x == 1 and y == -1 {
+            angle = 45.0;
+        } else if x == 1 and y == 1 {
+            angle = 135.0;
+        } else if x == -1 and y == 1 {
+            angle = -135.0;
+        } else if x == -1 and y == -1 {
+            angle = -45.0;
+        }
+        stops_from = 1;
+    }
+    var g = Gradient { angle: angle, stops: alloc.List(Stop).init(a) };
+    var pi = stops_from;
+    while pi < parts.len() : (pi += 1) {
+        let p = parts.items()[pi];
+        let part = css.trim(inner[p.from..p.to]);
+        let pwl = values.words(part, a);
+        let pw = pwl.items();
+        if pw.len() == 0 {
+            return none;
+        }
+        let c = values.parse_color(part[pw[0].from..pw[0].to], current: current, a: a) orelse return none;
+        var stop = Stop { color: c, has_at: false, at: 0.0 };
+        if pw.len() > 1 {
+            let second = part[pw[1].from..pw[1].to];
+            if second.len() == 1 and second[0].kind == css.PERCENTAGE {
+                stop.has_at = true;
+                stop.at = second[0].n / 100.0;
+            }
+        }
+        g.stops.push(stop);
+    }
+    if g.stops.len() < 2 {
+        return none;
+    }
+    return g;
+}
+
+/// [inset] x y [blur [spread]] [color], in any order around the lengths.
+fn shadow(value: []css.Token, w: []css.Span, cx: values.Ctx, current: u32, a: alloc.Allocator) -> ?Shadow {
+    var lengths: [4]f32 = [0.0; 4];
+    var count: usize = 0;
+    var sh = Shadow { x: 0.0, y: 0.0, blur: 0.0, spread: 0.0, has_color: false, color: 0, inset: false };
+    for sp in w {
+        let t = value[sp.from..sp.to];
+        if values.is_keyword(t, word: "inset") {
+            sh.inset = true;
+            continue;
+        }
+        match values.parse_px(t, cx: cx, a: a) {
+            some(p) => {
+                if count < 4 {
+                    lengths[count] = p;
+                }
+                count += 1;
+            }
+            none => {
+                sh.color = values.parse_color(t, current: current, a: a) orelse return none;
+                sh.has_color = true;
+            }
+        }
+    }
+    if count < 2 or count > 4 {
+        return none;
+    }
+    sh.x = lengths[0];
+    sh.y = lengths[1];
+    sh.blur = values.fmax(x: lengths[2], y: 0.0);
+    sh.spread = lengths[3];
+    return sh;
+}
+
+/// font-size: a keyword, a percentage of the parent's, or a length (em
+/// the parent's); limited to 1..=1000.
+fn font_size(t: []css.Token, parent: f32, cx: values.Ctx, a: alloc.Allocator) -> ?f32 {
+    let k = values.keyword_text(t);
+    var size: f32 = 0.0;
+    if k.len() > 0 {
+        if eqi(x: k, word: "xx-small") {
+            size = 9.0;
+        } else if eqi(x: k, word: "x-small") {
+            size = 10.0;
+        } else if eqi(x: k, word: "small") {
+            size = 13.0;
+        } else if eqi(x: k, word: "medium") {
+            size = 16.0;
+        } else if eqi(x: k, word: "large") {
+            size = 18.0;
+        } else if eqi(x: k, word: "x-large") {
+            size = 24.0;
+        } else if eqi(x: k, word: "xx-large") {
+            size = 32.0;
+        } else if eqi(x: k, word: "xxx-large") {
+            size = 48.0;
+        } else if eqi(x: k, word: "smaller") {
+            size = parent / 1.2;
+        } else if eqi(x: k, word: "larger") {
+            size = parent * 1.2;
+        } else {
+            return none;
+        }
+    } else if t.len() == 1 and t[0].kind == css.PERCENTAGE {
+        size = parent * t[0].n / 100.0;
+    } else {
+        size = values.parse_px(t, cx: values.Ctx { em: parent, rem: cx.rem, vw: cx.vw, vh: cx.vh }, a: a) orelse return none;
+    }
+    // Past this a glyph is bigger than any screen; under it, invisible.
+    return values.clamp(v: size, lo: 1.0, hi: 1000.0);
+}
+
+/// font-weight: a keyword, or a number from 1 to 1000.
+fn font_weight(t: []css.Token, parent: u16, a: alloc.Allocator) -> ?u16 {
+    let k = values.keyword_text(t);
+    if k.len() > 0 {
+        if eqi(x: k, word: "normal") {
+            return 400;
+        }
+        if eqi(x: k, word: "bold") {
+            return 700;
+        }
+        if eqi(x: k, word: "bolder") {
+            if parent < 400 {
+                return 400;
+            }
+            if parent < 600 {
+                return 700;
+            }
+            return 900;
+        }
+        if eqi(x: k, word: "lighter") {
+            if parent < 600 {
+                return 100;
+            }
+            if parent < 800 {
+                return 400;
+            }
+            return 700;
+        }
+        return none;
+    }
+    let n = values.parse_number(t, a) orelse return none;
+    if n >= 1.0 and n <= 1000.0 {
+        return n as u16;
+    }
+    return none;
+}
+
+/// Whether a family list asks for a fixed-width font: monospace, or one of
+/// the names people reach for when they mean it.
+fn monospace(t: []css.Token, a: alloc.Allocator) -> bool {
+    let comma = css.plain(css.COMMA, a);
+    let parts = css.split_top(t, sep: &comma, a: a);
+    for p in parts.items() {
+        var text = alloc.String.init(a);
+        css.to_css(css.trim(t[p.from..p.to]), out: &mut text);
+        var v = text.view();
+        while v.len() > 0 and v.bytes()[0] == '"' {
+            v = v[1..v.len()];
+        }
+        while v.len() > 0 and v.bytes()[v.len() - 1] == '"' {
+            v = v[0..v.len() - 1];
+        }
+        let low = css.lowercase(v, a);
+        let n = low.view();
+        if n.eq("monospace") or n.eq("ui-monospace") or n.eq("menlo") or n.eq("monaco") or n.eq("consolas") or n.eq("courier") or n.eq("courier new") or n.eq("sf mono") or n.eq("jetbrains mono") or n.eq("fira code") or n.eq("fira mono") or n.eq("source code pro") or n.eq("roboto mono") or n.eq("dejavu sans mono") or n.eq("liberation mono") or n.eq("cascadia code") or n.eq("ubuntu mono") or n.eq("noto sans mono") {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// line-height: normal, a factor, a percentage or a length (of em).
+fn line_height(t: []css.Token, cx: values.Ctx, a: alloc.Allocator) -> ?LineHeight {
+    if t.len() == 1 and t[0].kind == css.IDENT and eqi(x: t[0].text.view(), word: "normal") {
+        return LineHeight { kind: LINE_NORMAL, v: 0.0 };
+    }
+    if t.len() == 1 and t[0].kind == css.NUMBER {
+        if t[0].n >= 0.0 {
+            return LineHeight { kind: LINE_FACTOR, v: t[0].n };
+        }
+        return none;
+    }
+    if t.len() == 1 and t[0].kind == css.PERCENTAGE {
+        if t[0].n >= 0.0 {
+            return LineHeight { kind: LINE_PX, v: cx.em * t[0].n / 100.0 };
+        }
+        return none;
+    }
+    let p = values.parse_px(t, cx: cx, a: a) orelse return none;
+    if p >= 0.0 {
+        return LineHeight { kind: LINE_PX, v: p };
+    }
+    return none;
+}
+
+/// font: [style] [weight] size[/line-height] family.
+fn font(s: &mut Style, parent: &Style, value: []css.Token, w: []css.Span, cx: values.Ctx, a: alloc.Allocator) {
+    // The size is the first word that reads as one; the family follows it.
+    let slash = css.Token { kind: css.DELIM, n: 0.0, ch: '/' as u32, text: alloc.String.init(a) };
+    var at = w.len();
+    var i: usize = 0;
+    while i < w.len() : (i += 1) {
+        let t = value[w[i].from..w[i].to];
+        let sp = css.split_top(t, sep: &slash, a: a);
+        let head = css.trim(t[sp.items()[0].from..sp.items()[0].to]);
+        match font_size(head, parent: parent.font_size, cx: cx, a: a) {
+            some(_) => {
+                if not values.is_keyword(head, word: "normal") {
+                    at = i;
+                    break;
+                }
+            }
+            none => { }
+        }
+    }
+    if at == w.len() {
+        return;
+    }
+    let t = value[w[at].from..w[at].to];
+    let size_parts = css.split_top(t, sep: &slash, a: a);
+    let sp0 = size_parts.items()[0];
+    let size = font_size(css.trim(t[sp0.from..sp0.to]), parent: parent.font_size, cx: cx, a: a) orelse return;
+    s.font_size = size;
+    s.italic = false;
+    s.font_weight = 400;
+    s.line_height = LineHeight { kind: LINE_NORMAL, v: 0.0 };
+    var k: usize = 0;
+    while k < at : (k += 1) {
+        let word = value[w[k].from..w[k].to];
+        let kw = values.keyword_text(word);
+        if eqi(x: kw, word: "italic") or eqi(x: kw, word: "oblique") {
+            s.italic = true;
+        } else {
+            s.font_weight = font_weight(word, parent: parent.font_weight, a: a) orelse s.font_weight;
+        }
+    }
+    if size_parts.len() > 1 {
+        let sp1 = size_parts.items()[1];
+        let lcx = values.Ctx { em: size, rem: cx.rem, vw: cx.vw, vh: cx.vh };
+        s.line_height = line_height(css.trim(t[sp1.from..sp1.to]), cx: lcx, a: a) orelse s.line_height;
+    }
+    s.monospace = monospace(value[w[at].to..value.len()], a: a);
+}
+
+/// Whether a property inherits.
+fn is_inherited(name: str) -> bool {
+    return one_of(word: name, list: "color font font-size font-weight font-style font-family line-height text-align white-space text-transform letter-spacing visibility cursor list-style list-style-type pointer-events");
+}
+
+/// A copy of a list of tracks.
+fn copy_tracks(list: &alloc.List(Track), a: alloc.Allocator) -> alloc.List(Track) {
+    var out = alloc.List(Track).init(a);
+    for t in list.items() {
+        out.push(Track { kind: t.kind, len: t.len, fr: t.fr, sub: copy_tracks(&t.sub, a: a) });
+    }
+    return out;
+}
+
+/// A copy of a gradient.
+fn copy_gradient(g: &Gradient, a: alloc.Allocator) -> Gradient {
+    var stops = alloc.List(Stop).init(a);
+    for st in g.stops.items() {
+        stops.push(st.*);
+    }
+    return Gradient { angle: g.angle, stops: stops };
+}
+
+/// name (and, for a shorthand, what it covers) copied from from: what
+/// inherit, initial and unset do.
+fn copy_property(s: &mut Style, from: &Style, name: str, a: alloc.Allocator) {
+    if name.eq("display") {
+        s.display = from.display;
+    } else if name.eq("position") {
+        s.position = from.position;
+    } else if side_of_inset(name) < 4 {
+        s.inset[side_of_inset(name)] = from.inset[side_of_inset(name)];
+    } else if name.eq("inset") {
+        s.inset = from.inset;
+    } else if name.eq("width") {
+        s.width = from.width;
+    } else if name.eq("height") {
+        s.height = from.height;
+    } else if name.eq("min-width") {
+        s.min_width = from.min_width;
+    } else if name.eq("min-height") {
+        s.min_height = from.min_height;
+    } else if name.eq("max-width") {
+        s.max_width = from.max_width;
+    } else if name.eq("max-height") {
+        s.max_height = from.max_height;
+    } else if name.eq("margin") {
+        s.margin = from.margin;
+    } else if name.eq("padding") {
+        s.padding = from.padding;
+    } else if name.eq("border") {
+        s.border_width = from.border_width;
+        s.border_style = from.border_style;
+        s.border_color = from.border_color;
+        s.border_current = from.border_current;
+    } else if name.eq("border-width") {
+        s.border_width = from.border_width;
+    } else if name.eq("border-style") {
+        s.border_style = from.border_style;
+    } else if name.eq("border-color") {
+        s.border_color = from.border_color;
+        s.border_current = from.border_current;
+    } else if name.eq("border-radius") {
+        s.radius = from.radius;
+    } else if name.eq("box-sizing") {
+        s.box_sizing = from.box_sizing;
+    } else if name.eq("overflow") {
+        s.overflow = from.overflow;
+    } else if name.eq("overflow-x") {
+        s.overflow[0] = from.overflow[0];
+    } else if name.eq("overflow-y") {
+        s.overflow[1] = from.overflow[1];
+    } else if name.eq("flex-direction") {
+        s.flex_direction = from.flex_direction;
+    } else if name.eq("flex-wrap") {
+        s.flex_wrap = from.flex_wrap;
+    } else if name.eq("justify-content") {
+        s.justify_content = from.justify_content;
+    } else if name.eq("align-items") {
+        s.align_items = from.align_items;
+    } else if name.eq("align-self") {
+        s.align_self = from.align_self;
+    } else if name.eq("align-content") {
+        s.align_content = from.align_content;
+    } else if name.eq("flex") {
+        s.flex_grow = from.flex_grow;
+        s.flex_shrink = from.flex_shrink;
+        s.flex_basis = from.flex_basis;
+    } else if name.eq("flex-grow") {
+        s.flex_grow = from.flex_grow;
+    } else if name.eq("flex-shrink") {
+        s.flex_shrink = from.flex_shrink;
+    } else if name.eq("flex-basis") {
+        s.flex_basis = from.flex_basis;
+    } else if name.eq("gap") {
+        s.gap = from.gap;
+    } else if name.eq("background") or name.eq("background-color") {
+        s.background = from.background;
+        s.has_gradient = from.has_gradient;
+        s.gradient = copy_gradient(&from.gradient, a: a);
+    } else if name.eq("opacity") {
+        s.opacity = from.opacity;
+    } else if name.eq("box-shadow") {
+        s.has_shadow = from.has_shadow;
+        s.shadow = from.shadow;
+    } else if name.eq("color") {
+        s.color = from.color;
+    } else if name.eq("font-size") {
+        s.font_size = from.font_size;
+    } else if name.eq("font-weight") {
+        s.font_weight = from.font_weight;
+    } else if name.eq("font-style") {
+        s.italic = from.italic;
+    } else if name.eq("font-family") {
+        s.monospace = from.monospace;
+    } else if name.eq("font") {
+        s.font_size = from.font_size;
+        s.font_weight = from.font_weight;
+        s.italic = from.italic;
+        s.monospace = from.monospace;
+        s.line_height = from.line_height;
+    } else if name.eq("line-height") {
+        s.line_height = from.line_height;
+    } else if name.eq("text-align") {
+        s.text_align = from.text_align;
+    } else if name.eq("white-space") {
+        s.white_space = from.white_space;
+    } else if name.eq("text-transform") {
+        s.text_transform = from.text_transform;
+    } else if name.eq("letter-spacing") {
+        s.letter_spacing = from.letter_spacing;
+    } else if name.eq("text-decoration") or name.eq("text-decoration-line") {
+        s.text_decoration = from.text_decoration;
+    } else if name.eq("visibility") {
+        s.visibility = from.visibility;
+    } else if name.eq("cursor") {
+        s.cursor = from.cursor;
+    } else if name.eq("list-style") or name.eq("list-style-type") {
+        s.list_style = from.list_style;
+    } else if name.eq("pointer-events") {
+        s.pointer_events = from.pointer_events;
+    } else if name.eq("z-index") {
+        s.has_z_index = from.has_z_index;
+        s.z_index = from.z_index;
+    } else if name.eq("float") {
+        s.float = from.float;
+    } else if name.eq("clear") {
+        s.clear = from.clear;
+    } else if name.eq("order") {
+        s.order = from.order;
+    }
+}
+
+// ---- as the headless runner prints it --------------------------------------
+
+/// "name: " after the ones before it, parted by "; ".
+fn put(out: &mut alloc.String, first: &mut bool, name: str) {
+    if not first.* {
+        out.push_str("; ");
+    }
+    first.* = false;
+    out.push_str(name);
+    out.push_str(": ");
+}
+
+/// Four side values the way a shorthand writes them: 8px, 8px 16px, ...
+fn short4(v: []alloc.String, out: &mut alloc.String) {
+    let p = v[0].view();
+    let q = v[1].view();
+    let r = v[2].view();
+    let t = v[3].view();
+    if p.eq(q) and q.eq(r) and r.eq(t) {
+        out.push_str(p);
+    } else if p.eq(r) and q.eq(t) {
+        out.push_str(p);
+        out.push_str(" ");
+        out.push_str(q);
+    } else if q.eq(t) {
+        out.push_str(p);
+        out.push_str(" ");
+        out.push_str(q);
+        out.push_str(" ");
+        out.push_str(r);
+    } else {
+        out.push_str(p);
+        out.push_str(" ");
+        out.push_str(q);
+        out.push_str(" ");
+        out.push_str(r);
+        out.push_str(" ");
+        out.push_str(t);
+    }
+}
+
+/// Two values the way a shorthand writes them: one when they are the same.
+fn short2(p: str, q: str, out: &mut alloc.String) {
+    out.push_str(p);
+    if not p.eq(q) {
+        out.push_str(" ");
+        out.push_str(q);
+    }
+}
+
+/// Four lengths, shorthand.
+fn quad_css(v: [4]values.Length, out: &mut alloc.String, a: alloc.Allocator) {
+    var texts = alloc.List(alloc.String).init(a);
+    var i: usize = 0;
+    while i < 4 : (i += 1) {
+        var t = alloc.String.init(a);
+        values.write_length(v[i], out: &mut t);
+        texts.push(t);
+    }
+    short4(texts.items(), out: out);
+}
+
+/// Whether four lengths are the same as four others.
+fn quad_eq(x: [4]values.Length, y: [4]values.Length) -> bool {
+    var i: usize = 0;
+    while i < 4 : (i += 1) {
+        if not values.length_eq(x: x[i], y: y[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A grid track as CSS.
+fn track_css(t: &Track, out: &mut alloc.String) {
+    let k = t.kind;
+    if k == TRACK_FIXED {
+        values.write_length(t.len, out: out);
+    } else if k == TRACK_FR {
+        css.write_number(t.fr, out: out);
+        out.push_str("fr");
+    } else if k == TRACK_AUTO {
+        out.push_str("auto");
+    } else if k == TRACK_MIN_CONTENT {
+        out.push_str("min-content");
+    } else if k == TRACK_MAX_CONTENT {
+        out.push_str("max-content");
+    } else if k == TRACK_MINMAX {
+        out.push_str("minmax(");
+        track_css(&t.sub.items()[0], out: out);
+        out.push_str(", ");
+        track_css(&t.sub.items()[1], out: out);
+        out.push_str(")");
+    } else {
+        out.push_str("fit-content(");
+        values.write_length(t.len, out: out);
+        out.push_str(")");
+    }
+}
+
+/// A track list as CSS; none when it is empty.
+fn tracks_css(list: &alloc.List(TrackEntry), out: &mut alloc.String) {
+    if list.len() == 0 {
+        out.push_str("none");
+        return;
+    }
+    var first = true;
+    for e in list.items() {
+        if not first {
+            out.push_str(" ");
+        }
+        first = false;
+        if not e.repeat {
+            track_css(&e.tracks.items()[0], out: out);
+            continue;
+        }
+        out.push_str("repeat(");
+        if e.count_kind == REPEAT_AUTO_FILL {
+            out.push_str("auto-fill");
+        } else if e.count_kind == REPEAT_AUTO_FIT {
+            out.push_str("auto-fit");
+        } else {
+            out.push_u64(e.count as u64);
+        }
+        out.push_str(", ");
+        var inner_first = true;
+        for t in e.tracks.items() {
+            if not inner_first {
+                out.push_str(" ");
+            }
+            inner_first = false;
+            track_css(t, out: out);
+        }
+        out.push_str(")");
+    }
+}
+
+/// A grid line as CSS.
+fn line_css(l: Line, out: &mut alloc.String) {
+    if l.kind == LINE_AUTO {
+        out.push_str("auto");
+    } else if l.kind == LINE_INDEX {
+        out.push_i64(l.n as i64);
+    } else {
+        out.push_str("span ");
+        out.push_i64(l.n as i64);
+    }
+}
+
+/// A placement as CSS: start / end.
+fn placement_css(p: Placement, out: &mut alloc.String) {
+    line_css(p.start, out: out);
+    out.push_str(" / ");
+    line_css(p.end, out: out);
+}
+
+/// The properties style sets differently from where it started, what its
+/// own rules did, as the headless runner prints them: for an inherited
+/// property against parent, for the rest against their initial values and
+/// the tag's display. "" when nothing differs.
+pub fn describe(style: &Style, parent: &Style, tag: str, out: &mut alloc.String, a: alloc.Allocator) {
+    let base = child_of(parent, tag: tag, a: a);
+    var first = true;
+    if style.display != base.display {
+        put(out, first: &mut first, name: "display");
+        out.push_str(keyword_name(table: DISPLAYS, k: style.display));
+    }
+    if style.position != base.position {
+        put(out, first: &mut first, name: "position");
+        out.push_str(keyword_name(table: POSITIONS, k: style.position));
+    }
+    if not quad_eq(x: style.inset, y: base.inset) {
+        put(out, first: &mut first, name: "inset");
+        quad_css(style.inset, out: out, a: a);
+    }
+    if not values.length_eq(x: style.width, y: base.width) {
+        put(out, first: &mut first, name: "width");
+        values.write_length(style.width, out: out);
+    }
+    if not values.length_eq(x: style.height, y: base.height) {
+        put(out, first: &mut first, name: "height");
+        values.write_length(style.height, out: out);
+    }
+    if not values.length_eq(x: style.min_width, y: base.min_width) {
+        put(out, first: &mut first, name: "min-width");
+        values.write_length(style.min_width, out: out);
+    }
+    if not values.length_eq(x: style.min_height, y: base.min_height) {
+        put(out, first: &mut first, name: "min-height");
+        values.write_length(style.min_height, out: out);
+    }
+    if not values.length_eq(x: style.max_width, y: base.max_width) {
+        put(out, first: &mut first, name: "max-width");
+        values.write_length(style.max_width, out: out);
+    }
+    if not values.length_eq(x: style.max_height, y: base.max_height) {
+        put(out, first: &mut first, name: "max-height");
+        values.write_length(style.max_height, out: out);
+    }
+    if not quad_eq(x: style.margin, y: base.margin) {
+        put(out, first: &mut first, name: "margin");
+        quad_css(style.margin, out: out, a: a);
+    }
+    if not quad_eq(x: style.padding, y: base.padding) {
+        put(out, first: &mut first, name: "padding");
+        quad_css(style.padding, out: out, a: a);
+    }
+    var widths_differ = false;
+    var i: usize = 0;
+    while i < 4 : (i += 1) {
+        if style.border_width[i] != base.border_width[i] {
+            widths_differ = true;
+        }
+    }
+    if widths_differ {
+        put(out, first: &mut first, name: "border");
+        var widths = alloc.List(alloc.String).init(a);
+        var styles = alloc.List(alloc.String).init(a);
+        var colors = alloc.List(alloc.String).init(a);
+        i = 0;
+        while i < 4 : (i += 1) {
+            var wt = alloc.String.init(a);
+            css.write_number(style.border_width[i], out: &mut wt);
+            wt.push_str("px");
+            widths.push(wt);
+            styles.push(alloc.String.from(keyword_name(table: BORDER_STYLES, k: style.border_style[i]), a));
+            var ct = alloc.String.init(a);
+            if style.border_current[i] {
+                ct.push_str("currentcolor");
+            } else {
+                values.write_color(style.border_color[i], out: &mut ct);
+            }
+            colors.push(ct);
+        }
+        short4(widths.items(), out: out);
+        out.push_str(" ");
+        short4(styles.items(), out: out);
+        out.push_str(" ");
+        short4(colors.items(), out: out);
+    }
+    if not quad_eq(x: style.radius, y: base.radius) {
+        put(out, first: &mut first, name: "border-radius");
+        quad_css(style.radius, out: out, a: a);
+    }
+    if style.box_sizing != base.box_sizing {
+        put(out, first: &mut first, name: "box-sizing");
+        out.push_str(keyword_name(table: BOX_SIZINGS, k: style.box_sizing));
+    }
+    if style.overflow[0] != base.overflow[0] or style.overflow[1] != base.overflow[1] {
+        put(out, first: &mut first, name: "overflow");
+        short2(p: keyword_name(table: OVERFLOWS, k: style.overflow[0]), q: keyword_name(table: OVERFLOWS, k: style.overflow[1]), out: out);
+    }
+    if style.flex_direction != base.flex_direction {
+        put(out, first: &mut first, name: "flex-direction");
+        out.push_str(keyword_name(table: FLEX_DIRECTIONS, k: style.flex_direction));
+    }
+    if style.flex_wrap != base.flex_wrap {
+        put(out, first: &mut first, name: "flex-wrap");
+        out.push_str(keyword_name(table: FLEX_WRAPS, k: style.flex_wrap));
+    }
+    if style.justify_content != base.justify_content {
+        put(out, first: &mut first, name: "justify-content");
+        out.push_str(keyword_name(table: ALIGNS, k: style.justify_content));
+    }
+    if style.align_items != base.align_items {
+        put(out, first: &mut first, name: "align-items");
+        out.push_str(keyword_name(table: ALIGNS, k: style.align_items));
+    }
+    if style.align_self != base.align_self {
+        put(out, first: &mut first, name: "align-self");
+        out.push_str(keyword_name(table: ALIGNS, k: style.align_self));
+    }
+    if style.align_content != base.align_content {
+        put(out, first: &mut first, name: "align-content");
+        out.push_str(keyword_name(table: ALIGNS, k: style.align_content));
+    }
+    if style.justify_items != base.justify_items {
+        put(out, first: &mut first, name: "justify-items");
+        out.push_str(keyword_name(table: ALIGNS, k: style.justify_items));
+    }
+    if style.justify_self != base.justify_self {
+        put(out, first: &mut first, name: "justify-self");
+        out.push_str(keyword_name(table: ALIGNS, k: style.justify_self));
+    }
+    if style.flex_grow != base.flex_grow or style.flex_shrink != base.flex_shrink or not values.length_eq(x: style.flex_basis, y: base.flex_basis) {
+        put(out, first: &mut first, name: "flex");
+        css.write_number(style.flex_grow, out: out);
+        out.push_str(" ");
+        css.write_number(style.flex_shrink, out: out);
+        out.push_str(" ");
+        values.write_length(style.flex_basis, out: out);
+    }
+    if style.order != base.order {
+        put(out, first: &mut first, name: "order");
+        out.push_i64(style.order as i64);
+    }
+    if not values.length_eq(x: style.gap[0], y: base.gap[0]) or not values.length_eq(x: style.gap[1], y: base.gap[1]) {
+        put(out, first: &mut first, name: "gap");
+        var g0 = alloc.String.init(a);
+        values.write_length(style.gap[0], out: &mut g0);
+        var g1 = alloc.String.init(a);
+        values.write_length(style.gap[1], out: &mut g1);
+        short2(p: g0.view(), q: g1.view(), out: out);
+    }
+    if style.grid_template_columns.len() > 0 {
+        put(out, first: &mut first, name: "grid-template-columns");
+        tracks_css(&style.grid_template_columns, out: out);
+    }
+    if style.grid_template_rows.len() > 0 {
+        put(out, first: &mut first, name: "grid-template-rows");
+        tracks_css(&style.grid_template_rows, out: out);
+    }
+    if not placement_eq(x: style.grid_column, y: base.grid_column) {
+        put(out, first: &mut first, name: "grid-column");
+        placement_css(style.grid_column, out: out);
+    }
+    if not placement_eq(x: style.grid_row, y: base.grid_row) {
+        put(out, first: &mut first, name: "grid-row");
+        placement_css(style.grid_row, out: out);
+    }
+    if style.has_aspect_ratio {
+        put(out, first: &mut first, name: "aspect-ratio");
+        css.write_number(style.aspect_ratio, out: out);
+    }
+    if style.float != base.float {
+        put(out, first: &mut first, name: "float");
+        out.push_str(keyword_name(table: FLOATS, k: style.float));
+    }
+    if style.has_z_index != base.has_z_index or style.z_index != base.z_index {
+        put(out, first: &mut first, name: "z-index");
+        if style.has_z_index {
+            out.push_i64(style.z_index as i64);
+        } else {
+            out.push_str("auto");
+        }
+    }
+    if style.background != base.background {
+        put(out, first: &mut first, name: "background");
+        values.write_color(style.background, out: out);
+    }
+    if style.has_gradient {
+        put(out, first: &mut first, name: "background-image");
+        out.push_str("linear-gradient(");
+        css.write_number(style.gradient.angle, out: out);
+        out.push_str("deg");
+        for st in style.gradient.stops.items() {
+            out.push_str(", ");
+            values.write_color(st.color, out: out);
+        }
+        out.push_str(")");
+    }
+    if style.opacity != base.opacity {
+        put(out, first: &mut first, name: "opacity");
+        css.write_number(style.opacity, out: out);
+    }
+    if style.has_shadow {
+        put(out, first: &mut first, name: "box-shadow");
+        let sh = style.shadow;
+        if sh.inset {
+            out.push_str("inset ");
+        }
+        css.write_number(sh.x, out: out);
+        out.push_str("px ");
+        css.write_number(sh.y, out: out);
+        out.push_str("px ");
+        css.write_number(sh.blur, out: out);
+        out.push_str("px ");
+        css.write_number(sh.spread, out: out);
+        out.push_str("px ");
+        if sh.has_color {
+            values.write_color(sh.color, out: out);
+        } else {
+            out.push_str("currentcolor");
+        }
+    }
+    if style.color != base.color {
+        put(out, first: &mut first, name: "color");
+        values.write_color(style.color, out: out);
+    }
+    if style.font_size != base.font_size {
+        put(out, first: &mut first, name: "font-size");
+        css.write_number(style.font_size, out: out);
+        out.push_str("px");
+    }
+    if style.font_weight != base.font_weight {
+        put(out, first: &mut first, name: "font-weight");
+        out.push_u64(style.font_weight as u64);
+    }
+    if style.italic != base.italic {
+        put(out, first: &mut first, name: "font-style");
+        if style.italic {
+            out.push_str("italic");
+        } else {
+            out.push_str("normal");
+        }
+    }
+    if style.monospace != base.monospace {
+        put(out, first: &mut first, name: "font-family");
+        if style.monospace {
+            out.push_str("monospace");
+        } else {
+            out.push_str("sans-serif");
+        }
+    }
+    if not line_height_eq(x: style.line_height, y: base.line_height) {
+        put(out, first: &mut first, name: "line-height");
+        let lh = style.line_height;
+        if lh.kind == LINE_NORMAL {
+            out.push_str("normal");
+        } else if lh.kind == LINE_FACTOR {
+            css.write_number(lh.v, out: out);
+        } else {
+            css.write_number(lh.v, out: out);
+            out.push_str("px");
+        }
+    }
+    if style.text_align != base.text_align {
+        put(out, first: &mut first, name: "text-align");
+        out.push_str(keyword_name(table: TEXT_ALIGNS, k: style.text_align));
+    }
+    if style.white_space != base.white_space {
+        put(out, first: &mut first, name: "white-space");
+        out.push_str(keyword_name(table: WHITE_SPACES, k: style.white_space));
+    }
+    if style.text_transform != base.text_transform {
+        put(out, first: &mut first, name: "text-transform");
+        out.push_str(keyword_name(table: TEXT_TRANSFORMS, k: style.text_transform));
+    }
+    if style.letter_spacing != base.letter_spacing {
+        put(out, first: &mut first, name: "letter-spacing");
+        css.write_number(style.letter_spacing, out: out);
+        out.push_str("px");
+    }
+    if style.text_decoration != base.text_decoration {
+        put(out, first: &mut first, name: "text-decoration");
+        let d = style.text_decoration;
+        if d == 0 {
+            out.push_str("none");
+        } else {
+            var started = false;
+            if (d & UNDERLINE) != 0 {
+                out.push_str("underline");
+                started = true;
+            }
+            if (d & LINE_THROUGH) != 0 {
+                if started {
+                    out.push_str(" ");
+                }
+                out.push_str("line-through");
+                started = true;
+            }
+            if (d & OVERLINE) != 0 {
+                if started {
+                    out.push_str(" ");
+                }
+                out.push_str("overline");
+            }
+        }
+    }
+    if style.visibility != base.visibility {
+        put(out, first: &mut first, name: "visibility");
+        out.push_str(keyword_name(table: VISIBILITIES, k: style.visibility));
+    }
+    if style.cursor != base.cursor {
+        put(out, first: &mut first, name: "cursor");
+        out.push_str(keyword_name(table: CURSORS, k: style.cursor));
+    }
+    if style.list_style != base.list_style {
+        put(out, first: &mut first, name: "list-style");
+        out.push_str(keyword_name(table: LIST_STYLES, k: style.list_style));
+    }
+    if style.pointer_events != base.pointer_events {
+        put(out, first: &mut first, name: "pointer-events");
+        out.push_str(keyword_name(table: POINTER_EVENTS, k: style.pointer_events));
+    }
+}

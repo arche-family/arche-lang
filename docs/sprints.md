@@ -593,6 +593,15 @@ Nimadir ilovasi sahifasining ko'rinishi CSS va layout'dan chiqadi. Hozir telefon
 
 **Qabul:** Nimadir'ning `run-tests.sh`idagi CSS va layout holatlari, shuningdek probe, todo, store va gallery'ning `--boxes` va `--styles` chiqishi arche-wasm'da Nimadir'nikidek; telefon ilovalari yangi layout bilan `tests/phone.sh`dan o'tadi.
 
+Qilingani (sprint davom etmoqda):
+- CSS kaskadi Nimadir'ning `host/src/dom`idagidek, faqat `core` va `alloc` bilan:
+  - `lib/wasm/css.arche`: tokenizer, sonlarni f32'da aniq o'qish va yozish, deklaratsiyalar, selektorlar va ularning specificity'si, `@media`, ogohlantirish matnlari.
+  - `values.arche`: uzunliklar, `calc`/`min`/`max`/`clamp`, em, rem, vw va boshqa birliklar, ranglarning hamma shakli.
+  - `select.arche`: selektor moslagich (atribut, `:nth-child` va boshqalar, `:not`, kombinatorlar) kichik `select.Doc` interfeysi ustida; `query-all` endi shu bilan ishlaydi.
+  - `style.arche`: UA sheet (yorug' va qorong'i), kaskad, `var()` cheklovlari bilan, meros, hisoblangan `Style` (Nimadir'ning hamma maydoni) va `--styles` matni.
+- `arche-wasm nimadir`ga `--styles`, `--dark` va `--viewport WxH` qo'shildi. Sheet ogohlantirishlari Nimadir'dagidek `css: skipped …` bo'lib log'ga tushadi.
+- `wasm/tests/nimadir`ga 26 holat qo'shildi: `run-tests.sh`ning "CSS (ADR-4)" bo'limidan 13 tasi (probe, todo) va yana 13 tasi (shorthand'lar, flex va grid xossalari, global kalit so'zlar, `var()`, ichma-ich `@media`, holatlar). Hammasi Nimadir'ning shell'i bilan bir xil chiqadi, interpreter'da ham, JIT'da ham. Holat argumentlari endi shell qo'shtirnoqlari bilan o'qiladi.
+
 ## 11. Editor va macOS
 
 Karvon va boshqa editor'lar tilni LSP orqali ulaydi. S36 faqat 6-bosqichga (toolchain) tayanadi va backend'larga bog'liq emas, shuning uchun raqam tartibidan oldin, S27'dan avval bajariladi. Debugger uchun DWARF S27'da.
