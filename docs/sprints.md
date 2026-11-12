@@ -609,6 +609,7 @@ Qilingani (sprint davom etmoqda):
 - `lib/layout/` taffy 0.15'ning yadrosi: geometriya, hamma uslub turlari (grid treklari, `repeat`, joylashuv bilan), `LayoutInput`/`LayoutOutput`, kesh, `compute_root_layout`, `compute_cached_layout`, `compute_hidden_layout`, leaf layout, yaxlitlash va umumiy yordamchilar. Taffy'ning tree trait'lari bitta `dyn` interfeysga aylandi: `layout.tree.LayoutTree`. `calc()` Nimadir'nikidek uzunlik ichida turadi va `px + asos * foiz / 100` bilan hisoblanadi.
   - `conformance/tests/layout`: yettita test. Kutilgan natijalarning ko'pi haqiqiy taffy crate'idan olingan, bir xil holatlarni o'tkazadigan Rust dasturi orqali; natijalar bitma-bit bir xil.
   - `layout` va `audio` compiler'da kutubxona ildizlari bo'ldi (`spec/arche.md` §1.1).
+- `lib/layout/compute/oof.arche`: taffy'ning absolute va fixed pozitsiyali bloklari (`oof.rs`) to'liq: containing block, inset'lar (foiz va `calc` bilan), static pozitsiya va uning alignment'i, o'lcham, margin'lar, hoisting. To'qqizta test (`oof_*`) haqiqiy taffy bilan bitma-bit bir xil.
 - `wasm/tests/nimadir`ga 26 holat qo'shildi: `run-tests.sh`ning "CSS (ADR-4)" bo'limidan 13 tasi (probe, todo) va yana 13 tasi (shorthand'lar, flex va grid xossalari, global kalit so'zlar, `var()`, ichma-ich `@media`, holatlar). Hammasi Nimadir'ning shell'i bilan bir xil chiqadi, interpreter'da ham, JIT'da ham. Holat argumentlari endi shell qo'shtirnoqlari bilan o'qiladi.
 
 ## 11. Editor va macOS

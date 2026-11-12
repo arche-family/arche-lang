@@ -1,13 +1,437 @@
-/// compute.oof: taffy 0.15's compute/oof.rs, the out-of-flow (absolute and
-/// fixed) positioning pass.
+/// compute.oof: taffy 0.15's compute/oof.rs, the positioning pass shared by
+/// out-of-flow (position: absolute and position: fixed) boxes.
 ///
-/// Only the signatures compute.compute_root_layout calls are here yet, with
-/// bodies that stop the program; the pass itself is still to be ported into
-/// this module. A tree without absolute or fixed boxes never reaches them.
+/// The layout algorithms do not lay out their out-of-flow children (unless
+/// they are the child's containing block): they emit OofCandidates, which
+/// bubble up the tree in LayoutOutput.oof_candidates until they reach the
+/// box's containing block, which lays the box out with this module.
+///
+/// taffy reads the grid area of a box whose containing block is a grid
+/// container through LayoutContainingBlock::get_detailed_layout_info.
+/// LayoutTree has no such method: Nimadir does not implement it either, so
+/// taffy's default, DetailedLayoutInfo::None, holds, and every box is
+/// positioned against the area it is given.
 import alloc;
+import layout.compute.common.scrollable_overflow as so;
+import layout.compute.common.sizing_keyword as sk;
 import layout.geometry as geo;
 import layout.style as sty;
 import layout.tree as lt;
+import layout.util;
+
+/// resolve_static_offset: the final static offset of an out-of-flow box
+/// from its static position, its final size and its resolved margins. In
+/// each axis the margin box is aligned in the static-position area by the
+/// recorded keyword, or by the fallback when the alignment is safe and the
+/// margin box overflows the area. The offset is the border box's, from
+/// whatever the areas are from (the containing block's border box once a
+/// candidate has reached it).
+pub fn resolve_static_offset(static_position: geo.Point(lt.AxisStaticPosition), final_size: geo.Size(f32), resolved_margin: geo.Rect(f32)) -> geo.Point(f32) {
+    return geo.Point(f32) {
+        x: resolve_static_offset_axis(static_position.x, final_size.width, geo.Line(f32) { start: resolved_margin.left, end: resolved_margin.right }),
+        y: resolve_static_offset_axis(static_position.y, final_size.height, geo.Line(f32) { start: resolved_margin.top, end: resolved_margin.bottom }),
+    };
+}
+
+/// resolve_static_offset in one axis.
+fn resolve_static_offset_axis(sp: lt.AxisStaticPosition, size: f32, margin: geo.Line(f32)) -> f32 {
+    let margin_box_size = size + margin.start + margin.end;
+    let overflows = sp.align.safety == sty.AlignmentSafety.Safe and margin_box_size > sp.area.end - sp.area.start;
+    var keyword = sp.align.keyword;
+    if overflows {
+        keyword = sp.align.fallback;
+    }
+    return align_in_line(sp.area, margin_box_size, keyword) + margin.start;
+}
+
+/// align_in_line: where a box of size starts when aligned to the given
+/// physical edge of container.
+fn align_in_line(container: geo.Line(f32), size: f32, edge: lt.AxisStaticEdge) -> f32 {
+    match edge {
+        .Start => { return container.start; }
+        .End => { return container.end - size; }
+        .Center => { return (container.start + container.end - size) / 2.0; }
+    }
+}
+
+/// The self-alignment of an out-of-flow box in one axis, relative to the
+/// writing mode of its containing block: Start is the containing block's
+/// logical start edge (OofAlignment).
+type OofAlignment = enum {
+    /// normal (or auto): stretch-fit sizing for boxes that are neither
+    /// replaced nor tables; start alignment.
+    Normal,
+    /// stretch: stretch-fit sizing; start alignment.
+    Stretch,
+    /// Aligned to the logical start edge.
+    Start,
+    /// Centred.
+    Center,
+    /// Aligned to the logical end edge.
+    End,
+
+    /// from_resolved: an align-self or justify-self of an out-of-flow box
+    /// as a logical alignment. self-start and self-end must already be
+    /// resolved against the containing block's direction
+    /// (AlignItems.resolve_self_relative); baseline falls back to start.
+    fn from_resolved(alignment: sty.AlignSelf) -> OofAlignment {
+        match alignment.keyword {
+            .Normal => { return OofAlignment.Normal; }
+            .Stretch => { return OofAlignment.Stretch; }
+            .Center => { return OofAlignment.Center; }
+            .End => { return OofAlignment.End; }
+            .FlexEnd => { return OofAlignment.End; }
+            .SelfEnd => { return OofAlignment.End; }
+            .Start => { return OofAlignment.Start; }
+            .FlexStart => { return OofAlignment.Start; }
+            .SelfStart => { return OofAlignment.Start; }
+            .Baseline => { return OofAlignment.Start; }
+        }
+    }
+
+    /// physical_edge: the physical edge of the containing block the margin
+    /// box is aligned to once its size is known; Normal and Stretch act as
+    /// Start.
+    fn physical_edge(self: OofAlignment, reversed: bool) -> lt.AxisStaticEdge {
+        match self {
+            .Center => { return lt.AxisStaticEdge.Center; }
+            .End => {
+                if reversed {
+                    return lt.AxisStaticEdge.Start;
+                }
+                return lt.AxisStaticEdge.End;
+            }
+            _ => {
+                if reversed {
+                    return lt.AxisStaticEdge.End;
+                }
+                return lt.AxisStaticEdge.Start;
+            }
+        }
+    }
+}
+
+/// The inputs of the absolute positioning layout model
+/// (https://www.w3.org/TR/css-position-3/#abspos-layout) in one axis
+/// (OofAxis). Every coordinate is physical (left to right, top to bottom)
+/// and from the start of the containing block's inset-resolution area.
+type OofAxis = struct {
+    /// The size of the containing block in this axis.
+    cb_size: f32,
+    /// The resolved insets; none is auto.
+    inset: geo.Line(?f32),
+    /// The resolved margins; none is auto.
+    margin: geo.Line(?f32),
+    /// The static position, from the inset-resolution area.
+    static_position: lt.AxisStaticPosition,
+    /// The self-alignment in this axis.
+    alignment: OofAlignment,
+    /// The overflow position (safe, unsafe) of that self-alignment.
+    safety: sty.AlignmentSafety,
+    /// Whether this is the containing block's inline axis.
+    is_inline: bool,
+    /// Whether the containing block's logical start edge is this axis's
+    /// physical end edge (the inline axis of an rtl containing block).
+    reversed: bool,
+    /// Whether the containing block is a scroll container scrolling in this
+    /// axis.
+    is_scroll_axis: bool,
+
+    /// start_edge: the physical edge of the containing block's logical
+    /// start edge.
+    fn start_edge(self: OofAxis) -> lt.AxisStaticEdge {
+        if self.reversed {
+            return lt.AxisStaticEdge.End;
+        }
+        return lt.AxisStaticEdge.Start;
+    }
+
+    /// end_edge: the physical edge of the containing block's logical end
+    /// edge.
+    fn end_edge(self: OofAxis) -> lt.AxisStaticEdge {
+        if self.reversed {
+            return lt.AxisStaticEdge.Start;
+        }
+        return lt.AxisStaticEdge.End;
+    }
+
+    /// inset_modified_containing_block: the inset-modified containing block
+    /// (IMCB) in this axis
+    /// (https://www.w3.org/TR/css-position-3/#resolving-insets).
+    fn inset_modified_containing_block(self: OofAxis) -> geo.Line(f32) {
+        var imcb = geo.Line(f32) { start: 0.0, end: self.cb_size };
+        var weaker_edge = self.end_edge();
+        match self.inset.start {
+            some(start) => {
+                match self.inset.end {
+                    some(end) => {
+                        imcb = geo.Line(f32) { start: start, end: self.cb_size - end };
+                        weaker_edge = self.end_edge();
+                    }
+                    none => {
+                        // A lone auto inset resolves to zero, and is the
+                        // weaker inset.
+                        imcb = geo.Line(f32) { start: start, end: self.cb_size };
+                        weaker_edge = lt.AxisStaticEdge.End;
+                    }
+                }
+            }
+            none => {
+                match self.inset.end {
+                    some(end) => {
+                        imcb = geo.Line(f32) { start: 0.0, end: self.cb_size - end };
+                        weaker_edge = lt.AxisStaticEdge.Start;
+                    }
+                    none => {
+                        // Both insets auto: they resolve from the static
+                        // position rectangle and the alignment in it.
+                        let sp = self.static_position;
+                        match sp.align.keyword {
+                            .Start => { imcb = geo.Line(f32) { start: sp.area.start, end: self.cb_size }; }
+                            .End => { imcb = geo.Line(f32) { start: 0.0, end: sp.area.end }; }
+                            .Center => {
+                                // Centred on the static position
+                                // rectangle's centre, bounded by the
+                                // nearer edge of the containing block.
+                                let center = (sp.area.start + sp.area.end) / 2.0;
+                                let start_distance = center;
+                                let end_distance = self.cb_size - center;
+                                if util.abs(start_distance) <= util.abs(end_distance) {
+                                    imcb = geo.Line(f32) { start: 0.0, end: 2.0 * start_distance };
+                                } else {
+                                    imcb = geo.Line(f32) { start: self.cb_size - 2.0 * end_distance, end: self.cb_size };
+                                }
+                            }
+                        }
+                        weaker_edge = self.end_edge();
+                    }
+                }
+            }
+        }
+
+        // Overconstrained insets: the weaker one gives way until the IMCB's
+        // size is zero.
+        if imcb.end < imcb.start {
+            match weaker_edge {
+                .Start => { imcb.start = imcb.end; }
+                _ => { imcb.end = imcb.start; }
+            }
+        }
+        return imcb;
+    }
+
+    /// inset_modified_containing_block_size: the IMCB's size in this axis,
+    /// the room for the margin box.
+    fn inset_modified_containing_block_size(self: OofAxis) -> f32 {
+        let imcb = self.inset_modified_containing_block();
+        return imcb.end - imcb.start;
+    }
+
+    /// stretch_fit_size: the stretch-fit size of the border box, the IMCB
+    /// less the margins that are not auto (auto ones count as zero)
+    /// (https://www.w3.org/TR/css-position-3/#abspos-auto-size).
+    fn stretch_fit_size(self: OofAxis) -> f32 {
+        let non_auto_margin_sum = util.unwrap_or(self.margin.start, 0.0) + util.unwrap_or(self.margin.end, 0.0);
+        return util.f32_max(a: 0.0, b: self.inset_modified_containing_block_size() - non_auto_margin_sum);
+    }
+
+    /// is_stretch_sized: whether an auto size in this axis is the
+    /// stretch-fit size rather than fit-content
+    /// (https://www.w3.org/TR/css-position-3/#abspos-auto-size).
+    fn is_stretch_sized(self: OofAxis, is_replaced: bool, is_table: bool) -> bool {
+        let no_auto_inset = util.is_some(self.inset.start) and util.is_some(self.inset.end);
+        if not no_auto_inset {
+            return false;
+        }
+        match self.alignment {
+            .Stretch => { return true; }
+            .Normal => { return not is_replaced and not is_table; }
+            _ => { return false; }
+        }
+    }
+
+    /// resolve_margins: the auto margins resolved, given the final size
+    /// (https://www.w3.org/TR/css-position-3/#abspos-margins).
+    fn resolve_margins(self: OofAxis, size: f32) -> geo.Line(f32) {
+        let both_insets = util.is_some(self.inset.start) and util.is_some(self.inset.end);
+        let imcb = self.inset_modified_containing_block();
+        let free_space = imcb.end - imcb.start - size;
+        match self.margin.start {
+            some(start) => {
+                match self.margin.end {
+                    some(end) => { return geo.Line(f32) { start: start, end: end }; }
+                    none => { }
+                }
+            }
+            none => { }
+        }
+        // With an auto inset, auto margins are zero.
+        if not both_insets {
+            return geo.Line(f32) { start: util.unwrap_or(self.margin.start, 0.0), end: util.unwrap_or(self.margin.end, 0.0) };
+        }
+        match self.margin.start {
+            some(start) => { return geo.Line(f32) { start: start, end: free_space - start }; }
+            none => {
+                match self.margin.end {
+                    some(end) => { return geo.Line(f32) { start: free_space - end, end: end }; }
+                    none => {
+                        // In the inline axis the end margin takes all of a
+                        // negative free space.
+                        if free_space < 0.0 and self.is_inline {
+                            if self.reversed {
+                                return geo.Line(f32) { start: free_space, end: 0.0 };
+                            }
+                            return geo.Line(f32) { start: 0.0, end: free_space };
+                        }
+                        return geo.Line(f32) { start: free_space / 2.0, end: free_space / 2.0 };
+                    }
+                }
+            }
+        }
+    }
+
+    /// position: the physical start of the border box, given its final
+    /// size and margins
+    /// (https://www.w3.org/TR/css-position-3/#abspos-alignment).
+    fn position(self: OofAxis, size: f32, margin: geo.Line(f32)) -> f32 {
+        let imcb = self.inset_modified_containing_block();
+        let has_start = util.is_some(self.inset.start);
+        let has_end = util.is_some(self.inset.end);
+        if not has_start and not has_end {
+            // Both insets auto: static alignment, safe overflow against the
+            // IMCB.
+            let sp = self.static_position;
+            let static_box_size = size + margin.start + margin.end;
+            var offset: f32 = 0.0;
+            if sp.align.safety == sty.AlignmentSafety.Safe and static_box_size > imcb.end - imcb.start {
+                offset = align_in_line(imcb, static_box_size, self.start_edge());
+            } else {
+                offset = align_in_line(sp.area, static_box_size, sp.align.keyword);
+            }
+            return offset + margin.start;
+        }
+        // One auto inset: the margin box goes to the stronger inset's edge.
+        if has_start and not has_end {
+            return imcb.start + margin.start;
+        }
+        if not has_start and has_end {
+            return imcb.end - size - margin.end;
+        }
+
+        // Auto margins have already taken all the free space.
+        if util.is_none(self.margin.start) or util.is_none(self.margin.end) {
+            return imcb.start + margin.start;
+        }
+
+        let margin_box_size = size + margin.start + margin.end;
+        let imcb_size = imcb.end - imcb.start;
+        let edge = self.alignment.physical_edge(self.reversed);
+        var margin_box_start: f32 = 0.0;
+        match self.safety {
+            .Unsafe => { margin_box_start = align_in_line(imcb, margin_box_size, edge); }
+            .Safe => {
+                var safe_edge = edge;
+                if margin_box_size > imcb_size {
+                    safe_edge = self.start_edge();
+                }
+                margin_box_start = align_in_line(imcb, margin_box_size, safe_edge);
+            }
+            .Default => {
+                // The default overflow alignment of absolutely positioned
+                // boxes (https://www.w3.org/TR/css-align-3/#auto-safety-position).
+                if margin_box_size <= imcb_size or self.alignment == OofAlignment.Normal {
+                    // 1. It fits in the IMCB: aligned as asked.
+                    margin_box_start = align_in_line(imcb, margin_box_size, edge);
+                } else {
+                    // The overflow limit rectangle bounds the IMCB and the
+                    // containing block, unbounded in the direction a
+                    // scroll container scrolls.
+                    var limit = geo.Line(f32) { start: util.f32_min(a: 0.0, b: imcb.start), end: util.f32_max(a: imcb.end, b: self.cb_size) };
+                    if self.is_scroll_axis {
+                        if self.reversed {
+                            limit.start = util.neg_infinity();
+                        } else {
+                            limit.end = util.infinity();
+                        }
+                    }
+                    if margin_box_size <= limit.end - limit.start {
+                        // 2. It fits in the limit: it covers the IMCB,
+                        // aligned as asked as far as the limit allows.
+                        let start = align_in_line(imcb, margin_box_size, edge);
+                        margin_box_start = util.f32_max(a: util.f32_min(a: start, b: limit.end - margin_box_size), b: limit.start);
+                    } else {
+                        // 3. Start-aligned in the limit.
+                        margin_box_start = align_in_line(limit, margin_box_size, self.start_edge());
+                    }
+                }
+            }
+        }
+        return margin_box_start + margin.start;
+    }
+}
+
+/// compute_oof_layout: the out-of-flow pass of node_id after its layout
+/// algorithm gave output: lays out the candidates of output.oof_candidates
+/// whose containing block it is, records them as its hoisted children, and
+/// leaves the rest in output.oof_candidates to bubble further up. The
+/// scrollable overflow of the boxes it lays out joins
+/// output.scrollable_overflow_rect.
+///
+/// Call it once per PerformLayout of a container, after its algorithm
+/// (block, flexbox, grid) and inside the cache wrapper
+/// (compute.compute_cached_layout), so that a cache hit does not run it
+/// again. Without output.oof_positioning_area (leaves, size-only runs) it
+/// does nothing. Which candidates the node takes follows its style
+/// (Style.is_containing_block); fixed boxes no ancestor takes are laid out
+/// by compute.compute_root_layout's last pass.
+pub fn compute_oof_layout(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, output: &mut lt.LayoutOutput) {
+    var area = lt.OofPositioningArea { size: geo.size_zero(), offset: geo.point_zero() };
+    match output.oof_positioning_area {
+        some(a) => { area = a; }
+        none => { return; }
+    }
+
+    let direction = tree.get_style(node_id).direction;
+    let claims = tree.get_style(node_id).is_containing_block();
+
+    let candidates = output.oof_candidates.take();
+    var result = compute_oof_layout_for_area(tree, node_id, &candidates, area, direction, claims);
+    // The hoisted list is always recorded, empty too, so that lists of
+    // earlier runs do not persist.
+    tree.clear_hoisted_children(node_id);
+    tree.add_hoisted_children(node_id, result.hoisted.items());
+    output.oof_candidates = result.unclaimed.take();
+    output.scrollable_overflow_rect = output.scrollable_overflow_rect.union(result.scrollable_overflow_rect);
+}
+
+/// What laying out candidates against a positioning area gives
+/// (OofLayoutResult). Move-only, for its lists.
+pub type OofLayoutResult = struct {
+    /// The candidates claimed and laid out, in document order.
+    pub hoisted: alloc.List(lt.NodeId),
+    /// The candidates not claimed, which must bubble further.
+    pub unclaimed: lt.OofCandidates,
+    /// The scrollable overflow of the claimed boxes, from the area's
+    /// origin.
+    pub scrollable_overflow_rect: geo.Rect(f32),
+}
+
+/// compute_oof_layout_for_area: lays out candidates against an explicit
+/// positioning area. Unlike compute_oof_layout it neither records the
+/// geometry owner's hoisted children nor joins the overflow into an
+/// output: for a containing block without its own layout node, whose
+/// geometry another node owns. geometry_owner gives the tree's node and
+/// scroll-container state the pass uses; direction and claims are the
+/// actual containing block's.
+pub fn compute_oof_layout_for_area(tree: &mut dyn lt.LayoutTree, geometry_owner: lt.NodeId, candidates: &lt.OofCandidates, area: lt.OofPositioningArea, direction: sty.Direction, claims: sty.ContainingBlockClaims) -> OofLayoutResult {
+    let overflow = tree.get_style(geometry_owner).overflow;
+
+    var hoisted = alloc.List(lt.NodeId).init(tree.allocator());
+    var unclaimed = lt.OofCandidates.new();
+    let scrollable_overflow_rect = perform_oof_layout(tree, geometry_owner, candidates, area.size, area.offset, direction, claims, overflow, &mut hoisted, &mut unclaimed);
+
+    return OofLayoutResult { hoisted: hoisted, unclaimed: unclaimed, scrollable_overflow_rect: scrollable_overflow_rect };
+}
 
 /// The layout of one out-of-flow box (OofBoxLayout). Move-only, for its
 /// candidates.
@@ -24,35 +448,327 @@ pub type OofBoxLayout = struct {
 }
 
 /// layout_oof_box: sizes and positions one out-of-flow box against its
-/// containing block's area and stores its layout; before_layout sees the
-/// inputs of the final pass first. Not ported yet.
+/// containing block and stores its layout.
+/// - area_size and area_offset are the containing block's inset-resolution
+///   area (the border box less borders and scrollbar gutters), from its
+///   border box.
+/// - container_overflow is the containing block's overflow style, which
+///   says whether an overflowing box may be aligned into its scrollable
+///   overflow area.
+/// - grid_owner is the node whose detailed layout info gives a grid area;
+///   LayoutTree has none (taffy's default, as in Nimadir), so the box is
+///   always positioned against the given area.
+/// - before_layout sees the inputs of the final layout just before it
+///   runs, so that the caller may look at the box's cache.
 pub fn layout_oof_box(tree: &mut dyn lt.LayoutTree, candidate: lt.OofCandidate, area_size: geo.Size(f32), area_offset: geo.Point(f32), direction: sty.Direction, container_overflow: geo.Point(sty.Overflow), grid_owner: ?lt.NodeId, before_layout: &dyn fn(&mut dyn lt.LayoutTree, &lt.LayoutInput)) -> OofBoxLayout {
-    panic("layout.compute.oof.layout_oof_box is not ported yet");
+    let area_width = area_size.width;
+    let area_height = area_size.height;
+
+    // Everything of the box's style, read before its layout.
+    let child_style = tree.get_style(candidate.node);
+    let aspect_ratio = child_style.aspect_ratio;
+    let margin_style = child_style.margin;
+    let padding_style = child_style.padding;
+    let border_style = child_style.border;
+    let box_sizing = child_style.box_sizing;
+    let inset_style = child_style.inset;
+    let size_style = child_style.size;
+    let min_size_style = child_style.min_size;
+    let max_size_style = child_style.max_size;
+    let is_replaced = child_style.is_replaced();
+    let is_table = child_style.is_table();
+    let item_direction = child_style.direction;
+    let justify_style = child_style.justify_self;
+    let align_style = child_style.align_self;
+    let overflow = child_style.overflow;
+    let scrollbar_width = child_style.scrollbar_width;
+    let contain = child_style.contain;
+
+    let margin = geo.Rect(?f32) {
+        left: margin_style.left.resolve_to_option(area_width),
+        right: margin_style.right.resolve_to_option(area_width),
+        top: margin_style.top.resolve_to_option(area_width),
+        bottom: margin_style.bottom.resolve_to_option(area_width),
+    };
+    let padding = padding_style.resolve_or_zero_f(area_width);
+    let border = border_style.resolve_or_zero_f(area_width);
+    let padding_border_sum = padding.add(border).sum_axes();
+    var box_sizing_adjustment = geo.size_zero();
+    if box_sizing == sty.BoxSizing.ContentBox {
+        box_sizing_adjustment = padding_border_sum;
+    }
+
+    // The insets.
+    let left = inset_style.left.maybe_resolve_f(area_width);
+    let right = inset_style.right.maybe_resolve_f(area_width);
+    let top = inset_style.top.maybe_resolve_f(area_height);
+    let bottom = inset_style.bottom.maybe_resolve_f(area_height);
+
+    // Known dimensions from the size, min and max styles.
+    let style_size = size_style.maybe_resolve_f(area_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    var min_size = min_size_style.maybe_resolve_f(area_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment).fallback(padding_border_sum.map_some()).maybe_max_f(padding_border_sum);
+    let max_size = max_size_style.maybe_resolve_f(area_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    var known_dimensions = style_size.maybe_clamp(min: min_size, max: max_size);
+
+    // taffy has only the horizontal-tb writing mode, so only the inline
+    // axis can be reversed. auto (none) is normal for an absolutely
+    // positioned box: it does not defer to the containing block's
+    // *-items.
+    var justify_self = sty.AlignItems.normal();
+    match justify_style {
+        some(j) => { justify_self = j; }
+        none => { }
+    }
+    justify_self = justify_self.resolve_self_relative(item_direction: item_direction, container_direction: direction, axis_is_inline: true);
+    var align_self = sty.AlignItems.normal();
+    match align_style {
+        some(s) => { align_self = s; }
+        none => { }
+    }
+    align_self = align_self.resolve_self_relative(item_direction: item_direction, container_direction: direction, axis_is_inline: false);
+
+    // Static positions are from the containing block's border box; make
+    // them from the inset-resolution area.
+    let static_position = geo.Point(lt.AxisStaticPosition) {
+        x: lt.AxisStaticPosition {
+            area: geo.Line(f32) { start: candidate.static_position.x.area.start - area_offset.x, end: candidate.static_position.x.area.end - area_offset.x },
+            align: candidate.static_position.x.align,
+        },
+        y: lt.AxisStaticPosition {
+            area: geo.Line(f32) { start: candidate.static_position.y.area.start - area_offset.y, end: candidate.static_position.y.area.end - area_offset.y },
+            align: candidate.static_position.y.align,
+        },
+    };
+
+    let horizontal = OofAxis {
+        cb_size: area_width,
+        inset: geo.Line(?f32) { start: left, end: right },
+        margin: geo.Line(?f32) { start: margin.left, end: margin.right },
+        static_position: static_position.x,
+        alignment: OofAlignment.from_resolved(justify_self),
+        safety: justify_self.safety,
+        is_inline: true,
+        reversed: direction.is_rtl(),
+        is_scroll_axis: container_overflow.x.is_scroll_container(),
+    };
+    let vertical = OofAxis {
+        cb_size: area_height,
+        inset: geo.Line(?f32) { start: top, end: bottom },
+        margin: geo.Line(?f32) { start: margin.top, end: margin.bottom },
+        static_position: static_position.y,
+        alignment: OofAlignment.from_resolved(align_self),
+        safety: align_self.safety,
+        is_inline: false,
+        reversed: false,
+        is_scroll_axis: container_overflow.y.is_scroll_container(),
+    };
+    let stretch_fit_size = geo.Size(f32) { width: horizontal.stretch_fit_size(), height: vertical.stretch_fit_size() };
+    // The room for the border box is its stretch-fit size (the IMCB less
+    // its margins that are not auto). A table's never exceeds the
+    // containing block's, less the margins
+    // (https://www.w3.org/TR/css-tables-3/#abspos).
+    var stretch_space = stretch_fit_size;
+    if is_table {
+        let non_auto_margin = geo.Rect(f32) {
+            left: util.unwrap_or(margin.left, 0.0),
+            right: util.unwrap_or(margin.right, 0.0),
+            top: util.unwrap_or(margin.top, 0.0),
+            bottom: util.unwrap_or(margin.bottom, 0.0),
+        };
+        stretch_space = stretch_space.f32_min(geo.Size(f32) {
+            width: util.f32_max(a: 0.0, b: area_width - non_auto_margin.horizontal_axis_sum()),
+            height: util.f32_max(a: 0.0, b: area_height - non_auto_margin.vertical_axis_sum()),
+        });
+    }
+    let clamped_space = stretch_space.maybe_clamp(min: min_size, max: max_size);
+    let available_space = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(clamped_space.width), height: sty.AvailableSpace.definite(clamped_space.height) };
+
+    // The sizing keywords of the size styles (min-content, max-content,
+    // fit-content, fit-content(...), stretch). An axis sized explicitly
+    // wins over the automatic size below.
+    if size_style.width.is_sizing_keyword() or size_style.height.is_sizing_keyword() {
+        sk.resolve_absolute_sizing_keywords(tree, candidate.node, &mut known_dimensions, size_style, area_size, inset: geo.Rect(?f32) { left: left, right: right, top: top, bottom: bottom }, margin: margin, lt.SizingMode.ContentSize);
+        known_dimensions = known_dimensions.maybe_apply_aspect_ratio(aspect_ratio).maybe_clamp(min: min_size, max: max_size);
+    }
+
+    // Automatic sizes (https://www.w3.org/TR/css-position-3/#abspos-auto-size).
+    //
+    // An auto size is the stretch-fit size (the IMCB less the margins) when
+    // the axis's self-alignment is stretch (or normal for a box neither
+    // replaced nor a table) and neither inset is auto; otherwise it is the
+    // fit-content size, measured below. Stretch-fit sizes come first, so
+    // that a size can pass through the aspect ratio to the other axis.
+    // The block axis depends on the ratio, so a stretched inline size goes
+    // through the ratio rather than stretching the block size as well. An
+    // explicit stretch in both axes stretches both and ignores the ratio.
+    let stretch_width = util.is_none(known_dimensions.width) and horizontal.is_stretch_sized(is_replaced: is_replaced, is_table: is_table);
+    let stretch_height = util.is_none(known_dimensions.height) and vertical.is_stretch_sized(is_replaced: is_replaced, is_table: is_table);
+    let both_explicit_stretch = horizontal.alignment == OofAlignment.Stretch and vertical.alignment == OofAlignment.Stretch;
+    var stretch_aspect_ratio = aspect_ratio;
+    if stretch_width and stretch_height and both_explicit_stretch {
+        stretch_aspect_ratio = none;
+    }
+    if stretch_width {
+        if is_table {
+            // A table cannot be stretched below its content: the
+            // stretch-fit size is a minimum.
+            min_size.width = some(util.f32_max(a: util.unwrap_or(min_size.width, 0.0), b: stretch_fit_size.width));
+        } else {
+            known_dimensions.width = some(stretch_fit_size.width);
+            known_dimensions = known_dimensions.maybe_apply_aspect_ratio(stretch_aspect_ratio).maybe_clamp(min: min_size, max: max_size);
+        }
+    }
+    if util.is_none(known_dimensions.height) and stretch_height {
+        if is_table {
+            min_size.height = some(util.f32_max(a: util.unwrap_or(min_size.height, 0.0), b: stretch_fit_size.height));
+        } else {
+            known_dimensions.height = some(stretch_fit_size.height);
+            known_dimensions = known_dimensions.maybe_apply_aspect_ratio(stretch_aspect_ratio).maybe_clamp(min: min_size, max: max_size);
+        }
+    }
+
+    var unclamped_size = geo.size_zero();
+    if known_dimensions.both_axis_defined() {
+        unclamped_size = known_dimensions.unwrap_or(geo.size_zero());
+    } else {
+        let measured_size = lt.measure_child_size_both(tree, candidate.node, known_dimensions: known_dimensions, parent_size: area_size.map_some(), available_space: available_space, sizing_mode: lt.SizingMode.ContentSize, vertical_margins_are_collapsible: geo.line_false());
+        unclamped_size = known_dimensions.unwrap_or(measured_size);
+    }
+    let final_size = unclamped_size.maybe_clamp(min: min_size, max: max_size);
+
+    let layout_input = lt.LayoutInput {
+        run_mode: lt.RunMode.PerformLayout,
+        sizing_mode: lt.SizingMode.ContentSize,
+        axis: lt.RequestedAxis.Both,
+        known_dimensions: final_size.map_some(),
+        known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+        parent_size: area_size.map_some(),
+        available_space: available_space,
+        vertical_margins_are_collapsible: geo.line_false(),
+    };
+    before_layout(tree, &layout_input);
+    var layout_output = tree.compute_child_layout(candidate.node, layout_input);
+
+    // Auto margins (https://www.w3.org/TR/css-position-3/#abspos-margins).
+    let horizontal_margin = horizontal.resolve_margins(final_size.width);
+    let vertical_margin = vertical.resolve_margins(final_size.height);
+    let resolved_margin = geo.Rect(f32) {
+        left: horizontal_margin.start,
+        right: horizontal_margin.end,
+        top: vertical_margin.start,
+        bottom: vertical_margin.end,
+    };
+
+    // The margin box aligned in the IMCB
+    // (https://www.w3.org/TR/css-position-3/#abspos-alignment).
+    let location = geo.Point(f32) {
+        x: horizontal.position(final_size.width, horizontal_margin) + area_offset.x,
+        y: vertical.position(final_size.height, vertical_margin) + area_offset.y,
+    };
+
+    // The axes are swapped on purpose: a scrollbar takes room across the
+    // axis it scrolls.
+    var scrollbar_size = geo.size_zero();
+    if overflow.y == sty.Overflow.Scroll {
+        scrollbar_size.width = scrollbar_width;
+    }
+    if overflow.x == sty.Overflow.Scroll {
+        scrollbar_size.height = scrollbar_width;
+    }
+
+    let layout = lt.Layout {
+        order: candidate.order,
+        location: location,
+        size: final_size,
+        scrollable_overflow_rect: layout_output.scrollable_overflow_rect,
+        scrollbar_size: scrollbar_size,
+        border: border,
+        padding: padding,
+        margin: resolved_margin,
+    };
+    tree.set_unrounded_layout(candidate.node, &layout);
+
+    return OofBoxLayout { layout: layout, surfaced: layout_output.oof_candidates.take(), overflow: overflow, contain: contain };
 }
 
-/// perform_oof_layout: lays out the candidates the node claims, records
-/// them in hoisted and the rest in unclaimed, and gives their scrollable
-/// overflow. Not ported yet.
+/// perform_oof_layout: the final layout of the candidates whose containing
+/// block node_id is; the others go to unclaimed, to bubble further.
+/// - candidates are the node's merged list in document order (its direct
+///   out-of-flow children and those bubbled from in-flow children), from
+///   its border box.
+/// - area_size and area_offset are the node's inset-resolution area (the
+///   border box less borders and scrollbar gutters).
+/// - claims says which positions the node is the containing block of
+///   (Style.is_containing_block); the root's last pass claims all.
+/// - container_overflow is the containing block's overflow style.
+/// Laying out a claimed box may surface candidates from its subtree (a
+/// fixed descendant of an absolute box): they are swept again, claimed
+/// ones appended to the work list, the others to unclaimed. The claimed
+/// ids are appended to hoisted in order. Gives the claimed boxes'
+/// scrollable overflow.
 pub fn perform_oof_layout(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, candidates: &lt.OofCandidates, area_size: geo.Size(f32), area_offset: geo.Point(f32), direction: sty.Direction, claims: sty.ContainingBlockClaims, container_overflow: geo.Point(sty.Overflow), hoisted: &mut alloc.List(lt.NodeId), unclaimed: &mut lt.OofCandidates) -> geo.Rect(f32) {
-    panic("layout.compute.oof.perform_oof_layout is not ported yet");
-}
+    var absolute_overflow_rect = geo.rect_zero();
 
-/// compute_oof_layout: after a container's full layout, lays out the
-/// out-of-flow boxes it is the containing block of. A node without a
-/// positioning area (a leaf, a size-only run) or without candidates has
-/// nothing to do; the rest is not ported yet.
-pub fn compute_oof_layout(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, output: &mut lt.LayoutOutput) {
-    match output.oof_positioning_area {
-        some(_) => { }
-        none => { return; }
+    if candidates.is_empty() {
+        return absolute_overflow_rect;
     }
-    if output.oof_candidates.is_empty() {
-        // As taffy's pass over no candidates: an empty hoisted list, so
-        // that lists of earlier runs do not persist, and the overflow
-        // joined with an empty rectangle.
-        tree.clear_hoisted_children(node_id);
-        output.scrollable_overflow_rect = output.scrollable_overflow_rect.union(geo.rect_zero());
-        return;
+
+    let is_scroll_container = container_overflow.x.is_scroll_container() or container_overflow.y.is_scroll_container();
+    let a = tree.allocator();
+
+    // The claimed candidates start the work list, the rest go to
+    // unclaimed; claimed ones a box surfaces join the work list (Blink's
+    // sweep again).
+    var worklist = alloc.List(lt.OofCandidate).init(a);
+    let count = candidates.len();
+    var c: usize = 0;
+    while c < count : (c += 1) {
+        let candidate = candidates.get(c);
+        if claims.for_position(candidate.position) {
+            worklist.push(candidate);
+        } else {
+            unclaimed.push(candidate, a);
+        }
     }
-    panic("layout.compute.oof.compute_oof_layout is not ported yet");
+
+    var index: usize = 0;
+    while index < worklist.len() {
+        let candidate = worklist.items()[index];
+        index += 1;
+        hoisted.push(candidate.node);
+
+        var boxed = layout_oof_box(tree, candidate, area_size, area_offset, direction, container_overflow, some(node_id), fn [](t: &mut dyn lt.LayoutTree, i: &lt.LayoutInput) { });
+        let location = boxed.layout.location;
+        let final_size = boxed.layout.size;
+
+        // The candidates the box surfaced are swept again, their anchors
+        // moved to this node's border box.
+        var surfaced = boxed.surfaced.take();
+        if not surfaced.is_empty() {
+            surfaced.translate(location);
+            let surfaced_count = surfaced.len();
+            var s: usize = 0;
+            while s < surfaced_count : (s += 1) {
+                let surfaced_candidate = surfaced.get(s);
+                if claims.for_position(surfaced_candidate.position) {
+                    worklist.push(surfaced_candidate);
+                } else {
+                    unclaimed.push(surfaced_candidate, a);
+                }
+            }
+        }
+
+        // The location from the scroll origin (the inline start edge: the
+        // right one in rtl).
+        var relative_location = geo.Point(f32) { x: location.x - area_offset.x, y: location.y - area_offset.y };
+        if direction.is_rtl() {
+            relative_location = geo.Point(f32) {
+                x: area_size.width - (location.x - area_offset.x) - final_size.width,
+                y: location.y - area_offset.y,
+            };
+        }
+        absolute_overflow_rect = absolute_overflow_rect.union(so.compute_scrollable_overflow_contribution(relative_location, final_size, boxed.layout.scrollable_overflow_rect, boxed.overflow, boxed.contain, is_scroll_container));
+    }
+
+    return absolute_overflow_rect;
 }

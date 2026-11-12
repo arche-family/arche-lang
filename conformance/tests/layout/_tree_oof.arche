@@ -1,0 +1,437 @@
+// The tree of the out-of-flow tests: _tree's, nodes in a list, each
+// leaf's content a fixed size or text that wraps, as Nimadir's tree
+// measures its leaves. The container algorithms (block, flexbox, grid) are
+// ported separately, so a node with children is laid out by this tree's
+// own container, `container_layout`, which records its out-of-flow
+// children as candidates the way taffy's algorithms do. As in Nimadir,
+// every PerformLayout run ends with compute.oof.compute_oof_layout inside
+// the cache. The oracle /tmp/layout-port/oracle-oof is the same tree in
+// Rust over the taffy crate.
+import std;
+import alloc;
+import layout.compute as compute;
+import layout.compute.block as block;
+import layout.compute.leaf as leaf;
+import layout.compute.oof as oof;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import layout.tree.cache as tcache;
+import layout.util;
+
+/// What a leaf holds.
+pub type Content = enum {
+    /// Nothing: zero.
+    Empty,
+    /// A box of a fixed size, as an image.
+    Fixed { width: f32, height: f32 },
+    /// Text `width` wide on one line, wrapping into lines `line` high.
+    Text { width: f32, line: f32 },
+    /// A container: in-flow children one below the other; an out-of-flow
+    /// child's static position is the content box across and a line at
+    /// its place in the flow down, as in a block container.
+    Stack,
+    /// A container as Stack, but an out-of-flow child's static position is
+    /// the whole content box in both axes, aligned by its justify-self and
+    /// align-self or the container's justify-items and align-items, as in
+    /// a flex or grid container.
+    Area,
+}
+
+/// One node.
+pub type Node = struct {
+    /// Its style.
+    pub style: sty.Style,
+    /// What it holds, for a leaf.
+    pub content: Content,
+    /// Its children.
+    pub children: alloc.List(lt.NodeId),
+    /// The out-of-flow boxes it is the containing block of.
+    pub hoisted: alloc.List(lt.NodeId),
+    /// Its layout cache.
+    pub cache: tcache.Cache,
+    /// Its layout before rounding.
+    pub unrounded: lt.Layout,
+    /// Its rounded layout.
+    pub final_layout: lt.Layout,
+}
+
+/// The tree.
+pub type TestTree = struct {
+    /// The nodes; a NodeId is an index.
+    pub nodes: alloc.List(Node),
+    /// Where everything goes.
+    pub a: alloc.Allocator,
+    /// The names of grid lines and areas.
+    pub names: alloc.Interner,
+    /// How many times a layout ran uncached.
+    pub computed: u32,
+    /// How many times a leaf was measured.
+    pub measured: u32,
+
+    /// An empty tree.
+    pub fn init(a: alloc.Allocator) -> TestTree {
+        return TestTree { nodes: alloc.List(Node).init(a), a: a, names: alloc.Interner.init(a), computed: 0, measured: 0 };
+    }
+
+    /// Adds a node.
+    pub fn add(self: &mut TestTree, style: sty.Style, content: Content) -> lt.NodeId {
+        let id = lt.NodeId.from_usize(self.nodes.len());
+        self.nodes.push(Node {
+            style: style,
+            content: content,
+            children: alloc.List(lt.NodeId).init(self.a),
+            hoisted: alloc.List(lt.NodeId).init(self.a),
+            cache: tcache.Cache.new(),
+            unrounded: lt.Layout.new(),
+            final_layout: lt.Layout.new(),
+        });
+        return id;
+    }
+
+    /// Makes child the last child of parent.
+    pub fn add_child(self: &mut TestTree, parent: lt.NodeId, child: lt.NodeId) {
+        self.nodes[parent.to_usize()].children.push(child);
+    }
+
+    /// The node's unrounded layout.
+    pub fn unrounded_of(self: &TestTree, id: lt.NodeId) -> lt.Layout {
+        return self.nodes[id.to_usize()].unrounded;
+    }
+
+    /// The node's final layout.
+    pub fn final_of(self: &TestTree, id: lt.NodeId) -> lt.Layout {
+        return self.nodes[id.to_usize()].final_layout;
+    }
+
+    /// Writes `name hoisted:` and the ids of the node's hoisted children.
+    pub fn hoisted_line(self: &TestTree, out: &mut std.Output, name: str, id: lt.NodeId) {
+        out.write(name);
+        out.write(" hoisted:");
+        for h in self.nodes.items()[id.to_usize()].hoisted.items() {
+            out.write(" ");
+            out.write_u64(h.value);
+        }
+        out.write("\n");
+    }
+}
+
+/// The test tree's container: its in-flow children laid out one below the
+/// other at its content box's start edge (the right one in rtl), each with
+/// no known size, the content box's width as definite available space when
+/// it is known and max-content otherwise; its size the known or styled
+/// one, else the widest child and the children's heights, around the
+/// content box inset (padding, border and scrollbar gutters, the vertical
+/// gutter on the left in rtl). A full layout stores the children's
+/// layouts, merges the candidates they surfaced and records its out-of-flow
+/// children as candidates in document order; its positioning area is its
+/// border box less borders and gutters. area_static chooses Area's static
+/// positions over Stack's.
+fn container_layout(t: &mut TestTree, node: lt.NodeId, inputs: lt.LayoutInput, area_static: bool) -> lt.LayoutOutput {
+    let i = node.to_usize();
+    let parent_width = inputs.parent_size.width;
+    let padding = t.nodes.items()[i].style.padding.resolve_or_zero(parent_width);
+    let border = t.nodes.items()[i].style.border.resolve_or_zero(parent_width);
+    let direction = t.nodes.items()[i].style.direction;
+    let is_rtl = direction.is_rtl();
+    let overflow = t.nodes.items()[i].style.overflow;
+    let scrollbar_width = t.nodes.items()[i].style.scrollbar_width;
+    let justify_items = t.nodes.items()[i].style.justify_items;
+    let align_items = t.nodes.items()[i].style.align_items;
+    let size_style = t.nodes.items()[i].style.size;
+
+    var gutter_x: f32 = 0.0;
+    if overflow.y == sty.Overflow.Scroll {
+        gutter_x = scrollbar_width;
+    }
+    var gutter_y: f32 = 0.0;
+    if overflow.x == sty.Overflow.Scroll {
+        gutter_y = scrollbar_width;
+    }
+    var gutter = geo.Rect(f32) { left: 0.0, right: gutter_x, top: 0.0, bottom: gutter_y };
+    if is_rtl {
+        gutter = geo.Rect(f32) { left: gutter_x, right: 0.0, top: 0.0, bottom: gutter_y };
+    }
+    let inset = padding.add(border).add(gutter);
+
+    var known = inputs.known_dimensions;
+    if inputs.sizing_mode == lt.SizingMode.InherentSize {
+        known = known.fallback(size_style.maybe_resolve(inputs.parent_size));
+    }
+    let inner = geo.Size(?f32) {
+        width: util.maybe_sub_f(known.width, inset.horizontal_axis_sum()),
+        height: util.maybe_sub_f(known.height, inset.vertical_axis_sum()),
+    };
+    var child_space = sty.AvailableSpace.MaxContent;
+    match inner.width {
+        some(w) => { child_space = sty.AvailableSpace.definite(w); }
+        none => { }
+    }
+
+    // The in-flow children, in order.
+    var outputs = alloc.List(lt.LayoutOutput).init(t.a);
+    var content_width: f32 = 0.0;
+    var content_height: f32 = 0.0;
+    let count = t.nodes.items()[i].children.len();
+    var k: usize = 0;
+    while k < count : (k += 1) {
+        let child = t.nodes.items()[i].children.items()[k];
+        if not t.nodes.items()[child.to_usize()].style.position.is_out_of_flow() {
+            let out = t.compute_child_layout(child, lt.LayoutInput {
+                run_mode: inputs.run_mode,
+                sizing_mode: lt.SizingMode.InherentSize,
+                axis: lt.RequestedAxis.Both,
+                known_dimensions: geo.size_none(),
+                known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+                parent_size: inner,
+                available_space: geo.Size(sty.AvailableSpace) { width: child_space, height: sty.AvailableSpace.MaxContent },
+                vertical_margins_are_collapsible: geo.line_false(),
+            });
+            content_width = util.f32_max(a: content_width, b: out.size.width);
+            content_height = content_height + out.size.height;
+            outputs.push(out);
+        }
+    }
+    let size = geo.Size(f32) {
+        width: util.unwrap_or(known.width, content_width + inset.horizontal_axis_sum()),
+        height: util.unwrap_or(known.height, content_height + inset.vertical_axis_sum()),
+    };
+    if inputs.run_mode != lt.RunMode.PerformLayout {
+        return lt.LayoutOutput.from_outer_size(size);
+    }
+
+    var candidates = lt.OofCandidates.new();
+    var y = inset.top;
+    var n: usize = 0;
+    k = 0;
+    while k < count : (k += 1) {
+        let child = t.nodes.items()[i].children.items()[k];
+        let position = t.nodes.items()[child.to_usize()].style.position;
+        let child_direction = t.nodes.items()[child.to_usize()].style.direction;
+        let child_justify = t.nodes.items()[child.to_usize()].style.justify_self;
+        let child_align = t.nodes.items()[child.to_usize()].style.align_self;
+        let child_padding = t.nodes.items()[child.to_usize()].style.padding;
+        let child_border = t.nodes.items()[child.to_usize()].style.border;
+        if position.is_out_of_flow() {
+            var justify = justify_items;
+            match child_justify {
+                some(j) => { justify = j; }
+                none => { }
+            }
+            justify = justify.resolve_self_relative(item_direction: child_direction, container_direction: direction, axis_is_inline: true);
+            var align = sty.AlignItems.normal();
+            if area_static {
+                align = align_items;
+            }
+            match child_align {
+                some(s) => { align = s; }
+                none => { }
+            }
+            align = align.resolve_self_relative(item_direction: child_direction, container_direction: direction, axis_is_inline: false);
+            let x_area = geo.Line(f32) { start: inset.left, end: size.width - inset.right };
+            var y_area = geo.Line(f32) { start: y, end: y };
+            if area_static {
+                y_area = geo.Line(f32) { start: inset.top, end: size.height - inset.bottom };
+            }
+            candidates.push(lt.OofCandidate {
+                node: child,
+                order: k as u32,
+                position: position,
+                static_position: geo.Point(lt.AxisStaticPosition) {
+                    x: lt.AxisStaticPosition.from_alignment(justify, x_area, is_rtl),
+                    y: lt.AxisStaticPosition.from_alignment(align, y_area, false),
+                },
+            }, t.a);
+        } else {
+            let child_size = outputs.items()[n].size;
+            let child_overflow = outputs.items()[n].scrollable_overflow_rect;
+            var surfaced = outputs[n].oof_candidates.take();
+            n += 1;
+            var x = inset.left;
+            if is_rtl {
+                x = size.width - inset.right - child_size.width;
+            }
+            let location = geo.Point(f32) { x: x, y: y };
+            let child_layout = lt.Layout {
+                order: k as u32,
+                location: location,
+                size: child_size,
+                scrollable_overflow_rect: child_overflow,
+                scrollbar_size: geo.size_zero(),
+                border: child_border.resolve_or_zero(inner.width),
+                padding: child_padding.resolve_or_zero(inner.width),
+                margin: geo.rect_zero(),
+            };
+            t.set_unrounded_layout(child, &child_layout);
+            if not surfaced.is_empty() {
+                surfaced.translate(location);
+                candidates.append(&mut surfaced);
+            }
+            y = y + child_size.height;
+        }
+    }
+
+    var output = lt.LayoutOutput.from_outer_size(size);
+    output.oof_candidates = candidates;
+    let area_inset = border.add(gutter);
+    output.oof_positioning_area = some(lt.OofPositioningArea {
+        size: size.sub(area_inset.sum_axes()),
+        offset: geo.Point(f32) { x: area_inset.left, y: area_inset.top },
+    });
+    return output;
+}
+
+impl lt.LayoutTree for TestTree {
+    fn child_count(self: &TestTree, parent_node_id: lt.NodeId) -> usize {
+        return self.nodes[parent_node_id.to_usize()].children.len();
+    }
+
+    fn get_child_id(self: &TestTree, parent_node_id: lt.NodeId, child_index: usize) -> lt.NodeId {
+        return self.nodes[parent_node_id.to_usize()].children.items()[child_index];
+    }
+
+    fn get_style(self: &TestTree, node_id: lt.NodeId) -> &sty.Style {
+        return &self.nodes.items()[node_id.to_usize()].style;
+    }
+
+    fn set_unrounded_layout(self: &mut TestTree, node_id: lt.NodeId, layout: &lt.Layout) {
+        self.nodes[node_id.to_usize()].unrounded = layout.*;
+    }
+
+    fn compute_child_layout(self: &mut TestTree, node_id: lt.NodeId, inputs: lt.LayoutInput) -> lt.LayoutOutput {
+        if inputs.run_mode == lt.RunMode.PerformHiddenLayout {
+            return compute.compute_hidden_layout(self, node_id);
+        }
+        return compute.compute_cached_layout(TestTree, self, node_id, inputs, fn [](t: &mut TestTree, node: lt.NodeId, input: lt.LayoutInput) -> lt.LayoutOutput {
+            t.computed += 1;
+            let i = node.to_usize();
+            if t.nodes[i].style.display == sty.Display.None {
+                return compute.compute_hidden_layout(t, node);
+            }
+            var output = lt.LayoutOutput.hidden();
+            if t.nodes[i].children.len() > 0 {
+                var area_static = false;
+                match t.nodes[i].content {
+                    .Area => { area_static = true; }
+                    _ => { }
+                }
+                output = container_layout(t, node, input, area_static);
+            } else {
+                let content = t.nodes[i].content;
+                var count: u32 = 0;
+                output = leaf.compute_leaf_layout(input, &t.nodes.items()[i].style, fn [content, &mut count](known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+                    count += 1;
+                    return measure(content, known, available);
+                });
+                t.measured += count;
+            }
+            if input.run_mode == lt.RunMode.PerformLayout {
+                oof.compute_oof_layout(t, node, &mut output);
+            }
+            return output;
+        });
+    }
+
+    fn compute_block_child_layout(self: &mut TestTree, node_id: lt.NodeId, inputs: lt.LayoutInput, bfc: &mut block.BlockFormattingContext, block_ctx: &mut block.BlockContext) -> lt.LayoutOutput {
+        return self.compute_child_layout(node_id, inputs);
+    }
+
+    fn clear_hoisted_children(self: &mut TestTree, node_id: lt.NodeId) {
+        self.nodes[node_id.to_usize()].hoisted.clear();
+    }
+
+    fn add_hoisted_children(self: &mut TestTree, node_id: lt.NodeId, hoisted: []lt.NodeId) {
+        for h in hoisted {
+            self.nodes[node_id.to_usize()].hoisted.push(h.*);
+        }
+    }
+
+    fn cache_get(self: &mut TestTree, node_id: lt.NodeId, input: &lt.LayoutInput) -> ?lt.LayoutOutput {
+        return self.nodes[node_id.to_usize()].cache.get(input);
+    }
+
+    fn cache_store(self: &mut TestTree, node_id: lt.NodeId, input: &lt.LayoutInput, layout_output: lt.LayoutOutput) {
+        self.nodes[node_id.to_usize()].cache.store(input, layout_output);
+    }
+
+    fn cache_clear(self: &mut TestTree, node_id: lt.NodeId) {
+        _ = self.nodes[node_id.to_usize()].cache.clear();
+    }
+
+    fn get_unrounded_layout(self: &TestTree, node_id: lt.NodeId) -> lt.Layout {
+        return self.nodes[node_id.to_usize()].unrounded;
+    }
+
+    fn set_final_layout(self: &mut TestTree, node_id: lt.NodeId, layout: &lt.Layout) {
+        self.nodes[node_id.to_usize()].final_layout = layout.*;
+    }
+
+    fn is_out_of_flow(self: &TestTree, node_id: lt.NodeId) -> bool {
+        let st = &self.nodes.items()[node_id.to_usize()].style;
+        return st.display != sty.Display.None and st.position.is_out_of_flow();
+    }
+
+    fn hoisted_child_count(self: &TestTree, node_id: lt.NodeId) -> usize {
+        return self.nodes[node_id.to_usize()].hoisted.len();
+    }
+
+    fn get_hoisted_child_id(self: &TestTree, node_id: lt.NodeId, index: usize) -> lt.NodeId {
+        return self.nodes[node_id.to_usize()].hoisted.items()[index];
+    }
+
+    fn allocator(self: &TestTree) -> alloc.Allocator {
+        return self.a;
+    }
+
+    fn ident_text(self: &TestTree, ident: alloc.Symbol) -> str {
+        return self.names.text(ident);
+    }
+}
+
+/// What a leaf's content measures as, given what is known: a fixed box its
+/// size; text its width, wrapped at the available width into lines.
+pub fn measure(content: Content, known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+    match known.width {
+        some(w) => {
+            match known.height {
+                some(h) => { return geo.Size(f32) { width: w, height: h }; }
+                none => { }
+            }
+        }
+        none => { }
+    }
+    var width: f32 = 0.0;
+    var height: f32 = 0.0;
+    match content {
+        .Empty => { }
+        .Fixed { width: fw, height: fh } => {
+            width = fw;
+            height = fh;
+        }
+        .Stack => { }
+        .Area => { }
+        .Text { width: tw, line } => {
+            var room = tw;
+            match available.width {
+                .Definite { value } => { room = value; }
+                .MinContent => { room = line; }
+                .MaxContent => { }
+            }
+            match known.width {
+                some(w) => { room = w; }
+                none => { }
+            }
+            width = tw;
+            if room < tw {
+                width = room;
+            }
+            if width <= 0.0 {
+                width = 0.0;
+                height = tw;
+            } else {
+                height = (tw / width).ceil() * line;
+            }
+        }
+    }
+    return geo.Size(f32) { width: known.width orelse width, height: known.height orelse height };
+}

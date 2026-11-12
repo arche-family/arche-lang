@@ -1,0 +1,601 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: N1.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 390.0 0.0 290.0 | sb 0.0 0.0 | order 0
+// stdout: N1.1 at 15.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: N1.2 at 15.0 45.0 size 66.0 56.0 | pad 6.0 6.0 6.0 6.0 | border 2.0 2.0 2.0 2.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 1
+// stdout: N1.3 at 8.0 8.0 size 50.0 12.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 12.0 | sb 0.0 0.0 | order 0
+// stdout: N1.4 at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N1.5 at 23.0 65.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N1.6 at 8.0 20.0 size 28.0 28.0 | pad 4.0 4.0 4.0 4.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 3
+// stdout: N1.7 at 345.0 255.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N1.8 at 4.0 4.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 20.0 0.0 20.0 | sb 0.0 0.0 | order 1
+// stdout: N1.0 hoisted: 4 5 7
+// stdout: N1.2 hoisted:
+// stdout: N1.6 hoisted:
+// stdout: N1.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 390.0 0.0 290.0 | sb 0.0 0.0 | order 0
+// stdout: N1.1r at 15.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: N1.2r at 15.0 45.0 size 66.0 56.0 | pad 6.0 6.0 6.0 6.0 | border 2.0 2.0 2.0 2.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 1
+// stdout: N1.3r at 8.0 8.0 size 50.0 12.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 12.0 | sb 0.0 0.0 | order 0
+// stdout: N1.4r at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N1.5r at 23.0 65.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N1.6r at 8.0 20.0 size 28.0 28.0 | pad 4.0 4.0 4.0 4.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 3
+// stdout: N1.7r at 345.0 255.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N1.8r at 4.0 4.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 20.0 0.0 20.0 | sb 0.0 0.0 | order 1
+// stdout: N2.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: N2.1 at 15.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: N2.2 at 15.0 45.0 size 200.0 100.0 | pad 6.0 6.0 6.0 6.0 | border 2.0 2.0 2.0 2.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 196.0 0.0 96.0 | sb 0.0 0.0 | order 1
+// stdout: N2.3 at 12.0 12.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N2.4 at 128.4 48.4 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N2.5 at 10.0 10.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N2.6 at 23.0 53.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: N2.7 at 8.0 8.0 size 30.0 5.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 4
+// stdout: N2.8 at 2.0 2.0 size 196.0 96.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N2.9 at 0.0 0.0 size 30.0 5.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 30.0 0.0 5.0 | sb 0.0 0.0 | order 1
+// stdout: N2.0 hoisted: 5 6
+// stdout: N2.2 hoisted: 3 4 8
+// stdout: N2.7 hoisted:
+// stdout: N2.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: N2.1r at 15.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: N2.2r at 15.0 45.0 size 200.0 100.0 | pad 6.0 6.0 6.0 6.0 | border 2.0 2.0 2.0 2.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 196.0 0.0 96.0 | sb 0.0 0.0 | order 1
+// stdout: N2.3r at 12.0 12.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N2.4r at 128.0 48.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N2.5r at 10.0 10.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N2.6r at 23.0 53.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: N2.7r at 8.0 8.0 size 30.0 5.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 4
+// stdout: N2.8r at 2.0 2.0 size 196.0 96.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N2.9r at 0.0 0.0 size 30.0 5.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 30.0 0.0 5.0 | sb 0.0 0.0 | order 1
+// stdout: N3.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 210.0 0.0 110.0 | sb 0.0 0.0 | order 0
+// stdout: N3.1 at 25.0 35.0 size 72.0 32.0 | pad 5.0 5.0 5.0 5.0 | border 1.0 1.0 1.0 1.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 190.0 -15.0 80.0 | sb 0.0 0.0 | order 0
+// stdout: N3.2 at 6.0 6.0 size 60.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 60.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: N3.3 at 16.0 -14.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N3.4 at 745.0 555.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N3.5 at 101.0 1.0 size 80.0 80.0 | pad 3.0 3.0 3.0 3.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 90.0 0.0 80.0 | sb 0.0 0.0 | order 3
+// stdout: N3.6 at 40.0 40.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N3.7 at 129.0 39.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N3.8 at 3.0 3.0 size 15.0 15.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 15.0 0.0 15.0 | sb 0.0 0.0 | order 2
+// stdout: N3.0 hoisted: 1 4 7
+// stdout: N3.1 hoisted: 3 5
+// stdout: N3.5 hoisted: 6
+// stdout: N3.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 210.0 0.0 110.0 | sb 0.0 0.0 | order 0
+// stdout: N3.1r at 25.0 35.0 size 72.0 32.0 | pad 5.0 5.0 5.0 5.0 | border 1.0 1.0 1.0 1.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 190.0 -15.0 80.0 | sb 0.0 0.0 | order 0
+// stdout: N3.2r at 6.0 6.0 size 60.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 60.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: N3.3r at 16.0 -14.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N3.4r at 745.0 555.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N3.5r at 101.0 1.0 size 80.0 80.0 | pad 3.0 3.0 3.0 3.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 90.0 0.0 80.0 | sb 0.0 0.0 | order 3
+// stdout: N3.6r at 40.0 40.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N3.7r at 129.0 39.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N3.8r at 3.0 3.0 size 15.0 15.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 15.0 0.0 15.0 | sb 0.0 0.0 | order 2
+// stdout: N4.0 at 30.0 20.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 30.0 0.0 20.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: N4.1 at 15.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: N4.2 at -30.0 -20.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N4.3 at 720.0 540.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N4.4 at 15.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: N4.5 at 15.0 45.0 size 100.0 50.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 50.0 | sb 0.0 0.0 | order 4
+// stdout: N4.6 at 0.0 10.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N4.7 at 50.0 -20.0 size 640.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N4.0 hoisted: 2 3 4 7
+// stdout: N4.5 hoisted: 6
+// stdout: N4.0r at 30.0 20.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 30.0 0.0 20.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: N4.1r at 15.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: N4.2r at -30.0 -20.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N4.3r at 720.0 540.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N4.4r at 15.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: N4.5r at 15.0 45.0 size 100.0 50.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 50.0 | sb 0.0 0.0 | order 4
+// stdout: N4.6r at 0.0 10.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N4.7r at 50.0 -20.0 size 640.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N5.0 at 0.0 0.0 size 400.0 300.0 | pad 0.3 0.3 0.3 0.3 | border 1.7 1.7 1.7 1.7 | margin 0.0 0.0 0.0 0.0 | over 0.0 140.778 0.0 205.656 | sb 0.0 0.0 | order 0
+// stdout: N5.1 at 2.0 2.0 size 10.4 10.6 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 10.4 0.0 10.6 | sb 0.0 0.0 | order 0
+// stdout: N5.2 at 11.95 7.45 size 10.7 5.2 | pad 1.5 1.5 1.5 1.5 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 3.7 0.0 3.9 | sb 0.0 0.0 | order 1
+// stdout: N5.3 at 0.4 0.6 size 3.3 3.3 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 3.3 0.0 3.3 | sb 0.0 0.0 | order 0
+// stdout: N5.4 at 1.5 1.5 size 7.7 2.2 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 7.7 0.0 2.2 | sb 0.0 0.0 | order 1
+// stdout: N5.5 at 796.0 595.0 size 3.5 3.5 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 3.5 0.0 3.5 | sb 0.0 0.0 | order 2
+// stdout: N5.6 at 132.578 197.45601 size 9.9 9.9 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 9.9 0.0 9.9 | sb 0.0 0.0 | order 3
+// stdout: N5.0 hoisted: 2 6 5
+// stdout: N5.2 hoisted: 3
+// stdout: N5.0r at 0.0 0.0 size 400.0 300.0 | pad 0.0 0.0 0.0 0.0 | border 2.0 2.0 2.0 2.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 141.0 0.0 206.0 | sb 0.0 0.0 | order 0
+// stdout: N5.1r at 2.0 2.0 size 10.0 11.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 10.0 0.0 11.0 | sb 0.0 0.0 | order 0
+// stdout: N5.2r at 12.0 7.0 size 11.0 6.0 | pad 1.0 2.0 2.0 2.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 4.0 0.0 4.0 | sb 0.0 0.0 | order 1
+// stdout: N5.3r at 0.0 1.0 size 4.0 3.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 4.0 0.0 3.0 | sb 0.0 0.0 | order 0
+// stdout: N5.4r at 1.0 2.0 size 8.0 2.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 8.0 0.0 2.0 | sb 0.0 0.0 | order 1
+// stdout: N5.5r at 796.0 595.0 size 4.0 4.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 4.0 0.0 4.0 | sb 0.0 0.0 | order 2
+// stdout: N5.6r at 133.0 197.0 size 9.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 9.0 0.0 10.0 | sb 0.0 0.0 | order 3
+// stdout: N6.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 60.0 0.0 190.0 | sb 0.0 0.0 | order 0
+// stdout: N6.1 at 15.0 15.0 size 60.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 60.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: N6.2 at 15.0 35.0 size 200.0 120.0 | pad 10.0 10.0 10.0 10.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 125.0 0.0 110.0 | sb 0.0 0.0 | order 1
+// stdout: N6.3 at 75.0 70.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N6.4 at 75.0 0.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N6.5 at 90.0 105.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N6.6 at 15.0 155.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N6.0 hoisted: 6 5
+// stdout: N6.2 hoisted: 3 4
+// stdout: N6.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 60.0 0.0 190.0 | sb 0.0 0.0 | order 0
+// stdout: N6.1r at 15.0 15.0 size 60.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 60.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: N6.2r at 15.0 35.0 size 200.0 120.0 | pad 10.0 10.0 10.0 10.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 125.0 0.0 110.0 | sb 0.0 0.0 | order 1
+// stdout: N6.3r at 75.0 70.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: N6.4r at 75.0 0.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N6.5r at 90.0 105.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N6.6r at 15.0 155.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N7.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 306.0 0.0 60.0 | sb 0.0 0.0 | order 0
+// stdout: N7.1 at 15.0 15.0 size 300.0 10.0 | pad 9.0 4.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: N7.2 at 246.0 0.0 size 50.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 10.0 | sb 0.0 0.0 | order 0
+// stdout: N7.3 at 261.0 25.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N7.4 at 24.0 25.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N7.5 at 5.0 25.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: N7.0 hoisted: 3 4 5
+// stdout: N7.1 hoisted:
+// stdout: N7.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 306.0 0.0 60.0 | sb 0.0 0.0 | order 0
+// stdout: N7.1r at 15.0 15.0 size 300.0 10.0 | pad 9.0 4.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: N7.2r at 246.0 0.0 size 50.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 10.0 | sb 0.0 0.0 | order 0
+// stdout: N7.3r at 261.0 25.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: N7.4r at 24.0 25.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: N7.5r at 5.0 25.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// Hoisting through the tree: absolute boxes bubble past static containers
+// to the nearest positioned one and are recorded as its hoisted children;
+// fixed boxes bubble to the root's last pass, the initial containing block;
+// an absolute box is itself the containing block of its absolute
+// descendants; a fixed box inside an absolute one is surfaced by its layout
+// and swept again; rounding visits each box from its containing block.
+// The expected lines are taffy 0.15's own, from the same trees in Rust
+// (/tmp/layout-port/oracle-oof).
+import std;
+import alloc;
+import layout.compute as compute;
+import layout.geometry as geo;
+import layout.style as sty;
+import _show;
+import _tree_oof;
+
+/// absolute boxes inside static containers reach the relative root.
+fn case_n1(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 100.0, height: 30.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(6.0), right: sty.LengthPercentage.length(6.0), top: sty.LengthPercentage.length(6.0), bottom: sty.LengthPercentage.length(6.0) };
+    s2.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(2.0), right: sty.LengthPercentage.length(2.0), top: sty.LengthPercentage.length(2.0), bottom: sty.LengthPercentage.length(2.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n2);
+    let s3 = sty.Style.default(a);
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 12.0 });
+    t.add_child(parent: n2, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(4.0), right: sty.LengthPercentage.length(4.0), top: sty.LengthPercentage.length(4.0), bottom: sty.LengthPercentage.length(4.0) };
+    let n6 = t.add(s6, _tree_oof.Content.Stack);
+    t.add_child(parent: n2, child: n6);
+    var s7 = sty.Style.default(a);
+    s7.position = sty.Position.Absolute;
+    s7.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n7 = t.add(s7, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n6, child: n7);
+    let s8 = sty.Style.default(a);
+    let n8 = t.add(s8, _tree_oof.Content.Fixed { width: 20.0, height: 20.0 });
+    t.add_child(parent: n6, child: n8);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "N1.0", t.unrounded_of(n0));
+    _show.layout_line(out, "N1.1", t.unrounded_of(n1));
+    _show.layout_line(out, "N1.2", t.unrounded_of(n2));
+    _show.layout_line(out, "N1.3", t.unrounded_of(n3));
+    _show.layout_line(out, "N1.4", t.unrounded_of(n4));
+    _show.layout_line(out, "N1.5", t.unrounded_of(n5));
+    _show.layout_line(out, "N1.6", t.unrounded_of(n6));
+    _show.layout_line(out, "N1.7", t.unrounded_of(n7));
+    _show.layout_line(out, "N1.8", t.unrounded_of(n8));
+    t.hoisted_line(out, "N1.0", n0);
+    t.hoisted_line(out, "N1.2", n2);
+    t.hoisted_line(out, "N1.6", n6);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "N1.0r", t.final_of(n0));
+    _show.layout_line(out, "N1.1r", t.final_of(n1));
+    _show.layout_line(out, "N1.2r", t.final_of(n2));
+    _show.layout_line(out, "N1.3r", t.final_of(n3));
+    _show.layout_line(out, "N1.4r", t.final_of(n4));
+    _show.layout_line(out, "N1.5r", t.final_of(n5));
+    _show.layout_line(out, "N1.6r", t.final_of(n6));
+    _show.layout_line(out, "N1.7r", t.final_of(n7));
+    _show.layout_line(out, "N1.8r", t.final_of(n8));
+}
+
+/// a relative in-flow container claims its absolute descendants; fixed ones go on.
+fn case_n2(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 100.0, height: 30.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Relative;
+    s2.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(6.0), right: sty.LengthPercentage.length(6.0), top: sty.LengthPercentage.length(6.0), bottom: sty.LengthPercentage.length(6.0) };
+    s2.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(2.0), right: sty.LengthPercentage.length(2.0), top: sty.LengthPercentage.length(2.0), bottom: sty.LengthPercentage.length(2.0) };
+    s2.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(200.0), height: sty.Dimension.length(100.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.percent(0.1), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.percent(0.1) };
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Fixed;
+    s5.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.position = sty.Position.Fixed;
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n6);
+    let s7 = sty.Style.default(a);
+    let n7 = t.add(s7, _tree_oof.Content.Stack);
+    t.add_child(parent: n2, child: n7);
+    var s8 = sty.Style.default(a);
+    s8.position = sty.Position.Absolute;
+    s8.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n8 = t.add(s8, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n7, child: n8);
+    let s9 = sty.Style.default(a);
+    let n9 = t.add(s9, _tree_oof.Content.Fixed { width: 30.0, height: 5.0 });
+    t.add_child(parent: n7, child: n9);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "N2.0", t.unrounded_of(n0));
+    _show.layout_line(out, "N2.1", t.unrounded_of(n1));
+    _show.layout_line(out, "N2.2", t.unrounded_of(n2));
+    _show.layout_line(out, "N2.3", t.unrounded_of(n3));
+    _show.layout_line(out, "N2.4", t.unrounded_of(n4));
+    _show.layout_line(out, "N2.5", t.unrounded_of(n5));
+    _show.layout_line(out, "N2.6", t.unrounded_of(n6));
+    _show.layout_line(out, "N2.7", t.unrounded_of(n7));
+    _show.layout_line(out, "N2.8", t.unrounded_of(n8));
+    _show.layout_line(out, "N2.9", t.unrounded_of(n9));
+    t.hoisted_line(out, "N2.0", n0);
+    t.hoisted_line(out, "N2.2", n2);
+    t.hoisted_line(out, "N2.7", n7);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "N2.0r", t.final_of(n0));
+    _show.layout_line(out, "N2.1r", t.final_of(n1));
+    _show.layout_line(out, "N2.2r", t.final_of(n2));
+    _show.layout_line(out, "N2.3r", t.final_of(n3));
+    _show.layout_line(out, "N2.4r", t.final_of(n4));
+    _show.layout_line(out, "N2.5r", t.final_of(n5));
+    _show.layout_line(out, "N2.6r", t.final_of(n6));
+    _show.layout_line(out, "N2.7r", t.final_of(n7));
+    _show.layout_line(out, "N2.8r", t.final_of(n8));
+    _show.layout_line(out, "N2.9r", t.final_of(n9));
+}
+
+/// absolute boxes inside absolute boxes, and a fixed box inside them.
+fn case_n3(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    s1.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(20.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(30.0), bottom: sty.LengthPercentageAuto.auto() };
+    s1.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    s1.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(1.0), right: sty.LengthPercentage.length(1.0), top: sty.LengthPercentage.length(1.0), bottom: sty.LengthPercentage.length(1.0) };
+    let n1 = t.add(s1, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n1);
+    let s2 = sty.Style.default(a);
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 60.0, height: 20.0 });
+    t.add_child(parent: n1, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(5.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(5.0) };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n1, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Fixed;
+    s4.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(5.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(5.0) };
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n1, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    s5.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(100.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.auto() };
+    s5.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(80.0), height: sty.Dimension.length(80.0) };
+    s5.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(3.0), right: sty.LengthPercentage.length(3.0), top: sty.LengthPercentage.length(3.0), bottom: sty.LengthPercentage.length(3.0) };
+    let n5 = t.add(s5, _tree_oof.Content.Stack);
+    t.add_child(parent: n1, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.position = sty.Position.Absolute;
+    s6.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.percent(0.5), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.percent(0.5), bottom: sty.LengthPercentageAuto.auto() };
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n5, child: n6);
+    var s7 = sty.Style.default(a);
+    s7.position = sty.Position.Fixed;
+    let n7 = t.add(s7, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n5, child: n7);
+    let s8 = sty.Style.default(a);
+    let n8 = t.add(s8, _tree_oof.Content.Fixed { width: 15.0, height: 15.0 });
+    t.add_child(parent: n5, child: n8);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "N3.0", t.unrounded_of(n0));
+    _show.layout_line(out, "N3.1", t.unrounded_of(n1));
+    _show.layout_line(out, "N3.2", t.unrounded_of(n2));
+    _show.layout_line(out, "N3.3", t.unrounded_of(n3));
+    _show.layout_line(out, "N3.4", t.unrounded_of(n4));
+    _show.layout_line(out, "N3.5", t.unrounded_of(n5));
+    _show.layout_line(out, "N3.6", t.unrounded_of(n6));
+    _show.layout_line(out, "N3.7", t.unrounded_of(n7));
+    _show.layout_line(out, "N3.8", t.unrounded_of(n8));
+    t.hoisted_line(out, "N3.0", n0);
+    t.hoisted_line(out, "N3.1", n1);
+    t.hoisted_line(out, "N3.5", n5);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "N3.0r", t.final_of(n0));
+    _show.layout_line(out, "N3.1r", t.final_of(n1));
+    _show.layout_line(out, "N3.2r", t.final_of(n2));
+    _show.layout_line(out, "N3.3r", t.final_of(n3));
+    _show.layout_line(out, "N3.4r", t.final_of(n4));
+    _show.layout_line(out, "N3.5r", t.final_of(n5));
+    _show.layout_line(out, "N3.6r", t.final_of(n6));
+    _show.layout_line(out, "N3.7r", t.final_of(n7));
+    _show.layout_line(out, "N3.8r", t.final_of(n8));
+}
+
+/// a static root: absolute and fixed boxes all reach the root's last pass.
+fn case_n4(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Static;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    s0.margin = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(30.0), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.length(20.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 100.0, height: 30.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Fixed;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Relative;
+    s5.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(100.0), height: sty.Dimension.length(50.0) };
+    let n5 = t.add(s5, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.position = sty.Position.Absolute;
+    s6.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n5, child: n6);
+    var s7 = sty.Style.default(a);
+    s7.position = sty.Position.Fixed;
+    s7.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.percent(0.1), right: sty.LengthPercentageAuto.percent(0.1), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.auto() };
+    s7.size = geo.Size(sty.Dimension) { width: sty.Dimension.auto(), height: sty.Dimension.length(10.0) };
+    let n7 = t.add(s7, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n5, child: n7);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "N4.0", t.unrounded_of(n0));
+    _show.layout_line(out, "N4.1", t.unrounded_of(n1));
+    _show.layout_line(out, "N4.2", t.unrounded_of(n2));
+    _show.layout_line(out, "N4.3", t.unrounded_of(n3));
+    _show.layout_line(out, "N4.4", t.unrounded_of(n4));
+    _show.layout_line(out, "N4.5", t.unrounded_of(n5));
+    _show.layout_line(out, "N4.6", t.unrounded_of(n6));
+    _show.layout_line(out, "N4.7", t.unrounded_of(n7));
+    t.hoisted_line(out, "N4.0", n0);
+    t.hoisted_line(out, "N4.5", n5);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "N4.0r", t.final_of(n0));
+    _show.layout_line(out, "N4.1r", t.final_of(n1));
+    _show.layout_line(out, "N4.2r", t.final_of(n2));
+    _show.layout_line(out, "N4.3r", t.final_of(n3));
+    _show.layout_line(out, "N4.4r", t.final_of(n4));
+    _show.layout_line(out, "N4.5r", t.final_of(n5));
+    _show.layout_line(out, "N4.6r", t.final_of(n6));
+    _show.layout_line(out, "N4.7r", t.final_of(n7));
+}
+
+/// fractional offsets rounded through hoisted children.
+fn case_n5(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(0.3), right: sty.LengthPercentage.length(0.3), top: sty.LengthPercentage.length(0.3), bottom: sty.LengthPercentage.length(0.3) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(1.7), right: sty.LengthPercentage.length(1.7), top: sty.LengthPercentage.length(1.7), bottom: sty.LengthPercentage.length(1.7) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 10.4, height: 10.6 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.25), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(5.75), bottom: sty.LengthPercentageAuto.auto() };
+    s2.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(1.5), right: sty.LengthPercentage.length(1.5), top: sty.LengthPercentage.length(1.5), bottom: sty.LengthPercentage.length(1.5) };
+    let n2 = t.add(s2, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.4), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(0.6), bottom: sty.LengthPercentageAuto.auto() };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 3.3, height: 3.3 });
+    t.add_child(parent: n2, child: n3);
+    let s4 = sty.Style.default(a);
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 7.7, height: 2.2 });
+    t.add_child(parent: n2, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Fixed;
+    s5.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.5), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(1.5) };
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 3.5, height: 3.5 });
+    t.add_child(parent: n0, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.position = sty.Position.Absolute;
+    s6.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.percent(0.33), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.percent(0.66), bottom: sty.LengthPercentageAuto.auto() };
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 9.9, height: 9.9 });
+    t.add_child(parent: n0, child: n6);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "N5.0", t.unrounded_of(n0));
+    _show.layout_line(out, "N5.1", t.unrounded_of(n1));
+    _show.layout_line(out, "N5.2", t.unrounded_of(n2));
+    _show.layout_line(out, "N5.3", t.unrounded_of(n3));
+    _show.layout_line(out, "N5.4", t.unrounded_of(n4));
+    _show.layout_line(out, "N5.5", t.unrounded_of(n5));
+    _show.layout_line(out, "N5.6", t.unrounded_of(n6));
+    t.hoisted_line(out, "N5.0", n0);
+    t.hoisted_line(out, "N5.2", n2);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "N5.0r", t.final_of(n0));
+    _show.layout_line(out, "N5.1r", t.final_of(n1));
+    _show.layout_line(out, "N5.2r", t.final_of(n2));
+    _show.layout_line(out, "N5.3r", t.final_of(n3));
+    _show.layout_line(out, "N5.4r", t.final_of(n4));
+    _show.layout_line(out, "N5.5r", t.final_of(n5));
+    _show.layout_line(out, "N5.6r", t.final_of(n6));
+}
+
+/// a relative Area inside a Stack, with absolute children at its static positions.
+fn case_n6(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 60.0, height: 20.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Relative;
+    s2.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(200.0), height: sty.Dimension.length(120.0) };
+    s2.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s2.justify_items = sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default };
+    s2.align_items = sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default };
+    let n2 = t.add(s2, _tree_oof.Content.Area);
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Fixed;
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.position = sty.Position.Absolute;
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n6);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "N6.0", t.unrounded_of(n0));
+    _show.layout_line(out, "N6.1", t.unrounded_of(n1));
+    _show.layout_line(out, "N6.2", t.unrounded_of(n2));
+    _show.layout_line(out, "N6.3", t.unrounded_of(n3));
+    _show.layout_line(out, "N6.4", t.unrounded_of(n4));
+    _show.layout_line(out, "N6.5", t.unrounded_of(n5));
+    _show.layout_line(out, "N6.6", t.unrounded_of(n6));
+    t.hoisted_line(out, "N6.0", n0);
+    t.hoisted_line(out, "N6.2", n2);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "N6.0r", t.final_of(n0));
+    _show.layout_line(out, "N6.1r", t.final_of(n1));
+    _show.layout_line(out, "N6.2r", t.final_of(n2));
+    _show.layout_line(out, "N6.3r", t.final_of(n3));
+    _show.layout_line(out, "N6.4r", t.final_of(n4));
+    _show.layout_line(out, "N6.5r", t.final_of(n5));
+    _show.layout_line(out, "N6.6r", t.final_of(n6));
+}
+
+/// an rtl static container between: its static positions and its rtl children.
+fn case_n7(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.direction = sty.Direction.Rtl;
+    s1.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(300.0), height: sty.Dimension.auto() };
+    s1.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(9.0), right: sty.LengthPercentage.length(4.0), top: sty.LengthPercentage.length(0.0), bottom: sty.LengthPercentage.length(0.0) };
+    let n1 = t.add(s1, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n1);
+    let s2 = sty.Style.default(a);
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 10.0 });
+    t.add_child(parent: n1, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n1, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default });
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n1, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    s5.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.auto() };
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n1, child: n5);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "N7.0", t.unrounded_of(n0));
+    _show.layout_line(out, "N7.1", t.unrounded_of(n1));
+    _show.layout_line(out, "N7.2", t.unrounded_of(n2));
+    _show.layout_line(out, "N7.3", t.unrounded_of(n3));
+    _show.layout_line(out, "N7.4", t.unrounded_of(n4));
+    _show.layout_line(out, "N7.5", t.unrounded_of(n5));
+    t.hoisted_line(out, "N7.0", n0);
+    t.hoisted_line(out, "N7.1", n1);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "N7.0r", t.final_of(n0));
+    _show.layout_line(out, "N7.1r", t.final_of(n1));
+    _show.layout_line(out, "N7.2r", t.final_of(n2));
+    _show.layout_line(out, "N7.3r", t.final_of(n3));
+    _show.layout_line(out, "N7.4r", t.final_of(n4));
+    _show.layout_line(out, "N7.5r", t.final_of(n5));
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    case_n1(&mut sys.stdout, a);
+    case_n2(&mut sys.stdout, a);
+    case_n3(&mut sys.stdout, a);
+    case_n4(&mut sys.stdout, a);
+    case_n5(&mut sys.stdout, a);
+    case_n6(&mut sys.stdout, a);
+    case_n7(&mut sys.stdout, a);
+}

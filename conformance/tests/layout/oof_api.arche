@@ -1,0 +1,170 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: SO1 10.0 0.0
+// stdout: SO2 15.0 0.0
+// stdout: SO3 90.0 0.0
+// stdout: SO4 75.0 0.0
+// stdout: SO5 50.0 0.0
+// stdout: SO6 45.0 0.0
+// stdout: SO7 90.0 0.0
+// stdout: SO8 10.0 0.0
+// stdout: SO9 10.0 0.0
+// stdout: SO10 15.0 0.0
+// stdout: SO11 -10.0 0.0
+// stdout: SO12 40.0 0.0
+// stdout: SO13 20.0 0.0
+// stdout: SO14 12.5 0.0
+// stdout: SO15 -3.5 0.0
+// stdout: FA hoisted: 2 4
+// stdout: FA unclaimed: 3 10.0 40.0
+// stdout: FA over 0.0 370.0 0.0 270.0
+// stdout: FA.2 at 20.0 240.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: FA.3 at 0.0 0.0 size 0.0 0.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: FA.4 at 50.0 20.0 size 300.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 300.0 0.0 20.0 | sb 0.0 0.0 | order 3
+// stdout: FA.0 hoisted:
+// The public helpers of compute.oof: resolve_static_offset, on taffy's own
+// unit cases (start, end and centre alignment, safe fallback only on
+// overflow, unsafe, a degenerate area) and a few more; and
+// compute_oof_layout_for_area called directly with candidates made by
+// hand, in an rtl area: claimed boxes laid out, the fixed one left
+// unclaimed, the overflow they add, and no hoisted list recorded. The
+// expected lines are taffy 0.15's own (/tmp/layout-port/oracle-oof, api).
+import std;
+import alloc;
+import layout.compute.oof as oof;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import _show;
+import _tree_oof;
+
+/// A static position over start..end.
+fn sp(start: f32, end: f32, keyword: lt.AxisStaticEdge, safety: sty.AlignmentSafety, fallback: lt.AxisStaticEdge) -> lt.AxisStaticPosition {
+    return lt.AxisStaticPosition { area: geo.Line(f32) { start: start, end: end }, align: lt.AxisStaticAlign { keyword: keyword, safety: safety, fallback: fallback } };
+}
+
+/// Writes the static offset of a box `width` wide with margins left and
+/// right at sp_x, and at a start-aligned zero anchor down.
+fn resolve_x(out: &mut std.Output, name: str, sp_x: lt.AxisStaticPosition, width: f32, left: f32, right: f32) {
+    let position = geo.Point(lt.AxisStaticPosition) { x: sp_x, y: lt.AxisStaticPosition.from_edge(0.0, lt.AxisStaticEdge.Start) };
+    let margin = geo.Rect(f32) { left: left, right: right, top: 0.0, bottom: 0.0 };
+    let r = oof.resolve_static_offset(position, geo.Size(f32) { width: width, height: 10.0 }, margin);
+    out.write(name);
+    out.write(" ");
+    out.write_f32(r.x);
+    out.write(" ");
+    out.write_f32(r.y);
+    out.write("\n");
+}
+
+/// resolve_static_offset.
+fn static_offsets(out: &mut std.Output) {
+    let start = lt.AxisStaticEdge.Start;
+    let end = lt.AxisStaticEdge.End;
+    let center = lt.AxisStaticEdge.Center;
+    let safe = sty.AlignmentSafety.Safe;
+    let unsafe_ = sty.AlignmentSafety.Unsafe;
+    resolve_x(out, "SO1", sp(start: 10.0, end: 110.0, keyword: start, unsafe_, fallback: start), width: 20.0, left: 0.0, right: 0.0);
+    resolve_x(out, "SO2", sp(start: 10.0, end: 110.0, keyword: start, unsafe_, fallback: start), width: 20.0, left: 5.0, right: 15.0);
+    resolve_x(out, "SO3", sp(start: 10.0, end: 110.0, keyword: end, unsafe_, fallback: end), width: 20.0, left: 0.0, right: 0.0);
+    resolve_x(out, "SO4", sp(start: 10.0, end: 110.0, keyword: end, unsafe_, fallback: end), width: 20.0, left: 5.0, right: 15.0);
+    resolve_x(out, "SO5", sp(start: 10.0, end: 110.0, keyword: center, unsafe_, fallback: center), width: 20.0, left: 0.0, right: 0.0);
+    resolve_x(out, "SO6", sp(start: 10.0, end: 110.0, keyword: center, unsafe_, fallback: center), width: 20.0, left: 5.0, right: 15.0);
+    resolve_x(out, "SO7", sp(start: 10.0, end: 110.0, keyword: end, safe, fallback: start), width: 20.0, left: 0.0, right: 0.0);
+    resolve_x(out, "SO8", sp(start: 10.0, end: 110.0, keyword: end, safe, fallback: start), width: 100.0, left: 0.0, right: 0.0);
+    resolve_x(out, "SO9", sp(start: 10.0, end: 110.0, keyword: end, safe, fallback: start), width: 120.0, left: 0.0, right: 0.0);
+    resolve_x(out, "SO10", sp(start: 10.0, end: 110.0, keyword: end, safe, fallback: start), width: 90.0, left: 5.0, right: 15.0);
+    resolve_x(out, "SO11", sp(start: 10.0, end: 110.0, keyword: end, unsafe_, fallback: start), width: 120.0, left: 0.0, right: 0.0);
+    resolve_x(out, "SO12", lt.AxisStaticPosition.from_edge(40.0, start), width: 20.0, left: 0.0, right: 0.0);
+    resolve_x(out, "SO13", lt.AxisStaticPosition.from_edge(40.0, end), width: 20.0, left: 0.0, right: 0.0);
+    resolve_x(out, "SO14", sp(start: 10.0, end: 110.0, keyword: center, safe, fallback: start), width: 130.0, left: 2.5, right: 0.0);
+    resolve_x(out, "SO15", sp(start: -30.0, end: 31.0, keyword: center, sty.AlignmentSafety.Default, fallback: center), width: 7.0, left: 0.0, right: 1.0);
+}
+
+/// compute_oof_layout_for_area on hand-made candidates.
+fn for_area(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = sty.size_from_lengths(width: 400.0, height: 300.0);
+    s0.padding = _show.rect_lp(10.0);
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let n1 = t.add(sty.Style.default(a), _tree_oof.Content.Fixed { width: 30.0, height: 30.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) {
+        left: sty.LengthPercentageAuto.length(10.0),
+        right: sty.LengthPercentageAuto.auto(),
+        top: sty.LengthPercentageAuto.auto(),
+        bottom: sty.LengthPercentageAuto.length(10.0),
+    };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Fixed;
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 20.0, height: 20.0 });
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    let n4 = t.add(s4, _tree_oof.Content.Text { width: 300.0, line: 20.0 });
+    t.add_child(parent: n0, child: n4);
+
+    let anchor = geo.Point(lt.AxisStaticPosition) {
+        x: lt.AxisStaticPosition.from_edge(10.0, lt.AxisStaticEdge.Start),
+        y: lt.AxisStaticPosition.from_edge(40.0, lt.AxisStaticEdge.Start),
+    };
+    var candidates = lt.OofCandidates.new();
+    candidates.push(lt.OofCandidate { node: n2, order: 1, position: sty.Position.Absolute, static_position: anchor }, a);
+    candidates.push(lt.OofCandidate { node: n3, order: 2, position: sty.Position.Fixed, static_position: anchor }, a);
+    candidates.push(lt.OofCandidate {
+        node: n4,
+        order: 3,
+        position: sty.Position.Absolute,
+        static_position: geo.Point(lt.AxisStaticPosition) {
+            x: sp(start: 10.0, end: 390.0, keyword: lt.AxisStaticEdge.Center, sty.AlignmentSafety.Default, fallback: lt.AxisStaticEdge.Center),
+            y: lt.AxisStaticPosition.from_edge(40.0, lt.AxisStaticEdge.End),
+        },
+    }, a);
+    let area = lt.OofPositioningArea { size: geo.Size(f32) { width: 380.0, height: 280.0 }, offset: geo.Point(f32) { x: 10.0, y: 10.0 } };
+    let result = oof.compute_oof_layout_for_area(&mut t, n0, &candidates, area, sty.Direction.Rtl, sty.ContainingBlockClaims { absolute: true, fixed: false });
+
+    out.write("FA hoisted:");
+    for h in result.hoisted.items() {
+        out.write(" ");
+        out.write_u64(h.value);
+    }
+    out.write("\n");
+    out.write("FA unclaimed:");
+    var i: usize = 0;
+    while i < result.unclaimed.len() : (i += 1) {
+        let c = result.unclaimed.get(i);
+        out.write(" ");
+        out.write_u64(c.node.value);
+        out.write(" ");
+        out.write_f32(c.static_position.x.area.start);
+        out.write(" ");
+        out.write_f32(c.static_position.y.area.start);
+    }
+    out.write("\n");
+    let r = result.scrollable_overflow_rect;
+    out.write("FA over ");
+    out.write_f32(r.left);
+    out.write(" ");
+    out.write_f32(r.right);
+    out.write(" ");
+    out.write_f32(r.top);
+    out.write(" ");
+    out.write_f32(r.bottom);
+    out.write("\n");
+    _show.layout_line(out, "FA.2", t.unrounded_of(n2));
+    _show.layout_line(out, "FA.3", t.unrounded_of(n3));
+    _show.layout_line(out, "FA.4", t.unrounded_of(n4));
+    t.hoisted_line(out, "FA.0", n0);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    static_offsets(&mut sys.stdout);
+    for_area(&mut sys.stdout, sys.alloc);
+}

@@ -1,0 +1,378 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: O1.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over -40.0 450.0 -30.0 320.0 | sb 0.0 0.0 | order 0
+// stdout: O1.1 at 385.0 285.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O1.2 at -35.0 -25.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: O1.3 at 305.0 15.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 150.0 0.0 140.0 | sb 0.0 0.0 | order 2
+// stdout: O1.4 at 100.0 100.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O1.5 at 15.0 15.0 size 10.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 10.0 0.0 10.0 | sb 0.0 0.0 | order 3
+// stdout: O1.0 hoisted: 1 2 3
+// stdout: O1.3 hoisted: 4
+// stdout: O1.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over -40.0 450.0 -30.0 320.0 | sb 0.0 0.0 | order 0
+// stdout: O1.1r at 385.0 285.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O1.2r at -35.0 -25.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: O1.3r at 305.0 15.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 150.0 0.0 140.0 | sb 0.0 0.0 | order 2
+// stdout: O1.4r at 100.0 100.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O1.5r at 15.0 15.0 size 10.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 10.0 0.0 10.0 | sb 0.0 0.0 | order 3
+// stdout: O2.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over -30.0 430.0 -20.0 320.0 | sb 0.0 0.0 | order 0
+// stdout: O2.1 at 385.0 285.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O2.2 at -95.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: O2.3 at -25.0 -15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: O2.4 at 15.0 15.0 size 10.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 10.0 0.0 10.0 | sb 0.0 0.0 | order 3
+// stdout: O2.0 hoisted: 1 2 3
+// stdout: O2.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over -30.0 430.0 -20.0 320.0 | sb 0.0 0.0 | order 0
+// stdout: O2.1r at 385.0 285.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O2.2r at -95.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: O2.3r at -25.0 -15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: O2.4r at 15.0 15.0 size 10.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 10.0 0.0 10.0 | sb 0.0 0.0 | order 3
+// stdout: O3.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 150.0 0.0 350.0 | sb 0.0 0.0 | order 0
+// stdout: O3.1 at 15.0 15.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 350.0 0.0 340.0 | sb 0.0 0.0 | order 0
+// stdout: O3.2 at 300.0 300.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O3.3 at 55.0 15.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 350.0 0.0 340.0 | sb 0.0 0.0 | order 1
+// stdout: O3.4 at 300.0 300.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O3.5 at 95.0 15.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 350.0 0.0 340.0 | sb 0.0 0.0 | order 2
+// stdout: O3.6 at 300.0 300.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O3.7 at 135.0 15.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 350.0 0.0 340.0 | sb 0.0 0.0 | order 3
+// stdout: O3.8 at 300.0 300.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O3.0 hoisted: 1 3 5 7
+// stdout: O3.1 hoisted: 2
+// stdout: O3.3 hoisted: 4
+// stdout: O3.5 hoisted: 6
+// stdout: O3.7 hoisted: 8
+// stdout: O3.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 150.0 0.0 350.0 | sb 0.0 0.0 | order 0
+// stdout: O3.1r at 15.0 15.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 350.0 0.0 340.0 | sb 0.0 0.0 | order 0
+// stdout: O3.2r at 300.0 300.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O3.3r at 55.0 15.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 350.0 0.0 340.0 | sb 0.0 0.0 | order 1
+// stdout: O3.4r at 300.0 300.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O3.5r at 95.0 15.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 350.0 0.0 340.0 | sb 0.0 0.0 | order 2
+// stdout: O3.6r at 300.0 300.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O3.7r at 135.0 15.0 size 20.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 350.0 0.0 340.0 | sb 0.0 0.0 | order 3
+// stdout: O3.8r at 300.0 300.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O4.0 at 400.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over -60.0 460.0 0.0 120.0 | sb 0.0 0.0 | order 0
+// stdout: O4.1 at 5.0 5.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O4.2 at 405.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: O4.3 at -65.0 85.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: O4.0 hoisted: 1 2 3
+// stdout: O4.0r at 400.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over -60.0 460.0 0.0 120.0 | sb 0.0 0.0 | order 0
+// stdout: O4.1r at 5.0 5.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O4.2r at 405.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: O4.3r at -65.0 85.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: O5.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 375.0 0.0 275.0 | sb 15.0 15.0 | order 0
+// stdout: O5.1 at 330.0 240.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O5.2 at 5.0 5.0 size 375.0 275.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: O5.3 at 15.0 15.0 size 200.0 100.0 | pad 0.0 0.0 0.0 0.0 | border 2.0 2.0 2.0 2.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 184.0 0.0 96.0 | sb 0.0 0.0 | order 2
+// stdout: O5.4 at 14.0 2.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O5.5 at 148.0 58.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: O5.6 at 148.0 2.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: O5.0 hoisted: 1 2
+// stdout: O5.3 hoisted: 4 5 6
+// stdout: O5.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 375.0 0.0 275.0 | sb 15.0 15.0 | order 0
+// stdout: O5.1r at 330.0 240.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O5.2r at 5.0 5.0 size 375.0 275.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: O5.3r at 15.0 15.0 size 200.0 100.0 | pad 0.0 0.0 0.0 0.0 | border 2.0 2.0 2.0 2.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 184.0 0.0 96.0 | sb 0.0 0.0 | order 2
+// stdout: O5.4r at 14.0 2.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: O5.5r at 148.0 58.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: O5.6r at 148.0 2.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// The scrollable overflow out-of-flow boxes add to their containing block:
+// boxes past its edges, boxes before its origin (dropped by a scroll
+// container), boxes that clip, contain or scroll their own overflow, rtl
+// containers measuring from the right, and scrollbar gutters that shrink the
+// positioning area. The expected lines are taffy 0.15's own, from the same
+// trees in Rust (/tmp/layout-port/oracle-oof).
+import std;
+import alloc;
+import layout.compute as compute;
+import layout.geometry as geo;
+import layout.style as sty;
+import _show;
+import _tree_oof;
+
+/// boxes past the edges of a visible container.
+fn case_o1(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    s1.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(380.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(280.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(-40.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(-30.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(300.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    s3.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(20.0), height: sty.Dimension.length(20.0) };
+    let n3 = t.add(s3, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(100.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(100.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n3, child: n4);
+    let s5 = sty.Style.default(a);
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 10.0, height: 10.0 });
+    t.add_child(parent: n0, child: n5);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "O1.0", t.unrounded_of(n0));
+    _show.layout_line(out, "O1.1", t.unrounded_of(n1));
+    _show.layout_line(out, "O1.2", t.unrounded_of(n2));
+    _show.layout_line(out, "O1.3", t.unrounded_of(n3));
+    _show.layout_line(out, "O1.4", t.unrounded_of(n4));
+    _show.layout_line(out, "O1.5", t.unrounded_of(n5));
+    t.hoisted_line(out, "O1.0", n0);
+    t.hoisted_line(out, "O1.3", n3);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "O1.0r", t.final_of(n0));
+    _show.layout_line(out, "O1.1r", t.final_of(n1));
+    _show.layout_line(out, "O1.2r", t.final_of(n2));
+    _show.layout_line(out, "O1.3r", t.final_of(n3));
+    _show.layout_line(out, "O1.4r", t.final_of(n4));
+    _show.layout_line(out, "O1.5r", t.final_of(n5));
+}
+
+/// a scroll container drops boxes wholly before its origin.
+fn case_o2(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    s0.overflow = geo.Point(sty.Overflow) { x: sty.Overflow.Hidden, y: sty.Overflow.Hidden };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    s1.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(380.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(280.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(-100.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(-30.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(-20.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    let s4 = sty.Style.default(a);
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 10.0, height: 10.0 });
+    t.add_child(parent: n0, child: n4);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "O2.0", t.unrounded_of(n0));
+    _show.layout_line(out, "O2.1", t.unrounded_of(n1));
+    _show.layout_line(out, "O2.2", t.unrounded_of(n2));
+    _show.layout_line(out, "O2.3", t.unrounded_of(n3));
+    _show.layout_line(out, "O2.4", t.unrounded_of(n4));
+    t.hoisted_line(out, "O2.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "O2.0r", t.final_of(n0));
+    _show.layout_line(out, "O2.1r", t.final_of(n1));
+    _show.layout_line(out, "O2.2r", t.final_of(n2));
+    _show.layout_line(out, "O2.3r", t.final_of(n3));
+    _show.layout_line(out, "O2.4r", t.final_of(n4));
+}
+
+/// boxes that contain their overflow: clip, hidden, scroll, contain.
+fn case_o3(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    s1.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    s1.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(20.0), height: sty.Dimension.length(20.0) };
+    s1.overflow = geo.Point(sty.Overflow) { x: sty.Overflow.Clip, y: sty.Overflow.Clip };
+    let n1 = t.add(s1, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(300.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(300.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n1, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(50.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    s3.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(20.0), height: sty.Dimension.length(20.0) };
+    s3.overflow = geo.Point(sty.Overflow) { x: sty.Overflow.Hidden, y: sty.Overflow.Hidden };
+    let n3 = t.add(s3, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(300.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(300.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n3, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    s5.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(90.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    s5.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(20.0), height: sty.Dimension.length(20.0) };
+    s5.contain = sty.Contain.paint();
+    let n5 = t.add(s5, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.position = sty.Position.Absolute;
+    s6.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(300.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(300.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n5, child: n6);
+    var s7 = sty.Style.default(a);
+    s7.position = sty.Position.Absolute;
+    s7.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(130.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    s7.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(20.0), height: sty.Dimension.length(20.0) };
+    s7.overflow = geo.Point(sty.Overflow) { x: sty.Overflow.Clip, y: sty.Overflow.Visible };
+    let n7 = t.add(s7, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n7);
+    var s8 = sty.Style.default(a);
+    s8.position = sty.Position.Absolute;
+    s8.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(300.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(300.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n8 = t.add(s8, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n7, child: n8);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "O3.0", t.unrounded_of(n0));
+    _show.layout_line(out, "O3.1", t.unrounded_of(n1));
+    _show.layout_line(out, "O3.2", t.unrounded_of(n2));
+    _show.layout_line(out, "O3.3", t.unrounded_of(n3));
+    _show.layout_line(out, "O3.4", t.unrounded_of(n4));
+    _show.layout_line(out, "O3.5", t.unrounded_of(n5));
+    _show.layout_line(out, "O3.6", t.unrounded_of(n6));
+    _show.layout_line(out, "O3.7", t.unrounded_of(n7));
+    _show.layout_line(out, "O3.8", t.unrounded_of(n8));
+    t.hoisted_line(out, "O3.0", n0);
+    t.hoisted_line(out, "O3.1", n1);
+    t.hoisted_line(out, "O3.3", n3);
+    t.hoisted_line(out, "O3.5", n5);
+    t.hoisted_line(out, "O3.7", n7);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "O3.0r", t.final_of(n0));
+    _show.layout_line(out, "O3.1r", t.final_of(n1));
+    _show.layout_line(out, "O3.2r", t.final_of(n2));
+    _show.layout_line(out, "O3.3r", t.final_of(n3));
+    _show.layout_line(out, "O3.4r", t.final_of(n4));
+    _show.layout_line(out, "O3.5r", t.final_of(n5));
+    _show.layout_line(out, "O3.6r", t.final_of(n6));
+    _show.layout_line(out, "O3.7r", t.final_of(n7));
+    _show.layout_line(out, "O3.8r", t.final_of(n8));
+}
+
+/// an rtl container measures overflow from its right edge.
+fn case_o4(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    s0.direction = sty.Direction.Rtl;
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    s1.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(-60.0), top: sty.LengthPercentageAuto.length(40.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(-70.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(80.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "O4.0", t.unrounded_of(n0));
+    _show.layout_line(out, "O4.1", t.unrounded_of(n1));
+    _show.layout_line(out, "O4.2", t.unrounded_of(n2));
+    _show.layout_line(out, "O4.3", t.unrounded_of(n3));
+    t.hoisted_line(out, "O4.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "O4.0r", t.final_of(n0));
+    _show.layout_line(out, "O4.1r", t.final_of(n1));
+    _show.layout_line(out, "O4.2r", t.final_of(n2));
+    _show.layout_line(out, "O4.3r", t.final_of(n3));
+}
+
+/// scrollbar gutters shrink the positioning area; rtl puts the vertical one on the left.
+fn case_o5(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    s0.overflow = geo.Point(sty.Overflow) { x: sty.Overflow.Scroll, y: sty.Overflow.Scroll };
+    s0.scrollbar_width = 15.0;
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    s1.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Relative;
+    s3.direction = sty.Direction.Rtl;
+    s3.overflow = geo.Point(sty.Overflow) { x: sty.Overflow.Visible, y: sty.Overflow.Scroll };
+    s3.scrollbar_width = 12.0;
+    s3.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(200.0), height: sty.Dimension.length(100.0) };
+    s3.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(2.0), right: sty.LengthPercentage.length(2.0), top: sty.LengthPercentage.length(2.0), bottom: sty.LengthPercentage.length(2.0) };
+    let n3 = t.add(s3, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n3, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    s5.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n3, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.position = sty.Position.Absolute;
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n3, child: n6);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "O5.0", t.unrounded_of(n0));
+    _show.layout_line(out, "O5.1", t.unrounded_of(n1));
+    _show.layout_line(out, "O5.2", t.unrounded_of(n2));
+    _show.layout_line(out, "O5.3", t.unrounded_of(n3));
+    _show.layout_line(out, "O5.4", t.unrounded_of(n4));
+    _show.layout_line(out, "O5.5", t.unrounded_of(n5));
+    _show.layout_line(out, "O5.6", t.unrounded_of(n6));
+    t.hoisted_line(out, "O5.0", n0);
+    t.hoisted_line(out, "O5.3", n3);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "O5.0r", t.final_of(n0));
+    _show.layout_line(out, "O5.1r", t.final_of(n1));
+    _show.layout_line(out, "O5.2r", t.final_of(n2));
+    _show.layout_line(out, "O5.3r", t.final_of(n3));
+    _show.layout_line(out, "O5.4r", t.final_of(n4));
+    _show.layout_line(out, "O5.5r", t.final_of(n5));
+    _show.layout_line(out, "O5.6r", t.final_of(n6));
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    case_o1(&mut sys.stdout, a);
+    case_o2(&mut sys.stdout, a);
+    case_o3(&mut sys.stdout, a);
+    case_o4(&mut sys.stdout, a);
+    case_o5(&mut sys.stdout, a);
+}

@@ -1,0 +1,633 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: S1.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 310.0 0.0 120.0 | sb 0.0 0.0 | order 0
+// stdout: S1.1 at 15.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: S1.2 at 15.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S1.3 at 15.0 45.0 size 80.0 25.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 80.0 0.0 25.0 | sb 0.0 0.0 | order 2
+// stdout: S1.4 at 105.0 70.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: S1.5 at 15.0 5.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 4
+// stdout: S1.6 at 15.0 70.0 size 120.0 35.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 120.0 0.0 35.0 | sb 0.0 0.0 | order 5
+// stdout: S1.7 at 15.0 105.0 size 300.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 300.0 0.0 20.0 | sb 0.0 0.0 | order 6
+// stdout: S1.0 hoisted: 2 4 5 7
+// stdout: S1.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 310.0 0.0 120.0 | sb 0.0 0.0 | order 0
+// stdout: S1.1r at 15.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: S1.2r at 15.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S1.3r at 15.0 45.0 size 80.0 25.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 80.0 0.0 25.0 | sb 0.0 0.0 | order 2
+// stdout: S1.4r at 105.0 70.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: S1.5r at 15.0 5.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 4
+// stdout: S1.6r at 15.0 70.0 size 120.0 35.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 120.0 0.0 35.0 | sb 0.0 0.0 | order 5
+// stdout: S1.7r at 15.0 105.0 size 300.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 300.0 0.0 20.0 | sb 0.0 0.0 | order 6
+// stdout: S2.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over -120.0 500.0 0.0 60.0 | sb 0.0 0.0 | order 0
+// stdout: S2.1 at 175.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S2.2 at 335.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S2.3 at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S2.4 at 15.0 15.0 size 30.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 30.0 0.0 10.0 | sb 0.0 0.0 | order 3
+// stdout: S2.5 at 5.0 25.0 size 500.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 40.0 | sb 0.0 0.0 | order 4
+// stdout: S2.6 at -115.0 25.0 size 500.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 40.0 | sb 0.0 0.0 | order 5
+// stdout: S2.7 at 5.0 25.0 size 500.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 40.0 | sb 0.0 0.0 | order 6
+// stdout: S2.8 at 315.0 25.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 5.0 20.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 7
+// stdout: S2.0 hoisted: 1 2 3 5 6 7 8
+// stdout: S2.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over -120.0 500.0 0.0 60.0 | sb 0.0 0.0 | order 0
+// stdout: S2.1r at 175.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S2.2r at 335.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S2.3r at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S2.4r at 15.0 15.0 size 30.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 30.0 0.0 10.0 | sb 0.0 0.0 | order 3
+// stdout: S2.5r at 5.0 25.0 size 500.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 40.0 | sb 0.0 0.0 | order 4
+// stdout: S2.6r at -115.0 25.0 size 500.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 40.0 | sb 0.0 0.0 | order 5
+// stdout: S2.7r at 5.0 25.0 size 500.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 40.0 | sb 0.0 0.0 | order 6
+// stdout: S2.8r at 315.0 25.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 5.0 20.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 7
+// stdout: S3.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 380.0 -55.0 410.0 | sb 0.0 0.0 | order 0
+// stdout: S3.1 at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S3.2 at 175.0 130.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S3.3 at 335.0 245.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S3.4 at 335.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: S3.5 at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 4
+// stdout: S3.6 at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 5
+// stdout: S3.7 at 335.0 245.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 6
+// stdout: S3.8 at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 7
+// stdout: S3.9 at 15.0 5.0 size 50.0 400.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 400.0 | sb 0.0 0.0 | order 8
+// stdout: S3.10 at 15.0 -50.0 size 50.0 400.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 400.0 | sb 0.0 0.0 | order 9
+// stdout: S3.11 at 15.0 15.0 size 50.0 400.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 10.0 0.0 | over 0.0 50.0 0.0 400.0 | sb 0.0 0.0 | order 10
+// stdout: S3.0 hoisted: 1 2 3 4 5 6 7 8 9 10 11
+// stdout: S3.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 380.0 -55.0 410.0 | sb 0.0 0.0 | order 0
+// stdout: S3.1r at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S3.2r at 175.0 130.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S3.3r at 335.0 245.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S3.4r at 335.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: S3.5r at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 4
+// stdout: S3.6r at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 5
+// stdout: S3.7r at 335.0 245.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 6
+// stdout: S3.8r at 15.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 7
+// stdout: S3.9r at 15.0 5.0 size 50.0 400.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 400.0 | sb 0.0 0.0 | order 8
+// stdout: S3.10r at 15.0 -50.0 size 50.0 400.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 400.0 | sb 0.0 0.0 | order 9
+// stdout: S3.11r at 15.0 15.0 size 50.0 400.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 10.0 0.0 | over 0.0 50.0 0.0 400.0 | sb 0.0 0.0 | order 10
+// stdout: S4.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 380.0 0.0 280.0 | sb 0.0 0.0 | order 0
+// stdout: S4.1 at 335.0 130.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S4.2 at 15.0 130.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S4.3 at 335.0 245.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S4.4 at 15.0 132.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 6.0 2.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: S4.5 at 85.0 140.0 size 300.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 300.0 0.0 20.0 | sb 0.0 0.0 | order 4
+// stdout: S4.0 hoisted: 1 2 3 4 5
+// stdout: S4.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 380.0 0.0 280.0 | sb 0.0 0.0 | order 0
+// stdout: S4.1r at 335.0 130.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S4.2r at 15.0 130.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S4.3r at 335.0 245.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S4.4r at 15.0 132.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 6.0 2.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: S4.5r at 85.0 140.0 size 300.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 300.0 0.0 20.0 | sb 0.0 0.0 | order 4
+// stdout: S5.0 at 400.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 80.0 | sb 0.0 0.0 | order 0
+// stdout: S5.1 at 335.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S5.2 at 285.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 1
+// stdout: S5.3 at 15.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S5.4 at 335.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: S5.5 at 335.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 4
+// stdout: S5.6 at 15.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 5
+// stdout: S5.7 at 180.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 10.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 6
+// stdout: S5.8 at -105.0 45.0 size 500.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 20.0 | sb 0.0 0.0 | order 7
+// stdout: S5.0 hoisted: 1 3 4 5 6 7 8
+// stdout: S5.0r at 400.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 80.0 | sb 0.0 0.0 | order 0
+// stdout: S5.1r at 335.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S5.2r at 285.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 1
+// stdout: S5.3r at 15.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S5.4r at 335.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: S5.5r at 335.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 4
+// stdout: S5.6r at 15.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 5
+// stdout: S5.7r at 180.0 45.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 10.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 6
+// stdout: S5.8r at -105.0 45.0 size 500.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 20.0 | sb 0.0 0.0 | order 7
+// stdout: S6.0 at 400.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 510.0 0.0 280.0 | sb 0.0 0.0 | order 0
+// stdout: S6.1 at 335.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S6.2 at 15.0 245.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S6.3 at 175.0 130.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S6.4 at -105.0 15.0 size 500.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 20.0 | sb 0.0 0.0 | order 3
+// stdout: S6.5 at -115.0 15.0 size 500.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 20.0 | sb 0.0 0.0 | order 4
+// stdout: S6.0 hoisted: 1 2 3 4 5
+// stdout: S6.0r at 400.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 510.0 0.0 280.0 | sb 0.0 0.0 | order 0
+// stdout: S6.1r at 335.0 15.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S6.2r at 15.0 245.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S6.3r at 175.0 130.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S6.4r at -105.0 15.0 size 500.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 20.0 | sb 0.0 0.0 | order 3
+// stdout: S6.5r at -115.0 15.0 size 500.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 20.0 | sb 0.0 0.0 | order 4
+// stdout: S7.0 at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 260.0 0.0 100.0 | sb 0.0 0.0 | order 0
+// stdout: S7.1 at 15.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: S7.2 at 15.0 45.0 size 220.0 110.0 | pad 7.0 7.0 7.0 7.0 | border 3.0 3.0 3.0 3.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 1
+// stdout: S7.3 at 10.0 10.0 size 40.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 40.0 0.0 10.0 | sb 0.0 0.0 | order 0
+// stdout: S7.4 at 25.0 65.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S7.5 at 215.0 10.0 size 10.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S7.6 at 10.0 20.0 size 200.0 80.0 | pad 11.0 0.0 13.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 11.0 0.0 13.0 | sb 0.0 0.0 | order 3
+// stdout: S7.7 at 0.0 0.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S7.8 at 0.0 0.0 size 10.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 10.0 0.0 10.0 | sb 0.0 0.0 | order 1
+// stdout: S7.0 hoisted: 4 5
+// stdout: S7.2 hoisted:
+// stdout: S7.5 hoisted: 7
+// stdout: S7.0r at 0.0 0.0 size 400.0 300.0 | pad 10.0 10.0 10.0 10.0 | border 5.0 5.0 5.0 5.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 260.0 0.0 100.0 | sb 0.0 0.0 | order 0
+// stdout: S7.1r at 15.0 15.0 size 100.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 100.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: S7.2r at 15.0 45.0 size 220.0 110.0 | pad 7.0 7.0 7.0 7.0 | border 3.0 3.0 3.0 3.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 1
+// stdout: S7.3r at 10.0 10.0 size 40.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 40.0 0.0 10.0 | sb 0.0 0.0 | order 0
+// stdout: S7.4r at 25.0 65.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: S7.5r at 215.0 10.0 size 10.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: S7.6r at 10.0 20.0 size 200.0 80.0 | pad 11.0 0.0 13.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 11.0 0.0 13.0 | sb 0.0 0.0 | order 3
+// stdout: S7.7r at 0.0 0.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: S7.8r at 0.0 0.0 size 10.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 10.0 0.0 10.0 | sb 0.0 0.0 | order 1
+// Static positions: boxes with both insets of an axis auto stay where the
+// container recorded them. A Stack container records a block's static
+// position (its content box across, aligned by justify-self or the
+// container's justify-items, and a line at the box's place in the flow
+// down); an Area container records the content box in both axes, aligned
+// by justify-self and align-self or justify-items and align-items, as flex
+// and grid containers do. Start, center and end, safe fallbacks, rtl and
+// self-start and self-end against the box's own direction. The expected
+// lines are taffy 0.15's own, from the same trees in Rust
+// (/tmp/layout-port/oracle-oof).
+import std;
+import alloc;
+import layout.compute as compute;
+import layout.geometry as geo;
+import layout.style as sty;
+import _show;
+import _tree_oof;
+
+/// a Stack: absolute boxes between in-flow ones keep their place in the flow.
+fn case_s1(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 100.0, height: 30.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    let s3 = sty.Style.default(a);
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 80.0, height: 25.0 });
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(100.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.auto() };
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    s5.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n5);
+    let s6 = sty.Style.default(a);
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 120.0, height: 35.0 });
+    t.add_child(parent: n0, child: n6);
+    var s7 = sty.Style.default(a);
+    s7.position = sty.Position.Absolute;
+    let n7 = t.add(s7, _tree_oof.Content.Text { width: 300.0, line: 20.0 });
+    t.add_child(parent: n0, child: n7);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "S1.0", t.unrounded_of(n0));
+    _show.layout_line(out, "S1.1", t.unrounded_of(n1));
+    _show.layout_line(out, "S1.2", t.unrounded_of(n2));
+    _show.layout_line(out, "S1.3", t.unrounded_of(n3));
+    _show.layout_line(out, "S1.4", t.unrounded_of(n4));
+    _show.layout_line(out, "S1.5", t.unrounded_of(n5));
+    _show.layout_line(out, "S1.6", t.unrounded_of(n6));
+    _show.layout_line(out, "S1.7", t.unrounded_of(n7));
+    t.hoisted_line(out, "S1.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "S1.0r", t.final_of(n0));
+    _show.layout_line(out, "S1.1r", t.final_of(n1));
+    _show.layout_line(out, "S1.2r", t.final_of(n2));
+    _show.layout_line(out, "S1.3r", t.final_of(n3));
+    _show.layout_line(out, "S1.4r", t.final_of(n4));
+    _show.layout_line(out, "S1.5r", t.final_of(n5));
+    _show.layout_line(out, "S1.6r", t.final_of(n6));
+    _show.layout_line(out, "S1.7r", t.final_of(n7));
+}
+
+/// a Stack: justify-self and justify-items, safe and unsafe, against the content box.
+fn case_s2(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    s0.justify_items = sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default });
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Start, safety: sty.AlignmentSafety.Default });
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    let s4 = sty.Style.default(a);
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 30.0, height: 10.0 });
+    t.add_child(parent: n0, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    s5.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Safe });
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 500.0, height: 40.0 });
+    t.add_child(parent: n0, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.position = sty.Position.Absolute;
+    s6.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Unsafe });
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 500.0, height: 40.0 });
+    t.add_child(parent: n0, child: n6);
+    var s7 = sty.Style.default(a);
+    s7.position = sty.Position.Absolute;
+    s7.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Safe });
+    let n7 = t.add(s7, _tree_oof.Content.Fixed { width: 500.0, height: 40.0 });
+    t.add_child(parent: n0, child: n7);
+    var s8 = sty.Style.default(a);
+    s8.position = sty.Position.Absolute;
+    s8.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.FlexEnd, safety: sty.AlignmentSafety.Default });
+    s8.margin = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(5.0), right: sty.LengthPercentageAuto.length(20.0), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n8 = t.add(s8, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n8);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "S2.0", t.unrounded_of(n0));
+    _show.layout_line(out, "S2.1", t.unrounded_of(n1));
+    _show.layout_line(out, "S2.2", t.unrounded_of(n2));
+    _show.layout_line(out, "S2.3", t.unrounded_of(n3));
+    _show.layout_line(out, "S2.4", t.unrounded_of(n4));
+    _show.layout_line(out, "S2.5", t.unrounded_of(n5));
+    _show.layout_line(out, "S2.6", t.unrounded_of(n6));
+    _show.layout_line(out, "S2.7", t.unrounded_of(n7));
+    _show.layout_line(out, "S2.8", t.unrounded_of(n8));
+    t.hoisted_line(out, "S2.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "S2.0r", t.final_of(n0));
+    _show.layout_line(out, "S2.1r", t.final_of(n1));
+    _show.layout_line(out, "S2.2r", t.final_of(n2));
+    _show.layout_line(out, "S2.3r", t.final_of(n3));
+    _show.layout_line(out, "S2.4r", t.final_of(n4));
+    _show.layout_line(out, "S2.5r", t.final_of(n5));
+    _show.layout_line(out, "S2.6r", t.final_of(n6));
+    _show.layout_line(out, "S2.7r", t.final_of(n7));
+    _show.layout_line(out, "S2.8r", t.final_of(n8));
+}
+
+/// an Area: align-self and justify-self keywords in the content box.
+fn case_s3(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Area);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default });
+    s2.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default });
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default });
+    s3.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default });
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.FlexEnd, safety: sty.AlignmentSafety.Default });
+    s4.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.FlexStart, safety: sty.AlignmentSafety.Default });
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    s5.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Baseline, safety: sty.AlignmentSafety.Default });
+    s5.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Baseline, safety: sty.AlignmentSafety.Default });
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.position = sty.Position.Absolute;
+    s6.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Stretch, safety: sty.AlignmentSafety.Default });
+    s6.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Stretch, safety: sty.AlignmentSafety.Default });
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n6);
+    var s7 = sty.Style.default(a);
+    s7.position = sty.Position.Absolute;
+    s7.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.SelfEnd, safety: sty.AlignmentSafety.Default });
+    s7.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.SelfEnd, safety: sty.AlignmentSafety.Default });
+    let n7 = t.add(s7, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n7);
+    var s8 = sty.Style.default(a);
+    s8.position = sty.Position.Absolute;
+    s8.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.SelfStart, safety: sty.AlignmentSafety.Default });
+    s8.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.SelfStart, safety: sty.AlignmentSafety.Default });
+    let n8 = t.add(s8, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n8);
+    var s9 = sty.Style.default(a);
+    s9.position = sty.Position.Absolute;
+    s9.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Safe });
+    let n9 = t.add(s9, _tree_oof.Content.Fixed { width: 50.0, height: 400.0 });
+    t.add_child(parent: n0, child: n9);
+    var s10 = sty.Style.default(a);
+    s10.position = sty.Position.Absolute;
+    s10.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Unsafe });
+    let n10 = t.add(s10, _tree_oof.Content.Fixed { width: 50.0, height: 400.0 });
+    t.add_child(parent: n0, child: n10);
+    var s11 = sty.Style.default(a);
+    s11.position = sty.Position.Absolute;
+    s11.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Safe });
+    s11.margin = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n11 = t.add(s11, _tree_oof.Content.Fixed { width: 50.0, height: 400.0 });
+    t.add_child(parent: n0, child: n11);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "S3.0", t.unrounded_of(n0));
+    _show.layout_line(out, "S3.1", t.unrounded_of(n1));
+    _show.layout_line(out, "S3.2", t.unrounded_of(n2));
+    _show.layout_line(out, "S3.3", t.unrounded_of(n3));
+    _show.layout_line(out, "S3.4", t.unrounded_of(n4));
+    _show.layout_line(out, "S3.5", t.unrounded_of(n5));
+    _show.layout_line(out, "S3.6", t.unrounded_of(n6));
+    _show.layout_line(out, "S3.7", t.unrounded_of(n7));
+    _show.layout_line(out, "S3.8", t.unrounded_of(n8));
+    _show.layout_line(out, "S3.9", t.unrounded_of(n9));
+    _show.layout_line(out, "S3.10", t.unrounded_of(n10));
+    _show.layout_line(out, "S3.11", t.unrounded_of(n11));
+    t.hoisted_line(out, "S3.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "S3.0r", t.final_of(n0));
+    _show.layout_line(out, "S3.1r", t.final_of(n1));
+    _show.layout_line(out, "S3.2r", t.final_of(n2));
+    _show.layout_line(out, "S3.3r", t.final_of(n3));
+    _show.layout_line(out, "S3.4r", t.final_of(n4));
+    _show.layout_line(out, "S3.5r", t.final_of(n5));
+    _show.layout_line(out, "S3.6r", t.final_of(n6));
+    _show.layout_line(out, "S3.7r", t.final_of(n7));
+    _show.layout_line(out, "S3.8r", t.final_of(n8));
+    _show.layout_line(out, "S3.9r", t.final_of(n9));
+    _show.layout_line(out, "S3.10r", t.final_of(n10));
+    _show.layout_line(out, "S3.11r", t.final_of(n11));
+}
+
+/// an Area with align-items and justify-items, and a static position in one axis only.
+fn case_s4(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    s0.justify_items = sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default };
+    s0.align_items = sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default };
+    let n0 = t.add(s0, _tree_oof.Content.Area);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.auto() };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(10.0) };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Start, safety: sty.AlignmentSafety.Default });
+    s4.margin = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.length(6.0), bottom: sty.LengthPercentageAuto.length(2.0) };
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    let n5 = t.add(s5, _tree_oof.Content.Text { width: 300.0, line: 20.0 });
+    t.add_child(parent: n0, child: n5);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "S4.0", t.unrounded_of(n0));
+    _show.layout_line(out, "S4.1", t.unrounded_of(n1));
+    _show.layout_line(out, "S4.2", t.unrounded_of(n2));
+    _show.layout_line(out, "S4.3", t.unrounded_of(n3));
+    _show.layout_line(out, "S4.4", t.unrounded_of(n4));
+    _show.layout_line(out, "S4.5", t.unrounded_of(n5));
+    t.hoisted_line(out, "S4.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "S4.0r", t.final_of(n0));
+    _show.layout_line(out, "S4.1r", t.final_of(n1));
+    _show.layout_line(out, "S4.2r", t.final_of(n2));
+    _show.layout_line(out, "S4.3r", t.final_of(n3));
+    _show.layout_line(out, "S4.4r", t.final_of(n4));
+    _show.layout_line(out, "S4.5r", t.final_of(n5));
+}
+
+/// an rtl Stack: static positions from the right; self-start and self-end of ltr boxes.
+fn case_s5(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    s0.direction = sty.Direction.Rtl;
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    let s2 = sty.Style.default(a);
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 100.0, height: 30.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.SelfStart, safety: sty.AlignmentSafety.Default });
+    s3.direction = sty.Direction.Ltr;
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.SelfEnd, safety: sty.AlignmentSafety.Default });
+    s4.direction = sty.Direction.Ltr;
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    s5.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.SelfEnd, safety: sty.AlignmentSafety.Default });
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.position = sty.Position.Absolute;
+    s6.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default });
+    let n6 = t.add(s6, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n6);
+    var s7 = sty.Style.default(a);
+    s7.position = sty.Position.Absolute;
+    s7.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default });
+    s7.margin = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n7 = t.add(s7, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n7);
+    var s8 = sty.Style.default(a);
+    s8.position = sty.Position.Absolute;
+    s8.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Safe });
+    let n8 = t.add(s8, _tree_oof.Content.Fixed { width: 500.0, height: 20.0 });
+    t.add_child(parent: n0, child: n8);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "S5.0", t.unrounded_of(n0));
+    _show.layout_line(out, "S5.1", t.unrounded_of(n1));
+    _show.layout_line(out, "S5.2", t.unrounded_of(n2));
+    _show.layout_line(out, "S5.3", t.unrounded_of(n3));
+    _show.layout_line(out, "S5.4", t.unrounded_of(n4));
+    _show.layout_line(out, "S5.5", t.unrounded_of(n5));
+    _show.layout_line(out, "S5.6", t.unrounded_of(n6));
+    _show.layout_line(out, "S5.7", t.unrounded_of(n7));
+    _show.layout_line(out, "S5.8", t.unrounded_of(n8));
+    t.hoisted_line(out, "S5.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "S5.0r", t.final_of(n0));
+    _show.layout_line(out, "S5.1r", t.final_of(n1));
+    _show.layout_line(out, "S5.2r", t.final_of(n2));
+    _show.layout_line(out, "S5.3r", t.final_of(n3));
+    _show.layout_line(out, "S5.4r", t.final_of(n4));
+    _show.layout_line(out, "S5.5r", t.final_of(n5));
+    _show.layout_line(out, "S5.6r", t.final_of(n6));
+    _show.layout_line(out, "S5.7r", t.final_of(n7));
+    _show.layout_line(out, "S5.8r", t.final_of(n8));
+}
+
+/// an rtl Area.
+fn case_s6(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    s0.direction = sty.Direction.Rtl;
+    let n0 = t.add(s0, _tree_oof.Content.Area);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default });
+    s2.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default });
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default });
+    s3.align_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default });
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    s4.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Safe });
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 500.0, height: 20.0 });
+    t.add_child(parent: n0, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    s5.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.Start, safety: sty.AlignmentSafety.Safe });
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 500.0, height: 20.0 });
+    t.add_child(parent: n0, child: n5);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "S6.0", t.unrounded_of(n0));
+    _show.layout_line(out, "S6.1", t.unrounded_of(n1));
+    _show.layout_line(out, "S6.2", t.unrounded_of(n2));
+    _show.layout_line(out, "S6.3", t.unrounded_of(n3));
+    _show.layout_line(out, "S6.4", t.unrounded_of(n4));
+    _show.layout_line(out, "S6.5", t.unrounded_of(n5));
+    t.hoisted_line(out, "S6.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "S6.0r", t.final_of(n0));
+    _show.layout_line(out, "S6.1r", t.final_of(n1));
+    _show.layout_line(out, "S6.2r", t.final_of(n2));
+    _show.layout_line(out, "S6.3r", t.final_of(n3));
+    _show.layout_line(out, "S6.4r", t.final_of(n4));
+    _show.layout_line(out, "S6.5r", t.final_of(n5));
+}
+
+/// static positions surfaced through in-flow containers are moved to the containing block.
+fn case_s7(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(400.0), height: sty.Dimension.length(300.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 100.0, height: 30.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(7.0), right: sty.LengthPercentage.length(7.0), top: sty.LengthPercentage.length(7.0), bottom: sty.LengthPercentage.length(7.0) };
+    s2.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(3.0), right: sty.LengthPercentage.length(3.0), top: sty.LengthPercentage.length(3.0), bottom: sty.LengthPercentage.length(3.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n2);
+    let s3 = sty.Style.default(a);
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 40.0, height: 10.0 });
+    t.add_child(parent: n2, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n4);
+    var s5 = sty.Style.default(a);
+    s5.position = sty.Position.Absolute;
+    s5.justify_self = some(sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default });
+    s5.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(5.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n5 = t.add(s5, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n2, child: n5);
+    var s6 = sty.Style.default(a);
+    s6.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(11.0), right: sty.LengthPercentage.length(0.0), top: sty.LengthPercentage.length(13.0), bottom: sty.LengthPercentage.length(0.0) };
+    s6.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(200.0), height: sty.Dimension.length(80.0) };
+    s6.align_items = sty.AlignItems { keyword: sty.AlignItemsKeyword.End, safety: sty.AlignmentSafety.Default };
+    s6.justify_items = sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default };
+    let n6 = t.add(s6, _tree_oof.Content.Area);
+    t.add_child(parent: n2, child: n6);
+    var s7 = sty.Style.default(a);
+    s7.position = sty.Position.Absolute;
+    let n7 = t.add(s7, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n5, child: n7);
+    let s8 = sty.Style.default(a);
+    let n8 = t.add(s8, _tree_oof.Content.Fixed { width: 10.0, height: 10.0 });
+    t.add_child(parent: n5, child: n8);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "S7.0", t.unrounded_of(n0));
+    _show.layout_line(out, "S7.1", t.unrounded_of(n1));
+    _show.layout_line(out, "S7.2", t.unrounded_of(n2));
+    _show.layout_line(out, "S7.3", t.unrounded_of(n3));
+    _show.layout_line(out, "S7.4", t.unrounded_of(n4));
+    _show.layout_line(out, "S7.5", t.unrounded_of(n5));
+    _show.layout_line(out, "S7.6", t.unrounded_of(n6));
+    _show.layout_line(out, "S7.7", t.unrounded_of(n7));
+    _show.layout_line(out, "S7.8", t.unrounded_of(n8));
+    t.hoisted_line(out, "S7.0", n0);
+    t.hoisted_line(out, "S7.2", n2);
+    t.hoisted_line(out, "S7.5", n5);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "S7.0r", t.final_of(n0));
+    _show.layout_line(out, "S7.1r", t.final_of(n1));
+    _show.layout_line(out, "S7.2r", t.final_of(n2));
+    _show.layout_line(out, "S7.3r", t.final_of(n3));
+    _show.layout_line(out, "S7.4r", t.final_of(n4));
+    _show.layout_line(out, "S7.5r", t.final_of(n5));
+    _show.layout_line(out, "S7.6r", t.final_of(n6));
+    _show.layout_line(out, "S7.7r", t.final_of(n7));
+    _show.layout_line(out, "S7.8r", t.final_of(n8));
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    case_s1(&mut sys.stdout, a);
+    case_s2(&mut sys.stdout, a);
+    case_s3(&mut sys.stdout, a);
+    case_s4(&mut sys.stdout, a);
+    case_s5(&mut sys.stdout, a);
+    case_s6(&mut sys.stdout, a);
+    case_s7(&mut sys.stdout, a);
+}

@@ -1,0 +1,476 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: R1.0 at 250.0 50.0 size 300.0 200.0 | pad 5.0 5.0 5.0 5.0 | border 0.0 0.0 0.0 0.0 | margin 150.0 150.0 0.0 0.0 | over 0.0 60.0 0.0 50.0 | sb 0.0 0.0 | order 0
+// stdout: R1.1 at 10.0 10.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R1.2 at 490.0 500.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R1.3 at 5.0 5.0 size 40.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 40.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R1.0 hoisted: 1 2
+// stdout: R1.0r at 250.0 50.0 size 300.0 200.0 | pad 5.0 5.0 5.0 5.0 | border 0.0 0.0 0.0 0.0 | margin 150.0 150.0 0.0 0.0 | over 0.0 60.0 0.0 50.0 | sb 0.0 0.0 | order 0
+// stdout: R1.1r at 10.0 10.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R1.2r at 490.0 500.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R1.3r at 5.0 5.0 size 40.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 40.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R2.0 at 660.0 0.0 size 140.0 50.0 | pad 8.0 8.0 8.0 8.0 | border 2.0 2.0 2.0 2.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 136.0 0.0 78.0 | sb 0.0 0.0 | order 0
+// stdout: R2.1 at 10.0 10.0 size 120.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 120.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: R2.2 at 80.0 40.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R2.3 at 2.0 40.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R2.0 hoisted: 3 2
+// stdout: R2.0r at 660.0 0.0 size 140.0 50.0 | pad 8.0 8.0 8.0 8.0 | border 2.0 2.0 2.0 2.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 136.0 0.0 78.0 | sb 0.0 0.0 | order 0
+// stdout: R2.1r at 10.0 10.0 size 120.0 30.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 120.0 0.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: R2.2r at 80.0 40.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R2.3r at 2.0 40.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R3.0 at 85.0 25.0 size 635.0 555.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 5.0 0.0 5.0 0.0 | over 0.0 342.5 0.0 297.5 | sb 0.0 0.0 | order 0
+// stdout: R3.1 at 292.5 257.5 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R3.2 at 292.5 257.5 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R3.0 hoisted: 1 2
+// stdout: R3.0r at 85.0 25.0 size 635.0 555.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 5.0 0.0 5.0 0.0 | over 0.0 343.0 0.0 298.0 | sb 0.0 0.0 | order 0
+// stdout: R3.1r at 293.0 258.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R3.2r at 293.0 258.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R4.0 at 0.0 0.0 size 80.0 30.0 | pad 5.0 5.0 5.0 5.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 80.0 -10.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: R4.1 at 5.0 5.0 size 70.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 70.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: R4.2 at 30.0 -10.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R4.3 at 30.0 560.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R4.0 hoisted: 2 3
+// stdout: R4.0r at 0.0 0.0 size 80.0 30.0 | pad 5.0 5.0 5.0 5.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 80.0 -10.0 30.0 | sb 0.0 0.0 | order 0
+// stdout: R4.1r at 5.0 5.0 size 70.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 70.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: R4.2r at 30.0 -10.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R4.3r at 30.0 560.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R5.0 at 6.0 9.0 size 98.0 48.0 | pad 10.0 10.0 10.0 10.0 | border 4.0 4.0 4.0 4.0 | margin 6.0 0.0 9.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: R5.1 at 14.0 14.0 size 70.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 70.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: R5.2 at 444.0 4.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R5.3 at -6.0 24.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R5.4 at 14.0 34.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: R5.0 hoisted: 2 3 4
+// stdout: R5.0r at 6.0 9.0 size 98.0 48.0 | pad 10.0 10.0 10.0 10.0 | border 4.0 4.0 4.0 4.0 | margin 6.0 0.0 9.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: R5.1r at 14.0 14.0 size 70.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 70.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: R5.2r at 444.0 4.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R5.3r at -6.0 24.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R5.4r at 14.0 34.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: R6.0 at 40.0 50.0 size 300.0 200.0 | pad 0.0 0.0 0.0 0.0 | border 1.0 1.0 1.0 1.0 | margin 10.0 10.0 10.0 10.0 | over 0.0 298.0 0.0 198.0 | sb 0.0 0.0 | order 0
+// stdout: R6.1 at 249.0 159.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R6.2 at 710.0 510.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R6.3 at 1.0 1.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R6.0 hoisted: 1 2 3
+// stdout: R6.0r at 40.0 50.0 size 300.0 200.0 | pad 0.0 0.0 0.0 0.0 | border 1.0 1.0 1.0 1.0 | margin 10.0 10.0 10.0 10.0 | over 0.0 298.0 0.0 198.0 | sb 0.0 0.0 | order 0
+// stdout: R6.1r at 249.0 159.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R6.2r at 710.0 510.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R6.3r at 1.0 1.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R7.0 at 8.0 8.0 size 784.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 8.0 8.0 8.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 11.0 0.0 | order 0
+// stdout: R7.1 at 0.0 0.0 size 70.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 70.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: R7.2 at 731.0 552.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R7.3 at 731.0 -8.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R7.4 at -8.0 -8.0 size 789.0 600.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: R7.0 hoisted: 2 3 4
+// stdout: R7.0r at 8.0 8.0 size 784.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 8.0 8.0 8.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 11.0 0.0 | order 0
+// stdout: R7.1r at 0.0 0.0 size 70.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 70.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: R7.2r at 731.0 552.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R7.3r at 731.0 -8.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 2
+// stdout: R7.4r at -8.0 -8.0 size 789.0 600.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 3
+// stdout: R8.0 at 0.0 0.0 size 300.0 200.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 60.0 0.0 50.0 | sb 0.0 0.0 | order 0
+// stdout: R8.1 at 10.0 10.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R8.2 at 740.0 550.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R8.3 at 0.0 0.0 size 0.0 0.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 2
+// stdout: R8.4 at 0.0 0.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R8.0 hoisted: 1 2 4
+// stdout: R8.3 hoisted:
+// stdout: R8.0r at 0.0 0.0 size 300.0 200.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 60.0 0.0 50.0 | sb 0.0 0.0 | order 0
+// stdout: R8.1r at 10.0 10.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R8.2r at 740.0 550.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R8.3r at 0.0 0.0 size 0.0 0.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 2
+// stdout: R8.4r at 0.0 0.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R9.0 at 10.0 10.0 size 300.0 200.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 290.0 0.0 190.0 | sb 0.0 0.0 | order 0
+// stdout: R9.1 at 240.0 150.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R9.2 at 730.0 540.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R9.0 hoisted: 1 2
+// stdout: R9.0r at 10.0 10.0 size 300.0 200.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 290.0 0.0 190.0 | sb 0.0 0.0 | order 0
+// stdout: R9.1r at 240.0 150.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R9.2r at 730.0 540.0 size 50.0 40.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 1
+// stdout: R10.0 at 0.0 0.0 size 20.0 300.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 20.0 0.0 300.0 | sb 0.0 0.0 | order 0
+// stdout: R10.0 hoisted:
+// stdout: R10.0r at 0.0 0.0 size 20.0 300.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 20.0 0.0 300.0 | sb 0.0 0.0 | order 0
+// stdout: R11.0 at 690.0 535.0 size 90.0 45.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// stdout: R11.0 hoisted:
+// stdout: R11.0r at 690.0 535.0 size 90.0 45.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 50.0 0.0 40.0 | sb 0.0 0.0 | order 0
+// compute_root_layout with out-of-flow boxes: an absolute or fixed root,
+// laid out as any out-of-flow box against the viewport when both axes are
+// definite and in flow otherwise; the initial containing block of the last
+// pass, the viewport at the canvas origin, or the root's padding box in an
+// indefinite axis; relative and block roots; a scrollbar on the root; and
+// a second layout of the same tree, whose cached root keeps its hoisted
+// list. The expected lines are taffy 0.15's own, from the same trees in
+// Rust (/tmp/layout-port/oracle-oof).
+import std;
+import alloc;
+import layout.compute as compute;
+import layout.geometry as geo;
+import layout.style as sty;
+import _show;
+import _tree_oof;
+
+/// an absolute root with insets and auto margins, its children.
+fn case_r1(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Absolute;
+    s0.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(100.0), right: sty.LengthPercentageAuto.length(100.0), top: sty.LengthPercentageAuto.length(50.0), bottom: sty.LengthPercentageAuto.auto() };
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(300.0), height: sty.Dimension.length(200.0) };
+    s0.margin = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    s1.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Fixed;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(10.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(10.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    let s3 = sty.Style.default(a);
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 40.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "R1.0", t.unrounded_of(n0));
+    _show.layout_line(out, "R1.1", t.unrounded_of(n1));
+    _show.layout_line(out, "R1.2", t.unrounded_of(n2));
+    _show.layout_line(out, "R1.3", t.unrounded_of(n3));
+    t.hoisted_line(out, "R1.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R1.0r", t.final_of(n0));
+    _show.layout_line(out, "R1.1r", t.final_of(n1));
+    _show.layout_line(out, "R1.2r", t.final_of(n2));
+    _show.layout_line(out, "R1.3r", t.final_of(n3));
+}
+
+/// a fixed rtl root sized by its content, with a fixed child.
+fn case_r2(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Fixed;
+    s0.direction = sty.Direction.Rtl;
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(8.0), right: sty.LengthPercentage.length(8.0), top: sty.LengthPercentage.length(8.0), bottom: sty.LengthPercentage.length(8.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(2.0), right: sty.LengthPercentage.length(2.0), top: sty.LengthPercentage.length(2.0), bottom: sty.LengthPercentage.length(2.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 120.0, height: 30.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Fixed;
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.auto() };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "R2.0", t.unrounded_of(n0));
+    _show.layout_line(out, "R2.1", t.unrounded_of(n1));
+    _show.layout_line(out, "R2.2", t.unrounded_of(n2));
+    _show.layout_line(out, "R2.3", t.unrounded_of(n3));
+    t.hoisted_line(out, "R2.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R2.0r", t.final_of(n0));
+    _show.layout_line(out, "R2.1r", t.final_of(n1));
+    _show.layout_line(out, "R2.2r", t.final_of(n2));
+    _show.layout_line(out, "R2.3r", t.final_of(n3));
+}
+
+/// an absolute root stretched by its insets, with margins.
+fn case_r3(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Absolute;
+    s0.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.percent(0.1), right: sty.LengthPercentageAuto.percent(0.1), top: sty.LengthPercentageAuto.length(20.0), bottom: sty.LengthPercentageAuto.length(20.0) };
+    s0.margin = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(5.0), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.length(5.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    s0.justify_items = sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default };
+    s0.align_items = sty.AlignItems { keyword: sty.AlignItemsKeyword.Center, safety: sty.AlignmentSafety.Default };
+    let n0 = t.add(s0, _tree_oof.Content.Area);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Fixed;
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "R3.0", t.unrounded_of(n0));
+    _show.layout_line(out, "R3.1", t.unrounded_of(n1));
+    _show.layout_line(out, "R3.2", t.unrounded_of(n2));
+    t.hoisted_line(out, "R3.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R3.0r", t.final_of(n0));
+    _show.layout_line(out, "R3.1r", t.final_of(n1));
+    _show.layout_line(out, "R3.2r", t.final_of(n2));
+}
+
+/// an absolute root with an indefinite viewport is laid out in flow.
+fn case_r4(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Absolute;
+    s0.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(100.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(50.0), bottom: sty.LengthPercentageAuto.auto() };
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(5.0), right: sty.LengthPercentage.length(5.0), top: sty.LengthPercentage.length(5.0), bottom: sty.LengthPercentage.length(5.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 70.0, height: 20.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Fixed;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.MaxContent, height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "R4.0", t.unrounded_of(n0));
+    _show.layout_line(out, "R4.1", t.unrounded_of(n1));
+    _show.layout_line(out, "R4.2", t.unrounded_of(n2));
+    _show.layout_line(out, "R4.3", t.unrounded_of(n3));
+    t.hoisted_line(out, "R4.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R4.0r", t.final_of(n0));
+    _show.layout_line(out, "R4.1r", t.final_of(n1));
+    _show.layout_line(out, "R4.2r", t.final_of(n2));
+    _show.layout_line(out, "R4.3r", t.final_of(n3));
+}
+
+/// a static root with an indefinite height: the last pass uses its padding box there.
+fn case_r5(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.padding = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(10.0), right: sty.LengthPercentage.length(10.0), top: sty.LengthPercentage.length(10.0), bottom: sty.LengthPercentage.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(4.0), right: sty.LengthPercentage.length(4.0), top: sty.LengthPercentage.length(4.0), bottom: sty.LengthPercentage.length(4.0) };
+    s0.margin = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(6.0), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.length(9.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 70.0, height: 20.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Absolute;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Fixed;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.percent(0.5), bottom: sty.LengthPercentageAuto.auto() };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Absolute;
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n4);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(500.0), height: sty.AvailableSpace.MaxContent });
+    _show.layout_line(out, "R5.0", t.unrounded_of(n0));
+    _show.layout_line(out, "R5.1", t.unrounded_of(n1));
+    _show.layout_line(out, "R5.2", t.unrounded_of(n2));
+    _show.layout_line(out, "R5.3", t.unrounded_of(n3));
+    _show.layout_line(out, "R5.4", t.unrounded_of(n4));
+    t.hoisted_line(out, "R5.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R5.0r", t.final_of(n0));
+    _show.layout_line(out, "R5.1r", t.final_of(n1));
+    _show.layout_line(out, "R5.2r", t.final_of(n2));
+    _show.layout_line(out, "R5.3r", t.final_of(n3));
+    _show.layout_line(out, "R5.4r", t.final_of(n4));
+}
+
+/// a relative root offset by its insets; its fixed children against the viewport.
+fn case_r6(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(30.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(40.0), bottom: sty.LengthPercentageAuto.auto() };
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(300.0), height: sty.Dimension.length(200.0) };
+    s0.margin = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.length(10.0), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.length(10.0) };
+    s0.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(1.0), right: sty.LengthPercentage.length(1.0), top: sty.LengthPercentage.length(1.0), bottom: sty.LengthPercentage.length(1.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    s1.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Fixed;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Fixed;
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "R6.0", t.unrounded_of(n0));
+    _show.layout_line(out, "R6.1", t.unrounded_of(n1));
+    _show.layout_line(out, "R6.2", t.unrounded_of(n2));
+    _show.layout_line(out, "R6.3", t.unrounded_of(n3));
+    t.hoisted_line(out, "R6.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R6.0r", t.final_of(n0));
+    _show.layout_line(out, "R6.1r", t.final_of(n1));
+    _show.layout_line(out, "R6.2r", t.final_of(n2));
+    _show.layout_line(out, "R6.3r", t.final_of(n3));
+}
+
+/// a block root stretched to the viewport, with a scrollbar.
+fn case_r7(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.display = sty.Display.Block;
+    s0.margin = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(8.0), right: sty.LengthPercentageAuto.length(8.0), top: sty.LengthPercentageAuto.length(8.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    s0.overflow = geo.Point(sty.Overflow) { x: sty.Overflow.Visible, y: sty.Overflow.Scroll };
+    s0.scrollbar_width = 11.0;
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    let s1 = sty.Style.default(a);
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 70.0, height: 20.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Fixed;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    var s3 = sty.Style.default(a);
+    s3.position = sty.Position.Absolute;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n3 = t.add(s3, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Fixed;
+    s4.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(0.0), right: sty.LengthPercentageAuto.length(0.0), top: sty.LengthPercentageAuto.length(0.0), bottom: sty.LengthPercentageAuto.length(0.0) };
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n4);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "R7.0", t.unrounded_of(n0));
+    _show.layout_line(out, "R7.1", t.unrounded_of(n1));
+    _show.layout_line(out, "R7.2", t.unrounded_of(n2));
+    _show.layout_line(out, "R7.3", t.unrounded_of(n3));
+    _show.layout_line(out, "R7.4", t.unrounded_of(n4));
+    t.hoisted_line(out, "R7.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R7.0r", t.final_of(n0));
+    _show.layout_line(out, "R7.1r", t.final_of(n1));
+    _show.layout_line(out, "R7.2r", t.final_of(n2));
+    _show.layout_line(out, "R7.3r", t.final_of(n3));
+    _show.layout_line(out, "R7.4r", t.final_of(n4));
+}
+
+/// the same tree laid out twice: cached roots keep their hoisted lists.
+fn case_r8(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Relative;
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(300.0), height: sty.Dimension.length(200.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    s1.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Fixed;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(10.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(10.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    let s3 = sty.Style.default(a);
+    let n3 = t.add(s3, _tree_oof.Content.Stack);
+    t.add_child(parent: n0, child: n3);
+    var s4 = sty.Style.default(a);
+    s4.position = sty.Position.Fixed;
+    let n4 = t.add(s4, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n3, child: n4);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "R8.0", t.unrounded_of(n0));
+    _show.layout_line(out, "R8.1", t.unrounded_of(n1));
+    _show.layout_line(out, "R8.2", t.unrounded_of(n2));
+    _show.layout_line(out, "R8.3", t.unrounded_of(n3));
+    _show.layout_line(out, "R8.4", t.unrounded_of(n4));
+    t.hoisted_line(out, "R8.0", n0);
+    t.hoisted_line(out, "R8.3", n3);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R8.0r", t.final_of(n0));
+    _show.layout_line(out, "R8.1r", t.final_of(n1));
+    _show.layout_line(out, "R8.2r", t.final_of(n2));
+    _show.layout_line(out, "R8.3r", t.final_of(n3));
+    _show.layout_line(out, "R8.4r", t.final_of(n4));
+}
+
+/// an absolute root laid out twice, with children of both kinds.
+fn case_r9(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Absolute;
+    s0.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.length(10.0), bottom: sty.LengthPercentageAuto.auto() };
+    s0.size = geo.Size(sty.Dimension) { width: sty.Dimension.length(300.0), height: sty.Dimension.length(200.0) };
+    let n0 = t.add(s0, _tree_oof.Content.Stack);
+    var s1 = sty.Style.default(a);
+    s1.position = sty.Position.Absolute;
+    s1.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(10.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(10.0) };
+    let n1 = t.add(s1, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n1);
+    var s2 = sty.Style.default(a);
+    s2.position = sty.Position.Fixed;
+    s2.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(10.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(10.0) };
+    let n2 = t.add(s2, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    t.add_child(parent: n0, child: n2);
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "R9.0", t.unrounded_of(n0));
+    _show.layout_line(out, "R9.1", t.unrounded_of(n1));
+    _show.layout_line(out, "R9.2", t.unrounded_of(n2));
+    t.hoisted_line(out, "R9.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R9.0r", t.final_of(n0));
+    _show.layout_line(out, "R9.1r", t.final_of(n1));
+    _show.layout_line(out, "R9.2r", t.final_of(n2));
+}
+
+/// a fixed leaf root with a min-content viewport width is laid out in flow.
+fn case_r10(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Fixed;
+    s0.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.length(10.0), right: sty.LengthPercentageAuto.auto(), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.auto() };
+    let n0 = t.add(s0, _tree_oof.Content.Text { width: 300.0, line: 20.0 });
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.MinContent, height: sty.AvailableSpace.definite(300.0) });
+    _show.layout_line(out, "R10.0", t.unrounded_of(n0));
+    t.hoisted_line(out, "R10.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R10.0r", t.final_of(n0));
+}
+
+/// a fixed leaf root sized by aspect ratio and min size.
+fn case_r11(out: &mut std.Output, a: alloc.Allocator) {
+    var t = _tree_oof.TestTree.init(a);
+    var s0 = sty.Style.default(a);
+    s0.position = sty.Position.Fixed;
+    s0.inset = geo.Rect(sty.LengthPercentageAuto) { left: sty.LengthPercentageAuto.auto(), right: sty.LengthPercentageAuto.length(20.0), top: sty.LengthPercentageAuto.auto(), bottom: sty.LengthPercentageAuto.length(20.0) };
+    s0.aspect_ratio = some(2.0);
+    s0.min_size = geo.Size(sty.LengthPercentageAuto) { width: sty.LengthPercentageAuto.length(90.0), height: sty.LengthPercentageAuto.auto() };
+    let n0 = t.add(s0, _tree_oof.Content.Fixed { width: 50.0, height: 40.0 });
+    compute.compute_root_layout(&mut t, n0, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(800.0), height: sty.AvailableSpace.definite(600.0) });
+    _show.layout_line(out, "R11.0", t.unrounded_of(n0));
+    t.hoisted_line(out, "R11.0", n0);
+    compute.round_layout(&mut t, n0);
+    _show.layout_line(out, "R11.0r", t.final_of(n0));
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    case_r1(&mut sys.stdout, a);
+    case_r2(&mut sys.stdout, a);
+    case_r3(&mut sys.stdout, a);
+    case_r4(&mut sys.stdout, a);
+    case_r5(&mut sys.stdout, a);
+    case_r6(&mut sys.stdout, a);
+    case_r7(&mut sys.stdout, a);
+    case_r8(&mut sys.stdout, a);
+    case_r9(&mut sys.stdout, a);
+    case_r10(&mut sys.stdout, a);
+    case_r11(&mut sys.stdout, a);
+}
