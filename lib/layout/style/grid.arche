@@ -1,0 +1,823 @@
+/// style.grid: taffy 0.15's style/grid.rs, the CSS Grid styles, with the
+/// grid line coordinates of compute/grid/types/coordinates.rs that they
+/// are written in (GridLine, OriginZeroLine).
+///
+/// taffy's custom identifiers (named lines and areas, its CheapCloneStr S)
+/// are alloc.Symbol here, so every type stays copyable; the tree gives
+/// their text (LayoutTree.ident_text). The methods taffy gives
+/// Line<GridPlacement> and its kin are methods of geometry.Line(T), which
+/// choose their body by T.
+import alloc;
+import layout.geometry as geo;
+import layout.style as sty;
+
+/// The most tracks a grid has in an axis (MAX_GRID_TRACKS).
+pub const MAX_GRID_TRACKS: u16 = 10000;
+/// The smallest origin-zero line (MIN_OZ_LINE).
+pub const MIN_OZ_LINE: i16 = -10000;
+/// The largest origin-zero line (MAX_OZ_LINE).
+pub const MAX_OZ_LINE: i16 = 10000;
+
+/// grid-template-areas (GridTemplateAreas).
+pub type GridTemplateAreas = struct {
+    /// The named areas.
+    pub areas: alloc.List(GridTemplateArea),
+    /// The rows the template spans.
+    pub row_count: u16,
+    /// The columns the template spans.
+    pub column_count: u16,
+}
+
+/// One named area of grid-template-areas, in grid lines from 1
+/// (GridTemplateArea).
+pub type GridTemplateArea = struct {
+    /// The area's name.
+    pub name: alloc.Symbol,
+    /// Its first row line.
+    pub row_start: u16,
+    /// Its last row line.
+    pub row_end: u16,
+    /// Its first column line.
+    pub column_start: u16,
+    /// Its last column line.
+    pub column_end: u16,
+}
+
+/// A named grid line (NamedGridLine).
+pub type NamedGridLine = struct {
+    /// Its name.
+    pub name: alloc.Symbol,
+    /// Its line index.
+    pub index: u16,
+}
+
+/// The axis of a grid area (GridAreaAxis).
+pub type GridAreaAxis = enum {
+    /// Rows.
+    Row,
+    /// Columns.
+    Column,
+}
+
+/// The edge of a grid area (GridAreaEnd).
+pub type GridAreaEnd = enum {
+    /// Its start.
+    Start,
+    /// Its end.
+    End,
+}
+
+/// grid-auto-flow (GridAutoFlow).
+pub type GridAutoFlow = enum {
+    /// row.
+    Row,
+    /// column.
+    Column,
+    /// row dense.
+    RowDense,
+    /// column dense.
+    ColumnDense,
+
+    /// Whether the dense packing is used.
+    pub fn is_dense(self: GridAutoFlow) -> bool {
+        return self == GridAutoFlow.RowDense or self == GridAutoFlow.ColumnDense;
+    }
+
+    /// The axis items are placed along first: horizontal for row.
+    pub fn primary_axis(self: GridAutoFlow) -> geo.AbsoluteAxis {
+        if self == GridAutoFlow.Row or self == GridAutoFlow.RowDense {
+            return geo.AbsoluteAxis.Horizontal;
+        }
+        return geo.AbsoluteAxis.Vertical;
+    }
+}
+
+/// A grid line as CSS numbers it: from 1 at the start, from -1 at the end
+/// (GridLine).
+pub type GridLine = struct {
+    /// The CSS line number.
+    pub value: i16,
+
+    /// GridLine::from(i16).
+    pub fn from(value: i16) -> GridLine {
+        return GridLine { value: value };
+    }
+
+    /// The number.
+    pub fn as_i16(self: GridLine) -> i16 {
+        return self.value;
+    }
+
+    /// The line in origin-zero coordinates; line 0 is invalid.
+    pub fn into_origin_zero_line(self: GridLine, explicit_track_count: u16) -> OriginZeroLine {
+        let explicit_line_count = (explicit_track_count as i32) + 1;
+        var oz_line: i32 = 0;
+        if self.value > 0 {
+            oz_line = (self.value as i32) - 1;
+        } else if self.value < 0 {
+            oz_line = (self.value as i32) + explicit_line_count;
+        } else {
+            panic("Grid line of zero is invalid");
+        }
+        return OriginZeroLine.clamped(oz_line);
+    }
+}
+
+/// A grid line counted from 0 at the explicit grid's start; negative lines
+/// are before it (OriginZeroLine).
+pub type OriginZeroLine = struct {
+    /// The line.
+    pub value: i16,
+
+    /// The line, clamped to MIN_OZ_LINE..=MAX_OZ_LINE.
+    pub fn clamped(line: i32) -> OriginZeroLine {
+        var v = line;
+        if v < (MIN_OZ_LINE as i32) {
+            v = MIN_OZ_LINE as i32;
+        }
+        if v > (MAX_OZ_LINE as i32) {
+            v = MAX_OZ_LINE as i32;
+        }
+        return OriginZeroLine { value: v as i16 };
+    }
+
+    /// self + rhs.
+    pub fn add(self: OriginZeroLine, rhs: OriginZeroLine) -> OriginZeroLine {
+        return OriginZeroLine { value: self.value + rhs.value };
+    }
+
+    /// self - rhs.
+    pub fn sub(self: OriginZeroLine, rhs: OriginZeroLine) -> OriginZeroLine {
+        return OriginZeroLine { value: self.value - rhs.value };
+    }
+
+    /// self + n tracks (Add<u16>; n as i16 wraps as Rust's `as` does).
+    pub fn add_u16(self: OriginZeroLine, n: u16) -> OriginZeroLine {
+        return OriginZeroLine { value: self.value + (n as% i16) };
+    }
+
+    /// self - n tracks (Sub<u16>).
+    pub fn sub_u16(self: OriginZeroLine, n: u16) -> OriginZeroLine {
+        return OriginZeroLine { value: self.value - (n as% i16) };
+    }
+
+    /// The smaller line (Ord::min).
+    pub fn min(self: OriginZeroLine, other: OriginZeroLine) -> OriginZeroLine {
+        if other.value < self.value {
+            return other;
+        }
+        return self;
+    }
+
+    /// The larger line (Ord::max).
+    pub fn max(self: OriginZeroLine, other: OriginZeroLine) -> OriginZeroLine {
+        if other.value > self.value {
+            return other;
+        }
+        return self;
+    }
+
+    /// The line as CSS numbers it.
+    pub fn into_grid_line(self: OriginZeroLine, explicit_track_count: u16) -> GridLine {
+        let explicit_line_count = explicit_track_count + 1;
+        if self.value >= 0 {
+            return GridLine { value: self.value + 1 };
+        }
+        return GridLine { value: self.value - (explicit_line_count as% i16) };
+    }
+
+    /// How many implicit tracks before the explicit grid the line needs.
+    pub fn implied_negative_implicit_tracks(self: OriginZeroLine) -> u16 {
+        if self.value < 0 {
+            return ((0 - (self.value as i32)) as u16);
+        }
+        return 0;
+    }
+
+    /// How many implicit tracks after the explicit grid the line needs.
+    pub fn implied_positive_implicit_tracks(self: OriginZeroLine, explicit_track_count: u16) -> u16 {
+        if (self.value as i32) > (explicit_track_count as i32) {
+            return (self.value as u16) - explicit_track_count;
+        }
+        return 0;
+    }
+}
+
+/// A placement in origin-zero lines: auto, a line or a span
+/// (OriginZeroGridPlacement, taffy's GenericGridPlacement<OriginZeroLine>).
+pub type OriginZeroGridPlacement = enum {
+    /// auto.
+    Auto,
+    /// A line.
+    Line { line: OriginZeroLine },
+    /// span n.
+    Span { span: u16 },
+
+    /// Line<OriginZeroGridPlacement>::indefinite_span: the span of a
+    /// placement with at most one line; two lines are a definite placement.
+    pub fn indefinite_span(start: OriginZeroGridPlacement, end: OriginZeroGridPlacement) -> u16 {
+        match start {
+            .Line { .. } => {
+                match end {
+                    .Auto => { return 1; }
+                    .Span { span } => { return span; }
+                    .Line { .. } => { panic("indefinite_span should only be called on indefinite grid tracks"); }
+                }
+            }
+            .Auto => {
+                match end {
+                    .Line { .. } => { return 1; }
+                    .Auto => { return 1; }
+                    .Span { span } => { return span; }
+                }
+            }
+            .Span { span } => { return span; }
+        }
+    }
+}
+
+/// A placement in CSS line numbers, without names: auto, a line or a span
+/// (NonNamedGridPlacement, taffy's GenericGridPlacement<GridLine>).
+pub type NonNamedGridPlacement = enum {
+    /// auto.
+    Auto,
+    /// A line.
+    Line { line: GridLine },
+    /// span n.
+    Span { span: u16 },
+
+    /// The placement in origin-zero lines; line 0 is auto.
+    pub fn into_origin_zero_placement(self: NonNamedGridPlacement, explicit_track_count: u16) -> OriginZeroGridPlacement {
+        match self {
+            .Auto => { return OriginZeroGridPlacement.Auto; }
+            .Span { span } => { return OriginZeroGridPlacement.Span { span: clamp_span(span) }; }
+            .Line { line } => {
+                if line.as_i16() == 0 {
+                    return OriginZeroGridPlacement.Auto;
+                }
+                return OriginZeroGridPlacement.Line { line: line.into_origin_zero_line(explicit_track_count) };
+            }
+        }
+    }
+
+    /// Line<NonNamedGridPlacement>::indefinite_span.
+    pub fn indefinite_span(start: NonNamedGridPlacement, end: NonNamedGridPlacement) -> u16 {
+        match start {
+            .Line { .. } => {
+                match end {
+                    .Auto => { return 1; }
+                    .Span { span } => { return span; }
+                    .Line { .. } => { panic("indefinite_span should only be called on indefinite grid tracks"); }
+                }
+            }
+            .Auto => {
+                match end {
+                    .Line { .. } => { return 1; }
+                    .Auto => { return 1; }
+                    .Span { span } => { return span; }
+                }
+            }
+            .Span { span } => { return span; }
+        }
+    }
+}
+
+/// span n clamped to 1..=MAX_GRID_TRACKS.
+fn clamp_span(span: u16) -> u16 {
+    if span < 1 {
+        return 1;
+    }
+    if span > MAX_GRID_TRACKS {
+        return MAX_GRID_TRACKS;
+    }
+    return span;
+}
+
+/// grid-row-start and its kin (GridPlacement).
+pub type GridPlacement = enum {
+    /// auto.
+    Auto,
+    /// A line number.
+    Line { line: GridLine },
+    /// A named line: the index-th line of that name.
+    NamedLine { name: alloc.Symbol, index: i16 },
+    /// span n.
+    Span { span: u16 },
+    /// span n <name>.
+    NamedSpan { name: alloc.Symbol, span: u16 },
+
+    /// TaffyGridLine::from_line_index.
+    pub fn from_line_index(index: i16) -> GridPlacement {
+        return GridPlacement.Line { line: GridLine { value: index } };
+    }
+
+    /// TaffyGridSpan::from_span.
+    pub fn from_span(span: u16) -> GridPlacement {
+        return GridPlacement.Span { span: span };
+    }
+
+    /// The placement in origin-zero lines, named lines as auto.
+    pub fn into_origin_zero_placement_ignoring_named(self: GridPlacement, explicit_track_count: u16) -> OriginZeroGridPlacement {
+        match self {
+            .Auto => { return OriginZeroGridPlacement.Auto; }
+            .Span { span } => { return OriginZeroGridPlacement.Span { span: clamp_span(span) }; }
+            .Line { line } => {
+                if line.as_i16() == 0 {
+                    return OriginZeroGridPlacement.Auto;
+                }
+                return OriginZeroGridPlacement.Line { line: line.into_origin_zero_line(explicit_track_count) };
+            }
+            .NamedLine { .. } => { return OriginZeroGridPlacement.Auto; }
+            .NamedSpan { .. } => { return OriginZeroGridPlacement.Auto; }
+        }
+    }
+}
+
+/// Line<GridPlacement>::from_line_index: that line, then auto.
+pub fn placement_line_from_index(index: i16) -> geo.Line(GridPlacement) {
+    return geo.Line(GridPlacement) { start: GridPlacement.from_line_index(index), end: GridPlacement.Auto };
+}
+
+/// Line<GridPlacement>::from_span: that span, then auto.
+pub fn placement_line_from_span(span: u16) -> geo.Line(GridPlacement) {
+    return geo.Line(GridPlacement) { start: GridPlacement.from_span(span), end: GridPlacement.Auto };
+}
+
+/// The upper size of a track (MaxTrackSizingFunction); `inner` is taffy's
+/// `.0`.
+pub type MaxTrackSizingFunction = struct {
+    /// The value.
+    pub inner: sty.CompactLength,
+
+    /// A length.
+    pub fn length(value: f32) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.length(value) };
+    }
+
+    /// A percentage, a fraction.
+    pub fn percent(value: f32) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.percent(value) };
+    }
+
+    /// auto.
+    pub fn auto() -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.auto() };
+    }
+
+    /// min-content.
+    pub fn min_content() -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.min_content() };
+    }
+
+    /// max-content.
+    pub fn max_content() -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.max_content() };
+    }
+
+    /// fit-content(<length>).
+    pub fn fit_content_px(limit: f32) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.fit_content_px(limit) };
+    }
+
+    /// fit-content(<percentage>), a fraction.
+    pub fn fit_content_percent(limit: f32) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.fit_content_percent(limit) };
+    }
+
+    /// fit-content() of a length, percentage or calc.
+    pub fn fit_content(lp: sty.LengthPercentage) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.fit_content(lp) };
+    }
+
+    /// fr.
+    pub fn fr(value: f32) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.fr(value) };
+    }
+
+    /// calc().
+    pub fn calc(c: sty.Calc) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.calc(c) };
+    }
+
+    /// fit-content(calc()).
+    pub fn fit_content_calc(c: sty.Calc) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.fit_content_calc(c) };
+    }
+
+    /// ZERO.
+    pub fn zero() -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: sty.CompactLength.zero() };
+    }
+
+    /// From<LengthPercentage>.
+    pub fn from_lp(lp: sty.LengthPercentage) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: lp.inner };
+    }
+
+    /// From<LengthPercentageAuto>.
+    pub fn from_lpa(lpa: sty.LengthPercentageAuto) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: lpa.inner };
+    }
+
+    /// From<Dimension>: the fit-content keyword, stretch and content are
+    /// auto.
+    pub fn from_dimension(d: sty.Dimension) -> MaxTrackSizingFunction {
+        let t = d.inner.tag();
+        if t == sty.FIT_CONTENT_KEYWORD_TAG or t == sty.STRETCH_TAG or t == sty.CONTENT_TAG {
+            return MaxTrackSizingFunction.auto();
+        }
+        return MaxTrackSizingFunction { inner: d.inner };
+    }
+
+    /// From<MinTrackSizingFunction>.
+    pub fn from_min(m: MinTrackSizingFunction) -> MaxTrackSizingFunction {
+        return MaxTrackSizingFunction { inner: m.inner };
+    }
+
+    /// The CompactLength.
+    pub fn into_raw(self: MaxTrackSizingFunction) -> sty.CompactLength {
+        return self.inner;
+    }
+
+    /// Whether this is intrinsic.
+    pub fn is_intrinsic(self: MaxTrackSizingFunction) -> bool {
+        return self.inner.is_intrinsic();
+    }
+
+    /// Whether this is auto, max-content or fit-content(...).
+    pub fn is_max_content_alike(self: MaxTrackSizingFunction) -> bool {
+        return self.inner.is_max_content_alike();
+    }
+
+    /// Whether this is fr.
+    pub fn is_fr(self: MaxTrackSizingFunction) -> bool {
+        return self.inner.is_fr();
+    }
+
+    /// Whether this is auto.
+    pub fn is_auto(self: MaxTrackSizingFunction) -> bool {
+        return self.inner.is_auto();
+    }
+
+    /// Whether this is min-content.
+    pub fn is_min_content(self: MaxTrackSizingFunction) -> bool {
+        return self.inner.is_min_content();
+    }
+
+    /// Whether this is max-content.
+    pub fn is_max_content(self: MaxTrackSizingFunction) -> bool {
+        return self.inner.is_max_content();
+    }
+
+    /// Whether this is fit-content(...).
+    pub fn is_fit_content(self: MaxTrackSizingFunction) -> bool {
+        return self.inner.is_fit_content();
+    }
+
+    /// Whether this is max-content or fit-content(...).
+    pub fn is_max_or_fit_content(self: MaxTrackSizingFunction) -> bool {
+        return self.inner.is_max_or_fit_content();
+    }
+
+    /// Whether this has a definite value given the parent size.
+    pub fn has_definite_value(self: MaxTrackSizingFunction, parent_size: ?f32) -> bool {
+        match self.inner {
+            .Length { .. } => { return true; }
+            .Percent { .. } => { return is_some_f32(parent_size); }
+            .Calc { .. } => { return is_some_f32(parent_size); }
+            _ => { return false; }
+        }
+    }
+
+    /// The definite value of a length, percentage or calc().
+    pub fn definite_value(self: MaxTrackSizingFunction, parent_size: ?f32) -> ?f32 {
+        return definite_value_of(self.inner, parent_size);
+    }
+
+    /// The limit of fit-content(...).
+    pub fn fit_content_limit(self: MaxTrackSizingFunction, parent_size: ?f32) -> ?f32 {
+        match self.inner {
+            .FitContentPx { value } => { return value; }
+            .FitContentPercent { value } => {
+                match parent_size {
+                    some(size) => { return value * size; }
+                    none => { return none; }
+                }
+            }
+            .FitContentCalc { calc } => {
+                match parent_size {
+                    some(size) => { return calc.resolve(size); }
+                    none => { return none; }
+                }
+            }
+            _ => { return none; }
+        }
+    }
+
+    /// The fit-content limit, or else the definite value.
+    pub fn definite_limit(self: MaxTrackSizingFunction, parent_size: ?f32) -> ?f32 {
+        match self.inner {
+            .FitContentPx { .. } => { return self.fit_content_limit(parent_size); }
+            .FitContentPercent { .. } => { return self.fit_content_limit(parent_size); }
+            .FitContentCalc { .. } => { return self.fit_content_limit(parent_size); }
+            _ => { return self.definite_value(parent_size); }
+        }
+    }
+
+    /// The size a percentage or calc() resolves to.
+    pub fn resolved_percentage_size(self: MaxTrackSizingFunction, parent_size: f32) -> ?f32 {
+        return self.inner.resolved_percentage_size(parent_size);
+    }
+
+    /// Whether this depends on a percentage basis.
+    pub fn uses_percentage(self: MaxTrackSizingFunction) -> bool {
+        return self.inner.uses_percentage();
+    }
+}
+
+/// The lower size of a track (MinTrackSizingFunction).
+pub type MinTrackSizingFunction = struct {
+    /// The value.
+    pub inner: sty.CompactLength,
+
+    /// A length.
+    pub fn length(value: f32) -> MinTrackSizingFunction {
+        return MinTrackSizingFunction { inner: sty.CompactLength.length(value) };
+    }
+
+    /// A percentage, a fraction.
+    pub fn percent(value: f32) -> MinTrackSizingFunction {
+        return MinTrackSizingFunction { inner: sty.CompactLength.percent(value) };
+    }
+
+    /// auto.
+    pub fn auto() -> MinTrackSizingFunction {
+        return MinTrackSizingFunction { inner: sty.CompactLength.auto() };
+    }
+
+    /// min-content.
+    pub fn min_content() -> MinTrackSizingFunction {
+        return MinTrackSizingFunction { inner: sty.CompactLength.min_content() };
+    }
+
+    /// max-content.
+    pub fn max_content() -> MinTrackSizingFunction {
+        return MinTrackSizingFunction { inner: sty.CompactLength.max_content() };
+    }
+
+    /// calc().
+    pub fn calc(c: sty.Calc) -> MinTrackSizingFunction {
+        return MinTrackSizingFunction { inner: sty.CompactLength.calc(c) };
+    }
+
+    /// ZERO.
+    pub fn zero() -> MinTrackSizingFunction {
+        return MinTrackSizingFunction { inner: sty.CompactLength.zero() };
+    }
+
+    /// From<LengthPercentage>.
+    pub fn from_lp(lp: sty.LengthPercentage) -> MinTrackSizingFunction {
+        return MinTrackSizingFunction { inner: lp.inner };
+    }
+
+    /// From<LengthPercentageAuto>.
+    pub fn from_lpa(lpa: sty.LengthPercentageAuto) -> MinTrackSizingFunction {
+        return MinTrackSizingFunction { inner: lpa.inner };
+    }
+
+    /// From<Dimension>: fit-content of any kind, stretch and content are
+    /// auto.
+    pub fn from_dimension(d: sty.Dimension) -> MinTrackSizingFunction {
+        let t = d.inner.tag();
+        if t == sty.FIT_CONTENT_PX_TAG or t == sty.FIT_CONTENT_PERCENT_TAG or t == sty.FIT_CONTENT_KEYWORD_TAG or t == sty.STRETCH_TAG or t == sty.CONTENT_TAG {
+            return MinTrackSizingFunction.auto();
+        }
+        if d.inner.is_fit_content_calc() {
+            return MinTrackSizingFunction.auto();
+        }
+        return MinTrackSizingFunction { inner: d.inner };
+    }
+
+    /// From<MaxTrackSizingFunction>: fr and fit-content are auto.
+    pub fn from_max(m: MaxTrackSizingFunction) -> MinTrackSizingFunction {
+        if m.is_fr() or m.is_fit_content() {
+            return MinTrackSizingFunction.auto();
+        }
+        return MinTrackSizingFunction { inner: m.inner };
+    }
+
+    /// The CompactLength.
+    pub fn into_raw(self: MinTrackSizingFunction) -> sty.CompactLength {
+        return self.inner;
+    }
+
+    /// Whether this is intrinsic.
+    pub fn is_intrinsic(self: MinTrackSizingFunction) -> bool {
+        return self.inner.is_intrinsic();
+    }
+
+    /// Whether this is min-content or max-content.
+    pub fn is_min_or_max_content(self: MinTrackSizingFunction) -> bool {
+        return self.inner.is_min_or_max_content();
+    }
+
+    /// Whether this is fr.
+    pub fn is_fr(self: MinTrackSizingFunction) -> bool {
+        return self.inner.is_fr();
+    }
+
+    /// Whether this is auto.
+    pub fn is_auto(self: MinTrackSizingFunction) -> bool {
+        return self.inner.is_auto();
+    }
+
+    /// Whether this behaves as auto: auto, or a percentage without a basis.
+    pub fn behaves_as_auto(self: MinTrackSizingFunction, parent_size: ?f32) -> bool {
+        return self.inner.is_auto() or (not is_some_f32(parent_size) and self.inner.uses_percentage());
+    }
+
+    /// Whether this is min-content.
+    pub fn is_min_content(self: MinTrackSizingFunction) -> bool {
+        return self.inner.is_min_content();
+    }
+
+    /// Whether this is max-content.
+    pub fn is_max_content(self: MinTrackSizingFunction) -> bool {
+        return self.inner.is_max_content();
+    }
+
+    /// The definite value of a length, percentage or calc().
+    pub fn definite_value(self: MinTrackSizingFunction, parent_size: ?f32) -> ?f32 {
+        return definite_value_of(self.inner, parent_size);
+    }
+
+    /// The size a percentage or calc() resolves to.
+    pub fn resolved_percentage_size(self: MinTrackSizingFunction, parent_size: f32) -> ?f32 {
+        return self.inner.resolved_percentage_size(parent_size);
+    }
+
+    /// Whether this depends on a percentage basis.
+    pub fn uses_percentage(self: MinTrackSizingFunction) -> bool {
+        return self.inner.uses_percentage();
+    }
+}
+
+/// Whether an ?f32 is some.
+fn is_some_f32(x: ?f32) -> bool {
+    match x {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
+/// definite_value: a length, or a percentage (value * size) or calc()
+/// against parent_size.
+fn definite_value_of(c: sty.CompactLength, parent_size: ?f32) -> ?f32 {
+    match c {
+        .Length { value } => { return value; }
+        .Percent { value } => {
+            match parent_size {
+                some(size) => { return value * size; }
+                none => { return none; }
+            }
+        }
+        .Calc { calc } => {
+            match parent_size {
+                some(size) => { return calc.resolve(size); }
+                none => { return none; }
+            }
+        }
+        _ => { return none; }
+    }
+}
+
+/// A track's sizing function, minmax(min, max) (TrackSizingFunction).
+pub type TrackSizingFunction = struct {
+    /// The minimum.
+    pub min: MinTrackSizingFunction,
+    /// The maximum.
+    pub max: MaxTrackSizingFunction,
+
+    /// The minimum.
+    pub fn min_sizing_function(self: TrackSizingFunction) -> MinTrackSizingFunction {
+        return self.min;
+    }
+
+    /// The maximum.
+    pub fn max_sizing_function(self: TrackSizingFunction) -> MaxTrackSizingFunction {
+        return self.max;
+    }
+
+    /// Whether either bound is a length or percentage.
+    pub fn has_fixed_component(self: TrackSizingFunction) -> bool {
+        return self.min.inner.is_length_or_percentage() or self.max.inner.is_length_or_percentage();
+    }
+
+    /// AUTO: minmax(auto, auto).
+    pub fn auto() -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.auto(), max: MaxTrackSizingFunction.auto() };
+    }
+
+    /// MIN_CONTENT.
+    pub fn min_content() -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.min_content(), max: MaxTrackSizingFunction.min_content() };
+    }
+
+    /// MAX_CONTENT.
+    pub fn max_content() -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.max_content(), max: MaxTrackSizingFunction.max_content() };
+    }
+
+    /// ZERO.
+    pub fn zero() -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.zero(), max: MaxTrackSizingFunction.zero() };
+    }
+
+    /// fit-content(lp): minmax(auto, fit-content(lp)).
+    pub fn fit_content(lp: sty.LengthPercentage) -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.auto(), max: MaxTrackSizingFunction.fit_content(lp) };
+    }
+
+    /// A length in both bounds.
+    pub fn from_length(value: f32) -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.length(value), max: MaxTrackSizingFunction.length(value) };
+    }
+
+    /// A percentage in both bounds, a fraction.
+    pub fn from_percent(value: f32) -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.percent(value), max: MaxTrackSizingFunction.percent(value) };
+    }
+
+    /// n fr: minmax(auto, n fr).
+    pub fn from_fr(value: f32) -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.auto(), max: MaxTrackSizingFunction.fr(value) };
+    }
+
+    /// From<LengthPercentage>.
+    pub fn from_lp(lp: sty.LengthPercentage) -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.from_lp(lp), max: MaxTrackSizingFunction.from_lp(lp) };
+    }
+
+    /// From<LengthPercentageAuto>.
+    pub fn from_lpa(lpa: sty.LengthPercentageAuto) -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.from_lpa(lpa), max: MaxTrackSizingFunction.from_lpa(lpa) };
+    }
+
+    /// From<Dimension>.
+    pub fn from_dimension(d: sty.Dimension) -> TrackSizingFunction {
+        return TrackSizingFunction { min: MinTrackSizingFunction.from_dimension(d), max: MaxTrackSizingFunction.from_dimension(d) };
+    }
+}
+
+/// The count of repeat() (RepetitionCount).
+pub type RepetitionCount = enum {
+    /// auto-fill.
+    AutoFill,
+    /// auto-fit.
+    AutoFit,
+    /// A number of times.
+    Count { count: u16 },
+
+    /// Whether this is auto-fill or auto-fit.
+    pub fn is_auto(self: RepetitionCount) -> bool {
+        match self {
+            .Count { .. } => { return false; }
+            _ => { return true; }
+        }
+    }
+}
+
+/// repeat() in a track list (GridTemplateRepetition).
+pub type GridTemplateRepetition = struct {
+    /// How many times.
+    pub count: RepetitionCount,
+    /// The tracks repeated.
+    pub tracks: alloc.List(TrackSizingFunction),
+    /// The names of each line between the tracks, one more than tracks.
+    pub line_names: alloc.List(alloc.List(alloc.Symbol)),
+
+    /// The number of tracks, saturated at u16's largest.
+    pub fn track_count(self: &GridTemplateRepetition) -> u16 {
+        let n = self.tracks.len();
+        if n > 65535 {
+            return 65535;
+        }
+        return n as u16;
+    }
+}
+
+/// One entry of grid-template-rows or -columns (GridTemplateComponent).
+pub type GridTemplateComponent = enum {
+    /// A single track.
+    Single { track: TrackSizingFunction },
+    /// repeat().
+    Repeat { repetition: GridTemplateRepetition },
+
+    /// Whether this is repeat(auto-fill, ...) or repeat(auto-fit, ...).
+    pub fn is_auto_repetition(self: &GridTemplateComponent) -> bool {
+        match self {
+            .Single { .. } => { return false; }
+            .Repeat { repetition } => { return repetition.count.is_auto(); }
+        }
+    }
+}

@@ -1,0 +1,295 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: root once: computed 1 measured 1
+// stdout: root twice: computed 1 measured 1
+// stdout: root resized: computed 2 measured 2
+// stdout: measure twice: 20.0 20.0 computed 3
+// stdout: other width: 40.0 computed 4
+// stdout: first again: 20.0 computed 4
+// stdout: content size: 20.0 computed 5
+// stdout: inherent again: 20.0 computed 6
+// stdout: horizontal from both: 150.0 computed 6
+// stdout: vertical from both: computed 7
+// stdout: horizontal after vertical: computed 9
+// stdout: second chance: 1 hit, 2 gone
+// stdout: in place: 2 entries, 3.0
+// stdout: margins not cached: none none
+// stdout: other modes miss: 8 kept 1.0 2.0
+// stdout: mode change drops: final gone, 1 entry, 4.0 left
+// stdout: hidden ignored: 1.0
+// stdout: clear: true false true
+// The layout cache. Through the tree (the lines up to the axes are taffy
+// 0.15's own, from the same cases in Rust), a second identical root layout
+// and a second identical measure are served from the cache, a change of
+// width, sizing mode or requested axis is not. Then taffy's own tests of
+// Cache, ported.
+import std;
+import layout.compute as compute;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import layout.tree.cache as tcache;
+import _show;
+import _tree;
+
+/// taffy's test input: a size-only run with a known width.
+fn input(width: f32) -> lt.LayoutInput {
+    var i = _show.input(lt.RunMode.ComputeSize, lt.SizingMode.InherentSize, known: geo.size_none(), parent: geo.size_none(), geo.size_max_content());
+    i.known_dimensions.width = some(width);
+    return i;
+}
+
+/// taffy's test output: a square.
+fn output(width: f32) -> lt.LayoutOutput {
+    return lt.LayoutOutput.from_outer_size(geo.Size(f32) { width: width, height: width });
+}
+
+/// A full layout with both sizes known.
+fn perform_layout_input(width: f32, height: f32) -> lt.LayoutInput {
+    var i = input(width);
+    i.run_mode = lt.RunMode.PerformLayout;
+    i.known_dimensions = _show.some_size(width: width, height: height);
+    i.parent_size = _show.some_size(width: width, height: height);
+    return i;
+}
+
+/// The input in another mode: content size, or collapsible margins.
+fn other_mode(base: lt.LayoutInput, which: u32) -> lt.LayoutInput {
+    var i = base;
+    if which == 0 {
+        i.sizing_mode = lt.SizingMode.ContentSize;
+    } else if which == 1 {
+        i.vertical_margins_are_collapsible = geo.line_true();
+    } else if which == 2 {
+        i.vertical_margins_are_collapsible = geo.Line(bool) { start: true, end: false };
+    } else {
+        i.vertical_margins_are_collapsible = geo.Line(bool) { start: false, end: true };
+    }
+    return i;
+}
+
+/// Cache.store with an input passed by value.
+fn put(c: &mut tcache.Cache, i: lt.LayoutInput, o: lt.LayoutOutput) {
+    c.store(&i, o);
+}
+
+/// Cache.get with an input passed by value.
+fn fetch(c: &mut tcache.Cache, i: lt.LayoutInput) -> ?lt.LayoutOutput {
+    return c.get(&i);
+}
+
+/// The width of a cached result, or -1 for none.
+fn width_of(o: ?lt.LayoutOutput) -> f32 {
+    match o {
+        some(x) => { return x.size.width; }
+        none => { return -1.0; }
+    }
+}
+
+/// Whether a result is none.
+fn missing(o: ?lt.LayoutOutput) -> bool {
+    match o {
+        some(_) => { return false; }
+        none => { return true; }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let out = &mut sys.stdout;
+    var t = _tree.TestTree.init(sys.alloc);
+    var rs = sty.Style.default(sys.alloc);
+    rs.size = sty.size_from_lengths(width: 60.0, height: 40.0);
+    let r = t.add(rs, _tree.Content.Fixed { width: 10.0, height: 10.0 });
+    compute.compute_root_layout(&mut t, r, _show.def(width: 800.0, height: 600.0));
+    counts(out, "root once:", &t);
+    compute.compute_root_layout(&mut t, r, _show.def(width: 800.0, height: 600.0));
+    counts(out, "root twice:", &t);
+    compute.compute_root_layout(&mut t, r, _show.def(width: 700.0, height: 600.0));
+    counts(out, "root resized:", &t);
+
+    let n = t.add(sty.Style.default(sys.alloc), _tree.Content.Text { width: 200.0, line: 10.0 });
+    let parent = _show.some_size(width: 800.0, height: 600.0);
+    let cs = lt.RunMode.ComputeSize;
+    let inh = lt.SizingMode.InherentSize;
+    let wide = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(150.0), height: sty.AvailableSpace.MaxContent };
+    let narrow = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(50.0), height: sty.AvailableSpace.MaxContent };
+    let ia = _show.input(cs, inh, known: geo.size_none(), parent: parent, wide);
+    let ib = _show.input(cs, inh, known: geo.size_none(), parent: parent, narrow);
+    let o1 = t.compute_child_layout(n, ia);
+    let o2 = t.compute_child_layout(n, ia);
+    out.write("measure twice: ");
+    out.write_f32(o1.size.height);
+    out.write(" ");
+    out.write_f32(o2.size.height);
+    computed(out, &t);
+    let o3 = t.compute_child_layout(n, ib);
+    out.write("other width: ");
+    out.write_f32(o3.size.height);
+    computed(out, &t);
+    let o4 = t.compute_child_layout(n, ia);
+    out.write("first again: ");
+    out.write_f32(o4.size.height);
+    computed(out, &t);
+    let ic = _show.input(cs, lt.SizingMode.ContentSize, known: geo.size_none(), parent: parent, wide);
+    let o5 = t.compute_child_layout(n, ic);
+    out.write("content size: ");
+    out.write_f32(o5.size.height);
+    computed(out, &t);
+    let o6 = t.compute_child_layout(n, ia);
+    out.write("inherent again: ");
+    out.write_f32(o6.size.height);
+    computed(out, &t);
+    var h = ia;
+    h.axis = lt.RequestedAxis.Horizontal;
+    let o7 = t.compute_child_layout(n, h);
+    out.write("horizontal from both: ");
+    out.write_f32(o7.size.width);
+    computed(out, &t);
+    var v = ib;
+    v.axis = lt.RequestedAxis.Vertical;
+    _ = t.compute_child_layout(n, v);
+    out.write("vertical from both:");
+    computed(out, &t);
+    var v2 = ia;
+    v2.available_space.width = sty.AvailableSpace.definite(75.0);
+    v2.axis = lt.RequestedAxis.Vertical;
+    _ = t.compute_child_layout(n, v2);
+    var h2 = v2;
+    h2.axis = lt.RequestedAxis.Horizontal;
+    _ = t.compute_child_layout(n, h2);
+    out.write("horizontal after vertical:");
+    computed(out, &t);
+
+    // Recently used entries get a second chance before they are evicted.
+    var c = tcache.Cache.new();
+    var w: u32 = 0;
+    while w < 9 : (w += 1) {
+        put(&mut c, input(w as f32), output(w as f32));
+    }
+    put(&mut c, input(9.0), output(9.0));
+    let hit1 = width_of(fetch(&mut c, input(1.0))) == 1.0;
+    put(&mut c, input(10.0), output(10.0));
+    let hit2 = width_of(fetch(&mut c, input(1.0))) == 1.0;
+    let gone = missing(fetch(&mut c, input(2.0)));
+    if hit1 and hit2 and gone {
+        out.write("second chance: 1 hit, 2 gone\n");
+    }
+
+    // Storing an existing measurement updates it in place.
+    var d = tcache.Cache.new();
+    put(&mut d, input(1.0), output(1.0));
+    put(&mut d, input(2.0), output(2.0));
+    put(&mut d, input(1.0), output(3.0));
+    out.write("in place: ");
+    var entries: u64 = 0;
+    if not missing(fetch(&mut d, input(1.0))) {
+        entries += 1;
+    }
+    if not missing(fetch(&mut d, input(2.0))) {
+        entries += 1;
+    }
+    out.write_u64(entries);
+    out.write(" entries, ");
+    out.write_f32(width_of(fetch(&mut d, input(1.0))));
+    out.write("\n");
+
+    // Measurements that carry margin-collapse data are not cached.
+    var e = tcache.Cache.new();
+    var through = output(1.0);
+    through.margins_can_collapse_through = true;
+    put(&mut e, input(1.0), through);
+    var carried = output(2.0);
+    carried.top_margin = lt.CollapsibleMarginSet.from_margin(10.0);
+    put(&mut e, input(2.0), carried);
+    if missing(fetch(&mut e, input(1.0))) and missing(fetch(&mut e, input(2.0))) {
+        out.write("margins not cached: none none\n");
+    }
+
+    // Retrieving with another mode misses and keeps the entries.
+    var g = tcache.Cache.new();
+    put(&mut g, perform_layout_input(width: 100.0, height: 50.0), output(1.0));
+    put(&mut g, input(1.0), output(2.0));
+    var misses: u64 = 0;
+    var m: u32 = 0;
+    while m < 4 : (m += 1) {
+        if missing(fetch(&mut g, other_mode(perform_layout_input(width: 100.0, height: 50.0), m))) {
+            misses += 1;
+        }
+        if missing(fetch(&mut g, other_mode(input(1.0), m))) {
+            misses += 1;
+        }
+    }
+    out.write("other modes miss: ");
+    out.write_u64(misses);
+    out.write(" kept ");
+    out.write_f32(width_of(fetch(&mut g, perform_layout_input(width: 100.0, height: 50.0))));
+    out.write(" ");
+    out.write_f32(width_of(fetch(&mut g, input(1.0))));
+    out.write("\n");
+
+    // Storing with another mode drops every entry.
+    var ok_all = true;
+    m = 0;
+    while m < 4 : (m += 1) {
+        var k = tcache.Cache.new();
+        put(&mut k, perform_layout_input(width: 100.0, height: 50.0), output(1.0));
+        put(&mut k, input(1.0), output(2.0));
+        let other = other_mode(input(3.0), m);
+        put(&mut k, other, output(3.0));
+        ok_all = ok_all and width_of(fetch(&mut k, other)) == 3.0;
+        put(&mut k, input(4.0), output(4.0));
+        ok_all = ok_all and missing(fetch(&mut k, perform_layout_input(width: 100.0, height: 50.0)));
+        ok_all = ok_all and missing(fetch(&mut k, input(1.0)));
+        ok_all = ok_all and missing(fetch(&mut k, other));
+        ok_all = ok_all and width_of(fetch(&mut k, input(4.0))) == 4.0;
+    }
+    if ok_all {
+        out.write("mode change drops: final gone, 1 entry, 4.0 left\n");
+    }
+
+    // A hidden layout does not touch the cache.
+    var hc = tcache.Cache.new();
+    put(&mut hc, input(1.0), output(1.0));
+    put(&mut hc, lt.LayoutInput.hidden(), output(2.0));
+    out.write("hidden ignored: ");
+    out.write_f32(width_of(fetch(&mut hc, input(1.0))));
+    out.write("\n");
+
+    // clear reports whether there was something to clear.
+    let first = hc.clear();
+    let second = hc.clear();
+    out.write("clear: ");
+    write_bool(out, first);
+    out.write(" ");
+    write_bool(out, second);
+    out.write(" ");
+    write_bool(out, hc.is_empty());
+    out.write("\n");
+}
+
+/// " computed n" and a newline.
+fn computed(out: &mut std.Output, t: &_tree.TestTree) {
+    out.write(" computed ");
+    out.write_u64(t.computed as u64);
+    out.write("\n");
+}
+
+/// The tree's counters.
+fn counts(out: &mut std.Output, label: str, t: &_tree.TestTree) {
+    out.write(label);
+    out.write(" computed ");
+    out.write_u64(t.computed as u64);
+    out.write(" measured ");
+    out.write_u64(t.measured as u64);
+    out.write("\n");
+}
+
+/// true or false.
+fn write_bool(out: &mut std.Output, b: bool) {
+    if b {
+        out.write("true");
+    } else {
+        out.write("false");
+    }
+}

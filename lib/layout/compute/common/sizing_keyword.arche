@@ -1,0 +1,129 @@
+/// compute.common.sizing_keyword: taffy 0.15's
+/// compute/common/sizing_keyword.rs, the sizing keywords (min-content,
+/// max-content, fit-content, fit-content(...), stretch) of width and height.
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import layout.util;
+
+/// How a sizing keyword resolves (SizingKeywordResolution).
+pub type SizingKeywordResolution = enum {
+    /// Measure the item in this available space.
+    Measure { space: sty.AvailableSpace },
+    /// Exactly this size, unmeasured.
+    Exact { size: f32 },
+}
+
+/// resolve_sizing_keyword: the resolution of a size style that is a sizing
+/// keyword; none when it is not one or cannot resolve here (then it acts as
+/// auto). stretch_size is the stretched size (fit-content, stretch);
+/// percent_resolution_basis is what fit-content(<percentage>) resolves
+/// against.
+pub fn resolve_sizing_keyword(style: sty.Dimension, stretch_size: ?f32, percent_resolution_basis: ?f32) -> ?SizingKeywordResolution {
+    match style.inner {
+        .MinContent => { return SizingKeywordResolution.Measure { space: sty.AvailableSpace.MinContent }; }
+        .MaxContent => { return SizingKeywordResolution.Measure { space: sty.AvailableSpace.MaxContent }; }
+        .FitContentPx { value } => { return SizingKeywordResolution.Measure { space: sty.AvailableSpace.Definite { value: value } }; }
+        .FitContentPercent { value } => {
+            match percent_resolution_basis {
+                some(basis) => { return SizingKeywordResolution.Measure { space: sty.AvailableSpace.Definite { value: basis * value } }; }
+                none => { return none; }
+            }
+        }
+        .FitContentKeyword => {
+            match stretch_size {
+                some(size) => { return SizingKeywordResolution.Measure { space: sty.AvailableSpace.Definite { value: size } }; }
+                none => { return none; }
+            }
+        }
+        .FitContentCalc { calc } => {
+            match percent_resolution_basis {
+                some(basis) => { return SizingKeywordResolution.Measure { space: sty.AvailableSpace.Definite { value: calc.resolve(basis) } }; }
+                none => { return none; }
+            }
+        }
+        .Stretch => {
+            match stretch_size {
+                some(size) => { return SizingKeywordResolution.Exact { size: size }; }
+                none => { return none; }
+            }
+        }
+        _ => { return none; }
+    }
+}
+
+/// resolve_absolute_sizing_keywords: fills the known dimensions of an
+/// absolutely positioned item whose size styles are sizing keywords.
+/// area_size is its containing block; the stretch size of an axis is that
+/// less the item's insets and margins.
+pub fn resolve_absolute_sizing_keywords(tree: &mut dyn lt.LayoutTree, node: lt.NodeId, known_dimensions: &mut geo.Size(?f32), size_style: geo.Size(sty.Dimension), area_size: geo.Size(f32), inset: geo.Rect(?f32), margin: geo.Rect(?f32), sizing_mode: lt.SizingMode) {
+    let stretch_size = geo.Size(f32) {
+        width: util.f32_max(a: 0.0, b: area_size.width - util.unwrap_or(inset.left, 0.0) - util.unwrap_or(inset.right, 0.0) - util.unwrap_or(margin.left, 0.0) - util.unwrap_or(margin.right, 0.0)),
+        height: util.f32_max(a: 0.0, b: area_size.height - util.unwrap_or(inset.top, 0.0) - util.unwrap_or(inset.bottom, 0.0) - util.unwrap_or(margin.top, 0.0) - util.unwrap_or(margin.bottom, 0.0)),
+    };
+
+    var keyword_width: ?SizingKeywordResolution = none;
+    if util.is_none(known_dimensions.width) {
+        keyword_width = resolve_sizing_keyword(size_style.width, stretch_size: some(stretch_size.width), percent_resolution_basis: some(area_size.width));
+    }
+    var keyword_height: ?SizingKeywordResolution = none;
+    if util.is_none(known_dimensions.height) {
+        keyword_height = resolve_sizing_keyword(size_style.height, stretch_size: some(stretch_size.height), percent_resolution_basis: some(area_size.height));
+    }
+
+    let area = area_size.map_some();
+    // Both axes measured: one measure for both.
+    match keyword_width {
+        some(kw) => {
+            match keyword_height {
+                some(kh) => {
+                    match kw {
+                        .Measure { space: available_width } => {
+                            match kh {
+                                .Measure { space: available_height } => {
+                                    let measured_size = lt.measure_child_size_both(tree, node, known_dimensions: geo.size_none(), parent_size: area, available_space: geo.Size(sty.AvailableSpace) { width: available_width, height: available_height }, sizing_mode, geo.line_false());
+                                    known_dimensions.* = measured_size.map_some();
+                                    return;
+                                }
+                                _ => { }
+                            }
+                        }
+                        _ => { }
+                    }
+                }
+                none => { }
+            }
+        }
+        none => { }
+    }
+
+    match keyword_width {
+        some(resolution) => {
+            match resolution {
+                .Exact { size } => { known_dimensions.width = some(size); }
+                .Measure { space: available_width } => {
+                    let width = lt.measure_child_size(tree, node, known_dimensions: known_dimensions.*, parent_size: area, available_space: geo.Size(sty.AvailableSpace) { width: available_width, height: sty.AvailableSpace.Definite { value: stretch_size.height } }, sizing_mode, geo.AbsoluteAxis.Horizontal, geo.line_false());
+                    known_dimensions.width = some(width);
+                }
+            }
+        }
+        none => { }
+    }
+    match keyword_height {
+        some(resolution) => {
+            match resolution {
+                .Exact { size } => { known_dimensions.height = some(size); }
+                .Measure { space: available_height } => {
+                    var width_space = sty.AvailableSpace.Definite { value: stretch_size.width };
+                    match known_dimensions.width {
+                        some(w) => { width_space = sty.AvailableSpace.Definite { value: w }; }
+                        none => { }
+                    }
+                    let height = lt.measure_child_size(tree, node, known_dimensions: known_dimensions.*, parent_size: area, available_space: geo.Size(sty.AvailableSpace) { width: width_space, height: available_height }, sizing_mode, geo.AbsoluteAxis.Vertical, geo.line_false());
+                    known_dimensions.height = some(height);
+                }
+            }
+        }
+        none => { }
+    }
+}

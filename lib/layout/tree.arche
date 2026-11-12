@@ -1,0 +1,713 @@
+/// tree: taffy 0.15's tree/ (node.rs, layout.rs, traits.rs): node ids, what
+/// a layout takes and gives, and the one interface through which every
+/// algorithm reaches the embedder's tree.
+///
+/// taffy's traits (TraversePartialTree, LayoutPartialTree,
+/// LayoutContainingBlock, CacheTree, RoundTree and the block, flexbox and
+/// grid container traits) are one interface here, LayoutTree, used as
+/// `&mut dyn LayoutTree`. Every style getter of those traits is
+/// `get_style`, since one Style serves them all. The embedder implements
+/// it, and its compute_child_layout chooses the algorithm by display
+/// (compute.compute_cached_layout around compute_leaf_layout,
+/// compute_block_layout...), as Nimadir's Tree does.
+///
+/// taffy's LayoutPartialTreeExt helpers (measure_child_size,
+/// measure_child_size_both, perform_child_layout) are functions of this
+/// module that take the tree first. resolve_calc_value has no counterpart:
+/// calc() resolves itself (style.Calc).
+import alloc;
+import layout.compute.block as block;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.util;
+
+/// A node of the embedder's tree (NodeId): taffy's u64.
+pub type NodeId = struct {
+    /// The number.
+    pub value: u64,
+
+    /// NodeId::new.
+    pub fn new(value: u64) -> NodeId {
+        return NodeId { value: value };
+    }
+
+    /// From<usize>.
+    pub fn from_usize(index: usize) -> NodeId {
+        return NodeId { value: index as u64 };
+    }
+
+    /// usize::from(NodeId).
+    pub fn to_usize(self: NodeId) -> usize {
+        return self.value as usize;
+    }
+}
+
+/// Whether a full layout or only a size is wanted (RunMode).
+pub type RunMode = enum {
+    /// Lay out the node and its children.
+    PerformLayout,
+    /// Only the node's size is wanted.
+    ComputeSize,
+    /// The node is hidden (display: none): a null layout.
+    PerformHiddenLayout,
+}
+
+/// Whether the node's own size styles count (SizingMode).
+pub type SizingMode = enum {
+    /// Only the content counts.
+    ContentSize,
+    /// The size styles count too.
+    InherentSize,
+}
+
+/// The margins that may collapse together in block layout
+/// (CollapsibleMarginSet).
+pub type CollapsibleMarginSet = struct {
+    /// The largest positive margin.
+    positive: f32,
+    /// The smallest negative margin.
+    negative: f32,
+
+    /// CollapsibleMarginSet::ZERO.
+    pub fn zero() -> CollapsibleMarginSet {
+        return CollapsibleMarginSet { positive: 0.0, negative: 0.0 };
+    }
+
+    /// A set of one margin.
+    pub fn from_margin(margin: f32) -> CollapsibleMarginSet {
+        if margin >= 0.0 {
+            return CollapsibleMarginSet { positive: margin, negative: 0.0 };
+        }
+        return CollapsibleMarginSet { positive: 0.0, negative: margin };
+    }
+
+    /// The set with one more margin collapsed in.
+    pub fn collapse_with_margin(self: CollapsibleMarginSet, margin: f32) -> CollapsibleMarginSet {
+        var next = self;
+        if margin >= 0.0 {
+            next.positive = util.f32_max(a: self.positive, b: margin);
+        } else {
+            next.negative = util.f32_min(a: self.negative, b: margin);
+        }
+        return next;
+    }
+
+    /// The set with another set collapsed in.
+    pub fn collapse_with_set(self: CollapsibleMarginSet, other: CollapsibleMarginSet) -> CollapsibleMarginSet {
+        var next = self;
+        next.positive = util.f32_max(a: self.positive, b: other.positive);
+        next.negative = util.f32_min(a: self.negative, b: other.negative);
+        return next;
+    }
+
+    /// The collapsed margin: positive + negative.
+    pub fn resolve(self: CollapsibleMarginSet) -> f32 {
+        return self.positive + self.negative;
+    }
+
+    /// taffy's ==, f32 by f32.
+    pub fn eq(self: CollapsibleMarginSet, other: CollapsibleMarginSet) -> bool {
+        return self.positive == other.positive and self.negative == other.negative;
+    }
+}
+
+/// The axis a size is asked for (RequestedAxis).
+pub type RequestedAxis = enum {
+    /// The width.
+    Horizontal,
+    /// The height.
+    Vertical,
+    /// Both.
+    Both,
+
+    /// Horizontal and vertical swapped.
+    pub fn transpose(self: RequestedAxis) -> RequestedAxis {
+        match self {
+            .Horizontal => { return RequestedAxis.Vertical; }
+            .Vertical => { return RequestedAxis.Horizontal; }
+            .Both => { return RequestedAxis.Both; }
+        }
+    }
+
+    /// From<AbsoluteAxis>.
+    pub fn from_abs(axis: geo.AbsoluteAxis) -> RequestedAxis {
+        match axis {
+            .Horizontal => { return RequestedAxis.Horizontal; }
+            .Vertical => { return RequestedAxis.Vertical; }
+        }
+    }
+}
+
+/// What a parent asks of a child's layout (LayoutInput).
+pub type LayoutInput = struct {
+    /// A full layout or only a size.
+    pub run_mode: RunMode,
+    /// Whether the size styles count.
+    pub sizing_mode: SizingMode,
+    /// The axis wanted.
+    pub axis: RequestedAxis,
+    /// The sizes the node must take.
+    pub known_dimensions: geo.Size(?f32),
+    /// Whether each known dimension is definite for the node's content.
+    pub known_dimensions_are_definite: geo.Size(bool),
+    /// The parent's size, for percentages.
+    pub parent_size: geo.Size(?f32),
+    /// The space for the border box, margins already taken off.
+    pub available_space: geo.Size(sty.AvailableSpace),
+    /// Whether the top and bottom margins may collapse (block layout).
+    pub vertical_margins_are_collapsible: geo.Line(bool),
+
+    /// LayoutInput::HIDDEN.
+    pub fn hidden() -> LayoutInput {
+        return LayoutInput {
+            run_mode: RunMode.PerformHiddenLayout,
+            sizing_mode: SizingMode.InherentSize,
+            axis: RequestedAxis.Both,
+            known_dimensions: geo.size_none(),
+            known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+            parent_size: geo.size_none(),
+            available_space: geo.size_max_content(),
+            vertical_margins_are_collapsible: geo.line_false(),
+        };
+    }
+
+    /// Every per-axis input with its axes swapped; margins cannot collapse
+    /// across the change.
+    pub fn transpose(self: LayoutInput) -> LayoutInput {
+        return LayoutInput {
+            run_mode: self.run_mode,
+            sizing_mode: self.sizing_mode,
+            axis: self.axis.transpose(),
+            known_dimensions: self.known_dimensions.transpose(),
+            known_dimensions_are_definite: self.known_dimensions_are_definite.transpose(),
+            parent_size: self.parent_size.transpose(),
+            available_space: self.available_space.transpose(),
+            vertical_margins_are_collapsible: geo.line_false(),
+        };
+    }
+}
+
+/// A node's first and last baselines, from its border box's top
+/// (Baselines).
+pub type Baselines = struct {
+    /// The first baseline.
+    pub first: ?f32,
+    /// The last baseline.
+    pub last: ?f32,
+
+    /// Baselines::NONE.
+    pub fn none_set() -> Baselines {
+        return Baselines { first: none, last: none };
+    }
+
+    /// Only a first baseline.
+    pub fn from_first(first: ?f32) -> Baselines {
+        return Baselines { first: first, last: none };
+    }
+}
+
+/// Where an out-of-flow box's margin box goes in its static-position area
+/// (AxisStaticEdge).
+pub type AxisStaticEdge = enum {
+    /// At the start.
+    Start,
+    /// Centred.
+    Center,
+    /// At the end.
+    End,
+}
+
+/// The alignment of an out-of-flow box in its static-position area in one
+/// axis (AxisStaticAlign).
+pub type AxisStaticAlign = struct {
+    /// The edge.
+    pub keyword: AxisStaticEdge,
+    /// safe or not.
+    pub safety: sty.AlignmentSafety,
+    /// The edge when safe and the box overflows.
+    pub fallback: AxisStaticEdge,
+
+    /// A keyword without a safe fallback.
+    pub fn from_keyword(keyword: AxisStaticEdge) -> AxisStaticAlign {
+        return AxisStaticAlign { keyword: keyword, safety: sty.AlignmentSafety.Default, fallback: keyword };
+    }
+}
+
+/// The static position of an out-of-flow box in one axis
+/// (AxisStaticPosition).
+pub type AxisStaticPosition = struct {
+    /// The area, from the border box of the node holding the candidate.
+    pub area: geo.Line(f32),
+    /// The alignment in it.
+    pub align: AxisStaticAlign,
+
+    /// A zero-extent area at anchor.
+    pub fn from_edge(anchor: f32, edge: AxisStaticEdge) -> AxisStaticPosition {
+        return AxisStaticPosition { area: geo.Line(f32) { start: anchor, end: anchor }, align: AxisStaticAlign.from_keyword(edge) };
+    }
+
+    /// The box aligned in area by its self-alignment, normal and stretch as
+    /// start; the alignment must already be resolved (no self-start or
+    /// self-end).
+    pub fn from_alignment(alignment: sty.AlignSelf, area: geo.Line(f32), axis_is_rtl: bool) -> AxisStaticPosition {
+        var fallback = alignment.keyword;
+        if alignment.safety == sty.AlignmentSafety.Safe {
+            fallback = sty.AlignItemsKeyword.Start;
+        }
+        return AxisStaticPosition {
+            area: area,
+            align: AxisStaticAlign {
+                keyword: edge_for(alignment.keyword, axis_is_rtl),
+                safety: alignment.safety,
+                fallback: edge_for(fallback, axis_is_rtl),
+            },
+        };
+    }
+}
+
+/// The edge an alignment keyword aligns a box to, for the static position.
+fn edge_for(keyword: sty.AlignItemsKeyword, axis_is_rtl: bool) -> AxisStaticEdge {
+    let is_end = keyword == sty.AlignItemsKeyword.End or keyword == sty.AlignItemsKeyword.FlexEnd;
+    let start_position = (not is_end) != axis_is_rtl;
+    if keyword == sty.AlignItemsKeyword.Center {
+        return AxisStaticEdge.Center;
+    }
+    if start_position {
+        return AxisStaticEdge.Start;
+    }
+    return AxisStaticEdge.End;
+}
+
+/// An out-of-flow box on its way up to its containing block
+/// (OofCandidate).
+pub type OofCandidate = struct {
+    /// The box.
+    pub node: NodeId,
+    /// Its order: its index among its parent's children.
+    pub order: u32,
+    /// absolute or fixed.
+    pub position: sty.Position,
+    /// Its static position in each axis.
+    pub static_position: geo.Point(AxisStaticPosition),
+}
+
+/// The list and the allocator behind OofCandidates.
+type CandidateList = struct {
+    /// The candidates.
+    items: alloc.List(OofCandidate),
+    /// Where they are.
+    a: alloc.Allocator,
+}
+
+/// A list of OofCandidates, empty without memory (OofCandidates). It holds
+/// a list, so it and LayoutOutput are move-only: `clone` copies.
+pub type OofCandidates = struct {
+    /// The candidates, none when empty.
+    inner: ?CandidateList,
+
+    /// OofCandidates::new and NONE: an empty list.
+    pub fn new() -> OofCandidates {
+        return OofCandidates { inner: none };
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(self: &OofCandidates) -> bool {
+        return self.len() == 0;
+    }
+
+    /// How many.
+    pub fn len(self: &OofCandidates) -> usize {
+        match &self.inner {
+            some(l) => { return l.items.len(); }
+            none => { return 0; }
+        }
+    }
+
+    /// The i-th candidate (as_slice()[i]).
+    pub fn get(self: &OofCandidates, i: usize) -> OofCandidate {
+        match &self.inner {
+            some(l) => { return l.items.items()[i]; }
+            none => { panic("OofCandidates.get on an empty list"); }
+        }
+    }
+
+    /// Replaces the i-th candidate (as_mut_slice()[i] = candidate).
+    pub fn set(self: &mut OofCandidates, i: usize, candidate: OofCandidate) {
+        match &mut self.inner {
+            some(l) => { l.items[i] = candidate; }
+            none => { panic("OofCandidates.set on an empty list"); }
+        }
+    }
+
+    /// Appends a candidate; a first one takes memory from a.
+    pub fn push(self: &mut OofCandidates, candidate: OofCandidate, a: alloc.Allocator) {
+        if self.is_empty_list() {
+            self.inner = some(CandidateList { items: alloc.List(OofCandidate).init(a), a: a });
+        }
+        match &mut self.inner {
+            some(l) => { l.items.push(candidate); }
+            none => { unreachable(); }
+        }
+    }
+
+    /// Whether there is no list yet.
+    fn is_empty_list(self: &OofCandidates) -> bool {
+        match &self.inner {
+            some(_) => { return false; }
+            none => { return true; }
+        }
+    }
+
+    /// The allocator of the list, if there is one.
+    fn allocator(self: &OofCandidates) -> ?alloc.Allocator {
+        match &self.inner {
+            some(l) => { return l.a; }
+            none => { return none; }
+        }
+    }
+
+    /// Moves every candidate of other to the end of self, leaving other
+    /// empty (append).
+    pub fn append(self: &mut OofCandidates, other: &mut OofCandidates) {
+        if other.is_empty() {
+            return;
+        }
+        let a = other.allocator() orelse unreachable();
+        if self.is_empty_list() {
+            self.inner = some(CandidateList { items: alloc.List(OofCandidate).init(a), a: a });
+        }
+        let n = other.len();
+        var i: usize = 0;
+        while i < n : (i += 1) {
+            let c = other.get(i);
+            match &mut self.inner {
+                some(l) => { l.items.push(c); }
+                none => { unreachable(); }
+            }
+        }
+        other.inner = none;
+    }
+
+    /// The candidates, taken out: self is left empty (take).
+    pub fn take(self: &mut OofCandidates) -> OofCandidates {
+        let out = self.clone();
+        self.inner = none;
+        return out;
+    }
+
+    /// Empties the list (clear).
+    pub fn clear(self: &mut OofCandidates) {
+        self.inner = none;
+    }
+
+    /// A copy, in memory of the same allocator (Clone).
+    pub fn clone(self: &OofCandidates) -> OofCandidates {
+        match &self.inner {
+            some(l) => {
+                var items = alloc.List(OofCandidate).init(l.a);
+                for c in l.items.items() {
+                    items.push(c.*);
+                }
+                return OofCandidates { inner: some(CandidateList { items: items, a: l.a }) };
+            }
+            none => { return OofCandidates { inner: none }; }
+        }
+    }
+
+    /// Moves every static-position area by offset, from a child's border
+    /// box to its parent's (translate).
+    pub fn translate(self: &mut OofCandidates, offset: geo.Point(f32)) {
+        match &mut self.inner {
+            some(l) => {
+                for c in l.items.items_mut() {
+                    c.static_position.x.area.start = c.static_position.x.area.start + offset.x;
+                    c.static_position.x.area.end = c.static_position.x.area.end + offset.x;
+                    c.static_position.y.area.start = c.static_position.y.area.start + offset.y;
+                    c.static_position.y.area.end = c.static_position.y.area.end + offset.y;
+                }
+            }
+            none => { }
+        }
+    }
+}
+
+/// The area the insets of a container's out-of-flow boxes resolve against
+/// (OofPositioningArea).
+pub type OofPositioningArea = struct {
+    /// Its size.
+    pub size: geo.Size(f32),
+    /// Its offset from the container's border box.
+    pub offset: geo.Point(f32),
+}
+
+/// What a node's layout gives its parent (LayoutOutput). Move-only, for its
+/// candidates; `clone` copies.
+pub type LayoutOutput = struct {
+    /// The node's size.
+    pub size: geo.Size(f32),
+    /// The scrollable overflow of its content.
+    pub scrollable_overflow_rect: geo.Rect(f32),
+    /// Its baselines.
+    pub baselines: Baselines,
+    /// The top margin it may collapse with.
+    pub top_margin: CollapsibleMarginSet,
+    /// The bottom margin it may collapse with.
+    pub bottom_margin: CollapsibleMarginSet,
+    /// Whether margins collapse through it.
+    pub margins_can_collapse_through: bool,
+    /// Out-of-flow descendants not yet laid out by a containing block.
+    pub oof_candidates: OofCandidates,
+    /// The area its out-of-flow boxes are positioned in, after a full
+    /// layout of a container.
+    pub oof_positioning_area: ?OofPositioningArea,
+
+    /// LayoutOutput::HIDDEN and DEFAULT: all zero.
+    pub fn hidden() -> LayoutOutput {
+        return LayoutOutput.from_sizes_and_baselines(geo.size_zero(), geo.rect_zero(), Baselines.none_set());
+    }
+
+    /// From a size, a scrollable overflow rectangle and baselines.
+    pub fn from_sizes_and_baselines(size: geo.Size(f32), scrollable_overflow_rect: geo.Rect(f32), baselines: Baselines) -> LayoutOutput {
+        return LayoutOutput {
+            size: size,
+            scrollable_overflow_rect: scrollable_overflow_rect,
+            baselines: baselines,
+            top_margin: CollapsibleMarginSet.zero(),
+            bottom_margin: CollapsibleMarginSet.zero(),
+            margins_can_collapse_through: false,
+            oof_candidates: OofCandidates.new(),
+            oof_positioning_area: none,
+        };
+    }
+
+    /// From a size and a scrollable overflow rectangle.
+    pub fn from_sizes(size: geo.Size(f32), scrollable_overflow_rect: geo.Rect(f32)) -> LayoutOutput {
+        return LayoutOutput.from_sizes_and_baselines(size, scrollable_overflow_rect, Baselines.none_set());
+    }
+
+    /// From the size alone.
+    pub fn from_outer_size(size: geo.Size(f32)) -> LayoutOutput {
+        return LayoutOutput.from_sizes(size, geo.rect_zero());
+    }
+
+    /// A copy, its candidates copied (Clone).
+    pub fn clone(self: &LayoutOutput) -> LayoutOutput {
+        return LayoutOutput {
+            size: self.size,
+            scrollable_overflow_rect: self.scrollable_overflow_rect,
+            baselines: self.baselines,
+            top_margin: self.top_margin,
+            bottom_margin: self.bottom_margin,
+            margins_can_collapse_through: self.margins_can_collapse_through,
+            oof_candidates: self.oof_candidates.clone(),
+            oof_positioning_area: self.oof_positioning_area,
+        };
+    }
+
+    /// The axes swapped (inverse of LayoutInput.transpose); baselines and
+    /// margins dropped, candidates kept.
+    pub fn transpose(self: LayoutOutput) -> LayoutOutput {
+        var area: ?OofPositioningArea = none;
+        match self.oof_positioning_area {
+            some(x) => { area = some(OofPositioningArea { size: x.size.transpose(), offset: x.offset.transpose() }); }
+            none => { }
+        }
+        return LayoutOutput {
+            size: self.size.transpose(),
+            scrollable_overflow_rect: self.scrollable_overflow_rect.transpose(),
+            baselines: Baselines.none_set(),
+            top_margin: CollapsibleMarginSet.zero(),
+            bottom_margin: CollapsibleMarginSet.zero(),
+            margins_can_collapse_through: false,
+            oof_candidates: self.oof_candidates,
+            oof_positioning_area: area,
+        };
+    }
+}
+
+/// A node's final layout (Layout).
+pub type Layout = struct {
+    /// Paint order: higher on top.
+    pub order: u32,
+    /// The top-left corner, from the parent's (or containing block's)
+    /// border box.
+    pub location: geo.Point(f32),
+    /// The border box's size.
+    pub size: geo.Size(f32),
+    /// The scrollable overflow, from the scroll origin.
+    pub scrollable_overflow_rect: geo.Rect(f32),
+    /// The scrollbars' sizes.
+    pub scrollbar_size: geo.Size(f32),
+    /// The borders.
+    pub border: geo.Rect(f32),
+    /// The padding.
+    pub padding: geo.Rect(f32),
+    /// The margins.
+    pub margin: geo.Rect(f32),
+
+    /// Layout::new: all zero.
+    pub fn new() -> Layout {
+        return Layout.with_order(0);
+    }
+
+    /// All zero, with an order.
+    pub fn with_order(order: u32) -> Layout {
+        return Layout {
+            order: order,
+            location: geo.point_zero(),
+            size: geo.size_zero(),
+            scrollable_overflow_rect: geo.rect_zero(),
+            scrollbar_size: geo.size_zero(),
+            border: geo.rect_zero(),
+            padding: geo.rect_zero(),
+            margin: geo.rect_zero(),
+        };
+    }
+
+    /// The content box's width.
+    pub fn content_box_width(self: &Layout) -> f32 {
+        return self.size.width - self.padding.left - self.padding.right - self.border.left - self.border.right;
+    }
+
+    /// The content box's height.
+    pub fn content_box_height(self: &Layout) -> f32 {
+        return self.size.height - self.padding.top - self.padding.bottom - self.border.top - self.border.bottom;
+    }
+
+    /// The content box's size.
+    pub fn content_box_size(self: &Layout) -> geo.Size(f32) {
+        return geo.Size(f32) { width: self.content_box_width(), height: self.content_box_height() };
+    }
+
+    /// The content box's x, from the parent's border box.
+    pub fn content_box_x(self: &Layout) -> f32 {
+        return self.location.x + self.border.left + self.padding.left;
+    }
+
+    /// The content box's y, from the parent's border box.
+    pub fn content_box_y(self: &Layout) -> f32 {
+        return self.location.y + self.border.top + self.padding.top;
+    }
+
+    /// The largest horizontal scroll offset.
+    pub fn scroll_width(self: &Layout) -> f32 {
+        return util.f32_max(a: 0.0, b: self.scrollable_overflow_rect.right + util.f32_min(a: self.scrollbar_size.width, b: self.size.width) - self.size.width + self.border.left + self.border.right);
+    }
+
+    /// The largest vertical scroll offset.
+    pub fn scroll_height(self: &Layout) -> f32 {
+        return util.f32_max(a: 0.0, b: self.scrollable_overflow_rect.bottom + util.f32_min(a: self.scrollbar_size.height, b: self.size.height) - self.size.height + self.border.top + self.border.bottom);
+    }
+}
+
+/// The embedder's tree, as every layout algorithm sees it: taffy's
+/// TraversePartialTree, LayoutPartialTree, LayoutContainingBlock,
+/// CacheTree, RoundTree and container traits in one. Algorithms take
+/// `tree: &mut dyn LayoutTree`.
+pub type LayoutTree = interface {
+    /// The number of children of a node (TraversePartialTree).
+    fn child_count(self: &Self, parent_node_id: NodeId) -> usize;
+
+    /// The index-th child of a node.
+    fn get_child_id(self: &Self, parent_node_id: NodeId, child_index: usize) -> NodeId;
+
+    /// The node's style: every get_*_style of taffy's traits.
+    fn get_style(self: &Self, node_id: NodeId) -> &sty.Style;
+
+    /// Stores the node's unrounded layout (LayoutPartialTree).
+    fn set_unrounded_layout(self: &mut Self, node_id: NodeId, layout: &Layout);
+
+    /// Lays out a child: the embedder chooses the algorithm by display,
+    /// usually through compute.compute_cached_layout.
+    fn compute_child_layout(self: &mut Self, node_id: NodeId, inputs: LayoutInput) -> LayoutOutput;
+
+    /// Lays out a child of a block container in the block formatting
+    /// context bfc (LayoutBlockContainer::compute_block_child_layout with
+    /// some block context). An embedder without floats may call
+    /// compute_child_layout.
+    fn compute_block_child_layout(self: &mut Self, node_id: NodeId, inputs: LayoutInput, bfc: &mut block.BlockFormattingContext, block_ctx: &mut block.BlockContext) -> LayoutOutput;
+
+    /// Forgets the out-of-flow boxes whose containing block is the node
+    /// (LayoutContainingBlock).
+    fn clear_hoisted_children(self: &mut Self, node_id: NodeId);
+
+    /// Adds out-of-flow boxes whose containing block is the node.
+    fn add_hoisted_children(self: &mut Self, node_id: NodeId, hoisted: []NodeId);
+
+    /// The cached result for these inputs, if any (CacheTree).
+    fn cache_get(self: &mut Self, node_id: NodeId, input: &LayoutInput) -> ?LayoutOutput;
+
+    /// Caches a result.
+    fn cache_store(self: &mut Self, node_id: NodeId, input: &LayoutInput, layout_output: LayoutOutput);
+
+    /// Clears the node's cache.
+    fn cache_clear(self: &mut Self, node_id: NodeId);
+
+    /// The node's unrounded layout (RoundTree).
+    fn get_unrounded_layout(self: &Self, node_id: NodeId) -> Layout;
+
+    /// Stores the node's rounded, final layout.
+    fn set_final_layout(self: &mut Self, node_id: NodeId, layout: &Layout);
+
+    /// Whether the node is an absolute or fixed box (not display: none).
+    fn is_out_of_flow(self: &Self, node_id: NodeId) -> bool;
+
+    /// The number of out-of-flow boxes whose containing block is the node.
+    fn hoisted_child_count(self: &Self, node_id: NodeId) -> usize;
+
+    /// The index-th of them.
+    fn get_hoisted_child_id(self: &Self, node_id: NodeId, index: usize) -> NodeId;
+
+    /// Where the algorithms' lists go: taffy allocates from the global
+    /// allocator, which Arche does not have.
+    fn allocator(self: &Self) -> alloc.Allocator;
+
+    /// The text of a custom identifier (a named grid line or area).
+    fn ident_text(self: &Self, ident: alloc.Symbol) -> str;
+}
+
+/// LayoutPartialTreeExt::measure_child_size: the child's size in one axis,
+/// computed with RunMode::ComputeSize.
+pub fn measure_child_size(tree: &mut dyn LayoutTree, node_id: NodeId, known_dimensions: geo.Size(?f32), parent_size: geo.Size(?f32), available_space: geo.Size(sty.AvailableSpace), sizing_mode: SizingMode, axis: geo.AbsoluteAxis, vertical_margins_are_collapsible: geo.Line(bool)) -> f32 {
+    let output = tree.compute_child_layout(node_id, LayoutInput {
+        run_mode: RunMode.ComputeSize,
+        sizing_mode: sizing_mode,
+        axis: RequestedAxis.from_abs(axis),
+        known_dimensions: known_dimensions,
+        known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+        parent_size: parent_size,
+        available_space: available_space,
+        vertical_margins_are_collapsible: vertical_margins_are_collapsible,
+    });
+    return output.size.get_abs(axis);
+}
+
+/// LayoutPartialTreeExt::measure_child_size_both: the child's size in both
+/// axes.
+pub fn measure_child_size_both(tree: &mut dyn LayoutTree, node_id: NodeId, known_dimensions: geo.Size(?f32), parent_size: geo.Size(?f32), available_space: geo.Size(sty.AvailableSpace), sizing_mode: SizingMode, vertical_margins_are_collapsible: geo.Line(bool)) -> geo.Size(f32) {
+    let output = tree.compute_child_layout(node_id, LayoutInput {
+        run_mode: RunMode.ComputeSize,
+        sizing_mode: sizing_mode,
+        axis: RequestedAxis.Both,
+        known_dimensions: known_dimensions,
+        known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+        parent_size: parent_size,
+        available_space: available_space,
+        vertical_margins_are_collapsible: vertical_margins_are_collapsible,
+    });
+    return output.size;
+}
+
+/// LayoutPartialTreeExt::perform_child_layout: a full layout of the child.
+pub fn perform_child_layout(tree: &mut dyn LayoutTree, node_id: NodeId, known_dimensions: geo.Size(?f32), parent_size: geo.Size(?f32), available_space: geo.Size(sty.AvailableSpace), sizing_mode: SizingMode, vertical_margins_are_collapsible: geo.Line(bool)) -> LayoutOutput {
+    return tree.compute_child_layout(node_id, LayoutInput {
+        run_mode: RunMode.PerformLayout,
+        sizing_mode: sizing_mode,
+        axis: RequestedAxis.Both,
+        known_dimensions: known_dimensions,
+        known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+        parent_size: parent_size,
+        available_space: available_space,
+        vertical_margins_are_collapsible: vertical_margins_are_collapsible,
+    });
+}

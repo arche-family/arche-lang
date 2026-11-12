@@ -1,0 +1,48 @@
+/// compute.common.scrollable_overflow: taffy 0.15's
+/// compute/common/scrollable_overflow.rs.
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.util;
+
+/// compute_scrollable_overflow_contribution: the rectangle a child adds to
+/// its parent's scrollable overflow. location is the child's border box
+/// from the parent's scroll origin (mirrored for rtl). A scroll container
+/// or a box that contains its overflow adds its border box only; otherwise
+/// overflow escapes in each visible axis. Boxes wholly before a scroll
+/// container's origin add nothing.
+pub fn compute_scrollable_overflow_contribution(location: geo.Point(f32), size: geo.Size(f32), scrollable_overflow_rect: geo.Rect(f32), overflow: geo.Point(sty.Overflow), contain: sty.Contain, parent_is_scroll_container: bool) -> geo.Rect(f32) {
+    let is_scroll_container = overflow.x.is_scroll_container() or overflow.y.is_scroll_container();
+    let overflow_is_contained = contain.contains_scrollable_overflow();
+    let propagates_x = not is_scroll_container and not overflow_is_contained and overflow.x == sty.Overflow.Visible;
+    let propagates_y = not is_scroll_container and not overflow_is_contained and overflow.y == sty.Overflow.Visible;
+    var end_width = size.width;
+    if propagates_x {
+        end_width = util.f32_max(a: size.width, b: scrollable_overflow_rect.right);
+    }
+    var end_height = size.height;
+    if propagates_y {
+        end_height = util.f32_max(a: size.height, b: scrollable_overflow_rect.bottom);
+    }
+    if end_width <= 0.0 or end_height <= 0.0 {
+        return geo.rect_zero();
+    }
+    var start_x: f32 = 0.0;
+    if propagates_x {
+        start_x = util.f32_min(a: 0.0, b: scrollable_overflow_rect.left);
+    }
+    var start_y: f32 = 0.0;
+    if propagates_y {
+        start_y = util.f32_min(a: 0.0, b: scrollable_overflow_rect.top);
+    }
+    let contribution = geo.Rect(f32) {
+        left: location.x + start_x,
+        right: location.x + end_width,
+        top: location.y + start_y,
+        bottom: location.y + end_height,
+    };
+    let is_wholly_unreachable = contribution.right <= 0.0 or contribution.bottom <= 0.0;
+    if parent_is_scroll_container and is_wholly_unreachable {
+        return geo.rect_zero();
+    }
+    return contribution;
+}

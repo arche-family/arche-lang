@@ -1,0 +1,80 @@
+/// compute.block: taffy 0.15's compute/block.rs, block layout.
+///
+/// Only the two context types are here yet, because LayoutTree's
+/// compute_block_child_layout names them; the algorithm (compute_block_layout
+/// and the rest of block.rs) is still to be ported into this module.
+///
+/// taffy's BlockContext holds `&mut BlockFormattingContext`; a view cannot
+/// be a field in Arche, so the formatting context travels beside it: every
+/// function that reaches the floats takes `bfc: &mut BlockFormattingContext`
+/// next to `block_ctx: &mut BlockContext`, and sub_context makes the
+/// child's context without it.
+import alloc;
+import layout.util;
+
+/// What is shared by the blocks of one block formatting context: the floats
+/// (BlockFormattingContext). The float context (compute/float.rs) is still
+/// to be ported into it.
+pub type BlockFormattingContext = struct {
+    /// Where its lists go.
+    a: alloc.Allocator,
+
+    /// BlockFormattingContext::new.
+    pub fn new(a: alloc.Allocator) -> BlockFormattingContext {
+        return BlockFormattingContext { a: a };
+    }
+}
+
+/// The context of one block in a block formatting context (BlockContext),
+/// without the formatting context itself (see the module).
+pub type BlockContext = struct {
+    /// The y of the block's border-top from the formatting context root's.
+    pub y_offset: f32,
+    /// The x insets of its border box from the root's, left and right.
+    pub insets: [2]f32,
+    /// The x insets of its content box.
+    pub content_box_insets: [2]f32,
+    /// The height floats take up in it; -infinity without floats.
+    pub float_content_contribution: f32,
+    /// Whether it is the root of its formatting context.
+    pub is_root: bool,
+    /// Whether a float adjoining the current margin strut was placed on
+    /// each side.
+    pub adjoining_floats: [2]bool,
+    /// adjoining_floats when in-flow content was first committed.
+    pub top_adjoining_floats: ?[2]bool,
+
+    /// BlockFormattingContext::root_block_context: the context of the
+    /// formatting context's root.
+    pub fn root() -> BlockContext {
+        return BlockContext {
+            y_offset: 0.0,
+            insets: [0.0, 0.0],
+            content_box_insets: [0.0, 0.0],
+            float_content_contribution: util.neg_infinity(),
+            is_root: true,
+            adjoining_floats: [false, false],
+            top_adjoining_floats: none,
+        };
+    }
+
+    /// The context of a child block, additional_y_offset below and insets
+    /// in from this one.
+    pub fn sub_context(self: &BlockContext, additional_y_offset: f32, insets: [2]f32) -> BlockContext {
+        let child_insets: [2]f32 = [self.insets[0] + insets[0], self.insets[1] + insets[1]];
+        return BlockContext {
+            y_offset: self.y_offset + additional_y_offset,
+            insets: child_insets,
+            content_box_insets: child_insets,
+            float_content_contribution: util.neg_infinity(),
+            is_root: false,
+            adjoining_floats: self.adjoining_floats,
+            top_adjoining_floats: none,
+        };
+    }
+
+    /// Whether this block is its formatting context's root.
+    pub fn is_bfc_root(self: &BlockContext) -> bool {
+        return self.is_root;
+    }
+}

@@ -1,0 +1,84 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: before: c1 20.0 4.0 cache empty false false
+// stdout: root at 3.0 3.0 size 0.0 0.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 3.0 3.0 3.0 3.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: c1 at 0.0 0.0 size 0.0 0.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: c2 at 0.0 0.0 size 0.0 0.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: after: cache empty true true computed 3
+// stdout: hidden output 0.0 0.0 false
+// Hidden layout. A root with display none lays its children out hidden,
+// through compute_hidden_layout, so every one ends at the origin with a
+// zero size and an empty cache, whatever it had before. The expected lines
+// are taffy 0.15's own, from the same case in Rust.
+import std;
+import layout.compute as compute;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import _show;
+import _tree;
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    var t = _tree.TestTree.init(a);
+    var rs = sty.Style.default(a);
+    rs.display = sty.Display.None;
+    rs.margin = _show.rect_lpa(3.0);
+    rs.size = sty.size_from_lengths(width: 50.0, height: 50.0);
+    let r = t.add(rs, _tree.Content.Empty);
+    var s1 = sty.Style.default(a);
+    s1.size = sty.size_from_lengths(width: 20.0, height: 20.0);
+    let c1 = t.add(s1, _tree.Content.Fixed { width: 5.0, height: 5.0 });
+    let c2 = t.add(sty.Style.default(a), _tree.Content.Text { width: 30.0, line: 10.0 });
+    var gs = sty.Style.default(a);
+    gs.display = sty.Display.None;
+    _ = t.add(gs, _tree.Content.Empty);
+    t.add_child(parent: r, child: c1);
+    t.add_child(parent: r, child: c2);
+
+    let i1 = _show.input(lt.RunMode.PerformLayout, lt.SizingMode.InherentSize, known: _show.some_size(width: 20.0, height: 20.0), parent: _show.some_size(width: 800.0, height: 600.0), _show.def(width: 800.0, height: 600.0));
+    let o = t.compute_child_layout(c1, i1);
+    t.nodes[1].unrounded.size = o.size;
+    t.nodes[1].unrounded.location = geo.Point(f32) { x: 4.0, y: 5.0 };
+    _ = t.compute_child_layout(c2, i1);
+    sys.stdout.write("before: c1 ");
+    sys.stdout.write_f32(t.nodes[1].unrounded.size.width);
+    sys.stdout.write(" ");
+    sys.stdout.write_f32(t.nodes[1].unrounded.location.x);
+    sys.stdout.write(" cache empty ");
+    write_bool(&mut sys.stdout, t.nodes[1].cache.is_empty());
+    sys.stdout.write(" ");
+    write_bool(&mut sys.stdout, t.nodes[2].cache.is_empty());
+    sys.stdout.write("\n");
+
+    compute.compute_root_layout(&mut t, r, _show.def(width: 800.0, height: 600.0));
+    _show.layout_line(&mut sys.stdout, "root", t.unrounded_of(r));
+    _show.layout_line(&mut sys.stdout, "c1", t.unrounded_of(c1));
+    _show.layout_line(&mut sys.stdout, "c2", t.unrounded_of(c2));
+    sys.stdout.write("after: cache empty ");
+    write_bool(&mut sys.stdout, t.nodes[1].cache.is_empty());
+    sys.stdout.write(" ");
+    write_bool(&mut sys.stdout, t.nodes[2].cache.is_empty());
+    sys.stdout.write(" computed ");
+    sys.stdout.write_u64(t.computed as u64);
+    sys.stdout.write("\n");
+
+    let out = compute.compute_hidden_layout(&mut t, c2);
+    sys.stdout.write("hidden output ");
+    sys.stdout.write_f32(out.size.width);
+    sys.stdout.write(" ");
+    sys.stdout.write_f32(out.size.height);
+    sys.stdout.write(" ");
+    write_bool(&mut sys.stdout, out.margins_can_collapse_through);
+    sys.stdout.write("\n");
+}
+
+/// true or false.
+fn write_bool(out: &mut std.Output, b: bool) {
+    if b {
+        out.write("true");
+    } else {
+        out.write("false");
+    }
+}

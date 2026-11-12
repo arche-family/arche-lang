@@ -1,0 +1,435 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: nonnamed true false 1 2 | 0 auto | 2
+// stdout: space d4.0 max d6.0 d7.0 d2.0 | d3.0 min | 9.0 none
+// stdout: opt 2.0 none 4.0 4.0 1.0 | 1.0 3.0 2.0 | 9.0 5.0 | 2.0 none | true false | 12.0 3.0 | 2.0 2.0
+// stdout: size 4.0 6.0 | 1.0 2.0 true false | 5.0 8.0 | -3.0 4.0 | 1.0 6.0 6.0 | 9.0 7.0 | 1.0 3.0
+// stdout: rect 2.0 3.0 0.0 11.0 | 2.0 3.0 0.0 21.0 | 0.0 3.0 0.0 0.0 | -1.0 9.0 0.0 7.0 | 1.0 2.0 3.0 4.0 | 3.0 7.0 7.0
+// stdout: resolve 40.0 none 30.0 0.0 | 10.0 20.0 | 2.0
+// stdout: point 2.0 1.0 | 2.0 5.0 | 2.0 5.0 | 5.0 3.0 | 8.0
+// stdout: io vertical 5.0 none max d1.0 false | 4.0 6.0 3.0 0.0
+// stdout: static start end center start | end | end start
+// stdout: tracks true false true false 12.0 none 5.0 6.0 none | true false true | 3 true
+// stdout: keyword measure-min measure-d50.0 exact40.0 none none measure-d12.0
+// stdout: absolute 40.0 30.0 | 20.0 15.0
+// stdout: measure 30.0 | 30.0 20.0 | 30.0 20.0 3
+// stdout: overflow 5.0 70.0 5.0 45.0 | 10.0 50.0 5.0 25.0 | 0.0 0.0 0.0 0.0 | -3.0 31.0 0.0 25.0
+// The generic and smaller parts of the API, each instance the algorithms
+// use made at least once, so every method of it is checked: grid
+// placements without names, MaybeMath on sizes, resolving rects and sizes,
+// points, transposed inputs and outputs, static positions, track sizing
+// functions, sizing keywords, the tree's measuring helpers and scrollable
+// overflow contributions. Worked out by hand from taffy's code.
+import std;
+import alloc;
+import layout.compute.common.scrollable_overflow as overflow;
+import layout.compute.common.sizing_keyword as sizing;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.style.grid as sgrid;
+import layout.tree as lt;
+import layout.util;
+import _show;
+import _tree;
+
+/// " " and an f32.
+fn num(out: &mut std.Output, x: f32) {
+    out.write(" ");
+    out.write_f32(x);
+}
+
+/// " " and an ?f32, or " none".
+fn opt(out: &mut std.Output, x: ?f32) {
+    match x {
+        some(v) => { num(out, v); }
+        none => { out.write(" none"); }
+    }
+}
+
+/// " d<value>", " min" or " max".
+fn space(out: &mut std.Output, s: sty.AvailableSpace) {
+    match s {
+        .Definite { value } => {
+            out.write(" d");
+            out.write_f32(value);
+        }
+        .MinContent => { out.write(" min"); }
+        .MaxContent => { out.write(" max"); }
+    }
+}
+
+/// " true" or " false".
+fn flag(out: &mut std.Output, b: bool) {
+    if b {
+        out.write(" true");
+    } else {
+        out.write(" false");
+    }
+}
+
+/// " start", " center" or " end".
+fn edge(out: &mut std.Output, e: lt.AxisStaticEdge) {
+    match e {
+        .Start => { out.write(" start"); }
+        .Center => { out.write(" center"); }
+        .End => { out.write(" end"); }
+    }
+}
+
+/// A keyword's resolution.
+fn keyword(out: &mut std.Output, r: ?sizing.SizingKeywordResolution) {
+    match r {
+        some(x) => {
+            match x {
+                .Measure { space: s } => {
+                    out.write(" measure-");
+                    match s {
+                        .Definite { value } => {
+                            out.write("d");
+                            out.write_f32(value);
+                        }
+                        .MinContent => { out.write("min"); }
+                        .MaxContent => { out.write("max"); }
+                    }
+                }
+                .Exact { size } => {
+                    out.write(" exact");
+                    out.write_f32(size);
+                }
+            }
+        }
+        none => { out.write(" none"); }
+    }
+}
+
+/// A rect's four edges.
+fn rect(out: &mut std.Output, r: geo.Rect(f32)) {
+    num(out, r.left);
+    num(out, r.right);
+    num(out, r.top);
+    num(out, r.bottom);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let out = &mut sys.stdout;
+    let a = sys.alloc;
+
+    // Grid placements without names, 3 explicit tracks.
+    let nn = geo.Line(sgrid.NonNamedGridPlacement) { start: sgrid.NonNamedGridPlacement.Line { line: sgrid.GridLine.from(1) }, end: sgrid.NonNamedGridPlacement.Auto };
+    let nn2 = geo.Line(sgrid.NonNamedGridPlacement) { start: sgrid.NonNamedGridPlacement.Span { span: 2 }, end: sgrid.NonNamedGridPlacement.Line { line: sgrid.GridLine.from(0) } };
+    out.write("nonnamed");
+    flag(out, nn.is_definite());
+    flag(out, nn2.is_definite());
+    out.write(" ");
+    out.write_u64(nn.indefinite_span() as u64);
+    out.write(" ");
+    out.write_u64(nn2.indefinite_span() as u64);
+    let oz = nn.into_origin_zero(3);
+    out.write(" | ");
+    match oz.start {
+        .Line { line } => { out.write_i64(line.value as i64); }
+        _ => { out.write("?"); }
+    }
+    match oz.end {
+        .Auto => { out.write(" auto"); }
+        _ => { out.write(" ?"); }
+    }
+    out.write(" | ");
+    out.write_u64(nn2.into_origin_zero(3).indefinite_span() as u64);
+    out.write("\n");
+
+    // MaybeMath on Size<AvailableSpace>.
+    let sp = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(5.0), height: sty.AvailableSpace.MaxContent };
+    let four = geo.Size(f32) { width: 4.0, height: 4.0 };
+    out.write("space");
+    space(out, sp.maybe_min_f(four).width);
+    space(out, sp.maybe_max_f(four).height);
+    space(out, sp.maybe_clamp_f(min: geo.Size(f32) { width: 6.0, height: 6.0 }, max: geo.Size(f32) { width: 9.0, height: 9.0 }).width);
+    space(out, sp.maybe_add_f(geo.Size(f32) { width: 2.0, height: 2.0 }).width);
+    space(out, sp.maybe_sub_f(geo.Size(f32) { width: 3.0, height: 3.0 }).width);
+    let three_none = geo.Size(?f32) { width: some(3.0), height: none };
+    out.write(" |");
+    space(out, sp.maybe_set(three_none).width);
+    space(out, geo.size_min_content().maybe_set(three_none).height);
+    out.write(" |");
+    let opts = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(9.0), height: sty.AvailableSpace.MinContent }.into_options();
+    opt(out, opts.width);
+    opt(out, opts.height);
+    out.write("\n");
+
+    // MaybeMath and Option's helpers on Size<Option<f32>>.
+    let two_none = geo.Size(?f32) { width: some(2.0), height: none };
+    out.write("opt");
+    let m1 = two_none.maybe_min(geo.size_some(width: 7.0, height: 1.0));
+    opt(out, m1.width);
+    opt(out, m1.height);
+    opt(out, two_none.maybe_max(geo.size_some(width: 4.0, height: 1.0)).width);
+    opt(out, two_none.maybe_clamp(min: geo.size_some(width: 4.0, height: 0.0), max: geo.size_none()).width);
+    opt(out, two_none.maybe_sub(geo.size_some(width: 1.0, height: 1.0)).width);
+    out.write(" |");
+    opt(out, two_none.maybe_min_f(geo.Size(f32) { width: 1.0, height: 1.0 }).width);
+    opt(out, two_none.maybe_max_f(geo.Size(f32) { width: 3.0, height: 1.0 }).width);
+    opt(out, two_none.maybe_clamp_f(min: geo.size_zero(), max: geo.Size(f32) { width: 5.0, height: 5.0 }).width);
+    out.write(" |");
+    opt(out, two_none.maybe_add_f(geo.Size(f32) { width: 7.0, height: 1.0 }).width);
+    opt(out, two_none.maybe_sub_f(geo.Size(f32) { width: -3.0, height: 1.0 }).width);
+    out.write(" |");
+    let back = two_none.fallback(geo.size_none());
+    opt(out, back.width);
+    opt(out, back.height);
+    out.write(" |");
+    flag(out, geo.size_some(width: 1.0, height: 2.0).both_axis_defined());
+    flag(out, two_none.both_axis_defined());
+    out.write(" |");
+    let ratio: ?f32 = some(1.5);
+    opt(out, geo.Size(?f32) { width: some(18.0), height: none }.maybe_apply_aspect_ratio(ratio).height);
+    opt(out, geo.Size(?f32) { width: none, height: some(2.0) }.maybe_apply_aspect_ratio(ratio).width);
+    out.write(" |");
+    let filled = two_none.unwrap_or(geo.Size(f32) { width: 9.0, height: 2.0 });
+    num(out, filled.width);
+    num(out, filled.height);
+    out.write("\n");
+
+    // Size<f32>.
+    let sa = geo.Size(f32) { width: 1.0, height: 6.0 };
+    let sb = geo.Size(f32) { width: 4.0, height: 2.0 };
+    out.write("size");
+    num(out, sa.f32_max(sb).width);
+    num(out, sa.f32_max(sb).height);
+    out.write(" |");
+    num(out, sa.f32_min(sb).width);
+    num(out, sa.f32_min(sb).height);
+    flag(out, sa.has_non_zero_area());
+    flag(out, geo.Size(f32) { width: 0.0, height: 5.0 }.has_non_zero_area());
+    out.write(" |");
+    num(out, sa.add(sb).width);
+    num(out, sa.add(sb).height);
+    out.write(" |");
+    num(out, sa.sub(sb).width);
+    num(out, sa.sub(sb).height);
+    out.write(" |");
+    num(out, sa.main(sty.FlexDirection.Row));
+    num(out, sa.cross(sty.FlexDirection.Row));
+    num(out, sa.main(sty.FlexDirection.Column));
+    out.write(" |");
+    num(out, sa.with_main(sty.FlexDirection.ColumnReverse, 9.0).height);
+    var sc = sa;
+    sc.set_cross(sty.FlexDirection.RowReverse, 7.0);
+    num(out, sc.height);
+    out.write(" |");
+    num(out, sa.get(geo.AbstractAxis.Inline));
+    num(out, sa.with(geo.AbstractAxis.Block, 3.0).height);
+    out.write("\n");
+
+    // Rects: resolving lengths, union, flex edges and sums.
+    let lpa = geo.Rect(sty.LengthPercentageAuto) {
+        left: sty.LengthPercentageAuto.percent(0.1),
+        right: sty.LengthPercentageAuto.length(3.0),
+        top: sty.LengthPercentageAuto.auto(),
+        bottom: sty.LengthPercentageAuto.calc(sty.Calc { px: 1.0, percent: 50.0 }),
+    };
+    out.write("rect");
+    rect(out, lpa.resolve_or_zero_f(20.0));
+    out.write(" |");
+    rect(out, lpa.resolve_or_zero_size(geo.size_some(width: 20.0, height: 40.0)));
+    out.write(" |");
+    rect(out, lpa.resolve_or_zero(none));
+    let r1 = geo.Rect(f32) { left: 1.0, right: 2.0, top: 3.0, bottom: 4.0 };
+    out.write(" |");
+    rect(out, r1.union(geo.Rect(f32) { left: -1.0, right: 9.0, top: 0.0, bottom: 7.0 }));
+    out.write(" |");
+    num(out, r1.main_start(sty.FlexDirection.Row));
+    num(out, r1.main_end(sty.FlexDirection.Row));
+    num(out, r1.cross_start(sty.FlexDirection.Row));
+    num(out, r1.cross_end(sty.FlexDirection.Row));
+    out.write(" |");
+    num(out, r1.grid_axis_sum(geo.AbsoluteAxis.Horizontal));
+    num(out, r1.main_axis_sum(sty.FlexDirection.Column));
+    num(out, r1.cross_axis_sum(sty.FlexDirection.Row));
+    out.write("\n");
+
+    // Sizes of lengths resolved.
+    let ds = geo.Size(sty.Dimension) { width: sty.Dimension.percent(0.4), height: sty.Dimension.auto() };
+    out.write("resolve");
+    let rd = ds.maybe_resolve_f(geo.Size(f32) { width: 100.0, height: 50.0 });
+    opt(out, rd.width);
+    opt(out, rd.height);
+    let rz = ds.resolve_or_zero(geo.size_some(width: 75.0, height: 0.0));
+    num(out, rz.width);
+    num(out, rz.height);
+    out.write(" |");
+    let lps = geo.Size(sty.LengthPercentage) { width: sty.LengthPercentage.length(10.0), height: sty.LengthPercentage.percent(0.5) };
+    let rl = lps.maybe_resolve(geo.Size(?f32) { width: none, height: some(40.0) });
+    opt(out, rl.width);
+    opt(out, rl.height);
+    out.write(" |");
+    num(out, sty.LengthPercentage.calc(sty.Calc { px: 1.0, percent: 10.0 }).resolve_or_zero_f(10.0));
+    out.write("\n");
+
+    // Points and InBothAbsAxis.
+    var p = geo.Point(f32) { x: 1.0, y: 2.0 };
+    out.write("point");
+    num(out, p.transpose().x);
+    num(out, p.transpose().y);
+    out.write(" |");
+    num(out, p.get(geo.AbstractAxis.Block));
+    p.set(geo.AbstractAxis.Inline, 5.0);
+    num(out, p.x);
+    out.write(" |");
+    num(out, p.main(sty.FlexDirection.Column));
+    num(out, p.cross(sty.FlexDirection.Column));
+    out.write(" |");
+    num(out, p.to_size().width);
+    num(out, p.add(geo.Point(f32) { x: 1.0, y: 1.0 }).y);
+    out.write(" |");
+    let both = geo.InBothAbsAxis(f32) { horizontal: 7.0, vertical: 8.0 };
+    num(out, both.get(geo.AbsoluteAxis.Vertical));
+    out.write("\n");
+
+    // Transposed inputs and outputs.
+    var inp = _show.input(lt.RunMode.ComputeSize, lt.SizingMode.InherentSize, known: geo.Size(?f32) { width: some(5.0), height: none }, parent: geo.size_none(), geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(1.0), height: sty.AvailableSpace.MaxContent });
+    inp.axis = lt.RequestedAxis.from_abs(geo.AbsoluteAxis.Horizontal);
+    inp.vertical_margins_are_collapsible = geo.line_true();
+    let tin = inp.transpose();
+    out.write("io");
+    if tin.axis == lt.RequestedAxis.Vertical {
+        out.write(" vertical");
+    }
+    opt(out, tin.known_dimensions.height);
+    opt(out, tin.known_dimensions.width);
+    space(out, tin.available_space.width);
+    space(out, tin.available_space.height);
+    flag(out, tin.vertical_margins_are_collapsible.start);
+    var lo = lt.LayoutOutput.from_sizes(geo.Size(f32) { width: 6.0, height: 4.0 }, r1);
+    lo.top_margin = lt.CollapsibleMarginSet.from_margin(5.0);
+    let tout = lo.transpose();
+    out.write(" |");
+    num(out, tout.size.width);
+    num(out, tout.size.height);
+    num(out, tout.scrollable_overflow_rect.left);
+    num(out, tout.top_margin.resolve());
+    out.write("\n");
+
+    // Static positions from self alignment.
+    let area = geo.Line(f32) { start: 0.0, end: 10.0 };
+    out.write("static");
+    edge(out, lt.AxisStaticPosition.from_alignment(sty.AlignItems.start(), area, false).align.keyword);
+    edge(out, lt.AxisStaticPosition.from_alignment(sty.AlignItems.end(), area, false).align.keyword);
+    edge(out, lt.AxisStaticPosition.from_alignment(sty.AlignItems.center(), area, false).align.keyword);
+    edge(out, lt.AxisStaticPosition.from_alignment(sty.AlignItems.stretch(), area, false).align.keyword);
+    out.write(" |");
+    edge(out, lt.AxisStaticPosition.from_alignment(sty.AlignItems.start(), area, true).align.keyword);
+    out.write(" |");
+    let safe_end = lt.AxisStaticPosition.from_alignment(sty.AlignItems.safe(sty.AlignItemsKeyword.End), area, false);
+    edge(out, safe_end.align.keyword);
+    edge(out, safe_end.align.fallback);
+    out.write("\n");
+
+    // Track sizing functions.
+    let twelve = sgrid.TrackSizingFunction.from_length(12.0);
+    let none_size: ?f32 = none;
+    let size12: ?f32 = some(12.0);
+    let size5: ?f32 = some(5.0);
+    out.write("tracks");
+    flag(out, twelve.has_fixed_component());
+    flag(out, sgrid.TrackSizingFunction.auto().has_fixed_component());
+    flag(out, sgrid.TrackSizingFunction.fit_content(sty.LengthPercentage.length(20.0)).max.is_fit_content());
+    flag(out, sgrid.MaxTrackSizingFunction.fr(1.0).is_intrinsic());
+    opt(out, twelve.max_sizing_function().definite_value(none_size));
+    opt(out, sgrid.MaxTrackSizingFunction.percent(0.5).definite_value(none_size));
+    opt(out, sgrid.MaxTrackSizingFunction.fit_content_px(5.0).fit_content_limit(none_size));
+    opt(out, sgrid.MaxTrackSizingFunction.fit_content_percent(0.5).definite_limit(size12));
+    opt(out, sgrid.MaxTrackSizingFunction.auto().definite_limit(size12));
+    out.write(" |");
+    flag(out, sgrid.MinTrackSizingFunction.percent(0.1).behaves_as_auto(none_size));
+    flag(out, sgrid.MinTrackSizingFunction.percent(0.1).behaves_as_auto(size5));
+    flag(out, sgrid.MinTrackSizingFunction.from_max(sgrid.MaxTrackSizingFunction.fr(2.0)).is_auto());
+    var tracks = alloc.List(sgrid.TrackSizingFunction).init(a);
+    tracks.push(twelve);
+    tracks.push(sgrid.TrackSizingFunction.auto());
+    tracks.push(sgrid.TrackSizingFunction.from_fr(1.0));
+    let rep = sgrid.GridTemplateComponent.Repeat {
+        repetition: sgrid.GridTemplateRepetition { count: sgrid.RepetitionCount.AutoFill, tracks: tracks, line_names: alloc.List(alloc.List(alloc.Symbol)).init(a) },
+    };
+    out.write(" |");
+    match &rep {
+        .Repeat { repetition } => {
+            out.write(" ");
+            out.write_u64(repetition.track_count() as u64);
+        }
+        .Single { .. } => { }
+    }
+    flag(out, rep.is_auto_repetition());
+    out.write("\n");
+
+    // Sizing keywords.
+    let full: ?f32 = some(100.0);
+    let forty: ?f32 = some(40.0);
+    out.write("keyword");
+    keyword(out, sizing.resolve_sizing_keyword(sty.Dimension.min_content(), stretch_size: forty, percent_resolution_basis: full));
+    keyword(out, sizing.resolve_sizing_keyword(sty.Dimension.fit_content_percent(0.5), stretch_size: forty, percent_resolution_basis: full));
+    keyword(out, sizing.resolve_sizing_keyword(sty.Dimension.stretch(), stretch_size: forty, percent_resolution_basis: full));
+    keyword(out, sizing.resolve_sizing_keyword(sty.Dimension.stretch(), stretch_size: none_size, percent_resolution_basis: full));
+    keyword(out, sizing.resolve_sizing_keyword(sty.Dimension.length(5.0), stretch_size: forty, percent_resolution_basis: full));
+    keyword(out, sizing.resolve_sizing_keyword(sty.Dimension.fit_content_px(12.0), stretch_size: none_size, percent_resolution_basis: none_size));
+    out.write("\n");
+
+    // The sizing keywords of an absolutely positioned box: stretched in
+    // both axes, then measured in both.
+    var t = _tree.TestTree.init(a);
+    let node = t.add(sty.Style.default(a), _tree.Content.Fixed { width: 20.0, height: 15.0 });
+    var kd = geo.size_none();
+    let inset = geo.Rect(?f32) { left: some(10.0), right: some(20.0), top: some(5.0), bottom: some(15.0) };
+    let margin = geo.Rect(?f32) { left: some(5.0), right: some(25.0), top: some(0.0), bottom: none };
+    let area_size = geo.Size(f32) { width: 100.0, height: 50.0 };
+    let stretched = geo.Size(sty.Dimension) { width: sty.Dimension.stretch(), height: sty.Dimension.stretch() };
+    sizing.resolve_absolute_sizing_keywords(&mut t, node, &mut kd, stretched, area_size, inset: inset, margin: margin, lt.SizingMode.InherentSize);
+    out.write("absolute");
+    opt(out, kd.width);
+    opt(out, kd.height);
+    var kd2 = geo.size_none();
+    let intrinsic = geo.Size(sty.Dimension) { width: sty.Dimension.min_content(), height: sty.Dimension.max_content() };
+    sizing.resolve_absolute_sizing_keywords(&mut t, node, &mut kd2, intrinsic, area_size, inset: inset, margin: margin, lt.SizingMode.InherentSize);
+    out.write(" |");
+    opt(out, kd2.width);
+    opt(out, kd2.height);
+    out.write("\n");
+
+    // The tree's measuring helpers, each a miss of the cache: a width, then
+    // both axes, then a full layout.
+    var mt = _tree.TestTree.init(a);
+    let text = mt.add(sty.Style.default(a), _tree.Content.Text { width: 60.0, line: 10.0 });
+    let parent = _show.some_size(width: 800.0, height: 600.0);
+    let thirty = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(30.0), height: sty.AvailableSpace.MaxContent };
+    out.write("measure");
+    num(out, lt.measure_child_size(&mut mt, text, known_dimensions: geo.size_none(), parent_size: parent, available_space: thirty, lt.SizingMode.InherentSize, geo.AbsoluteAxis.Horizontal, geo.line_false()));
+    let both_sizes = lt.measure_child_size_both(&mut mt, text, known_dimensions: geo.size_none(), parent_size: parent, available_space: thirty, lt.SizingMode.InherentSize, geo.line_false());
+    out.write(" |");
+    num(out, both_sizes.width);
+    num(out, both_sizes.height);
+    let full_layout = lt.perform_child_layout(&mut mt, text, known_dimensions: geo.size_none(), parent_size: parent, available_space: thirty, lt.SizingMode.InherentSize, geo.line_false());
+    out.write(" |");
+    num(out, full_layout.size.width);
+    num(out, full_layout.size.height);
+    out.write(" ");
+    out.write_u64(mt.computed as u64);
+    out.write("\n");
+
+    // Scrollable overflow contributions: one that propagates, a scroll
+    // container's border box, one wholly before a scroll container's
+    // origin, and one whose containment keeps its overflow in.
+    let visible = geo.Point(sty.Overflow) { x: sty.Overflow.Visible, y: sty.Overflow.Visible };
+    let inner = geo.Rect(f32) { left: -5.0, right: 60.0, top: 0.0, bottom: 40.0 };
+    out.write("overflow");
+    rect(out, overflow.compute_scrollable_overflow_contribution(geo.Point(f32) { x: 10.0, y: 5.0 }, geo.Size(f32) { width: 40.0, height: 20.0 }, inner, visible, sty.Contain.none_set(), false));
+    out.write(" |");
+    let hidden_x = geo.Point(sty.Overflow) { x: sty.Overflow.Hidden, y: sty.Overflow.Visible };
+    rect(out, overflow.compute_scrollable_overflow_contribution(geo.Point(f32) { x: 10.0, y: 5.0 }, geo.Size(f32) { width: 40.0, height: 20.0 }, inner, hidden_x, sty.Contain.none_set(), false));
+    out.write(" |");
+    rect(out, overflow.compute_scrollable_overflow_contribution(geo.Point(f32) { x: -50.0, y: 5.0 }, geo.Size(f32) { width: 40.0, height: 20.0 }, geo.rect_zero(), visible, sty.Contain.none_set(), true));
+    out.write(" |");
+    let big = geo.Rect(f32) { left: -10.0, right: 100.0, top: -10.0, bottom: 100.0 };
+    rect(out, overflow.compute_scrollable_overflow_contribution(geo.Point(f32) { x: -3.0, y: 0.0 }, geo.Size(f32) { width: 34.0, height: 25.0 }, big, visible, sty.Contain.layout(), false));
+    out.write("\n");
+}

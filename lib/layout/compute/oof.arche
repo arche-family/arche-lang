@@ -1,0 +1,58 @@
+/// compute.oof: taffy 0.15's compute/oof.rs, the out-of-flow (absolute and
+/// fixed) positioning pass.
+///
+/// Only the signatures compute.compute_root_layout calls are here yet, with
+/// bodies that stop the program; the pass itself is still to be ported into
+/// this module. A tree without absolute or fixed boxes never reaches them.
+import alloc;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+
+/// The layout of one out-of-flow box (OofBoxLayout). Move-only, for its
+/// candidates.
+pub type OofBoxLayout = struct {
+    /// Its final layout, its location from the containing block's border
+    /// box.
+    pub layout: lt.Layout,
+    /// Candidates surfaced from its subtree, from its own border box.
+    pub surfaced: lt.OofCandidates,
+    /// Its overflow style.
+    pub overflow: geo.Point(sty.Overflow),
+    /// Its contain style.
+    pub contain: sty.Contain,
+}
+
+/// layout_oof_box: sizes and positions one out-of-flow box against its
+/// containing block's area and stores its layout; before_layout sees the
+/// inputs of the final pass first. Not ported yet.
+pub fn layout_oof_box(tree: &mut dyn lt.LayoutTree, candidate: lt.OofCandidate, area_size: geo.Size(f32), area_offset: geo.Point(f32), direction: sty.Direction, container_overflow: geo.Point(sty.Overflow), grid_owner: ?lt.NodeId, before_layout: &dyn fn(&mut dyn lt.LayoutTree, &lt.LayoutInput)) -> OofBoxLayout {
+    panic("layout.compute.oof.layout_oof_box is not ported yet");
+}
+
+/// perform_oof_layout: lays out the candidates the node claims, records
+/// them in hoisted and the rest in unclaimed, and gives their scrollable
+/// overflow. Not ported yet.
+pub fn perform_oof_layout(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, candidates: &lt.OofCandidates, area_size: geo.Size(f32), area_offset: geo.Point(f32), direction: sty.Direction, claims: sty.ContainingBlockClaims, container_overflow: geo.Point(sty.Overflow), hoisted: &mut alloc.List(lt.NodeId), unclaimed: &mut lt.OofCandidates) -> geo.Rect(f32) {
+    panic("layout.compute.oof.perform_oof_layout is not ported yet");
+}
+
+/// compute_oof_layout: after a container's full layout, lays out the
+/// out-of-flow boxes it is the containing block of. A node without a
+/// positioning area (a leaf, a size-only run) or without candidates has
+/// nothing to do; the rest is not ported yet.
+pub fn compute_oof_layout(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, output: &mut lt.LayoutOutput) {
+    match output.oof_positioning_area {
+        some(_) => { }
+        none => { return; }
+    }
+    if output.oof_candidates.is_empty() {
+        // As taffy's pass over no candidates: an empty hoisted list, so
+        // that lists of earlier runs do not persist, and the overflow
+        // joined with an empty rectangle.
+        tree.clear_hoisted_children(node_id);
+        output.scrollable_overflow_rect = output.scrollable_overflow_rect.union(geo.rect_zero());
+        return;
+    }
+    panic("layout.compute.oof.compute_oof_layout is not ported yet");
+}

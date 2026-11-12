@@ -1,0 +1,536 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: max 1.0 2.0 3.0 min 3.0 3.0 -1.5
+// stdout: round 3.0 -2.0 1.0 0.0 1.0 -7.0
+// stdout: f32::round 0.0 3.0 -3.0 -0.0
+// stdout: opt min 3.0 3.0 none 3.0 max 5.0 none add 8.0 3.0 sub -2.0 none
+// stdout: opt f 1.0 3.0 none 2.5 4.0
+// stdout: f32 o 3.0 7.0 12.0 4.0 3.0
+// stdout: clamp 4.0 4.0 6.0 none
+// stdout: space d4.0 d4.0 max d10.0 d3.0 min d7.0 d8.0
+// stdout: free 7.0 0.0 inf rough true false
+// stdout: compact 1000000001 1000001000 0100110000 0010010000 0010110000 0011110000 0011111000 0000000100 0010000000 0000001010
+// stdout: resolve 5.0/5.0/5.0 50.0/none/50.0 none/none/0.0 24.0/none/24.0 none/none/0.0 none/none/0.0 none/none/0.0
+// stdout: lpa 2.0/2.0 3.0/3.0 none/none 12.0/12.0
+// stdout: layout 96.0 41.0 11.5 24.0 scroll 49.0 3.0
+// stdout: margins 1.0 10.0
+// stdout: align start=0.0/0.0 end=30.0/-10.0 center=15.0/-5.0 flex-end=30.0/-10.0 stretch=0.0/0.0 space-between=0.0/0.0 space-around=15.0/0.0 space-evenly=15.0/0.0 safe-center=15.0/0.0 safe-end=30.0/0.0
+// stdout: total_cmp -1 1 0 -1 1 -1
+// stdout: grid 0 2 auto span3 | 1..2 3..5 2..5 4..6 2..3 | none..4 2..none 2..3 | 3..4 3..6 | 1 2 3 | 3 0
+// stdout: placement true true false true false | 0..1 3..4
+// stdout: lines 7 -5 | 2 0 | 0 3
+// stdout: candidates 0 2 3 | 7 9 | 0 0 3 | 11.5 13.5 | 3 0
+// stdout: style flex none false true | 0 claims true false | true false
+// The helpers the algorithms share. The lines up to the alignment offsets
+// are taffy 0.15's own, from the same values in Rust (f32 max and min with
+// NaN, taffy's rounding, MaybeMath, AvailableSpace, CompactLength,
+// resolving lengths with calc(), Layout's content box and scroll extent,
+// collapsing margins, align-content offsets). The rest (total order, grid
+// lines and placements, out-of-flow candidates, style queries) is worked
+// out by hand from taffy's code.
+import std;
+import alloc;
+import layout.compute.common.alignment as alignment;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.style.grid as sgrid;
+import layout.tree as lt;
+import layout.util;
+
+/// " " and an f32.
+fn num(out: &mut std.Output, x: f32) {
+    out.write(" ");
+    out.write_f32(x);
+}
+
+/// " " and an ?f32, or " none".
+fn opt(out: &mut std.Output, x: ?f32) {
+    match x {
+        some(v) => { num(out, v); }
+        none => { out.write(" none"); }
+    }
+}
+
+/// An ?f32 without the leading space.
+fn opt_bare(out: &mut std.Output, x: ?f32) {
+    match x {
+        some(v) => { out.write_f32(v); }
+        none => { out.write("none"); }
+    }
+}
+
+/// " d<value>", " min" or " max".
+fn space(out: &mut std.Output, s: sty.AvailableSpace) {
+    match s {
+        .Definite { value } => {
+            out.write(" d");
+            out.write_f32(value);
+        }
+        .MinContent => { out.write(" min"); }
+        .MaxContent => { out.write(" max"); }
+    }
+}
+
+/// 1 or 0.
+fn bit(out: &mut std.Output, b: bool) {
+    if b {
+        out.write("1");
+    } else {
+        out.write("0");
+    }
+}
+
+/// The predicates of a CompactLength as ten bits.
+fn compact(out: &mut std.Output, c: sty.CompactLength) {
+    out.write(" ");
+    bit(out, c.is_length_or_percentage());
+    bit(out, c.is_auto());
+    bit(out, c.is_sizing_keyword());
+    bit(out, c.is_fit_content());
+    bit(out, c.is_max_content_alike());
+    bit(out, c.is_intrinsic());
+    bit(out, c.uses_percentage());
+    bit(out, c.is_fr());
+    bit(out, c.has_calc());
+    bit(out, c.is_zero());
+}
+
+/// A Dimension resolved against 200, against nothing, and or zero.
+fn resolve(out: &mut std.Output, d: sty.Dimension) {
+    let full: ?f32 = some(200.0);
+    out.write(" ");
+    opt_bare(out, d.maybe_resolve(full));
+    out.write("/");
+    opt_bare(out, d.maybe_resolve(none));
+    out.write("/");
+    out.write_f32(d.resolve_or_zero(full));
+}
+
+/// A LengthPercentageAuto resolved against 30 two ways.
+fn resolve_lpa(out: &mut std.Output, x: sty.LengthPercentageAuto) {
+    let ctx: ?f32 = some(30.0);
+    out.write(" ");
+    opt_bare(out, x.maybe_resolve(ctx));
+    out.write("/");
+    opt_bare(out, x.resolve_to_option(30.0));
+}
+
+/// taffy's compute_block_align_content_offset: one subject.
+fn block_offset(ac: sty.AlignContent, free_space: f32) -> f32 {
+    let keyword = alignment.apply_alignment_fallback(free_space, 1, ac);
+    return alignment.compute_alignment_offset(free_space: free_space, 1, gap: 0.0, keyword, layout_is_flex_reversed: false, is_first: true);
+}
+
+/// " name=a/b": the offsets with 30 and -10 free.
+fn align(out: &mut std.Output, name: str, ac: sty.AlignContent) {
+    out.write(" ");
+    out.write(name);
+    out.write("=");
+    out.write_f32(block_offset(ac, 30.0));
+    out.write("/");
+    out.write_f32(block_offset(ac, -10.0));
+}
+
+/// " s..e" of origin-zero lines.
+fn span_of(out: &mut std.Output, l: geo.Line(sgrid.OriginZeroLine)) {
+    out.write(" ");
+    out.write_i64(l.start.value as i64);
+    out.write("..");
+    out.write_i64(l.end.value as i64);
+}
+
+/// An origin-zero placement: its line, auto, or spanN.
+fn oz(out: &mut std.Output, p: sgrid.OriginZeroGridPlacement) {
+    out.write(" ");
+    match p {
+        .Auto => { out.write("auto"); }
+        .Line { line } => { out.write_i64(line.value as i64); }
+        .Span { span } => {
+            out.write("span");
+            out.write_u64(span as u64);
+        }
+    }
+}
+
+/// An origin-zero line, as an origin-zero placement.
+fn ozl(v: i16) -> sgrid.OriginZeroGridPlacement {
+    return sgrid.OriginZeroGridPlacement.Line { line: sgrid.OriginZeroLine { value: v } };
+}
+
+/// A placement line of two origin-zero placements.
+fn ozline(start: sgrid.OriginZeroGridPlacement, end: sgrid.OriginZeroGridPlacement) -> geo.Line(sgrid.OriginZeroGridPlacement) {
+    return geo.Line(sgrid.OriginZeroGridPlacement) { start: start, end: end };
+}
+
+/// An optional origin-zero line.
+fn ozo(out: &mut std.Output, l: ?sgrid.OriginZeroLine) {
+    match l {
+        some(v) => { out.write_i64(v.value as i64); }
+        none => { out.write("none"); }
+    }
+}
+
+/// A candidate at an x and a y.
+fn candidate(node: u64, x: f32, y: f32) -> lt.OofCandidate {
+    return lt.OofCandidate {
+        node: lt.NodeId.new(node),
+        order: 0,
+        position: sty.Position.Absolute,
+        static_position: geo.Point(lt.AxisStaticPosition) {
+            x: lt.AxisStaticPosition.from_edge(x, lt.AxisStaticEdge.Start),
+            y: lt.AxisStaticPosition.from_edge(y, lt.AxisStaticEdge.Start),
+        },
+    };
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let out = &mut sys.stdout;
+    let nan = util.nan();
+    let one: f32 = 1.0;
+    let three: f32 = 3.0;
+    out.write("max");
+    num(out, util.f32_max(a: one, b: nan));
+    num(out, util.f32_max(a: nan, b: 2.0));
+    num(out, util.f32_max(a: three, b: -4.0));
+    out.write(" min");
+    num(out, util.f32_min(a: nan, b: 3.0));
+    num(out, util.f32_min(a: three, b: nan));
+    num(out, util.f32_min(a: -1.5, b: 2.0));
+    out.write("\n");
+
+    out.write("round");
+    num(out, util.round(2.5));
+    num(out, util.round(-2.5));
+    num(out, util.round(0.49999997));
+    num(out, util.round(-0.5));
+    num(out, util.round(1.4999999));
+    num(out, util.round(-7.25));
+    out.write("\n");
+    out.write("f32::round");
+    num(out, util.round_half_away(0.49999997));
+    num(out, util.round_half_away(2.5));
+    num(out, util.round_half_away(-2.5));
+    num(out, util.round_half_away(-0.4));
+    out.write("\n");
+
+    let a: ?f32 = some(3.0);
+    let b: ?f32 = some(5.0);
+    let n: ?f32 = none;
+    out.write("opt min");
+    opt(out, util.maybe_min(lhs: a, rhs: b));
+    opt(out, util.maybe_min(lhs: a, rhs: n));
+    opt(out, util.maybe_min(lhs: n, rhs: b));
+    opt(out, util.maybe_min(lhs: b, rhs: a));
+    out.write(" max");
+    opt(out, util.maybe_max(lhs: a, rhs: b));
+    opt(out, util.maybe_max(lhs: n, rhs: a));
+    out.write(" add");
+    opt(out, util.maybe_add(lhs: a, rhs: b));
+    opt(out, util.maybe_add(lhs: a, rhs: n));
+    out.write(" sub");
+    opt(out, util.maybe_sub(lhs: a, rhs: b));
+    opt(out, util.maybe_sub(lhs: n, rhs: b));
+    out.write("\n");
+    out.write("opt f");
+    opt(out, util.maybe_min_f(a, 1.0));
+    opt(out, util.maybe_max_f(a, 1.0));
+    opt(out, util.maybe_add_f(n, 1.0));
+    opt(out, util.maybe_sub_f(a, 0.5));
+    opt(out, util.maybe_clamp_f(b, min: 1.0, max: 4.0));
+    out.write("\n");
+    out.write("f32 o");
+    num(out, util.f32_maybe_min(7.0, a));
+    num(out, util.f32_maybe_max(7.0, n));
+    num(out, util.f32_maybe_add(7.0, b));
+    num(out, util.f32_maybe_sub(7.0, a));
+    num(out, util.f32_maybe_clamp(7.0, min: n, max: a));
+    out.write("\n");
+    let four: ?f32 = some(4.0);
+    let six: ?f32 = some(6.0);
+    out.write("clamp");
+    opt(out, util.maybe_clamp(value: b, min: a, max: four));
+    opt(out, util.maybe_clamp(value: b, min: n, max: four));
+    opt(out, util.maybe_clamp(value: b, min: six, max: n));
+    opt(out, util.maybe_clamp(value: n, min: a, max: b));
+    out.write("\n");
+
+    let d = sty.AvailableSpace.definite(10.0);
+    let mn = sty.AvailableSpace.MinContent;
+    let mx = sty.AvailableSpace.MaxContent;
+    let eight: ?f32 = some(8.0);
+    out.write("space");
+    space(out, d.maybe_min_f(4.0));
+    space(out, mn.maybe_min_f(4.0));
+    space(out, mx.maybe_max_f(4.0));
+    space(out, d.maybe_min(n));
+    space(out, mx.maybe_min(a));
+    space(out, mn.maybe_max(a));
+    space(out, d.maybe_sub(a));
+    space(out, d.maybe_clamp(min: a, max: eight));
+    out.write("\n");
+    out.write("free");
+    num(out, d.compute_free_space(3.0));
+    num(out, mn.compute_free_space(3.0));
+    num(out, mx.compute_free_space(3.0));
+    out.write(" rough ");
+    if d.is_roughly_equal(sty.AvailableSpace.definite(10.0000001)) {
+        out.write("true ");
+    } else {
+        out.write("false ");
+    }
+    if d.is_roughly_equal(sty.AvailableSpace.definite(10.001)) {
+        out.write("true\n");
+    } else {
+        out.write("false\n");
+    }
+
+    out.write("compact");
+    compact(out, sty.CompactLength.length(0.0));
+    compact(out, sty.CompactLength.percent(0.5));
+    compact(out, sty.CompactLength.auto());
+    compact(out, sty.CompactLength.min_content());
+    compact(out, sty.CompactLength.max_content());
+    compact(out, sty.CompactLength.fit_content_px(10.0));
+    compact(out, sty.CompactLength.fit_content_percent(0.5));
+    compact(out, sty.CompactLength.fr(1.0));
+    compact(out, sty.CompactLength.stretch());
+    compact(out, sty.CompactLength.calc(sty.Calc { px: 1.0, percent: 2.0 }));
+    out.write("\n");
+
+    out.write("resolve");
+    resolve(out, sty.Dimension.length(5.0));
+    resolve(out, sty.Dimension.percent(0.25));
+    resolve(out, sty.Dimension.auto());
+    resolve(out, sty.Dimension.calc(sty.Calc { px: 4.0, percent: 10.0 }));
+    resolve(out, sty.Dimension.min_content());
+    resolve(out, sty.Dimension.content());
+    resolve(out, sty.Dimension.fit_content_px(9.0));
+    out.write("\n");
+    out.write("lpa");
+    resolve_lpa(out, sty.LengthPercentageAuto.length(2.0));
+    resolve_lpa(out, sty.LengthPercentageAuto.percent(0.1));
+    resolve_lpa(out, sty.LengthPercentageAuto.auto());
+    resolve_lpa(out, sty.LengthPercentageAuto.calc(sty.Calc { px: -3.0, percent: 50.0 }));
+    out.write("\n");
+
+    var l = lt.Layout.new();
+    l.size = geo.Size(f32) { width: 100.0, height: 50.0 };
+    l.padding = geo.Rect(f32) { left: 1.0, right: 2.0, top: 3.0, bottom: 4.0 };
+    l.border = geo.Rect(f32) { left: 0.5, right: 0.5, top: 1.0, bottom: 1.0 };
+    l.location = geo.Point(f32) { x: 10.0, y: 20.0 };
+    l.scrollbar_size = geo.Size(f32) { width: 8.0, height: 6.0 };
+    l.scrollable_overflow_rect = geo.Rect(f32) { left: -5.0, right: 140.0, top: 0.0, bottom: 45.0 };
+    out.write("layout");
+    num(out, l.content_box_width());
+    num(out, l.content_box_height());
+    num(out, l.content_box_x());
+    num(out, l.content_box_y());
+    out.write(" scroll");
+    num(out, l.scroll_width());
+    num(out, l.scroll_height());
+    out.write("\n");
+
+    let m = lt.CollapsibleMarginSet.from_margin(5.0).collapse_with_margin(-3.0).collapse_with_margin(8.0).collapse_with_margin(-7.0);
+    let m2 = lt.CollapsibleMarginSet.from_margin(-2.0).collapse_with_set(lt.CollapsibleMarginSet.from_margin(12.0));
+    out.write("margins");
+    num(out, m.resolve());
+    num(out, m2.resolve());
+    out.write("\n");
+
+    out.write("align");
+    align(out, "start", sty.AlignContent.start());
+    align(out, "end", sty.AlignContent.end());
+    align(out, "center", sty.AlignContent.center());
+    align(out, "flex-end", sty.AlignContent.flex_end());
+    align(out, "stretch", sty.AlignContent.stretch());
+    align(out, "space-between", sty.AlignContent.space_between());
+    align(out, "space-around", sty.AlignContent.space_around());
+    align(out, "space-evenly", sty.AlignContent.space_evenly());
+    align(out, "safe-center", sty.AlignContent.safe(sty.AlignContentKeyword.Center));
+    align(out, "safe-end", sty.AlignContent.safe(sty.AlignContentKeyword.End));
+    out.write("\n");
+
+    // total_cmp: -1.0 < 2.0, +0.0 > -0.0, NaN == NaN, -inf < 1, NaN > inf,
+    // -NaN < -inf.
+    out.write("total_cmp ");
+    out.write_i64(util.total_cmp(a: -1.0, b: 2.0) as i64);
+    out.write(" ");
+    out.write_i64(util.total_cmp(a: 0.0, b: -0.0) as i64);
+    out.write(" ");
+    out.write_i64(util.total_cmp(a: nan, b: nan) as i64);
+    out.write(" ");
+    out.write_i64(util.total_cmp(a: util.neg_infinity(), b: 1.0) as i64);
+    out.write(" ");
+    out.write_i64(util.total_cmp(a: nan, b: util.infinity()) as i64);
+    out.write(" ");
+    out.write_i64(util.total_cmp(a: -nan, b: util.neg_infinity()) as i64);
+    out.write("\n");
+
+    // Grid lines with 3 explicit tracks: line 1 is 0, line -1 is 3 (the
+    // 4th line), -6 is -2; 0 is auto; span 3. Definite placements, in
+    // order: two equal lines, two lines reversed, a line and a span, a span
+    // and a line, auto and a line. Absolutely positioned tracks; indefinite
+    // ones from line 3; spans.
+    out.write("grid");
+    oz(out, sgrid.GridPlacement.from_line_index(1).into_origin_zero_placement_ignoring_named(3));
+    oz(out, sgrid.NonNamedGridPlacement.Line { line: sgrid.GridLine.from(3) }.into_origin_zero_placement(3));
+    oz(out, sgrid.GridPlacement.from_line_index(0).into_origin_zero_placement_ignoring_named(3));
+    oz(out, sgrid.GridPlacement.from_span(3).into_origin_zero_placement_ignoring_named(3));
+    out.write(" |");
+    span_of(out, ozline(start: ozl(1), end: ozl(1)).resolve_definite_grid_lines());
+    span_of(out, ozline(start: ozl(5), end: ozl(3)).resolve_definite_grid_lines());
+    span_of(out, ozline(start: ozl(2), end: sgrid.OriginZeroGridPlacement.Span { span: 3 }).resolve_definite_grid_lines());
+    span_of(out, ozline(start: sgrid.OriginZeroGridPlacement.Span { span: 2 }, end: ozl(6)).resolve_definite_grid_lines());
+    span_of(out, ozline(start: sgrid.OriginZeroGridPlacement.Auto, end: ozl(3)).resolve_definite_grid_lines());
+    out.write(" |");
+    let abs1 = ozline(start: sgrid.OriginZeroGridPlacement.Auto, end: ozl(4)).resolve_absolutely_positioned_grid_tracks();
+    out.write(" ");
+    ozo(out, abs1.start);
+    out.write("..");
+    ozo(out, abs1.end);
+    let abs2 = ozline(start: ozl(2), end: sgrid.OriginZeroGridPlacement.Auto).resolve_absolutely_positioned_grid_tracks();
+    out.write(" ");
+    ozo(out, abs2.start);
+    out.write("..");
+    ozo(out, abs2.end);
+    let abs3 = ozline(start: ozl(2), end: ozl(2)).resolve_absolutely_positioned_grid_tracks();
+    out.write(" ");
+    ozo(out, abs3.start);
+    out.write("..");
+    ozo(out, abs3.end);
+    out.write(" |");
+    let from3 = sgrid.OriginZeroLine { value: 3 };
+    span_of(out, ozline(start: sgrid.OriginZeroGridPlacement.Auto, end: sgrid.OriginZeroGridPlacement.Auto).resolve_indefinite_grid_tracks(from3));
+    span_of(out, ozline(start: sgrid.OriginZeroGridPlacement.Span { span: 3 }, end: sgrid.OriginZeroGridPlacement.Span { span: 5 }).resolve_indefinite_grid_tracks(from3));
+    out.write(" | ");
+    out.write_u64(ozline(start: sgrid.OriginZeroGridPlacement.Auto, end: sgrid.OriginZeroGridPlacement.Auto).indefinite_span() as u64);
+    out.write(" ");
+    out.write_u64(ozline(start: ozl(1), end: sgrid.OriginZeroGridPlacement.Span { span: 2 }).indefinite_span() as u64);
+    out.write(" ");
+    out.write_u64(ozline(start: sgrid.OriginZeroGridPlacement.Span { span: 3 }, end: sgrid.OriginZeroGridPlacement.Auto).indefinite_span() as u64);
+    out.write(" | ");
+    let wide = geo.Line(sgrid.OriginZeroLine) { start: sgrid.OriginZeroLine { value: -1 }, end: sgrid.OriginZeroLine { value: 2 } };
+    out.write_u64(wide.span() as u64);
+    out.write(" ");
+    let back = geo.Line(sgrid.OriginZeroLine) { start: sgrid.OriginZeroLine { value: 4 }, end: sgrid.OriginZeroLine { value: 2 } };
+    out.write_u64(back.span() as u64);
+    out.write("\n");
+
+    // is_definite of GridPlacement lines: a line, a named line, auto and a
+    // span, line 0 then a line, a span and line 0.
+    var names = alloc.Interner.init(sys.alloc);
+    let header = names.intern("header");
+    out.write("placement ");
+    bit_word(out, sgrid.placement_line_from_index(2).is_definite());
+    out.write(" ");
+    bit_word(out, geo.Line(sgrid.GridPlacement) { start: sgrid.GridPlacement.NamedLine { name: header, index: 1 }, end: sgrid.GridPlacement.Auto }.is_definite());
+    out.write(" ");
+    bit_word(out, geo.Line(sgrid.GridPlacement) { start: sgrid.GridPlacement.Auto, end: sgrid.GridPlacement.from_span(2) }.is_definite());
+    out.write(" ");
+    bit_word(out, geo.Line(sgrid.GridPlacement) { start: sgrid.GridPlacement.from_line_index(0), end: sgrid.GridPlacement.from_line_index(-1) }.is_definite());
+    out.write(" ");
+    bit_word(out, geo.Line(sgrid.GridPlacement) { start: sgrid.GridPlacement.from_span(1), end: sgrid.GridPlacement.from_line_index(0) }.is_definite());
+    out.write(" |");
+    // Lines 1 / 2 and -2 / -1 of a 4-track grid, named lines as auto.
+    let p1 = geo.Line(sgrid.GridPlacement) { start: sgrid.GridPlacement.from_line_index(1), end: sgrid.GridPlacement.from_line_index(2) }.into_origin_zero_ignoring_named(4).resolve_definite_grid_lines();
+    span_of(out, p1);
+    let p2 = geo.Line(sgrid.GridPlacement) { start: sgrid.GridPlacement.from_line_index(-2), end: sgrid.GridPlacement.from_line_index(-1) }.into_origin_zero_ignoring_named(4).resolve_definite_grid_lines();
+    span_of(out, p2);
+    out.write("\n");
+
+    // Origin-zero lines as CSS numbers them with 3 explicit tracks (6 is
+    // line 7, -1 is line -5), and the implicit tracks lines imply.
+    let six_line = sgrid.OriginZeroLine { value: 6 }.into_grid_line(3);
+    let neg = sgrid.OriginZeroLine { value: -1 }.into_grid_line(3);
+    out.write("lines ");
+    out.write_i64(six_line.as_i16() as i64);
+    out.write(" ");
+    out.write_i64(neg.as_i16() as i64);
+    out.write(" | ");
+    out.write_u64(sgrid.OriginZeroLine { value: -2 }.implied_negative_implicit_tracks() as u64);
+    out.write(" ");
+    out.write_u64(sgrid.OriginZeroLine { value: 2 }.implied_negative_implicit_tracks() as u64);
+    out.write(" | ");
+    out.write_u64(sgrid.OriginZeroLine { value: 3 }.implied_positive_implicit_tracks(3) as u64);
+    out.write(" ");
+    out.write_u64(sgrid.OriginZeroLine { value: 6 }.implied_positive_implicit_tracks(3) as u64);
+    out.write("\n");
+
+    // Out-of-flow candidates: empty, two pushed, one appended (the other
+    // list left empty), taken (the list left empty), translated.
+    var c1 = lt.OofCandidates.new();
+    out.write("candidates ");
+    out.write_u64(c1.len() as u64);
+    c1.push(candidate(7, x: 1.5, y: 2.5), sys.alloc);
+    c1.push(candidate(8, x: 0.0, y: 0.0), sys.alloc);
+    out.write(" ");
+    out.write_u64(c1.len() as u64);
+    var c2 = lt.OofCandidates.new();
+    c2.push(candidate(9, x: 10.0, y: 11.0), sys.alloc);
+    c1.append(&mut c2);
+    out.write(" ");
+    out.write_u64(c1.len() as u64);
+    out.write(" | ");
+    out.write_u64(c1.get(0).node.value);
+    out.write(" ");
+    out.write_u64(c1.get(2).node.value);
+    out.write(" | ");
+    out.write_u64(c2.len() as u64);
+    out.write(" ");
+    var c3 = c1.take();
+    out.write_u64(c1.len() as u64);
+    out.write(" ");
+    out.write_u64(c3.len() as u64);
+    out.write(" |");
+    c3.translate(geo.Point(f32) { x: 10.0, y: 11.0 });
+    num(out, c3.get(0).static_position.x.area.start);
+    num(out, c3.get(0).static_position.y.area.end);
+    out.write(" |");
+    let copy = c3.clone();
+    c3.clear();
+    out.write(" ");
+    out.write_u64(copy.len() as u64);
+    out.write(" ");
+    out.write_u64(c3.len() as u64);
+    out.write("\n");
+
+    // Style queries: the default display, auto self alignment, whether it
+    // is a block, whether a scroll container; containing-block claims.
+    var st = sty.Style.default(sys.alloc);
+    out.write("style ");
+    if st.display == sty.Display.Flex {
+        out.write("flex");
+    }
+    match st.align_self {
+        some(_) => { out.write(" some"); }
+        none => { out.write(" none"); }
+    }
+    out.write(" ");
+    bit_word(out, st.is_block());
+    st.overflow.y = sty.Overflow.Hidden;
+    out.write(" ");
+    bit_word(out, st.overflow.y.is_scroll_container());
+    out.write(" | ");
+    out.write_u64(st.grid_template_tracks(geo.AbsoluteAxis.Horizontal).len() as u64);
+    out.write(" claims ");
+    st.position = sty.Position.Relative;
+    let claims = st.is_containing_block();
+    bit_word(out, claims.for_position(sty.Position.Absolute));
+    out.write(" ");
+    bit_word(out, claims.for_position(sty.Position.Fixed));
+    out.write(" | ");
+    bit_word(out, sty.Contain.content().establishes_independent_formatting_context());
+    out.write(" ");
+    bit_word(out, sty.Contain.paint().suppresses_baseline());
+    out.write("\n");
+}
+
+/// true or false.
+fn bit_word(out: &mut std.Output, b: bool) {
+    if b {
+        out.write("true");
+    } else {
+        out.write("false");
+    }
+}

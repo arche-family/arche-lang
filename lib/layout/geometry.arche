@@ -1,0 +1,1006 @@
+/// geometry: taffy 0.15's geometry.rs, the generic Size, Rect, Point, Line
+/// and MinMax, with the helpers the layout algorithms use.
+///
+/// The types are generic as taffy's are: `Size(f32)`, `Size(?f32)`,
+/// `Size(sty.AvailableSpace)`, `Rect(sty.LengthPercentage)`... A method
+/// that only makes sense for some element types (adding, maybe_min,
+/// maybe_resolve...) chooses its body with `comptime if` on the element
+/// type, and is unreachable for the others. Where taffy's trait is
+/// generic over the right-hand side, the method's name says which one:
+/// `maybe_min(rhs: Size(?f32))` and `maybe_min_f(rhs: Size(f32))`.
+///
+/// taffy's constants are functions here: Size::ZERO is `size_zero()`,
+/// Size::NONE `size_none()`, Rect::ZERO `rect_zero()`, Line::FALSE
+/// `line_false()`, Size::MAX_CONTENT `size_max_content()`.
+import core.meta;
+import layout.style as sty;
+import layout.style.grid as sgrid;
+import layout.util;
+
+/// The two absolute axes (AbsoluteAxis).
+pub type AbsoluteAxis = enum {
+    /// The horizontal axis.
+    Horizontal,
+    /// The vertical axis.
+    Vertical,
+
+    /// The other axis.
+    pub fn other_axis(self: AbsoluteAxis) -> AbsoluteAxis {
+        match self {
+            .Horizontal => { return AbsoluteAxis.Vertical; }
+            .Vertical => { return AbsoluteAxis.Horizontal; }
+        }
+    }
+}
+
+/// The two abstract axes (AbstractAxis): inline and block.
+pub type AbstractAxis = enum {
+    /// The axis in which text runs (horizontal in horizontal-tb).
+    Inline,
+    /// The axis in which blocks stack (vertical in horizontal-tb).
+    Block,
+
+    /// The other axis.
+    pub fn other(self: AbstractAxis) -> AbstractAxis {
+        match self {
+            .Inline => { return AbstractAxis.Block; }
+            .Block => { return AbstractAxis.Inline; }
+        }
+    }
+
+    /// The absolute axis, assuming horizontal-tb writing mode.
+    pub fn as_abs_naive(self: AbstractAxis) -> AbsoluteAxis {
+        match self {
+            .Inline => { return AbsoluteAxis.Horizontal; }
+            .Block => { return AbsoluteAxis.Vertical; }
+        }
+    }
+}
+
+/// A value for each absolute axis (InBothAbsAxis).
+pub type InBothAbsAxis(comptime T: type) = struct {
+    /// The horizontal value.
+    pub horizontal: T,
+    /// The vertical value.
+    pub vertical: T,
+
+    /// The value for axis.
+    pub fn get(self: InBothAbsAxis(T), axis: AbsoluteAxis) -> T {
+        match axis {
+            .Horizontal => { return self.horizontal; }
+            .Vertical => { return self.vertical; }
+        }
+    }
+}
+
+/// A width and a height (Size<T>).
+pub type Size(comptime T: type) = struct {
+    /// The horizontal component.
+    pub width: T,
+    /// The vertical component.
+    pub height: T,
+
+    /// The component in an absolute axis (get_abs).
+    pub fn get_abs(self: Size(T), axis: AbsoluteAxis) -> T {
+        match axis {
+            .Horizontal => { return self.width; }
+            .Vertical => { return self.height; }
+        }
+    }
+
+    /// Width and height swapped.
+    pub fn transpose(self: Size(T)) -> Size(T) {
+        return Size(T) { width: self.height, height: self.width };
+    }
+
+    /// The component in the flex direction's main axis.
+    pub fn main(self: Size(T), direction: sty.FlexDirection) -> T {
+        if direction.is_row() {
+            return self.width;
+        }
+        return self.height;
+    }
+
+    /// The component in the flex direction's cross axis.
+    pub fn cross(self: Size(T), direction: sty.FlexDirection) -> T {
+        if direction.is_row() {
+            return self.height;
+        }
+        return self.width;
+    }
+
+    /// Sets the main-axis component.
+    pub fn set_main(self: &mut Size(T), direction: sty.FlexDirection, value: T) {
+        if direction.is_row() {
+            self.width = value;
+        } else {
+            self.height = value;
+        }
+    }
+
+    /// Sets the cross-axis component.
+    pub fn set_cross(self: &mut Size(T), direction: sty.FlexDirection, value: T) {
+        if direction.is_row() {
+            self.height = value;
+        } else {
+            self.width = value;
+        }
+    }
+
+    /// A copy with the main-axis component replaced.
+    pub fn with_main(self: Size(T), direction: sty.FlexDirection, value: T) -> Size(T) {
+        var next = self;
+        next.set_main(direction, value);
+        return next;
+    }
+
+    /// A copy with the cross-axis component replaced.
+    pub fn with_cross(self: Size(T), direction: sty.FlexDirection, value: T) -> Size(T) {
+        var next = self;
+        next.set_cross(direction, value);
+        return next;
+    }
+
+    /// The component in an abstract axis (inline is the width).
+    pub fn get(self: Size(T), axis: AbstractAxis) -> T {
+        match axis {
+            .Inline => { return self.width; }
+            .Block => { return self.height; }
+        }
+    }
+
+    /// Sets the component in an abstract axis.
+    pub fn set(self: &mut Size(T), axis: AbstractAxis, value: T) {
+        match axis {
+            .Inline => { self.width = value; }
+            .Block => { self.height = value; }
+        }
+    }
+
+    /// A copy with the component in an abstract axis replaced.
+    pub fn with(self: Size(T), axis: AbstractAxis, value: T) -> Size(T) {
+        var next = self;
+        next.set(axis, value);
+        return next;
+    }
+
+    /// Size<f32> + Size<f32>, component by component.
+    pub fn add(self: Size(T), rhs: Size(T)) -> Size(T) {
+        comptime if meta.same(T, f32) {
+            return Size(T) { width: self.width + rhs.width, height: self.height + rhs.height };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<f32> - Size<f32>, component by component.
+    pub fn sub(self: Size(T), rhs: Size(T)) -> Size(T) {
+        comptime if meta.same(T, f32) {
+            return Size(T) { width: self.width - rhs.width, height: self.height - rhs.height };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<f32>::f32_max: the larger of each component.
+    pub fn f32_max(self: Size(T), rhs: Size(T)) -> Size(T) {
+        comptime if meta.same(T, f32) {
+            return Size(T) { width: util.f32_max(a: self.width, b: rhs.width), height: util.f32_max(a: self.height, b: rhs.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<f32>::f32_min: the smaller of each component.
+    pub fn f32_min(self: Size(T), rhs: Size(T)) -> Size(T) {
+        comptime if meta.same(T, f32) {
+            return Size(T) { width: util.f32_min(a: self.width, b: rhs.width), height: util.f32_min(a: self.height, b: rhs.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<f32>::has_non_zero_area: both components above zero.
+    pub fn has_non_zero_area(self: Size(T)) -> bool {
+        comptime if meta.same(T, f32) {
+            return self.width > 0.0 and self.height > 0.0;
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<f32>.map(Some): every component some.
+    pub fn map_some(self: Size(T)) -> Size(?f32) {
+        comptime if meta.same(T, f32) {
+            return Size(?f32) { width: some(self.width), height: some(self.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<Option<f32>>::maybe_apply_aspect_ratio: the missing component
+    /// from the other and the ratio (width / height), when exactly one is
+    /// missing.
+    pub fn maybe_apply_aspect_ratio(self: Size(T), aspect_ratio: ?f32) -> Size(T) {
+        comptime if meta.same(T, ?f32) {
+            match aspect_ratio {
+                some(ratio) => {
+                    match self.width {
+                        some(width) => {
+                            match self.height {
+                                some(_) => { return self; }
+                                none => { return Size(T) { width: some(width), height: some(width / ratio) }; }
+                            }
+                        }
+                        none => {
+                            match self.height {
+                                some(height) => { return Size(T) { width: some(height * ratio), height: some(height) }; }
+                                none => { return self; }
+                            }
+                        }
+                    }
+                }
+                none => { return self; }
+            }
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<Option<f32>>::unwrap_or: each component, or alt's.
+    pub fn unwrap_or(self: Size(T), alt: Size(f32)) -> Size(f32) {
+        comptime if meta.same(T, ?f32) {
+            return Size(f32) { width: util.unwrap_or(self.width, alt.width), height: util.unwrap_or(self.height, alt.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<Option<f32>>::or (a keyword in Arche): each component, or
+    /// alt's.
+    pub fn fallback(self: Size(T), alt: Size(T)) -> Size(T) {
+        comptime if meta.same(T, ?f32) {
+            return Size(T) { width: util.opt_or(value: self.width, alt: alt.width), height: util.opt_or(value: self.height, alt: alt.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<Option<f32>>::both_axis_defined.
+    pub fn both_axis_defined(self: Size(T)) -> bool {
+        comptime if meta.same(T, ?f32) {
+            return util.is_some(self.width) and util.is_some(self.height);
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<AvailableSpace>::into_options: definite space as some.
+    pub fn into_options(self: Size(T)) -> Size(?f32) {
+        comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(?f32) { width: self.width.into_option(), height: self.height.into_option() };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Size<AvailableSpace>::maybe_set: definite space where value is some.
+    pub fn maybe_set(self: Size(T), value: Size(?f32)) -> Size(T) {
+        comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) { width: self.width.maybe_set(value.width), height: self.height.maybe_set(value.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeMath::maybe_min against Size<Option<f32>>, for Size<f32>,
+    /// Size<Option<f32>> and Size<AvailableSpace>.
+    pub fn maybe_min(self: Size(T), rhs: Size(?f32)) -> Size(T) {
+        comptime if meta.same(T, f32) {
+            return Size(T) { width: util.f32_maybe_min(self.width, rhs.width), height: util.f32_maybe_min(self.height, rhs.height) };
+        } else comptime if meta.same(T, ?f32) {
+            return Size(T) { width: util.maybe_min(lhs: self.width, rhs: rhs.width), height: util.maybe_min(lhs: self.height, rhs: rhs.height) };
+        } else comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) { width: self.width.maybe_min(rhs.width), height: self.height.maybe_min(rhs.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeMath::maybe_max against Size<Option<f32>>.
+    pub fn maybe_max(self: Size(T), rhs: Size(?f32)) -> Size(T) {
+        comptime if meta.same(T, f32) {
+            return Size(T) { width: util.f32_maybe_max(self.width, rhs.width), height: util.f32_maybe_max(self.height, rhs.height) };
+        } else comptime if meta.same(T, ?f32) {
+            return Size(T) { width: util.maybe_max(lhs: self.width, rhs: rhs.width), height: util.maybe_max(lhs: self.height, rhs: rhs.height) };
+        } else comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) { width: self.width.maybe_max(rhs.width), height: self.height.maybe_max(rhs.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeMath::maybe_clamp against Size<Option<f32>> bounds.
+    pub fn maybe_clamp(self: Size(T), min: Size(?f32), max: Size(?f32)) -> Size(T) {
+        comptime if meta.same(T, f32) {
+            return Size(T) {
+                width: util.f32_maybe_clamp(self.width, min: min.width, max: max.width),
+                height: util.f32_maybe_clamp(self.height, min: min.height, max: max.height),
+            };
+        } else comptime if meta.same(T, ?f32) {
+            return Size(T) {
+                width: util.maybe_clamp(value: self.width, min: min.width, max: max.width),
+                height: util.maybe_clamp(value: self.height, min: min.height, max: max.height),
+            };
+        } else comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) {
+                width: self.width.maybe_clamp(min: min.width, max: max.width),
+                height: self.height.maybe_clamp(min: min.height, max: max.height),
+            };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeMath::maybe_add against Size<Option<f32>>.
+    pub fn maybe_add(self: Size(T), rhs: Size(?f32)) -> Size(T) {
+        comptime if meta.same(T, f32) {
+            return Size(T) { width: util.f32_maybe_add(self.width, rhs.width), height: util.f32_maybe_add(self.height, rhs.height) };
+        } else comptime if meta.same(T, ?f32) {
+            return Size(T) { width: util.maybe_add(lhs: self.width, rhs: rhs.width), height: util.maybe_add(lhs: self.height, rhs: rhs.height) };
+        } else comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) { width: self.width.maybe_add(rhs.width), height: self.height.maybe_add(rhs.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeMath::maybe_sub against Size<Option<f32>>.
+    pub fn maybe_sub(self: Size(T), rhs: Size(?f32)) -> Size(T) {
+        comptime if meta.same(T, f32) {
+            return Size(T) { width: util.f32_maybe_sub(self.width, rhs.width), height: util.f32_maybe_sub(self.height, rhs.height) };
+        } else comptime if meta.same(T, ?f32) {
+            return Size(T) { width: util.maybe_sub(lhs: self.width, rhs: rhs.width), height: util.maybe_sub(lhs: self.height, rhs: rhs.height) };
+        } else comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) { width: self.width.maybe_sub(rhs.width), height: self.height.maybe_sub(rhs.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeMath::maybe_min against Size<f32>, for Size<Option<f32>> and
+    /// Size<AvailableSpace>.
+    pub fn maybe_min_f(self: Size(T), rhs: Size(f32)) -> Size(T) {
+        comptime if meta.same(T, ?f32) {
+            return Size(T) { width: util.maybe_min_f(self.width, rhs.width), height: util.maybe_min_f(self.height, rhs.height) };
+        } else comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) { width: self.width.maybe_min_f(rhs.width), height: self.height.maybe_min_f(rhs.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeMath::maybe_max against Size<f32>.
+    pub fn maybe_max_f(self: Size(T), rhs: Size(f32)) -> Size(T) {
+        comptime if meta.same(T, ?f32) {
+            return Size(T) { width: util.maybe_max_f(self.width, rhs.width), height: util.maybe_max_f(self.height, rhs.height) };
+        } else comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) { width: self.width.maybe_max_f(rhs.width), height: self.height.maybe_max_f(rhs.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeMath::maybe_clamp against Size<f32> bounds.
+    pub fn maybe_clamp_f(self: Size(T), min: Size(f32), max: Size(f32)) -> Size(T) {
+        comptime if meta.same(T, ?f32) {
+            return Size(T) {
+                width: util.maybe_clamp_f(self.width, min: min.width, max: max.width),
+                height: util.maybe_clamp_f(self.height, min: min.height, max: max.height),
+            };
+        } else comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) {
+                width: self.width.maybe_clamp_f(min: min.width, max: max.width),
+                height: self.height.maybe_clamp_f(min: min.height, max: max.height),
+            };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeMath::maybe_add against Size<f32>.
+    pub fn maybe_add_f(self: Size(T), rhs: Size(f32)) -> Size(T) {
+        comptime if meta.same(T, ?f32) {
+            return Size(T) { width: util.maybe_add_f(self.width, rhs.width), height: util.maybe_add_f(self.height, rhs.height) };
+        } else comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) { width: self.width.maybe_add_f(rhs.width), height: self.height.maybe_add_f(rhs.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeMath::maybe_sub against Size<f32>.
+    pub fn maybe_sub_f(self: Size(T), rhs: Size(f32)) -> Size(T) {
+        comptime if meta.same(T, ?f32) {
+            return Size(T) { width: util.maybe_sub_f(self.width, rhs.width), height: util.maybe_sub_f(self.height, rhs.height) };
+        } else comptime if meta.same(T, sty.AvailableSpace) {
+            return Size(T) { width: self.width.maybe_sub_f(rhs.width), height: self.height.maybe_sub_f(rhs.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeResolve against Size<Option<f32>>, for Size<Dimension>,
+    /// Size<LengthPercentage> and Size<LengthPercentageAuto>.
+    pub fn maybe_resolve(self: Size(T), context: Size(?f32)) -> Size(?f32) {
+        comptime if meta.same(T, sty.Dimension) or meta.same(T, sty.LengthPercentage) or meta.same(T, sty.LengthPercentageAuto) {
+            return Size(?f32) { width: self.width.maybe_resolve(context.width), height: self.height.maybe_resolve(context.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// MaybeResolve against Size<f32>.
+    pub fn maybe_resolve_f(self: Size(T), context: Size(f32)) -> Size(?f32) {
+        comptime if meta.same(T, sty.Dimension) or meta.same(T, sty.LengthPercentage) or meta.same(T, sty.LengthPercentageAuto) {
+            return Size(?f32) { width: self.width.maybe_resolve_f(context.width), height: self.height.maybe_resolve_f(context.height) };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// ResolveOrZero against Size<Option<f32>>.
+    pub fn resolve_or_zero(self: Size(T), context: Size(?f32)) -> Size(f32) {
+        comptime if meta.same(T, sty.Dimension) or meta.same(T, sty.LengthPercentage) or meta.same(T, sty.LengthPercentageAuto) {
+            return Size(f32) { width: self.width.resolve_or_zero(context.width), height: self.height.resolve_or_zero(context.height) };
+        } else {
+            unreachable();
+        }
+    }
+}
+
+/// An edge value for each side (Rect<T>).
+pub type Rect(comptime T: type) = struct {
+    /// The left (start) edge.
+    pub left: T,
+    /// The right (end) edge.
+    pub right: T,
+    /// The top edge.
+    pub top: T,
+    /// The bottom edge.
+    pub bottom: T,
+
+    /// The axes swapped: left/right become top/bottom.
+    pub fn transpose(self: Rect(T)) -> Rect(T) {
+        return Rect(T) { left: self.top, right: self.bottom, top: self.left, bottom: self.right };
+    }
+
+    /// The left and right edges as a Line.
+    pub fn horizontal_components(self: Rect(T)) -> Line(T) {
+        return Line(T) { start: self.left, end: self.right };
+    }
+
+    /// The top and bottom edges as a Line.
+    pub fn vertical_components(self: Rect(T)) -> Line(T) {
+        return Line(T) { start: self.top, end: self.bottom };
+    }
+
+    /// The main-start edge of a flex direction.
+    pub fn main_start(self: Rect(T), direction: sty.FlexDirection) -> T {
+        if direction.is_row() {
+            return self.left;
+        }
+        return self.top;
+    }
+
+    /// The main-end edge.
+    pub fn main_end(self: Rect(T), direction: sty.FlexDirection) -> T {
+        if direction.is_row() {
+            return self.right;
+        }
+        return self.bottom;
+    }
+
+    /// The cross-start edge.
+    pub fn cross_start(self: Rect(T), direction: sty.FlexDirection) -> T {
+        if direction.is_row() {
+            return self.top;
+        }
+        return self.left;
+    }
+
+    /// The cross-end edge.
+    pub fn cross_end(self: Rect(T), direction: sty.FlexDirection) -> T {
+        if direction.is_row() {
+            return self.bottom;
+        }
+        return self.right;
+    }
+
+    /// Rect<f32> + Rect<f32>, edge by edge.
+    pub fn add(self: Rect(T), rhs: Rect(T)) -> Rect(T) {
+        comptime if meta.same(T, f32) {
+            return Rect(T) { left: self.left + rhs.left, right: self.right + rhs.right, top: self.top + rhs.top, bottom: self.bottom + rhs.bottom };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// left + right.
+    pub fn horizontal_axis_sum(self: Rect(T)) -> T {
+        comptime if meta.same(T, f32) {
+            return self.left + self.right;
+        } else {
+            unreachable();
+        }
+    }
+
+    /// top + bottom.
+    pub fn vertical_axis_sum(self: Rect(T)) -> T {
+        comptime if meta.same(T, f32) {
+            return self.top + self.bottom;
+        } else {
+            unreachable();
+        }
+    }
+
+    /// The sums of each axis as a Size.
+    pub fn sum_axes(self: Rect(T)) -> Size(T) {
+        comptime if meta.same(T, f32) {
+            return Size(T) { width: self.left + self.right, height: self.top + self.bottom };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// The sum of the edges in an absolute axis (grid_axis_sum).
+    pub fn grid_axis_sum(self: Rect(T), axis: AbsoluteAxis) -> T {
+        comptime if meta.same(T, f32) {
+            match axis {
+                .Horizontal => { return self.left + self.right; }
+                .Vertical => { return self.top + self.bottom; }
+            }
+        } else {
+            unreachable();
+        }
+    }
+
+    /// The sum of the edges in a flex direction's main axis.
+    pub fn main_axis_sum(self: Rect(T), direction: sty.FlexDirection) -> T {
+        comptime if meta.same(T, f32) {
+            if direction.is_row() {
+                return self.left + self.right;
+            }
+            return self.top + self.bottom;
+        } else {
+            unreachable();
+        }
+    }
+
+    /// The sum of the edges in a flex direction's cross axis.
+    pub fn cross_axis_sum(self: Rect(T), direction: sty.FlexDirection) -> T {
+        comptime if meta.same(T, f32) {
+            if direction.is_row() {
+                return self.top + self.bottom;
+            }
+            return self.left + self.right;
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Rect<f32>::union: the smallest rectangle holding both.
+    pub fn union(self: Rect(T), other: Rect(T)) -> Rect(T) {
+        comptime if meta.same(T, f32) {
+            return Rect(T) {
+                left: util.f32_min(a: self.left, b: other.left),
+                right: util.f32_max(a: self.right, b: other.right),
+                top: util.f32_min(a: self.top, b: other.top),
+                bottom: util.f32_max(a: self.bottom, b: other.bottom),
+            };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// ResolveOrZero against one Option<f32>, every edge against it (as
+    /// padding and border resolve against the parent's width).
+    pub fn resolve_or_zero(self: Rect(T), context: ?f32) -> Rect(f32) {
+        comptime if meta.same(T, sty.Dimension) or meta.same(T, sty.LengthPercentage) or meta.same(T, sty.LengthPercentageAuto) {
+            return Rect(f32) {
+                left: self.left.resolve_or_zero(context),
+                right: self.right.resolve_or_zero(context),
+                top: self.top.resolve_or_zero(context),
+                bottom: self.bottom.resolve_or_zero(context),
+            };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// ResolveOrZero against one f32.
+    pub fn resolve_or_zero_f(self: Rect(T), context: f32) -> Rect(f32) {
+        comptime if meta.same(T, sty.Dimension) or meta.same(T, sty.LengthPercentage) or meta.same(T, sty.LengthPercentageAuto) {
+            return Rect(f32) {
+                left: self.left.resolve_or_zero_f(context),
+                right: self.right.resolve_or_zero_f(context),
+                top: self.top.resolve_or_zero_f(context),
+                bottom: self.bottom.resolve_or_zero_f(context),
+            };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// ResolveOrZero against a Size<Option<f32>>: left and right against the
+    /// width, top and bottom against the height.
+    pub fn resolve_or_zero_size(self: Rect(T), context: Size(?f32)) -> Rect(f32) {
+        comptime if meta.same(T, sty.Dimension) or meta.same(T, sty.LengthPercentage) or meta.same(T, sty.LengthPercentageAuto) {
+            return Rect(f32) {
+                left: self.left.resolve_or_zero(context.width),
+                right: self.right.resolve_or_zero(context.width),
+                top: self.top.resolve_or_zero(context.height),
+                bottom: self.bottom.resolve_or_zero(context.height),
+            };
+        } else {
+            unreachable();
+        }
+    }
+}
+
+/// A start and an end (Line<T>).
+pub type Line(comptime T: type) = struct {
+    /// The start.
+    pub start: T,
+    /// The end.
+    pub end: T,
+
+    /// start + end (Line<f32>::sum).
+    pub fn sum(self: Line(T)) -> T {
+        comptime if meta.same(T, f32) {
+            return self.start + self.end;
+        } else {
+            unreachable();
+        }
+    }
+
+    /// is_definite of a grid placement: a line at either end (a named one
+    /// too, for GridPlacement).
+    pub fn is_definite(self: Line(T)) -> bool {
+        comptime if meta.same(T, sgrid.GridPlacement) {
+            match self.start {
+                .Line { line } => {
+                    if line.as_i16() != 0 {
+                        return true;
+                    }
+                }
+                .NamedLine { .. } => { return true; }
+                _ => { }
+            }
+            match self.end {
+                .Line { line } => {
+                    if line.as_i16() != 0 {
+                        return true;
+                    }
+                }
+                .NamedLine { .. } => { return true; }
+                _ => { }
+            }
+            return false;
+        } else comptime if meta.same(T, sgrid.NonNamedGridPlacement) {
+            match self.start {
+                .Line { line } => {
+                    if line.as_i16() != 0 {
+                        return true;
+                    }
+                }
+                _ => { }
+            }
+            match self.end {
+                .Line { line } => {
+                    if line.as_i16() != 0 {
+                        return true;
+                    }
+                }
+                _ => { }
+            }
+            return false;
+        } else comptime if meta.same(T, sgrid.OriginZeroGridPlacement) {
+            match self.start {
+                .Line { .. } => { return true; }
+                _ => { }
+            }
+            match self.end {
+                .Line { .. } => { return true; }
+                _ => { }
+            }
+            return false;
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Line<GridPlacement>::into_origin_zero_ignoring_named.
+    pub fn into_origin_zero_ignoring_named(self: Line(T), explicit_track_count: u16) -> Line(sgrid.OriginZeroGridPlacement) {
+        comptime if meta.same(T, sgrid.GridPlacement) {
+            return Line(sgrid.OriginZeroGridPlacement) {
+                start: self.start.into_origin_zero_placement_ignoring_named(explicit_track_count),
+                end: self.end.into_origin_zero_placement_ignoring_named(explicit_track_count),
+            };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Line<NonNamedGridPlacement>::into_origin_zero.
+    pub fn into_origin_zero(self: Line(T), explicit_track_count: u16) -> Line(sgrid.OriginZeroGridPlacement) {
+        comptime if meta.same(T, sgrid.NonNamedGridPlacement) {
+            return Line(sgrid.OriginZeroGridPlacement) {
+                start: self.start.into_origin_zero_placement(explicit_track_count),
+                end: self.end.into_origin_zero_placement(explicit_track_count),
+            };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Line<GenericGridPlacement<_>>::indefinite_span.
+    pub fn indefinite_span(self: Line(T)) -> u16 {
+        comptime if meta.same(T, sgrid.OriginZeroGridPlacement) {
+            return sgrid.OriginZeroGridPlacement.indefinite_span(start: self.start, end: self.end);
+        } else comptime if meta.same(T, sgrid.NonNamedGridPlacement) {
+            return sgrid.NonNamedGridPlacement.indefinite_span(start: self.start, end: self.end);
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Line<OriginZeroGridPlacement>::resolve_definite_grid_lines.
+    pub fn resolve_definite_grid_lines(self: Line(T)) -> Line(sgrid.OriginZeroLine) {
+        comptime if meta.same(T, sgrid.OriginZeroGridPlacement) {
+            match self.start {
+                .Line { line: line1 } => {
+                    match self.end {
+                        .Line { line: line2 } => {
+                            if line1 == line2 {
+                                return Line(sgrid.OriginZeroLine) { start: line1, end: line1.add_u16(1) };
+                            }
+                            return Line(sgrid.OriginZeroLine) { start: line1.min(line2), end: line1.max(line2) };
+                        }
+                        .Span { span } => { return Line(sgrid.OriginZeroLine) { start: line1, end: line1.add_u16(span) }; }
+                        .Auto => { return Line(sgrid.OriginZeroLine) { start: line1, end: line1.add_u16(1) }; }
+                    }
+                }
+                .Span { span } => {
+                    match self.end {
+                        .Line { line } => { return Line(sgrid.OriginZeroLine) { start: line.sub_u16(span), end: line }; }
+                        _ => { }
+                    }
+                }
+                .Auto => {
+                    match self.end {
+                        .Line { line } => { return Line(sgrid.OriginZeroLine) { start: line.sub_u16(1), end: line }; }
+                        _ => { }
+                    }
+                }
+            }
+            panic("resolve_definite_grid_tracks should only be called on definite grid tracks");
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Line<OriginZeroGridPlacement>::resolve_absolutely_positioned_grid_tracks.
+    pub fn resolve_absolutely_positioned_grid_tracks(self: Line(T)) -> Line(?sgrid.OriginZeroLine) {
+        comptime if meta.same(T, sgrid.OriginZeroGridPlacement) {
+            match self.start {
+                .Line { line: track1 } => {
+                    match self.end {
+                        .Line { line: track2 } => {
+                            if track1 == track2 {
+                                return Line(?sgrid.OriginZeroLine) { start: some(track1), end: some(track1.add_u16(1)) };
+                            }
+                            return Line(?sgrid.OriginZeroLine) { start: some(track1.min(track2)), end: some(track1.max(track2)) };
+                        }
+                        .Span { span } => { return Line(?sgrid.OriginZeroLine) { start: some(track1), end: some(track1.add_u16(span)) }; }
+                        .Auto => { return Line(?sgrid.OriginZeroLine) { start: some(track1), end: none }; }
+                    }
+                }
+                .Span { span } => {
+                    match self.end {
+                        .Line { line: track } => { return Line(?sgrid.OriginZeroLine) { start: some(track.sub_u16(span)), end: some(track) }; }
+                        _ => { }
+                    }
+                }
+                .Auto => {
+                    match self.end {
+                        .Line { line: track } => { return Line(?sgrid.OriginZeroLine) { start: none, end: some(track) }; }
+                        _ => { }
+                    }
+                }
+            }
+            return Line(?sgrid.OriginZeroLine) { start: none, end: none };
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Line<OriginZeroGridPlacement>::resolve_indefinite_grid_tracks: the
+    /// span placed from start.
+    pub fn resolve_indefinite_grid_tracks(self: Line(T), start: sgrid.OriginZeroLine) -> Line(sgrid.OriginZeroLine) {
+        comptime if meta.same(T, sgrid.OriginZeroGridPlacement) {
+            match self.start {
+                .Auto => {
+                    match self.end {
+                        .Auto => { return Line(sgrid.OriginZeroLine) { start: start, end: start.add_u16(1) }; }
+                        .Span { span } => { return Line(sgrid.OriginZeroLine) { start: start, end: start.add_u16(span) }; }
+                        _ => { }
+                    }
+                }
+                .Span { span } => {
+                    match self.end {
+                        .Auto => { return Line(sgrid.OriginZeroLine) { start: start, end: start.add_u16(span) }; }
+                        .Span { .. } => { return Line(sgrid.OriginZeroLine) { start: start, end: start.add_u16(span) }; }
+                        _ => { }
+                    }
+                }
+                _ => { }
+            }
+            panic("resolve_indefinite_grid_tracks should only be called on indefinite grid tracks");
+        } else {
+            unreachable();
+        }
+    }
+
+    /// Line<OriginZeroLine>::span: end - start, at least 0.
+    pub fn span(self: Line(T)) -> u16 {
+        comptime if meta.same(T, sgrid.OriginZeroLine) {
+            let d = self.end.value - self.start.value;
+            if d < 0 {
+                return 0;
+            }
+            return d as u16;
+        } else {
+            unreachable();
+        }
+    }
+}
+
+/// An x and a y (Point<T>).
+pub type Point(comptime T: type) = struct {
+    /// The horizontal component.
+    pub x: T,
+    /// The vertical component.
+    pub y: T,
+
+    /// The component in an abstract axis (inline is x).
+    pub fn get(self: Point(T), axis: AbstractAxis) -> T {
+        match axis {
+            .Inline => { return self.x; }
+            .Block => { return self.y; }
+        }
+    }
+
+    /// Sets the component in an abstract axis.
+    pub fn set(self: &mut Point(T), axis: AbstractAxis, value: T) {
+        match axis {
+            .Inline => { self.x = value; }
+            .Block => { self.y = value; }
+        }
+    }
+
+    /// x and y swapped.
+    pub fn transpose(self: Point(T)) -> Point(T) {
+        return Point(T) { x: self.y, y: self.x };
+    }
+
+    /// The main-axis component of a flex direction.
+    pub fn main(self: Point(T), direction: sty.FlexDirection) -> T {
+        if direction.is_row() {
+            return self.x;
+        }
+        return self.y;
+    }
+
+    /// The cross-axis component of a flex direction.
+    pub fn cross(self: Point(T), direction: sty.FlexDirection) -> T {
+        if direction.is_row() {
+            return self.y;
+        }
+        return self.x;
+    }
+
+    /// The point as a Size (From<Point<T>> for Size<T>).
+    pub fn to_size(self: Point(T)) -> Size(T) {
+        return Size(T) { width: self.x, height: self.y };
+    }
+
+    /// Point<f32> + Point<f32>.
+    pub fn add(self: Point(T), rhs: Point(T)) -> Point(T) {
+        comptime if meta.same(T, f32) {
+            return Point(T) { x: self.x + rhs.x, y: self.y + rhs.y };
+        } else {
+            unreachable();
+        }
+    }
+}
+
+/// A minimum and a maximum (MinMax<Min, Max>).
+pub type MinMax(comptime Min: type, comptime Max: type) = struct {
+    /// The minimum.
+    pub min: Min,
+    /// The maximum.
+    pub max: Max,
+}
+
+/// Size::ZERO for Size<f32>.
+pub fn size_zero() -> Size(f32) {
+    return Size(f32) { width: 0.0, height: 0.0 };
+}
+
+/// Size::NONE for Size<Option<f32>>.
+pub fn size_none() -> Size(?f32) {
+    return Size(?f32) { width: none, height: none };
+}
+
+/// Size::new for Size<Option<f32>>: both some.
+pub fn size_some(width: f32, height: f32) -> Size(?f32) {
+    return Size(?f32) { width: some(width), height: some(height) };
+}
+
+/// Size::MAX_CONTENT for Size<AvailableSpace>.
+pub fn size_max_content() -> Size(sty.AvailableSpace) {
+    return Size(sty.AvailableSpace) { width: sty.AvailableSpace.MaxContent, height: sty.AvailableSpace.MaxContent };
+}
+
+/// Size::MIN_CONTENT for Size<AvailableSpace>.
+pub fn size_min_content() -> Size(sty.AvailableSpace) {
+    return Size(sty.AvailableSpace) { width: sty.AvailableSpace.MinContent, height: sty.AvailableSpace.MinContent };
+}
+
+/// Size::from_cross for Size<Option<f32>>: value in the cross axis, none in
+/// the main axis.
+pub fn size_from_cross(direction: sty.FlexDirection, value: ?f32) -> Size(?f32) {
+    var next = size_none();
+    if direction.is_row() {
+        next.height = value;
+    } else {
+        next.width = value;
+    }
+    return next;
+}
+
+/// Rect::ZERO for Rect<f32>.
+pub fn rect_zero() -> Rect(f32) {
+    return Rect(f32) { left: 0.0, right: 0.0, top: 0.0, bottom: 0.0 };
+}
+
+/// Rect::NONE for Rect<Option<f32>>.
+pub fn rect_none() -> Rect(?f32) {
+    return Rect(?f32) { left: none, right: none, top: none, bottom: none };
+}
+
+/// Rect::new for Rect<f32>.
+pub fn rect_new(start: f32, end: f32, top: f32, bottom: f32) -> Rect(f32) {
+    return Rect(f32) { left: start, right: end, top: top, bottom: bottom };
+}
+
+/// Point::ZERO for Point<f32>.
+pub fn point_zero() -> Point(f32) {
+    return Point(f32) { x: 0.0, y: 0.0 };
+}
+
+/// Point::NONE for Point<Option<f32>>.
+pub fn point_none() -> Point(?f32) {
+    return Point(?f32) { x: none, y: none };
+}
+
+/// Line::TRUE for Line<bool>.
+pub fn line_true() -> Line(bool) {
+    return Line(bool) { start: true, end: true };
+}
+
+/// Line::FALSE for Line<bool>.
+pub fn line_false() -> Line(bool) {
+    return Line(bool) { start: false, end: false };
+}

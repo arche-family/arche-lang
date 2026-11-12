@@ -1,0 +1,108 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: R1 at 10.0 10.0 size 200.0 100.0 | pad 5.0 5.0 5.0 5.0 | border 0.0 0.0 0.0 0.0 | margin 10.0 10.0 10.0 10.0 | over 0.0 35.0 0.0 25.0 | sb 0.0 0.0 | order 0
+// stdout: R2 at 8.0 8.0 size 784.0 58.0 | pad 4.0 4.0 4.0 4.0 | border 0.0 0.0 0.0 0.0 | margin 8.0 8.0 8.0 8.0 | over 0.0 4.0 0.0 54.0 | sb 0.0 0.0 | order 0
+// stdout: R3 at 15.0 7.0 size 100.0 50.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: R4 at 691.0 0.0 size 100.0 50.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 5.0 9.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: R5 at 0.0 0.0 size 300.0 100.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: R6 at 0.0 0.0 size 500.0 20.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 500.0 0.0 20.0 | sb 0.0 0.0 | order 0
+// stdout: R7 at 80.0 -30.0 size 10.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 0.0 0.0 0.0 0.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: R8 at 40.0 40.0 size 10.0 10.0 | pad 0.0 0.0 0.0 0.0 | border 0.0 0.0 0.0 0.0 | margin 40.0 40.0 40.0 40.0 | over 0.0 0.0 0.0 0.0 | sb 0.0 0.0 | order 0
+// stdout: R9 at 2.5 2.5 size 169.15 35.8 | pad 0.0 0.0 0.0 0.0 | border 1.25 1.25 1.25 1.25 | margin 2.5 2.5 2.5 2.5 | over 0.0 90.0 0.0 9.0 | sb 7.0 0.0 | order 0
+// compute_root_layout on a leaf root against the viewport, with margins,
+// padding, a block root stretched to the viewport, relative and rtl roots,
+// min over max with an aspect ratio, an indefinite viewport, percentage
+// insets and margins, and content-box sizing with a scrollbar. The expected
+// lines are taffy 0.15's own, from the same cases in Rust.
+import std;
+import alloc;
+import layout.compute as compute;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import _show;
+import _tree;
+
+/// Lays out a tree of one root and writes the root's unrounded layout.
+fn run(out: &mut std.Output, name: str, style: sty.Style, content: _tree.Content, space: geo.Size(sty.AvailableSpace), a: alloc.Allocator) {
+    var t = _tree.TestTree.init(a);
+    let root = t.add(style, content);
+    compute.compute_root_layout(&mut t, root, space);
+    _show.layout_line(out, name, t.unrounded_of(root));
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let screen = _show.def(width: 800.0, height: 600.0);
+
+    var s1 = sty.Style.default(a);
+    s1.margin = _show.rect_lpa(10.0);
+    s1.padding = _show.rect_lp(5.0);
+    s1.size = sty.size_from_lengths(width: 200.0, height: 100.0);
+    run(&mut sys.stdout, "R1", s1, _tree.Content.Fixed { width: 30.0, height: 20.0 }, screen, a);
+
+    var s2 = sty.Style.default(a);
+    s2.display = sty.Display.Block;
+    s2.margin = _show.rect_lpa(8.0);
+    s2.padding = _show.rect_lp(4.0);
+    run(&mut sys.stdout, "R2", s2, _tree.Content.Fixed { width: 0.0, height: 50.0 }, screen, a);
+
+    var s3 = sty.Style.default(a);
+    s3.display = sty.Display.Block;
+    s3.position = sty.Position.Relative;
+    s3.inset = geo.Rect(sty.LengthPercentageAuto) {
+        left: sty.LengthPercentageAuto.length(15.0),
+        right: sty.LengthPercentageAuto.length(99.0),
+        top: sty.LengthPercentageAuto.length(7.0),
+        bottom: sty.LengthPercentageAuto.length(99.0),
+    };
+    s3.size = sty.size_from_lengths(width: 100.0, height: 50.0);
+    run(&mut sys.stdout, "R3", s3, _tree.Content.Empty, screen, a);
+
+    var s4 = sty.Style.default(a);
+    s4.direction = sty.Direction.Rtl;
+    s4.margin.left = sty.LengthPercentageAuto.length(5.0);
+    s4.margin.right = sty.LengthPercentageAuto.length(9.0);
+    s4.size = sty.size_from_lengths(width: 100.0, height: 50.0);
+    run(&mut sys.stdout, "R4", s4, _tree.Content.Empty, screen, a);
+
+    var s5 = sty.Style.default(a);
+    s5.display = sty.Display.Block;
+    s5.min_size.width = sty.LengthPercentageAuto.length(300.0);
+    s5.max_size.width = sty.LengthPercentageAuto.length(200.0);
+    s5.aspect_ratio = some(3.0);
+    run(&mut sys.stdout, "R5", s5, _tree.Content.Empty, screen, a);
+
+    var s6 = sty.Style.default(a);
+    s6.display = sty.Display.Block;
+    let open = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.MaxContent, height: sty.AvailableSpace.definite(600.0) };
+    run(&mut sys.stdout, "R6", s6, _tree.Content.Text { width: 500.0, line: 20.0 }, open, a);
+
+    var s7 = sty.Style.default(a);
+    s7.position = sty.Position.Relative;
+    s7.inset = geo.Rect(sty.LengthPercentageAuto) {
+        left: sty.LengthPercentageAuto.percent(0.1),
+        right: sty.LengthPercentageAuto.auto(),
+        top: sty.LengthPercentageAuto.auto(),
+        bottom: sty.LengthPercentageAuto.percent(0.05),
+    };
+    s7.size = sty.size_from_lengths(width: 10.0, height: 10.0);
+    run(&mut sys.stdout, "R7", s7, _tree.Content.Empty, screen, a);
+
+    var s8 = sty.Style.default(a);
+    let p = sty.LengthPercentageAuto.percent(0.05);
+    s8.margin = geo.Rect(sty.LengthPercentageAuto) { left: p, right: p, top: p, bottom: p };
+    s8.size = sty.size_from_lengths(width: 10.0, height: 10.0);
+    run(&mut sys.stdout, "R8", s8, _tree.Content.Empty, screen, a);
+
+    var s9 = sty.Style.default(a);
+    s9.display = sty.Display.Block;
+    s9.margin = _show.rect_lpa(2.5);
+    s9.border = _show.rect_lp(1.25);
+    s9.box_sizing = sty.BoxSizing.ContentBox;
+    s9.size = geo.Size(sty.Dimension) { width: sty.Dimension.percent(0.5), height: sty.Dimension.length(33.3) };
+    s9.overflow = geo.Point(sty.Overflow) { x: sty.Overflow.Visible, y: sty.Overflow.Scroll };
+    s9.scrollbar_width = 7.0;
+    run(&mut sys.stdout, "R9", s9, _tree.Content.Text { width: 90.0, line: 9.0 }, _show.def(width: 333.3, height: 222.2), a);
+}

@@ -1,0 +1,171 @@
+/// compute.leaf: taffy 0.15's compute/leaf.rs, the layout of a node without
+/// children: its size styles, padding, border and aspect ratio around what
+/// a measure function says its content takes.
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import layout.util;
+
+/// compute_leaf_layout: the leaf's size. measure_function gets the known
+/// dimensions (none in a full layout) and the space for the content box,
+/// and gives the content's size. A definite available space is the border
+/// box's: the caller took the margins off. taffy's calc resolver is not a
+/// parameter: calc() resolves itself.
+pub fn compute_leaf_layout(inputs: lt.LayoutInput, style: &sty.Style, measure_function: &dyn fn(geo.Size(?f32), geo.Size(sty.AvailableSpace)) -> geo.Size(f32)) -> lt.LayoutOutput {
+    let known_dimensions = inputs.known_dimensions;
+    let parent_size = inputs.parent_size;
+    let available_space = inputs.available_space;
+    let sizing_mode = inputs.sizing_mode;
+    let run_mode = inputs.run_mode;
+
+    // Percentage padding and borders resolve against the parent's width in
+    // both axes, as CSS says.
+    let padding = style.padding.resolve_or_zero(parent_size.width);
+    let border = style.border.resolve_or_zero(parent_size.width);
+    let padding_border = padding.add(border);
+    let pb_sum = padding_border.sum_axes();
+    var box_sizing_adjustment = geo.size_zero();
+    if style.box_sizing == sty.BoxSizing.ContentBox {
+        box_sizing_adjustment = pb_sum;
+    }
+
+    // The preferred, min and max sizes; ContentSize ignores the styles.
+    var node_size = known_dimensions;
+    var node_min_size = geo.size_none();
+    var node_max_size = geo.size_none();
+    var aspect_ratio: ?f32 = none;
+    if sizing_mode == lt.SizingMode.InherentSize {
+        aspect_ratio = style.aspect_ratio;
+        let style_size = style.size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+        let style_min_size = style.min_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+        let style_max_size = style.max_size.maybe_resolve(parent_size).maybe_add_f(box_sizing_adjustment);
+        node_size = known_dimensions.fallback(style_size);
+        node_min_size = style_min_size;
+        node_max_size = style_max_size;
+    }
+
+    // Scrollbar gutters, for overflow: scroll; the axes are swapped, as a
+    // node that scrolls vertically needs room across.
+    var scrollbar_gutter = geo.point_zero();
+    if style.overflow.y == sty.Overflow.Scroll {
+        scrollbar_gutter.x = style.scrollbar_width;
+    }
+    if style.overflow.x == sty.Overflow.Scroll {
+        scrollbar_gutter.y = style.scrollbar_width;
+    }
+
+    var content_box_inset = padding_border;
+    content_box_inset.right = content_box_inset.right + scrollbar_gutter.x;
+    content_box_inset.bottom = content_box_inset.bottom + scrollbar_gutter.y;
+
+    let has_styles_preventing_being_collapsed_through = not style.is_block()
+        or style.overflow.x.is_scroll_container()
+        or style.overflow.y.is_scroll_container()
+        or style.position.is_out_of_flow()
+        or style.contain.establishes_independent_formatting_context()
+        or padding.top > 0.0
+        or padding.bottom > 0.0
+        or border.top > 0.0
+        or border.bottom > 0.0
+        or is_positive(node_size.height)
+        or is_positive(node_min_size.height);
+
+    // Both sizes known: done.
+    if run_mode == lt.RunMode.ComputeSize and has_styles_preventing_being_collapsed_through {
+        match node_size.width {
+            some(width) => {
+                match node_size.height {
+                    some(height) => {
+                        let size = geo.Size(f32) { width: width, height: height }.maybe_clamp(min: node_min_size, max: node_max_size).maybe_max(padding_border.sum_axes().map_some());
+                        return lt.LayoutOutput.from_sizes_and_baselines(size, geo.rect_zero(), lt.Baselines.none_set());
+                    }
+                    none => { }
+                }
+            }
+            none => { }
+        }
+    }
+
+    // The space for the content box.
+    let inner_width = content_box_inset.horizontal_axis_sum();
+    let inner_height = content_box_inset.vertical_axis_sum();
+    let min_width = node_min_size.width;
+    let max_width = node_max_size.width;
+    let min_height = node_min_size.height;
+    let max_height = node_max_size.height;
+    let content_space = geo.Size(sty.AvailableSpace) {
+        width: from_known(known_dimensions.width, available_space.width)
+            .maybe_set(known_dimensions.width)
+            .maybe_set(node_size.width)
+            .map_definite_value(fn [min_width, max_width, inner_width](size: f32) -> f32 {
+                return util.f32_maybe_clamp(size, min: min_width, max: max_width) - inner_width;
+            }),
+        height: from_known(known_dimensions.height, available_space.height)
+            .maybe_set(known_dimensions.height)
+            .maybe_set(node_size.height)
+            .map_definite_value(fn [min_height, max_height, inner_height](size: f32) -> f32 {
+                return util.f32_maybe_clamp(size, min: min_height, max: max_height) - inner_height;
+            }),
+    };
+
+    // Measure the content.
+    var measure_known = geo.size_none();
+    if run_mode == lt.RunMode.ComputeSize {
+        measure_known = known_dimensions;
+    } else if run_mode == lt.RunMode.PerformHiddenLayout {
+        unreachable();
+    }
+    let measured_size = measure_function(measure_known, content_space);
+
+    let clamped_size = known_dimensions.fallback(node_size).unwrap_or(measured_size.add(content_box_inset.sum_axes())).maybe_clamp(min: node_min_size, max: node_max_size);
+    var ratio_height: f32 = 0.0;
+    match aspect_ratio {
+        some(ratio) => { ratio_height = clamped_size.width / ratio; }
+        none => { }
+    }
+    let unfloored = geo.Size(f32) { width: clamped_size.width, height: util.f32_max(a: clamped_size.height, b: ratio_height) };
+    let size = unfloored.maybe_max(padding_border.sum_axes().map_some());
+
+    // A scroll container's own end padding is part of its scrollable
+    // overflow; other boxes' is not.
+    let is_scroll_container = style.overflow.x.is_scroll_container() or style.overflow.y.is_scroll_container();
+    let is_rtl = style.direction.is_rtl();
+    var start_padding = padding.left;
+    var end_padding = padding.right;
+    if is_rtl {
+        start_padding = padding.right;
+        end_padding = padding.left;
+    }
+    var end_extra: f32 = 0.0;
+    var bottom_extra: f32 = 0.0;
+    if is_scroll_container {
+        end_extra = end_padding;
+        bottom_extra = padding.bottom;
+    }
+    let scrollable_overflow_rect = geo.Rect(f32) {
+        left: 0.0,
+        right: start_padding + measured_size.width + end_extra,
+        top: 0.0,
+        bottom: padding.top + measured_size.height + bottom_extra,
+    };
+
+    var output = lt.LayoutOutput.from_sizes_and_baselines(size, scrollable_overflow_rect, lt.Baselines.none_set());
+    output.margins_can_collapse_through = not has_styles_preventing_being_collapsed_through and size.height == 0.0 and measured_size.height == 0.0;
+    return output;
+}
+
+/// known.map(AvailableSpace::from).unwrap_or(space).
+fn from_known(known: ?f32, space: sty.AvailableSpace) -> sty.AvailableSpace {
+    match known {
+        some(v) => { return sty.AvailableSpace.Definite { value: v }; }
+        none => { return space; }
+    }
+}
+
+/// matches!(x, Some(h) if h > 0.0).
+fn is_positive(x: ?f32) -> bool {
+    match x {
+        some(h) => { return h > 0.0; }
+        none => { return false; }
+    }
+}

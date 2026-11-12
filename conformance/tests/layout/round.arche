@@ -1,0 +1,62 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: root at 0.0 1.0 size 101.0 50.0 | pad 1.0 2.0 1.0 3.0 | border 2.0 2.0 3.0 1.0 | margin 0.3 0.7 1.5 2.5 | over -1.0 102.0 -1.0 50.0 | sb 2.0 3.0 | order 0
+// stdout: a at 11.0 20.0 size 30.0 11.0 | pad 0.0 1.0 2.0 2.0 | border 0.0 1.0 2.0 1.0 | margin 0.3 0.7 1.5 2.5 | over -1.0 31.0 0.0 11.0 | sb 1.0 3.0 | order 0
+// stdout: a.g at -1.0 1.0 size 2.0 2.0 | pad 1.0 1.0 1.0 1.0 | border 1.0 1.0 1.0 0.0 | margin 0.3 0.7 1.5 2.5 | over 0.0 2.0 -1.0 3.0 | sb 1.0 3.0 | order 0
+// stdout: b(abs) at 6.0 -6.0 size 10.0 4.0 | pad 0.0 2.0 2.0 4.0 | border 2.0 2.0 5.0 1.0 | margin 0.3 0.7 1.5 2.5 | over -3.0 13.0 0.0 4.0 | sb 3.0 3.0 | order 0
+// stdout: c at -2.0 33.0 size 0.0 1.0 | pad 0.0 0.0 1.0 1.0 | border 0.0 0.0 0.0 1.0 | margin 0.3 0.7 1.5 2.5 | over 0.0 0.0 -1.0 1.0 | sb 0.0 3.0 | order 0
+// round_layout over fractional layouts: each edge is rounded where it
+// falls on the page, (x + 0.5).floor() as taffy rounds, and sizes are the
+// differences of rounded edges, so a child's rounding depends on its
+// parents' positions. The absolute child is skipped among the children and
+// rounded from its containing block's hoisted list. The expected lines are
+// taffy 0.15's own, from the same case in Rust.
+import std;
+import layout.compute as compute;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import _show;
+import _tree;
+
+/// An unrounded layout with fractional everything.
+fn mk(x: f32, y: f32, w: f32, h: f32, e: f32) -> lt.Layout {
+    var l = lt.Layout.new();
+    l.location = geo.Point(f32) { x: x, y: y };
+    l.size = geo.Size(f32) { width: w, height: h };
+    l.border = geo.Rect(f32) { left: e, right: e + 0.25, top: e * 2.0, bottom: 0.5 };
+    l.padding = geo.Rect(f32) { left: 0.5, right: e, top: 1.49, bottom: e + 1.0 };
+    l.margin = geo.Rect(f32) { left: 0.3, right: 0.7, top: 1.5, bottom: 2.5 };
+    l.scrollbar_size = geo.Size(f32) { width: e, height: 2.5 };
+    l.scrollable_overflow_rect = geo.Rect(f32) { left: -e, right: w + e, top: -0.5, bottom: h + 0.49 };
+    return l;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    var t = _tree.TestTree.init(a);
+    let r = t.add(sty.Style.default(a), _tree.Content.Empty);
+    let ca = t.add(sty.Style.default(a), _tree.Content.Empty);
+    let g = t.add(sty.Style.default(a), _tree.Content.Empty);
+    var bs = sty.Style.default(a);
+    bs.position = sty.Position.Absolute;
+    let b = t.add(bs, _tree.Content.Empty);
+    let c = t.add(sty.Style.default(a), _tree.Content.Empty);
+    t.add_child(parent: r, child: ca);
+    t.add_child(parent: ca, child: g);
+    t.add_child(parent: r, child: b);
+    t.add_child(parent: r, child: c);
+    t.nodes[0].hoisted.push(b);
+    t.nodes[0].unrounded = mk(x: 0.4, y: 0.6, w: 100.5, h: 50.25, e: 1.5);
+    t.nodes[1].unrounded = mk(x: 10.3, y: 20.7, w: 30.5, h: 10.5, e: 0.75);
+    t.nodes[2].unrounded = mk(x: -0.5, y: 0.5, w: 1.5, h: 2.5, e: 0.5);
+    t.nodes[3].unrounded = mk(x: 5.5, y: -5.5, w: 10.49999, h: 3.5, e: 2.5);
+    t.nodes[4].unrounded = mk(x: -2.5, y: 33.333, w: 0.1, h: 0.9, e: 0.0);
+    compute.round_layout(&mut t, r);
+    _show.layout_line(&mut sys.stdout, "root", t.final_of(r));
+    _show.layout_line(&mut sys.stdout, "a", t.final_of(ca));
+    _show.layout_line(&mut sys.stdout, "a.g", t.final_of(g));
+    _show.layout_line(&mut sys.stdout, "b(abs)", t.final_of(b));
+    _show.layout_line(&mut sys.stdout, "c", t.final_of(c));
+}

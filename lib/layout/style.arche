@@ -1,0 +1,1793 @@
+/// style: taffy 0.15's style/ (mod.rs, compact_length.rs, dimension.rs,
+/// available_space.rs, alignment.rs, flex.rs, block.rs, float.rs) and the
+/// resolution of util/resolve.rs; the grid styles are in style.grid.
+///
+/// One Style serves every style trait of taffy (CoreStyle, OofItemStyle,
+/// the block, flexbox and grid container and item styles), as in Nimadir,
+/// where every trait method reads the field of the same name. A trait method
+/// that only reads a field is that field here (`style.size`, not
+/// `style.size()`); one that computes something is a method.
+///
+/// calc() is linear, as Nimadir's is: `Calc { px, percent }`, percent 0-100,
+/// resolves against a basis as `px + basis * percent / 100.0`. It is held in
+/// the value itself rather than behind taffy's pointer, so no algorithm
+/// needs taffy's calc resolver: a value resolves itself. Plain percentages
+/// stay fractions, as in taffy: `Dimension.percent(0.5)` is 50%.
+///
+/// taffy's constants (AlignItems::START, LengthPercentage::ZERO,
+/// Style::DEFAULT...) are functions here: `AlignItems.start()`,
+/// `LengthPercentage.zero()`, `Style.default(a)`.
+import alloc;
+import core.float;
+import layout.geometry as geo;
+import layout.style.grid as sgrid;
+import layout.util;
+
+// --- CompactLength (compact_length.rs) ---
+
+/// taffy's tag of a length: CompactLength::LENGTH_TAG.
+pub const LENGTH_TAG: usize = 1;
+/// CompactLength::PERCENT_TAG.
+pub const PERCENT_TAG: usize = 5;
+/// CompactLength::AUTO_TAG.
+pub const AUTO_TAG: usize = 3;
+/// CompactLength::FR_TAG.
+pub const FR_TAG: usize = 19;
+/// CompactLength::CONTENT_TAG.
+pub const CONTENT_TAG: usize = 35;
+/// CompactLength::MIN_CONTENT_TAG.
+pub const MIN_CONTENT_TAG: usize = 11;
+/// CompactLength::MAX_CONTENT_TAG.
+pub const MAX_CONTENT_TAG: usize = 27;
+/// CompactLength::FIT_CONTENT_PX_TAG.
+pub const FIT_CONTENT_PX_TAG: usize = 43;
+/// CompactLength::FIT_CONTENT_KEYWORD_TAG.
+pub const FIT_CONTENT_KEYWORD_TAG: usize = 59;
+/// CompactLength::STRETCH_TAG.
+pub const STRETCH_TAG: usize = 75;
+/// CompactLength::FIT_CONTENT_PERCENT_TAG.
+pub const FIT_CONTENT_PERCENT_TAG: usize = 15;
+/// CompactLength::CALC_TAG: the low three bits of a calc value's tag.
+pub const CALC_TAG: usize = 4;
+/// CompactLength::FIT_CONTENT_CALC_TAG.
+pub const FIT_CONTENT_CALC_TAG: usize = 6;
+/// CompactLength::NON_POINTER_BIT.
+pub const NON_POINTER_BIT: usize = 1;
+/// CompactLength::KEYWORD_BIT.
+pub const KEYWORD_BIT: usize = 2;
+/// CompactLength::PERCENTAGE_BIT.
+pub const PERCENTAGE_BIT: usize = 4;
+/// CompactLength::SIZING_KEYWORD_BIT.
+pub const SIZING_KEYWORD_BIT: usize = 8;
+
+/// A linear calc(): `px` pixels plus `percent` percent (0-100) of the basis.
+pub type Calc = struct {
+    /// The pixels.
+    pub px: f32,
+    /// The percentage, 0-100 (not a fraction).
+    pub percent: f32,
+
+    /// The value against a basis, as Nimadir's calc_value computes it:
+    /// px + basis * percent / 100.0.
+    pub fn resolve(self: Calc, basis: f32) -> f32 {
+        return self.px + basis * self.percent / 100.0;
+    }
+
+    /// Whether both parts have the same bits.
+    pub fn eq(self: Calc, other: Calc) -> bool {
+        return float.bits32(self.px) == float.bits32(other.px) and float.bits32(self.percent) == float.bits32(other.percent);
+    }
+}
+
+/// Every length and keyword a size style can hold (CompactLength). taffy
+/// packs it into a tagged pointer; this is the same set of values as an
+/// enum, and `tag()` gives taffy's tag.
+pub type CompactLength = enum {
+    /// An absolute length in pixels.
+    Length { value: f32 },
+    /// A percentage, as a fraction (0.5 is 50%).
+    Percent { value: f32 },
+    /// A calc() expression.
+    Calc { calc: Calc },
+    /// fit-content(calc()).
+    FitContentCalc { calc: Calc },
+    /// auto.
+    Auto,
+    /// A fraction of the free space, in grid tracks.
+    Fr { value: f32 },
+    /// content (flex-basis).
+    Content,
+    /// min-content.
+    MinContent,
+    /// max-content.
+    MaxContent,
+    /// fit-content(<length>).
+    FitContentPx { value: f32 },
+    /// fit-content(<percentage>), a fraction.
+    FitContentPercent { value: f32 },
+    /// The fit-content keyword.
+    FitContentKeyword,
+    /// stretch.
+    Stretch,
+
+    /// CompactLength::length.
+    pub fn length(value: f32) -> CompactLength {
+        return CompactLength.Length { value: value };
+    }
+
+    /// CompactLength::percent; value is a fraction.
+    pub fn percent(value: f32) -> CompactLength {
+        return CompactLength.Percent { value: value };
+    }
+
+    /// CompactLength::calc.
+    pub fn calc(c: Calc) -> CompactLength {
+        return CompactLength.Calc { calc: c };
+    }
+
+    /// CompactLength::fit_content_calc.
+    pub fn fit_content_calc(c: Calc) -> CompactLength {
+        return CompactLength.FitContentCalc { calc: c };
+    }
+
+    /// CompactLength::auto.
+    pub fn auto() -> CompactLength {
+        return CompactLength.Auto;
+    }
+
+    /// CompactLength::fr.
+    pub fn fr(value: f32) -> CompactLength {
+        return CompactLength.Fr { value: value };
+    }
+
+    /// CompactLength::min_content.
+    pub fn min_content() -> CompactLength {
+        return CompactLength.MinContent;
+    }
+
+    /// CompactLength::max_content.
+    pub fn max_content() -> CompactLength {
+        return CompactLength.MaxContent;
+    }
+
+    /// CompactLength::fit_content_px.
+    pub fn fit_content_px(limit: f32) -> CompactLength {
+        return CompactLength.FitContentPx { value: limit };
+    }
+
+    /// CompactLength::fit_content_percent; limit is a fraction.
+    pub fn fit_content_percent(limit: f32) -> CompactLength {
+        return CompactLength.FitContentPercent { value: limit };
+    }
+
+    /// CompactLength::fit_content_keyword.
+    pub fn fit_content_keyword() -> CompactLength {
+        return CompactLength.FitContentKeyword;
+    }
+
+    /// CompactLength::stretch.
+    pub fn stretch() -> CompactLength {
+        return CompactLength.Stretch;
+    }
+
+    /// CompactLength::content.
+    pub fn content() -> CompactLength {
+        return CompactLength.Content;
+    }
+
+    /// CompactLength::ZERO: a length of 0.0.
+    pub fn zero() -> CompactLength {
+        return CompactLength.Length { value: 0.0 };
+    }
+
+    /// TaffyFitContent::fit_content: fit-content() of a length, percentage
+    /// or calc.
+    pub fn fit_content(lp: LengthPercentage) -> CompactLength {
+        match lp.inner {
+            .Length { value } => { return CompactLength.FitContentPx { value: value }; }
+            .Percent { value } => { return CompactLength.FitContentPercent { value: value }; }
+            .Calc { calc } => { return CompactLength.FitContentCalc { calc: calc }; }
+            _ => { unreachable(); }
+        }
+    }
+
+    /// taffy's tag: the *_TAG constants; a calc value gives CALC_TAG or
+    /// FIT_CONTENT_CALC_TAG (taffy's own carries pointer bits above the low
+    /// three, which no check of taffy reads).
+    pub fn tag(self: CompactLength) -> usize {
+        match self {
+            .Length { .. } => { return LENGTH_TAG; }
+            .Percent { .. } => { return PERCENT_TAG; }
+            .Calc { .. } => { return CALC_TAG; }
+            .FitContentCalc { .. } => { return FIT_CONTENT_CALC_TAG; }
+            .Auto => { return AUTO_TAG; }
+            .Fr { .. } => { return FR_TAG; }
+            .Content => { return CONTENT_TAG; }
+            .MinContent => { return MIN_CONTENT_TAG; }
+            .MaxContent => { return MAX_CONTENT_TAG; }
+            .FitContentPx { .. } => { return FIT_CONTENT_PX_TAG; }
+            .FitContentPercent { .. } => { return FIT_CONTENT_PERCENT_TAG; }
+            .FitContentKeyword => { return FIT_CONTENT_KEYWORD_TAG; }
+            .Stretch => { return STRETCH_TAG; }
+        }
+    }
+
+    /// The number a length, percentage, fr or fit-content limit holds; 0.0
+    /// for a keyword or calc.
+    pub fn value(self: CompactLength) -> f32 {
+        match self {
+            .Length { value } => { return value; }
+            .Percent { value } => { return value; }
+            .Fr { value } => { return value; }
+            .FitContentPx { value } => { return value; }
+            .FitContentPercent { value } => { return value; }
+            _ => { return 0.0; }
+        }
+    }
+
+    /// The calc() a calc or fit-content(calc()) value holds (calc_value);
+    /// zero for others.
+    pub fn calc_value(self: CompactLength) -> Calc {
+        match self {
+            .Calc { calc } => { return calc; }
+            .FitContentCalc { calc } => { return calc; }
+            _ => { return Calc { px: 0.0, percent: 0.0 }; }
+        }
+    }
+
+    /// Whether this is a plain calc() (not fit-content(calc())).
+    pub fn is_plain_calc(self: CompactLength) -> bool {
+        match self {
+            .Calc { .. } => { return true; }
+            _ => { return false; }
+        }
+    }
+
+    /// Whether this is fit-content(calc()).
+    pub fn is_fit_content_calc(self: CompactLength) -> bool {
+        match self {
+            .FitContentCalc { .. } => { return true; }
+            _ => { return false; }
+        }
+    }
+
+    /// Whether this holds a calc() of either kind.
+    pub fn has_calc(self: CompactLength) -> bool {
+        return self.is_plain_calc() or self.is_fit_content_calc();
+    }
+
+    /// Whether this is CompactLength::ZERO: a length whose bits are +0.0's.
+    pub fn is_zero(self: CompactLength) -> bool {
+        match self {
+            .Length { value } => { return float.bits32(value) == 0; }
+            _ => { return false; }
+        }
+    }
+
+    /// Whether this is a length or a percentage (calc() is not).
+    pub fn is_length_or_percentage(self: CompactLength) -> bool {
+        return (self.tag() & (NON_POINTER_BIT | KEYWORD_BIT)) == NON_POINTER_BIT;
+    }
+
+    /// Whether this is auto.
+    pub fn is_auto(self: CompactLength) -> bool {
+        return self.tag() == AUTO_TAG;
+    }
+
+    /// Whether this is content.
+    pub fn is_content(self: CompactLength) -> bool {
+        return self.tag() == CONTENT_TAG;
+    }
+
+    /// Whether this is min-content.
+    pub fn is_min_content(self: CompactLength) -> bool {
+        return self.tag() == MIN_CONTENT_TAG;
+    }
+
+    /// Whether this is max-content.
+    pub fn is_max_content(self: CompactLength) -> bool {
+        return self.tag() == MAX_CONTENT_TAG;
+    }
+
+    /// Whether this is fit-content(...) of a length, percentage or calc.
+    pub fn is_fit_content(self: CompactLength) -> bool {
+        let t = self.tag();
+        return t == FIT_CONTENT_PX_TAG or t == FIT_CONTENT_PERCENT_TAG or self.is_fit_content_calc();
+    }
+
+    /// Whether this is a sizing keyword: min-content, max-content,
+    /// fit-content (keyword or function) or stretch.
+    pub fn is_sizing_keyword(self: CompactLength) -> bool {
+        let mask = NON_POINTER_BIT | KEYWORD_BIT | SIZING_KEYWORD_BIT;
+        return (self.tag() & mask) == mask or self.is_fit_content_calc();
+    }
+
+    /// Whether this is max-content or fit-content(...).
+    pub fn is_max_or_fit_content(self: CompactLength) -> bool {
+        let t = self.tag();
+        return t == MAX_CONTENT_TAG or t == FIT_CONTENT_PX_TAG or t == FIT_CONTENT_PERCENT_TAG or self.is_fit_content_calc();
+    }
+
+    /// Whether this is auto, max-content or fit-content(...).
+    pub fn is_max_content_alike(self: CompactLength) -> bool {
+        let t = self.tag();
+        return t == AUTO_TAG or t == MAX_CONTENT_TAG or t == FIT_CONTENT_PX_TAG or t == FIT_CONTENT_PERCENT_TAG or self.is_fit_content_calc();
+    }
+
+    /// Whether this is min-content or max-content.
+    pub fn is_min_or_max_content(self: CompactLength) -> bool {
+        let t = self.tag();
+        return t == MIN_CONTENT_TAG or t == MAX_CONTENT_TAG;
+    }
+
+    /// Whether this is intrinsic: auto, min-content, max-content or
+    /// fit-content(...).
+    pub fn is_intrinsic(self: CompactLength) -> bool {
+        let t = self.tag();
+        return t == AUTO_TAG or t == MIN_CONTENT_TAG or t == MAX_CONTENT_TAG or t == FIT_CONTENT_PX_TAG or t == FIT_CONTENT_PERCENT_TAG or self.is_fit_content_calc();
+    }
+
+    /// Whether this is fr.
+    pub fn is_fr(self: CompactLength) -> bool {
+        return self.tag() == FR_TAG;
+    }
+
+    /// Whether this depends on a percentage basis: a percentage, a calc()
+    /// or fit-content(<percentage>) (taffy's PERCENTAGE_BIT).
+    pub fn uses_percentage(self: CompactLength) -> bool {
+        return (self.tag() & PERCENTAGE_BIT) != 0;
+    }
+
+    /// The size a percentage or plain calc() resolves to against
+    /// parent_size; none for others.
+    pub fn resolved_percentage_size(self: CompactLength, parent_size: f32) -> ?f32 {
+        match self {
+            .Percent { value } => { return value * parent_size; }
+            .Calc { calc } => { return calc.resolve(parent_size); }
+            _ => { return none; }
+        }
+    }
+
+    /// taffy's ==: the same tag and the same bits.
+    pub fn eq(self: CompactLength, other: CompactLength) -> bool {
+        if self.tag() != other.tag() {
+            return false;
+        }
+        match self {
+            .Calc { calc } => { return calc.eq(other.calc_value()); }
+            .FitContentCalc { calc } => { return calc.eq(other.calc_value()); }
+            _ => { return float.bits32(self.value()) == float.bits32(other.value()); }
+        }
+    }
+}
+
+// --- Dimension, LengthPercentage, LengthPercentageAuto (dimension.rs,
+// util/resolve.rs) ---
+
+/// A length, a percentage or a calc() (LengthPercentage): padding, border,
+/// gap. `inner` is taffy's `.0`.
+pub type LengthPercentage = struct {
+    /// The value.
+    pub inner: CompactLength,
+
+    /// LengthPercentage::length.
+    pub fn length(value: f32) -> LengthPercentage {
+        return LengthPercentage { inner: CompactLength.length(value) };
+    }
+
+    /// LengthPercentage::percent; value is a fraction.
+    pub fn percent(value: f32) -> LengthPercentage {
+        return LengthPercentage { inner: CompactLength.percent(value) };
+    }
+
+    /// LengthPercentage::calc.
+    pub fn calc(c: Calc) -> LengthPercentage {
+        return LengthPercentage { inner: CompactLength.calc(c) };
+    }
+
+    /// LengthPercentage::ZERO.
+    pub fn zero() -> LengthPercentage {
+        return LengthPercentage { inner: CompactLength.zero() };
+    }
+
+    /// The CompactLength (into_raw).
+    pub fn into_raw(self: LengthPercentage) -> CompactLength {
+        return self.inner;
+    }
+
+    /// MaybeResolve<Option<f32>>: a length as is, a percentage or calc()
+    /// against the context when there is one.
+    pub fn maybe_resolve(self: LengthPercentage, context: ?f32) -> ?f32 {
+        match self.inner {
+            .Length { value } => { return value; }
+            .Percent { value } => {
+                match context {
+                    some(dim) => { return dim * value; }
+                    none => { return none; }
+                }
+            }
+            .Calc { calc } => {
+                match context {
+                    some(dim) => { return calc.resolve(dim); }
+                    none => { return none; }
+                }
+            }
+            _ => { unreachable(); }
+        }
+    }
+
+    /// MaybeResolve<f32>.
+    pub fn maybe_resolve_f(self: LengthPercentage, context: f32) -> ?f32 {
+        let c: ?f32 = some(context);
+        return self.maybe_resolve(c);
+    }
+
+    /// ResolveOrZero<Option<f32>>.
+    pub fn resolve_or_zero(self: LengthPercentage, context: ?f32) -> f32 {
+        return util.unwrap_or(self.maybe_resolve(context), 0.0);
+    }
+
+    /// ResolveOrZero<f32>.
+    pub fn resolve_or_zero_f(self: LengthPercentage, context: f32) -> f32 {
+        return util.unwrap_or(self.maybe_resolve_f(context), 0.0);
+    }
+
+    /// Whether this depends on a percentage basis.
+    pub fn uses_percentage(self: LengthPercentage) -> bool {
+        return self.inner.uses_percentage();
+    }
+}
+
+/// A length, a percentage, a calc() or auto (LengthPercentageAuto): margin,
+/// inset, min and max size.
+pub type LengthPercentageAuto = struct {
+    /// The value.
+    pub inner: CompactLength,
+
+    /// LengthPercentageAuto::length.
+    pub fn length(value: f32) -> LengthPercentageAuto {
+        return LengthPercentageAuto { inner: CompactLength.length(value) };
+    }
+
+    /// LengthPercentageAuto::percent; value is a fraction.
+    pub fn percent(value: f32) -> LengthPercentageAuto {
+        return LengthPercentageAuto { inner: CompactLength.percent(value) };
+    }
+
+    /// LengthPercentageAuto::auto.
+    pub fn auto() -> LengthPercentageAuto {
+        return LengthPercentageAuto { inner: CompactLength.auto() };
+    }
+
+    /// LengthPercentageAuto::calc.
+    pub fn calc(c: Calc) -> LengthPercentageAuto {
+        return LengthPercentageAuto { inner: CompactLength.calc(c) };
+    }
+
+    /// LengthPercentageAuto::ZERO.
+    pub fn zero() -> LengthPercentageAuto {
+        return LengthPercentageAuto { inner: CompactLength.zero() };
+    }
+
+    /// From<LengthPercentage>.
+    pub fn from_lp(lp: LengthPercentage) -> LengthPercentageAuto {
+        return LengthPercentageAuto { inner: lp.inner };
+    }
+
+    /// The CompactLength (into_raw).
+    pub fn into_raw(self: LengthPercentageAuto) -> CompactLength {
+        return self.inner;
+    }
+
+    /// Whether this is auto.
+    pub fn is_auto(self: LengthPercentageAuto) -> bool {
+        return self.inner.is_auto();
+    }
+
+    /// resolve_to_option: against a definite context; none for auto.
+    pub fn resolve_to_option(self: LengthPercentageAuto, context: f32) -> ?f32 {
+        match self.inner {
+            .Length { value } => { return value; }
+            .Percent { value } => { return context * value; }
+            .Auto => { return none; }
+            .Calc { calc } => { return calc.resolve(context); }
+            _ => { unreachable(); }
+        }
+    }
+
+    /// MaybeResolve<Option<f32>>: none for auto.
+    pub fn maybe_resolve(self: LengthPercentageAuto, context: ?f32) -> ?f32 {
+        match self.inner {
+            .Auto => { return none; }
+            .Length { value } => { return value; }
+            .Percent { value } => {
+                match context {
+                    some(dim) => { return dim * value; }
+                    none => { return none; }
+                }
+            }
+            .Calc { calc } => {
+                match context {
+                    some(dim) => { return calc.resolve(dim); }
+                    none => { return none; }
+                }
+            }
+            _ => { unreachable(); }
+        }
+    }
+
+    /// MaybeResolve<f32>.
+    pub fn maybe_resolve_f(self: LengthPercentageAuto, context: f32) -> ?f32 {
+        let c: ?f32 = some(context);
+        return self.maybe_resolve(c);
+    }
+
+    /// ResolveOrZero<Option<f32>>.
+    pub fn resolve_or_zero(self: LengthPercentageAuto, context: ?f32) -> f32 {
+        return util.unwrap_or(self.maybe_resolve(context), 0.0);
+    }
+
+    /// ResolveOrZero<f32>.
+    pub fn resolve_or_zero_f(self: LengthPercentageAuto, context: f32) -> f32 {
+        return util.unwrap_or(self.maybe_resolve_f(context), 0.0);
+    }
+
+    /// Whether this depends on a percentage basis.
+    pub fn uses_percentage(self: LengthPercentageAuto) -> bool {
+        return self.inner.uses_percentage();
+    }
+}
+
+/// A size style (Dimension): width, height, flex-basis.
+pub type Dimension = struct {
+    /// The value.
+    pub inner: CompactLength,
+
+    /// Dimension::length.
+    pub fn length(value: f32) -> Dimension {
+        return Dimension { inner: CompactLength.length(value) };
+    }
+
+    /// Dimension::percent; value is a fraction.
+    pub fn percent(value: f32) -> Dimension {
+        return Dimension { inner: CompactLength.percent(value) };
+    }
+
+    /// Dimension::auto.
+    pub fn auto() -> Dimension {
+        return Dimension { inner: CompactLength.auto() };
+    }
+
+    /// Dimension::min_content.
+    pub fn min_content() -> Dimension {
+        return Dimension { inner: CompactLength.min_content() };
+    }
+
+    /// Dimension::max_content.
+    pub fn max_content() -> Dimension {
+        return Dimension { inner: CompactLength.max_content() };
+    }
+
+    /// Dimension::fit_content: the fit-content keyword.
+    pub fn fit_content() -> Dimension {
+        return Dimension { inner: CompactLength.fit_content_keyword() };
+    }
+
+    /// Dimension::fit_content_px.
+    pub fn fit_content_px(limit: f32) -> Dimension {
+        return Dimension { inner: CompactLength.fit_content_px(limit) };
+    }
+
+    /// Dimension::fit_content_percent; limit is a fraction.
+    pub fn fit_content_percent(limit: f32) -> Dimension {
+        return Dimension { inner: CompactLength.fit_content_percent(limit) };
+    }
+
+    /// Dimension::fit_content_calc.
+    pub fn fit_content_calc(c: Calc) -> Dimension {
+        return Dimension { inner: CompactLength.fit_content_calc(c) };
+    }
+
+    /// Dimension::stretch.
+    pub fn stretch() -> Dimension {
+        return Dimension { inner: CompactLength.stretch() };
+    }
+
+    /// Dimension::content.
+    pub fn content() -> Dimension {
+        return Dimension { inner: CompactLength.content() };
+    }
+
+    /// Dimension::calc.
+    pub fn calc(c: Calc) -> Dimension {
+        return Dimension { inner: CompactLength.calc(c) };
+    }
+
+    /// Dimension::ZERO.
+    pub fn zero() -> Dimension {
+        return Dimension { inner: CompactLength.zero() };
+    }
+
+    /// From<LengthPercentage>.
+    pub fn from_lp(lp: LengthPercentage) -> Dimension {
+        return Dimension { inner: lp.inner };
+    }
+
+    /// From<LengthPercentageAuto>.
+    pub fn from_lpa(lpa: LengthPercentageAuto) -> Dimension {
+        return Dimension { inner: lpa.inner };
+    }
+
+    /// The CompactLength (into_raw).
+    pub fn into_raw(self: Dimension) -> CompactLength {
+        return self.inner;
+    }
+
+    /// Whether this is fit-content(calc()).
+    pub fn is_fit_content_calc(self: Dimension) -> bool {
+        return self.inner.is_fit_content_calc();
+    }
+
+    /// The calc() held (calc_value).
+    pub fn calc_value(self: Dimension) -> Calc {
+        return self.inner.calc_value();
+    }
+
+    /// into_option: a length's value, none for anything else.
+    pub fn into_option(self: Dimension) -> ?f32 {
+        match self.inner {
+            .Length { value } => { return value; }
+            _ => { return none; }
+        }
+    }
+
+    /// Whether this is auto.
+    pub fn is_auto(self: Dimension) -> bool {
+        return self.inner.is_auto();
+    }
+
+    /// Whether this is a sizing keyword.
+    pub fn is_sizing_keyword(self: Dimension) -> bool {
+        return self.inner.is_sizing_keyword();
+    }
+
+    /// Whether this is stretch.
+    pub fn is_stretch(self: Dimension) -> bool {
+        return self.inner.tag() == STRETCH_TAG;
+    }
+
+    /// Whether this is content.
+    pub fn is_content(self: Dimension) -> bool {
+        return self.inner.is_content();
+    }
+
+    /// taffy's tag.
+    pub fn tag(self: Dimension) -> usize {
+        return self.inner.tag();
+    }
+
+    /// The number held.
+    pub fn value(self: Dimension) -> f32 {
+        return self.inner.value();
+    }
+
+    /// Whether this depends on a percentage basis.
+    pub fn uses_percentage(self: Dimension) -> bool {
+        return self.inner.uses_percentage();
+    }
+
+    /// MaybeResolve<Option<f32>>: none for auto, content and the sizing
+    /// keywords.
+    pub fn maybe_resolve(self: Dimension, context: ?f32) -> ?f32 {
+        match self.inner {
+            .Auto => { return none; }
+            .Content => { return none; }
+            .Length { value } => { return value; }
+            .Percent { value } => {
+                match context {
+                    some(dim) => { return dim * value; }
+                    none => { return none; }
+                }
+            }
+            .Calc { calc } => {
+                match context {
+                    some(dim) => { return calc.resolve(dim); }
+                    none => { return none; }
+                }
+            }
+            .Fr { .. } => { unreachable(); }
+            _ => { return none; }
+        }
+    }
+
+    /// MaybeResolve<f32>.
+    pub fn maybe_resolve_f(self: Dimension, context: f32) -> ?f32 {
+        let c: ?f32 = some(context);
+        return self.maybe_resolve(c);
+    }
+
+    /// ResolveOrZero<Option<f32>>.
+    pub fn resolve_or_zero(self: Dimension, context: ?f32) -> f32 {
+        return util.unwrap_or(self.maybe_resolve(context), 0.0);
+    }
+
+    /// ResolveOrZero<f32>.
+    pub fn resolve_or_zero_f(self: Dimension, context: f32) -> f32 {
+        return util.unwrap_or(self.maybe_resolve_f(context), 0.0);
+    }
+}
+
+/// Size<Dimension>::from_lengths.
+pub fn size_from_lengths(width: f32, height: f32) -> geo.Size(Dimension) {
+    return geo.Size(Dimension) { width: Dimension.length(width), height: Dimension.length(height) };
+}
+
+/// Size<Dimension>::from_percent; fractions.
+pub fn size_from_percent(width: f32, height: f32) -> geo.Size(Dimension) {
+    return geo.Size(Dimension) { width: Dimension.percent(width), height: Dimension.percent(height) };
+}
+
+/// Size::auto() for Size<Dimension>.
+pub fn size_auto() -> geo.Size(Dimension) {
+    return geo.Size(Dimension) { width: Dimension.auto(), height: Dimension.auto() };
+}
+
+/// Size::auto() for Size<LengthPercentageAuto>.
+pub fn size_auto_lpa() -> geo.Size(LengthPercentageAuto) {
+    return geo.Size(LengthPercentageAuto) { width: LengthPercentageAuto.auto(), height: LengthPercentageAuto.auto() };
+}
+
+/// Size::zero() for Size<LengthPercentage>.
+pub fn size_zero_lp() -> geo.Size(LengthPercentage) {
+    return geo.Size(LengthPercentage) { width: LengthPercentage.zero(), height: LengthPercentage.zero() };
+}
+
+/// Rect::auto() for Rect<LengthPercentageAuto>.
+pub fn rect_auto_lpa() -> geo.Rect(LengthPercentageAuto) {
+    let a = LengthPercentageAuto.auto();
+    return geo.Rect(LengthPercentageAuto) { left: a, right: a, top: a, bottom: a };
+}
+
+/// Rect::zero() for Rect<LengthPercentageAuto>.
+pub fn rect_zero_lpa() -> geo.Rect(LengthPercentageAuto) {
+    let z = LengthPercentageAuto.zero();
+    return geo.Rect(LengthPercentageAuto) { left: z, right: z, top: z, bottom: z };
+}
+
+/// Rect::zero() for Rect<LengthPercentage>.
+pub fn rect_zero_lp() -> geo.Rect(LengthPercentage) {
+    let z = LengthPercentage.zero();
+    return geo.Rect(LengthPercentage) { left: z, right: z, top: z, bottom: z };
+}
+
+// --- AvailableSpace (available_space.rs, util/math.rs) ---
+
+/// The space a node may lay out into (AvailableSpace).
+pub type AvailableSpace = enum {
+    /// A definite number of pixels.
+    Definite { value: f32 },
+    /// As small as the content can be: min-content.
+    MinContent,
+    /// As large as the content wants: max-content.
+    MaxContent,
+
+    /// AvailableSpace::Definite(value).
+    pub fn definite(value: f32) -> AvailableSpace {
+        return AvailableSpace.Definite { value: value };
+    }
+
+    /// AvailableSpace::ZERO.
+    pub fn zero() -> AvailableSpace {
+        return AvailableSpace.Definite { value: 0.0 };
+    }
+
+    /// From<Option<f32>>: some is definite, none is max-content.
+    pub fn from_option(option: ?f32) -> AvailableSpace {
+        match option {
+            some(value) => { return AvailableSpace.Definite { value: value }; }
+            none => { return AvailableSpace.MaxContent; }
+        }
+    }
+
+    /// Whether this is definite.
+    pub fn is_definite(self: AvailableSpace) -> bool {
+        match self {
+            .Definite { .. } => { return true; }
+            _ => { return false; }
+        }
+    }
+
+    /// The definite value, or none.
+    pub fn into_option(self: AvailableSpace) -> ?f32 {
+        match self {
+            .Definite { value } => { return value; }
+            _ => { return none; }
+        }
+    }
+
+    /// The definite value, or default.
+    pub fn unwrap_or(self: AvailableSpace, default: f32) -> f32 {
+        match self {
+            .Definite { value } => { return value; }
+            _ => { return default; }
+        }
+    }
+
+    /// The definite value; panics when there is none.
+    pub fn unwrap(self: AvailableSpace) -> f32 {
+        match self {
+            .Definite { value } => { return value; }
+            _ => { panic("AvailableSpace.unwrap on an indefinite space"); }
+        }
+    }
+
+    /// AvailableSpace::or (a keyword in Arche): self when definite, else
+    /// default.
+    pub fn fallback(self: AvailableSpace, default: AvailableSpace) -> AvailableSpace {
+        match self {
+            .Definite { .. } => { return self; }
+            _ => { return default; }
+        }
+    }
+
+    /// Definite(value) when value is some, else self.
+    pub fn maybe_set(self: AvailableSpace, value: ?f32) -> AvailableSpace {
+        match value {
+            some(v) => { return AvailableSpace.Definite { value: v }; }
+            none => { return self; }
+        }
+    }
+
+    /// map_definite_value: the function applied to a definite value.
+    pub fn map_definite_value(self: AvailableSpace, map_function: &dyn fn(f32) -> f32) -> AvailableSpace {
+        match self {
+            .Definite { value } => { return AvailableSpace.Definite { value: map_function(value) }; }
+            _ => { return self; }
+        }
+    }
+
+    /// compute_free_space: infinite for max-content, 0 for min-content.
+    pub fn compute_free_space(self: AvailableSpace, used_space: f32) -> f32 {
+        match self {
+            .MaxContent => { return util.infinity(); }
+            .MinContent => { return 0.0; }
+            .Definite { value } => { return value - used_space; }
+        }
+    }
+
+    /// is_roughly_equal: definite values within f32::EPSILON.
+    pub fn is_roughly_equal(self: AvailableSpace, other: AvailableSpace) -> bool {
+        match self {
+            .Definite { value } => {
+                match other {
+                    .Definite { value: b } => { return util.abs(value - b) < util.epsilon(); }
+                    _ => { return false; }
+                }
+            }
+            .MinContent => {
+                match other {
+                    .MinContent => { return true; }
+                    _ => { return false; }
+                }
+            }
+            .MaxContent => {
+                match other {
+                    .MaxContent => { return true; }
+                    _ => { return false; }
+                }
+            }
+        }
+    }
+
+    /// MaybeMath<f32>::maybe_min: an indefinite space becomes Definite(rhs).
+    pub fn maybe_min_f(self: AvailableSpace, rhs: f32) -> AvailableSpace {
+        match self {
+            .Definite { value } => { return AvailableSpace.Definite { value: util.f32_min(a: value, b: rhs) }; }
+            _ => { return AvailableSpace.Definite { value: rhs }; }
+        }
+    }
+
+    /// MaybeMath<f32>::maybe_max.
+    pub fn maybe_max_f(self: AvailableSpace, rhs: f32) -> AvailableSpace {
+        match self {
+            .Definite { value } => { return AvailableSpace.Definite { value: util.f32_max(a: value, b: rhs) }; }
+            _ => { return self; }
+        }
+    }
+
+    /// MaybeMath<f32>::maybe_clamp.
+    pub fn maybe_clamp_f(self: AvailableSpace, min: f32, max: f32) -> AvailableSpace {
+        match self {
+            .Definite { value } => { return AvailableSpace.Definite { value: util.f32_max(a: util.f32_min(a: value, b: max), b: min) }; }
+            _ => { return self; }
+        }
+    }
+
+    /// MaybeMath<f32>::maybe_add.
+    pub fn maybe_add_f(self: AvailableSpace, rhs: f32) -> AvailableSpace {
+        match self {
+            .Definite { value } => { return AvailableSpace.Definite { value: value + rhs }; }
+            _ => { return self; }
+        }
+    }
+
+    /// MaybeMath<f32>::maybe_sub.
+    pub fn maybe_sub_f(self: AvailableSpace, rhs: f32) -> AvailableSpace {
+        match self {
+            .Definite { value } => { return AvailableSpace.Definite { value: value - rhs }; }
+            _ => { return self; }
+        }
+    }
+
+    /// MaybeMath<Option<f32>>::maybe_min: an indefinite space becomes
+    /// Definite(rhs) when rhs is some.
+    pub fn maybe_min(self: AvailableSpace, rhs: ?f32) -> AvailableSpace {
+        match rhs {
+            some(r) => { return self.maybe_min_f(r); }
+            none => { return self; }
+        }
+    }
+
+    /// MaybeMath<Option<f32>>::maybe_max.
+    pub fn maybe_max(self: AvailableSpace, rhs: ?f32) -> AvailableSpace {
+        match rhs {
+            some(r) => { return self.maybe_max_f(r); }
+            none => { return self; }
+        }
+    }
+
+    /// MaybeMath<Option<f32>>::maybe_clamp.
+    pub fn maybe_clamp(self: AvailableSpace, min: ?f32, max: ?f32) -> AvailableSpace {
+        match self {
+            .Definite { value } => { return AvailableSpace.Definite { value: util.f32_maybe_clamp(value, min: min, max: max) }; }
+            _ => { return self; }
+        }
+    }
+
+    /// MaybeMath<Option<f32>>::maybe_add.
+    pub fn maybe_add(self: AvailableSpace, rhs: ?f32) -> AvailableSpace {
+        match rhs {
+            some(r) => { return self.maybe_add_f(r); }
+            none => { return self; }
+        }
+    }
+
+    /// MaybeMath<Option<f32>>::maybe_sub.
+    pub fn maybe_sub(self: AvailableSpace, rhs: ?f32) -> AvailableSpace {
+        match rhs {
+            some(r) => { return self.maybe_sub_f(r); }
+            none => { return self; }
+        }
+    }
+}
+
+// --- Alignment (alignment.rs) ---
+
+/// The keywords of align-items, align-self, justify-items and
+/// justify-self (AlignItemsKeyword).
+pub type AlignItemsKeyword = enum {
+    /// normal.
+    Normal,
+    /// start.
+    Start,
+    /// end.
+    End,
+    /// flex-start.
+    FlexStart,
+    /// flex-end.
+    FlexEnd,
+    /// self-start.
+    SelfStart,
+    /// self-end.
+    SelfEnd,
+    /// center.
+    Center,
+    /// baseline.
+    Baseline,
+    /// stretch.
+    Stretch,
+}
+
+/// The keywords of align-content and justify-content
+/// (AlignContentKeyword).
+pub type AlignContentKeyword = enum {
+    /// normal.
+    Normal,
+    /// start.
+    Start,
+    /// end.
+    End,
+    /// flex-start.
+    FlexStart,
+    /// flex-end.
+    FlexEnd,
+    /// center.
+    Center,
+    /// stretch.
+    Stretch,
+    /// space-between.
+    SpaceBetween,
+    /// space-evenly.
+    SpaceEvenly,
+    /// space-around.
+    SpaceAround,
+
+    /// The keyword for the reversed axis (reversed).
+    pub fn reversed(self: AlignContentKeyword) -> AlignContentKeyword {
+        match self {
+            .Start => { return AlignContentKeyword.End; }
+            .End => { return AlignContentKeyword.Start; }
+            .FlexStart => { return AlignContentKeyword.FlexEnd; }
+            .FlexEnd => { return AlignContentKeyword.FlexStart; }
+            .Stretch => { return AlignContentKeyword.End; }
+            _ => { return self; }
+        }
+    }
+}
+
+/// The overflow position of an alignment: safe, unsafe or neither
+/// (AlignmentSafety).
+pub type AlignmentSafety = enum {
+    /// Neither given.
+    Default,
+    /// unsafe.
+    Unsafe,
+    /// safe.
+    Safe,
+}
+
+/// align-items, align-self, justify-items, justify-self (AlignItems).
+pub type AlignItems = struct {
+    /// The keyword.
+    pub keyword: AlignItemsKeyword,
+    /// The overflow position.
+    pub safety: AlignmentSafety,
+
+    /// AlignItems::NORMAL.
+    pub fn normal() -> AlignItems {
+        return AlignItems { keyword: AlignItemsKeyword.Normal, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignItems::START.
+    pub fn start() -> AlignItems {
+        return AlignItems { keyword: AlignItemsKeyword.Start, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignItems::END.
+    pub fn end() -> AlignItems {
+        return AlignItems { keyword: AlignItemsKeyword.End, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignItems::FLEX_START.
+    pub fn flex_start() -> AlignItems {
+        return AlignItems { keyword: AlignItemsKeyword.FlexStart, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignItems::FLEX_END.
+    pub fn flex_end() -> AlignItems {
+        return AlignItems { keyword: AlignItemsKeyword.FlexEnd, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignItems::SELF_START.
+    pub fn self_start() -> AlignItems {
+        return AlignItems { keyword: AlignItemsKeyword.SelfStart, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignItems::SELF_END.
+    pub fn self_end() -> AlignItems {
+        return AlignItems { keyword: AlignItemsKeyword.SelfEnd, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignItems::CENTER.
+    pub fn center() -> AlignItems {
+        return AlignItems { keyword: AlignItemsKeyword.Center, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignItems::BASELINE.
+    pub fn baseline() -> AlignItems {
+        return AlignItems { keyword: AlignItemsKeyword.Baseline, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignItems::STRETCH.
+    pub fn stretch() -> AlignItems {
+        return AlignItems { keyword: AlignItemsKeyword.Stretch, safety: AlignmentSafety.Default };
+    }
+
+    /// The keyword with `safe` (AlignItems::SAFE_*).
+    pub fn safe(keyword: AlignItemsKeyword) -> AlignItems {
+        return AlignItems { keyword: keyword, safety: AlignmentSafety.Safe };
+    }
+
+    /// Whether this is `safe`.
+    pub fn is_safe(self: AlignItems) -> bool {
+        return self.safety == AlignmentSafety.Safe;
+    }
+
+    /// The same keyword with another safety.
+    pub fn with_safety(self: AlignItems, safety: AlignmentSafety) -> AlignItems {
+        return AlignItems { keyword: self.keyword, safety: safety };
+    }
+
+    /// Whether the keyword is stretch or normal.
+    pub fn is_stretch_or_normal(self: AlignItems) -> bool {
+        return self.keyword == AlignItemsKeyword.Stretch or self.keyword == AlignItemsKeyword.Normal;
+    }
+
+    /// resolve_self_relative: self-start and self-end as start or end, by
+    /// the item's and the container's direction in the inline axis.
+    pub fn resolve_self_relative(self: AlignItems, item_direction: Direction, container_direction: Direction, axis_is_inline: bool) -> AlignItems {
+        let flip = axis_is_inline and item_direction != container_direction;
+        var keyword = self.keyword;
+        if self.keyword == AlignItemsKeyword.SelfStart {
+            if flip {
+                keyword = AlignItemsKeyword.End;
+            } else {
+                keyword = AlignItemsKeyword.Start;
+            }
+        } else if self.keyword == AlignItemsKeyword.SelfEnd {
+            if flip {
+                keyword = AlignItemsKeyword.Start;
+            } else {
+                keyword = AlignItemsKeyword.End;
+            }
+        }
+        return AlignItems { keyword: keyword, safety: self.safety };
+    }
+}
+
+/// justify-items (JustifyItems), the same type as AlignItems.
+pub type JustifyItems = AlignItems;
+
+/// align-self (AlignSelf), the same type as AlignItems.
+pub type AlignSelf = AlignItems;
+
+/// justify-self (JustifySelf), the same type as AlignItems.
+pub type JustifySelf = AlignItems;
+
+/// align-content and justify-content (AlignContent).
+pub type AlignContent = struct {
+    /// The keyword.
+    pub keyword: AlignContentKeyword,
+    /// The overflow position.
+    pub safety: AlignmentSafety,
+
+    /// AlignContent::NORMAL.
+    pub fn normal() -> AlignContent {
+        return AlignContent { keyword: AlignContentKeyword.Normal, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignContent::START.
+    pub fn start() -> AlignContent {
+        return AlignContent { keyword: AlignContentKeyword.Start, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignContent::END.
+    pub fn end() -> AlignContent {
+        return AlignContent { keyword: AlignContentKeyword.End, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignContent::FLEX_START.
+    pub fn flex_start() -> AlignContent {
+        return AlignContent { keyword: AlignContentKeyword.FlexStart, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignContent::FLEX_END.
+    pub fn flex_end() -> AlignContent {
+        return AlignContent { keyword: AlignContentKeyword.FlexEnd, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignContent::CENTER.
+    pub fn center() -> AlignContent {
+        return AlignContent { keyword: AlignContentKeyword.Center, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignContent::STRETCH.
+    pub fn stretch() -> AlignContent {
+        return AlignContent { keyword: AlignContentKeyword.Stretch, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignContent::SPACE_BETWEEN.
+    pub fn space_between() -> AlignContent {
+        return AlignContent { keyword: AlignContentKeyword.SpaceBetween, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignContent::SPACE_EVENLY.
+    pub fn space_evenly() -> AlignContent {
+        return AlignContent { keyword: AlignContentKeyword.SpaceEvenly, safety: AlignmentSafety.Default };
+    }
+
+    /// AlignContent::SPACE_AROUND.
+    pub fn space_around() -> AlignContent {
+        return AlignContent { keyword: AlignContentKeyword.SpaceAround, safety: AlignmentSafety.Default };
+    }
+
+    /// The keyword with `safe` (AlignContent::SAFE_*).
+    pub fn safe(keyword: AlignContentKeyword) -> AlignContent {
+        return AlignContent { keyword: keyword, safety: AlignmentSafety.Safe };
+    }
+
+    /// Whether this is `safe`.
+    pub fn is_safe(self: AlignContent) -> bool {
+        return self.safety == AlignmentSafety.Safe;
+    }
+
+    /// The same keyword with another safety.
+    pub fn with_safety(self: AlignContent, safety: AlignmentSafety) -> AlignContent {
+        return AlignContent { keyword: self.keyword, safety: safety };
+    }
+}
+
+/// justify-content (JustifyContent), the same type as AlignContent.
+pub type JustifyContent = AlignContent;
+
+// --- Flexbox (flex.rs) ---
+
+/// flex-wrap (FlexWrap).
+pub type FlexWrap = enum {
+    /// nowrap.
+    NoWrap,
+    /// wrap.
+    Wrap,
+    /// wrap-reverse.
+    WrapReverse,
+    /// balance: wrap into balanced lines (taffy's flexbox_balance, a
+    /// default feature).
+    Balance,
+    /// balance with wrap-reverse.
+    BalanceReverse,
+
+    /// Whether items may wrap onto several lines.
+    pub fn is_multi_line(self: FlexWrap) -> bool {
+        return self != FlexWrap.NoWrap;
+    }
+
+    /// Whether the lines stack in reverse.
+    pub fn is_reverse(self: FlexWrap) -> bool {
+        return self == FlexWrap.WrapReverse or self == FlexWrap.BalanceReverse;
+    }
+
+    /// Whether the lines are balanced.
+    pub fn is_balance(self: FlexWrap) -> bool {
+        return self == FlexWrap.Balance or self == FlexWrap.BalanceReverse;
+    }
+}
+
+/// flex-direction (FlexDirection).
+pub type FlexDirection = enum {
+    /// row.
+    Row,
+    /// column.
+    Column,
+    /// row-reverse.
+    RowReverse,
+    /// column-reverse.
+    ColumnReverse,
+
+    /// Whether the main axis is horizontal.
+    pub fn is_row(self: FlexDirection) -> bool {
+        return self == FlexDirection.Row or self == FlexDirection.RowReverse;
+    }
+
+    /// Whether the main axis is vertical.
+    pub fn is_column(self: FlexDirection) -> bool {
+        return self == FlexDirection.Column or self == FlexDirection.ColumnReverse;
+    }
+
+    /// Whether items run from the end.
+    pub fn is_reverse(self: FlexDirection) -> bool {
+        return self == FlexDirection.RowReverse or self == FlexDirection.ColumnReverse;
+    }
+
+    /// The main axis.
+    pub fn main_axis(self: FlexDirection) -> geo.AbsoluteAxis {
+        if self.is_row() {
+            return geo.AbsoluteAxis.Horizontal;
+        }
+        return geo.AbsoluteAxis.Vertical;
+    }
+
+    /// The cross axis.
+    pub fn cross_axis(self: FlexDirection) -> geo.AbsoluteAxis {
+        if self.is_row() {
+            return geo.AbsoluteAxis.Vertical;
+        }
+        return geo.AbsoluteAxis.Horizontal;
+    }
+}
+
+// --- Block and float (block.rs, float.rs) ---
+
+/// text-align, as far as block layout reads it (TextAlign).
+pub type TextAlign = enum {
+    /// No legacy alignment.
+    Auto,
+    /// -webkit-left.
+    LegacyLeft,
+    /// -webkit-right.
+    LegacyRight,
+    /// -webkit-center.
+    LegacyCenter,
+}
+
+/// float (Float).
+pub type Float = enum {
+    /// float: left.
+    Left,
+    /// float: right.
+    Right,
+    /// float: none.
+    None,
+
+    /// Whether the box floats.
+    pub fn is_floated(self: Float) -> bool {
+        return self == Float.Left or self == Float.Right;
+    }
+
+    /// The side it floats to, or none.
+    pub fn float_direction(self: Float) -> ?FloatDirection {
+        match self {
+            .Left => { return FloatDirection.Left; }
+            .Right => { return FloatDirection.Right; }
+            .None => { return none; }
+        }
+    }
+}
+
+/// The side a float goes to (FloatDirection); `index()` is taffy's
+/// `direction as usize`.
+pub type FloatDirection = enum {
+    /// Left, 0.
+    Left,
+    /// Right, 1.
+    Right,
+
+    /// 0 for left, 1 for right.
+    pub fn index(self: FloatDirection) -> usize {
+        match self {
+            .Left => { return 0; }
+            .Right => { return 1; }
+        }
+    }
+}
+
+/// clear (Clear).
+pub type Clear = enum {
+    /// clear: left.
+    Left,
+    /// clear: right.
+    Right,
+    /// clear: both.
+    Both,
+    /// clear: none.
+    None,
+}
+
+// --- The core styles (mod.rs) ---
+
+/// display (Display).
+pub type Display = enum {
+    /// block.
+    Block,
+    /// flow-root.
+    FlowRoot,
+    /// flex.
+    Flex,
+    /// grid.
+    Grid,
+    /// none.
+    None,
+
+    /// Display::DEFAULT: flex, as with taffy's default features.
+    pub fn default_value() -> Display {
+        return Display.Flex;
+    }
+}
+
+/// Whether a node generates a box (BoxGenerationMode).
+pub type BoxGenerationMode = enum {
+    /// It does.
+    Normal,
+    /// It and its descendants do not (display: none).
+    None,
+}
+
+/// position (Position).
+pub type Position = enum {
+    /// static.
+    Static,
+    /// relative.
+    Relative,
+    /// absolute.
+    Absolute,
+    /// fixed.
+    Fixed,
+    /// sticky.
+    Sticky,
+
+    /// Whether the box is out of flow: absolute or fixed.
+    pub fn is_out_of_flow(self: Position) -> bool {
+        return self == Position.Absolute or self == Position.Fixed;
+    }
+
+    /// Whether the box is positioned: anything but static.
+    pub fn is_positioned(self: Position) -> bool {
+        return self != Position.Static;
+    }
+}
+
+/// Which out-of-flow boxes a node is the containing block of
+/// (ContainingBlockClaims).
+pub type ContainingBlockClaims = struct {
+    /// Of position: absolute boxes.
+    pub absolute: bool,
+    /// Of position: fixed boxes.
+    pub fixed: bool,
+
+    /// ContainingBlockClaims::NONE.
+    pub fn none_claimed() -> ContainingBlockClaims {
+        return ContainingBlockClaims { absolute: false, fixed: false };
+    }
+
+    /// ContainingBlockClaims::ALL.
+    pub fn all() -> ContainingBlockClaims {
+        return ContainingBlockClaims { absolute: true, fixed: true };
+    }
+
+    /// Whether boxes of this position are claimed.
+    pub fn for_position(self: ContainingBlockClaims, position: Position) -> bool {
+        if position == Position.Absolute {
+            return self.absolute;
+        }
+        if position == Position.Fixed {
+            return self.fixed;
+        }
+        return false;
+    }
+}
+
+/// box-sizing (BoxSizing).
+pub type BoxSizing = enum {
+    /// border-box.
+    BorderBox,
+    /// content-box.
+    ContentBox,
+}
+
+/// overflow in one axis (Overflow).
+pub type Overflow = enum {
+    /// visible.
+    Visible,
+    /// clip.
+    Clip,
+    /// hidden.
+    Hidden,
+    /// scroll.
+    Scroll,
+
+    /// Whether the box is a scroll container: hidden or scroll.
+    pub fn is_scroll_container(self: Overflow) -> bool {
+        return self == Overflow.Hidden or self == Overflow.Scroll;
+    }
+
+    /// The automatic minimum size: 0 for a scroll container, else none.
+    pub fn maybe_into_automatic_min_size(self: Overflow) -> ?f32 {
+        if self.is_scroll_container() {
+            let zero: f32 = 0.0;
+            return zero;
+        }
+        return none;
+    }
+}
+
+/// contain, as bits (Contain).
+pub type Contain = struct {
+    /// LAYOUT is 1, PAINT 2.
+    pub bits: u8,
+
+    /// Contain::NONE.
+    pub fn none_set() -> Contain {
+        return Contain { bits: 0 };
+    }
+
+    /// Contain::LAYOUT.
+    pub fn layout() -> Contain {
+        return Contain { bits: 1 };
+    }
+
+    /// Contain::PAINT.
+    pub fn paint() -> Contain {
+        return Contain { bits: 2 };
+    }
+
+    /// Contain::CONTENT: layout and paint.
+    pub fn content() -> Contain {
+        return Contain { bits: 3 };
+    }
+
+    /// Whether every bit of other is set.
+    pub fn contains(self: Contain, other: Contain) -> bool {
+        return (self.bits & other.bits) == other.bits;
+    }
+
+    /// Whether a bit of other is set.
+    pub fn intersects(self: Contain, other: Contain) -> bool {
+        return (self.bits & other.bits) != 0;
+    }
+
+    /// Both sets of bits.
+    pub fn union(self: Contain, other: Contain) -> Contain {
+        return Contain { bits: self.bits | other.bits };
+    }
+
+    /// Whether the box gets an independent formatting context.
+    pub fn establishes_independent_formatting_context(self: Contain) -> bool {
+        return self.intersects(Contain.layout().union(Contain.paint()));
+    }
+
+    /// Whether layout containment suppresses the box's baseline.
+    pub fn suppresses_baseline(self: Contain) -> bool {
+        return self.contains(Contain.layout());
+    }
+
+    /// Whether the box keeps its scrollable overflow in.
+    pub fn contains_scrollable_overflow(self: Contain) -> bool {
+        return self.intersects(Contain.layout().union(Contain.paint()));
+    }
+}
+
+/// direction (Direction).
+pub type Direction = enum {
+    /// ltr.
+    Ltr,
+    /// rtl.
+    Rtl,
+
+    /// Whether this is rtl.
+    pub fn is_rtl(self: Direction) -> bool {
+        return self == Direction.Rtl;
+    }
+}
+
+/// A node's style: every property any of taffy's algorithms reads (Style).
+/// It holds lists, the grid's, so it is move-only, made with
+/// `Style.default(a)` and changed field by field.
+pub type Style = struct {
+    /// display.
+    pub display: Display,
+    /// Whether the item is a table (block layout does not stretch it).
+    pub item_is_table: bool,
+    /// Whether the item is replaced (an image, a control).
+    pub item_is_replaced: bool,
+    /// Whether the item is a compressible replaced element.
+    pub item_is_compressible_replaced: bool,
+    /// box-sizing.
+    pub box_sizing: BoxSizing,
+    /// direction.
+    pub direction: Direction,
+    /// overflow-x and overflow-y.
+    pub overflow: geo.Point(Overflow),
+    /// The width reserved for a scrollbar.
+    pub scrollbar_width: f32,
+    /// contain.
+    pub contain: Contain,
+    /// float.
+    pub float: Float,
+    /// clear.
+    pub clear: Clear,
+    /// position.
+    pub position: Position,
+    /// top, right, bottom, left.
+    pub inset: geo.Rect(LengthPercentageAuto),
+    /// width and height.
+    pub size: geo.Size(Dimension),
+    /// min-width and min-height.
+    pub min_size: geo.Size(LengthPercentageAuto),
+    /// max-width and max-height.
+    pub max_size: geo.Size(LengthPercentageAuto),
+    /// aspect-ratio, width / height.
+    pub aspect_ratio: ?f32,
+    /// margin.
+    pub margin: geo.Rect(LengthPercentageAuto),
+    /// padding.
+    pub padding: geo.Rect(LengthPercentage),
+    /// border widths.
+    pub border: geo.Rect(LengthPercentage),
+    /// align-items.
+    pub align_items: AlignItems,
+    /// align-self; none is auto.
+    pub align_self: ?AlignSelf,
+    /// justify-items.
+    pub justify_items: AlignItems,
+    /// justify-self; none is auto.
+    pub justify_self: ?AlignSelf,
+    /// align-content.
+    pub align_content: AlignContent,
+    /// justify-content.
+    pub justify_content: JustifyContent,
+    /// column-gap (width) and row-gap (height).
+    pub gap: geo.Size(LengthPercentage),
+    /// text-align, as block layout reads it.
+    pub text_align: TextAlign,
+    /// flex-direction.
+    pub flex_direction: FlexDirection,
+    /// flex-wrap.
+    pub flex_wrap: FlexWrap,
+    /// The least number of lines a balanced flex container has
+    /// (flexbox_balance).
+    pub flex_line_count: u16,
+    /// flex-basis.
+    pub flex_basis: Dimension,
+    /// flex-grow.
+    pub flex_grow: f32,
+    /// flex-shrink.
+    pub flex_shrink: f32,
+    /// grid-template-rows.
+    pub grid_template_rows: alloc.List(sgrid.GridTemplateComponent),
+    /// grid-template-columns.
+    pub grid_template_columns: alloc.List(sgrid.GridTemplateComponent),
+    /// grid-auto-rows.
+    pub grid_auto_rows: alloc.List(sgrid.TrackSizingFunction),
+    /// grid-auto-columns.
+    pub grid_auto_columns: alloc.List(sgrid.TrackSizingFunction),
+    /// grid-auto-flow.
+    pub grid_auto_flow: sgrid.GridAutoFlow,
+    /// grid-template-areas, if any.
+    pub grid_template_areas: ?sgrid.GridTemplateAreas,
+    /// The names of each column line of grid-template-columns.
+    pub grid_template_column_names: alloc.List(alloc.List(alloc.Symbol)),
+    /// The names of each row line of grid-template-rows.
+    pub grid_template_row_names: alloc.List(alloc.List(alloc.Symbol)),
+    /// grid-row-start and grid-row-end.
+    pub grid_row: geo.Line(sgrid.GridPlacement),
+    /// grid-column-start and grid-column-end.
+    pub grid_column: geo.Line(sgrid.GridPlacement),
+
+    /// Style::DEFAULT, its lists empty, in memory from a.
+    pub fn default(a: alloc.Allocator) -> Style {
+        let auto_place = geo.Line(sgrid.GridPlacement) { start: sgrid.GridPlacement.Auto, end: sgrid.GridPlacement.Auto };
+        return Style {
+            display: Display.default_value(),
+            item_is_table: false,
+            item_is_replaced: false,
+            item_is_compressible_replaced: false,
+            box_sizing: BoxSizing.BorderBox,
+            direction: Direction.Ltr,
+            overflow: geo.Point(Overflow) { x: Overflow.Visible, y: Overflow.Visible },
+            scrollbar_width: 0.0,
+            contain: Contain.none_set(),
+            float: Float.None,
+            clear: Clear.None,
+            position: Position.Static,
+            inset: rect_auto_lpa(),
+            size: size_auto(),
+            min_size: size_auto_lpa(),
+            max_size: size_auto_lpa(),
+            aspect_ratio: none,
+            margin: rect_zero_lpa(),
+            padding: rect_zero_lp(),
+            border: rect_zero_lp(),
+            align_items: AlignItems.normal(),
+            align_self: none,
+            justify_items: AlignItems.normal(),
+            justify_self: none,
+            align_content: AlignContent.normal(),
+            justify_content: AlignContent.normal(),
+            gap: size_zero_lp(),
+            text_align: TextAlign.Auto,
+            flex_direction: FlexDirection.Row,
+            flex_wrap: FlexWrap.NoWrap,
+            flex_line_count: 1,
+            flex_basis: Dimension.auto(),
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
+            grid_template_rows: alloc.List(sgrid.GridTemplateComponent).init(a),
+            grid_template_columns: alloc.List(sgrid.GridTemplateComponent).init(a),
+            grid_auto_rows: alloc.List(sgrid.TrackSizingFunction).init(a),
+            grid_auto_columns: alloc.List(sgrid.TrackSizingFunction).init(a),
+            grid_auto_flow: sgrid.GridAutoFlow.Row,
+            grid_template_areas: none,
+            grid_template_column_names: alloc.List(alloc.List(alloc.Symbol)).init(a),
+            grid_template_row_names: alloc.List(alloc.List(alloc.Symbol)).init(a),
+            grid_row: auto_place,
+            grid_column: auto_place,
+        };
+    }
+
+    /// CoreStyle::box_generation_mode: none for display: none.
+    pub fn box_generation_mode(self: &Style) -> BoxGenerationMode {
+        if self.display == Display.None {
+            return BoxGenerationMode.None;
+        }
+        return BoxGenerationMode.Normal;
+    }
+
+    /// CoreStyle::is_block: display: block (not flow-root).
+    pub fn is_block(self: &Style) -> bool {
+        return self.display == Display.Block;
+    }
+
+    /// CoreStyle::is_compressible_replaced.
+    pub fn is_compressible_replaced(self: &Style) -> bool {
+        return self.item_is_replaced or self.item_is_compressible_replaced;
+    }
+
+    /// CoreStyle::is_replaced.
+    pub fn is_replaced(self: &Style) -> bool {
+        return self.item_is_replaced;
+    }
+
+    /// OofItemStyle::is_table and BlockItemStyle::is_table.
+    pub fn is_table(self: &Style) -> bool {
+        return self.item_is_table;
+    }
+
+    /// CoreStyle::is_containing_block: a positioned box claims absolute
+    /// boxes, none claims fixed ones.
+    pub fn is_containing_block(self: &Style) -> ContainingBlockClaims {
+        return ContainingBlockClaims { absolute: self.position.is_positioned(), fixed: false };
+    }
+
+    /// GridContainerStyle::grid_template_tracks: the columns for the
+    /// horizontal axis, the rows for the vertical.
+    pub fn grid_template_tracks(self: &Style, axis: geo.AbsoluteAxis) -> []sgrid.GridTemplateComponent {
+        match axis {
+            .Horizontal => { return self.grid_template_columns.items(); }
+            .Vertical => { return self.grid_template_rows.items(); }
+        }
+    }
+
+    /// grid-auto-columns for the horizontal axis, grid-auto-rows for the
+    /// vertical.
+    pub fn grid_auto_tracks(self: &Style, axis: geo.AbsoluteAxis) -> []sgrid.TrackSizingFunction {
+        match axis {
+            .Horizontal => { return self.grid_auto_columns.items(); }
+            .Vertical => { return self.grid_auto_rows.items(); }
+        }
+    }
+
+    /// The line names of grid-template-columns (horizontal) or -rows.
+    pub fn grid_template_line_names(self: &Style, axis: geo.AbsoluteAxis) -> []alloc.List(alloc.Symbol) {
+        match axis {
+            .Horizontal => { return self.grid_template_column_names.items(); }
+            .Vertical => { return self.grid_template_row_names.items(); }
+        }
+    }
+
+    /// GridContainerStyle::grid_align_content: justify-content in the
+    /// inline axis, align-content in the block axis; normal is stretch.
+    pub fn grid_align_content(self: &Style, axis: geo.AbstractAxis) -> AlignContent {
+        var alignment = self.align_content;
+        if axis == geo.AbstractAxis.Inline {
+            alignment = self.justify_content;
+        }
+        if alignment.keyword == AlignContentKeyword.Normal {
+            return AlignContent.stretch();
+        }
+        return alignment;
+    }
+
+    /// GridItemStyle::grid_placement: grid-column for the horizontal axis,
+    /// grid-row for the vertical.
+    pub fn grid_placement(self: &Style, axis: geo.AbsoluteAxis) -> geo.Line(sgrid.GridPlacement) {
+        match axis {
+            .Horizontal => { return self.grid_column; }
+            .Vertical => { return self.grid_row; }
+        }
+    }
+
+    /// GridContainerStyle::grid_template_area_row_count: 0 without areas.
+    pub fn grid_template_area_row_count(self: &Style) -> u16 {
+        match &self.grid_template_areas {
+            some(t) => { return t.row_count; }
+            none => { return 0; }
+        }
+    }
+
+    /// GridContainerStyle::grid_template_area_column_count.
+    pub fn grid_template_area_column_count(self: &Style) -> u16 {
+        match &self.grid_template_areas {
+            some(t) => { return t.column_count; }
+            none => { return 0; }
+        }
+    }
+}

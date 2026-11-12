@@ -582,6 +582,12 @@ S38 yopildi: Nimadir world'idagi Arche ilovalari (`arche-app`, `arche-bindings`)
 
 **Qabul:** WASM spec testsuite'i ARM64 JIT bilan o'tadi; QEMU aarch64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi.
 
+Qilingani (sprint davom etmoqda):
+- JIT ikki qismga bo'lindi. `lib/wasm/jit.arche`da hamma protsessorga umumiy qism qoldi: kontekst, exit'lar, `Asm`, `length`. Mashina kodi `wasm.jit_arch` modulida. Uning faylini compiler target'ga qarab tanlaydi, `std.linux`nikidek (`compiler/program.arche`, `jit_arch_file`): x86-64 uchun `jit_arch.arche`, ARM64 uchun `jit_arch-aarch64.arche`. x86-64'ning kodi o'zgarmadi: spec testsuite'ining 3439 modulida JIT avvalgi baytlarni yozadi. Region'ga kirish (`jit.enter`) va yozilgan kodni protsessorga ko'rsatish (`jit.sync`) ham shu modulga o'tdi. x86-64'da bular `call` va hech narsa. ARM64'da `blr`, keyin `dc cvau`, `ic ivau`, `dsb ish` va `isb`; cache qatorining o'lchami `CTR_EL0`dan olinadi.
+- ARM64 JIT x86-64'niki compile qiladigan instruksiyalarning hammasini o'sha yo'l bilan compile qiladi. Chaqiruv AAPCS64 bo'yicha. Frame, memory, uning o'lchami va kontekst x19–x22'da turadi: bu registrlarni AAPCS64 chaqiruvlar orasida saqlaydi. Stack 16 baytga tekis qoladi. Instruksiyaga sig'magan immediate movz/movk bilan yuklanadi, sig'magan offset esa x17 orqali qo'shiladi. pc'larga sakrash `b` bilan (±128 MiB). Float'lar odatdagi FPCR bilan hisoblanadi, shuning uchun NaN'lar WASM'ning canonical va arithmetic qoidalariga mos chiqadi.
+- Spec testsuite'i (27416 tekshiruv) aarch64'da QEMU'ning user mode'ida interpreter'da ham, JIT bilan ham o'tadi, debug va release build'da. Mashina kodi x86-64'dagi kabi 368884 marta ishlaydi va interpreter'ga o'sha 135562 instruksiyani beradi. `spec.sh` endi JIT haqiqatan ishlaganini ham tekshiradi. CI'ning `cross` job'iga (aarch64) shu qadam qo'shildi.
+- Ochiq: `wasm/main.arche` kod region'ini x86-64'ning `mmap` raqami (9) bilan so'raydi. aarch64'da bu boshqa syscall, shuning uchun region berilmaydi va `--jit` indamay interpreter'da ishlaydi. Tuzatish: `linux.MMAP`. Testlar shu tuzatish bilan o'tkazildi; usiz CI'dagi yangi qadam o'tmaydi.
+
 ### S40. CSS va layout, Nimadir'nikidek
 
 Nimadir ilovasi sahifasining ko'rinishi CSS va layout'dan chiqadi. Hozir telefon uni o'zining soddalashtirilgan layout'i bilan chizadi (arche-os `phone/page.arche`), headless `arche-wasm` esa umuman joylashtirmaydi. Bu sprint ikkalasiga bitta dvigatel beradi, natijasi Nimadir'nikidek: ilova telefonda ham, Nimadir'da ham bir xil ko'rinadi, `dom.bounds` ham bir xil javob beradi (S38'dan).
@@ -600,6 +606,9 @@ Qilingani (sprint davom etmoqda):
   - `select.arche`: selektor moslagich (atribut, `:nth-child` va boshqalar, `:not`, kombinatorlar) kichik `select.Doc` interfeysi ustida; `query-all` endi shu bilan ishlaydi.
   - `style.arche`: UA sheet (yorug' va qorong'i), kaskad, `var()` cheklovlari bilan, meros, hisoblangan `Style` (Nimadir'ning hamma maydoni) va `--styles` matni.
 - `arche-wasm nimadir`ga `--styles`, `--dark` va `--viewport WxH` qo'shildi. Sheet ogohlantirishlari Nimadir'dagidek `css: skipped …` bo'lib log'ga tushadi.
+- `lib/layout/` taffy 0.15'ning yadrosi: geometriya, hamma uslub turlari (grid treklari, `repeat`, joylashuv bilan), `LayoutInput`/`LayoutOutput`, kesh, `compute_root_layout`, `compute_cached_layout`, `compute_hidden_layout`, leaf layout, yaxlitlash va umumiy yordamchilar. Taffy'ning tree trait'lari bitta `dyn` interfeysga aylandi: `layout.tree.LayoutTree`. `calc()` Nimadir'nikidek uzunlik ichida turadi va `px + asos * foiz / 100` bilan hisoblanadi.
+  - `conformance/tests/layout`: yettita test. Kutilgan natijalarning ko'pi haqiqiy taffy crate'idan olingan, bir xil holatlarni o'tkazadigan Rust dasturi orqali; natijalar bitma-bit bir xil.
+  - `layout` va `audio` compiler'da kutubxona ildizlari bo'ldi (`spec/arche.md` §1.1).
 - `wasm/tests/nimadir`ga 26 holat qo'shildi: `run-tests.sh`ning "CSS (ADR-4)" bo'limidan 13 tasi (probe, todo) va yana 13 tasi (shorthand'lar, flex va grid xossalari, global kalit so'zlar, `var()`, ichma-ich `@media`, holatlar). Hammasi Nimadir'ning shell'i bilan bir xil chiqadi, interpreter'da ham, JIT'da ham. Holat argumentlari endi shell qo'shtirnoqlari bilan o'qiladi.
 
 ## 11. Editor va macOS

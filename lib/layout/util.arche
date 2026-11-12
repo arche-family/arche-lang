@@ -1,0 +1,338 @@
+/// util: taffy 0.15's util/sys.rs and util/math.rs, the f32 helpers and the
+/// Option combinators every layout algorithm uses (docs/sprints.md S40).
+///
+/// The f32 functions give exactly what taffy's Rust gives, bit for bit:
+/// - f32_max and f32_min are Rust's f32::max and f32::min: a NaN operand is
+///   ignored. When the two compare equal (+0.0 and -0.0) Rust leaves the
+///   result to the compiler, and x86-64 gives `a`, unless the other operand
+///   is a constant, which then wins. So write a constant as `a`:
+///   taffy's `x.max(0.0)` is `f32_max(a: 0.0, b: x)`.
+/// - round is taffy's own rounding, (x + 0.5).floor(), not f32::round.
+/// - the maybe_* functions are taffy's MaybeMath for Option<f32> and f32.
+///   Their names say the operand types: `maybe_min(lhs: ?f32, rhs: ?f32)`,
+///   `maybe_min_f(lhs: ?f32, rhs: f32)` (rhs a plain f32), and
+///   `f32_maybe_min(lhs: f32, rhs: ?f32)` (self a plain f32).
+import core.float;
+
+/// f32::INFINITY.
+pub fn infinity() -> f32 {
+    return float.from_bits32(0x7F800000);
+}
+
+/// f32::NEG_INFINITY.
+pub fn neg_infinity() -> f32 {
+    return float.from_bits32(0xFF800000);
+}
+
+/// f32::MAX, the largest finite f32.
+pub fn f32_max_value() -> f32 {
+    return float.from_bits32(0x7F7FFFFF);
+}
+
+/// f32::EPSILON, 2^-23.
+pub fn epsilon() -> f32 {
+    return float.from_bits32(0x34000000);
+}
+
+/// f32::NAN, the quiet NaN Rust writes.
+pub fn nan() -> f32 {
+    return float.from_bits32(0x7FC00000);
+}
+
+/// Whether x is a NaN.
+pub fn is_nan(x: f32) -> bool {
+    return x != x;
+}
+
+/// Whether x is neither infinite nor a NaN (f32::is_finite).
+pub fn is_finite(x: f32) -> bool {
+    return (float.bits32(x) & 0x7F800000) != 0x7F800000;
+}
+
+/// Whether x is an infinity of either sign (f32::is_infinite).
+pub fn is_infinite(x: f32) -> bool {
+    return (float.bits32(x) & 0x7FFFFFFF) == 0x7F800000;
+}
+
+/// Whether the sign bit is set (f32::is_sign_negative), -0.0 and negative
+/// NaNs included.
+pub fn is_sign_negative(x: f32) -> bool {
+    return (float.bits32(x) & 0x80000000) != 0;
+}
+
+/// Rust's f32::max: the larger, a NaN operand ignored; equal operands give
+/// `a` (see the module's note on signed zeros and constants).
+pub fn f32_max(a: f32, b: f32) -> f32 {
+    if a != a {
+        return b;
+    }
+    if b > a {
+        return b;
+    }
+    return a;
+}
+
+/// Rust's f32::min: the smaller, a NaN operand ignored; equal operands give
+/// `a`.
+pub fn f32_min(a: f32, b: f32) -> f32 {
+    if a != a {
+        return b;
+    }
+    if b < a {
+        return b;
+    }
+    return a;
+}
+
+/// taffy's util::sys::round: (value + 0.5).floor(), so halves round up,
+/// toward +infinity, also below zero.
+pub fn round(value: f32) -> f32 {
+    return (value + 0.5).floor();
+}
+
+/// f32::floor.
+pub fn floor(value: f32) -> f32 {
+    return value.floor();
+}
+
+/// f32::ceil.
+pub fn ceil(value: f32) -> f32 {
+    return value.ceil();
+}
+
+/// f32::abs: the sign bit cleared.
+pub fn abs(value: f32) -> f32 {
+    return value.abs();
+}
+
+/// f32::trunc.
+pub fn trunc(value: f32) -> f32 {
+    return value.trunc();
+}
+
+/// Rust's f32::round: half away from zero (taffy itself uses `round`).
+pub fn round_half_away(value: f32) -> f32 {
+    let t = value.trunc();
+    // value - t is exact: it is value's fraction.
+    if (value - t).abs() >= 0.5 {
+        if value < 0.0 {
+            return t - 1.0;
+        }
+        return t + 1.0;
+    }
+    return t;
+}
+
+/// Rust's f32::total_cmp as -1, 0 or 1: IEEE 754's total order, where
+/// -NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN.
+pub fn total_cmp(a: f32, b: f32) -> i32 {
+    let l = total_key(a);
+    let r = total_key(b);
+    if l < r {
+        return -1;
+    }
+    if l > r {
+        return 1;
+    }
+    return 0;
+}
+
+/// The i32 whose order is f32's total order.
+fn total_key(x: f32) -> i32 {
+    var k = float.bits32(x) as% i32;
+    let mask = ((k >> 31) as% u32) >> 1;
+    k = k ^ (mask as% i32);
+    return k;
+}
+
+/// Option::unwrap_or for ?f32.
+pub fn unwrap_or(value: ?f32, default: f32) -> f32 {
+    match value {
+        some(v) => { return v; }
+        none => { return default; }
+    }
+}
+
+/// Option::or for ?f32: value when it is some, else alt.
+pub fn opt_or(value: ?f32, alt: ?f32) -> ?f32 {
+    match value {
+        some(v) => { return v; }
+        none => { return alt; }
+    }
+}
+
+/// Whether value is some.
+pub fn is_some(value: ?f32) -> bool {
+    match value {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
+/// Whether value is none.
+pub fn is_none(value: ?f32) -> bool {
+    match value {
+        some(_) => { return false; }
+        none => { return true; }
+    }
+}
+
+// MaybeMath<Option<f32>, Option<f32>> for Option<f32>.
+
+/// ?f32.maybe_min(?f32): none when lhs is none, lhs when rhs is.
+pub fn maybe_min(lhs: ?f32, rhs: ?f32) -> ?f32 {
+    match lhs {
+        some(l) => {
+            match rhs {
+                some(r) => { return f32_min(a: l, b: r); }
+                none => { return l; }
+            }
+        }
+        none => { return none; }
+    }
+}
+
+/// ?f32.maybe_max(?f32).
+pub fn maybe_max(lhs: ?f32, rhs: ?f32) -> ?f32 {
+    match lhs {
+        some(l) => {
+            match rhs {
+                some(r) => { return f32_max(a: l, b: r); }
+                none => { return l; }
+            }
+        }
+        none => { return none; }
+    }
+}
+
+/// ?f32.maybe_clamp(?f32, ?f32): base.min(max).max(min) with the bounds
+/// that are some.
+pub fn maybe_clamp(value: ?f32, min: ?f32, max: ?f32) -> ?f32 {
+    match value {
+        some(base) => {
+            return f32_maybe_clamp(base, min: min, max: max);
+        }
+        none => { return none; }
+    }
+}
+
+/// ?f32.maybe_add(?f32).
+pub fn maybe_add(lhs: ?f32, rhs: ?f32) -> ?f32 {
+    match lhs {
+        some(l) => {
+            match rhs {
+                some(r) => { return l + r; }
+                none => { return l; }
+            }
+        }
+        none => { return none; }
+    }
+}
+
+/// ?f32.maybe_sub(?f32).
+pub fn maybe_sub(lhs: ?f32, rhs: ?f32) -> ?f32 {
+    match lhs {
+        some(l) => {
+            match rhs {
+                some(r) => { return l - r; }
+                none => { return l; }
+            }
+        }
+        none => { return none; }
+    }
+}
+
+// MaybeMath<f32, Option<f32>> for Option<f32>.
+
+/// ?f32.maybe_min(f32): lhs.map(|v| v.min(rhs)).
+pub fn maybe_min_f(lhs: ?f32, rhs: f32) -> ?f32 {
+    match lhs {
+        some(l) => { return f32_min(a: l, b: rhs); }
+        none => { return none; }
+    }
+}
+
+/// ?f32.maybe_max(f32).
+pub fn maybe_max_f(lhs: ?f32, rhs: f32) -> ?f32 {
+    match lhs {
+        some(l) => { return f32_max(a: l, b: rhs); }
+        none => { return none; }
+    }
+}
+
+/// ?f32.maybe_clamp(f32, f32): value.min(max).max(min).
+pub fn maybe_clamp_f(value: ?f32, min: f32, max: f32) -> ?f32 {
+    match value {
+        some(v) => { return f32_max(a: f32_min(a: v, b: max), b: min); }
+        none => { return none; }
+    }
+}
+
+/// ?f32.maybe_add(f32).
+pub fn maybe_add_f(lhs: ?f32, rhs: f32) -> ?f32 {
+    match lhs {
+        some(l) => { return l + rhs; }
+        none => { return none; }
+    }
+}
+
+/// ?f32.maybe_sub(f32).
+pub fn maybe_sub_f(lhs: ?f32, rhs: f32) -> ?f32 {
+    match lhs {
+        some(l) => { return l - rhs; }
+        none => { return none; }
+    }
+}
+
+// MaybeMath<Option<f32>, f32> for f32.
+
+/// f32.maybe_min(?f32): lhs when rhs is none.
+pub fn f32_maybe_min(lhs: f32, rhs: ?f32) -> f32 {
+    match rhs {
+        some(r) => { return f32_min(a: lhs, b: r); }
+        none => { return lhs; }
+    }
+}
+
+/// f32.maybe_max(?f32).
+pub fn f32_maybe_max(lhs: f32, rhs: ?f32) -> f32 {
+    match rhs {
+        some(r) => { return f32_max(a: lhs, b: r); }
+        none => { return lhs; }
+    }
+}
+
+/// f32.maybe_clamp(?f32, ?f32): value.min(max).max(min) with the bounds
+/// that are some.
+pub fn f32_maybe_clamp(value: f32, min: ?f32, max: ?f32) -> f32 {
+    match min {
+        some(lo) => {
+            match max {
+                some(hi) => { return f32_max(a: f32_min(a: value, b: hi), b: lo); }
+                none => { return f32_max(a: value, b: lo); }
+            }
+        }
+        none => {
+            match max {
+                some(hi) => { return f32_min(a: value, b: hi); }
+                none => { return value; }
+            }
+        }
+    }
+}
+
+/// f32.maybe_add(?f32).
+pub fn f32_maybe_add(lhs: f32, rhs: ?f32) -> f32 {
+    match rhs {
+        some(r) => { return lhs + r; }
+        none => { return lhs; }
+    }
+}
+
+/// f32.maybe_sub(?f32).
+pub fn f32_maybe_sub(lhs: f32, rhs: ?f32) -> f32 {
+    match rhs {
+        some(r) => { return lhs - r; }
+        none => { return lhs; }
+    }
+}

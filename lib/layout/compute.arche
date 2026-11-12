@@ -1,0 +1,363 @@
+/// compute: taffy 0.15's compute/mod.rs: laying out the root, the cache in
+/// front of an algorithm, hidden layout and rounding.
+///
+/// The algorithms are its modules: compute.leaf, compute.block,
+/// compute.flexbox, compute.grid, compute.oof, and compute.common for what
+/// they share.
+import alloc;
+import layout.compute.oof as oof;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import layout.util;
+
+/// The root's layout and the candidates it surfaced.
+type RootLayout = struct {
+    /// The layout.
+    layout: lt.Layout,
+    /// The out-of-flow boxes no containing block below the root took.
+    candidates: lt.OofCandidates,
+}
+
+/// compute_root_layout: lays out the root against the initial containing
+/// block, the viewport `available_space` at the canvas origin, and then the
+/// out-of-flow boxes nothing below claimed. An absolute or fixed root is
+/// laid out as any out-of-flow box, when both axes are definite; a
+/// relative root is offset by its insets.
+pub fn compute_root_layout(tree: &mut dyn lt.LayoutTree, root: lt.NodeId, available_space: geo.Size(sty.AvailableSpace)) {
+    let root_style = tree.get_style(root);
+    let position = root_style.position;
+    let direction = root_style.direction;
+
+    let icb_size = available_space.into_options();
+    var oof_root_area: ?geo.Size(f32) = none;
+    if position.is_out_of_flow() {
+        match icb_size.width {
+            some(width) => {
+                match icb_size.height {
+                    some(height) => { oof_root_area = some(geo.Size(f32) { width: width, height: height }); }
+                    none => { }
+                }
+            }
+            none => { }
+        }
+    }
+
+    // When the root's layout comes from the cache its algorithm does not
+    // run, so the hoisted children it recorded before (those of the pass
+    // below included) are still there and must not be added again.
+    var root_is_cached = false;
+
+    var result = RootLayout { layout: lt.Layout.new(), candidates: lt.OofCandidates.new() };
+    match oof_root_area {
+        some(area_size) => {
+            // The root's margin box is placed at the initial containing
+            // block's origin.
+            var start: f32 = 0.0;
+            var end: f32 = 0.0;
+            var edge = lt.AxisStaticEdge.Start;
+            if direction.is_rtl() {
+                start = area_size.width;
+                end = area_size.width;
+                edge = lt.AxisStaticEdge.End;
+            }
+            let candidate = lt.OofCandidate {
+                node: root,
+                order: 0,
+                position: position,
+                static_position: geo.Point(lt.AxisStaticPosition) {
+                    x: lt.AxisStaticPosition { area: geo.Line(f32) { start: start, end: end }, align: lt.AxisStaticAlign.from_keyword(edge) },
+                    y: lt.AxisStaticPosition.from_edge(0.0, lt.AxisStaticEdge.Start),
+                },
+            };
+            // The initial containing block is not a scroll container.
+            let visible = geo.Point(sty.Overflow) { x: sty.Overflow.Visible, y: sty.Overflow.Visible };
+            let boxed = oof.layout_oof_box(tree, candidate, area_size, geo.point_zero(), direction, visible, none, fn [&mut root_is_cached, root](t: &mut dyn lt.LayoutTree, inputs: &lt.LayoutInput) {
+                match t.cache_get(root, inputs) {
+                    some(_) => { root_is_cached = true; }
+                    none => { root_is_cached = false; }
+                }
+            });
+            result = RootLayout { layout: boxed.layout, candidates: boxed.surfaced };
+        }
+        none => {
+            result = compute_in_flow_root_layout(tree, root, available_space, &mut root_is_cached);
+        }
+    }
+    let layout = result.layout;
+
+    // The last positioning pass, for the out-of-flow boxes no nearer
+    // containing block took: the initial containing block holds fixed
+    // boxes and absolute boxes without a positioned ancestor.
+    if not result.candidates.is_empty() {
+        let overflow = tree.get_style(root).overflow;
+
+        // The initial containing block is the viewport, at the canvas
+        // origin; in an indefinite axis it falls back to the root's
+        // padding box.
+        let area_inset = layout.border.add(geo.Rect(f32) { left: 0.0, right: layout.scrollbar_size.width, top: 0.0, bottom: layout.scrollbar_size.height });
+        let root_padding_box_size = layout.size.sub(geo.Size(f32) { width: area_inset.horizontal_axis_sum(), height: area_inset.vertical_axis_sum() });
+        var area_width = root_padding_box_size.width;
+        var area_x = area_inset.left;
+        match icb_size.width {
+            some(width) => {
+                area_width = util.f32_max(a: 0.0, b: width - layout.scrollbar_size.width);
+                area_x = -layout.location.x;
+            }
+            none => { }
+        }
+        var area_height = root_padding_box_size.height;
+        var area_y = area_inset.top;
+        match icb_size.height {
+            some(height) => {
+                area_height = util.f32_max(a: 0.0, b: height - layout.scrollbar_size.height);
+                area_y = -layout.location.y;
+            }
+            none => { }
+        }
+        let area_size = geo.Size(f32) { width: area_width, height: area_height };
+        let area_offset = geo.Point(f32) { x: area_x, y: area_y };
+
+        var hoisted = alloc.List(lt.NodeId).init(tree.allocator());
+        var unclaimed = lt.OofCandidates.new();
+        // The root is the initial containing block and claims all the rest.
+        _ = oof.perform_oof_layout(tree, root, &result.candidates, area_size, area_offset, direction, sty.ContainingBlockClaims.all(), overflow, &mut hoisted, &mut unclaimed);
+        if not root_is_cached {
+            tree.add_hoisted_children(root, hoisted.items());
+        }
+    }
+}
+
+/// Lays out an in-flow (or relative) root against the available space,
+/// stores its layout, and gives it with the candidates its subtree
+/// surfaced (compute_in_flow_root_layout).
+fn compute_in_flow_root_layout(tree: &mut dyn lt.LayoutTree, root: lt.NodeId, available_space: geo.Size(sty.AvailableSpace), root_is_cached: &mut bool) -> RootLayout {
+    var known_dimensions = geo.size_none();
+
+    // The space given to the root leaves out its margins.
+    let margin_style = tree.get_style(root).margin;
+    let first_margin = margin_style.resolve_or_zero(available_space.width.into_option());
+    let root_available_space = available_space.maybe_sub_f(first_margin.sum_axes()).maybe_max_f(geo.size_zero());
+
+    let parent_size = available_space.into_options();
+    let block_style = tree.get_style(root);
+    if block_style.is_block() {
+        let aspect_ratio = block_style.aspect_ratio;
+        let padding = block_style.padding.resolve_or_zero(parent_size.width);
+        let border = block_style.border.resolve_or_zero(parent_size.width);
+        let padding_border_size = padding.add(border).sum_axes();
+        var box_sizing_adjustment = geo.size_zero();
+        if block_style.box_sizing == sty.BoxSizing.ContentBox {
+            box_sizing_adjustment = padding_border_size;
+        }
+
+        let min_size = block_style.min_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+        let max_size = block_style.max_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+        let clamped_style_size = block_style.size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment).maybe_clamp(min: min_size, max: max_size);
+
+        // A min at least as large as the max decides the size.
+        let min_max_definite_size = geo.Size(?f32) {
+            width: min_if_at_most_max(min: min_size.width, max: max_size.width),
+            height: min_if_at_most_max(min: min_size.height, max: max_size.height),
+        };
+
+        // A block stretches to fill definite available space.
+        let available_space_based_size = geo.Size(?f32) { width: root_available_space.width.into_option(), height: none };
+
+        known_dimensions = known_dimensions.fallback(min_max_definite_size).fallback(clamped_style_size).fallback(available_space_based_size).maybe_max_f(padding_border_size);
+    }
+
+    let inputs = lt.LayoutInput {
+        run_mode: lt.RunMode.PerformLayout,
+        sizing_mode: lt.SizingMode.InherentSize,
+        axis: lt.RequestedAxis.Both,
+        known_dimensions: known_dimensions,
+        known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+        parent_size: available_space.into_options(),
+        available_space: root_available_space,
+        vertical_margins_are_collapsible: geo.line_false(),
+    };
+    match tree.cache_get(root, &inputs) {
+        some(_) => { root_is_cached.* = true; }
+        none => { root_is_cached.* = false; }
+    }
+
+    let output = tree.compute_child_layout(root, inputs);
+    let style = tree.get_style(root);
+    let padding = style.padding.resolve_or_zero(available_space.width.into_option());
+    let border = style.border.resolve_or_zero(available_space.width.into_option());
+    let margin = style.margin.resolve_or_zero(available_space.width.into_option());
+    var scrollbar_size = geo.size_zero();
+    if style.overflow.y == sty.Overflow.Scroll {
+        scrollbar_size.width = style.scrollbar_width;
+    }
+    if style.overflow.x == sty.Overflow.Scroll {
+        scrollbar_size.height = style.scrollbar_width;
+    }
+    let is_rtl = style.direction.is_rtl();
+
+    // The root's margin box sits at the initial containing block's origin.
+    var location = geo.Point(f32) { x: margin.left, y: margin.top };
+    if is_rtl {
+        match available_space.width.into_option() {
+            some(available_width) => { location.x = available_width - output.size.width - margin.right; }
+            none => { }
+        }
+    }
+
+    // A relative root is offset by its insets, resolved against the
+    // initial containing block.
+    if style.position == sty.Position.Relative {
+        let icb_size = available_space.into_options();
+        let inset = style.inset;
+        let left = inset.left.maybe_resolve(icb_size.width);
+        let right = inset.right.maybe_resolve(icb_size.width);
+        let top = inset.top.maybe_resolve(icb_size.height);
+        let bottom = inset.bottom.maybe_resolve(icb_size.height);
+        if is_rtl {
+            location.x = location.x + util.unwrap_or(util.opt_or(value: negated(right), alt: left), 0.0);
+        } else {
+            location.x = location.x + util.unwrap_or(util.opt_or(value: left, alt: negated(right)), 0.0);
+        }
+        location.y = location.y + util.unwrap_or(util.opt_or(value: top, alt: negated(bottom)), 0.0);
+    }
+
+    let layout = lt.Layout {
+        order: 0,
+        location: location,
+        size: output.size,
+        scrollable_overflow_rect: output.scrollable_overflow_rect,
+        scrollbar_size: scrollbar_size,
+        border: border,
+        padding: padding,
+        margin: margin,
+    };
+    tree.set_unrounded_layout(root, &layout);
+
+    return RootLayout { layout: layout, candidates: output.oof_candidates };
+}
+
+/// min when both are some and max <= min, else none.
+fn min_if_at_most_max(min: ?f32, max: ?f32) -> ?f32 {
+    match min {
+        some(lo) => {
+            match max {
+                some(hi) => {
+                    if hi <= lo {
+                        return lo;
+                    }
+                }
+                none => { }
+            }
+        }
+        none => { }
+    }
+    return none;
+}
+
+/// value.map(|v| -v).
+fn negated(value: ?f32) -> ?f32 {
+    match value {
+        some(v) => { return -v; }
+        none => { return none; }
+    }
+}
+
+/// compute_cached_layout: the node's cached result for these inputs if
+/// there is one; else compute_uncached's, which is then cached. T is the
+/// embedder's tree, so the closure sees it whole; call it from the
+/// embedder's compute_child_layout as
+/// `compute.compute_cached_layout(MyTree, self, node, inputs, fn [](t: &mut MyTree, n: lt.NodeId, i: lt.LayoutInput) -> lt.LayoutOutput { ... })`.
+pub fn compute_cached_layout(comptime T: type, tree: &mut T, node: lt.NodeId, inputs: lt.LayoutInput, compute_uncached: &dyn fn(&mut T, lt.NodeId, lt.LayoutInput) -> lt.LayoutOutput) -> lt.LayoutOutput where T: lt.LayoutTree {
+    // First the cache.
+    match tree.cache_get(node, &inputs) {
+        some(cached) => { return cached; }
+        none => { }
+    }
+    let computed = compute_uncached(tree, node, inputs);
+    tree.cache_store(node, &inputs, computed.clone());
+    return computed;
+}
+
+/// round_layout: rounds every layout below node_id to whole pixels. Edges
+/// are rounded at their cumulative position on the page and sizes taken as
+/// differences of rounded edges, so that rounding opens no gaps; each node
+/// reads its unrounded layout and writes its final one. Out-of-flow boxes
+/// are visited from their containing block, whose box their location is
+/// from.
+pub fn round_layout(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId) {
+    round_layout_inner(tree, node_id, cumulative_x: 0.0, cumulative_y: 0.0);
+}
+
+/// Rounds node_id's layout, its parent's box at cumulative_x and
+/// cumulative_y unrounded, then its descendants.
+fn round_layout_inner(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, cumulative_x: f32, cumulative_y: f32) {
+    let unrounded_layout = tree.get_unrounded_layout(node_id);
+    var layout = unrounded_layout;
+
+    let parent_x = cumulative_x;
+    let parent_y = cumulative_y;
+    let x = cumulative_x + unrounded_layout.location.x;
+    let y = cumulative_y + unrounded_layout.location.y;
+
+    layout.location.x = util.round(x) - util.round(parent_x);
+    layout.location.y = util.round(y) - util.round(parent_y);
+    layout.size.width = util.round(x + unrounded_layout.size.width) - util.round(x);
+    layout.size.height = util.round(y + unrounded_layout.size.height) - util.round(y);
+    layout.scrollbar_size.width = util.round(unrounded_layout.scrollbar_size.width);
+    layout.scrollbar_size.height = util.round(unrounded_layout.scrollbar_size.height);
+    layout.border.left = util.round(x + unrounded_layout.border.left) - util.round(x);
+    layout.border.right = util.round(x + unrounded_layout.size.width) - util.round(x + unrounded_layout.size.width - unrounded_layout.border.right);
+    layout.border.top = util.round(y + unrounded_layout.border.top) - util.round(y);
+    layout.border.bottom = util.round(y + unrounded_layout.size.height) - util.round(y + unrounded_layout.size.height - unrounded_layout.border.bottom);
+    layout.padding.left = util.round(x + unrounded_layout.padding.left) - util.round(x);
+    layout.padding.right = util.round(x + unrounded_layout.size.width) - util.round(x + unrounded_layout.size.width - unrounded_layout.padding.right);
+    layout.padding.top = util.round(y + unrounded_layout.padding.top) - util.round(y);
+    layout.padding.bottom = util.round(y + unrounded_layout.size.height) - util.round(y + unrounded_layout.size.height - unrounded_layout.padding.bottom);
+
+    // round_scrollable_overflow_rect
+    let unrounded_rect = unrounded_layout.scrollable_overflow_rect;
+    layout.scrollable_overflow_rect.left = util.round(x + unrounded_rect.left) - util.round(x);
+    layout.scrollable_overflow_rect.right = util.round(x + unrounded_rect.right) - util.round(x);
+    layout.scrollable_overflow_rect.top = util.round(y + unrounded_rect.top) - util.round(y);
+    layout.scrollable_overflow_rect.bottom = util.round(y + unrounded_rect.bottom) - util.round(y);
+
+    tree.set_final_layout(node_id, &layout);
+
+    // In-flow children; out-of-flow ones come from their containing
+    // block's hoisted list below, so each node is visited once and from
+    // the box its location is relative to.
+    let child_count = tree.child_count(node_id);
+    var index: usize = 0;
+    while index < child_count : (index += 1) {
+        let child = tree.get_child_id(node_id, index);
+        if not tree.is_out_of_flow(child) {
+            round_layout_inner(tree, child, cumulative_x: x, cumulative_y: y);
+        }
+    }
+
+    let hoisted_count = tree.hoisted_child_count(node_id);
+    var h: usize = 0;
+    while h < hoisted_count : (h += 1) {
+        let child = tree.get_hoisted_child_id(node_id, h);
+        round_layout_inner(tree, child, cumulative_x: x, cumulative_y: y);
+    }
+}
+
+/// compute_hidden_layout: a hidden node (display: none) and all its
+/// descendants get a zero layout at the origin, and their caches are
+/// cleared.
+pub fn compute_hidden_layout(tree: &mut dyn lt.LayoutTree, node: lt.NodeId) -> lt.LayoutOutput {
+    tree.cache_clear(node);
+    let zero = lt.Layout.with_order(0);
+    tree.set_unrounded_layout(node, &zero);
+
+    let count = tree.child_count(node);
+    var index: usize = 0;
+    while index < count : (index += 1) {
+        let child_id = tree.get_child_id(node, index);
+        _ = tree.compute_child_layout(child_id, lt.LayoutInput.hidden());
+    }
+
+    return lt.LayoutOutput.hidden();
+}

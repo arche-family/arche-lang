@@ -1,0 +1,135 @@
+// test: run
+// spec: layout
+// stage0: skip
+// stdout: L1 50.0 30.0 | 0.0 50.0 0.0 30.0 | false
+// stdout: L2 100.0 40.0 | 0.0 91.0 0.0 45.0 | false
+// stdout: L3 114.0 54.0 | 0.0 105.0 0.0 35.0 | false
+// stdout: L4 200.0 50.0 | 0.0 300.0 0.0 30.0 | false
+// stdout: L5 150.0 60.0 | 0.0 150.0 0.0 60.0 | false
+// stdout: L6 120.0 60.0 | 0.0 0.0 0.0 0.0 | false
+// stdout: L7 160.0 10.0 | 0.0 10.0 0.0 10.0 | false
+// stdout: L8 90.0 80.0 | 0.0 0.0 0.0 0.0 | false
+// stdout: L9 0.0 0.0 | 0.0 0.0 0.0 0.0 | true
+// stdout: L10 68.0 38.0 | 0.0 58.0 0.0 28.0 | false
+// stdout: L11 30.0 10.0 | 0.0 27.0 0.0 10.0 | false
+// stdout: L12 20.0 10.0 | 0.0 20.0 0.0 10.0 | false
+// stdout: L13 15.0 120.0 | 0.0 15.0 0.0 120.0 | false
+// stdout: L14 10.3 40.8 | 0.0 9.15 0.0 39.65 | false
+// stdout: L15 33.3 27.3741 | 0.0 0.0 0.0 0.0 | false
+// stdout: L16 80.0 5.0 | 0.0 60.0 0.0 5.0 | false
+// stdout: L17 11.0 11.0 | 0.0 0.0 0.0 0.0 | false
+// stdout: L18 40.0 42.0 | 0.0 37.0 0.0 39.0 | false
+// Leaf layout, taffy's compute_leaf_layout, with sizes, min and max,
+// padding, border, box-sizing, aspect ratio, percentages and calc(),
+// scrollbars, rtl overflow and the early return of a size-only run. The
+// expected lines are taffy 0.15's own, from the same cases in Rust.
+import std;
+import alloc;
+import layout.compute.leaf as leaf;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import _show;
+import _tree;
+
+/// Lays out one leaf with compute_leaf_layout and writes its output.
+fn run(out: &mut std.Output, name: str, style: &sty.Style, content: _tree.Content, inputs: lt.LayoutInput) {
+    let o = leaf.compute_leaf_layout(inputs, style, fn [content](k: geo.Size(?f32), avail: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+        return _tree.measure(content, k, avail);
+    });
+    _show.leaf_line(out, name, &o);
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let pl = lt.RunMode.PerformLayout;
+    let cs = lt.RunMode.ComputeSize;
+    let inh = lt.SizingMode.InherentSize;
+    let parent = _show.some_size(width: 800.0, height: 600.0);
+    let screen = _show.def(width: 800.0, height: 600.0);
+    let all = _show.input(pl, inh, known: geo.size_none(), parent: parent, screen);
+
+    let s1 = sty.Style.default(a);
+    run(&mut sys.stdout, "L1", &s1, _tree.Content.Fixed { width: 50.0, height: 30.0 }, all);
+
+    var s2 = sty.Style.default(a);
+    s2.size = sty.size_from_lengths(width: 100.0, height: 40.0);
+    s2.padding = _show.rect_lp(5.0);
+    s2.border = _show.rect_lp(2.0);
+    run(&mut sys.stdout, "L2", &s2, _tree.Content.Text { width: 300.0, line: 10.0 }, all);
+    s2.box_sizing = sty.BoxSizing.ContentBox;
+    run(&mut sys.stdout, "L3", &s2, _tree.Content.Text { width: 300.0, line: 10.0 }, all);
+
+    var s4 = sty.Style.default(a);
+    s4.max_size.width = sty.LengthPercentageAuto.length(200.0);
+    s4.min_size.height = sty.LengthPercentageAuto.length(50.0);
+    run(&mut sys.stdout, "L4", &s4, _tree.Content.Fixed { width: 300.0, height: 30.0 }, all);
+
+    var s5 = sty.Style.default(a);
+    s5.size.width = sty.Dimension.percent(0.5);
+    let half_parent = geo.Size(?f32) { width: some(300.0), height: none };
+    let half_space = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(300.0), height: sty.AvailableSpace.MaxContent };
+    run(&mut sys.stdout, "L5", &s5, _tree.Content.Text { width: 400.0, line: 20.0 }, _show.input(pl, inh, known: geo.size_none(), parent: half_parent, half_space));
+
+    var s6 = sty.Style.default(a);
+    s6.aspect_ratio = some(2.0);
+    s6.size.width = sty.Dimension.length(120.0);
+    run(&mut sys.stdout, "L6", &s6, _tree.Content.Empty, all);
+
+    var s7 = sty.Style.default(a);
+    s7.size.width = sty.Dimension.calc(sty.Calc { px: 10.0, percent: 50.0 });
+    run(&mut sys.stdout, "L7", &s7, _tree.Content.Fixed { width: 10.0, height: 10.0 }, _show.input(pl, inh, known: geo.size_none(), parent: _show.some_size(width: 300.0, height: 300.0), _show.def(width: 300.0, height: 300.0)));
+
+    var s8 = sty.Style.default(a);
+    s8.min_size.width = sty.LengthPercentageAuto.length(90.0);
+    run(&mut sys.stdout, "L8", &s8, _tree.Content.Fixed { width: 1.0, height: 1.0 }, _show.input(cs, inh, known: _show.some_size(width: 70.0, height: 80.0), parent: parent, screen));
+
+    var s9 = sty.Style.default(a);
+    s9.display = sty.Display.Block;
+    run(&mut sys.stdout, "L9", &s9, _tree.Content.Empty, all);
+
+    var s10 = sty.Style.default(a);
+    s10.overflow = geo.Point(sty.Overflow) { x: sty.Overflow.Scroll, y: sty.Overflow.Scroll };
+    s10.scrollbar_width = 10.0;
+    s10.padding = _show.rect_lp(4.0);
+    run(&mut sys.stdout, "L10", &s10, _tree.Content.Fixed { width: 50.0, height: 20.0 }, all);
+
+    var s11 = sty.Style.default(a);
+    s11.direction = sty.Direction.Rtl;
+    s11.padding.left = sty.LengthPercentage.length(3.0);
+    s11.padding.right = sty.LengthPercentage.length(7.0);
+    run(&mut sys.stdout, "L11", &s11, _tree.Content.Fixed { width: 20.0, height: 10.0 }, all);
+
+    var s12 = sty.Style.default(a);
+    s12.size = sty.size_from_lengths(width: 100.0, height: 100.0);
+    run(&mut sys.stdout, "L12", &s12, _tree.Content.Fixed { width: 20.0, height: 10.0 }, _show.input(pl, lt.SizingMode.ContentSize, known: geo.size_none(), parent: parent, screen));
+
+    let s13 = sty.Style.default(a);
+    let min_space = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.MinContent, height: sty.AvailableSpace.MaxContent };
+    run(&mut sys.stdout, "L13", &s13, _tree.Content.Text { width: 120.0, line: 15.0 }, _show.input(pl, inh, known: geo.size_none(), parent: parent, min_space));
+
+    var s14 = sty.Style.default(a);
+    s14.size.width = sty.Dimension.length(10.3);
+    s14.padding = _show.rect_lp(1.15);
+    run(&mut sys.stdout, "L14", &s14, _tree.Content.Text { width: 33.3, line: 7.7 }, all);
+
+    var s15 = sty.Style.default(a);
+    s15.size = geo.Size(sty.Dimension) { width: sty.Dimension.percent(0.333), height: sty.Dimension.calc(sty.Calc { px: 1.5, percent: 33.3 }) };
+    run(&mut sys.stdout, "L15", &s15, _tree.Content.Empty, _show.input(pl, inh, known: geo.size_none(), parent: _show.some_size(width: 100.0, height: 77.7), _show.def(width: 100.0, height: 77.7)));
+
+    var s16 = sty.Style.default(a);
+    s16.min_size.width = sty.LengthPercentageAuto.length(80.0);
+    s16.max_size.width = sty.LengthPercentageAuto.length(50.0);
+    run(&mut sys.stdout, "L16", &s16, _tree.Content.Fixed { width: 60.0, height: 5.0 }, all);
+
+    var s17 = sty.Style.default(a);
+    let tenth = sty.LengthPercentage.percent(0.1);
+    s17.border = geo.Rect(sty.LengthPercentage) { left: tenth, right: tenth, top: tenth, bottom: tenth };
+    run(&mut sys.stdout, "L17", &s17, _tree.Content.Empty, _show.input(pl, inh, known: geo.size_none(), parent: _show.some_size(width: 55.0, height: 10.0), _show.def(width: 55.0, height: 10.0)));
+
+    var s18 = sty.Style.default(a);
+    s18.size.width = sty.Dimension.length(40.0);
+    s18.padding = _show.rect_lp(3.0);
+    let wide = geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(500.0), height: sty.AvailableSpace.MaxContent };
+    run(&mut sys.stdout, "L18", &s18, _tree.Content.Text { width: 100.0, line: 12.0 }, _show.input(cs, inh, known: geo.size_none(), parent: parent, wide));
+}

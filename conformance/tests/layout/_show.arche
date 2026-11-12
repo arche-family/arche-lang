@@ -1,0 +1,105 @@
+// Helpers of the layout tests: inputs, and layouts written as the taffy
+// oracle (/tmp/layout-port/oracle) writes them, so the expected lines are
+// taffy's own.
+import std;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+
+/// A LayoutInput for both axes, its known dimensions definite and no
+/// collapsible margins.
+pub fn input(run_mode: lt.RunMode, sizing_mode: lt.SizingMode, known: geo.Size(?f32), parent: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> lt.LayoutInput {
+    return lt.LayoutInput {
+        run_mode: run_mode,
+        sizing_mode: sizing_mode,
+        axis: lt.RequestedAxis.Both,
+        known_dimensions: known,
+        known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+        parent_size: parent,
+        available_space: available,
+        vertical_margins_are_collapsible: geo.line_false(),
+    };
+}
+
+/// Definite available space.
+pub fn def(width: f32, height: f32) -> geo.Size(sty.AvailableSpace) {
+    return geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(width), height: sty.AvailableSpace.definite(height) };
+}
+
+/// Some width and height.
+pub fn some_size(width: f32, height: f32) -> geo.Size(?f32) {
+    return geo.Size(?f32) { width: some(width), height: some(height) };
+}
+
+/// The same length on every side, for padding and border.
+pub fn rect_lp(v: f32) -> geo.Rect(sty.LengthPercentage) {
+    let x = sty.LengthPercentage.length(v);
+    return geo.Rect(sty.LengthPercentage) { left: x, right: x, top: x, bottom: x };
+}
+
+/// The same length on every side, for margins and insets.
+pub fn rect_lpa(v: f32) -> geo.Rect(sty.LengthPercentageAuto) {
+    let x = sty.LengthPercentageAuto.length(v);
+    return geo.Rect(sty.LengthPercentageAuto) { left: x, right: x, top: x, bottom: x };
+}
+
+/// " " and an f32.
+fn num(out: &mut std.Output, x: f32) {
+    out.write(" ");
+    out.write_f32(x);
+}
+
+/// A leaf's output: size | scrollable overflow | collapse through.
+pub fn leaf_line(out: &mut std.Output, name: str, o: &lt.LayoutOutput) {
+    out.write(name);
+    num(out, o.size.width);
+    num(out, o.size.height);
+    out.write(" |");
+    num(out, o.scrollable_overflow_rect.left);
+    num(out, o.scrollable_overflow_rect.right);
+    num(out, o.scrollable_overflow_rect.top);
+    num(out, o.scrollable_overflow_rect.bottom);
+    out.write(" | ");
+    if o.margins_can_collapse_through {
+        out.write("true\n");
+    } else {
+        out.write("false\n");
+    }
+}
+
+/// A layout, every field.
+pub fn layout_line(out: &mut std.Output, name: str, l: lt.Layout) {
+    out.write(name);
+    out.write(" at");
+    num(out, l.location.x);
+    num(out, l.location.y);
+    out.write(" size");
+    num(out, l.size.width);
+    num(out, l.size.height);
+    out.write(" | pad");
+    num(out, l.padding.left);
+    num(out, l.padding.right);
+    num(out, l.padding.top);
+    num(out, l.padding.bottom);
+    out.write(" | border");
+    num(out, l.border.left);
+    num(out, l.border.right);
+    num(out, l.border.top);
+    num(out, l.border.bottom);
+    out.write(" | margin");
+    num(out, l.margin.left);
+    num(out, l.margin.right);
+    num(out, l.margin.top);
+    num(out, l.margin.bottom);
+    out.write(" | over");
+    num(out, l.scrollable_overflow_rect.left);
+    num(out, l.scrollable_overflow_rect.right);
+    num(out, l.scrollable_overflow_rect.top);
+    num(out, l.scrollable_overflow_rect.bottom);
+    out.write(" | sb");
+    num(out, l.scrollbar_size.width);
+    num(out, l.scrollbar_size.height);
+    out.write(" | order ");
+    out.write_u64(l.order as u64);
+    out.write("\n");
+}

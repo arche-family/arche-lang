@@ -1,0 +1,92 @@
+/// compute.common.alignment: taffy 0.15's compute/common/alignment.rs, the
+/// CSS alignment shared by flexbox, grid and block layout.
+import layout.style as sty;
+import layout.util;
+
+/// resolve_self_alignment_safety: a `safe` alignment of an overflowing
+/// subject falls back to start; otherwise the keyword without its safety.
+pub fn resolve_self_alignment_safety(alignment: sty.AlignItems, overflows: bool) -> sty.AlignItemsKeyword {
+    if alignment.safety == sty.AlignmentSafety.Safe and overflows {
+        return sty.AlignItemsKeyword.Start;
+    }
+    return alignment.keyword;
+}
+
+/// apply_alignment_fallback: the keyword the alignment math uses, after the
+/// fallbacks of css-align-3 and csswg-drafts#10154. normal must already be
+/// resolved (it is treated as stretch).
+pub fn apply_alignment_fallback(free_space: f32, num_items: usize, alignment_mode: sty.AlignContent) -> sty.AlignContentKeyword {
+    var keyword = alignment_mode.keyword;
+    if keyword == sty.AlignContentKeyword.Normal {
+        keyword = sty.AlignContentKeyword.Stretch;
+    }
+    var is_safe = alignment_mode.safety == sty.AlignmentSafety.Safe;
+
+    // 1. With a single item, or items that overflow, the distributed
+    //    keywords fall back to a position, and gain `safe`.
+    if num_items <= 1 or free_space <= 0.0 {
+        if keyword == sty.AlignContentKeyword.Stretch or keyword == sty.AlignContentKeyword.SpaceBetween {
+            keyword = sty.AlignContentKeyword.FlexStart;
+            is_safe = true;
+        } else if keyword == sty.AlignContentKeyword.SpaceAround or keyword == sty.AlignContentKeyword.SpaceEvenly {
+            keyword = sty.AlignContentKeyword.Center;
+            is_safe = true;
+        }
+    }
+
+    // 2. A safe alignment falls back to start when the subject overflows.
+    if free_space <= 0.0 and is_safe {
+        keyword = sty.AlignContentKeyword.Start;
+    }
+
+    return keyword;
+}
+
+/// compute_alignment_offset: the offset of an item (the first, or one after
+/// another) for align-content and justify-content, in flexbox and grid
+/// (grid passes a gap of zero).
+pub fn compute_alignment_offset(free_space: f32, num_items: usize, gap: f32, alignment_mode: sty.AlignContentKeyword, layout_is_flex_reversed: bool, is_first: bool) -> f32 {
+    if is_first {
+        match alignment_mode {
+            .Start => { return 0.0; }
+            .FlexStart => {
+                if layout_is_flex_reversed {
+                    return free_space;
+                }
+                return 0.0;
+            }
+            .End => { return free_space; }
+            .FlexEnd => {
+                if layout_is_flex_reversed {
+                    return 0.0;
+                }
+                return free_space;
+            }
+            .Center => { return free_space / 2.0; }
+            .Normal => { return 0.0; }
+            .Stretch => { return 0.0; }
+            .SpaceBetween => { return 0.0; }
+            .SpaceAround => {
+                if free_space >= 0.0 {
+                    return (free_space / (num_items as f32)) / 2.0;
+                }
+                return free_space / 2.0;
+            }
+            .SpaceEvenly => {
+                if free_space >= 0.0 {
+                    return free_space / ((num_items + 1) as f32);
+                }
+                return free_space / 2.0;
+            }
+        }
+    }
+    let space = util.f32_max(a: 0.0, b: free_space);
+    var extra: f32 = 0.0;
+    match alignment_mode {
+        .SpaceBetween => { extra = space / ((num_items -% 1) as f32); }
+        .SpaceAround => { extra = space / (num_items as f32); }
+        .SpaceEvenly => { extra = space / ((num_items + 1) as f32); }
+        _ => { }
+    }
+    return gap + extra;
+}
