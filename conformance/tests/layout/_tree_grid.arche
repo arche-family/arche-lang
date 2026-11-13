@@ -1,8 +1,33 @@
 // The tree of the grid tests: _tree.arche's, whose grid containers are
-// laid out by compute.grid, as Nimadir's tree does (the oracle,
-// /tmp/layout-port/oracle-grid, has the same tree in Rust). Other
-// containers (block, flexbox) are not laid out here. The out-of-flow pass
-// is not run after a grid: its candidates are printed instead.
+// laid out by compute.grid, as Nimadir's tree does, and a small case
+// language that builds a tree, lays it out and writes every node's layout.
+// The oracle, _oracle/grid (a Cargo project over the real taffy 0.15), has
+// the same tree and reads the same cases, so the expected lines are taffy's
+// own. Other containers (block, flexbox) are not laid out here. The
+// out-of-flow pass is not run after a grid: its candidates are printed
+// instead (mode=direct), and compute_root_layout lays them out at the root.
+//
+// A case is a header and a node:
+//   avail=800,600 mode=layout round (grid cols=10,1fr gap=5 (leaf fixed=50,20))
+// avail: the available space (a number, min or max); mode: layout
+// (compute_root_layout, then every node's unrounded layout), direct (the
+// root's compute_child_layout: its output, out-of-flow candidates and the
+// other nodes' layouts) or size, sizew, sizeh (a ComputeSize run, in both
+// axes, the width or the height); round: the rounded layouts too;
+// sizing=content; known=W,H (direct and size; `none` for either). A count
+// of uncached layouts and measured leaves ends every case.
+// A node is `(kind key=value... child...)`, kind grid or leaf; the keys
+// are listed in apply_prop. Grid values:
+//   cols=, rows=  a template: tracks, repeat(N|auto-fill|auto-fit,...) and
+//                 line-name groups [a.b] ([] is an empty group), separated
+//                 by commas; with any group written every line gets one
+//   acols=, arows= auto tracks, separated by commas
+//   a track       minmax(MIN,MAX), Nfr (minmax(auto,Nfr)), fit-content(X)
+//                 (minmax(auto,fit-content(X))) or one value for both: a
+//                 length, N%, calc(PX+P%), auto, min-content, max-content
+//   areas=R,C,name:rs:re:cs:ce,...   grid-template-areas
+//   col=, row=    START/END, each auto, N, span-N, NAME:N or span-NAME:N
+//   flow=row|column|row-dense|column-dense
 import std;
 import alloc;
 import layout.compute as compute;
@@ -11,8 +36,10 @@ import layout.compute.grid as grid;
 import layout.compute.leaf as leaf;
 import layout.geometry as geo;
 import layout.style as sty;
+import layout.style.grid as sgrid;
 import layout.tree as lt;
 import layout.tree.cache as tcache;
+import _show;
 
 /// What a leaf holds.
 pub type Content = enum {
@@ -335,4 +362,870 @@ pub fn counts_line(out: &mut std.Output, name: str, t: &TestTree) {
     out.write(" measured ");
     out.write_u64(t.measured as u64);
     out.write("\n");
+}
+
+// --- The case language ---
+
+/// A token's bytes in the case text.
+type Span = struct {
+    /// The first byte.
+    start: usize,
+    /// One past the last.
+    end: usize,
+}
+
+/// The token at pos: "(" or ")", or a word up to a space or the ")" that
+/// closes its node (a word's own parentheses, as in calc(...), are part of
+/// it); empty at the end.
+fn token_at(src: str, pos: usize) -> Span {
+    let b = src.bytes();
+    var at = pos;
+    while at < b.len() and (b[at] == ' ' or b[at] == '\n') {
+        at += 1;
+    }
+    if at >= b.len() {
+        return Span { start: at, end: at };
+    }
+    if b[at] == '(' or b[at] == ')' {
+        return Span { start: at, end: at + 1 };
+    }
+    var end = at;
+    var depth: usize = 0;
+    while end < b.len() {
+        let c = b[end];
+        if c == ' ' or c == '\n' {
+            break;
+        }
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        }
+        end += 1;
+    }
+    return Span { start: at, end: end };
+}
+
+/// The index-th piece of text between the separators that are outside
+/// parentheses and brackets.
+fn piece_at(text: str, sep: u8, index: usize) -> str {
+    let b = text.bytes();
+    var depth: usize = 0;
+    var start: usize = 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        let c = b[i];
+        if c == '(' or c == '[' {
+            depth += 1;
+        } else if c == ')' or c == ']' {
+            depth -= 1;
+        } else if c == sep and depth == 0 {
+            if n == index {
+                return text[start..i];
+            }
+            n += 1;
+            start = i + 1;
+        }
+    }
+    if n == index {
+        return text[start..b.len()];
+    }
+    panic("a value has too few pieces");
+}
+
+/// The number of pieces of text between the separators that are outside
+/// parentheses and brackets.
+fn piece_count_of(text: str, sep: u8) -> usize {
+    let b = text.bytes();
+    var depth: usize = 0;
+    var n: usize = 1;
+    for c in b {
+        if c.* == '(' or c.* == '[' {
+            depth += 1;
+        } else if c.* == ')' or c.* == ']' {
+            depth -= 1;
+        } else if c.* == sep and depth == 0 {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// The index-th comma-separated piece of text.
+fn piece(text: str, index: usize) -> str {
+    return piece_at(text, ',', index);
+}
+
+/// The number of comma-separated pieces of text.
+fn piece_count(text: str) -> usize {
+    return piece_count_of(text, ',');
+}
+
+/// Where the first `:` of text is; its length when there is none.
+fn colon_at(text: str) -> usize {
+    let b = text.bytes();
+    var i: usize = 0;
+    while i < b.len() and b[i] != ':' {
+        i += 1;
+    }
+    return i;
+}
+
+/// A decimal number: an optional `-`, digits, an optional `.` and digits,
+/// read as the integer of its digits over a power of ten in f64, then f32
+/// (the oracle reads it the same way). Reading stops at any other byte.
+fn parse_f32(text: str) -> f32 {
+    let b = text.bytes();
+    var i: usize = 0;
+    var negative = false;
+    if b.len() > 0 and b[0] == '-' {
+        negative = true;
+        i = 1;
+    }
+    var mantissa: u64 = 0;
+    var scale: f64 = 1.0;
+    var after_point = false;
+    while i < b.len() : (i += 1) {
+        let c = b[i];
+        if c == '.' {
+            after_point = true;
+            continue;
+        }
+        if c < '0' or c > '9' {
+            break;
+        }
+        mantissa = mantissa * 10 + ((c - '0') as u64);
+        if after_point {
+            scale = scale * 10.0;
+        }
+    }
+    let value = ((mantissa as f64) / scale) as f32;
+    if negative {
+        return -value;
+    }
+    return value;
+}
+
+/// Whether text ends with `%`.
+fn is_percent(text: str) -> bool {
+    let b = text.bytes();
+    return b.len() > 0 and b[b.len() - 1] == '%';
+}
+
+/// Whether text ends with `fr`.
+fn is_fr(text: str) -> bool {
+    let b = text.bytes();
+    return b.len() > 1 and b[b.len() - 2] == 'f' and b[b.len() - 1] == 'r';
+}
+
+/// calc(PX+PERCENT%): a Calc.
+fn parse_calc(text: str) -> sty.Calc {
+    let inner = text[5..text.len() - 1];
+    let b = inner.bytes();
+    var plus: usize = 1;
+    while plus < b.len() and b[plus] != '+' {
+        plus += 1;
+    }
+    return sty.Calc { px: parse_f32(inner[0..plus]), percent: parse_f32(inner[plus + 1..b.len()]) };
+}
+
+/// A size style: a length, N%, calc(...), auto, content, min-content,
+/// max-content, fit-content, fit-content(N, N% or calc(...)) or stretch.
+fn parse_dimension(text: str) -> sty.Dimension {
+    if text.eq("auto") {
+        return sty.Dimension.auto();
+    }
+    if text.eq("content") {
+        return sty.Dimension.content();
+    }
+    if text.eq("min-content") {
+        return sty.Dimension.min_content();
+    }
+    if text.eq("max-content") {
+        return sty.Dimension.max_content();
+    }
+    if text.eq("fit-content") {
+        return sty.Dimension.fit_content();
+    }
+    if text.eq("stretch") {
+        return sty.Dimension.stretch();
+    }
+    if text.starts_with("fit-content(") {
+        let inner = text[12..text.len() - 1];
+        if inner.starts_with("calc(") {
+            return sty.Dimension.fit_content_calc(parse_calc(inner));
+        }
+        if is_percent(inner) {
+            return sty.Dimension.fit_content_percent(parse_f32(inner) / 100.0);
+        }
+        return sty.Dimension.fit_content_px(parse_f32(inner));
+    }
+    if text.starts_with("calc(") {
+        return sty.Dimension.calc(parse_calc(text));
+    }
+    if is_percent(text) {
+        return sty.Dimension.percent(parse_f32(text) / 100.0);
+    }
+    return sty.Dimension.length(parse_f32(text));
+}
+
+/// A margin, inset, min or max size: a length, N%, calc(...) or auto.
+fn parse_lpa(text: str) -> sty.LengthPercentageAuto {
+    if text.eq("auto") {
+        return sty.LengthPercentageAuto.auto();
+    }
+    if text.starts_with("calc(") {
+        return sty.LengthPercentageAuto.calc(parse_calc(text));
+    }
+    if is_percent(text) {
+        return sty.LengthPercentageAuto.percent(parse_f32(text) / 100.0);
+    }
+    return sty.LengthPercentageAuto.length(parse_f32(text));
+}
+
+/// A padding, border or gap: a length, N% or calc(...).
+fn parse_lp(text: str) -> sty.LengthPercentage {
+    if text.starts_with("calc(") {
+        return sty.LengthPercentage.calc(parse_calc(text));
+    }
+    if is_percent(text) {
+        return sty.LengthPercentage.percent(parse_f32(text) / 100.0);
+    }
+    return sty.LengthPercentage.length(parse_f32(text));
+}
+
+/// Four LengthPercentageAuto edges from one value or four (left, right,
+/// top, bottom).
+fn parse_rect_lpa(text: str) -> geo.Rect(sty.LengthPercentageAuto) {
+    if piece_count(text) == 1 {
+        let v = parse_lpa(text);
+        return geo.Rect(sty.LengthPercentageAuto) { left: v, right: v, top: v, bottom: v };
+    }
+    return geo.Rect(sty.LengthPercentageAuto) { left: parse_lpa(piece(text, 0)), right: parse_lpa(piece(text, 1)), top: parse_lpa(piece(text, 2)), bottom: parse_lpa(piece(text, 3)) };
+}
+
+/// Four LengthPercentage edges from one value or four.
+fn parse_rect_lp(text: str) -> geo.Rect(sty.LengthPercentage) {
+    if piece_count(text) == 1 {
+        let v = parse_lp(text);
+        return geo.Rect(sty.LengthPercentage) { left: v, right: v, top: v, bottom: v };
+    }
+    return geo.Rect(sty.LengthPercentage) { left: parse_lp(piece(text, 0)), right: parse_lp(piece(text, 1)), top: parse_lp(piece(text, 2)), bottom: parse_lp(piece(text, 3)) };
+}
+
+/// The safety prefix of an alignment value: safe- or unsafe-.
+fn parse_safety(text: str) -> sty.AlignmentSafety {
+    if text.starts_with("safe-") {
+        return sty.AlignmentSafety.Safe;
+    }
+    if text.starts_with("unsafe-") {
+        return sty.AlignmentSafety.Unsafe;
+    }
+    return sty.AlignmentSafety.Default;
+}
+
+/// An alignment value without its safety prefix.
+fn alignment_keyword_text(text: str) -> str {
+    if text.starts_with("safe-") {
+        return text[5..text.len()];
+    }
+    if text.starts_with("unsafe-") {
+        return text[7..text.len()];
+    }
+    return text;
+}
+
+/// align-items, align-self, justify-items or justify-self.
+fn parse_align_items(text: str) -> sty.AlignItems {
+    let word = alignment_keyword_text(text);
+    var keyword = sty.AlignItemsKeyword.Normal;
+    if word.eq("start") {
+        keyword = sty.AlignItemsKeyword.Start;
+    } else if word.eq("end") {
+        keyword = sty.AlignItemsKeyword.End;
+    } else if word.eq("flex-start") {
+        keyword = sty.AlignItemsKeyword.FlexStart;
+    } else if word.eq("flex-end") {
+        keyword = sty.AlignItemsKeyword.FlexEnd;
+    } else if word.eq("self-start") {
+        keyword = sty.AlignItemsKeyword.SelfStart;
+    } else if word.eq("self-end") {
+        keyword = sty.AlignItemsKeyword.SelfEnd;
+    } else if word.eq("center") {
+        keyword = sty.AlignItemsKeyword.Center;
+    } else if word.eq("baseline") {
+        keyword = sty.AlignItemsKeyword.Baseline;
+    } else if word.eq("stretch") {
+        keyword = sty.AlignItemsKeyword.Stretch;
+    }
+    return sty.AlignItems { keyword: keyword, safety: parse_safety(text) };
+}
+
+/// align-content or justify-content.
+fn parse_align_content(text: str) -> sty.AlignContent {
+    let word = alignment_keyword_text(text);
+    var keyword = sty.AlignContentKeyword.Normal;
+    if word.eq("start") {
+        keyword = sty.AlignContentKeyword.Start;
+    } else if word.eq("end") {
+        keyword = sty.AlignContentKeyword.End;
+    } else if word.eq("flex-start") {
+        keyword = sty.AlignContentKeyword.FlexStart;
+    } else if word.eq("flex-end") {
+        keyword = sty.AlignContentKeyword.FlexEnd;
+    } else if word.eq("center") {
+        keyword = sty.AlignContentKeyword.Center;
+    } else if word.eq("stretch") {
+        keyword = sty.AlignContentKeyword.Stretch;
+    } else if word.eq("space-between") {
+        keyword = sty.AlignContentKeyword.SpaceBetween;
+    } else if word.eq("space-evenly") {
+        keyword = sty.AlignContentKeyword.SpaceEvenly;
+    } else if word.eq("space-around") {
+        keyword = sty.AlignContentKeyword.SpaceAround;
+    }
+    return sty.AlignContent { keyword: keyword, safety: parse_safety(text) };
+}
+
+/// An overflow value.
+fn parse_overflow(text: str) -> sty.Overflow {
+    if text.eq("clip") {
+        return sty.Overflow.Clip;
+    }
+    if text.eq("hidden") {
+        return sty.Overflow.Hidden;
+    }
+    if text.eq("scroll") {
+        return sty.Overflow.Scroll;
+    }
+    return sty.Overflow.Visible;
+}
+
+/// A track's minimum: a length, N%, calc(...), auto, min-content or
+/// max-content.
+fn parse_min(text: str) -> sgrid.MinTrackSizingFunction {
+    if text.eq("auto") {
+        return sgrid.MinTrackSizingFunction.auto();
+    }
+    if text.eq("min-content") {
+        return sgrid.MinTrackSizingFunction.min_content();
+    }
+    if text.eq("max-content") {
+        return sgrid.MinTrackSizingFunction.max_content();
+    }
+    if text.starts_with("calc(") {
+        return sgrid.MinTrackSizingFunction.calc(parse_calc(text));
+    }
+    if is_percent(text) {
+        return sgrid.MinTrackSizingFunction.percent(parse_f32(text) / 100.0);
+    }
+    return sgrid.MinTrackSizingFunction.length(parse_f32(text));
+}
+
+/// A track's maximum: the minimum's values, Nfr and fit-content(N, N% or
+/// calc(...)).
+fn parse_max(text: str) -> sgrid.MaxTrackSizingFunction {
+    if text.eq("auto") {
+        return sgrid.MaxTrackSizingFunction.auto();
+    }
+    if text.eq("min-content") {
+        return sgrid.MaxTrackSizingFunction.min_content();
+    }
+    if text.eq("max-content") {
+        return sgrid.MaxTrackSizingFunction.max_content();
+    }
+    if text.starts_with("fit-content(") {
+        let inner = text[12..text.len() - 1];
+        if inner.starts_with("calc(") {
+            return sgrid.MaxTrackSizingFunction.fit_content_calc(parse_calc(inner));
+        }
+        if is_percent(inner) {
+            return sgrid.MaxTrackSizingFunction.fit_content_percent(parse_f32(inner) / 100.0);
+        }
+        return sgrid.MaxTrackSizingFunction.fit_content_px(parse_f32(inner));
+    }
+    if is_fr(text) {
+        return sgrid.MaxTrackSizingFunction.fr(parse_f32(text));
+    }
+    if text.starts_with("calc(") {
+        return sgrid.MaxTrackSizingFunction.calc(parse_calc(text));
+    }
+    if is_percent(text) {
+        return sgrid.MaxTrackSizingFunction.percent(parse_f32(text) / 100.0);
+    }
+    return sgrid.MaxTrackSizingFunction.length(parse_f32(text));
+}
+
+/// A track: minmax(MIN,MAX), Nfr (minmax(auto,Nfr)), fit-content(...)
+/// (minmax(auto,fit-content(...))) or one value for both.
+fn parse_track(text: str) -> sgrid.TrackSizingFunction {
+    if text.starts_with("minmax(") {
+        let inner = text[7..text.len() - 1];
+        return sgrid.TrackSizingFunction { min: parse_min(piece(inner, 0)), max: parse_max(piece(inner, 1)) };
+    }
+    if is_fr(text) or text.starts_with("fit-content(") {
+        return sgrid.TrackSizingFunction { min: sgrid.MinTrackSizingFunction.auto(), max: parse_max(text) };
+    }
+    return sgrid.TrackSizingFunction { min: parse_min(text), max: parse_max(text) };
+}
+
+/// Adds the names of a group, [a.b], to group.
+fn parse_names(names: &mut alloc.Interner, text: str, group: &mut alloc.List(alloc.Symbol)) {
+    let inner = text[1..text.len() - 1];
+    let n = piece_count_of(inner, '.');
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        let name = piece_at(inner, '.', i);
+        if name.len() > 0 {
+            group.push(names.intern(name));
+        }
+    }
+}
+
+/// A repeat()'s tracks and line-name groups, from its first-th piece: the
+/// tracks, and a group for every line if any group is written.
+fn parse_repeat_items(names: &mut alloc.Interner, text: str, first: usize, tracks: &mut alloc.List(sgrid.TrackSizingFunction), groups: &mut alloc.List(alloc.List(alloc.Symbol)), a: alloc.Allocator) {
+    var pending = alloc.List(alloc.Symbol).init(a);
+    var any_names = false;
+    let n = piece_count(text);
+    var i = first;
+    while i < n : (i += 1) {
+        let p = piece(text, i);
+        if p.starts_with("[") {
+            any_names = true;
+            parse_names(names, p, &mut pending);
+        } else {
+            groups.push(pending);
+            pending = alloc.List(alloc.Symbol).init(a);
+            tracks.push(parse_track(p));
+        }
+    }
+    groups.push(pending);
+    if not any_names {
+        groups.clear();
+    }
+}
+
+/// A template: tracks, repeat(COUNT,...) and line-name groups; a group for
+/// every line if any group is written.
+fn parse_template(names: &mut alloc.Interner, text: str, components: &mut alloc.List(sgrid.GridTemplateComponent), groups: &mut alloc.List(alloc.List(alloc.Symbol)), a: alloc.Allocator) {
+    var pending = alloc.List(alloc.Symbol).init(a);
+    var any_names = false;
+    let n = piece_count(text);
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        let p = piece(text, i);
+        if p.starts_with("[") {
+            any_names = true;
+            parse_names(names, p, &mut pending);
+        } else if p.starts_with("repeat(") {
+            groups.push(pending);
+            pending = alloc.List(alloc.Symbol).init(a);
+            let inner = p[7..p.len() - 1];
+            let count_text = piece(inner, 0);
+            var count = sgrid.RepetitionCount.AutoFill;
+            if count_text.eq("auto-fit") {
+                count = sgrid.RepetitionCount.AutoFit;
+            } else if not count_text.eq("auto-fill") {
+                count = sgrid.RepetitionCount.Count { count: parse_f32(count_text) as u16 };
+            }
+            var tracks = alloc.List(sgrid.TrackSizingFunction).init(a);
+            var line_names = alloc.List(alloc.List(alloc.Symbol)).init(a);
+            parse_repeat_items(names, inner, 1, &mut tracks, &mut line_names, a);
+            components.push(sgrid.GridTemplateComponent.Repeat { repetition: sgrid.GridTemplateRepetition { count: count, tracks: tracks, line_names: line_names } });
+        } else {
+            groups.push(pending);
+            pending = alloc.List(alloc.Symbol).init(a);
+            components.push(sgrid.GridTemplateComponent.Single { track: parse_track(p) });
+        }
+    }
+    groups.push(pending);
+    if not any_names {
+        groups.clear();
+    }
+}
+
+/// A placement: auto, N, span-N, NAME:N or span-NAME:N.
+fn parse_placement(names: &mut alloc.Interner, text: str) -> sgrid.GridPlacement {
+    if text.eq("auto") {
+        return sgrid.GridPlacement.Auto;
+    }
+    if text.starts_with("span-") {
+        let rest = text[5..text.len()];
+        let colon = colon_at(rest);
+        if colon < rest.len() {
+            return sgrid.GridPlacement.NamedSpan { name: names.intern(rest[0..colon]), span: parse_f32(rest[colon + 1..rest.len()]) as u16 };
+        }
+        return sgrid.GridPlacement.from_span(parse_f32(rest) as u16);
+    }
+    let colon = colon_at(text);
+    if colon < text.len() {
+        return sgrid.GridPlacement.NamedLine { name: names.intern(text[0..colon]), index: parse_f32(text[colon + 1..text.len()]) as i16 };
+    }
+    return sgrid.GridPlacement.from_line_index(parse_f32(text) as i16);
+}
+
+/// START/END placements.
+fn parse_line(names: &mut alloc.Interner, text: str) -> geo.Line(sgrid.GridPlacement) {
+    let start = parse_placement(names, piece_at(text, '/', 0));
+    let end = parse_placement(names, piece_at(text, '/', 1));
+    return geo.Line(sgrid.GridPlacement) { start: start, end: end };
+}
+
+/// grid-template-areas: R,C,name:rs:re:cs:ce,...
+fn parse_areas(names: &mut alloc.Interner, text: str, a: alloc.Allocator) -> sgrid.GridTemplateAreas {
+    var areas = alloc.List(sgrid.GridTemplateArea).init(a);
+    let n = piece_count(text);
+    var i: usize = 2;
+    while i < n : (i += 1) {
+        let p = piece(text, i);
+        let name = names.intern(piece_at(p, ':', 0));
+        areas.push(sgrid.GridTemplateArea {
+            name: name,
+            row_start: parse_f32(piece_at(p, ':', 1)) as u16,
+            row_end: parse_f32(piece_at(p, ':', 2)) as u16,
+            column_start: parse_f32(piece_at(p, ':', 3)) as u16,
+            column_end: parse_f32(piece_at(p, ':', 4)) as u16,
+        });
+    }
+    return sgrid.GridTemplateAreas { areas: areas, row_count: parse_f32(piece(text, 0)) as u16, column_count: parse_f32(piece(text, 1)) as u16 };
+}
+
+/// Applies one key=value to a node's style or content.
+fn apply_prop(names: &mut alloc.Interner, style: &mut sty.Style, content: &mut Content, prop: str, a: alloc.Allocator) {
+    let b = prop.bytes();
+    var eq_at: usize = 0;
+    while eq_at < b.len() and b[eq_at] != '=' {
+        eq_at += 1;
+    }
+    if eq_at >= b.len() {
+        panic("a property without =");
+    }
+    let key = prop[0..eq_at];
+    let value = prop[eq_at + 1..b.len()];
+    if key.eq("w") {
+        style.size.width = parse_dimension(value);
+    } else if key.eq("h") {
+        style.size.height = parse_dimension(value);
+    } else if key.eq("minw") {
+        style.min_size.width = parse_lpa(value);
+    } else if key.eq("minh") {
+        style.min_size.height = parse_lpa(value);
+    } else if key.eq("maxw") {
+        style.max_size.width = parse_lpa(value);
+    } else if key.eq("maxh") {
+        style.max_size.height = parse_lpa(value);
+    } else if key.eq("gap") {
+        if piece_count(value) == 1 {
+            let g = parse_lp(value);
+            style.gap = geo.Size(sty.LengthPercentage) { width: g, height: g };
+        } else {
+            style.gap = geo.Size(sty.LengthPercentage) { width: parse_lp(piece(value, 0)), height: parse_lp(piece(value, 1)) };
+        }
+    } else if key.eq("m") {
+        style.margin = parse_rect_lpa(value);
+    } else if key.eq("p") {
+        style.padding = parse_rect_lp(value);
+    } else if key.eq("b") {
+        style.border = parse_rect_lp(value);
+    } else if key.eq("inset") {
+        style.inset = parse_rect_lpa(value);
+    } else if key.eq("il") {
+        style.inset.left = parse_lpa(value);
+    } else if key.eq("ir") {
+        style.inset.right = parse_lpa(value);
+    } else if key.eq("it") {
+        style.inset.top = parse_lpa(value);
+    } else if key.eq("ib") {
+        style.inset.bottom = parse_lpa(value);
+    } else if key.eq("pos") {
+        if value.eq("relative") {
+            style.position = sty.Position.Relative;
+        } else if value.eq("absolute") {
+            style.position = sty.Position.Absolute;
+        } else if value.eq("fixed") {
+            style.position = sty.Position.Fixed;
+        } else {
+            style.position = sty.Position.Static;
+        }
+    } else if key.eq("ai") {
+        style.align_items = parse_align_items(value);
+    } else if key.eq("as") {
+        style.align_self = some(parse_align_items(value));
+    } else if key.eq("ji") {
+        style.justify_items = parse_align_items(value);
+    } else if key.eq("js") {
+        style.justify_self = some(parse_align_items(value));
+    } else if key.eq("ac") {
+        style.align_content = parse_align_content(value);
+    } else if key.eq("jc") {
+        style.justify_content = parse_align_content(value);
+    } else if key.eq("ar") {
+        style.aspect_ratio = some(parse_f32(value));
+    } else if key.eq("box") {
+        if value.eq("content") {
+            style.box_sizing = sty.BoxSizing.ContentBox;
+        } else {
+            style.box_sizing = sty.BoxSizing.BorderBox;
+        }
+    } else if key.eq("dirn") {
+        if value.eq("rtl") {
+            style.direction = sty.Direction.Rtl;
+        } else {
+            style.direction = sty.Direction.Ltr;
+        }
+    } else if key.eq("ox") {
+        style.overflow.x = parse_overflow(value);
+    } else if key.eq("oy") {
+        style.overflow.y = parse_overflow(value);
+    } else if key.eq("sw") {
+        style.scrollbar_width = parse_f32(value);
+    } else if key.eq("contain") {
+        if value.eq("layout") {
+            style.contain = sty.Contain.layout();
+        } else if value.eq("paint") {
+            style.contain = sty.Contain.paint();
+        } else if value.eq("content") {
+            style.contain = sty.Contain.content();
+        } else {
+            style.contain = sty.Contain.none_set();
+        }
+    } else if key.eq("replaced") {
+        style.item_is_replaced = value.eq("1");
+    } else if key.eq("creplaced") {
+        style.item_is_compressible_replaced = value.eq("1");
+    } else if key.eq("display") {
+        if value.eq("none") {
+            style.display = sty.Display.None;
+        } else {
+            style.display = sty.Display.Grid;
+        }
+    } else if key.eq("cols") {
+        var components = alloc.List(sgrid.GridTemplateComponent).init(a);
+        var groups = alloc.List(alloc.List(alloc.Symbol)).init(a);
+        parse_template(names, value, &mut components, &mut groups, a);
+        style.grid_template_columns = components;
+        style.grid_template_column_names = groups;
+    } else if key.eq("rows") {
+        var components = alloc.List(sgrid.GridTemplateComponent).init(a);
+        var groups = alloc.List(alloc.List(alloc.Symbol)).init(a);
+        parse_template(names, value, &mut components, &mut groups, a);
+        style.grid_template_rows = components;
+        style.grid_template_row_names = groups;
+    } else if key.eq("acols") {
+        let n = piece_count(value);
+        var i: usize = 0;
+        while i < n : (i += 1) {
+            style.grid_auto_columns.push(parse_track(piece(value, i)));
+        }
+    } else if key.eq("arows") {
+        let n = piece_count(value);
+        var i: usize = 0;
+        while i < n : (i += 1) {
+            style.grid_auto_rows.push(parse_track(piece(value, i)));
+        }
+    } else if key.eq("flow") {
+        if value.eq("column") {
+            style.grid_auto_flow = sgrid.GridAutoFlow.Column;
+        } else if value.eq("row-dense") {
+            style.grid_auto_flow = sgrid.GridAutoFlow.RowDense;
+        } else if value.eq("column-dense") {
+            style.grid_auto_flow = sgrid.GridAutoFlow.ColumnDense;
+        } else {
+            style.grid_auto_flow = sgrid.GridAutoFlow.Row;
+        }
+    } else if key.eq("areas") {
+        style.grid_template_areas = some(parse_areas(names, value, a));
+    } else if key.eq("col") {
+        style.grid_column = parse_line(names, value);
+    } else if key.eq("row") {
+        style.grid_row = parse_line(names, value);
+    } else if key.eq("fixed") {
+        content.* = Content.Fixed { width: parse_f32(piece(value, 0)), height: parse_f32(piece(value, 1)) };
+    } else if key.eq("text") {
+        content.* = Content.Text { width: parse_f32(piece(value, 0)), line: parse_f32(piece(value, 1)) };
+    } else {
+        panic("an unknown property");
+    }
+}
+
+/// Parses the node at pos (and its children), adding them to the tree in
+/// preorder; pos moves past it.
+fn parse_node(t: &mut TestTree, src: str, pos: &mut usize) -> lt.NodeId {
+    let open = token_at(src, pos.*);
+    if not src[open.start..open.end].eq("(") {
+        panic("a node starts with (");
+    }
+    let kind = token_at(src, open.end);
+    pos.* = kind.end;
+    let a = t.a;
+    var style = sty.Style.default(a);
+    if src[kind.start..kind.end].eq("grid") {
+        style.display = sty.Display.Grid;
+    }
+    var content = Content.Empty;
+    while true {
+        let tk = token_at(src, pos.*);
+        let text = src[tk.start..tk.end];
+        if text.eq("(") or text.eq(")") {
+            break;
+        }
+        if text.len() == 0 {
+            panic("a node is not closed");
+        }
+        pos.* = tk.end;
+        apply_prop(&mut t.names, &mut style, &mut content, text, a);
+    }
+    let id = t.add(style, content);
+    while true {
+        let tk = token_at(src, pos.*);
+        let text = src[tk.start..tk.end];
+        if text.eq(")") {
+            pos.* = tk.end;
+            break;
+        }
+        if text.len() == 0 {
+            panic("a node is not closed");
+        }
+        let child = parse_node(t, src, pos);
+        t.add_child(parent: id, child: child);
+    }
+    return id;
+}
+
+/// One axis of the avail header: a number, min or max.
+fn parse_space(text: str) -> sty.AvailableSpace {
+    if text.eq("min") {
+        return sty.AvailableSpace.MinContent;
+    }
+    if text.eq("max") {
+        return sty.AvailableSpace.MaxContent;
+    }
+    return sty.AvailableSpace.definite(parse_f32(text));
+}
+
+/// One axis of the known header: a number or none.
+fn parse_known(text: str) -> ?f32 {
+    if text.eq("none") {
+        return none;
+    }
+    return parse_f32(text);
+}
+
+/// Writes a node's layout as "NAME.INDEX at ...".
+fn node_line(out: &mut std.Output, name: str, index: usize, l: lt.Layout) {
+    out.write(name);
+    out.write(".");
+    out.write_u64(index as u64);
+    _show.layout_line(out, "", l);
+}
+
+/// Runs one case and writes its lines.
+pub fn run(out: &mut std.Output, name: str, spec: str, a: alloc.Allocator) {
+    var t = TestTree.init(a);
+    var pos: usize = 0;
+    var avail = _show.def(width: 800.0, height: 600.0);
+    var mode: u8 = 0;
+    var do_round = false;
+    var sizing = lt.SizingMode.InherentSize;
+    var known = geo.size_none();
+    while true {
+        let tk = token_at(spec, pos);
+        let text = spec[tk.start..tk.end];
+        if text.eq("(") {
+            break;
+        }
+        if text.len() == 0 {
+            panic("a case without a node");
+        }
+        pos = tk.end;
+        if text.starts_with("avail=") {
+            let value = text[6..text.len()];
+            avail = geo.Size(sty.AvailableSpace) { width: parse_space(piece(value, 0)), height: parse_space(piece(value, 1)) };
+        } else if text.eq("mode=layout") {
+            mode = 0;
+        } else if text.eq("mode=direct") {
+            mode = 1;
+        } else if text.eq("mode=size") {
+            mode = 2;
+        } else if text.eq("mode=sizew") {
+            mode = 3;
+        } else if text.eq("mode=sizeh") {
+            mode = 4;
+        } else if text.eq("round") {
+            do_round = true;
+        } else if text.eq("sizing=content") {
+            sizing = lt.SizingMode.ContentSize;
+        } else if text.starts_with("known=") {
+            let value = text[6..text.len()];
+            known = geo.Size(?f32) { width: parse_known(piece(value, 0)), height: parse_known(piece(value, 1)) };
+        } else {
+            panic("an unknown header");
+        }
+    }
+    let root = parse_node(&mut t, spec, &mut pos);
+    let count = t.nodes.len();
+
+    if mode == 0 {
+        compute.compute_root_layout(&mut t, root, avail);
+        var i: usize = 0;
+        while i < count : (i += 1) {
+            node_line(out, name, i, t.unrounded_of(lt.NodeId.from_usize(i)));
+        }
+    } else if mode == 1 {
+        let input = lt.LayoutInput {
+            run_mode: lt.RunMode.PerformLayout,
+            sizing_mode: sizing,
+            axis: lt.RequestedAxis.Both,
+            known_dimensions: known,
+            known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+            parent_size: avail.into_options(),
+            available_space: avail,
+            vertical_margins_are_collapsible: geo.line_false(),
+        };
+        let o = t.compute_child_layout(root, input);
+        output_lines(out, name, &o);
+        var i: usize = 1;
+        while i < count : (i += 1) {
+            node_line(out, name, i, t.unrounded_of(lt.NodeId.from_usize(i)));
+        }
+    } else {
+        var axis = lt.RequestedAxis.Both;
+        if mode == 3 {
+            axis = lt.RequestedAxis.Horizontal;
+        } else if mode == 4 {
+            axis = lt.RequestedAxis.Vertical;
+        }
+        let input = lt.LayoutInput {
+            run_mode: lt.RunMode.ComputeSize,
+            sizing_mode: sizing,
+            axis: axis,
+            known_dimensions: known,
+            known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+            parent_size: avail.into_options(),
+            available_space: avail,
+            vertical_margins_are_collapsible: geo.line_false(),
+        };
+        let o = t.compute_child_layout(root, input);
+        out.write(name);
+        out.write(" size");
+        num(out, o.size.width);
+        num(out, o.size.height);
+        out.write("\n");
+    }
+
+    if do_round {
+        compute.round_layout(&mut t, root);
+        var r: usize = 0;
+        while r < count : (r += 1) {
+            out.write(name);
+            out.write("r");
+            node_line(out, "", r, t.final_of(lt.NodeId.from_usize(r)));
+        }
+    }
+    counts_line(out, name, &t);
 }
