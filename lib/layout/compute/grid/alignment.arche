@@ -1,0 +1,501 @@
+/// compute.grid.alignment: taffy 0.15's compute/grid/alignment.rs, the
+/// alignment of the tracks and the final size and position of each item.
+import layout.compute.common.alignment as calign;
+import layout.compute.common.scrollable_overflow as overflow;
+import layout.compute.common.sizing_keyword as kw;
+import layout.compute.grid.types.grid_track as gt;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import layout.util;
+
+/// align_tracks: places the tracks of an axis by align-content (rows) or
+/// justify-content (columns); it changes something only when the tracks
+/// do not fill the content box.
+pub fn align_tracks(grid_container_content_box_size: f32, padding: geo.Line(f32), border: geo.Line(f32), tracks: []mut gt.GridTrack, track_alignment_style: sty.AlignContent, axis_is_reversed: bool) {
+    var used_size: f32 = gt.sum_zero();
+    for track in tracks {
+        used_size = used_size + track.base_size;
+    }
+    let free_space = grid_container_content_box_size - used_size;
+    let origin = padding.start + border.start;
+
+    // The tracks that are not collapsed, gutters not counted.
+    var num_tracks: usize = 0;
+    var t: usize = 1;
+    while t < tracks.len() : (t += 2) {
+        if not tracks[t].is_collapsed {
+            num_tracks += 1;
+        }
+    }
+
+    // Gaps are tracks here, so the gap is zero; grid layout is never
+    // reversed.
+    let gap: f32 = 0.0;
+    let layout_is_reversed = false;
+    var track_alignment = calign.apply_alignment_fallback(free_space, num_tracks, track_alignment_style);
+    if axis_is_reversed {
+        track_alignment = track_alignment.reversed();
+    }
+
+    // When every track is collapsed none takes the offset below, but the
+    // grid's lines still align in the container (at the inline start in
+    // rtl, say): the origin takes it.
+    var empty_grid_offset: f32 = 0.0;
+    if num_tracks == 0 {
+        empty_grid_offset = calign.compute_alignment_offset(free_space: free_space, num_items: num_tracks, gap: gap, alignment_mode: track_alignment, layout_is_flex_reversed: layout_is_reversed, is_first: true);
+    }
+
+    // The offsets. Tracks are in logical order; a reversed axis (rtl) gets
+    // its offsets right to left by going through them backwards.
+    var total_offset = origin + empty_grid_offset;
+    var seen_non_collapsed_track = false;
+    let count = tracks.len();
+    var i: usize = 0;
+    while i < count : (i += 1) {
+        var index = i;
+        if axis_is_reversed {
+            index = count - 1 - i;
+        }
+        // Gutters are odd tracks, so even indexes from zero.
+        let is_gutter = i % 2 == 0;
+        let is_non_collapsed_track = not is_gutter and not tracks[index].is_collapsed;
+
+        // Only tracks that are not collapsed take alignment offsets.
+        let is_first = is_non_collapsed_track and not seen_non_collapsed_track;
+
+        var offset: f32 = 0.0;
+        if is_non_collapsed_track {
+            offset = calign.compute_alignment_offset(free_space: free_space, num_items: num_tracks, gap: gap, alignment_mode: track_alignment, layout_is_flex_reversed: layout_is_reversed, is_first: is_first);
+        }
+
+        tracks[index].offset = total_offset + offset;
+        total_offset = total_offset + offset + tracks[index].base_size;
+        if is_non_collapsed_track {
+            seen_non_collapsed_track = true;
+        }
+    }
+}
+
+/// What align_and_position_item gives: the item's contribution to the
+/// container's scrollable overflow, its y and its height.
+pub type PositionedItem = struct {
+    /// The overflow contribution.
+    pub overflow_contribution: geo.Rect(f32),
+    /// Its y.
+    pub y_position: f32,
+    /// Its height.
+    pub height: f32,
+}
+
+/// align_and_position_item: sizes a grid item, places it in its grid area
+/// and lays it out; candidates its subtree surfaced join
+/// bubbled_candidates, from the container's border box.
+/// containing_block_size is the basis of the item's percentages: the grid
+/// area for grid.
+pub fn align_and_position_item(tree: &mut dyn lt.LayoutTree, node: lt.NodeId, order: u32, grid_area: geo.Rect(f32), containing_block_size: geo.Size(f32), container_alignment_styles: geo.InBothAbsAxis(sty.AlignItems), baseline_shim: f32, direction: sty.Direction, container_border_box_width: f32, container_border: geo.Rect(f32), container_is_scroll_container: bool, bubbled_candidates: &mut lt.OofCandidates) -> PositionedItem {
+    let grid_area_size = geo.Size(f32) { width: grid_area.right - grid_area.left, height: grid_area.bottom - grid_area.top };
+
+    let style = tree.get_style(node);
+
+    let overflow_style = style.overflow;
+    let contain = style.contain;
+    let scrollbar_width = style.scrollbar_width;
+    let aspect_ratio = style.aspect_ratio;
+    let is_replaced = style.is_replaced();
+    // justify-self and align-self fall back to the container's
+    // justify-items and align-items, then self-start and self-end resolve
+    // against the item's own direction. Horizontal is the inline axis
+    // (horizontal-tb only); in the block axis they are start and end.
+    let item_direction = style.direction;
+    var justify_style = container_alignment_styles.horizontal;
+    match style.justify_self {
+        some(x) => { justify_style = x; }
+        none => { }
+    }
+    let justify_self = justify_style.resolve_self_relative(item_direction: item_direction, container_direction: direction, axis_is_inline: true);
+    var align_style = container_alignment_styles.vertical;
+    match style.align_self {
+        some(x) => { align_style = x; }
+        none => { }
+    }
+    let align_self = align_style.resolve_self_relative(item_direction: item_direction, container_direction: direction, axis_is_inline: false);
+
+    let position = style.position;
+    let inset_horizontal = geo.Line(?f32) {
+        start: style.inset.left.resolve_to_option(containing_block_size.width),
+        end: style.inset.right.resolve_to_option(containing_block_size.width),
+    };
+    let inset_vertical = geo.Line(?f32) {
+        start: style.inset.top.resolve_to_option(containing_block_size.height),
+        end: style.inset.bottom.resolve_to_option(containing_block_size.height),
+    };
+    let padding = style.padding.resolve_or_zero(some(containing_block_size.width));
+    let border = style.border.resolve_or_zero(some(containing_block_size.width));
+    let padding_border_size = padding.add(border).sum_axes();
+
+    var box_sizing_adjustment = geo.size_zero();
+    if style.box_sizing == sty.BoxSizing.ContentBox {
+        box_sizing_adjustment = padding_border_size;
+    }
+
+    let size_style = style.size;
+    let containing_block_options = containing_block_size.map_some();
+    let inherent_size = size_style.maybe_resolve(containing_block_options).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    let min_size = style.min_size.maybe_resolve(containing_block_options).maybe_add_f(box_sizing_adjustment).fallback(padding_border_size.map_some()).maybe_max_f(padding_border_size).maybe_apply_aspect_ratio(aspect_ratio);
+    let max_size = style.max_size.maybe_resolve(containing_block_options).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+
+    // normal resolves (when neither side sets an alignment): an item with
+    // an aspect ratio but no width or height stretches its width, and its
+    // height follows from the ratio. Replaced elements do not stretch;
+    // they are sized as for start.
+    // See: https://www.w3.org/TR/css-grid-1/#grid-item-sizing
+    var horizontal_alignment = justify_self;
+    if justify_self.keyword == sty.AlignItemsKeyword.Normal {
+        if util.is_some(inherent_size.width) or size_style.width.is_sizing_keyword() or is_replaced {
+            horizontal_alignment = sty.AlignItems.start();
+        } else {
+            horizontal_alignment = sty.AlignItems.stretch();
+        }
+    }
+    var vertical_alignment = align_self;
+    if align_self.keyword == sty.AlignItemsKeyword.Normal {
+        if util.is_some(inherent_size.height) or size_style.height.is_sizing_keyword() or util.is_some(aspect_ratio) or is_replaced {
+            vertical_alignment = sty.AlignItems.start();
+        } else {
+            vertical_alignment = sty.AlignItems.stretch();
+        }
+    }
+
+    // Not a bug: CSS resolves both horizontal and vertical margins against
+    // the grid area's width.
+    let margin = geo.Rect(?f32) {
+        left: style.margin.left.resolve_to_option(containing_block_size.width),
+        right: style.margin.right.resolve_to_option(containing_block_size.width),
+        top: style.margin.top.resolve_to_option(containing_block_size.width),
+        bottom: style.margin.bottom.resolve_to_option(containing_block_size.width),
+    };
+
+    let grid_area_minus_item_margins_size = geo.Size(f32) {
+        width: util.f32_max(a: 0.0, b: util.f32_maybe_sub(util.f32_maybe_sub(grid_area_size.width, margin.left), margin.right)),
+        height: util.f32_max(a: 0.0, b: util.f32_maybe_sub(util.f32_maybe_sub(grid_area_size.height, margin.top), margin.bottom) - baseline_shim),
+    };
+
+    // A size that is a sizing keyword (min-content, max-content,
+    // fit-content, fit-content(...), stretch) resolves to an exact size, or
+    // by measuring the item under the matching constraint.
+    var keyword_width: ?kw.SizingKeywordResolution = none;
+    if util.is_none(inherent_size.width) {
+        keyword_width = kw.resolve_sizing_keyword(size_style.width, stretch_size: some(grid_area_minus_item_margins_size.width), percent_resolution_basis: some(containing_block_size.width));
+    }
+    var keyword_height: ?kw.SizingKeywordResolution = none;
+    if util.is_none(inherent_size.height) {
+        keyword_height = kw.resolve_sizing_keyword(size_style.height, stretch_size: some(grid_area_minus_item_margins_size.height), percent_resolution_basis: some(containing_block_size.height));
+    }
+
+    // Both axes to measure: one measuring call.
+    var keyword_measured_size = geo.size_none();
+    match keyword_width {
+        some(width_resolution) => {
+            match width_resolution {
+                .Measure { space: available_width } => {
+                    match keyword_height {
+                        some(height_resolution) => {
+                            match height_resolution {
+                                .Measure { space: available_height } => {
+                                    if not position.is_out_of_flow() {
+                                        keyword_measured_size = lt.measure_child_size_both(tree, node, known_dimensions: geo.size_none(), parent_size: containing_block_options, available_space: geo.Size(sty.AvailableSpace) { width: available_width, height: available_height }, sizing_mode: lt.SizingMode.InherentSize, vertical_margins_are_collapsible: geo.line_false()).map_some();
+                                    }
+                                }
+                                _ => { }
+                            }
+                        }
+                        none => { }
+                    }
+                }
+                _ => { }
+            }
+        }
+        none => { }
+    }
+
+    // An absolutely positioned item without a width takes one from its
+    // left and right insets when both are set.
+    var width = inherent_size.width;
+    if util.is_none(width) {
+        var found = false;
+        if position.is_out_of_flow() {
+            match inset_horizontal.start {
+                some(left) => {
+                    match inset_horizontal.end {
+                        some(right) => {
+                            width = some(util.f32_max(a: 0.0, b: grid_area_minus_item_margins_size.width - left - right));
+                            found = true;
+                        }
+                        none => { }
+                    }
+                }
+                none => { }
+            }
+        }
+
+        if not found {
+            match keyword_width {
+                some(resolution) => {
+                    found = true;
+                    match resolution {
+                        .Exact { size } => { width = some(size); }
+                        .Measure { space: available_width } => {
+                            match keyword_measured_size.width {
+                                some(w) => { width = some(w); }
+                                none => {
+                                    width = some(lt.measure_child_size(tree, node, known_dimensions: geo.size_none(), parent_size: containing_block_options, available_space: geo.Size(sty.AvailableSpace) { width: available_width, height: sty.AvailableSpace.definite(grid_area_minus_item_margins_size.height) }, sizing_mode: lt.SizingMode.InherentSize, axis: geo.AbsoluteAxis.Horizontal, vertical_margins_are_collapsible: geo.line_false()));
+                                }
+                            }
+                        }
+                    }
+                }
+                none => { }
+            }
+        }
+
+        // Stretch alignment, without auto margins in the axis, for an item
+        // that is not absolutely positioned.
+        if not found and util.is_some(margin.left) and util.is_some(margin.right) and is_stretch(horizontal_alignment) and not position.is_out_of_flow() {
+            width = some(grid_area_minus_item_margins_size.width);
+        }
+    }
+
+    // The aspect ratio again, after the stretch and the insets.
+    let after_width = geo.Size(?f32) { width: width, height: inherent_size.height }.maybe_apply_aspect_ratio(aspect_ratio);
+
+    var height = after_width.height;
+    if util.is_none(height) {
+        var found = false;
+        if position.is_out_of_flow() {
+            match inset_vertical.start {
+                some(top) => {
+                    match inset_vertical.end {
+                        some(bottom) => {
+                            height = some(util.f32_max(a: 0.0, b: grid_area_minus_item_margins_size.height - top - bottom));
+                            found = true;
+                        }
+                        none => { }
+                    }
+                }
+                none => { }
+            }
+        }
+
+        if not found {
+            match keyword_height {
+                some(resolution) => {
+                    found = true;
+                    match resolution {
+                        .Exact { size } => { height = some(size); }
+                        .Measure { space: available_height } => {
+                            match keyword_measured_size.height {
+                                some(h) => { height = some(h); }
+                                none => {
+                                    var available_width = sty.AvailableSpace.definite(grid_area_minus_item_margins_size.width);
+                                    match after_width.width {
+                                        some(w) => { available_width = sty.AvailableSpace.definite(w); }
+                                        none => { }
+                                    }
+                                    height = some(lt.measure_child_size(tree, node, known_dimensions: geo.Size(?f32) { width: after_width.width, height: none }, parent_size: containing_block_options, available_space: geo.Size(sty.AvailableSpace) { width: available_width, height: available_height }, sizing_mode: lt.SizingMode.InherentSize, axis: geo.AbsoluteAxis.Vertical, vertical_margins_are_collapsible: geo.line_false()));
+                                }
+                            }
+                        }
+                    }
+                }
+                none => { }
+            }
+        }
+
+        // Stretch alignment, as for the width.
+        if not found and util.is_some(margin.top) and util.is_some(margin.bottom) and is_stretch(vertical_alignment) and not position.is_out_of_flow() {
+            height = some(grid_area_minus_item_margins_size.height);
+        }
+    }
+    // The aspect ratio again, then the min and max sizes.
+    let after_height = geo.Size(?f32) { width: after_width.width, height: height }.maybe_apply_aspect_ratio(aspect_ratio);
+    let clamped = after_height.maybe_clamp(min: min_size, max: max_size);
+
+    // Lay the item out.
+    var size = clamped;
+    if position.is_out_of_flow() and (util.is_none(clamped.width) or util.is_none(clamped.height)) {
+        size = lt.measure_child_size_both(tree, node, known_dimensions: clamped, parent_size: containing_block_options, available_space: geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(grid_area_minus_item_margins_size.width), height: sty.AvailableSpace.definite(grid_area_minus_item_margins_size.height) }, sizing_mode: lt.SizingMode.InherentSize, vertical_margins_are_collapsible: geo.line_false()).map_some();
+    }
+
+    var layout_output = lt.perform_child_layout(tree, node, known_dimensions: size, parent_size: containing_block_options, available_space: geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(grid_area_minus_item_margins_size.width), height: sty.AvailableSpace.definite(grid_area_minus_item_margins_size.height) }, sizing_mode: lt.SizingMode.InherentSize, vertical_margins_are_collapsible: geo.line_false());
+
+    // The final size.
+    let final_size = size.unwrap_or(layout_output.size).maybe_clamp(min: min_size, max: max_size);
+
+    let x_aligned = align_item_within_area(geo.Line(f32) { start: grid_area.left, end: grid_area.right }, horizontal_alignment, resolved_size: final_size.width, position: position, inset: inset_horizontal, margin: margin.horizontal_components(), baseline_shim: 0.0, direction: direction);
+    let y_aligned = align_item_within_area(geo.Line(f32) { start: grid_area.top, end: grid_area.bottom }, vertical_alignment, resolved_size: final_size.height, position: position, inset: inset_vertical, margin: margin.vertical_components(), baseline_shim: baseline_shim, direction: sty.Direction.Ltr);
+    let x = x_aligned.start;
+    let y = y_aligned.start;
+
+    var scrollbar_size = geo.size_zero();
+    if overflow_style.y == sty.Overflow.Scroll {
+        scrollbar_size.width = scrollbar_width;
+    }
+    if overflow_style.x == sty.Overflow.Scroll {
+        scrollbar_size.height = scrollbar_width;
+    }
+
+    let resolved_margin = geo.Rect(f32) { left: x_aligned.margin.start, right: x_aligned.margin.end, top: y_aligned.margin.start, bottom: y_aligned.margin.end };
+
+    // Candidates of the item's subtree bubble up, moved from the item's box
+    // to the container's.
+    var item_candidates = layout_output.oof_candidates.take();
+    if not item_candidates.is_empty() {
+        item_candidates.translate(geo.Point(f32) { x: x, y: y });
+        bubbled_candidates.append(&mut item_candidates);
+    }
+
+    let item_layout = lt.Layout {
+        order: order,
+        location: geo.Point(f32) { x: x, y: y },
+        size: final_size,
+        scrollable_overflow_rect: layout_output.scrollable_overflow_rect,
+        scrollbar_size: scrollbar_size,
+        border: border,
+        padding: padding,
+        margin: resolved_margin,
+    };
+    tree.set_unrounded_layout(node, &item_layout);
+
+    // The contribution to the container's scrollable overflow, from the
+    // container's padding-box origin (mirrored in rtl), as the overflow
+    // region is.
+    var contribution_location = geo.Point(f32) { x: x - container_border.left, y: y - container_border.top };
+    if direction.is_rtl() {
+        contribution_location = geo.Point(f32) { x: container_border_box_width - (x + final_size.width) - container_border.right, y: y - container_border.top };
+    }
+    let contribution = overflow.compute_scrollable_overflow_contribution(contribution_location, final_size, layout_output.scrollable_overflow_rect, overflow_style, contain, parent_is_scroll_container: container_is_scroll_container);
+
+    return PositionedItem { overflow_contribution: contribution, y_position: y, height: final_size.height };
+}
+
+/// Whether an alignment is AlignSelf::STRETCH.
+fn is_stretch(alignment: sty.AlignSelf) -> bool {
+    return alignment.keyword == sty.AlignItemsKeyword.Stretch and alignment.safety == sty.AlignmentSafety.Default;
+}
+
+/// What align_item_within_area gives: the item's start and its margins.
+pub type AlignedAxis = struct {
+    /// The item's start.
+    pub start: f32,
+    /// Its resolved margins.
+    pub margin: geo.Line(f32),
+}
+
+/// align_item_within_area: an item's start and margins in one axis of its
+/// grid area.
+pub fn align_item_within_area(grid_area: geo.Line(f32), alignment_style: sty.AlignSelf, resolved_size: f32, position: sty.Position, inset: geo.Line(?f32), margin: geo.Line(?f32), baseline_shim: f32, direction: sty.Direction) -> AlignedAxis {
+    // The grid area's size in the axis.
+    let non_auto_margin = geo.Line(f32) { start: util.unwrap_or(margin.start, 0.0) + baseline_shim, end: util.unwrap_or(margin.end, 0.0) };
+    let grid_area_size = util.f32_max(a: 0.0, b: grid_area.end - grid_area.start);
+    let free_space = util.f32_max(a: 0.0, b: grid_area_size - resolved_size - non_auto_margin.sum());
+
+    // Auto margins share the free space.
+    var auto_margin_count: u8 = 0;
+    if util.is_none(margin.start) {
+        auto_margin_count += 1;
+    }
+    if util.is_none(margin.end) {
+        auto_margin_count += 1;
+    }
+    var auto_margin_size: f32 = 0.0;
+    if auto_margin_count > 0 {
+        auto_margin_size = free_space / (auto_margin_count as f32);
+    }
+    let resolved_margin = geo.Line(f32) {
+        start: util.unwrap_or(margin.start, auto_margin_size) + baseline_shim,
+        end: util.unwrap_or(margin.end, auto_margin_size),
+    };
+
+    let overflows = resolved_size + non_auto_margin.sum() > grid_area_size;
+    let alignment_keyword = calign.resolve_self_alignment_safety(alignment_style, overflows);
+
+    // The offset in the axis. Baseline is not supported yet: it is start.
+    var alignment_based_offset: f32 = 0.0;
+    match alignment_keyword {
+        .Start => { alignment_based_offset = start_offset(grid_area_size: grid_area_size, resolved_size: resolved_size, resolved_margin: resolved_margin, direction: direction); }
+        .FlexStart => { alignment_based_offset = start_offset(grid_area_size: grid_area_size, resolved_size: resolved_size, resolved_margin: resolved_margin, direction: direction); }
+        .Baseline => { alignment_based_offset = start_offset(grid_area_size: grid_area_size, resolved_size: resolved_size, resolved_margin: resolved_margin, direction: direction); }
+        .Stretch => { alignment_based_offset = start_offset(grid_area_size: grid_area_size, resolved_size: resolved_size, resolved_margin: resolved_margin, direction: direction); }
+        .End => { alignment_based_offset = end_offset(grid_area_size: grid_area_size, resolved_size: resolved_size, resolved_margin: resolved_margin, direction: direction); }
+        .FlexEnd => { alignment_based_offset = end_offset(grid_area_size: grid_area_size, resolved_size: resolved_size, resolved_margin: resolved_margin, direction: direction); }
+        .Center => { alignment_based_offset = (grid_area_size - resolved_size + resolved_margin.start - resolved_margin.end) / 2.0; }
+        // normal resolved, and self-start and self-end resolved to start
+        // and end against the item's direction, in
+        // align_and_position_item.
+        .Normal => { unreachable(); }
+        .SelfStart => { unreachable(); }
+        .SelfEnd => { unreachable(); }
+    }
+
+    var offset_within_area = alignment_based_offset;
+    if position.is_out_of_flow() {
+        match inset.start {
+            some(start) => {
+                match inset.end {
+                    some(end) => {
+                        if direction.is_rtl() {
+                            offset_within_area = grid_area_size - end - resolved_size - non_auto_margin.end;
+                        } else {
+                            offset_within_area = start + non_auto_margin.start;
+                        }
+                    }
+                    none => { offset_within_area = start + non_auto_margin.start; }
+                }
+            }
+            none => {
+                match inset.end {
+                    some(end) => { offset_within_area = grid_area_size - end - resolved_size - non_auto_margin.end; }
+                    none => { }
+                }
+            }
+        }
+    }
+
+    var start = grid_area.start + offset_within_area;
+    if position == sty.Position.Relative {
+        var relative_inset: ?f32 = none;
+        if direction.is_rtl() {
+            relative_inset = util.opt_or(value: negated(inset.end), alt: inset.start);
+        } else {
+            relative_inset = util.opt_or(value: inset.start, alt: negated(inset.end));
+        }
+        start = start + util.unwrap_or(relative_inset, 0.0);
+    }
+
+    return AlignedAxis { start: start, margin: resolved_margin };
+}
+
+/// The offset of a start-aligned item (an end-aligned one in rtl).
+fn start_offset(grid_area_size: f32, resolved_size: f32, resolved_margin: geo.Line(f32), direction: sty.Direction) -> f32 {
+    if direction.is_rtl() {
+        return grid_area_size - resolved_size - resolved_margin.end;
+    }
+    return resolved_margin.start;
+}
+
+/// The offset of an end-aligned item (a start-aligned one in rtl).
+fn end_offset(grid_area_size: f32, resolved_size: f32, resolved_margin: geo.Line(f32), direction: sty.Direction) -> f32 {
+    if direction.is_rtl() {
+        return resolved_margin.start;
+    }
+    return grid_area_size - resolved_size - resolved_margin.end;
+}
+
+/// value.map(|pos| -pos).
+fn negated(value: ?f32) -> ?f32 {
+    match value {
+        some(v) => { return -v; }
+        none => { return none; }
+    }
+}

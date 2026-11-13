@@ -1,0 +1,176 @@
+/// compute.grid.implicit_grid: taffy 0.15's compute/grid/implicit_grid.rs,
+/// the estimate of the implicit grid's track counts before placement.
+///
+/// The estimate sizes the occupancy matrix ahead of placement: the
+/// negative implicit and explicit counts are exact, the positive implicit
+/// count a lower bound that auto-placement may raise. It mixes track and
+/// line numbers.
+import layout.compute.grid.placement as placement;
+import layout.compute.grid.types.grid_track_counts as counts;
+import layout.geometry as geo;
+import layout.style.grid as sgrid;
+
+/// The estimated track counts of both axes (taffy's pair).
+pub type GridSizeEstimate = struct {
+    /// The columns.
+    pub columns: counts.TrackCounts,
+    /// The rows.
+    pub rows: counts.TrackCounts,
+}
+
+/// compute_grid_size_estimate: the track counts of the grid from the
+/// explicit counts and the items' placements.
+pub fn compute_grid_size_estimate(explicit_col_count: u16, explicit_row_count: u16, placements: []placement.ItemPlacement) -> GridSizeEstimate {
+    // The smallest and largest lines the items use, and their largest
+    // spans.
+    let known = get_known_child_positions(placements);
+
+    // Track counts from the explicit counts and those lines.
+    let negative_implicit_inline_tracks = known.col_min.implied_negative_implicit_tracks();
+    let explicit_inline_tracks = explicit_col_count;
+    var positive_implicit_inline_tracks = known.col_max.implied_positive_implicit_tracks(explicit_col_count);
+    let negative_implicit_block_tracks = known.row_min.implied_negative_implicit_tracks();
+    let explicit_block_tracks = explicit_row_count;
+    var positive_implicit_block_tracks = known.row_max.implied_positive_implicit_tracks(explicit_row_count);
+
+    // More positive tracks where an item's span does not fit.
+    let tot_inline_tracks = negative_implicit_inline_tracks + explicit_inline_tracks + positive_implicit_inline_tracks;
+    if tot_inline_tracks < known.col_max_span {
+        positive_implicit_inline_tracks = known.col_max_span - explicit_inline_tracks - negative_implicit_inline_tracks;
+    }
+
+    let tot_block_tracks = negative_implicit_block_tracks + explicit_block_tracks + positive_implicit_block_tracks;
+    if tot_block_tracks < known.row_max_span {
+        positive_implicit_block_tracks = known.row_max_span - explicit_block_tracks - negative_implicit_block_tracks;
+    }
+
+    let column_counts = counts.TrackCounts.from_raw(negative_implicit: negative_implicit_inline_tracks, explicit: explicit_inline_tracks, positive_implicit: positive_implicit_inline_tracks);
+    let row_counts = counts.TrackCounts.from_raw(negative_implicit: negative_implicit_block_tracks, explicit: explicit_block_tracks, positive_implicit: positive_implicit_block_tracks);
+
+    return GridSizeEstimate { columns: column_counts, rows: row_counts };
+}
+
+/// The lines and spans get_known_child_positions finds.
+type KnownPositions = struct {
+    /// The smallest column line.
+    col_min: sgrid.OriginZeroLine,
+    /// The largest column line.
+    col_max: sgrid.OriginZeroLine,
+    /// The largest column span of an indefinitely placed item.
+    col_max_span: u16,
+    /// The smallest row line.
+    row_min: sgrid.OriginZeroLine,
+    /// The largest row line.
+    row_max: sgrid.OriginZeroLine,
+    /// The largest row span of an indefinitely placed item.
+    row_max_span: u16,
+}
+
+/// get_known_child_positions: the smallest and largest lines of the items'
+/// placements, origin-zero, and their largest spans, in tracks.
+fn get_known_child_positions(placements: []placement.ItemPlacement) -> KnownPositions {
+    let zero = sgrid.OriginZeroLine { value: 0 };
+    var known = KnownPositions { col_min: zero, col_max: zero, col_max_span: 0, row_min: zero, row_max: zero, row_max_span: 0 };
+    for item_placement in placements {
+        // Items name the lines around tracks, not tracks.
+        let col = child_min_line_max_line_span(item_placement.horizontal);
+        let row = child_min_line_max_line_span(item_placement.vertical);
+
+        known.col_min = known.col_min.min(col.min);
+        known.col_max = known.col_max.max(col.max);
+        known.col_max_span = max_u16(x: known.col_max_span, y: col.span);
+        known.row_min = known.row_min.min(row.min);
+        known.row_max = known.row_max.max(row.max);
+        known.row_max_span = max_u16(x: known.row_max_span, y: row.span);
+    }
+    return known;
+}
+
+/// One item's lines and span in an axis.
+type LinesAndSpan = struct {
+    /// The smallest line.
+    min: sgrid.OriginZeroLine,
+    /// The largest line.
+    max: sgrid.OriginZeroLine,
+    /// The span, for an indefinitely placed item.
+    span: u16,
+}
+
+/// child_min_line_max_line_span: a cautious estimate of the smallest and
+/// largest lines one item uses, origin-zero, and its span.
+fn child_min_line_max_line_span(oz_line: geo.Line(sgrid.OriginZeroGridPlacement)) -> LinesAndSpan {
+    // 8.3.1. Grid Placement Conflict Handling
+    // A. Two lines with the start after the end: swapped.
+    // B. Equal lines: the end line dropped.
+    // C. Two spans: the end's dropped.
+    // D. Only a span of a named line: a span of 1.
+    let zero = sgrid.OriginZeroLine { value: 0 };
+    var min = zero;
+    var max = zero;
+    var span: u16 = 1;
+    match oz_line.start {
+        .Line { line: track1 } => {
+            match oz_line.end {
+                .Line { line: track2 } => {
+                    if track1.value == track2.value {
+                        min = track1;
+                        max = track1.add_u16(1);
+                    } else {
+                        min = track1.min(track2);
+                        max = track1.max(track2);
+                    }
+                }
+                .Auto => {
+                    min = track1;
+                    max = track1.add_u16(1);
+                }
+                .Span { span: s } => {
+                    min = track1;
+                    max = track1.add_u16(s);
+                }
+            }
+        }
+        .Auto => {
+            match oz_line.end {
+                .Line { line: track } => {
+                    // A definite end with an auto start is a span of 1
+                    // ending there.
+                    min = track.sub_u16(1);
+                    max = track;
+                }
+                _ => { span = oz_line.indefinite_span(); }
+            }
+        }
+        .Span { span: s } => {
+            match oz_line.end {
+                .Line { line: track } => {
+                    min = track.sub_u16(s);
+                    max = track;
+                }
+                _ => { span = oz_line.indefinite_span(); }
+            }
+        }
+    }
+
+    // The lines clamped into the limited grid, so the estimated counts
+    // stay within the track limit, as placement clamps the items.
+    // https://www.w3.org/TR/css-grid-1/#overlarge-grids
+    var clamped_min = min.value;
+    if clamped_min < sgrid.MIN_OZ_LINE {
+        clamped_min = sgrid.MIN_OZ_LINE;
+    }
+    var clamped_max = max.value;
+    if clamped_max > sgrid.MAX_OZ_LINE {
+        clamped_max = sgrid.MAX_OZ_LINE;
+    }
+
+    return LinesAndSpan { min: sgrid.OriginZeroLine { value: clamped_min }, max: sgrid.OriginZeroLine { value: clamped_max }, span: span };
+}
+
+/// core::cmp::max for u16.
+fn max_u16(x: u16, y: u16) -> u16 {
+    if y > x {
+        return y;
+    }
+    return x;
+}

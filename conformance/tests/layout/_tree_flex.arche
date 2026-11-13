@@ -1,0 +1,990 @@
+// A tree for the flexbox tests: _tree.arche's tree, whose flex containers
+// are laid out by layout.compute.flexbox, and a small case language that
+// builds a tree, lays it out and writes every node's layout. The taffy
+// oracle (/tmp/layout-port/oracle-flex) reads the same cases, so the
+// expected lines are taffy's own.
+//
+// A case is a header and a node:
+//   avail=800,600 mode=layout round (flex w=300 gap=10 (leaf fixed=50,20))
+// avail: the available space (a number, min or max); mode: layout
+// (compute_root_layout, then every node's unrounded layout), direct (the
+// root's compute_child_layout: its output, out-of-flow candidates and the
+// other nodes' layouts) or size, sizew, sizeh (a ComputeSize run, in both
+// axes, the width or the height); round: the rounded layouts too;
+// sizing=content; known=W,H (direct and size; `none` for either).
+// A node is `(kind key=value... child...)`, kind flex or leaf; the keys
+// are listed in apply_prop.
+import std;
+import alloc;
+import layout.compute as compute;
+import layout.compute.block as block;
+import layout.compute.flexbox as flexbox;
+import layout.compute.leaf as leaf;
+import layout.compute.oof as oof;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import layout.tree.cache as tcache;
+import _show;
+
+/// What a leaf holds.
+pub type Content = enum {
+    /// Nothing: zero.
+    Empty,
+    /// A box of a fixed size, as an image.
+    Fixed { width: f32, height: f32 },
+    /// Text `width` wide on one line, wrapping into lines `line` high.
+    Text { width: f32, line: f32 },
+}
+
+/// One node.
+pub type Node = struct {
+    /// Its style.
+    pub style: sty.Style,
+    /// What it holds, for a leaf.
+    pub content: Content,
+    /// Its children.
+    pub children: alloc.List(lt.NodeId),
+    /// The out-of-flow boxes it is the containing block of.
+    pub hoisted: alloc.List(lt.NodeId),
+    /// Its layout cache.
+    pub cache: tcache.Cache,
+    /// Its layout before rounding.
+    pub unrounded: lt.Layout,
+    /// Its rounded layout.
+    pub final_layout: lt.Layout,
+}
+
+/// The tree.
+pub type TestTree = struct {
+    /// The nodes; a NodeId is an index.
+    pub nodes: alloc.List(Node),
+    /// Where everything goes.
+    pub a: alloc.Allocator,
+    /// The names of grid lines and areas.
+    pub names: alloc.Interner,
+    /// How many times a layout ran uncached.
+    pub computed: u32,
+    /// How many times a leaf was measured.
+    pub measured: u32,
+
+    /// An empty tree.
+    pub fn init(a: alloc.Allocator) -> TestTree {
+        return TestTree { nodes: alloc.List(Node).init(a), a: a, names: alloc.Interner.init(a), computed: 0, measured: 0 };
+    }
+
+    /// Adds a node.
+    pub fn add(self: &mut TestTree, style: sty.Style, content: Content) -> lt.NodeId {
+        let id = lt.NodeId.from_usize(self.nodes.len());
+        self.nodes.push(Node {
+            style: style,
+            content: content,
+            children: alloc.List(lt.NodeId).init(self.a),
+            hoisted: alloc.List(lt.NodeId).init(self.a),
+            cache: tcache.Cache.new(),
+            unrounded: lt.Layout.new(),
+            final_layout: lt.Layout.new(),
+        });
+        return id;
+    }
+
+    /// Makes child the last child of parent.
+    pub fn add_child(self: &mut TestTree, parent: lt.NodeId, child: lt.NodeId) {
+        self.nodes[parent.to_usize()].children.push(child);
+    }
+
+    /// The node's unrounded layout.
+    pub fn unrounded_of(self: &TestTree, id: lt.NodeId) -> lt.Layout {
+        return self.nodes[id.to_usize()].unrounded;
+    }
+
+    /// The node's final layout.
+    pub fn final_of(self: &TestTree, id: lt.NodeId) -> lt.Layout {
+        return self.nodes[id.to_usize()].final_layout;
+    }
+}
+
+impl lt.LayoutTree for TestTree {
+    fn child_count(self: &TestTree, parent_node_id: lt.NodeId) -> usize {
+        return self.nodes[parent_node_id.to_usize()].children.len();
+    }
+
+    fn get_child_id(self: &TestTree, parent_node_id: lt.NodeId, child_index: usize) -> lt.NodeId {
+        return self.nodes[parent_node_id.to_usize()].children.items()[child_index];
+    }
+
+    fn get_style(self: &TestTree, node_id: lt.NodeId) -> &sty.Style {
+        return &self.nodes.items()[node_id.to_usize()].style;
+    }
+
+    fn set_unrounded_layout(self: &mut TestTree, node_id: lt.NodeId, layout: &lt.Layout) {
+        self.nodes[node_id.to_usize()].unrounded = layout.*;
+    }
+
+    fn compute_child_layout(self: &mut TestTree, node_id: lt.NodeId, inputs: lt.LayoutInput) -> lt.LayoutOutput {
+        if inputs.run_mode == lt.RunMode.PerformHiddenLayout {
+            return compute.compute_hidden_layout(self, node_id);
+        }
+        return compute.compute_cached_layout(TestTree, self, node_id, inputs, fn [](t: &mut TestTree, node: lt.NodeId, input: lt.LayoutInput) -> lt.LayoutOutput {
+            t.computed += 1;
+            let i = node.to_usize();
+            if t.nodes[i].style.display == sty.Display.None {
+                return compute.compute_hidden_layout(t, node);
+            }
+            if t.nodes[i].children.len() > 0 {
+                if t.nodes[i].style.display != sty.Display.Flex {
+                    panic("the flex test tree lays out only flex containers");
+                }
+                var output = flexbox.compute_flexbox_layout(t, node, input);
+                if input.run_mode == lt.RunMode.PerformLayout {
+                    oof_pass(t, node, &mut output);
+                }
+                return output;
+            }
+            let content = t.nodes[i].content;
+            var count: u32 = 0;
+            let output = leaf.compute_leaf_layout(input, &t.nodes.items()[i].style, fn [content, &mut count](known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+                count += 1;
+                return measure(content, known, available);
+            });
+            t.measured += count;
+            return output;
+        });
+    }
+
+    fn compute_block_child_layout(self: &mut TestTree, node_id: lt.NodeId, inputs: lt.LayoutInput, bfc: &mut block.BlockFormattingContext, block_ctx: &mut block.BlockContext) -> lt.LayoutOutput {
+        return self.compute_child_layout(node_id, inputs);
+    }
+
+    fn clear_hoisted_children(self: &mut TestTree, node_id: lt.NodeId) {
+        self.nodes[node_id.to_usize()].hoisted.clear();
+    }
+
+    fn add_hoisted_children(self: &mut TestTree, node_id: lt.NodeId, hoisted: []lt.NodeId) {
+        for h in hoisted {
+            self.nodes[node_id.to_usize()].hoisted.push(h.*);
+        }
+    }
+
+    fn cache_get(self: &mut TestTree, node_id: lt.NodeId, input: &lt.LayoutInput) -> ?lt.LayoutOutput {
+        return self.nodes[node_id.to_usize()].cache.get(input);
+    }
+
+    fn cache_store(self: &mut TestTree, node_id: lt.NodeId, input: &lt.LayoutInput, layout_output: lt.LayoutOutput) {
+        self.nodes[node_id.to_usize()].cache.store(input, layout_output);
+    }
+
+    fn cache_clear(self: &mut TestTree, node_id: lt.NodeId) {
+        _ = self.nodes[node_id.to_usize()].cache.clear();
+    }
+
+    fn get_unrounded_layout(self: &TestTree, node_id: lt.NodeId) -> lt.Layout {
+        return self.nodes[node_id.to_usize()].unrounded;
+    }
+
+    fn set_final_layout(self: &mut TestTree, node_id: lt.NodeId, layout: &lt.Layout) {
+        self.nodes[node_id.to_usize()].final_layout = layout.*;
+    }
+
+    fn is_out_of_flow(self: &TestTree, node_id: lt.NodeId) -> bool {
+        let st = &self.nodes.items()[node_id.to_usize()].style;
+        return st.display != sty.Display.None and st.position.is_out_of_flow();
+    }
+
+    fn hoisted_child_count(self: &TestTree, node_id: lt.NodeId) -> usize {
+        return self.nodes[node_id.to_usize()].hoisted.len();
+    }
+
+    fn get_hoisted_child_id(self: &TestTree, node_id: lt.NodeId, index: usize) -> lt.NodeId {
+        return self.nodes[node_id.to_usize()].hoisted.items()[index];
+    }
+
+    fn allocator(self: &TestTree) -> alloc.Allocator {
+        return self.a;
+    }
+
+    fn ident_text(self: &TestTree, ident: alloc.Symbol) -> str {
+        return self.names.text(ident);
+    }
+}
+
+/// taffy's compute_oof_layout after a container's full layout. A node that
+/// claims none of its candidates passes them all up, as taffy's pass does
+/// (an empty hoisted list, the overflow joined with an empty rectangle);
+/// the rest is layout.compute.oof's.
+fn oof_pass(t: &mut TestTree, node: lt.NodeId, output: &mut lt.LayoutOutput) {
+    match output.oof_positioning_area {
+        some(_) => { }
+        none => { return; }
+    }
+    let claims = t.nodes.items()[node.to_usize()].style.is_containing_block();
+    var claims_any = false;
+    var i: usize = 0;
+    while i < output.oof_candidates.len() : (i += 1) {
+        if claims.for_position(output.oof_candidates.get(i).position) {
+            claims_any = true;
+        }
+    }
+    if claims_any or output.oof_candidates.is_empty() {
+        oof.compute_oof_layout(t, node, output);
+        return;
+    }
+    t.clear_hoisted_children(node);
+    output.scrollable_overflow_rect = output.scrollable_overflow_rect.union(geo.rect_zero());
+}
+
+/// What a leaf's content measures as, given what is known: a fixed box its
+/// size; text its width, wrapped at the available width into lines.
+pub fn measure(content: Content, known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+    match known.width {
+        some(w) => {
+            match known.height {
+                some(h) => { return geo.Size(f32) { width: w, height: h }; }
+                none => { }
+            }
+        }
+        none => { }
+    }
+    var width: f32 = 0.0;
+    var height: f32 = 0.0;
+    match content {
+        .Empty => { }
+        .Fixed { width: fw, height: fh } => {
+            width = fw;
+            height = fh;
+        }
+        .Text { width: tw, line } => {
+            var room = tw;
+            match available.width {
+                .Definite { value } => { room = value; }
+                .MinContent => { room = line; }
+                .MaxContent => { }
+            }
+            match known.width {
+                some(w) => { room = w; }
+                none => { }
+            }
+            width = tw;
+            if room < tw {
+                width = room;
+            }
+            if width <= 0.0 {
+                width = 0.0;
+                height = tw;
+            } else {
+                height = (tw / width).ceil() * line;
+            }
+        }
+    }
+    return geo.Size(f32) { width: known.width orelse width, height: known.height orelse height };
+}
+
+// --- The case language ---
+
+/// A token's bytes in the case text.
+type Span = struct {
+    /// The first byte.
+    start: usize,
+    /// One past the last.
+    end: usize,
+}
+
+/// The token at pos: "(" or ")", or a word up to a space or the ")" that
+/// closes its node (a word's own parentheses, as in calc(...), are part of
+/// it); empty at the end.
+fn token_at(src: str, pos: usize) -> Span {
+    let b = src.bytes();
+    var at = pos;
+    while at < b.len() and (b[at] == ' ' or b[at] == '\n') {
+        at += 1;
+    }
+    if at >= b.len() {
+        return Span { start: at, end: at };
+    }
+    if b[at] == '(' or b[at] == ')' {
+        return Span { start: at, end: at + 1 };
+    }
+    var end = at;
+    var depth: usize = 0;
+    while end < b.len() {
+        let c = b[end];
+        if c == ' ' or c == '\n' {
+            break;
+        }
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        }
+        end += 1;
+    }
+    return Span { start: at, end: end };
+}
+
+/// The index-th comma-separated piece of text.
+fn piece(text: str, index: usize) -> str {
+    let b = text.bytes();
+    var start: usize = 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        if b[i] == ',' {
+            if n == index {
+                return text[start..i];
+            }
+            n += 1;
+            start = i + 1;
+        }
+    }
+    if n == index {
+        return text[start..b.len()];
+    }
+    panic("a value has too few pieces");
+}
+
+/// The number of comma-separated pieces of text.
+fn piece_count(text: str) -> usize {
+    var n: usize = 1;
+    for c in text.bytes() {
+        if c.* == ',' {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// A decimal number: an optional `-`, digits, an optional `.` and digits,
+/// read as the integer of its digits over a power of ten in f64, then f32
+/// (the oracle reads it the same way). Reading stops at any other byte.
+fn parse_f32(text: str) -> f32 {
+    let b = text.bytes();
+    var i: usize = 0;
+    var negative = false;
+    if b.len() > 0 and b[0] == '-' {
+        negative = true;
+        i = 1;
+    }
+    var mantissa: u64 = 0;
+    var scale: f64 = 1.0;
+    var after_point = false;
+    while i < b.len() : (i += 1) {
+        let c = b[i];
+        if c == '.' {
+            after_point = true;
+            continue;
+        }
+        if c < '0' or c > '9' {
+            break;
+        }
+        mantissa = mantissa * 10 + ((c - '0') as u64);
+        if after_point {
+            scale = scale * 10.0;
+        }
+    }
+    let value = ((mantissa as f64) / scale) as f32;
+    if negative {
+        return -value;
+    }
+    return value;
+}
+
+/// Whether text ends with `%`.
+fn is_percent(text: str) -> bool {
+    let b = text.bytes();
+    return b.len() > 0 and b[b.len() - 1] == '%';
+}
+
+/// calc(PX+PERCENT%): a Calc.
+fn parse_calc(text: str) -> sty.Calc {
+    let inner = text[5..text.len() - 1];
+    let b = inner.bytes();
+    var plus: usize = 1;
+    while plus < b.len() and b[plus] != '+' {
+        plus += 1;
+    }
+    return sty.Calc { px: parse_f32(inner[0..plus]), percent: parse_f32(inner[plus + 1..b.len()]) };
+}
+
+/// A size style: a length, N%, calc(...), auto, content, min-content,
+/// max-content, fit-content, fit-content(N or N%) or stretch.
+fn parse_dimension(text: str) -> sty.Dimension {
+    if text.eq("auto") {
+        return sty.Dimension.auto();
+    }
+    if text.eq("content") {
+        return sty.Dimension.content();
+    }
+    if text.eq("min-content") {
+        return sty.Dimension.min_content();
+    }
+    if text.eq("max-content") {
+        return sty.Dimension.max_content();
+    }
+    if text.eq("fit-content") {
+        return sty.Dimension.fit_content();
+    }
+    if text.eq("stretch") {
+        return sty.Dimension.stretch();
+    }
+    if text.starts_with("fit-content(") {
+        let inner = text[12..text.len() - 1];
+        if is_percent(inner) {
+            return sty.Dimension.fit_content_percent(parse_f32(inner) / 100.0);
+        }
+        return sty.Dimension.fit_content_px(parse_f32(inner));
+    }
+    if text.starts_with("calc(") {
+        return sty.Dimension.calc(parse_calc(text));
+    }
+    if is_percent(text) {
+        return sty.Dimension.percent(parse_f32(text) / 100.0);
+    }
+    return sty.Dimension.length(parse_f32(text));
+}
+
+/// A margin, inset, min or max size: a length, N%, calc(...) or auto.
+fn parse_lpa(text: str) -> sty.LengthPercentageAuto {
+    if text.eq("auto") {
+        return sty.LengthPercentageAuto.auto();
+    }
+    if text.starts_with("calc(") {
+        return sty.LengthPercentageAuto.calc(parse_calc(text));
+    }
+    if is_percent(text) {
+        return sty.LengthPercentageAuto.percent(parse_f32(text) / 100.0);
+    }
+    return sty.LengthPercentageAuto.length(parse_f32(text));
+}
+
+/// A padding, border or gap: a length, N% or calc(...).
+fn parse_lp(text: str) -> sty.LengthPercentage {
+    if text.starts_with("calc(") {
+        return sty.LengthPercentage.calc(parse_calc(text));
+    }
+    if is_percent(text) {
+        return sty.LengthPercentage.percent(parse_f32(text) / 100.0);
+    }
+    return sty.LengthPercentage.length(parse_f32(text));
+}
+
+/// Four LengthPercentageAuto edges from one value or four (left, right,
+/// top, bottom).
+fn parse_rect_lpa(text: str) -> geo.Rect(sty.LengthPercentageAuto) {
+    if piece_count(text) == 1 {
+        let v = parse_lpa(text);
+        return geo.Rect(sty.LengthPercentageAuto) { left: v, right: v, top: v, bottom: v };
+    }
+    return geo.Rect(sty.LengthPercentageAuto) { left: parse_lpa(piece(text, 0)), right: parse_lpa(piece(text, 1)), top: parse_lpa(piece(text, 2)), bottom: parse_lpa(piece(text, 3)) };
+}
+
+/// Four LengthPercentage edges from one value or four.
+fn parse_rect_lp(text: str) -> geo.Rect(sty.LengthPercentage) {
+    if piece_count(text) == 1 {
+        let v = parse_lp(text);
+        return geo.Rect(sty.LengthPercentage) { left: v, right: v, top: v, bottom: v };
+    }
+    return geo.Rect(sty.LengthPercentage) { left: parse_lp(piece(text, 0)), right: parse_lp(piece(text, 1)), top: parse_lp(piece(text, 2)), bottom: parse_lp(piece(text, 3)) };
+}
+
+/// The safety prefix of an alignment value: safe- or unsafe-.
+fn parse_safety(text: str) -> sty.AlignmentSafety {
+    if text.starts_with("safe-") {
+        return sty.AlignmentSafety.Safe;
+    }
+    if text.starts_with("unsafe-") {
+        return sty.AlignmentSafety.Unsafe;
+    }
+    return sty.AlignmentSafety.Default;
+}
+
+/// An alignment value without its safety prefix.
+fn alignment_keyword_text(text: str) -> str {
+    if text.starts_with("safe-") {
+        return text[5..text.len()];
+    }
+    if text.starts_with("unsafe-") {
+        return text[7..text.len()];
+    }
+    return text;
+}
+
+/// align-items or align-self.
+fn parse_align_items(text: str) -> sty.AlignItems {
+    let word = alignment_keyword_text(text);
+    var keyword = sty.AlignItemsKeyword.Normal;
+    if word.eq("start") {
+        keyword = sty.AlignItemsKeyword.Start;
+    } else if word.eq("end") {
+        keyword = sty.AlignItemsKeyword.End;
+    } else if word.eq("flex-start") {
+        keyword = sty.AlignItemsKeyword.FlexStart;
+    } else if word.eq("flex-end") {
+        keyword = sty.AlignItemsKeyword.FlexEnd;
+    } else if word.eq("self-start") {
+        keyword = sty.AlignItemsKeyword.SelfStart;
+    } else if word.eq("self-end") {
+        keyword = sty.AlignItemsKeyword.SelfEnd;
+    } else if word.eq("center") {
+        keyword = sty.AlignItemsKeyword.Center;
+    } else if word.eq("baseline") {
+        keyword = sty.AlignItemsKeyword.Baseline;
+    } else if word.eq("stretch") {
+        keyword = sty.AlignItemsKeyword.Stretch;
+    }
+    return sty.AlignItems { keyword: keyword, safety: parse_safety(text) };
+}
+
+/// align-content or justify-content.
+fn parse_align_content(text: str) -> sty.AlignContent {
+    let word = alignment_keyword_text(text);
+    var keyword = sty.AlignContentKeyword.Normal;
+    if word.eq("start") {
+        keyword = sty.AlignContentKeyword.Start;
+    } else if word.eq("end") {
+        keyword = sty.AlignContentKeyword.End;
+    } else if word.eq("flex-start") {
+        keyword = sty.AlignContentKeyword.FlexStart;
+    } else if word.eq("flex-end") {
+        keyword = sty.AlignContentKeyword.FlexEnd;
+    } else if word.eq("center") {
+        keyword = sty.AlignContentKeyword.Center;
+    } else if word.eq("stretch") {
+        keyword = sty.AlignContentKeyword.Stretch;
+    } else if word.eq("space-between") {
+        keyword = sty.AlignContentKeyword.SpaceBetween;
+    } else if word.eq("space-evenly") {
+        keyword = sty.AlignContentKeyword.SpaceEvenly;
+    } else if word.eq("space-around") {
+        keyword = sty.AlignContentKeyword.SpaceAround;
+    }
+    return sty.AlignContent { keyword: keyword, safety: parse_safety(text) };
+}
+
+/// An overflow value.
+fn parse_overflow(text: str) -> sty.Overflow {
+    if text.eq("clip") {
+        return sty.Overflow.Clip;
+    }
+    if text.eq("hidden") {
+        return sty.Overflow.Hidden;
+    }
+    if text.eq("scroll") {
+        return sty.Overflow.Scroll;
+    }
+    return sty.Overflow.Visible;
+}
+
+/// Applies one key=value to a node's style or content.
+fn apply_prop(style: &mut sty.Style, content: &mut Content, prop: str) {
+    let b = prop.bytes();
+    var eq_at: usize = 0;
+    while eq_at < b.len() and b[eq_at] != '=' {
+        eq_at += 1;
+    }
+    if eq_at >= b.len() {
+        panic("a property without =");
+    }
+    let key = prop[0..eq_at];
+    let value = prop[eq_at + 1..b.len()];
+    if key.eq("w") {
+        style.size.width = parse_dimension(value);
+    } else if key.eq("h") {
+        style.size.height = parse_dimension(value);
+    } else if key.eq("minw") {
+        style.min_size.width = parse_lpa(value);
+    } else if key.eq("minh") {
+        style.min_size.height = parse_lpa(value);
+    } else if key.eq("maxw") {
+        style.max_size.width = parse_lpa(value);
+    } else if key.eq("maxh") {
+        style.max_size.height = parse_lpa(value);
+    } else if key.eq("basis") {
+        style.flex_basis = parse_dimension(value);
+    } else if key.eq("grow") {
+        style.flex_grow = parse_f32(value);
+    } else if key.eq("shrink") {
+        style.flex_shrink = parse_f32(value);
+    } else if key.eq("dir") {
+        if value.eq("column") {
+            style.flex_direction = sty.FlexDirection.Column;
+        } else if value.eq("row-reverse") {
+            style.flex_direction = sty.FlexDirection.RowReverse;
+        } else if value.eq("column-reverse") {
+            style.flex_direction = sty.FlexDirection.ColumnReverse;
+        } else {
+            style.flex_direction = sty.FlexDirection.Row;
+        }
+    } else if key.eq("wrap") {
+        if value.eq("wrap") {
+            style.flex_wrap = sty.FlexWrap.Wrap;
+        } else if value.eq("wrap-reverse") {
+            style.flex_wrap = sty.FlexWrap.WrapReverse;
+        } else if value.eq("balance") {
+            style.flex_wrap = sty.FlexWrap.Balance;
+        } else if value.eq("balance-reverse") {
+            style.flex_wrap = sty.FlexWrap.BalanceReverse;
+        } else {
+            style.flex_wrap = sty.FlexWrap.NoWrap;
+        }
+    } else if key.eq("lines") {
+        style.flex_line_count = parse_f32(value) as u16;
+    } else if key.eq("gap") {
+        if piece_count(value) == 1 {
+            let g = parse_lp(value);
+            style.gap = geo.Size(sty.LengthPercentage) { width: g, height: g };
+        } else {
+            style.gap = geo.Size(sty.LengthPercentage) { width: parse_lp(piece(value, 0)), height: parse_lp(piece(value, 1)) };
+        }
+    } else if key.eq("m") {
+        style.margin = parse_rect_lpa(value);
+    } else if key.eq("ml") {
+        style.margin.left = parse_lpa(value);
+    } else if key.eq("mr") {
+        style.margin.right = parse_lpa(value);
+    } else if key.eq("mt") {
+        style.margin.top = parse_lpa(value);
+    } else if key.eq("mb") {
+        style.margin.bottom = parse_lpa(value);
+    } else if key.eq("p") {
+        style.padding = parse_rect_lp(value);
+    } else if key.eq("b") {
+        style.border = parse_rect_lp(value);
+    } else if key.eq("inset") {
+        style.inset = parse_rect_lpa(value);
+    } else if key.eq("il") {
+        style.inset.left = parse_lpa(value);
+    } else if key.eq("ir") {
+        style.inset.right = parse_lpa(value);
+    } else if key.eq("it") {
+        style.inset.top = parse_lpa(value);
+    } else if key.eq("ib") {
+        style.inset.bottom = parse_lpa(value);
+    } else if key.eq("pos") {
+        if value.eq("relative") {
+            style.position = sty.Position.Relative;
+        } else if value.eq("absolute") {
+            style.position = sty.Position.Absolute;
+        } else if value.eq("fixed") {
+            style.position = sty.Position.Fixed;
+        } else {
+            style.position = sty.Position.Static;
+        }
+    } else if key.eq("ai") {
+        style.align_items = parse_align_items(value);
+    } else if key.eq("as") {
+        style.align_self = some(parse_align_items(value));
+    } else if key.eq("ac") {
+        style.align_content = parse_align_content(value);
+    } else if key.eq("jc") {
+        style.justify_content = parse_align_content(value);
+    } else if key.eq("ar") {
+        style.aspect_ratio = some(parse_f32(value));
+    } else if key.eq("box") {
+        if value.eq("content") {
+            style.box_sizing = sty.BoxSizing.ContentBox;
+        } else {
+            style.box_sizing = sty.BoxSizing.BorderBox;
+        }
+    } else if key.eq("dirn") {
+        if value.eq("rtl") {
+            style.direction = sty.Direction.Rtl;
+        } else {
+            style.direction = sty.Direction.Ltr;
+        }
+    } else if key.eq("ox") {
+        style.overflow.x = parse_overflow(value);
+    } else if key.eq("oy") {
+        style.overflow.y = parse_overflow(value);
+    } else if key.eq("sw") {
+        style.scrollbar_width = parse_f32(value);
+    } else if key.eq("contain") {
+        if value.eq("layout") {
+            style.contain = sty.Contain.layout();
+        } else if value.eq("paint") {
+            style.contain = sty.Contain.paint();
+        } else if value.eq("content") {
+            style.contain = sty.Contain.content();
+        } else {
+            style.contain = sty.Contain.none_set();
+        }
+    } else if key.eq("display") {
+        if value.eq("none") {
+            style.display = sty.Display.None;
+        } else {
+            style.display = sty.Display.Flex;
+        }
+    } else if key.eq("fixed") {
+        content.* = Content.Fixed { width: parse_f32(piece(value, 0)), height: parse_f32(piece(value, 1)) };
+    } else if key.eq("text") {
+        content.* = Content.Text { width: parse_f32(piece(value, 0)), line: parse_f32(piece(value, 1)) };
+    } else {
+        panic("an unknown property");
+    }
+}
+
+/// Parses the node at pos (and its children), adding them to the tree in
+/// preorder; pos moves past it.
+fn parse_node(t: &mut TestTree, src: str, pos: &mut usize, a: alloc.Allocator) -> lt.NodeId {
+    let open = token_at(src, pos.*);
+    if not src[open.start..open.end].eq("(") {
+        panic("a node starts with (");
+    }
+    let kind = token_at(src, open.end);
+    pos.* = kind.end;
+    var style = sty.Style.default(a);
+    style.display = sty.Display.Flex;
+    var content = Content.Empty;
+    while true {
+        let tk = token_at(src, pos.*);
+        let text = src[tk.start..tk.end];
+        if text.eq("(") or text.eq(")") {
+            break;
+        }
+        if text.len() == 0 {
+            panic("a node is not closed");
+        }
+        pos.* = tk.end;
+        apply_prop(&mut style, &mut content, text);
+    }
+    let id = t.add(style, content);
+    while true {
+        let tk = token_at(src, pos.*);
+        let text = src[tk.start..tk.end];
+        if text.eq(")") {
+            pos.* = tk.end;
+            break;
+        }
+        if text.len() == 0 {
+            panic("a node is not closed");
+        }
+        let child = parse_node(t, src, pos, a);
+        t.add_child(parent: id, child: child);
+    }
+    return id;
+}
+
+/// One axis of the avail header: a number, min or max.
+fn parse_space(text: str) -> sty.AvailableSpace {
+    if text.eq("min") {
+        return sty.AvailableSpace.MinContent;
+    }
+    if text.eq("max") {
+        return sty.AvailableSpace.MaxContent;
+    }
+    return sty.AvailableSpace.definite(parse_f32(text));
+}
+
+/// One axis of the known header: a number or none.
+fn parse_known(text: str) -> ?f32 {
+    if text.eq("none") {
+        return none;
+    }
+    return parse_f32(text);
+}
+
+/// " " and an f32.
+fn num(out: &mut std.Output, x: f32) {
+    out.write(" ");
+    out.write_f32(x);
+}
+
+/// " " and an optional f32, or " none".
+fn opt_num(out: &mut std.Output, x: ?f32) {
+    match x {
+        some(v) => { num(out, v); }
+        none => { out.write(" none"); }
+    }
+}
+
+/// A static-position edge's name.
+fn edge_name(edge: lt.AxisStaticEdge) -> str {
+    match edge {
+        .Start => { return "start"; }
+        .Center => { return "center"; }
+        .End => { return "end"; }
+    }
+}
+
+/// An alignment safety's name.
+fn safety_name(safety: sty.AlignmentSafety) -> str {
+    match safety {
+        .Default => { return "default"; }
+        .Unsafe => { return "unsafe"; }
+        .Safe => { return "safe"; }
+    }
+}
+
+/// One axis of a static position.
+fn static_axis(out: &mut std.Output, axis: lt.AxisStaticPosition) {
+    num(out, axis.area.start);
+    num(out, axis.area.end);
+    out.write(" ");
+    out.write(edge_name(axis.align.keyword));
+    out.write(" ");
+    out.write(safety_name(axis.align.safety));
+    out.write(" ");
+    out.write(edge_name(axis.align.fallback));
+}
+
+/// Writes a layout output: size, overflow, first baseline, the
+/// out-of-flow positioning area and every candidate.
+fn output_lines(out: &mut std.Output, name: str, o: &lt.LayoutOutput) {
+    out.write(name);
+    out.write(" out");
+    num(out, o.size.width);
+    num(out, o.size.height);
+    out.write(" | over");
+    num(out, o.scrollable_overflow_rect.left);
+    num(out, o.scrollable_overflow_rect.right);
+    num(out, o.scrollable_overflow_rect.top);
+    num(out, o.scrollable_overflow_rect.bottom);
+    out.write(" | base");
+    opt_num(out, o.baselines.first);
+    out.write(" | area");
+    match o.oof_positioning_area {
+        some(area) => {
+            num(out, area.size.width);
+            num(out, area.size.height);
+            num(out, area.offset.x);
+            num(out, area.offset.y);
+        }
+        none => { out.write(" none"); }
+    }
+    out.write("\n");
+    var i: usize = 0;
+    while i < o.oof_candidates.len() : (i += 1) {
+        let c = o.oof_candidates.get(i);
+        out.write(name);
+        out.write(".c");
+        out.write_u64(i as u64);
+        out.write(" node ");
+        out.write_u64(c.node.value);
+        out.write(" order ");
+        out.write_u64(c.order as u64);
+        if c.position == sty.Position.Fixed {
+            out.write(" fixed |");
+        } else {
+            out.write(" absolute |");
+        }
+        static_axis(out, c.static_position.x);
+        out.write(" |");
+        static_axis(out, c.static_position.y);
+        out.write("\n");
+    }
+}
+
+/// Writes a node's layout as "NAME.INDEX at ...".
+fn node_line(out: &mut std.Output, name: str, index: usize, l: lt.Layout) {
+    out.write(name);
+    out.write(".");
+    out.write_u64(index as u64);
+    _show.layout_line(out, "", l);
+}
+
+/// Runs one case and writes its lines.
+pub fn run(out: &mut std.Output, name: str, spec: str, a: alloc.Allocator) {
+    var t = TestTree.init(a);
+    var pos: usize = 0;
+    var avail = _show.def(width: 800.0, height: 600.0);
+    var mode: u8 = 0;
+    var do_round = false;
+    var sizing = lt.SizingMode.InherentSize;
+    var known = geo.size_none();
+    while true {
+        let tk = token_at(spec, pos);
+        let text = spec[tk.start..tk.end];
+        if text.eq("(") {
+            break;
+        }
+        if text.len() == 0 {
+            panic("a case without a node");
+        }
+        pos = tk.end;
+        if text.starts_with("avail=") {
+            let value = text[6..text.len()];
+            avail = geo.Size(sty.AvailableSpace) { width: parse_space(piece(value, 0)), height: parse_space(piece(value, 1)) };
+        } else if text.eq("mode=layout") {
+            mode = 0;
+        } else if text.eq("mode=direct") {
+            mode = 1;
+        } else if text.eq("mode=size") {
+            mode = 2;
+        } else if text.eq("mode=sizew") {
+            mode = 3;
+        } else if text.eq("mode=sizeh") {
+            mode = 4;
+        } else if text.eq("round") {
+            do_round = true;
+        } else if text.eq("sizing=content") {
+            sizing = lt.SizingMode.ContentSize;
+        } else if text.starts_with("known=") {
+            let value = text[6..text.len()];
+            known = geo.Size(?f32) { width: parse_known(piece(value, 0)), height: parse_known(piece(value, 1)) };
+        } else {
+            panic("an unknown header");
+        }
+    }
+    let root = parse_node(&mut t, spec, &mut pos, a);
+    let count = t.nodes.len();
+
+    if mode == 0 {
+        compute.compute_root_layout(&mut t, root, avail);
+        var i: usize = 0;
+        while i < count : (i += 1) {
+            node_line(out, name, i, t.unrounded_of(lt.NodeId.from_usize(i)));
+        }
+    } else if mode == 1 {
+        let input = lt.LayoutInput {
+            run_mode: lt.RunMode.PerformLayout,
+            sizing_mode: sizing,
+            axis: lt.RequestedAxis.Both,
+            known_dimensions: known,
+            known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+            parent_size: avail.into_options(),
+            available_space: avail,
+            vertical_margins_are_collapsible: geo.line_false(),
+        };
+        let o = t.compute_child_layout(root, input);
+        output_lines(out, name, &o);
+        var i: usize = 1;
+        while i < count : (i += 1) {
+            node_line(out, name, i, t.unrounded_of(lt.NodeId.from_usize(i)));
+        }
+    } else {
+        var axis = lt.RequestedAxis.Both;
+        if mode == 3 {
+            axis = lt.RequestedAxis.Horizontal;
+        } else if mode == 4 {
+            axis = lt.RequestedAxis.Vertical;
+        }
+        let input = lt.LayoutInput {
+            run_mode: lt.RunMode.ComputeSize,
+            sizing_mode: sizing,
+            axis: axis,
+            known_dimensions: known,
+            known_dimensions_are_definite: geo.Size(bool) { width: true, height: true },
+            parent_size: avail.into_options(),
+            available_space: avail,
+            vertical_margins_are_collapsible: geo.line_false(),
+        };
+        let o = t.compute_child_layout(root, input);
+        out.write(name);
+        out.write(" size");
+        num(out, o.size.width);
+        num(out, o.size.height);
+        out.write("\n");
+    }
+
+    if do_round {
+        compute.round_layout(&mut t, root);
+        var r: usize = 0;
+        while r < count : (r += 1) {
+            out.write(name);
+            out.write("r");
+            node_line(out, "", r, t.final_of(lt.NodeId.from_usize(r)));
+        }
+    }
+}

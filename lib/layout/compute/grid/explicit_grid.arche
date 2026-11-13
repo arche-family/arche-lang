@@ -1,0 +1,416 @@
+/// compute.grid.explicit_grid: taffy 0.15's compute/grid/explicit_grid.rs,
+/// the size of the explicit grid and the GridTracks of a grid's styles,
+/// repeat(auto-fill) and repeat(auto-fit) included.
+import alloc;
+import layout.compute.grid.types.grid_track as gt;
+import layout.compute.grid.types.grid_track_counts as counts;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.style.grid as sgrid;
+import layout.util;
+
+/// How auto repetitions are counted (AutoRepeatStrategy).
+pub type AutoRepeatStrategy = enum {
+    /// With a definite size or max size in the axis: the most repetitions
+    /// that do not overflow the content box.
+    MaxRepetitionsThatDoNotOverflow,
+    /// Otherwise, with a definite min size: the fewest that fill it.
+    MinRepetitionsThatDoOverflow,
+}
+
+/// The size of the explicit grid's template in an axis (taffy's
+/// (u16, u16) of compute_explicit_grid_size_in_axis).
+pub type ExplicitGridSize = struct {
+    /// How many times the auto repetition repeats.
+    pub auto_repetition_count: u16,
+    /// The tracks of the template.
+    pub track_count: u16,
+}
+
+/// No explicit tracks.
+fn no_tracks() -> ExplicitGridSize {
+    return ExplicitGridSize { auto_repetition_count: 0, track_count: 0 };
+}
+
+/// u32::saturating_add.
+fn sat_add_u32(a: u32, b: u32) -> u32 {
+    if a > 4294967295 - b {
+        return 4294967295;
+    }
+    return a + b;
+}
+
+/// u32::saturating_sub.
+fn sat_sub_u32(a: u32, b: u32) -> u32 {
+    if b > a {
+        return 0;
+    }
+    return a - b;
+}
+
+/// A track counted as its max track sizing function when that is
+/// definite, else as its min, the max floored by the min when both are
+/// (track_definite_value).
+fn track_definite_value(sizing_function: sgrid.TrackSizingFunction, parent_size: ?f32) -> f32 {
+    let max_size = sizing_function.max.definite_value(parent_size);
+    let min_size = sizing_function.min.definite_value(parent_size);
+    match max_size {
+        some(max) => { return util.f32_maybe_max(max, min_size); }
+        none => {
+            match min_size {
+                some(min) => { return min; }
+                none => { panic("called `Option::unwrap()` on a `None` value"); }
+            }
+        }
+    }
+}
+
+/// compute_explicit_grid_size_in_axis: how many times the auto repetition
+/// repeats and how many tracks the template has, in an axis.
+pub fn compute_explicit_grid_size_in_axis(style: &sty.Style, auto_fit_container_size: ?f32, auto_fit_strategy: AutoRepeatStrategy, axis: geo.AbsoluteAxis) -> ExplicitGridSize {
+    let template = style.grid_template_tracks(axis);
+
+    // No tracks in the template: no explicit tracks.
+    if template.len() == 0 {
+        return no_tracks();
+    }
+
+    // A repetition without tracks makes the whole template invalid.
+    for track_def in template {
+        match track_def {
+            .Single { .. } => { }
+            .Repeat { repetition } => {
+                if repetition.track_count() == 0 {
+                    return no_tracks();
+                }
+            }
+        }
+    }
+
+    // The tracks of single tracks and counted repetitions, clamped to the
+    // track limit.
+    var non_auto_sum: u32 = 0;
+    for track_def in template {
+        var additional_tracks: u32 = 0;
+        match track_def {
+            .Single { .. } => { additional_tracks = 1; }
+            .Repeat { repetition } => {
+                match repetition.count {
+                    .Count { count } => { additional_tracks = (count as u32) * (repetition.track_count() as u32); }
+                    _ => { additional_tracks = 0; }
+                }
+            }
+        }
+        non_auto_sum = sat_add_u32(a: non_auto_sum, b: additional_tracks);
+    }
+    var non_auto_repeating_track_count: u16 = 0;
+    if non_auto_sum < (sgrid.MAX_GRID_TRACKS as u32) {
+        non_auto_repeating_track_count = non_auto_sum as u16;
+    } else {
+        non_auto_repeating_track_count = sgrid.MAX_GRID_TRACKS;
+    }
+
+    var auto_repetition_count: u16 = 0;
+    var all_track_defs_have_fixed_component = true;
+    for track_def in template {
+        if track_def.is_auto_repetition() {
+            auto_repetition_count += 1;
+        }
+        match track_def {
+            .Single { track } => {
+                if not track.has_fixed_component() {
+                    all_track_defs_have_fixed_component = false;
+                }
+            }
+            .Repeat { repetition } => {
+                for sizing_function in repetition.tracks.items() {
+                    if not sizing_function.has_fixed_component() {
+                        all_track_defs_have_fixed_component = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // Several auto repetitions, or one beside a track without a fixed
+    // component, make the template invalid.
+    let template_is_valid = auto_repetition_count == 0 or (auto_repetition_count == 1 and all_track_defs_have_fixed_component);
+    if not template_is_valid {
+        return no_tracks();
+    }
+
+    // Without repetitions, one track per entry.
+    if auto_repetition_count == 0 {
+        return ExplicitGridSize { auto_repetition_count: 0, track_count: non_auto_repeating_track_count };
+    }
+
+    var auto_repeat_insertion_point: u32 = 0;
+    var repetition_index: usize = 0;
+    var found = false;
+    for (i, def) in template {
+        match def {
+            .Single { .. } => { auto_repeat_insertion_point = sat_add_u32(a: auto_repeat_insertion_point, b: 1); }
+            .Repeat { repetition } => {
+                match repetition.count {
+                    .Count { count } => {
+                        auto_repeat_insertion_point = sat_add_u32(a: auto_repeat_insertion_point, b: (count as u32) * (repetition.track_count() as u32));
+                    }
+                    _ => {
+                        repetition_index = i;
+                        found = true;
+                    }
+                }
+            }
+        }
+        if found {
+            break;
+        }
+    }
+    let repetition_definition = &template[repetition_index];
+    var repetition_tracks_len: usize = 0;
+    match repetition_definition {
+        .Repeat { repetition } => { repetition_tracks_len = repetition.tracks.len(); }
+        .Single { .. } => { unreachable(); }
+    }
+    var repetition_track_count: u16 = 65535;
+    if repetition_tracks_len < 65535 {
+        repetition_track_count = repetition_tracks_len as u16;
+    }
+
+    // The number of repetitions.
+    var num_repetitions: u32 = 1;
+    match auto_fit_container_size {
+        none => { num_repetitions = 1; }
+        some(inner_container_size) => {
+            let parent_size: ?f32 = some(inner_container_size);
+
+            var non_repeating_track_used_space: f32 = gt.sum_zero();
+            for track_def in template {
+                var used: f32 = 0.0;
+                match track_def {
+                    .Single { track } => { used = track_definite_value(track.*, parent_size); }
+                    .Repeat { repetition } => {
+                        match repetition.count {
+                            .Count { count } => {
+                                var sum: f32 = gt.sum_zero();
+                                for sizing_function in repetition.tracks.items() {
+                                    sum = sum + track_definite_value(sizing_function.*, parent_size);
+                                }
+                                used = sum * (count as f32);
+                            }
+                            _ => { used = 0.0; }
+                        }
+                    }
+                }
+                non_repeating_track_used_space = non_repeating_track_used_space + used;
+            }
+            let gap_size = style.gap.get_abs(axis).resolve_or_zero(some(inner_container_size));
+
+            // The space one repetition of the repeated tracks takes.
+            var per_repetition_track_used_space: f32 = gt.sum_zero();
+            match repetition_definition {
+                .Repeat { repetition } => {
+                    for sizing_function in repetition.tracks.items() {
+                        per_repetition_track_used_space = per_repetition_track_used_space + track_definite_value(sizing_function.*, parent_size);
+                    }
+                }
+                .Single { .. } => { unreachable(); }
+            }
+
+            // The first repetition is special: its gaps depend on the
+            // non-repeating tracks.
+            let gap_count = sat_sub_u32(a: (non_auto_repeating_track_count as u32) + (repetition_track_count as u32), b: 1);
+            let first_repetition_and_non_repeating_tracks_used_space = non_repeating_track_used_space + per_repetition_track_used_space + ((gap_count as f32) * gap_size);
+
+            // One repetition that already overflows gives 1 (repetitions
+            // are floored at 1).
+            if first_repetition_and_non_repeating_tracks_used_space > inner_container_size {
+                num_repetitions = 1;
+            } else {
+                let per_repetition_gap_used_space = (repetition_track_count as f32) * gap_size;
+                let per_repetition_used_space = per_repetition_track_used_space + per_repetition_gap_used_space;
+                let num_repetition_that_fit = (inner_container_size - first_repetition_and_non_repeating_tracks_used_space) / per_repetition_used_space;
+
+                // A preferred or max size: the most repetitions that do not
+                // overflow; a min size: the fewest that overflow it; with
+                // the first one counted above added. f32 to u32 saturates,
+                // so zero-sized tracks give u32::MAX, clamped below.
+                match auto_fit_strategy {
+                    .MaxRepetitionsThatDoNotOverflow => { num_repetitions = sat_add_u32(a: util.floor(num_repetition_that_fit) as% u32, b: 1); }
+                    .MinRepetitionsThatDoOverflow => { num_repetitions = sat_add_u32(a: util.ceil(num_repetition_that_fit) as% u32, b: 1); }
+                }
+            }
+        }
+    }
+
+    // Repetitions clamped to the room left after the insertion point, so
+    // the tracks before it stay and those after it are cut, in source
+    // order.
+    // https://www.w3.org/TR/css-grid-1/#overlarge-grids
+    let remaining_tracks = sat_sub_u32(a: sgrid.MAX_GRID_TRACKS as u32, b: auto_repeat_insertion_point);
+    var repetitions: u16 = 0;
+    if remaining_tracks != 0 {
+        let max_repetitions = (remaining_tracks + (repetition_track_count as u32) - 1) / (repetition_track_count as u32);
+        var clamped = num_repetitions;
+        if clamped < 1 {
+            clamped = 1;
+        }
+        if clamped > max_repetitions {
+            clamped = max_repetitions;
+        }
+        repetitions = clamped as u16;
+    }
+
+    var grid_template_track_count = (non_auto_repeating_track_count as u32) + (repetition_track_count as u32) * (repetitions as u32);
+    if grid_template_track_count > (sgrid.MAX_GRID_TRACKS as u32) {
+        grid_template_track_count = sgrid.MAX_GRID_TRACKS as u32;
+    }
+    return ExplicitGridSize { auto_repetition_count: repetitions, track_count: grid_template_track_count as u16 };
+}
+
+/// initialize_grid_tracks: the tracks and gutters of an axis, their sizing
+/// functions resolved, for the given counts: implicit tracks before, the
+/// template's (auto-fit tracks without items collapsed), implicit tracks
+/// after. track_has_items says whether a CellOccupancyMatrix track holds an
+/// item.
+pub fn initialize_grid_tracks(tracks: &mut alloc.List(gt.GridTrack), track_counts: counts.TrackCounts, style: &sty.Style, axis: geo.AbsoluteAxis, auto_repetition_count: u16, track_has_items: &dyn fn(usize) -> bool) {
+    let track_template = style.grid_template_tracks(axis);
+    let auto_tracks = style.grid_auto_tracks(axis);
+    var gap = style.gap.width;
+    if axis == geo.AbsoluteAxis.Vertical {
+        gap = style.gap.height;
+    }
+
+    // Emptied, for a relayout; then the first gutter.
+    tracks.clear();
+    tracks.push(gt.GridTrack.gutter(gap));
+
+    let auto_track_count = auto_tracks.len();
+
+    // The implicit tracks before the explicit grid: grid-auto-* cycled so
+    // that it ends at the explicit grid.
+    if track_counts.negative_implicit > 0 {
+        if auto_track_count == 0 {
+            create_implicit_tracks(tracks, track_counts.negative_implicit, auto_tracks, first: 0, gap: gap);
+        } else {
+            let offset = auto_track_count - ((track_counts.negative_implicit as usize) % auto_track_count);
+            create_implicit_tracks(tracks, track_counts.negative_implicit, auto_tracks, first: offset, gap: gap);
+        }
+    }
+
+    var current_track_index = track_counts.negative_implicit as usize;
+
+    // The explicit track count is clamped to MAX_GRID_TRACKS, so the
+    // template's tracks are cut there too.
+    let explicit_track_limit = (track_counts.negative_implicit + track_counts.explicit) as usize;
+
+    // The explicit tracks. A count of zero may come from an invalid
+    // template, which is then ignored.
+    if track_counts.explicit > 0 {
+        for track_sizing_function in track_template {
+            match track_sizing_function {
+                .Single { track } => {
+                    if current_track_index < explicit_track_limit {
+                        tracks.push(gt.GridTrack.new(track.min_sizing_function(), track.max_sizing_function()));
+                        tracks.push(gt.GridTrack.gutter(gap));
+                        current_track_index += 1;
+                    }
+                }
+                .Repeat { repetition } => {
+                    let repeat_track_count = repetition.track_count() as usize;
+                    match repetition.count {
+                        .Count { count } => {
+                            let repeated_track_count = min_usize(a: repeat_track_count * (count as usize), b: explicit_track_limit - current_track_index);
+                            var k: usize = 0;
+                            while k < repeated_track_count : (k += 1) {
+                                let sizing_function = repetition.tracks.items()[k % repeat_track_count];
+                                tracks.push(gt.GridTrack.new(sizing_function.min_sizing_function(), sizing_function.max_sizing_function()));
+                                tracks.push(gt.GridTrack.gutter(gap));
+                                current_track_index += 1;
+                            }
+                        }
+                        _ => {
+                            var is_auto_fit = false;
+                            match repetition.count {
+                                .AutoFit => { is_auto_fit = true; }
+                                _ => { }
+                            }
+                            let auto_repeated_track_count = min_usize(a: repeat_track_count * (auto_repetition_count as usize), b: explicit_track_limit - current_track_index);
+                            var k: usize = 0;
+                            while k < auto_repeated_track_count : (k += 1) {
+                                let track_def = repetition.tracks.items()[k % repeat_track_count];
+                                var track = gt.GridTrack.new(track_def.min_sizing_function(), track_def.max_sizing_function());
+                                var gutter = gt.GridTrack.gutter(gap);
+
+                                // Auto-fit tracks without items collapse.
+                                if is_auto_fit and not track_has_items(current_track_index) {
+                                    track.collapse();
+                                    gutter.collapse();
+                                }
+
+                                tracks.push(track);
+                                tracks.push(gutter);
+
+                                current_track_index += 1;
+                            }
+
+                            // Whether the auto repetition ends the track list.
+                            let is_last = current_track_index == track_counts.len();
+
+                            // Above, the gutter after a collapsed track is
+                            // collapsed and the one before is not, which is
+                            // right while a track that is not collapsed
+                            // follows. At the end of the list none does, so
+                            // going backwards, every track and gutter up to
+                            // the last track that is not collapsed is
+                            // collapsed (those met on the way already are).
+                            if is_auto_fit and is_last {
+                                let all = tracks.items_mut();
+                                var j = all.len();
+                                while j > 0 {
+                                    j -= 1;
+                                    if all[j].kind == gt.GridTrackKind.Track and not all[j].is_collapsed {
+                                        break;
+                                    }
+                                    all[j].collapse();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let grid_area_tracks = (track_counts.negative_implicit + track_counts.explicit) - (current_track_index as u16);
+
+    // The implicit tracks after the explicit grid.
+    create_implicit_tracks(tracks, track_counts.positive_implicit + grid_area_tracks, auto_tracks, first: 0, gap: gap);
+
+    // The first and last grid lines collapse.
+    let all_tracks = tracks.items_mut();
+    all_tracks[0].collapse();
+    all_tracks[all_tracks.len() - 1].collapse();
+}
+
+/// create_implicit_tracks: count tracks and their gutters, from
+/// grid-auto-* cycled from its first-th entry, or auto when it is empty.
+fn create_implicit_tracks(tracks: &mut alloc.List(gt.GridTrack), count: u16, auto_tracks: []sgrid.TrackSizingFunction, first: usize, gap: sty.LengthPercentage) {
+    var k: usize = 0;
+    while k < (count as usize) : (k += 1) {
+        var track_def = sgrid.TrackSizingFunction.auto();
+        if auto_tracks.len() > 0 {
+            track_def = auto_tracks[(first + k) % auto_tracks.len()];
+        }
+        tracks.push(gt.GridTrack.new(track_def.min_sizing_function(), track_def.max_sizing_function()));
+        tracks.push(gt.GridTrack.gutter(gap));
+    }
+}
+
+/// core::cmp::min for usize.
+fn min_usize(a: usize, b: usize) -> usize {
+    if b < a {
+        return b;
+    }
+    return a;
+}

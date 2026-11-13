@@ -1,0 +1,295 @@
+/// compute.grid.placement: taffy 0.15's compute/grid/placement.rs, the
+/// placement of items in the grid, which also finds the implicit grid.
+/// <https://www.w3.org/TR/css-grid-1/#placement>
+import layout.compute.grid.types.cell_occupancy as cell;
+import layout.compute.grid.types.grid_item as gi;
+import layout.geometry as geo;
+import layout.style.grid as sgrid;
+
+/// An item's grid-row and grid-column, named lines resolved, in
+/// origin-zero lines (ItemPlacement).
+pub type ItemPlacement = geo.InBothAbsAxis(geo.Line(sgrid.OriginZeroGridPlacement));
+
+/// The cursor moved on by one track (advance_position), saturating.
+fn advance_position(position: sgrid.OriginZeroLine) -> sgrid.OriginZeroLine {
+    if position.value == 32767 {
+        return position;
+    }
+    return sgrid.OriginZeroLine { value: position.value + 1 };
+}
+
+/// An indefinite span placed at position (resolve_indefinite_grid_span),
+/// its lines clamped to i16.
+fn resolve_indefinite_grid_span(position: sgrid.OriginZeroLine, span: u16) -> geo.Line(sgrid.OriginZeroLine) {
+    let start = position.value as i32;
+    let end = start + (span as i32);
+    return geo.Line(sgrid.OriginZeroLine) { start: clamp_to_i16(start), end: clamp_to_i16(end) };
+}
+
+/// An i32 as a line, clamped to i16.
+fn clamp_to_i16(value: i32) -> sgrid.OriginZeroLine {
+    var v = value;
+    if v < -32768 {
+        v = -32768;
+    }
+    if v > 32767 {
+        v = 32767;
+    }
+    return sgrid.OriginZeroLine { value: v as i16 };
+}
+
+/// An item's placement in both axes: the primary and secondary spans.
+type PlacedSpans = struct {
+    /// The span in the primary axis.
+    primary: geo.Line(sgrid.OriginZeroLine),
+    /// The span in the secondary axis.
+    secondary: geo.Line(sgrid.OriginZeroLine),
+}
+
+/// place_grid_items: places the items, growing the implicit grid as
+/// needed. items and placements run in parallel, in document order:
+/// placements[i] is items[i]'s grid-row and grid-column, named lines
+/// resolved.
+/// [Specification](https://www.w3.org/TR/css-grid-2/#auto-placement-algo)
+pub fn place_grid_items(cell_occupancy_matrix: &mut cell.CellOccupancyMatrix, items: []mut gi.GridItem, placements: []ItemPlacement, grid_auto_flow: sgrid.GridAutoFlow) {
+    let primary_axis = grid_auto_flow.primary_axis();
+    let secondary_axis = primary_axis.other_axis();
+
+    // 1. The items with definite positions.
+    for (index, item) in items {
+        let placement = placements[index];
+        if not (placement.horizontal.is_definite() and placement.vertical.is_definite()) {
+            continue;
+        }
+        let spans = place_definite_grid_item(placement, primary_axis);
+        record_grid_placement(cell_occupancy_matrix, item, primary_axis, primary_span: spans.primary, secondary_span: spans.secondary, placement_type: cell.CellOccupancyState.DefinitelyPlaced);
+    }
+
+    // 2. The others with a definite secondary-axis position.
+    for (index, item) in items {
+        let placement = placements[index];
+        if not (placement.get(secondary_axis).is_definite() and not placement.get(primary_axis).is_definite()) {
+            continue;
+        }
+        let spans = place_definite_secondary_axis_item(cell_occupancy_matrix, placement, grid_auto_flow);
+        record_grid_placement(cell_occupancy_matrix, item, primary_axis, primary_span: spans.primary, secondary_span: spans.secondary, placement_type: cell.CellOccupancyState.AutoPlaced);
+    }
+
+    // 3. The columns of the implicit grid are already counted: the
+    // estimate sized the matrix from the explicit grid and the largest
+    // span of the items without a definite column, and mark_area_as grows
+    // it for the items with one.
+
+    // 4. The remaining items: definite only in the secondary axis, or in
+    // neither.
+    let primary_axis_grid_start_line = cell_occupancy_matrix.track_counts(primary_axis).implicit_start_line();
+    let secondary_axis_grid_start_line = cell_occupancy_matrix.track_counts(secondary_axis).implicit_start_line();
+    var grid_position_primary = primary_axis_grid_start_line;
+    var grid_position_secondary = secondary_axis_grid_start_line;
+    for (index, item) in items {
+        let placement = placements[index];
+        if placement.get(secondary_axis).is_definite() {
+            continue;
+        }
+
+        let spans = place_indefinitely_positioned_item(cell_occupancy_matrix, placement, grid_auto_flow, grid_position_primary: grid_position_primary, grid_position_secondary: grid_position_secondary);
+
+        record_grid_placement(cell_occupancy_matrix, item, primary_axis, primary_span: spans.primary, secondary_span: spans.secondary, placement_type: cell.CellOccupancyState.AutoPlaced);
+
+        // Dense packing starts over from the grid's start for the next
+        // item; sparse packing goes on after this one.
+        if grid_auto_flow.is_dense() {
+            grid_position_primary = primary_axis_grid_start_line;
+            grid_position_secondary = secondary_axis_grid_start_line;
+        } else {
+            grid_position_primary = spans.primary.end;
+            grid_position_secondary = spans.secondary.start;
+        }
+    }
+}
+
+/// Places an item with definite positions in both axes
+/// (place_definite_grid_item).
+fn place_definite_grid_item(placement: ItemPlacement, primary_axis: geo.AbsoluteAxis) -> PlacedSpans {
+    let primary_span = placement.get(primary_axis).resolve_definite_grid_lines();
+    let secondary_span = placement.get(primary_axis.other_axis()).resolve_definite_grid_lines();
+    return PlacedSpans { primary: primary_span, secondary: secondary_span };
+}
+
+/// Step 2: places an item with a definite secondary-axis position, at the
+/// first free place along the primary axis
+/// (place_definite_secondary_axis_item).
+fn place_definite_secondary_axis_item(cell_occupancy_matrix: &cell.CellOccupancyMatrix, placement: ItemPlacement, auto_flow: sgrid.GridAutoFlow) -> PlacedSpans {
+    let primary_axis = auto_flow.primary_axis();
+    let secondary_axis = primary_axis.other_axis();
+    let primary_axis_grid_start_line = cell_occupancy_matrix.track_counts(primary_axis).implicit_start_line();
+
+    let secondary_axis_placement = placement.get(secondary_axis).resolve_definite_grid_lines();
+    var starting_position = primary_axis_grid_start_line;
+    if not auto_flow.is_dense() {
+        match cell_occupancy_matrix.auto_placement_cursor(primary_axis, secondary_axis_placement.start) {
+            some(cursor) => { starting_position = cursor; }
+            none => { }
+        }
+    }
+    let primary_axis_span = placement.get(primary_axis).indefinite_span();
+
+    var position = starting_position;
+    while true {
+        let primary_axis_placement = resolve_indefinite_grid_span(position, primary_axis_span);
+
+        match cell_occupancy_matrix.line_area_collision_jump(primary_axis, primary_span: primary_axis_placement, secondary_span: secondary_axis_placement) {
+            none => { return PlacedSpans { primary: primary_axis_placement, secondary: secondary_axis_placement }; }
+            some(next_position) => { position = next_position; }
+        }
+    }
+    unreachable();
+}
+
+/// Step 4: places an item without a definite secondary-axis position,
+/// searching from the cursor (place_indefinitely_positioned_item).
+fn place_indefinitely_positioned_item(cell_occupancy_matrix: &cell.CellOccupancyMatrix, placement: ItemPlacement, auto_flow: sgrid.GridAutoFlow, grid_position_primary: sgrid.OriginZeroLine, grid_position_secondary: sgrid.OriginZeroLine) -> PlacedSpans {
+    let primary_axis = auto_flow.primary_axis();
+    let secondary_axis = primary_axis.other_axis();
+
+    let primary_placement_style = placement.get(primary_axis);
+    let secondary_placement_style = placement.get(secondary_axis);
+
+    let secondary_span = secondary_placement_style.indefinite_span();
+    let has_definite_primary_axis_position = primary_placement_style.is_definite();
+    let primary_axis_grid_start_line = cell_occupancy_matrix.track_counts(primary_axis).implicit_start_line();
+    let primary_axis_grid_end_line = cell_occupancy_matrix.track_counts(primary_axis).implicit_end_line();
+    let secondary_axis_grid_start_line = cell_occupancy_matrix.track_counts(secondary_axis).implicit_start_line();
+
+    var primary_idx = grid_position_primary;
+    var secondary_idx = grid_position_secondary;
+
+    if has_definite_primary_axis_position {
+        let primary_span = primary_placement_style.resolve_definite_grid_lines();
+
+        // Where the search starts in the secondary axis: dense from the
+        // first track, sparse past the cursor's track when the item is
+        // before it.
+        if auto_flow.is_dense() {
+            secondary_idx = secondary_axis_grid_start_line;
+        } else if primary_span.start.value < primary_idx.value {
+            secondary_idx = advance_position(secondary_idx);
+        }
+
+        // The primary position is fixed: move along the secondary axis
+        // until the item fits.
+        while true {
+            let secondary_line = resolve_indefinite_grid_span(secondary_idx, secondary_span);
+
+            // Occupied: jump past the collision and try again.
+            match cell_occupancy_matrix.line_area_collision_jump(secondary_axis, primary_span: secondary_line, secondary_span: primary_span) {
+                some(next_position) => {
+                    secondary_idx = next_position;
+                    continue;
+                }
+                none => { }
+            }
+
+            // Free.
+            return PlacedSpans { primary: primary_span, secondary: secondary_line };
+        }
+        unreachable();
+    }
+
+    let primary_span_count = primary_placement_style.indefinite_span();
+
+    // An item spanning every primary-axis track fits only at the primary
+    // start, in a stripe of empty tracks.
+    let spans_all_primary_tracks = (primary_span_count as usize) >= cell_occupancy_matrix.track_counts(primary_axis).len();
+
+    // Neither position is fixed: search along the primary axis to the end
+    // of the existing tracks, then from the primary start one secondary
+    // track further, until the item fits.
+    while true {
+        let primary_line = resolve_indefinite_grid_span(primary_idx, primary_span_count);
+        let secondary_line = resolve_indefinite_grid_span(secondary_idx, secondary_span);
+
+        // Out of bounds in the primary axis: the next secondary track,
+        // from the primary start.
+        let primary_out_of_bounds = primary_line.end.value > primary_axis_grid_end_line.value;
+        if primary_out_of_bounds {
+            // Out of bounds even at the start it never fits, as the search
+            // only moves away from the start: record_grid_placement clamps
+            // it into the limited grid.
+            if primary_idx.value == primary_axis_grid_start_line.value {
+                return PlacedSpans { primary: primary_line, secondary: secondary_line };
+            }
+            secondary_idx = advance_position(secondary_idx);
+            primary_idx = primary_axis_grid_start_line;
+            continue;
+        }
+
+        // Spanning every primary track, it fits when every secondary track
+        // it spans is empty: jump past the tracks that are not.
+        if spans_all_primary_tracks {
+            match cell_occupancy_matrix.occupied_track_jump(secondary_axis, secondary_line) {
+                some(next_position) => {
+                    secondary_idx = next_position;
+                    primary_idx = primary_axis_grid_start_line;
+                    continue;
+                }
+                none => { return PlacedSpans { primary: primary_line, secondary: secondary_line }; }
+            }
+        }
+
+        // Occupied: jump the primary index past the collision.
+        match cell_occupancy_matrix.line_area_collision_jump(primary_axis, primary_span: primary_line, secondary_span: secondary_line) {
+            some(next_position) => {
+                primary_idx = next_position;
+                continue;
+            }
+            none => { }
+        }
+
+        // Free and in bounds.
+        return PlacedSpans { primary: primary_line, secondary: secondary_line };
+    }
+    unreachable();
+}
+
+/// A placement clamped into the limited grid, at least one track wide
+/// (clamp_span_to_limited_grid).
+/// See: <https://www.w3.org/TR/css-grid-1/#overlarge-grids>
+fn clamp_span_to_limited_grid(span: geo.Line(sgrid.OriginZeroLine)) -> geo.Line(sgrid.OriginZeroLine) {
+    var start = span.start.value;
+    if start < sgrid.MIN_OZ_LINE {
+        start = sgrid.MIN_OZ_LINE;
+    }
+    if start > sgrid.MAX_OZ_LINE - 1 {
+        start = sgrid.MAX_OZ_LINE - 1;
+    }
+    var end = span.end.value;
+    if end < start + 1 {
+        end = start + 1;
+    }
+    if end > sgrid.MAX_OZ_LINE {
+        end = sgrid.MAX_OZ_LINE;
+    }
+    return geo.Line(sgrid.OriginZeroLine) { start: sgrid.OriginZeroLine { value: start }, end: sgrid.OriginZeroLine { value: end } };
+}
+
+/// Records an item's placement in the matrix and in the item
+/// (record_grid_placement), clamped into the limited grid so the implicit
+/// grid cannot overflow.
+fn record_grid_placement(cell_occupancy_matrix: &mut cell.CellOccupancyMatrix, item: &mut gi.GridItem, primary_axis: geo.AbsoluteAxis, primary_span: geo.Line(sgrid.OriginZeroLine), secondary_span: geo.Line(sgrid.OriginZeroLine), placement_type: cell.CellOccupancyState) {
+    let primary = clamp_span_to_limited_grid(primary_span);
+    let secondary = clamp_span_to_limited_grid(secondary_span);
+
+    cell_occupancy_matrix.mark_area_as(primary_axis, primary_span: primary, secondary_span: secondary, value: placement_type);
+
+    match primary_axis {
+        .Horizontal => {
+            item.column = primary;
+            item.row = secondary;
+        }
+        .Vertical => {
+            item.column = secondary;
+            item.row = primary;
+        }
+    }
+}

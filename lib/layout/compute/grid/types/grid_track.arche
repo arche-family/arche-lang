@@ -1,0 +1,149 @@
+/// compute.grid.types.grid_track: taffy 0.15's
+/// compute/grid/types/grid_track.rs, one track (row or column) or gutter
+/// while the grid is sized.
+///
+/// taffy's track sizing functions estimate the other axis's tracks with a
+/// closure (get_track_size_estimate); there are two of them, so they are
+/// the enum TrackSizeEstimate here.
+import layout.style as sty;
+import layout.style.grid as sgrid;
+import layout.util;
+
+/// Whether a GridTrack is a track or a gutter (GridTrackKind).
+pub type GridTrackKind = enum {
+    /// A track.
+    Track,
+    /// A gutter (a grid line, a gap).
+    Gutter,
+}
+
+/// One track or gutter while the grid is sized (GridTrack).
+pub type GridTrack = struct {
+    /// A track or a gutter.
+    pub kind: GridTrackKind,
+    /// Whether it is collapsed: an empty auto-fit track, or a gutter next
+    /// to one. A collapsed track is sized as if it were not there.
+    pub is_collapsed: bool,
+    /// The min track sizing function.
+    pub min_track_sizing_function: sgrid.MinTrackSizingFunction,
+    /// The max track sizing function.
+    pub max_track_sizing_function: sgrid.MaxTrackSizingFunction,
+    /// Its start from the grid container's border box.
+    pub offset: f32,
+    /// Its size in the axis.
+    pub base_size: f32,
+    /// A scratch value while sized; may be infinite.
+    pub growth_limit: f32,
+    /// What the alignment adds to the estimate of the space for an item
+    /// sized in the other axis.
+    pub content_alignment_adjustment: f32,
+    /// A scratch value while space is distributed.
+    pub item_incurred_increase: f32,
+    /// A scratch value while space is distributed to base sizes.
+    pub base_size_planned_increase: f32,
+    /// A scratch value while space is distributed to growth limits.
+    pub growth_limit_planned_increase: f32,
+    /// Whether the track may grow without limit (css-grid-1 "infinitely
+    /// growable").
+    pub infinitely_growable: bool,
+    /// The fit-content() limit of the max track sizing function, infinity
+    /// when it is not fit-content() or does not resolve; set each sizing
+    /// pass by resolve_fit_content_limit. taffy's fit_content_limit()
+    /// reads it.
+    pub fit_content_limit: f32,
+
+    /// GridTrack::new_with_kind.
+    fn new_with_kind(kind: GridTrackKind, min_track_sizing_function: sgrid.MinTrackSizingFunction, max_track_sizing_function: sgrid.MaxTrackSizingFunction) -> GridTrack {
+        return GridTrack {
+            kind: kind,
+            is_collapsed: false,
+            min_track_sizing_function: min_track_sizing_function,
+            max_track_sizing_function: max_track_sizing_function,
+            offset: 0.0,
+            base_size: 0.0,
+            growth_limit: 0.0,
+            content_alignment_adjustment: 0.0,
+            item_incurred_increase: 0.0,
+            base_size_planned_increase: 0.0,
+            growth_limit_planned_increase: 0.0,
+            infinitely_growable: false,
+            fit_content_limit: util.infinity(),
+        };
+    }
+
+    /// A track (GridTrack::new).
+    pub fn new(min_track_sizing_function: sgrid.MinTrackSizingFunction, max_track_sizing_function: sgrid.MaxTrackSizingFunction) -> GridTrack {
+        return GridTrack.new_with_kind(GridTrackKind.Track, min_track_sizing_function, max_track_sizing_function);
+    }
+
+    /// A gutter of the gap's size (GridTrack::gutter).
+    pub fn gutter(size: sty.LengthPercentage) -> GridTrack {
+        return GridTrack.new_with_kind(GridTrackKind.Gutter, sgrid.MinTrackSizingFunction.from_lp(size), sgrid.MaxTrackSizingFunction.from_lp(size));
+    }
+
+    /// Collapses the track: both sizing functions become zero.
+    pub fn collapse(self: &mut GridTrack) {
+        self.is_collapsed = true;
+        self.min_track_sizing_function = sgrid.MinTrackSizingFunction.zero();
+        self.max_track_sizing_function = sgrid.MaxTrackSizingFunction.zero();
+        self.fit_content_limit = util.infinity();
+    }
+
+    /// Whether the max track sizing function is fr.
+    pub fn is_flexible(self: &GridTrack) -> bool {
+        return self.max_track_sizing_function.is_fr();
+    }
+
+    /// Whether either sizing function depends on a percentage basis.
+    pub fn uses_percentage(self: &GridTrack) -> bool {
+        return self.min_track_sizing_function.uses_percentage() or self.max_track_sizing_function.uses_percentage();
+    }
+
+    /// Whether either sizing function is intrinsic.
+    pub fn has_intrinsic_sizing_function(self: &GridTrack) -> bool {
+        return self.min_track_sizing_function.is_intrinsic() or self.max_track_sizing_function.is_intrinsic();
+    }
+
+    /// Caches the fit-content() limit against the container's inner size
+    /// in this axis; infinity when there is none.
+    pub fn resolve_fit_content_limit(self: &mut GridTrack, axis_inner_node_size: ?f32) {
+        self.fit_content_limit = util.unwrap_or(self.max_track_sizing_function.fit_content_limit(axis_inner_node_size), util.infinity());
+    }
+
+    /// The growth limit, capped by the fit-content() limit.
+    pub fn fit_content_limited_growth_limit(self: &GridTrack) -> f32 {
+        return util.f32_min(a: self.growth_limit, b: self.fit_content_limit);
+    }
+
+    /// The flex factor of an fr track, else 0.
+    pub fn flex_factor(self: &GridTrack) -> f32 {
+        if self.max_track_sizing_function.is_fr() {
+            return self.max_track_sizing_function.inner.value();
+        }
+        return 0.0;
+    }
+}
+
+/// How a track of the other axis is estimated while items are sized
+/// (taffy's get_track_size_estimate closures).
+pub type TrackSizeEstimate = enum {
+    /// The definite value of the max track sizing function (the first
+    /// sizing of the columns).
+    MaxTrackDefiniteValue,
+    /// The base size.
+    BaseSize,
+
+    /// The estimate of a track against the parent size in its axis.
+    pub fn estimate(self: TrackSizeEstimate, track: &GridTrack, parent_size: ?f32) -> ?f32 {
+        match self {
+            .MaxTrackDefiniteValue => { return track.max_track_sizing_function.definite_value(parent_size); }
+            .BaseSize => { return track.base_size; }
+        }
+    }
+}
+
+/// The start of Rust's f32 sum (iter::Sum for f32): -0.0, so that a sum of
+/// nothing, or of negative zeros only, is -0.0.
+pub fn sum_zero() -> f32 {
+    return -0.0;
+}

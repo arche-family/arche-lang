@@ -1,0 +1,2800 @@
+/// compute.flexbox: taffy 0.15's compute/flexbox.rs, the flexbox layout
+/// algorithm (https://www.w3.org/TR/css-flexbox-1/), with taffy's
+/// flexbox_balance feature on: `flex-wrap: balance` and `flex-line-count`.
+///
+/// The functions are taffy's, in its order and with its names; the f32
+/// operations are taffy's, in the same order, so the boxes are the same bit
+/// for bit. Where Rust and Arche differ:
+/// - A flex line is a range of the item list (start..end), not a slice of
+///   it: a view cannot be a field. Functions take the items and the lines
+///   as two slices.
+/// - An item's out-of-flow candidates live beside it, in a list of their
+///   own indexed like the items, so that FlexItem stays a plain value.
+/// - Rust's f32 `sum()` starts from -0.0, and so do the sums here.
+/// - taffy's calc resolver is not a parameter: calc() resolves itself.
+/// - taffy's `mod balance` is the last part of this module.
+import alloc;
+import core.float;
+import layout.compute.common.alignment as calign;
+import layout.compute.common.scrollable_overflow as soverflow;
+import layout.compute.common.sizing_keyword as skw;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.tree as lt;
+import layout.util;
+
+/// The intermediate results of a flexbox calculation for a single item
+/// (FlexItem).
+type FlexItem = struct {
+    /// The identifier for the associated node.
+    node: lt.NodeId,
+    /// The order of the node relative to its siblings.
+    order: u32,
+    /// The base size of this item.
+    size: geo.Size(?f32),
+    /// The raw size style of this item, for its sizing keywords.
+    size_style: geo.Size(sty.Dimension),
+    /// The minimum allowable size of this item.
+    min_size: geo.Size(?f32),
+    /// The maximum allowable size of this item.
+    max_size: geo.Size(?f32),
+    /// The aspect ratio of this item.
+    aspect_ratio: ?f32,
+    /// The cross-alignment of this item.
+    align_self: sty.AlignSelf,
+    /// The overflow style of the item.
+    overflow: geo.Point(sty.Overflow),
+    /// The contain style of the item.
+    contain: sty.Contain,
+    /// The width of the scrollbars (if it has any).
+    scrollbar_width: f32,
+    /// The flex shrink style of the item.
+    flex_shrink: f32,
+    /// The flex grow style of the item.
+    flex_grow: f32,
+    /// Whether the item's used flex basis is definite (rather than derived
+    /// from the item's content).
+    flex_basis_is_definite: bool,
+    /// The minimum size of the item, content-based automatic minimum sizes
+    /// included.
+    resolved_minimum_main_size: f32,
+    /// The `position: relative` offset of this item, in the container's
+    /// flex axes (zero for non-relative items).
+    relative_inset: geo.Size(f32),
+    /// The margin of this item.
+    margin: geo.Rect(f32),
+    /// Whether each margin is an auto margin or not.
+    margin_is_auto: geo.Rect(bool),
+    /// The padding of this item.
+    padding: geo.Rect(f32),
+    /// The border of this item.
+    border: geo.Rect(f32),
+    /// The default size of this item.
+    flex_basis: f32,
+    /// The default size of this item, minus padding and border.
+    inner_flex_basis: f32,
+    /// The amount by which this item has deviated from its target size.
+    violation: f32,
+    /// Is the size of this item locked.
+    frozen: bool,
+    /// Either the max- or min- content flex fraction.
+    content_flex_fraction: f32,
+    /// The proposed inner size of this item.
+    hypothetical_inner_size: geo.Size(f32),
+    /// The proposed outer size of this item.
+    hypothetical_outer_size: geo.Size(f32),
+    /// The size that this item wants to be.
+    target_size: geo.Size(f32),
+    /// The size that this item wants to be, plus any padding and border.
+    outer_target_size: geo.Size(f32),
+    /// The position of the bottom edge of this item.
+    baseline: f32,
+    /// A temporary value for the main offset, from relative position,
+    /// alignment and justification.
+    offset_main: f32,
+    /// A temporary value for the cross offset.
+    offset_cross: f32,
+
+    /// Whether the item is a scroll container.
+    fn is_scroll_container(self: &FlexItem) -> bool {
+        return self.overflow.x.is_scroll_container() or self.overflow.y.is_scroll_container();
+    }
+
+    /// Whether the item participates in baseline alignment: align-self
+    /// baseline and neither cross-axis margin auto.
+    fn participates_in_baseline_alignment(self: &FlexItem, dir: sty.FlexDirection) -> bool {
+        return is_align_baseline(self.align_self) and not self.margin_is_auto.cross_start(dir) and not self.margin_is_auto.cross_end(dir);
+    }
+}
+
+/// A line of flex items: the items start..end of the item list
+/// (FlexLine).
+type FlexLine = struct {
+    /// The first item of the line.
+    start: usize,
+    /// One past the last item.
+    end: usize,
+    /// The dimensions of the cross-axis.
+    cross_size: f32,
+    /// The relative offset of the cross-axis.
+    offset_cross: f32,
+}
+
+/// Values that can be cached during the flexbox algorithm (AlgoConstants).
+type AlgoConstants = struct {
+    /// The direction of the current segment being laid out.
+    dir: sty.FlexDirection,
+    /// The layout direction of the current segment being laid out.
+    layout_direction: sty.Direction,
+    /// Is this segment a row.
+    is_row: bool,
+    /// Is this segment a column.
+    is_column: bool,
+    /// Is wrapping enabled (in either direction).
+    is_wrap: bool,
+    /// Is the wrap direction inverted.
+    is_wrap_reverse: bool,
+    /// Are items balanced across lines (`flex-wrap: balance`).
+    is_balance: bool,
+    /// The requested minimum number of lines (`flex-line-count`): some for
+    /// every multi-line container, none for nowrap.
+    line_count: ?u16,
+    /// The container's min size style.
+    min_size: geo.Size(?f32),
+    /// The container's max size style.
+    max_size: geo.Size(?f32),
+    /// The border of this section.
+    border: geo.Rect(f32),
+    /// The space between the content box and the border box: padding,
+    /// border and scrollbar gutter.
+    content_box_inset: geo.Rect(f32),
+    /// The size reserved for scrollbar gutters in each axis.
+    scrollbar_gutter: geo.Point(f32),
+    /// Whether the node being laid out is a scroll container.
+    is_scroll_container: bool,
+    /// The gap of this section.
+    gap: geo.Size(f32),
+    /// The align_items property of this node.
+    align_items: sty.AlignItems,
+    /// The align_content property of this node.
+    align_content: sty.AlignContent,
+    /// The justify_content property of this node.
+    justify_content: sty.JustifyContent,
+    /// The border-box size of the node being laid out (if known).
+    node_outer_size: geo.Size(?f32),
+    /// The content-box size of the node being laid out (if known).
+    node_inner_size: geo.Size(?f32),
+    /// Whether the known main size of the node (if any) is definite.
+    known_main_size_is_definite: bool,
+    /// Whether the node has a known main size which is definite.
+    has_definite_main_size: bool,
+    /// Whether the node has a known cross size which is definite.
+    has_definite_cross_size: bool,
+    /// Whether the cross-axis space that non-stretched items are
+    /// fit-content sized into is definite.
+    cross_axis_available_space_is_definite: bool,
+    /// The size of the virtual container containing the flex items.
+    container_size: geo.Size(f32),
+    /// The size of the internal container.
+    inner_container_size: geo.Size(f32),
+
+    /// The definite cross-axis space for measuring items, divided between
+    /// the requested number of lines (after the gaps between them) when a
+    /// multi-line container asks for more than one (divided_cross_space).
+    fn divided_cross_space(self: &AlgoConstants, cross_available_space: f32) -> f32 {
+        match self.line_count {
+            some(requested) => {
+                if requested > 1 {
+                    let line_count = requested as f32;
+                    return (cross_available_space - (line_count - 1.0) * self.gap.cross(self.dir)) / line_count;
+                }
+            }
+            none => { }
+        }
+        return cross_available_space;
+    }
+}
+
+/// compute_flexbox_layout: the layout of a box by the flexbox algorithm.
+pub fn compute_flexbox_layout(tree: &mut dyn lt.LayoutTree, node: lt.NodeId, inputs: lt.LayoutInput) -> lt.LayoutOutput {
+    let known_dimensions = inputs.known_dimensions;
+    let parent_size = inputs.parent_size;
+    let run_mode = inputs.run_mode;
+    let style = tree.get_style(node);
+
+    let contain = style.contain;
+    let aspect_ratio = style.aspect_ratio;
+    let padding = style.padding.resolve_or_zero(parent_size.width);
+    let border = style.border.resolve_or_zero(parent_size.width);
+    let padding_border_sum = padding.sum_axes().add(border.sum_axes());
+    var box_sizing_adjustment = geo.size_zero();
+    if style.box_sizing == sty.BoxSizing.ContentBox {
+        box_sizing_adjustment = padding_border_sum;
+    }
+
+    let min_size = style.min_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    let max_size = style.max_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    var clamped_style_size = geo.size_none();
+    if inputs.sizing_mode == lt.SizingMode.InherentSize {
+        clamped_style_size = style.size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment).maybe_clamp(min: min_size, max: max_size);
+    }
+
+    // If both min and max in a given axis are set and max <= min then this
+    // determines the size in that axis.
+    let min_max_definite_size = geo.Size(?f32) {
+        width: min_max_definite(min: min_size.width, max: max_size.width),
+        height: min_max_definite(min: min_size.height, max: max_size.height),
+    };
+
+    // The size of the container should be floored by the padding and border.
+    let styled_based_known_dimensions = known_dimensions.fallback(min_max_definite_size.fallback(clamped_style_size).maybe_max_f(padding_border_sum));
+
+    // Short-circuit layout if the container's size is fully determined by
+    // the container's size and the run mode is ComputeSize.
+    if run_mode == lt.RunMode.ComputeSize {
+        match styled_based_known_dimensions.width {
+            some(width) => {
+                match styled_based_known_dimensions.height {
+                    some(height) => { return lt.LayoutOutput.from_outer_size(geo.Size(f32) { width: width, height: height }); }
+                    none => { }
+                }
+                // The width is known and only the width is requested.
+                if inputs.axis == lt.RequestedAxis.Horizontal {
+                    return lt.LayoutOutput.from_outer_size(geo.Size(f32) { width: width, height: 0.0 });
+                }
+            }
+            none => { }
+        }
+    }
+
+    // The definiteness flags only apply to dimensions passed in as known by
+    // the parent: dimensions from the node's own style are always definite.
+    let known_dimensions_are_definite = geo.Size(bool) {
+        width: inputs.known_dimensions_are_definite.width or util.is_none(known_dimensions.width),
+        height: inputs.known_dimensions_are_definite.height or util.is_none(known_dimensions.height),
+    };
+
+    var preliminary_inputs = inputs;
+    preliminary_inputs.known_dimensions = styled_based_known_dimensions;
+    preliminary_inputs.known_dimensions_are_definite = known_dimensions_are_definite;
+    var output = compute_preliminary(tree, node, preliminary_inputs);
+
+    // Layout containment suppresses the box's baseline for baseline
+    // alignment.
+    if contain.suppresses_baseline() {
+        output.baselines = lt.Baselines.none_set();
+    }
+
+    return output;
+}
+
+/// min when both are some and max <= min, else none.
+fn min_max_definite(min: ?f32, max: ?f32) -> ?f32 {
+    match min {
+        some(lo) => {
+            match max {
+                some(hi) => {
+                    if hi <= lo {
+                        return lo;
+                    }
+                }
+                none => { }
+            }
+        }
+        none => { }
+    }
+    return none;
+}
+
+/// compute_preliminary: the flex layout algorithm itself (§9).
+fn compute_preliminary(tree: &mut dyn lt.LayoutTree, node: lt.NodeId, inputs: lt.LayoutInput) -> lt.LayoutOutput {
+    let known_dimensions = inputs.known_dimensions;
+    let parent_size = inputs.parent_size;
+    let run_mode = inputs.run_mode;
+    let a = tree.allocator();
+
+    // Define some general constants we will need for the remainder of the
+    // algorithm.
+    var constants = compute_constants(tree.get_style(node), known_dimensions: known_dimensions, known_dimensions_are_definite: inputs.known_dimensions_are_definite, parent_size: parent_size, available_space: inputs.available_space);
+
+    // 9.1. Initial Setup
+
+    // 1. Generate anonymous flex items as described in §4 Flex Items.
+    var flex_items = generate_anonymous_flex_items(tree, node, &constants, a);
+    var item_candidates = alloc.List(lt.OofCandidates).init(a);
+    var c: usize = 0;
+    while c < flex_items.len() : (c += 1) {
+        item_candidates.push(lt.OofCandidates.new());
+    }
+
+    // 9.2. Line Length Determination
+
+    // 2. Determine the available main and cross space for the flex items.
+    let available_space = determine_available_space(known_dimensions, inputs.available_space, &constants);
+
+    // 3. Determine the flex base size and hypothetical main size of each
+    //    item.
+    determine_flex_base_size(tree, &constants, available_space, flex_items.items_mut());
+
+    // 4. Determine the main size of the flex container: done as part of
+    //    compute_constants (constants.node_inner_size).
+
+    // 9.3. Main Size Determination
+
+    // 5. Collect flex items into flex lines.
+    var flex_lines = if constants.is_balance { collect_balanced_flex_lines(&constants, available_space, flex_items.items(), a) } else { collect_flex_lines(&constants, available_space, flex_items.items(), a) };
+
+    // If the container size is undefined, determine the container's main
+    // size and then re-resolve gaps based on the newly determined size.
+    match constants.node_inner_size.main(constants.dir) {
+        some(inner_main_size) => {
+            let outer_main_size = inner_main_size + constants.content_box_inset.main_axis_sum(constants.dir);
+            constants.inner_container_size.set_main(constants.dir, inner_main_size);
+            constants.container_size.set_main(constants.dir, outer_main_size);
+        }
+        none => {
+            // Sets constants.container_size and
+            // constants.inner_container_size.
+            determine_container_main_size(tree, available_space, flex_lines.items(), flex_items.items_mut(), &mut constants);
+            let determined_inner = constants.inner_container_size.main(constants.dir);
+            let determined_outer = constants.container_size.main(constants.dir);
+            constants.node_inner_size.set_main(constants.dir, some(determined_inner));
+            constants.node_outer_size.set_main(constants.dir, some(determined_outer));
+
+            // Re-resolve percentage gaps.
+            let style = tree.get_style(node);
+            let inner_container_size = constants.inner_container_size.main(constants.dir);
+            let new_gap = util.unwrap_or(style.gap.main(constants.dir).maybe_resolve_f(inner_container_size), 0.0);
+            constants.gap.set_main(constants.dir, new_gap);
+        }
+    }
+
+    // If only the container's main size has been requested then we are
+    // done, as nothing below changes it.
+    if run_mode == lt.RunMode.ComputeSize {
+        var main_axis_is_requested_axis = false;
+        match inputs.axis {
+            .Horizontal => { main_axis_is_requested_axis = constants.dir.is_row(); }
+            .Vertical => { main_axis_is_requested_axis = constants.dir.is_column(); }
+            .Both => { }
+        }
+        if main_axis_is_requested_axis {
+            let main_only = geo.size_zero().with_main(constants.dir, constants.container_size.main(constants.dir));
+            return lt.LayoutOutput.from_outer_size(main_only);
+        }
+    }
+
+    // 6. Resolve the flexible lengths of all the flex items to find their
+    //    used main size.
+    for line in flex_lines.items() {
+        resolve_flexible_lengths(line.*, flex_items.items_mut(), &constants);
+    }
+
+    // 9.4. Cross Size Determination
+
+    // 7. Determine the hypothetical cross size of each item.
+    for line in flex_lines.items() {
+        determine_hypothetical_cross_size(tree, line.*, flex_items.items_mut(), &constants, available_space);
+    }
+
+    // Calculate child baselines, only where they are needed.
+    calculate_children_base_lines(tree, known_dimensions, available_space, flex_lines.items(), flex_items.items_mut(), &constants);
+
+    // 8. Calculate the cross size of each flex line.
+    calculate_cross_size(flex_lines.items_mut(), flex_items.items(), known_dimensions, &constants);
+
+    // 9. Handle 'align-content: stretch'.
+    handle_align_content_stretch(flex_lines.items_mut(), known_dimensions, &constants);
+
+    // 10. Collapse visibility:collapse items: not supported, as in taffy.
+
+    // 11. Determine the used cross size of each flex item.
+    determine_used_cross_size(tree, flex_lines.items(), flex_items.items_mut(), &constants);
+
+    // 9.5. Main-Axis Alignment
+
+    // 12. Distribute any remaining free space.
+    distribute_remaining_free_space(flex_lines.items(), flex_items.items_mut(), &constants);
+
+    // 9.6. Cross-Axis Alignment
+
+    // 13. Resolve cross-axis auto margins (also includes 14).
+    resolve_cross_axis_auto_margins(flex_lines.items(), flex_items.items_mut(), &constants);
+
+    // 15. Determine the flex container's used cross size.
+    let total_line_cross_size = determine_container_cross_size(flex_lines.items(), known_dimensions, &mut constants);
+
+    // We have the container size. If our caller does not care about
+    // performing layout we are done now.
+    if run_mode == lt.RunMode.ComputeSize {
+        return lt.LayoutOutput.from_outer_size(constants.container_size);
+    }
+
+    // 16. Align all flex lines per align-content.
+    align_flex_lines_per_align_content(flex_lines.items_mut(), &constants, total_line_cross_size);
+
+    // Do a final layout pass and gather the resulting layouts.
+    let inflow_overflow_rect = final_layout_pass(tree, flex_lines.items(), flex_items.items_mut(), item_candidates.items_mut(), &constants);
+
+    // Collect out-of-flow candidates in document order: direct out-of-flow
+    // children interleaved with candidates bubbled from in-flow children's
+    // subtrees. The out-of-flow pass (compute.oof) lays them out later.
+    var candidates = lt.OofCandidates.new();
+    collect_oof_candidates(tree, node, &constants, flex_items.items(), item_candidates.items_mut(), &mut candidates, a);
+
+    let gutter_x = constants.scrollbar_gutter.x;
+    var inset_left: f32 = 0.0;
+    var inset_right = gutter_x;
+    if constants.layout_direction.is_rtl() {
+        inset_left = gutter_x;
+        inset_right = 0.0;
+    }
+    let absolute_position_inset = constants.border.add(geo.Rect(f32) { left: inset_left, right: inset_right, top: 0.0, bottom: constants.scrollbar_gutter.y });
+    let absolute_position_area = constants.container_size.sub(absolute_position_inset.sum_axes());
+    let absolute_position_offset = geo.Point(f32) { x: absolute_position_inset.left, y: absolute_position_inset.top };
+
+    // Hidden layout of display: none children.
+    let len = tree.child_count(node);
+    var order: usize = 0;
+    while order < len : (order += 1) {
+        let child = tree.get_child_id(node, order);
+        if tree.get_style(child).box_generation_mode() == sty.BoxGenerationMode.None {
+            let hidden = lt.Layout.with_order(order as u32);
+            tree.set_unrounded_layout(child, &hidden);
+            _ = lt.perform_child_layout(tree, child, known_dimensions: geo.size_none(), parent_size: geo.size_none(), available_space: geo.size_max_content(), sizing_mode: lt.SizingMode.ContentSize, vertical_margins_are_collapsible: geo.line_false());
+        }
+    }
+
+    // 8.5. Flex Container Baselines: the first baseline, from the
+    // startmost flex line (the last in line order for wrap-reverse).
+    var first_vertical_baseline: ?f32 = none;
+    let line_total = flex_lines.len();
+    if line_total > 0 {
+        var first_line = flex_lines.items()[0];
+        if constants.is_wrap_reverse {
+            first_line = flex_lines.items()[line_total - 1];
+        }
+        let items = flex_items.items();
+        if first_line.end > first_line.start {
+            if constants.is_column {
+                // The startmost item: the last in flex order for reverse
+                // directions.
+                if constants.dir.is_reverse() {
+                    first_vertical_baseline = some(items[first_line.end - 1].baseline);
+                } else {
+                    first_vertical_baseline = some(items[first_line.start].baseline);
+                }
+            } else {
+                var chosen = first_line.start;
+                var i = first_line.start;
+                while i < first_line.end : (i += 1) {
+                    if items[i].participates_in_baseline_alignment(constants.dir) {
+                        chosen = i;
+                        break;
+                    }
+                }
+                first_vertical_baseline = some(items[chosen].baseline);
+            }
+        }
+    }
+
+    var output = lt.LayoutOutput.from_sizes_and_baselines(constants.container_size, inflow_overflow_rect, lt.Baselines.from_first(first_vertical_baseline));
+    output.oof_candidates = candidates;
+    output.oof_positioning_area = some(lt.OofPositioningArea { size: absolute_position_area, offset: absolute_position_offset });
+    return output;
+}
+
+/// resolve_normal_alignment: `normal` behaves as `stretch` for flex items.
+fn resolve_normal_alignment(alignment_value: sty.AlignItems) -> sty.AlignItems {
+    if alignment_value.keyword == sty.AlignItemsKeyword.Normal {
+        return sty.AlignItems.stretch();
+    }
+    return alignment_value;
+}
+
+/// Whether an alignment is AlignSelf::STRETCH (taffy's ==: the keyword and
+/// the safety).
+fn is_align_stretch(value: sty.AlignItems) -> bool {
+    return value.keyword == sty.AlignItemsKeyword.Stretch and value.safety == sty.AlignmentSafety.Default;
+}
+
+/// Whether an alignment is AlignSelf::BASELINE.
+fn is_align_baseline(value: sty.AlignItems) -> bool {
+    return value.keyword == sty.AlignItemsKeyword.Baseline and value.safety == sty.AlignmentSafety.Default;
+}
+
+/// Whether available space is min-content.
+fn is_min_content(space: sty.AvailableSpace) -> bool {
+    match space {
+        .MinContent => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// f32::is_normal: neither zero, subnormal, infinite nor NaN.
+fn is_normal(x: f32) -> bool {
+    let exponent = float.bits32(x) & 0x7F800000;
+    return exponent != 0 and exponent != 0x7F800000;
+}
+
+/// compute_constants: the constants reused through the algorithm.
+fn compute_constants(style: &sty.Style, known_dimensions: geo.Size(?f32), known_dimensions_are_definite: geo.Size(bool), parent_size: geo.Size(?f32), available_space: geo.Size(sty.AvailableSpace)) -> AlgoConstants {
+    let dir = style.flex_direction;
+    let is_row = dir.is_row();
+    let is_column = dir.is_column();
+    let flex_wrap = style.flex_wrap;
+    let is_wrap = flex_wrap.is_multi_line();
+    let is_wrap_reverse = flex_wrap.is_reverse();
+    let is_balance = flex_wrap.is_balance();
+    var line_count: ?u16 = none;
+    if is_wrap {
+        var requested = style.flex_line_count;
+        if requested < 1 {
+            requested = 1;
+        }
+        line_count = some(requested);
+    }
+
+    let aspect_ratio = style.aspect_ratio;
+    let padding = style.padding.resolve_or_zero(parent_size.width);
+    let border = style.border.resolve_or_zero(parent_size.width);
+    let padding_border_sum = padding.sum_axes().add(border.sum_axes());
+    var box_sizing_adjustment = geo.size_zero();
+    if style.box_sizing == sty.BoxSizing.ContentBox {
+        box_sizing_adjustment = padding_border_sum;
+    }
+
+    // `normal` behaves as `stretch` for flex items; resolved once here so
+    // that items deferring to align-items are resolved too.
+    let align_items = resolve_normal_alignment(style.align_items);
+    // `normal` behaves as `stretch` for flex containers; in the main axis
+    // `stretch` behaves as `flex-start`.
+    var align_content = style.align_content;
+    if align_content.keyword == sty.AlignContentKeyword.Normal {
+        align_content = sty.AlignContent.stretch();
+    }
+    var justify_content = style.justify_content;
+    if justify_content.keyword == sty.AlignContentKeyword.Normal {
+        justify_content = sty.AlignContent.flex_start();
+    }
+    let layout_direction = style.direction;
+
+    // Scrollbar gutters are reserved for `overflow: scroll`, the axes
+    // transposed: a node that scrolls vertically reserves horizontal space.
+    let overflow = style.overflow;
+    var gutter_x: f32 = 0.0;
+    if overflow.y == sty.Overflow.Scroll {
+        gutter_x = style.scrollbar_width;
+    }
+    var gutter_y: f32 = 0.0;
+    if overflow.x == sty.Overflow.Scroll {
+        gutter_y = style.scrollbar_width;
+    }
+    let scrollbar_gutter = geo.Point(f32) { x: gutter_x, y: gutter_y };
+    let is_scroll_container = overflow.x.is_scroll_container() or overflow.y.is_scroll_container();
+    var content_box_inset = padding.add(border);
+    content_box_inset.bottom = content_box_inset.bottom + scrollbar_gutter.y;
+
+    match layout_direction {
+        .Ltr => { content_box_inset.right = content_box_inset.right + scrollbar_gutter.x; }
+        .Rtl => { content_box_inset.left = content_box_inset.left + scrollbar_gutter.x; }
+    }
+
+    let node_outer_size = known_dimensions;
+    let node_inner_size = node_outer_size.maybe_sub_f(content_box_inset.sum_axes());
+    let known_main_size_is_definite = known_dimensions_are_definite.main(dir);
+    let has_definite_main_size = known_main_size_is_definite and util.is_some(known_dimensions.main(dir));
+    let has_definite_cross_size = known_dimensions_are_definite.cross(dir) and util.is_some(known_dimensions.cross(dir));
+    let cross_axis_available_space_is_definite = has_definite_cross_size or available_space.cross(dir).is_definite();
+    let gap = style.gap.resolve_or_zero(node_inner_size.fallback(geo.size_some(width: 0.0, height: 0.0)));
+
+    return AlgoConstants {
+        dir: dir,
+        layout_direction: layout_direction,
+        is_row: is_row,
+        is_column: is_column,
+        is_wrap: is_wrap,
+        is_wrap_reverse: is_wrap_reverse,
+        is_balance: is_balance,
+        line_count: line_count,
+        min_size: style.min_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment),
+        max_size: style.max_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment),
+        border: border,
+        content_box_inset: content_box_inset,
+        scrollbar_gutter: scrollbar_gutter,
+        is_scroll_container: is_scroll_container,
+        gap: gap,
+        align_items: align_items,
+        align_content: align_content,
+        justify_content: justify_content,
+        node_outer_size: node_outer_size,
+        node_inner_size: node_inner_size,
+        known_main_size_is_definite: known_main_size_is_definite,
+        has_definite_main_size: has_definite_main_size,
+        has_definite_cross_size: has_definite_cross_size,
+        cross_axis_available_space_is_definite: cross_axis_available_space_is_definite,
+        container_size: geo.size_zero(),
+        inner_container_size: geo.size_zero(),
+    };
+}
+
+/// value.map(|pos| -pos).
+fn negated(value: ?f32) -> ?f32 {
+    match value {
+        some(v) => { return -v; }
+        none => { return none; }
+    }
+}
+
+/// resolve_relative_inset: a `position: relative` item's inset as one
+/// offset in the container's flex axes, by flex and writing direction.
+fn resolve_relative_inset(inset: geo.Rect(?f32), constants: &AlgoConstants) -> geo.Size(f32) {
+    let direction = constants.dir;
+    let is_rtl_row = direction.is_row() and constants.layout_direction.is_rtl();
+    let is_rtl_column = direction.is_column() and constants.layout_direction.is_rtl();
+    var main_offset: f32 = 0.0;
+    if is_rtl_row {
+        main_offset = util.unwrap_or(util.opt_or(value: inset.main_end(direction), alt: negated(inset.main_start(direction))), 0.0);
+    } else {
+        main_offset = util.unwrap_or(util.opt_or(value: inset.main_start(direction), alt: negated(inset.main_end(direction))), 0.0);
+    }
+    var cross_offset: f32 = 0.0;
+    if is_rtl_column {
+        cross_offset = util.unwrap_or(util.opt_or(value: negated(inset.cross_end(direction)), alt: inset.cross_start(direction)), 0.0);
+    } else {
+        cross_offset = util.unwrap_or(util.opt_or(value: inset.cross_start(direction), alt: negated(inset.cross_end(direction))), 0.0);
+    }
+    var out = geo.size_zero();
+    out.set_main(direction, main_offset);
+    out.set_cross(direction, cross_offset);
+    return out;
+}
+
+/// generate_anonymous_flex_items (9.1): an item for every in-flow child
+/// that generates a box.
+fn generate_anonymous_flex_items(tree: &mut dyn lt.LayoutTree, node: lt.NodeId, constants: &AlgoConstants, a: alloc.Allocator) -> alloc.List(FlexItem) {
+    // Percentage sizes of items resolve against the container's inner size,
+    // but only if that size is definite.
+    var percent_resolution_size = constants.node_inner_size;
+    if not constants.known_main_size_is_definite {
+        percent_resolution_size = constants.node_inner_size.with_main(constants.dir, none);
+    }
+
+    var items = alloc.List(FlexItem).init(a);
+    let count = tree.child_count(node);
+    var index: usize = 0;
+    while index < count : (index += 1) {
+        let child = tree.get_child_id(node, index);
+        let child_style = tree.get_style(child);
+        if child_style.position.is_out_of_flow() {
+            continue;
+        }
+        if child_style.box_generation_mode() == sty.BoxGenerationMode.None {
+            continue;
+        }
+        let aspect_ratio = child_style.aspect_ratio;
+        let padding = child_style.padding.resolve_or_zero(constants.node_inner_size.width);
+        let border = child_style.border.resolve_or_zero(constants.node_inner_size.width);
+        let pb_sum = padding.add(border).sum_axes();
+        var box_sizing_adjustment = geo.size_zero();
+        if child_style.box_sizing == sty.BoxSizing.ContentBox {
+            box_sizing_adjustment = pb_sum;
+        }
+
+        var relative_inset = geo.size_zero();
+        if child_style.position == sty.Position.Relative {
+            let style_inset = child_style.inset;
+            let inset = geo.Rect(?f32) {
+                left: style_inset.left.maybe_resolve(constants.node_inner_size.width),
+                right: style_inset.right.maybe_resolve(constants.node_inner_size.width),
+                top: style_inset.top.maybe_resolve(constants.node_inner_size.height),
+                bottom: style_inset.bottom.maybe_resolve(constants.node_inner_size.height),
+            };
+            relative_inset = resolve_relative_inset(inset, constants);
+        }
+
+        let style_margin = child_style.margin;
+        let align_self = resolve_normal_alignment(child_style.align_self orelse constants.align_items).resolve_self_relative(item_direction: child_style.direction, container_direction: constants.layout_direction, axis_is_inline: constants.is_column);
+
+        items.push(FlexItem {
+            node: child,
+            order: index as u32,
+            size: child_style.size.maybe_resolve(percent_resolution_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment),
+            size_style: child_style.size,
+            min_size: child_style.min_size.maybe_resolve(percent_resolution_size).maybe_add_f(box_sizing_adjustment),
+            max_size: child_style.max_size.maybe_resolve(percent_resolution_size).maybe_add_f(box_sizing_adjustment),
+            aspect_ratio: aspect_ratio,
+            align_self: align_self,
+            overflow: child_style.overflow,
+            contain: child_style.contain,
+            scrollbar_width: child_style.scrollbar_width,
+            flex_shrink: child_style.flex_shrink,
+            flex_grow: child_style.flex_grow,
+            flex_basis_is_definite: false,
+            resolved_minimum_main_size: 0.0,
+            relative_inset: relative_inset,
+            margin: style_margin.resolve_or_zero(constants.node_inner_size.width),
+            margin_is_auto: geo.Rect(bool) {
+                left: style_margin.left.is_auto(),
+                right: style_margin.right.is_auto(),
+                top: style_margin.top.is_auto(),
+                bottom: style_margin.bottom.is_auto(),
+            },
+            padding: child_style.padding.resolve_or_zero(constants.node_inner_size.width),
+            border: child_style.border.resolve_or_zero(constants.node_inner_size.width),
+            flex_basis: 0.0,
+            inner_flex_basis: 0.0,
+            violation: 0.0,
+            frozen: false,
+            content_flex_fraction: 0.0,
+            hypothetical_inner_size: geo.size_zero(),
+            hypothetical_outer_size: geo.size_zero(),
+            target_size: geo.size_zero(),
+            outer_target_size: geo.size_zero(),
+            baseline: 0.0,
+            offset_main: 0.0,
+            offset_cross: 0.0,
+        });
+    }
+    return items;
+}
+
+/// determine_available_space (9.2): the available main and cross space
+/// for the flex items. A definite content-box size is used; otherwise the
+/// container's own available space less its padding and border (the
+/// parent took its margins off already). This may be infinite.
+fn determine_available_space(known_dimensions: geo.Size(?f32), outer_available_space: geo.Size(sty.AvailableSpace), constants: &AlgoConstants) -> geo.Size(sty.AvailableSpace) {
+    // The size styles were already applied to known_dimensions.
+    let width = match known_dimensions.width {
+        some(node_width) => { sty.AvailableSpace.Definite { value: util.f32_max(a: 0.0, b: node_width - constants.content_box_inset.horizontal_axis_sum()) } }
+        none => { outer_available_space.width.maybe_sub_f(constants.content_box_inset.horizontal_axis_sum()).maybe_max_f(0.0) }
+    };
+    let height = match known_dimensions.height {
+        some(node_height) => { sty.AvailableSpace.Definite { value: util.f32_max(a: 0.0, b: node_height - constants.content_box_inset.vertical_axis_sum()) } }
+        none => { outer_available_space.height.maybe_sub_f(constants.content_box_inset.vertical_axis_sum()).maybe_max_f(0.0) }
+    };
+    return geo.Size(sty.AvailableSpace) { width: width, height: height };
+}
+
+/// overflow.map(Overflow::maybe_into_automatic_min_size) as a Size: the
+/// automatic minimum size of each axis (0 for a scroll container).
+fn automatic_min_size(overflow: geo.Point(sty.Overflow)) -> geo.Size(?f32) {
+    return geo.Size(?f32) { width: overflow.x.maybe_into_automatic_min_size(), height: overflow.y.maybe_into_automatic_min_size() };
+}
+
+/// determine_flex_base_size (9.2): the flex base size and hypothetical
+/// main size of each item. The min and max main sizes do not clamp the
+/// base size, and its content box is not floored at zero.
+fn determine_flex_base_size(tree: &mut dyn lt.LayoutTree, constants: &AlgoConstants, available_space: geo.Size(sty.AvailableSpace), flex_items: []mut FlexItem) {
+    let dir = constants.dir;
+
+    var item_index: usize = 0;
+    while item_index < flex_items.len() : (item_index += 1) {
+        var child = flex_items[item_index];
+        let child_style = tree.get_style(child.node);
+
+        // Parent size for child sizing.
+        let cross_axis_parent_size = constants.node_inner_size.cross(dir);
+        let child_parent_size = geo.size_from_cross(dir, cross_axis_parent_size);
+
+        // Available space for child sizing (excluding the child's margins).
+        // Min/max sizes transferred through the aspect ratio count
+        // (csswg-drafts#10997).
+        let transferred_min_size = child.min_size.maybe_apply_aspect_ratio(child.aspect_ratio);
+        let transferred_max_size = child.max_size.maybe_apply_aspect_ratio(child.aspect_ratio);
+        let child_min_cross = transferred_min_size.cross(dir);
+        let child_max_cross = transferred_max_size.cross(dir);
+
+        // Clamp available space by min- and max- size.
+        let cross_axis_available_space = match available_space.cross(dir) {
+            .Definite { value: val } => {
+                sty.AvailableSpace.Definite { value: util.f32_maybe_clamp(util.f32_max(a: 0.0, b: constants.divided_cross_space(util.unwrap_or(cross_axis_parent_size, val)) - child.margin.cross_axis_sum(dir)), min: child_min_cross, max: child_max_cross) }
+            }
+            .MinContent => {
+                match child_min_cross {
+                    some(min) => { sty.AvailableSpace.Definite { value: min } }
+                    none => { sty.AvailableSpace.MinContent }
+                }
+            }
+            .MaxContent => {
+                match child_max_cross {
+                    some(max) => { sty.AvailableSpace.Definite { value: max } }
+                    none => { sty.AvailableSpace.MaxContent }
+                }
+            }
+        };
+
+        // Known dimensions for child sizing.
+        var child_cross_size_is_definite = util.is_some(child.size.cross(dir));
+        var ckd = child.size.with_main(dir, none);
+        // Clamp the definite cross size by the cross min/max sizes, so that
+        // sizes transferred through an aspect ratio use the used cross size.
+        ckd.set_cross(dir, util.maybe_clamp(value: ckd.cross(dir), min: transferred_min_size.cross(dir), max: transferred_max_size.cross(dir)));
+        if is_align_stretch(child.align_self) and not child.margin_is_auto.cross_start(constants.dir) and not child.margin_is_auto.cross_end(constants.dir) and util.is_none(ckd.cross(dir)) {
+            ckd.set_cross(dir, cross_axis_available_space.into_option());
+            // The cross size of a stretched item is definite if the
+            // container has a definite cross size.
+            child_cross_size_is_definite = not constants.is_wrap and constants.has_definite_cross_size and util.is_some(cross_axis_parent_size);
+        }
+        let child_known_dimensions = ckd;
+
+        // Percentage padding and border resolve against the container's
+        // width, whichever axis is the main axis.
+        let container_width = constants.node_inner_size.width;
+        var box_sizing_adjustment: f32 = 0.0;
+        if child_style.box_sizing == sty.BoxSizing.ContentBox {
+            let padding = child_style.padding.resolve_or_zero(container_width);
+            let border = child_style.border.resolve_or_zero(container_width);
+            box_sizing_adjustment = padding.add(border).sum_axes().main(dir);
+        }
+        // Percentage flex bases resolve against the container's inner main
+        // size, but only if that size is definite.
+        var percent_resolution_main_size: ?f32 = none;
+        if constants.known_main_size_is_definite {
+            percent_resolution_main_size = constants.node_inner_size.main(dir);
+        }
+        let flex_basis_style = child_style.flex_basis;
+        let flex_basis = util.maybe_add_f(flex_basis_style.maybe_resolve(percent_resolution_main_size), box_sizing_adjustment);
+
+        // taffy's labelled block 'flex_basis, as a loop left by break.
+        var flex_basis_value: f32 = 0.0;
+        while true {
+            // A. If the item has a definite used flex basis, that's the flex
+            //    base size.
+
+            // B. If the flex item has an intrinsic aspect ratio, a used flex
+            //    basis of content, and a definite cross size, then the flex
+            //    base size is calculated from its inner cross size and the
+            //    flex item's intrinsic aspect ratio.
+
+            let main_size = child.size.main(dir);
+            let main_stretch_size = util.maybe_max_f(util.maybe_sub_f(percent_resolution_main_size, child.margin.main_axis_sum(dir)), 0.0);
+
+            // A flex basis that is a sizing keyword is used in place of the
+            // main size property: `stretch` resolves to an exact size, the
+            // others give the space the item is measured in. One that cannot
+            // resolve here behaves as `content`.
+            var keyword_main_available_space: ?sty.AvailableSpace = none;
+            if flex_basis_style.is_content() {
+                // `content`: the item is measured, its main size ignored.
+            } else if flex_basis_style.is_sizing_keyword() {
+                match skw.resolve_sizing_keyword(flex_basis_style, stretch_size: main_stretch_size, percent_resolution_basis: percent_resolution_main_size) {
+                    some(resolution) => {
+                        match resolution {
+                            .Exact { size } => {
+                                child.flex_basis_is_definite = true;
+                                flex_basis_value = size;
+                                break;
+                            }
+                            .Measure { space } => { keyword_main_available_space = some(space); }
+                        }
+                    }
+                    none => { }
+                }
+            } else {
+                var definite_basis = flex_basis;
+                if util.is_none(definite_basis) and flex_basis_style.is_auto() {
+                    definite_basis = main_size;
+                }
+                match definite_basis {
+                    some(basis) => {
+                        child.flex_basis_is_definite = true;
+                        flex_basis_value = basis;
+                        break;
+                    }
+                    none => { }
+                }
+
+                // A main size that is a sizing keyword either resolves to an
+                // exact size or gives the space the item is measured in.
+                if flex_basis_style.is_auto() {
+                    match skw.resolve_sizing_keyword(child.size_style.main(dir), stretch_size: main_stretch_size, percent_resolution_basis: percent_resolution_main_size) {
+                        some(resolution) => {
+                            match resolution {
+                                .Exact { size } => {
+                                    child.flex_basis_is_definite = true;
+                                    flex_basis_value = size;
+                                    break;
+                                }
+                                .Measure { space } => { keyword_main_available_space = some(space); }
+                            }
+                        }
+                        none => { }
+                    }
+                }
+            }
+
+            // C. Sizing under a min- or max-content constraint is covered by
+            //    E, which passes the constraint through.
+
+            // D. Orthogonal flows: not supported, as in taffy.
+
+            // An aspect ratio and a definite cross size give the flex base
+            // size through the ratio (B), and it is definite.
+            if child_cross_size_is_definite {
+                match child.aspect_ratio {
+                    some(ratio) => {
+                        match child_known_dimensions.cross(dir) {
+                            some(cross) => {
+                                child.flex_basis_is_definite = true;
+                                if dir.is_row() {
+                                    flex_basis_value = cross * ratio;
+                                } else {
+                                    flex_basis_value = cross / ratio;
+                                }
+                                break;
+                            }
+                            none => { }
+                        }
+                    }
+                    none => { }
+                }
+            }
+
+            // E. Otherwise, size the item into the available space using its
+            //    used flex basis in place of its main size, treating content
+            //    as max-content; an auto, indefinite cross size is
+            //    fit-content.
+            var definite_as_max = sty.AvailableSpace.MaxContent;
+            if is_min_content(available_space.main(dir)) {
+                definite_as_max = sty.AvailableSpace.MinContent;
+            }
+            let child_available_space = geo.size_max_content().with_main(dir, keyword_main_available_space orelse definite_as_max).with_cross(dir, cross_axis_available_space);
+
+            flex_basis_value = lt.measure_child_size(tree, child.node, known_dimensions: child_known_dimensions, parent_size: child_parent_size, available_space: child_available_space, sizing_mode: lt.SizingMode.ContentSize, axis: dir.main_axis(), vertical_margins_are_collapsible: geo.line_false());
+            break;
+        }
+        child.flex_basis = flex_basis_value;
+
+        // Floor flex-basis by the padding_border_sum (floors
+        // inner_flex_basis at zero), as Chrome and Firefox do.
+        let padding_border_sum = child.padding.main_axis_sum(constants.dir) + child.border.main_axis_sum(constants.dir);
+        child.flex_basis = util.f32_max(a: child.flex_basis, b: padding_border_sum);
+
+        // The hypothetical main size is the item's flex base size clamped
+        // according to its used min and max main sizes (and flooring the
+        // content box size at zero).
+
+        child.inner_flex_basis = child.flex_basis - child.padding.main_axis_sum(constants.dir) - child.border.main_axis_sum(constants.dir);
+
+        let padding_border_axes_sums = child.padding.add(child.border).sum_axes().map_some();
+
+        // The main-axis parent size is not passed: a percentage size in an
+        // axis does not contribute to a min-content contribution in it
+        // (css-sizing-3 #min-percentage-contribution).
+        let style_min_main_size = child.min_size.fallback(automatic_min_size(child.overflow)).main(dir);
+
+        child.resolved_minimum_main_size = match style_min_main_size {
+            some(style_min) => { style_min }
+            none => {
+                let min_content_space = geo.size_min_content().with_cross(dir, cross_axis_available_space);
+                let min_content_main_size = lt.measure_child_size(tree, child.node, known_dimensions: child_known_dimensions, parent_size: child_parent_size, available_space: min_content_space, sizing_mode: lt.SizingMode.ContentSize, axis: dir.main_axis(), vertical_margins_are_collapsible: geo.line_false());
+
+                // 4.5. Automatic Minimum Size of Flex Items.
+                let clamped_min_content_size = util.f32_maybe_min(util.f32_maybe_min(min_content_main_size, child.size.main(dir)), transferred_max_size.main(dir));
+                util.f32_maybe_max(clamped_min_content_size, padding_border_axes_sums.main(dir))
+            }
+        };
+
+        // Sizes transferred through the aspect ratio clamp the hypothetical
+        // main size, but do not resolve flexible lengths or clamp the final
+        // size (csswg-drafts#10997).
+        let hypothetical_inner_min_main = util.f32_maybe_max(util.f32_maybe_max(child.resolved_minimum_main_size, transferred_min_size.main(constants.dir)), padding_border_axes_sums.main(constants.dir));
+        let hypothetical_inner_size = util.f32_maybe_clamp(child.flex_basis, min: some(hypothetical_inner_min_main), max: transferred_max_size.main(constants.dir));
+        let hypothetical_outer_size = hypothetical_inner_size + child.margin.main_axis_sum(constants.dir);
+
+        child.hypothetical_inner_size.set_main(constants.dir, hypothetical_inner_size);
+        child.hypothetical_outer_size.set_main(constants.dir, hypothetical_outer_size);
+        flex_items[item_index] = child;
+    }
+}
+
+/// The main-axis space lines wrap against, from the container's max main
+/// size, its definiteness and the available space (shared by
+/// collect_flex_lines and collect_balanced_flex_lines).
+fn wrap_main_axis_available_space(constants: &AlgoConstants, available_space: geo.Size(sty.AvailableSpace)) -> sty.AvailableSpace {
+    match constants.max_size.main(constants.dir) {
+        some(max_size) => {
+            let available = available_space.main(constants.dir).into_option() orelse max_size;
+            // If the container's main size is not definite then it is at
+            // most the max main size, so the max size (and not the
+            // available space) is the limit that items wrap against.
+            var limited = available;
+            if not constants.has_definite_main_size {
+                limited = util.f32_min(a: available, b: max_size);
+            }
+            return sty.AvailableSpace.Definite { value: util.f32_maybe_max(limited, constants.min_size.main(constants.dir)) };
+        }
+        none => {
+            // A column container's automatic main size is content-based, so
+            // definite available space from an ancestor does not limit where
+            // its lines wrap. Automatic widths resolve against available
+            // space, so rows do wrap against it.
+            if not constants.dir.is_row() and not constants.has_definite_main_size and available_space.main(constants.dir).is_definite() {
+                return sty.AvailableSpace.MaxContent;
+            }
+            return available_space.main(constants.dir);
+        }
+    }
+}
+
+/// One line per item: every wrapping opportunity taken.
+fn one_line_per_item(item_count: usize, a: alloc.Allocator) -> alloc.List(FlexLine) {
+    var lines = alloc.List(FlexLine).init(a);
+    var i: usize = 0;
+    while i < item_count : (i += 1) {
+        lines.push(FlexLine { start: i, end: i + 1, cross_size: 0.0, offset_cross: 0.0 });
+    }
+    return lines;
+}
+
+/// collect_flex_lines (9.3): a single-line container's items in one line;
+/// otherwise consecutive items until the next would not fit the inner main
+/// size (an item that does not fit alone gets a line of its own), by
+/// outer hypothetical main size, which can be negative. Zero-sized items
+/// join the end of a line even when it is full.
+fn collect_flex_lines(constants: &AlgoConstants, available_space: geo.Size(sty.AvailableSpace), flex_items: []FlexItem, a: alloc.Allocator) -> alloc.List(FlexLine) {
+    let item_count = flex_items.len();
+    var lines = alloc.List(FlexLine).init(a);
+
+    // Wrapping into multiple lines requires a definite main size; a known
+    // main size derived from the container's own content puts every item
+    // into one line, as when the container was sized under a min- or
+    // max-content constraint.
+    if not constants.is_wrap or not constants.known_main_size_is_definite {
+        lines.push(FlexLine { start: 0, end: item_count, cross_size: 0.0, offset_cross: 0.0 });
+        return lines;
+    }
+
+    let main_axis_available_space = wrap_main_axis_available_space(constants, available_space);
+    match main_axis_available_space {
+        // Under a max-content constraint the flex items never wrap.
+        .MaxContent => {
+            lines.push(FlexLine { start: 0, end: item_count, cross_size: 0.0, offset_cross: 0.0 });
+            return lines;
+        }
+        // Wrapping under a min-content constraint takes every wrapping
+        // opportunity: each item in its own line.
+        .MinContent => {
+            return one_line_per_item(item_count, a);
+        }
+        .Definite { value: line_limit } => {
+            let main_axis_gap = constants.gap.main(constants.dir);
+            var line_start: usize = 0;
+            while line_start < item_count {
+                // The index of the first item of the next line (or the
+                // number of remaining items when they all fit).
+                var line_length: f32 = 0.0;
+                let remaining = item_count - line_start;
+                var index = remaining;
+                var idx: usize = 0;
+                while idx < remaining : (idx += 1) {
+                    // Gaps only occur between items, not before the first.
+                    var gap_contribution = main_axis_gap;
+                    if idx == 0 {
+                        gap_contribution = 0.0;
+                    }
+                    line_length = line_length + (flex_items[line_start + idx].hypothetical_outer_size.main(constants.dir) + gap_contribution);
+                    if line_length > line_limit and idx != 0 {
+                        index = idx;
+                        break;
+                    }
+                }
+                lines.push(FlexLine { start: line_start, end: line_start + index, cross_size: 0.0, offset_cross: 0.0 });
+                line_start = line_start + index;
+            }
+            return lines;
+        }
+    }
+}
+
+/// collect_balanced_flex_lines: the items in balanced flex lines
+/// (`flex-wrap: balance`), the largest line as small as possible
+/// (css-flexbox-2 #balance-values).
+fn collect_balanced_flex_lines(constants: &AlgoConstants, available_space: geo.Size(sty.AvailableSpace), flex_items: []FlexItem, a: alloc.Allocator) -> alloc.List(FlexLine) {
+    let item_count = flex_items.len();
+    if item_count == 0 {
+        return alloc.List(FlexLine).init(a);
+    }
+
+    // A known main size derived from the container's own content balances
+    // the items without a size limit, as when the container was sized
+    // under a min- or max-content constraint.
+    var main_axis_available_space = sty.AvailableSpace.MaxContent;
+    if constants.known_main_size_is_definite {
+        main_axis_available_space = wrap_main_axis_available_space(constants, available_space);
+    }
+
+    // Under a min-content constraint every wrapping opportunity is taken,
+    // as with greedy wrapping (a multi-line container's min-content main
+    // size is the size of its largest item).
+    if is_min_content(main_axis_available_space) {
+        return one_line_per_item(item_count, a);
+    }
+
+    let line_break_size = main_axis_available_space.into_option() orelse util.infinity();
+    let min_line_count = (constants.line_count orelse 1) as usize;
+    var item_sizes = alloc.List(f32).init(a);
+    for item in flex_items {
+        item_sizes.push(item.hypothetical_outer_size.main(constants.dir));
+    }
+    let item_counts = balanced_line_item_counts(item_sizes.items(), line_limit: line_break_size, gap_between_items: constants.gap.main(constants.dir), min_line_count: min_line_count, a: a);
+
+    var lines = alloc.List(FlexLine).init(a);
+    var line_start: usize = 0;
+    for count in item_counts.items() {
+        lines.push(FlexLine { start: line_start, end: line_start + count.*, cross_size: 0.0, offset_cross: 0.0 });
+        line_start = line_start + count.*;
+    }
+    return lines;
+}
+
+/// item_known_dimension_definiteness: whether each of an item's known
+/// dimensions counts as definite in its layout. The main size is definite
+/// when the container's is or the item's flex basis is; the cross size
+/// when the item is stretched, has a definite cross size, or is a column's
+/// item fit-content sized against definite space (css-flexbox-1
+/// #definite-sizes, css-sizing-3 #definite).
+fn item_known_dimension_definiteness(constants: &AlgoConstants, item: &FlexItem) -> geo.Size(bool) {
+    let dir = constants.dir;
+    let main_is_definite = constants.has_definite_main_size or item.flex_basis_is_definite;
+
+    let has_cross_auto_margins = item.margin_is_auto.cross_start(dir) or item.margin_is_auto.cross_end(dir);
+    let cross_size = item.size_style.cross(dir);
+    let is_stretched = not has_cross_auto_margins and (cross_size.is_stretch() or (is_align_stretch(item.align_self) and cross_size.is_auto()));
+    let cross_is_definite = is_stretched or util.is_some(item.size.cross(dir)) or (not dir.is_row() and constants.cross_axis_available_space_is_definite);
+
+    let all_definite = geo.Size(bool) { width: true, height: true };
+    return all_definite.with_main(dir, main_is_definite).with_cross(dir, cross_is_definite);
+}
+
+/// The length an item takes in a line when sizing the container into
+/// definite space: its flex basis floored by its min main size, with its
+/// margins, floored by its padding and border.
+fn item_main_length(child: &FlexItem, constants: &AlgoConstants) -> f32 {
+    let padding_border_sum = child.padding.add(child.border).main_axis_sum(constants.dir);
+    return util.f32_max(a: util.f32_maybe_max(child.flex_basis, child.min_size.main(constants.dir)) + child.margin.main_axis_sum(constants.dir), b: padding_border_sum);
+}
+
+/// The longest line, by item_main_length and gaps (max_by total_cmp,
+/// unwrap_or 0).
+fn longest_line_length(lines: []FlexLine, items: []FlexItem, constants: &AlgoConstants, main_axis_gap: f32) -> f32 {
+    var longest: f32 = 0.0;
+    var have_line = false;
+    for line in lines {
+        let line_main_axis_gap = sum_axis_gaps(main_axis_gap, line.end - line.start);
+        var total_target_size: f32 = -0.0;
+        var i = line.start;
+        while i < line.end : (i += 1) {
+            total_target_size = total_target_size + item_main_length(&items[i], constants);
+        }
+        let line_length = total_target_size + line_main_axis_gap;
+        if not have_line or util.total_cmp(a: line_length, b: longest) >= 0 {
+            longest = line_length;
+            have_line = true;
+        }
+    }
+    return longest;
+}
+
+/// determine_container_main_size: the container's main size, when it is
+/// not known.
+fn determine_container_main_size(tree: &mut dyn lt.LayoutTree, available_space: geo.Size(sty.AvailableSpace), lines: []FlexLine, items: []mut FlexItem, constants: &mut AlgoConstants) {
+    let main_content_box_inset = constants.content_box_inset.main_axis_sum(constants.dir);
+
+    let content_main_size = match constants.node_outer_size.main(constants.dir) {
+        some(outer) => { outer }
+        none => { outer_main_size_from_content(tree, available_space, lines, items, constants, main_content_box_inset) }
+    };
+
+    let outer_main_size = util.f32_max(a: util.f32_maybe_clamp(content_main_size, min: constants.min_size.main(constants.dir), max: constants.max_size.main(constants.dir)), b: main_content_box_inset - constants.scrollbar_gutter.main(constants.dir));
+
+    let inner_main_size = util.f32_max(a: 0.0, b: outer_main_size - main_content_box_inset);
+    constants.container_size.set_main(constants.dir, outer_main_size);
+    constants.inner_container_size.set_main(constants.dir, inner_main_size);
+    constants.node_inner_size.set_main(constants.dir, some(inner_main_size));
+}
+
+/// The container's outer main size from its content (taffy's
+/// unwrap_or_else closure in determine_container_main_size).
+fn outer_main_size_from_content(tree: &mut dyn lt.LayoutTree, available_space: geo.Size(sty.AvailableSpace), lines: []FlexLine, items: []mut FlexItem, constants: &AlgoConstants, main_content_box_inset: f32) -> f32 {
+    let dir = constants.dir;
+    match available_space.main(dir) {
+        .Definite { value: main_axis_available_space } => {
+            let main_axis_gap = constants.gap.main(constants.dir);
+            let size = longest_line_length(lines, items, constants, main_axis_gap) + main_content_box_inset;
+
+            // A balanced container can produce several lines that all fit
+            // the available space (flex-line-count); fit-content sizing then
+            // uses its max-content size: the longest line when the items are
+            // balanced across the minimum line count without a size limit.
+            if constants.is_balance {
+                let min_line_count = constants.line_count orelse 1;
+                var item_count: usize = 0;
+                for line in lines {
+                    item_count = item_count + (line.end - line.start);
+                }
+                if item_count == 0 {
+                    return size;
+                }
+                var item_lengths = alloc.List(f32).init(tree.allocator());
+                for line in lines {
+                    var i = line.start;
+                    while i < line.end : (i += 1) {
+                        item_lengths.push(item_main_length(&items[i], constants));
+                    }
+                }
+                var line_minimum = min_line_count;
+                if line_minimum < 1 {
+                    line_minimum = 1;
+                }
+                let item_counts = balanced_line_item_counts(item_lengths.items(), line_limit: util.infinity(), gap_between_items: main_axis_gap, min_line_count: line_minimum as usize, a: tree.allocator());
+                var widest_line_length: f32 = 0.0;
+                var index: usize = 0;
+                for count in item_counts.items() {
+                    var line_sum: f32 = -0.0;
+                    var j = index;
+                    while j < index + count.* : (j += 1) {
+                        line_sum = line_sum + item_lengths.items()[j];
+                    }
+                    let line_length = line_sum + sum_axis_gaps(main_axis_gap, count.*);
+                    widest_line_length = util.f32_max(a: widest_line_length, b: line_length);
+                    index = index + count.*;
+                }
+                let max_content_size = widest_line_length + main_content_box_inset;
+                return util.f32_max(a: size, b: util.f32_min(a: max_content_size, b: main_axis_available_space));
+            }
+
+            if lines.len() > 1 {
+                return util.f32_max(a: size, b: main_axis_available_space);
+            }
+            return size;
+        }
+        _ => { }
+    }
+
+    if is_min_content(available_space.main(dir)) and constants.is_wrap {
+        return longest_line_length(lines, items, constants, constants.gap.main(constants.dir)) + main_content_box_inset;
+    }
+
+    // MinContent or MaxContent: the largest sum, over the lines, of the
+    // items' max-content contributions.
+    var main_size: f32 = 0.0;
+
+    for line in lines {
+        var i = line.start;
+        while i < line.end : (i += 1) {
+            let item = items[i];
+            let style_min = item.min_size.main(constants.dir);
+            let style_preferred = item.size.main(constants.dir);
+            let style_max = item.max_size.main(constants.dir);
+
+            // For rows the preferred size floors the clamping basis, which
+            // matches Chrome and Firefox; for columns the flex base size alone
+            // is the clamping basis, as the spec says.
+            var clamping_basis: ?f32 = some(item.flex_basis);
+            if constants.is_row {
+                clamping_basis = util.maybe_max(lhs: some(item.flex_basis), rhs: style_preferred);
+            }
+            var flex_basis_min: ?f32 = none;
+            if item.flex_shrink == 0.0 {
+                flex_basis_min = clamping_basis;
+            }
+            var flex_basis_max: ?f32 = none;
+            if item.flex_grow == 0.0 {
+                flex_basis_max = clamping_basis;
+            }
+
+            let min_main_size = util.f32_max(a: util.unwrap_or(util.opt_or(value: util.maybe_max(lhs: style_min, rhs: flex_basis_min), alt: flex_basis_min), item.resolved_minimum_main_size), b: item.resolved_minimum_main_size);
+            let max_main_size = util.unwrap_or(util.opt_or(value: util.maybe_min(lhs: style_max, rhs: flex_basis_max), alt: flex_basis_max), util.infinity());
+
+            let content_contribution = item_content_contribution(tree, &item, constants, available_space, min_main_size: min_main_size, max_main_size: max_main_size);
+            var content_flex_fraction: f32 = 0.0;
+            let diff = content_contribution - item.flex_basis;
+            if diff > 0.0 {
+                content_flex_fraction = diff / util.f32_max(a: 1.0, b: item.flex_grow);
+            } else if diff < 0.0 {
+                let scaled_shrink_factor = util.f32_max(a: 1.0, b: item.flex_shrink) * item.inner_flex_basis;
+                content_flex_fraction = diff / scaled_shrink_factor;
+            }
+            items[i].content_flex_fraction = content_flex_fraction;
+        }
+
+        // The spec scales by the line's largest flex fraction; neither
+        // Chrome nor Firefox does, nor taffy. Each item's flex base size
+        // plus its flex factor times its own fraction; the container's
+        // max-content size is the largest sum in a line.
+        var item_main_size_sum: f32 = -0.0;
+        var k = line.start;
+        while k < line.end : (k += 1) {
+            let item = items[k];
+            let flex_fraction = item.content_flex_fraction;
+            var flex_contribution: f32 = 0.0;
+            if item.content_flex_fraction > 0.0 {
+                flex_contribution = util.f32_max(a: 1.0, b: item.flex_grow) * flex_fraction;
+            } else if item.content_flex_fraction < 0.0 {
+                let scaled_shrink_factor = util.f32_max(a: 1.0, b: item.flex_shrink) * item.inner_flex_basis;
+                if scaled_shrink_factor != 0.0 {
+                    flex_contribution = scaled_shrink_factor * flex_fraction;
+                }
+            }
+            let size = item.flex_basis + flex_contribution;
+            items[k].outer_target_size.set_main(constants.dir, size);
+            items[k].target_size.set_main(constants.dir, size);
+            item_main_size_sum = item_main_size_sum + size;
+        }
+
+        let gap_sum = sum_axis_gaps(constants.gap.main(constants.dir), line.end - line.start);
+        main_size = util.f32_max(a: main_size, b: item_main_size_sum + gap_sum);
+    }
+
+    return main_size + main_content_box_inset;
+}
+
+/// An item's min- or max-content contribution to its container's main
+/// size, with its margins (the content_contribution match of
+/// determine_container_main_size).
+fn item_content_contribution(tree: &mut dyn lt.LayoutTree, item: &FlexItem, constants: &AlgoConstants, available_space: geo.Size(sty.AvailableSpace), min_main_size: f32, max_main_size: f32) -> f32 {
+    let dir = constants.dir;
+    let style_min = item.min_size.main(constants.dir);
+    let style_preferred = item.size.main(constants.dir);
+    let style_max = item.max_size.main(constants.dir);
+    let margin_main = item.margin.main_axis_sum(constants.dir);
+
+    // Clamping values with max <= min decide the size without measuring.
+    match style_preferred {
+        some(pref) => {
+            if max_main_size <= min_main_size or max_main_size <= pref {
+                return util.f32_max(a: util.f32_min(a: pref, b: max_main_size), b: min_main_size) + margin_main;
+            }
+        }
+        none => { }
+    }
+    if max_main_size <= min_main_size {
+        return min_main_size + margin_main;
+    }
+
+    if item.is_scroll_container() {
+        return item.flex_basis + margin_main;
+    }
+
+    match style_preferred {
+        some(pref) => {
+            // A definite preferred main size is the content contribution
+            // (an inherent-size measure would give it), floored by the main
+            // padding and border, so the item is not measured.
+            let item_pb_main = item.padding.main_axis_sum(constants.dir) + item.border.main_axis_sum(constants.dir);
+            let inner_main_size = util.f32_max(a: pref, b: item_pb_main);
+            if constants.is_row {
+                return util.f32_maybe_clamp(inner_main_size + margin_main, min: style_min, max: style_max);
+            }
+            return util.f32_maybe_clamp(util.f32_max(a: inner_main_size, b: item.flex_basis) + margin_main, min: style_min, max: style_max);
+        }
+        none => { }
+    }
+
+    // Parent size for child sizing.
+    let cross_axis_parent_size = constants.node_inner_size.cross(dir);
+
+    // Available space for child sizing (excluding the child's margins).
+    let child_min_cross = item.min_size.cross(dir);
+    let child_max_cross = item.max_size.cross(dir);
+    let unclamped_cross_space = match available_space.cross(dir) {
+        .Definite { value: val } => { sty.AvailableSpace.Definite { value: util.f32_max(a: 0.0, b: constants.divided_cross_space(util.unwrap_or(cross_axis_parent_size, val)) - item.margin.cross_axis_sum(dir)) } }
+        _ => { available_space.cross(dir) }
+    };
+    let cross_axis_available_space = unclamped_cross_space.maybe_clamp(min: child_min_cross, max: child_max_cross);
+
+    let child_available_space = available_space.with_cross(dir, cross_axis_available_space);
+
+    // Known dimensions for child sizing; the definite cross size is clamped
+    // by the cross min/max sizes, as in determine_flex_base_size.
+    var ckd = item.size.with_main(dir, none);
+    let transferred_min_size = item.min_size.maybe_apply_aspect_ratio(item.aspect_ratio);
+    let transferred_max_size = item.max_size.maybe_apply_aspect_ratio(item.aspect_ratio);
+    ckd.set_cross(dir, util.maybe_clamp(value: ckd.cross(dir), min: transferred_min_size.cross(dir), max: transferred_max_size.cross(dir)));
+    if is_align_stretch(item.align_self) and util.is_none(ckd.cross(dir)) {
+        ckd.set_cross(dir, cross_axis_available_space.into_option());
+    }
+    let child_known_dimensions = ckd;
+
+    // The min- or max-content size, by the constraint.
+    let measured_main_size = lt.measure_child_size(tree, item.node, known_dimensions: child_known_dimensions, parent_size: constants.node_inner_size, available_space: child_available_space, sizing_mode: lt.SizingMode.ContentSize, axis: dir.main_axis(), vertical_margins_are_collapsible: geo.line_false());
+
+    // A known cross size transferred through the aspect ratio floors the
+    // measured content size.
+    var transferred_main_size: ?f32 = none;
+    match item.aspect_ratio {
+        some(ratio) => {
+            match child_known_dimensions.cross(dir) {
+                some(cross) => {
+                    if constants.is_row {
+                        transferred_main_size = some(cross * ratio);
+                    } else {
+                        transferred_main_size = some(cross / ratio);
+                    }
+                }
+                none => { }
+            }
+        }
+        none => { }
+    }
+
+    let inner_main_size = util.f32_maybe_max(measured_main_size, transferred_main_size);
+
+    // Asymmetrical between rows and columns, found by taffy by trial
+    // against WebKit and Firefox (flex_basis_unconstraint_row/column).
+    if constants.is_row {
+        return util.f32_maybe_clamp(inner_main_size + margin_main, min: style_min, max: style_max);
+    }
+    return util.f32_maybe_clamp(util.f32_max(a: inner_main_size, b: item.flex_basis) + margin_main, min: style_min, max: style_max);
+}
+
+/// The space the line's items take: each frozen item's outer target main
+/// size, each other's outer flex base size, and the gaps.
+fn line_used_space(line: FlexLine, items: []FlexItem, constants: &AlgoConstants, total_main_axis_gap: f32) -> f32 {
+    var sum: f32 = -0.0;
+    var i = line.start;
+    while i < line.end : (i += 1) {
+        let child = &items[i];
+        if child.frozen {
+            sum = sum + child.outer_target_size.main(constants.dir);
+        } else {
+            sum = sum + (child.flex_basis + child.margin.main_axis_sum(constants.dir));
+        }
+    }
+    return total_main_axis_gap + sum;
+}
+
+/// resolve_flexible_lengths (9.7): the main component of each item's
+/// target_size and outer_target_size in a line.
+fn resolve_flexible_lengths(line: FlexLine, items: []mut FlexItem, constants: &AlgoConstants) {
+    let dir = constants.dir;
+    let total_main_axis_gap = sum_axis_gaps(constants.gap.main(constants.dir), line.end - line.start);
+
+    // 1. Determine the used flex factor: grow when the outer hypothetical
+    //    main sizes sum to less than the inner main size, else shrink.
+    var total_hypothetical_outer_main_size: f32 = -0.0;
+    var h = line.start;
+    while h < line.end : (h += 1) {
+        total_hypothetical_outer_main_size = total_hypothetical_outer_main_size + items[h].hypothetical_outer_size.main(dir);
+    }
+    let used_flex_factor: f32 = total_main_axis_gap + total_hypothetical_outer_main_size;
+    let inner_main = constants.node_inner_size.main(constants.dir);
+    let growing = used_flex_factor < util.unwrap_or(inner_main, 0.0);
+    let shrinking = used_flex_factor > util.unwrap_or(inner_main, 0.0);
+    let exactly_sized = not growing and not shrinking;
+
+    // 2. Size inflexible items: freeze, at the hypothetical main size, any
+    //    item with a flex factor of zero, or growing with a flex base size
+    //    above it, or shrinking with one below it.
+    for child in items[line.start..line.end] {
+        let inner_target_size = child.hypothetical_inner_size.main(dir);
+        child.target_size.set_main(dir, inner_target_size);
+
+        if exactly_sized or (child.flex_grow == 0.0 and child.flex_shrink == 0.0) or (growing and child.flex_basis > child.hypothetical_inner_size.main(dir)) or (shrinking and child.flex_basis < child.hypothetical_inner_size.main(dir)) {
+            child.frozen = true;
+            let outer_target_size = inner_target_size + child.margin.main_axis_sum(dir);
+            child.outer_target_size.set_main(dir, outer_target_size);
+        }
+    }
+
+    if exactly_sized {
+        return;
+    }
+
+    // 3. Calculate initial free space.
+    let used_space = line_used_space(line, items, constants, total_main_axis_gap);
+    let initial_free_space = util.unwrap_or(util.maybe_sub_f(inner_main, used_space), 0.0);
+
+    // 4. Loop.
+    while true {
+        // a. If all the flex items on the line are frozen, free space has
+        //    been distributed.
+        var all_frozen = true;
+        for child in items[line.start..line.end] {
+            if not child.frozen {
+                all_frozen = false;
+            }
+        }
+        if all_frozen {
+            break;
+        }
+
+        // b. Calculate the remaining free space as for initial free space.
+        //    If the unfrozen items' flex factors sum to less than one, the
+        //    initial free space times that sum, when of smaller magnitude.
+        let loop_used_space = line_used_space(line, items, constants, total_main_axis_gap);
+
+        var sum_flex_grow: f32 = 0.0;
+        var sum_flex_shrink: f32 = 0.0;
+        for child in items[line.start..line.end] {
+            if not child.frozen {
+                sum_flex_grow = sum_flex_grow + child.flex_grow;
+                sum_flex_shrink = sum_flex_shrink + child.flex_shrink;
+            }
+        }
+
+        var free_space: f32 = 0.0;
+        if growing and sum_flex_grow < 1.0 {
+            free_space = util.f32_maybe_min(initial_free_space * sum_flex_grow - total_main_axis_gap, util.maybe_sub_f(inner_main, loop_used_space));
+        } else if shrinking and sum_flex_shrink < 1.0 {
+            free_space = util.f32_maybe_max(initial_free_space * sum_flex_shrink - total_main_axis_gap, util.maybe_sub_f(inner_main, loop_used_space));
+        } else {
+            free_space = util.unwrap_or(util.maybe_sub_f(inner_main, loop_used_space), used_flex_factor - loop_used_space);
+        }
+
+        // c. Distribute free space proportional to the flex factors: grow
+        //    factors, or flex shrink factors scaled by the inner flex base
+        //    sizes (which may give a negative inner main size, corrected
+        //    next).
+        if is_normal(free_space) {
+            if growing and sum_flex_grow > 0.0 {
+                for child in items[line.start..line.end] {
+                    if not child.frozen {
+                        child.target_size.set_main(dir, child.flex_basis + free_space * (child.flex_grow / sum_flex_grow));
+                    }
+                }
+            } else if shrinking and sum_flex_shrink > 0.0 {
+                var sum_scaled_shrink_factor: f32 = -0.0;
+                for child in items[line.start..line.end] {
+                    if not child.frozen {
+                        sum_scaled_shrink_factor = sum_scaled_shrink_factor + child.inner_flex_basis * child.flex_shrink;
+                    }
+                }
+
+                if sum_scaled_shrink_factor > 0.0 {
+                    for child in items[line.start..line.end] {
+                        if not child.frozen {
+                            let scaled_shrink_factor = child.inner_flex_basis * child.flex_shrink;
+                            child.target_size.set_main(dir, child.flex_basis + free_space * (scaled_shrink_factor / sum_scaled_shrink_factor));
+                        }
+                    }
+                }
+            }
+        }
+
+        // d. Fix min/max violations: clamp each unfrozen item's target main
+        //    size by its used min and max main sizes and floor its content
+        //    box at zero.
+        var total_violation: f32 = 0.0;
+        for child in items[line.start..line.end] {
+            if not child.frozen {
+                let resolved_min_main: ?f32 = some(child.resolved_minimum_main_size);
+                let max_main = child.max_size.main(dir);
+                let clamped = util.f32_max(a: 0.0, b: util.f32_maybe_clamp(child.target_size.main(dir), min: resolved_min_main, max: max_main));
+                child.violation = clamped - child.target_size.main(dir);
+                child.target_size.set_main(dir, clamped);
+                child.outer_target_size.set_main(dir, child.target_size.main(dir) + child.margin.main_axis_sum(dir));
+                total_violation = total_violation + child.violation;
+            }
+        }
+
+        // e. Freeze over-flexed items: all for a zero total violation, those
+        //    with min violations for a positive one, those with max
+        //    violations for a negative one.
+        for child in items[line.start..line.end] {
+            if not child.frozen {
+                if total_violation > 0.0 {
+                    child.frozen = child.violation > 0.0;
+                } else if total_violation < 0.0 {
+                    child.frozen = child.violation < 0.0;
+                } else {
+                    child.frozen = true;
+                }
+            }
+        }
+
+        // f. Return to the start of this loop.
+    }
+}
+
+/// determine_hypothetical_cross_size (9.4): each item laid out with its
+/// used main size and the available space, auto as fit-content.
+fn determine_hypothetical_cross_size(tree: &mut dyn lt.LayoutTree, line: FlexLine, items: []mut FlexItem, constants: &AlgoConstants, available_space: geo.Size(sty.AvailableSpace)) {
+    var i = line.start;
+    while i < line.end : (i += 1) {
+        let child = items[i];
+        let padding_border_sum = child.padding.add(child.border).cross_axis_sum(constants.dir);
+
+        // The available space passed to the child excludes its margins.
+        let child_available_main = sty.AvailableSpace.Definite { value: util.f32_max(a: 0.0, b: constants.container_size.main(constants.dir) - child.margin.main_axis_sum(constants.dir)) };
+
+        // Sizes transferred through the aspect ratio clamp the hypothetical
+        // cross size (csswg-drafts#10997).
+        let transferred_min_cross = child.min_size.maybe_apply_aspect_ratio(child.aspect_ratio).cross(constants.dir);
+        let transferred_max_cross = child.max_size.maybe_apply_aspect_ratio(child.aspect_ratio).cross(constants.dir);
+
+        let child_cross = util.maybe_max_f(util.maybe_clamp(value: child.size.cross(constants.dir), min: transferred_min_cross, max: transferred_max_cross), padding_border_sum);
+
+        var available_cross = available_space.cross(constants.dir);
+        match available_cross {
+            .Definite { value: val } => {
+                available_cross = sty.AvailableSpace.Definite { value: util.f32_max(a: 0.0, b: constants.divided_cross_space(val) - child.margin.cross_axis_sum(constants.dir)) };
+            }
+            _ => { }
+        }
+        var child_available_cross = available_cross.maybe_clamp(min: transferred_min_cross, max: transferred_max_cross).maybe_max_f(padding_border_sum);
+
+        // A cross size that is a sizing keyword other than stretch gives
+        // the space the item is measured in; stretch is
+        // determine_used_cross_size's.
+        var divided_inner_cross: ?f32 = none;
+        match constants.node_inner_size.cross(constants.dir) {
+            some(val) => { divided_inner_cross = some(constants.divided_cross_space(val)); }
+            none => { }
+        }
+        let cross_stretch_size = util.maybe_max_f(util.maybe_sub_f(divided_inner_cross, child.margin.cross_axis_sum(constants.dir)), 0.0);
+        match skw.resolve_sizing_keyword(child.size_style.cross(constants.dir), stretch_size: cross_stretch_size, percent_resolution_basis: constants.node_inner_size.cross(constants.dir)) {
+            some(resolution) => {
+                match resolution {
+                    .Measure { space } => { child_available_cross = space; }
+                    _ => { }
+                }
+            }
+            none => { }
+        }
+
+        let child_inner_cross = match child_cross {
+            some(cross) => { cross }
+            none => {
+                var known_width = child_cross;
+                var known_height = child_cross;
+                var space_width = child_available_cross;
+                var space_height = child_available_cross;
+                if constants.is_row {
+                    known_width = some(child.target_size.width);
+                    space_width = child_available_main;
+                } else {
+                    known_height = some(child.target_size.height);
+                    space_height = child_available_main;
+                }
+                let output = tree.compute_child_layout(child.node, lt.LayoutInput {
+                    run_mode: lt.RunMode.ComputeSize,
+                    sizing_mode: lt.SizingMode.ContentSize,
+                    axis: lt.RequestedAxis.from_abs(constants.dir.cross_axis()),
+                    known_dimensions: geo.Size(?f32) { width: known_width, height: known_height },
+                    known_dimensions_are_definite: item_known_dimension_definiteness(constants, &child),
+                    parent_size: constants.node_inner_size,
+                    available_space: geo.Size(sty.AvailableSpace) { width: space_width, height: space_height },
+                    vertical_margins_are_collapsible: geo.line_false(),
+                });
+                util.f32_max(a: util.f32_maybe_clamp(output.size.get_abs(constants.dir.cross_axis()), min: transferred_min_cross, max: transferred_max_cross), b: padding_border_sum)
+            }
+        };
+        let child_outer_cross = child_inner_cross + child.margin.cross_axis_sum(constants.dir);
+
+        items[i].hypothetical_inner_size.set_cross(constants.dir, child_inner_cross);
+        items[i].hypothetical_outer_size.set_cross(constants.dir, child_outer_cross);
+    }
+}
+
+/// calculate_children_base_lines: the baselines of the items that take
+/// part in baseline alignment, in lines with more than one of them.
+fn calculate_children_base_lines(tree: &mut dyn lt.LayoutTree, node_size: geo.Size(?f32), available_space: geo.Size(sty.AvailableSpace), flex_lines: []FlexLine, items: []mut FlexItem, constants: &AlgoConstants) {
+    // Only rows: baseline alignment is supported in the cross axis only
+    // where it is also the inline axis.
+    if not constants.is_row {
+        return;
+    }
+
+    for line in flex_lines {
+        // With one or zero items taking part, baseline alignment is a no-op.
+        var line_baseline_child_count: usize = 0;
+        var c = line.start;
+        while c < line.end : (c += 1) {
+            if items[c].participates_in_baseline_alignment(constants.dir) {
+                line_baseline_child_count += 1;
+            }
+        }
+        if line_baseline_child_count <= 1 {
+            continue;
+        }
+
+        var i = line.start;
+        while i < line.end : (i += 1) {
+            let child = items[i];
+            if not child.participates_in_baseline_alignment(constants.dir) {
+                continue;
+            }
+
+            var known_width = some(child.hypothetical_inner_size.width);
+            var known_height = some(child.target_size.height);
+            var space_width = available_space.width.maybe_set(node_size.width);
+            var space_height = sty.AvailableSpace.Definite { value: constants.container_size.height };
+            if constants.is_row {
+                known_width = some(child.target_size.width);
+                known_height = some(child.hypothetical_inner_size.height);
+                space_width = sty.AvailableSpace.Definite { value: constants.container_size.width };
+                space_height = available_space.height.maybe_set(node_size.height);
+            }
+            // The available space passed to the child excludes its margins.
+            let outer_space = geo.Size(sty.AvailableSpace) { width: space_width, height: space_height };
+            let child_space = outer_space.maybe_sub_f(child.margin.sum_axes()).maybe_max_f(geo.size_zero());
+            let measured_size_and_baselines = tree.compute_child_layout(child.node, lt.LayoutInput {
+                run_mode: lt.RunMode.PerformLayout,
+                sizing_mode: lt.SizingMode.ContentSize,
+                axis: lt.RequestedAxis.Both,
+                known_dimensions: geo.Size(?f32) { width: known_width, height: known_height },
+                known_dimensions_are_definite: item_known_dimension_definiteness(constants, &child),
+                parent_size: constants.node_inner_size,
+                available_space: child_space,
+                vertical_margins_are_collapsible: geo.line_false(),
+            });
+
+            let baseline = measured_size_and_baselines.baselines.first;
+            let height = measured_size_and_baselines.size.height;
+
+            // Scroll containers' baselines come from their content as if
+            // scrolled to the start, clamped to their border box
+            // (csswg-drafts#7660).
+            var clamped_baseline = util.unwrap_or(baseline, height);
+            if child.overflow.y.is_scroll_container() {
+                clamped_baseline = util.f32_max(a: 0.0, b: util.f32_min(a: util.unwrap_or(baseline, height), b: height));
+            }
+
+            items[i].baseline = clamped_baseline + child.margin.top;
+        }
+    }
+}
+
+/// calculate_cross_size (9.4): the cross size of each flex line.
+fn calculate_cross_size(flex_lines: []mut FlexLine, items: []FlexItem, node_size: geo.Size(?f32), constants: &AlgoConstants) {
+    // A single-line container with a definite cross size: the line's cross
+    // size is the container's inner cross size.
+    if not constants.is_wrap and util.is_some(node_size.cross(constants.dir)) {
+        let cross_axis_padding_border = constants.content_box_inset.cross_axis_sum(constants.dir);
+        let cross_min_size = constants.min_size.cross(constants.dir);
+        let cross_max_size = constants.max_size.cross(constants.dir);
+        flex_lines[0].cross_size = util.unwrap_or(util.maybe_max_f(util.maybe_sub_f(util.maybe_clamp(value: node_size.cross(constants.dir), min: cross_min_size, max: cross_max_size), cross_axis_padding_border), 0.0), 0.0);
+    } else {
+        // Otherwise, for each flex line, the largest of: the largest
+        // distances of the baseline-aligned items' baselines from their
+        // outer cross-start and cross-end edges, summed; the other items'
+        // largest outer hypothetical cross size; and zero.
+        for line in flex_lines {
+            var max_baseline: f32 = 0.0;
+            var i = line.start;
+            while i < line.end : (i += 1) {
+                max_baseline = util.f32_max(a: max_baseline, b: items[i].baseline);
+            }
+            var cross_size: f32 = 0.0;
+            var j = line.start;
+            while j < line.end : (j += 1) {
+                let child = &items[j];
+                var extent = child.hypothetical_outer_size.cross(constants.dir);
+                if child.participates_in_baseline_alignment(constants.dir) {
+                    extent = max_baseline - child.baseline + child.hypothetical_outer_size.cross(constants.dir);
+                }
+                cross_size = util.f32_max(a: cross_size, b: extent);
+            }
+            line.cross_size = cross_size;
+        }
+
+        // A single-line container clamps the line's cross size by its min
+        // and max cross sizes.
+        if not constants.is_wrap {
+            let cross_axis_padding_border = constants.content_box_inset.cross_axis_sum(constants.dir);
+            let cross_min_size = constants.min_size.cross(constants.dir);
+            let cross_max_size = constants.max_size.cross(constants.dir);
+            flex_lines[0].cross_size = util.f32_maybe_clamp(flex_lines[0].cross_size, min: util.maybe_sub_f(cross_min_size, cross_axis_padding_border), max: util.maybe_sub_f(cross_max_size, cross_axis_padding_border));
+        }
+    }
+}
+
+/// handle_align_content_stretch (9.4): with align-content stretch, lines
+/// that fall short of the container's inner cross size grow equally to
+/// fill it.
+fn handle_align_content_stretch(flex_lines: []mut FlexLine, node_size: geo.Size(?f32), constants: &AlgoConstants) {
+    if constants.align_content.keyword == sty.AlignContentKeyword.Stretch and constants.align_content.safety == sty.AlignmentSafety.Default {
+        let cross_axis_padding_border = constants.content_box_inset.cross_axis_sum(constants.dir);
+        let cross_min_size = constants.min_size.cross(constants.dir);
+        let cross_max_size = constants.max_size.cross(constants.dir);
+        let container_min_inner_cross = util.unwrap_or(util.maybe_max_f(util.maybe_sub_f(util.maybe_clamp(value: util.opt_or(value: node_size.cross(constants.dir), alt: cross_min_size), min: cross_min_size, max: cross_max_size), cross_axis_padding_border), 0.0), 0.0);
+
+        let total_cross_axis_gap = sum_axis_gaps(constants.gap.cross(constants.dir), flex_lines.len());
+        var lines_cross_sum: f32 = -0.0;
+        for line in flex_lines {
+            lines_cross_sum = lines_cross_sum + line.cross_size;
+        }
+        let lines_total_cross: f32 = lines_cross_sum + total_cross_axis_gap;
+
+        if lines_total_cross < container_min_inner_cross {
+            let remaining = container_min_inner_cross - lines_total_cross;
+            let addition = remaining / (flex_lines.len() as f32);
+            for line in flex_lines {
+                line.cross_size = line.cross_size + addition;
+            }
+        }
+    }
+}
+
+/// determine_used_cross_size (9.4): a stretched item (align-self stretch,
+/// cross size auto, neither cross margin auto, or a cross size of stretch)
+/// takes its line's cross size less its margins, clamped by its min and
+/// max cross sizes (the max without the aspect ratio, as Chrome and
+/// Firefox do); any other its hypothetical cross size. The main size does
+/// not change, even with an aspect ratio.
+fn determine_used_cross_size(tree: &mut dyn lt.LayoutTree, flex_lines: []FlexLine, items: []mut FlexItem, constants: &AlgoConstants) {
+    for line in flex_lines {
+        let line_cross_size = line.cross_size;
+
+        var i = line.start;
+        while i < line.end : (i += 1) {
+            let child = items[i];
+            let child_style = tree.get_style(child.node);
+            // A cross size of `stretch` stretches to the flex line like
+            // align-self: stretch, whatever the alignment.
+            let cross_is_stretch = child.size_style.cross(constants.dir).is_stretch();
+            var target_cross = child.hypothetical_inner_size.cross(constants.dir);
+            if not child.margin_is_auto.cross_start(constants.dir) and not child.margin_is_auto.cross_end(constants.dir) and (cross_is_stretch or (is_align_stretch(child.align_self) and child_style.size.cross(constants.dir).is_auto())) {
+                // Percentage padding and border resolve against the
+                // container's width on all four sides.
+                let padding = child_style.padding.resolve_or_zero(constants.node_inner_size.width);
+                let border = child_style.border.resolve_or_zero(constants.node_inner_size.width);
+                let pb_sum = padding.add(border).sum_axes();
+                var box_sizing_adjustment = geo.size_zero();
+                if child_style.box_sizing == sty.BoxSizing.ContentBox {
+                    box_sizing_adjustment = pb_sum;
+                }
+
+                let max_size_ignoring_aspect_ratio = child_style.max_size.maybe_resolve(constants.node_inner_size).maybe_add_f(box_sizing_adjustment);
+
+                target_cross = util.f32_maybe_clamp(util.f32_max(a: 0.0, b: line_cross_size - child.margin.cross_axis_sum(constants.dir)), min: child.min_size.cross(constants.dir), max: max_size_ignoring_aspect_ratio.cross(constants.dir));
+            }
+            items[i].target_size.set_cross(constants.dir, target_cross);
+            items[i].outer_target_size.set_cross(constants.dir, target_cross + child.margin.cross_axis_sum(constants.dir));
+        }
+    }
+}
+
+/// distribute_remaining_free_space (9.5): positive free space goes equally
+/// to the line's main-axis auto margins, if any (others become zero);
+/// then the items are aligned per justify-content.
+fn distribute_remaining_free_space(flex_lines: []FlexLine, items: []mut FlexItem, constants: &AlgoConstants) {
+    for line in flex_lines {
+        let num_items = line.end - line.start;
+        let total_main_axis_gap = sum_axis_gaps(constants.gap.main(constants.dir), num_items);
+        var outer_sum: f32 = -0.0;
+        var s = line.start;
+        while s < line.end : (s += 1) {
+            outer_sum = outer_sum + items[s].outer_target_size.main(constants.dir);
+        }
+        let used_space: f32 = total_main_axis_gap + outer_sum;
+        var free_space = constants.inner_container_size.main(constants.dir) - used_space;
+        var num_auto_margins: i32 = 0;
+
+        for child in items[line.start..line.end] {
+            if child.margin_is_auto.main_start(constants.dir) {
+                num_auto_margins += 1;
+            }
+            if child.margin_is_auto.main_end(constants.dir) {
+                num_auto_margins += 1;
+            }
+        }
+
+        if free_space > 0.0 and num_auto_margins > 0 {
+            let margin = free_space / (num_auto_margins as f32);
+
+            for child in items[line.start..line.end] {
+                if child.margin_is_auto.main_start(constants.dir) {
+                    if constants.is_row {
+                        child.margin.left = margin;
+                    } else {
+                        child.margin.top = margin;
+                    }
+                }
+                if child.margin_is_auto.main_end(constants.dir) {
+                    if constants.is_row {
+                        child.margin.right = margin;
+                    } else {
+                        child.margin.bottom = margin;
+                    }
+                }
+            }
+
+            // The auto margins have absorbed all of the free space, leaving
+            // none for justify-content.
+            free_space = 0.0;
+        }
+
+        let layout_reverse = constants.dir.is_reverse();
+        let gap = constants.gap.main(constants.dir);
+        let justify_content_mode = calign.apply_alignment_fallback(free_space, num_items, constants.justify_content);
+
+        // Reversed lines are justified from their last item.
+        var k: usize = 0;
+        while k < num_items : (k += 1) {
+            var index = line.start + k;
+            if layout_reverse {
+                index = line.end - 1 - k;
+            }
+            items[index].offset_main = calign.compute_alignment_offset(free_space:, num_items, gap:, justify_content_mode, layout_is_flex_reversed: layout_reverse, is_first: k == 0);
+        }
+    }
+}
+
+/// resolve_cross_axis_auto_margins (9.6): auto cross margins share the
+/// difference between the line's cross size and the item's outer cross
+/// size (both margins halve it); items without them are aligned per
+/// align-self (step 14).
+fn resolve_cross_axis_auto_margins(flex_lines: []FlexLine, items: []mut FlexItem, constants: &AlgoConstants) {
+    for line in flex_lines {
+        let line_cross_size = line.cross_size;
+        var max_baseline: f32 = 0.0;
+        var b = line.start;
+        while b < line.end : (b += 1) {
+            max_baseline = util.f32_max(a: max_baseline, b: items[b].baseline);
+        }
+        var max_baseline_to_bottom_distance: f32 = 0.0;
+        var d = line.start;
+        while d < line.end : (d += 1) {
+            if items[d].participates_in_baseline_alignment(constants.dir) {
+                max_baseline_to_bottom_distance = util.f32_max(a: max_baseline_to_bottom_distance, b: items[d].outer_target_size.cross(constants.dir) - items[d].baseline);
+            }
+        }
+
+        var i = line.start;
+        while i < line.end : (i += 1) {
+            let child = items[i];
+            let free_space = line_cross_size - child.outer_target_size.cross(constants.dir);
+
+            if child.margin_is_auto.cross_start(constants.dir) and child.margin_is_auto.cross_end(constants.dir) {
+                if constants.is_row {
+                    items[i].margin.top = free_space / 2.0;
+                    items[i].margin.bottom = free_space / 2.0;
+                } else {
+                    items[i].margin.left = free_space / 2.0;
+                    items[i].margin.right = free_space / 2.0;
+                }
+            } else if child.margin_is_auto.cross_start(constants.dir) {
+                if constants.is_row {
+                    items[i].margin.top = free_space;
+                } else {
+                    items[i].margin.left = free_space;
+                }
+            } else if child.margin_is_auto.cross_end(constants.dir) {
+                if constants.is_row {
+                    items[i].margin.bottom = free_space;
+                } else {
+                    items[i].margin.right = free_space;
+                }
+            } else {
+                // 14. Align all flex items along the cross-axis.
+                items[i].offset_cross = align_flex_items_along_cross_axis(&child, free_space:, max_baseline:, max_baseline_to_bottom_distance:, constants);
+            }
+        }
+    }
+}
+
+/// align_flex_items_along_cross_axis (9.6): an item's cross offset per
+/// align-self, when neither cross margin is auto.
+fn align_flex_items_along_cross_axis(child: &FlexItem, free_space: f32, max_baseline: f32, max_baseline_to_bottom_distance: f32, constants: &AlgoConstants) -> f32 {
+    let cross_axis_should_reverse = constants.is_column and constants.layout_direction == sty.Direction.Rtl;
+
+    // A `safe` alignment of an item that would overflow its line falls
+    // back to start (css-align-3 #overflow-values).
+    var align_keyword = child.align_self.keyword;
+    if child.align_self.is_safe() and free_space < 0.0 {
+        align_keyword = sty.AlignItemsKeyword.Start;
+    }
+
+    match align_keyword {
+        .Start => {
+            if cross_axis_should_reverse {
+                return free_space;
+            }
+            return 0.0;
+        }
+        .FlexStart => {
+            if constants.is_wrap_reverse != cross_axis_should_reverse {
+                return free_space;
+            }
+            return 0.0;
+        }
+        .End => {
+            if cross_axis_should_reverse {
+                return 0.0;
+            }
+            return free_space;
+        }
+        .FlexEnd => {
+            if constants.is_wrap_reverse != cross_axis_should_reverse {
+                return 0.0;
+            }
+            return free_space;
+        }
+        .Center => { return free_space / 2.0; }
+        .Baseline => {
+            if constants.is_row {
+                if constants.is_wrap_reverse {
+                    // The cross axis is flipped: the baseline-aligned group
+                    // aligns to the cross-start edge, the line's bottom.
+                    let line_cross_size = free_space + child.outer_target_size.cross(constants.dir);
+                    return line_cross_size - max_baseline_to_bottom_distance - child.baseline;
+                }
+                return max_baseline - child.baseline;
+            }
+            // Without vertical writing modes, baseline alignment only makes
+            // sense in rows; in columns it is flex-start.
+            let baseline_column_should_reverse = cross_axis_should_reverse and not constants.is_wrap;
+            if constants.is_wrap_reverse != baseline_column_should_reverse {
+                return free_space;
+            }
+            return 0.0;
+        }
+        .Stretch => {
+            if constants.is_wrap_reverse != cross_axis_should_reverse {
+                return free_space;
+            }
+            return 0.0;
+        }
+        // Normal is resolved to Stretch, and SelfStart and SelfEnd to Start
+        // and End, when the items are generated.
+        .Normal => { unreachable(); }
+        .SelfStart => { unreachable(); }
+        .SelfEnd => { unreachable(); }
+    }
+}
+
+/// determine_container_cross_size (9.6): the container's cross size: the
+/// definite cross size, or the lines' cross sizes summed, clamped by the
+/// min and max cross sizes. Gives the lines' total cross size.
+fn determine_container_cross_size(flex_lines: []FlexLine, node_size: geo.Size(?f32), constants: &mut AlgoConstants) -> f32 {
+    let total_cross_axis_gap = sum_axis_gaps(constants.gap.cross(constants.dir), flex_lines.len());
+    var total_line_cross_size: f32 = -0.0;
+    for line in flex_lines {
+        total_line_cross_size = total_line_cross_size + line.cross_size;
+    }
+
+    let padding_border_sum = constants.content_box_inset.cross_axis_sum(constants.dir);
+    let cross_scrollbar_gutter = constants.scrollbar_gutter.cross(constants.dir);
+    let min_cross_size = constants.min_size.cross(constants.dir);
+    let max_cross_size = constants.max_size.cross(constants.dir);
+    let outer_container_size = util.f32_max(a: util.f32_maybe_clamp(util.unwrap_or(node_size.cross(constants.dir), total_line_cross_size + total_cross_axis_gap + padding_border_sum), min: min_cross_size, max: max_cross_size), b: padding_border_sum - cross_scrollbar_gutter);
+    let inner_container_size = util.f32_max(a: 0.0, b: outer_container_size - padding_border_sum);
+
+    constants.container_size.set_cross(constants.dir, outer_container_size);
+    constants.inner_container_size.set_cross(constants.dir, inner_container_size);
+
+    return total_line_cross_size;
+}
+
+/// align_flex_lines_per_align_content (9.6): each line's cross offset per
+/// align-content.
+fn align_flex_lines_per_align_content(flex_lines: []mut FlexLine, constants: &AlgoConstants, total_cross_size: f32) {
+    let num_lines = flex_lines.len();
+    let gap = constants.gap.cross(constants.dir);
+    let total_cross_axis_gap = sum_axis_gaps(gap, num_lines);
+    let free_space = constants.inner_container_size.cross(constants.dir) - total_cross_size - total_cross_axis_gap;
+
+    let align_content_mode = calign.apply_alignment_fallback(free_space, num_lines, constants.align_content);
+
+    // wrap-reverse lines are aligned from the last.
+    var k: usize = 0;
+    while k < num_lines : (k += 1) {
+        var index = k;
+        if constants.is_wrap_reverse {
+            index = num_lines - 1 - k;
+        }
+        flex_lines[index].offset_cross = calign.compute_alignment_offset(free_space:, num_lines, gap:, align_content_mode, layout_is_flex_reversed: constants.is_wrap_reverse, is_first: k == 0);
+    }
+}
+
+/// calculate_flex_item: the final layout of one item, stored in the tree;
+/// moves total_offset_main past it and adds its scrollable overflow.
+fn calculate_flex_item(tree: &mut dyn lt.LayoutTree, item: &mut FlexItem, item_candidates: &mut lt.OofCandidates, total_offset_main: &mut f32, total_offset_cross: f32, line_offset_cross: f32, total_overflow_rect: &mut geo.Rect(f32), border: geo.Rect(f32), constants: &AlgoConstants) {
+    let container_size = constants.container_size;
+    let node_inner_size = constants.node_inner_size;
+    let direction = constants.dir;
+    let layout_direction = constants.layout_direction;
+    let definiteness = item_known_dimension_definiteness(constants, item);
+    var layout_output = tree.compute_child_layout(item.node, lt.LayoutInput {
+        run_mode: lt.RunMode.PerformLayout,
+        sizing_mode: lt.SizingMode.ContentSize,
+        axis: lt.RequestedAxis.Both,
+        known_dimensions: item.target_size.map_some(),
+        known_dimensions_are_definite: definiteness,
+        parent_size: node_inner_size,
+        // The available space passed to the child excludes its margins.
+        available_space: geo.Size(sty.AvailableSpace) {
+            width: sty.AvailableSpace.Definite { value: util.f32_max(a: 0.0, b: container_size.width - item.margin.sum_axes().width) },
+            height: sty.AvailableSpace.Definite { value: util.f32_max(a: 0.0, b: container_size.height - item.margin.sum_axes().height) },
+        },
+        vertical_margins_are_collapsible: geo.line_false(),
+    });
+    let size = layout_output.size;
+    let scrollable_overflow_rect = layout_output.scrollable_overflow_rect;
+
+    let is_rtl_row = direction.is_row() and layout_direction.is_rtl();
+    let is_rtl_column = direction.is_column() and layout_direction.is_rtl();
+    let main_relative_inset = item.relative_inset.main(direction);
+    let cross_relative_inset = item.relative_inset.cross(direction);
+    var effective_line_offset_cross = line_offset_cross;
+    if is_rtl_column {
+        effective_line_offset_cross = 0.0;
+    }
+
+    var offset_main = total_offset_main.* + item.offset_main + item.margin.main_start(direction) + main_relative_inset;
+    if is_rtl_row {
+        offset_main = total_offset_main.* - item.offset_main - item.margin.main_end(direction) - main_relative_inset - size.width;
+    }
+
+    let offset_cross = total_offset_cross + item.offset_cross + effective_line_offset_cross + item.margin.cross_start(direction) + cross_relative_inset;
+
+    if direction.is_row() {
+        let baseline_offset_cross = total_offset_cross + item.offset_cross + effective_line_offset_cross + item.margin.cross_start(direction);
+        // Scroll containers' baselines come from their content as if
+        // scrolled to the start, clamped to their border box
+        // (csswg-drafts#7660).
+        let first_baseline = util.unwrap_or(layout_output.baselines.first, size.height);
+        var inner_baseline = first_baseline;
+        if item.overflow.y.is_scroll_container() {
+            inner_baseline = util.f32_max(a: 0.0, b: util.f32_min(a: first_baseline, b: size.height));
+        }
+        item.baseline = baseline_offset_cross + inner_baseline;
+    } else {
+        let baseline_offset_main = total_offset_main.* + item.offset_main + item.margin.main_start(direction);
+        let inner_baseline = util.unwrap_or(layout_output.baselines.first, size.height);
+        item.baseline = baseline_offset_main + inner_baseline;
+    }
+
+    var location = geo.Point(f32) { x: offset_cross, y: offset_main };
+    if direction.is_row() {
+        location = geo.Point(f32) { x: offset_main, y: offset_cross };
+    }
+    var scrollbar_size = geo.size_zero();
+    if item.overflow.y == sty.Overflow.Scroll {
+        scrollbar_size.width = item.scrollbar_width;
+    }
+    if item.overflow.x == sty.Overflow.Scroll {
+        scrollbar_size.height = item.scrollbar_width;
+    }
+
+    let layout = lt.Layout {
+        order: item.order,
+        location: location,
+        size: size,
+        scrollable_overflow_rect: scrollable_overflow_rect,
+        scrollbar_size: scrollbar_size,
+        border: item.border,
+        padding: item.padding,
+        margin: item.margin,
+    };
+    tree.set_unrounded_layout(item.node, &layout);
+
+    // Keep the out-of-flow candidates of the item's subtree, their anchors
+    // moved from the item's box to the container's.
+    item_candidates.* = layout_output.oof_candidates.take();
+    if not item_candidates.is_empty() {
+        item_candidates.translate(location);
+    }
+
+    if is_rtl_row {
+        total_offset_main.* = total_offset_main.* - (item.offset_main + item.margin.main_axis_sum(direction) + size.main(direction));
+    } else {
+        total_offset_main.* = total_offset_main.* + (item.offset_main + item.margin.main_axis_sum(direction) + size.main(direction));
+    }
+
+    var contribution_location = geo.Point(f32) { x: location.x - border.left, y: location.y - border.top };
+    if layout_direction.is_rtl() {
+        contribution_location = geo.Point(f32) { x: container_size.width - (location.x + size.width) - border.right, y: location.y - border.top };
+    }
+    total_overflow_rect.* = total_overflow_rect.union(soverflow.compute_scrollable_overflow_contribution(contribution_location, size, scrollable_overflow_rect, item.overflow, item.contain, constants.is_scroll_container));
+}
+
+/// calculate_layout_line: the final layout of a line's items, in visual
+/// order; moves total_offset_cross past the line.
+fn calculate_layout_line(tree: &mut dyn lt.LayoutTree, line: FlexLine, items: []mut FlexItem, candidates: []mut lt.OofCandidates, total_offset_cross: &mut f32, overflow_rect: &mut geo.Rect(f32), border: geo.Rect(f32), constants: &AlgoConstants) {
+    let container_size = constants.container_size;
+    let padding_border = constants.content_box_inset;
+    let direction = constants.dir;
+    let layout_direction = constants.layout_direction;
+    var total_offset_main = padding_border.main_start(direction);
+    if layout_direction.is_rtl() and direction.is_row() {
+        total_offset_main = container_size.width - padding_border.main_end(direction);
+    }
+    let line_offset_cross = line.offset_cross;
+
+    let is_rtl_column = layout_direction.is_rtl() and direction.is_column();
+    if is_rtl_column {
+        total_offset_cross.* = total_offset_cross.* - (line_offset_cross + line.cross_size);
+    }
+
+    let count = line.end - line.start;
+    var k: usize = 0;
+    while k < count : (k += 1) {
+        var index = line.start + k;
+        if direction.is_reverse() {
+            index = line.end - 1 - k;
+        }
+        calculate_flex_item(tree, &mut items[index], &mut candidates[index], &mut total_offset_main, total_offset_cross: total_offset_cross.*, line_offset_cross: line_offset_cross, overflow_rect, border, constants);
+    }
+
+    if not is_rtl_column {
+        total_offset_cross.* = total_offset_cross.* + (line_offset_cross + line.cross_size);
+    }
+}
+
+/// final_layout_pass: the final layout of every item; gives the in-flow
+/// scrollable overflow.
+fn final_layout_pass(tree: &mut dyn lt.LayoutTree, flex_lines: []FlexLine, items: []mut FlexItem, candidates: []mut lt.OofCandidates, constants: &AlgoConstants) -> geo.Rect(f32) {
+    var total_offset_cross = constants.content_box_inset.cross_start(constants.dir);
+    if constants.is_column and constants.layout_direction.is_rtl() {
+        total_offset_cross = constants.container_size.width - constants.content_box_inset.cross_end(constants.dir);
+    }
+
+    var overflow_rect = geo.rect_zero();
+
+    let line_count = flex_lines.len();
+    var k: usize = 0;
+    while k < line_count : (k += 1) {
+        var index = k;
+        if constants.is_wrap_reverse {
+            index = line_count - 1 - k;
+        }
+        calculate_layout_line(tree, flex_lines[index], items, candidates, &mut total_offset_cross, &mut overflow_rect, constants.border, constants);
+    }
+
+    // A scroll container's own padding at the end of the content is part
+    // of its scrollable overflow; other boxes do not extend it by their
+    // own padding.
+    if constants.is_scroll_container {
+        if constants.layout_direction.is_rtl() {
+            overflow_rect.right = overflow_rect.right + (constants.content_box_inset.left - constants.border.left - constants.scrollbar_gutter.x);
+        } else {
+            overflow_rect.right = overflow_rect.right + (constants.content_box_inset.right - constants.border.right - constants.scrollbar_gutter.x);
+        }
+        overflow_rect.bottom = overflow_rect.bottom + (constants.content_box_inset.bottom - constants.border.bottom - constants.scrollbar_gutter.y);
+    }
+
+    return overflow_rect;
+}
+
+/// The static-position edge of an out-of-flow child in the main axis, per
+/// justify-content. stretch is invalid there and acts as flex-start, and
+/// normal was resolved to flex-start; `safe` is not applied, as Chrome
+/// does not for justify-content. start and end are writing-mode relative
+/// (they flip for rtl but not for reversed directions); flex-start,
+/// flex-end and the distributed keywords' fallbacks are flex-relative.
+fn main_static_edge(main_keyword: sty.AlignContentKeyword, main_axis_flex_start_reversed: bool, main_is_rtl: bool) -> lt.AxisStaticEdge {
+    var main_start_position = true;
+    if main_keyword == sty.AlignContentKeyword.Start {
+        main_start_position = not main_is_rtl;
+    } else if main_keyword == sty.AlignContentKeyword.End {
+        main_start_position = main_is_rtl;
+    }
+    match main_keyword {
+        .Start => {
+            if main_start_position {
+                return lt.AxisStaticEdge.Start;
+            }
+            return lt.AxisStaticEdge.End;
+        }
+        .End => {
+            if main_start_position {
+                return lt.AxisStaticEdge.Start;
+            }
+            return lt.AxisStaticEdge.End;
+        }
+        .SpaceBetween => {
+            if main_axis_flex_start_reversed {
+                return lt.AxisStaticEdge.End;
+            }
+            return lt.AxisStaticEdge.Start;
+        }
+        .Normal => {
+            if main_axis_flex_start_reversed {
+                return lt.AxisStaticEdge.End;
+            }
+            return lt.AxisStaticEdge.Start;
+        }
+        .Stretch => {
+            if main_axis_flex_start_reversed {
+                return lt.AxisStaticEdge.End;
+            }
+            return lt.AxisStaticEdge.Start;
+        }
+        .FlexStart => {
+            if main_axis_flex_start_reversed {
+                return lt.AxisStaticEdge.End;
+            }
+            return lt.AxisStaticEdge.Start;
+        }
+        .FlexEnd => {
+            if main_axis_flex_start_reversed {
+                return lt.AxisStaticEdge.Start;
+            }
+            return lt.AxisStaticEdge.End;
+        }
+        .SpaceEvenly => { return lt.AxisStaticEdge.Center; }
+        .SpaceAround => { return lt.AxisStaticEdge.Center; }
+        .Center => { return lt.AxisStaticEdge.Center; }
+    }
+}
+
+/// The static-position edge of an out-of-flow child in the cross axis, per
+/// align-self (taffy's cross_edge_for closure). start, end and baseline
+/// (whose static-position fallback is start) are writing-mode relative:
+/// they flip for rtl but not for wrap-reverse; flex-start, flex-end and
+/// stretch (which does not apply to absolutely positioned items) are
+/// flex-relative.
+fn cross_edge_for(keyword: sty.AlignItemsKeyword, cross_is_rtl: bool, cross_axis_flex_start_reversed: bool) -> lt.AxisStaticEdge {
+    var start_position = true;
+    if keyword == sty.AlignItemsKeyword.Start or keyword == sty.AlignItemsKeyword.Baseline {
+        start_position = not cross_is_rtl;
+    } else if keyword == sty.AlignItemsKeyword.End {
+        start_position = cross_is_rtl;
+    }
+    match keyword {
+        .Start => {
+            if start_position {
+                return lt.AxisStaticEdge.Start;
+            }
+            return lt.AxisStaticEdge.End;
+        }
+        .End => {
+            if start_position {
+                return lt.AxisStaticEdge.Start;
+            }
+            return lt.AxisStaticEdge.End;
+        }
+        .Baseline => {
+            if start_position {
+                return lt.AxisStaticEdge.Start;
+            }
+            return lt.AxisStaticEdge.End;
+        }
+        .Stretch => {
+            if cross_axis_flex_start_reversed {
+                return lt.AxisStaticEdge.End;
+            }
+            return lt.AxisStaticEdge.Start;
+        }
+        .FlexStart => {
+            if cross_axis_flex_start_reversed {
+                return lt.AxisStaticEdge.End;
+            }
+            return lt.AxisStaticEdge.Start;
+        }
+        .FlexEnd => {
+            if cross_axis_flex_start_reversed {
+                return lt.AxisStaticEdge.Start;
+            }
+            return lt.AxisStaticEdge.End;
+        }
+        .Center => { return lt.AxisStaticEdge.Center; }
+        // Normal is resolved to Stretch, and SelfStart and SelfEnd to Start
+        // and End, where align_self is read.
+        .Normal => { unreachable(); }
+        .SelfStart => { unreachable(); }
+        .SelfEnd => { unreachable(); }
+    }
+}
+
+/// collect_oof_candidates: the out-of-flow candidates in document order,
+/// direct out-of-flow children (with their static positions by the
+/// flexbox alignment rules) interleaved with those bubbled out of each
+/// in-flow item's subtree. They are sized and positioned by the
+/// out-of-flow pass at their containing block.
+fn collect_oof_candidates(tree: &mut dyn lt.LayoutTree, node: lt.NodeId, constants: &AlgoConstants, items: []FlexItem, item_candidates: []mut lt.OofCandidates, candidates: &mut lt.OofCandidates, a: alloc.Allocator) {
+    // Lines are contiguous ranges of the items in document order, so the
+    // items are sorted by order; the cursor is taffy's peekable iterator
+    // over the items with candidates.
+    var cursor: usize = 0;
+    let item_count = items.len();
+
+    let dir = constants.dir;
+    let container_size = constants.container_size;
+    let content_box_inset = constants.content_box_inset;
+
+    let main_axis_is_horizontal = constants.is_row;
+    let cross_axis_is_horizontal = not constants.is_row;
+    let main_is_rtl = main_axis_is_horizontal and constants.layout_direction.is_rtl();
+    let cross_is_rtl = cross_axis_is_horizontal and constants.layout_direction.is_rtl();
+    let main_axis_flex_start_reversed = dir.is_reverse() != main_is_rtl;
+    let cross_axis_flex_start_reversed = constants.is_wrap_reverse != cross_is_rtl;
+
+    // The static-position area in each axis is the container's content box.
+    let main_area = geo.Line(f32) {
+        start: content_box_inset.main_start(dir),
+        end: container_size.main(dir) - content_box_inset.main_end(dir),
+    };
+    let cross_area = geo.Line(f32) {
+        start: content_box_inset.cross_start(dir),
+        end: container_size.cross(dir) - content_box_inset.cross_end(dir),
+    };
+
+    let child_count = tree.child_count(node);
+    var order: usize = 0;
+    while order < child_count : (order += 1) {
+        let child = tree.get_child_id(node, order);
+        let child_style = tree.get_style(child);
+        let position = child_style.position;
+
+        if child_style.box_generation_mode() == sty.BoxGenerationMode.None {
+            continue;
+        }
+        // An in-flow item: merge the candidates bubbled out of its subtree.
+        if not position.is_out_of_flow() {
+            while cursor < item_count and item_candidates[cursor].is_empty() {
+                cursor += 1;
+            }
+            if cursor < item_count and items[cursor].order == (order as u32) {
+                candidates.append(&mut item_candidates[cursor]);
+                cursor += 1;
+            }
+            continue;
+        }
+
+        let align_self = resolve_normal_alignment(child_style.align_self orelse constants.align_items).resolve_self_relative(item_direction: child_style.direction, container_direction: constants.layout_direction, axis_is_inline: constants.is_column);
+
+        // Main-axis static position (justify-content).
+        let main_edge = main_static_edge(constants.justify_content.keyword, main_axis_flex_start_reversed:, main_is_rtl:);
+
+        // Cross-axis static position (align-self).
+        let cross_position = lt.AxisStaticPosition {
+            area: cross_area,
+            align: lt.AxisStaticAlign {
+                keyword: cross_edge_for(align_self.keyword, cross_is_rtl:, cross_axis_flex_start_reversed:),
+                safety: align_self.safety,
+                fallback: cross_edge_for(calign.resolve_self_alignment_safety(align_self, true), cross_is_rtl:, cross_axis_flex_start_reversed:),
+            },
+        };
+        let main_position = lt.AxisStaticPosition { area: main_area, align: lt.AxisStaticAlign.from_keyword(main_edge) };
+
+        var static_position = geo.Point(lt.AxisStaticPosition) { x: cross_position, y: main_position };
+        if constants.is_row {
+            static_position = geo.Point(lt.AxisStaticPosition) { x: main_position, y: cross_position };
+        }
+        candidates.push(lt.OofCandidate { node: child, order: order as u32, position: position, static_position: static_position }, a);
+    }
+}
+
+/// sum_axis_gaps: the space the gaps between num_items items (children or
+/// lines) take: none for fewer than two.
+fn sum_axis_gaps(gap: f32, num_items: usize) -> f32 {
+    if num_items <= 1 {
+        return 0.0;
+    }
+    return gap * ((num_items - 1) as f32);
+}
+
+// --- Balanced line breaking for `flex-wrap: balance` (taffy's mod
+// balance) ---
+//
+// The balancing algorithm of the CSS Flexbox Level 2 draft
+// (css-flexbox-2 #balancing). Items are divided into exactly `line_count`
+// contiguous lines, line_count the number greedy line breaking gives
+// (with item sizes floored at zero), raised to the minimum flex line count
+// (clamped to the number of items), such that: every line holds an item;
+// no line exceeds the container's inner main size unless it holds a single
+// item; a zero-sized item joins the end of the preceding line rather than
+// starting one, unless no valid division can glue it there; the sum of the
+// squared line sizes is least (equivalent to the squared errors, as every
+// division has the same line count and totals); ties give the most items
+// to the first line, then the second, and so on. All arithmetic is f64:
+// finite f32 sizes convert exactly and the sums stay far from f64's
+// limits, so equally balanced divisions compare equal and the tie-break
+// decides. A dynamic program over (line count, first item of suffix) with
+// the divide-and-conquer optimization.
+
+/// INFEASIBLE: the score of a division that breaks the line size limit.
+fn infeasible() -> f64 {
+    return float.from_bits64(0x7FF0000000000000);
+}
+
+/// to_size: an item size as f64, negatives floored at zero (an infinite
+/// size clamped to the largest finite f32 so sums stay meaningful).
+fn to_size(value: f32) -> f64 {
+    var x = value as f64;
+    if x < 0.0 {
+        x = 0.0;
+    }
+    if x > (util.f32_max_value() as f64) {
+        x = util.f32_max_value() as f64;
+    }
+    return x;
+}
+
+/// One entry of LineSizes.sums: the prefix sum through an item (each item
+/// also brings one trailing gap), and whether the item's floored size is
+/// zero.
+type PrefixSum = struct {
+    /// The prefix sum.
+    sum: f64,
+    /// Whether the item's size is zero.
+    is_zero: bool,
+}
+
+/// The line sizing shared by the scoring and readback phases (LineSizes).
+type LineSizes = struct {
+    /// Per item, the prefix sum of the item sizes through it: the line of
+    /// items start..=end is sums[end] - sums[start - 1] - gap_between_items.
+    sums: alloc.List(PrefixSum),
+    /// The size of the gap between adjacent items on a line.
+    gap_between_items: f64,
+    /// The container's inner main size, which lines of more than one item
+    /// may not exceed.
+    limit: f64,
+
+    /// The total number of items.
+    fn item_count(self: &LineSizes) -> usize {
+        return self.sums.len();
+    }
+
+    /// Whether the item at index has a (floored) size of zero.
+    fn is_zero_item(self: &LineSizes, index: usize) -> bool {
+        return self.sums.items()[index].is_zero;
+    }
+
+    /// The size of the line holding items start..=end.
+    fn line_size(self: &LineSizes, start: usize, end: usize) -> f64 {
+        var start_sum: f64 = 0.0;
+        if start != 0 {
+            start_sum = self.sums.items()[start - 1].sum;
+        }
+        return self.sums.items()[end].sum - start_sum - self.gap_between_items;
+    }
+
+    /// The squared size of the line holding items start..=end, or
+    /// INFEASIBLE for a line of more than one item over the limit.
+    fn line_cost(self: &LineSizes, start: usize, end: usize) -> f64 {
+        let size = self.line_size(start:, end:);
+        if end > start and size > self.limit {
+            return infeasible();
+        }
+        return size * size;
+    }
+
+    /// For every suffix of the items, the number of lines greedy line
+    /// breaking gives it (zero for the empty suffix): also the fewest
+    /// lines it can validly be divided into, and it can be divided into any
+    /// number from there up to its item count.
+    fn suffix_greedy_line_counts(self: &LineSizes, a: alloc.Allocator) -> alloc.List(u32) {
+        let item_count = self.item_count();
+        var counts = alloc.List(u32).init(a);
+        var z: usize = 0;
+        while z < item_count + 1 : (z += 1) {
+            counts.push(0);
+        }
+        // The (exclusive) end of the greedy first line of the suffix, which
+        // only moves down as the suffix grows leftwards.
+        var line_end = item_count;
+        var k: usize = 0;
+        while k < item_count : (k += 1) {
+            let start = item_count - 1 - k;
+            while line_end > start + 1 and self.line_size(start:, end: line_end - 1) > self.limit {
+                line_end -= 1;
+            }
+            counts[start] = 1 + counts.items()[line_end];
+        }
+        return counts;
+    }
+
+    /// For every start, the largest end such that the line start..=end
+    /// does not exceed the limit (start itself if even that one item
+    /// overflows).
+    fn fit_ends(self: &LineSizes, a: alloc.Allocator) -> alloc.List(u32) {
+        let item_count = self.item_count();
+        var ends = alloc.List(u32).init(a);
+        // Lines starting later are smaller, so the fit end only moves up.
+        var fit_end: usize = 0;
+        var start: usize = 0;
+        while start < item_count : (start += 1) {
+            if fit_end < start {
+                fit_end = start;
+            }
+            while fit_end + 1 < item_count and self.line_size(start:, end: fit_end + 1) <= self.limit {
+                fit_end += 1;
+            }
+            ends.push(fit_end as u32);
+        }
+        return ends;
+    }
+}
+
+/// The first index in values[lo..hi] whose value is not below bound
+/// (partition_point by `end < bound`), the values ascending.
+fn partition_below(values: []u32, lo: usize, hi: usize, bound: usize) -> usize {
+    var low = lo;
+    var high = hi;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if (values[mid] as usize) < bound {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+/// fill_row: cur[start] and opts[opts_base + start] for start in
+/// start_lo..=start_hi, where cur[start] is the least, over valid ends, of
+/// line_cost(start, end) + prev[end + 1], and opts the largest end giving
+/// it. Ends before a non-zero item are minimized over
+/// nonzero_ends[col_lo..col_hi]; the one end before a zero item the
+/// zero-sized-item rule allows, min(fit_ends[start], max_end), is merged
+/// in afterwards. Over the non-zero ends the cost satisfies the concave
+/// quadrangle inequality, so the largest minimizing end does not decrease
+/// with start, and solving the middle start splits the end range in two
+/// (taffy's Row is the parameters sizes to max_end).
+fn fill_row(sizes: &LineSizes, fit_ends: []u32, prev: []f64, nonzero_ends: []u32, max_end: usize, cur: []mut f64, opts: []mut u32, opts_base: usize, start_lo: usize, start_hi: usize, col_lo: usize, col_hi: usize) {
+    if start_lo > start_hi {
+        return;
+    }
+    let start = start_lo + (start_hi - start_lo) / 2;
+
+    // Minimize over the in-range ends before a non-zero item, from start
+    // (the line holds at least one item).
+    let first_col = partition_below(nonzero_ends, lo: col_lo, hi: col_hi, bound: start);
+    var min_cost = infeasible();
+    var min_col: ?usize = none;
+    var col = first_col;
+    while col < col_hi : (col += 1) {
+        let end = nonzero_ends[col] as usize;
+        let line_cost = sizes.line_cost(start:, end:);
+        if line_cost == infeasible() {
+            // Every longer line also exceeds the limit.
+            break;
+        }
+        let cost = line_cost + prev[end + 1];
+        // `<=` keeps the largest minimizing end: the most items to the
+        // earliest lines, as the tie-break requires.
+        if cost <= min_cost {
+            min_cost = cost;
+            min_col = some(col);
+        }
+    }
+
+    // Merge the single end before a zero item the zero-sized-item rule
+    // allows.
+    var min_end: ?usize = none;
+    match min_col {
+        some(mc) => { min_end = some(nonzero_ends[mc] as usize); }
+        none => { }
+    }
+    var zero_end = fit_ends[start] as usize;
+    if max_end < zero_end {
+        zero_end = max_end;
+    }
+    if sizes.is_zero_item(zero_end + 1) {
+        let cost = sizes.line_cost(start:, end: zero_end) + prev[zero_end + 1];
+        var later = true;
+        match min_end {
+            some(me) => { later = me < zero_end; }
+            none => { }
+        }
+        if cost < min_cost or (cost == min_cost and later) {
+            min_cost = cost;
+            min_end = some(zero_end);
+        }
+    }
+
+    // Infeasible states are left out of the range by the caller, and every
+    // feasible state has a valid transition.
+    cur[start] = min_cost;
+    opts[opts_base + start] = (min_end orelse start) as u32;
+
+    // The zero-rule end is left out of the narrowing: only the non-zero
+    // ends' minima are monotone.
+    if start > start_lo {
+        var left_col_hi = col_hi;
+        match min_col {
+            some(mc) => { left_col_hi = mc + 1; }
+            none => { }
+        }
+        fill_row(sizes, fit_ends:, prev:, nonzero_ends:, max_end:, cur:, opts:, opts_base:, start_lo:, start_hi: start - 1, col_lo:, col_hi: left_col_hi);
+    }
+    if start < start_hi {
+        let right_col_lo = min_col orelse first_col;
+        fill_row(sizes, fit_ends:, prev:, nonzero_ends:, max_end:, cur:, opts:, opts_base:, start_lo: start + 1, start_hi:, col_lo: right_col_lo, col_hi:);
+    }
+}
+
+/// balanced_line_item_counts: the number of items on each line that
+/// balances the items across lines, the largest line as small as
+/// possible, with at least min_line_count lines (one per item when there
+/// are fewer). item_sizes is not empty; the counts are all non-zero and
+/// sum to the number of items.
+fn balanced_line_item_counts(item_sizes: []f32, line_limit: f32, gap_between_items: f32, min_line_count: usize, a: alloc.Allocator) -> alloc.List(usize) {
+    let item_count = item_sizes.len();
+    let gap = to_size(gap_between_items);
+    let limit = line_limit as f64;
+
+    var sums = alloc.List(PrefixSum).init(a);
+    var running: f64 = 0.0;
+    for item_size in item_sizes {
+        let size = to_size(item_size.*);
+        running = running + (size + gap);
+        sums.push(PrefixSum { sum: running, is_zero: size == 0.0 });
+    }
+    let sizes = LineSizes { sums: sums, gap_between_items: gap, limit: limit };
+
+    // suffix_greedy[start]: the lines greedy line breaking gives items
+    // start.., the fewest the suffix can validly be divided into.
+    let suffix_greedy = sizes.suffix_greedy_line_counts(a);
+    var clamped_minimum = min_line_count;
+    if clamped_minimum < 1 {
+        clamped_minimum = 1;
+    }
+    if clamped_minimum > item_count {
+        clamped_minimum = item_count;
+    }
+    var line_count = suffix_greedy.items()[0] as usize;
+    if line_count < clamped_minimum {
+        line_count = clamped_minimum;
+    }
+
+    var item_counts = alloc.List(usize).init(a);
+    if line_count == item_count {
+        // One item per line is the only division.
+        var one: usize = 0;
+        while one < item_count : (one += 1) {
+            item_counts.push(1);
+        }
+        return item_counts;
+    }
+
+    let fit_ends = sizes.fit_ends(a);
+    var nonzero_ends = alloc.List(u32).init(a);
+    var e: usize = 0;
+    while e < item_count - 1 : (e += 1) {
+        if not sizes.is_zero_item(e + 1) {
+            nonzero_ends.push(e as u32);
+        }
+    }
+
+    // prev[start]: the least total score of any valid division of items
+    // start.. into exactly lines - 1 lines (INFEASIBLE if there is none);
+    // cur the row being computed for `lines` lines: a first line
+    // start..=end plus a division of end + 1.. into lines - 1 lines.
+    // opts[(lines - 2) * item_count + start] records the largest end
+    // giving cur[start], from which the division is read back.
+    var prev = alloc.List(f64).init(a);
+    var p: usize = 0;
+    while p < item_count : (p += 1) {
+        prev.push(sizes.line_cost(start: p, end: item_count - 1));
+    }
+    var cur = alloc.List(f64).init(a);
+    var q: usize = 0;
+    while q < item_count : (q += 1) {
+        cur.push(infeasible());
+    }
+    var opts = alloc.List(u32).init(a);
+    var o: usize = 0;
+    while o < (line_count - 1) * item_count : (o += 1) {
+        opts.push(0);
+    }
+    var lines: usize = 2;
+    while lines <= line_count : (lines += 1) {
+        // The remaining lines - 1 lines need one item each, bounding this
+        // line's end.
+        let max_end = item_count - lines;
+        // Starts whose suffix does not fit in `lines` lines even greedily
+        // are infeasible; they form a prefix, and leaving them out keeps
+        // every state fill_row solves feasible.
+        var first_start: usize = 0;
+        while first_start < max_end and (suffix_greedy.items()[first_start] as usize) > lines {
+            cur[first_start] = infeasible();
+            first_start += 1;
+        }
+        let col_hi = partition_below(nonzero_ends.items(), lo: 0, hi: nonzero_ends.len(), bound: max_end + 1);
+        fill_row(&sizes, fit_ends: fit_ends.items(), prev: prev.items(), nonzero_ends: nonzero_ends.items(), max_end:, cur: cur.items_mut(), opts: opts.items_mut(), opts_base: (lines - 2) * item_count, start_lo: first_start, start_hi: max_end, col_lo: 0, col_hi:);
+        let swapped = prev;
+        prev = cur;
+        cur = swapped;
+    }
+
+    // Read the division back, front to back.
+    var start: usize = 0;
+    var remaining_lines = line_count;
+    while remaining_lines >= 2 : (remaining_lines -= 1) {
+        let end = opts.items()[(remaining_lines - 2) * item_count + start] as usize;
+        item_counts.push(end - start + 1);
+        start = end + 1;
+    }
+    item_counts.push(item_count - start);
+    return item_counts;
+}

@@ -1,0 +1,100 @@
+/// compute.grid.types.grid_track_counts: taffy 0.15's
+/// compute/grid/types/grid_track_counts.rs, the number of tracks before, in
+/// and after the explicit grid in one axis, and the conversions between
+/// origin-zero lines and track indexes that depend on them, with
+/// OriginZeroLine::into_track_vec_index and try_into_track_vec_index of
+/// coordinates.rs (the rest of coordinates.rs is in style.grid).
+///
+/// taffy uses two kinds of track index: CellOccupancyMatrix indexes count
+/// tracks only, from 0 at the implicit grid's first track; GridTrackVec
+/// indexes count lines and tracks alike, so even indexes are lines
+/// (gutters) and odd ones tracks.
+import layout.geometry as geo;
+import layout.style.grid as sgrid;
+
+/// The tracks of one axis, before, in and after the explicit grid
+/// (TrackCounts).
+pub type TrackCounts = struct {
+    /// The tracks of the implicit grid before the explicit grid.
+    pub negative_implicit: u16,
+    /// The tracks of the explicit grid.
+    pub explicit: u16,
+    /// The tracks of the implicit grid after the explicit grid.
+    pub positive_implicit: u16,
+
+    /// TrackCounts::from_raw.
+    pub fn from_raw(negative_implicit: u16, explicit: u16, positive_implicit: u16) -> TrackCounts {
+        return TrackCounts { negative_implicit: negative_implicit, explicit: explicit, positive_implicit: positive_implicit };
+    }
+
+    /// TrackCounts::default: no tracks.
+    pub fn zero() -> TrackCounts {
+        return TrackCounts { negative_implicit: 0, explicit: 0, positive_implicit: 0 };
+    }
+
+    /// The tracks of the axis in all.
+    pub fn len(self: TrackCounts) -> usize {
+        return (self.negative_implicit + self.explicit + self.positive_implicit) as usize;
+    }
+
+    /// The line at the start of the implicit grid.
+    pub fn implicit_start_line(self: TrackCounts) -> sgrid.OriginZeroLine {
+        return sgrid.OriginZeroLine { value: 0 - (self.negative_implicit as i16) };
+    }
+
+    /// The line at the end of the implicit grid.
+    pub fn implicit_end_line(self: TrackCounts) -> sgrid.OriginZeroLine {
+        return sgrid.OriginZeroLine { value: (self.explicit + self.positive_implicit) as i16 };
+    }
+
+    /// The CellOccupancyMatrix index of the track just after a line.
+    pub fn oz_line_to_next_track(self: TrackCounts, index: sgrid.OriginZeroLine) -> i16 {
+        return index.value + (self.negative_implicit as i16);
+    }
+
+    /// The CellOccupancyMatrix tracks between two lines, as start..end
+    /// (the end exclusive).
+    pub fn oz_line_range_to_track_range(self: TrackCounts, input: geo.Line(sgrid.OriginZeroLine)) -> geo.Line(i16) {
+        let start = self.oz_line_to_next_track(input.start);
+        let end = self.oz_line_to_next_track(input.end);
+        return geo.Line(i16) { start: start, end: end };
+    }
+
+    /// The line just before a CellOccupancyMatrix track.
+    pub fn track_to_prev_oz_line(self: TrackCounts, index: u16) -> sgrid.OriginZeroLine {
+        return sgrid.OriginZeroLine { value: (index as i16) - (self.negative_implicit as i16) };
+    }
+
+    /// The lines around the CellOccupancyMatrix tracks start..end.
+    pub fn track_range_to_oz_line_range(self: TrackCounts, input: geo.Line(i16)) -> geo.Line(sgrid.OriginZeroLine) {
+        let start = self.track_to_prev_oz_line(input.start as u16);
+        let end = self.track_to_prev_oz_line(input.end as u16);
+        return geo.Line(sgrid.OriginZeroLine) { start: start, end: end };
+    }
+}
+
+/// OriginZeroLine::into_track_vec_index: the GridTrackVec index of a line,
+/// which must be in the grid.
+pub fn into_track_vec_index(line: sgrid.OriginZeroLine, track_counts: TrackCounts) -> usize {
+    match try_into_track_vec_index(line, track_counts) {
+        some(index) => { return index; }
+        none => {
+            if line.value > 0 {
+                panic("OriginZero grid line cannot be more than the number of positive grid lines");
+            }
+            panic("OriginZero grid line cannot be less than the number of negative grid lines");
+        }
+    }
+}
+
+/// OriginZeroLine::try_into_track_vec_index: the GridTrackVec index of a
+/// line, none when the line is outside the grid.
+pub fn try_into_track_vec_index(line: sgrid.OriginZeroLine, track_counts: TrackCounts) -> ?usize {
+    if line.value < 0 - (track_counts.negative_implicit as i16) {
+        return none;
+    }
+    if line.value > ((track_counts.explicit + track_counts.positive_implicit) as i16) {
+        return none;
+    }
+    return 2 * ((line.value + (track_counts.negative_implicit as i16)) as usize);
+}

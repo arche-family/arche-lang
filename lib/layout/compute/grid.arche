@@ -1,0 +1,866 @@
+/// compute.grid: taffy 0.15's compute/grid/mod.rs, CSS Grid layout, a part
+/// of CSS Grid Level 1 <https://www.w3.org/TR/css-grid-1>.
+///
+/// The algorithm is in this module's modules, one per file of taffy's
+/// compute/grid: explicit_grid, implicit_grid, placement, track_sizing,
+/// alignment, and types (cell_occupancy, grid_item, grid_track,
+/// grid_track_counts, named). taffy's coordinates.rs is in style.grid,
+/// with the styles written in its lines.
+///
+/// taffy's DetailedGridInfo (the tracks, items and line names it records
+/// for the embedder, and the grid areas of out-of-flow boxes resolved from
+/// it) is left out: Nimadir does not record it, so an out-of-flow box whose
+/// containing block is a grid is placed against the grid's padding box.
+import alloc;
+import layout.compute.grid.alignment as galign;
+import layout.compute.grid.explicit_grid as explicit;
+import layout.compute.grid.implicit_grid as implicit;
+import layout.compute.grid.placement as placement;
+import layout.compute.grid.track_sizing as sizing;
+import layout.compute.grid.types.cell_occupancy as cell;
+import layout.compute.grid.types.grid_item as gi;
+import layout.compute.grid.types.grid_track as gt;
+import layout.compute.grid.types.grid_track_counts as counts;
+import layout.compute.grid.types.named as named;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.style.grid as sgrid;
+import layout.tree as lt;
+import layout.util;
+
+/// The container's resolved box, size limits, alignment and available
+/// space, computed once from its style and the inputs
+/// (GridContainerConstants).
+type GridContainerConstants = struct {
+    /// Its direction.
+    direction: sty.Direction,
+    /// Its contain.
+    contain: sty.Contain,
+    /// The positioning schemes it is a containing block for.
+    containing_block_claims: sty.ContainingBlockClaims,
+    /// Its padding.
+    padding: geo.Rect(f32),
+    /// Its border.
+    border: geo.Rect(f32),
+    /// Padding and border summed per axis.
+    padding_border_size: geo.Size(f32),
+    /// Its border-box min size, if definite.
+    min_size: geo.Size(?f32),
+    /// Its border-box max size, if definite.
+    max_size: geo.Size(?f32),
+    /// Its border-box preferred size, if definite.
+    preferred_size: geo.Size(?f32),
+    /// The room for scrollbars in each axis.
+    scrollbar_gutter: geo.Point(f32),
+    /// Whether its overflow makes it a scroll container.
+    is_scroll_container: bool,
+    /// Padding, border and scrollbar gutter together.
+    content_box_inset: geo.Rect(f32),
+    /// Its align-content.
+    align_content: sty.AlignContent,
+    /// Its justify-content.
+    justify_content: sty.AlignContent,
+    /// Its align-items.
+    align_items: sty.AlignItems,
+    /// Its justify-items.
+    justify_items: sty.AlignItems,
+    /// The space to size the tracks in.
+    available_grid_space: geo.Size(sty.AvailableSpace),
+    /// Its border-box size, if definite.
+    outer_node_size: geo.Size(?f32),
+    /// Its content-box min size, if definite.
+    inner_min_size: geo.Size(?f32),
+    /// Its content-box max size, if definite.
+    inner_max_size: geo.Size(?f32),
+    /// Its content-box size, if definite.
+    inner_node_size: geo.Size(?f32),
+}
+
+/// compute_container_constants: the container's style resolved against
+/// the inputs (step 1 of compute_grid_layout).
+fn compute_container_constants(style: &sty.Style, inputs: lt.LayoutInput) -> GridContainerConstants {
+    let known_dimensions = inputs.known_dimensions;
+    let parent_size = inputs.parent_size;
+    let available_space = inputs.available_space;
+
+    let direction = style.direction;
+    let contain = style.contain;
+    let containing_block_claims = style.is_containing_block();
+
+    // 1. The available grid space.
+    // https://www.w3.org/TR/css-grid-1/#available-grid-space
+    let aspect_ratio = style.aspect_ratio;
+    let padding = style.padding.resolve_or_zero(parent_size.width);
+    let border = style.border.resolve_or_zero(parent_size.width);
+    let padding_border = padding.add(border);
+    let padding_border_size = padding_border.sum_axes();
+    var box_sizing_adjustment = geo.size_zero();
+    if style.box_sizing == sty.BoxSizing.ContentBox {
+        box_sizing_adjustment = padding_border_size;
+    }
+
+    let min_size = style.min_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    let max_size = style.max_size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    var preferred_size = geo.size_none();
+    if inputs.sizing_mode == lt.SizingMode.InherentSize {
+        preferred_size = style.size.maybe_resolve(parent_size).maybe_apply_aspect_ratio(style.aspect_ratio).maybe_add_f(box_sizing_adjustment);
+    }
+
+    // overflow: scroll reserves room for a scrollbar, the axes swapped: a
+    // node scrolling vertically needs room across.
+    var scrollbar_gutter = geo.point_zero();
+    if style.overflow.y == sty.Overflow.Scroll {
+        scrollbar_gutter.x = style.scrollbar_width;
+    }
+    if style.overflow.x == sty.Overflow.Scroll {
+        scrollbar_gutter.y = style.scrollbar_width;
+    }
+    let is_scroll_container = style.overflow.x.is_scroll_container() or style.overflow.y.is_scroll_container();
+    var content_box_inset = padding_border;
+    content_box_inset.bottom = content_box_inset.bottom + scrollbar_gutter.y;
+
+    match direction {
+        .Ltr => { content_box_inset.right = content_box_inset.right + scrollbar_gutter.x; }
+        .Rtl => { content_box_inset.left = content_box_inset.left + scrollbar_gutter.x; }
+    }
+
+    // normal is stretch for grid containers.
+    let align_content = style.grid_align_content(geo.AbstractAxis.Block);
+    let justify_content = style.grid_align_content(geo.AbstractAxis.Inline);
+    let align_items = style.align_items;
+    let justify_items = style.justify_items;
+    let known_or_preferred = known_dimensions.fallback(preferred_size);
+    let constrained_available_space = geo.Size(sty.AvailableSpace) {
+        width: definite_or(known_or_preferred.width, available_space.width),
+        height: definite_or(known_or_preferred.height, available_space.height),
+    }.maybe_clamp(min: min_size, max: max_size).maybe_max_f(padding_border_size);
+
+    let horizontal_inset = content_box_inset.horizontal_axis_sum();
+    let vertical_inset = content_box_inset.vertical_axis_sum();
+    let available_grid_space = geo.Size(sty.AvailableSpace) {
+        width: constrained_available_space.width.map_definite_value(fn [horizontal_inset](space: f32) -> f32 { return space - horizontal_inset; }),
+        height: constrained_available_space.height.map_definite_value(fn [vertical_inset](space: f32) -> f32 { return space - vertical_inset; }),
+    };
+
+    let outer_node_size = known_or_preferred.maybe_clamp(min: min_size, max: max_size).maybe_max_f(padding_border_size);
+
+    // Track sizing works on the content box, so the min and max sizes
+    // (border-box sizes) become content-box sizes for it.
+    let inner_min_size = min_size.maybe_sub_f(content_box_inset.sum_axes());
+    let inner_max_size = max_size.maybe_sub_f(content_box_inset.sum_axes());
+    let inner_node_size = geo.Size(?f32) {
+        width: util.maybe_sub_f(outer_node_size.width, horizontal_inset),
+        height: util.maybe_sub_f(outer_node_size.height, vertical_inset),
+    };
+
+    return GridContainerConstants {
+        direction: direction,
+        contain: contain,
+        containing_block_claims: containing_block_claims,
+        padding: padding,
+        border: border,
+        padding_border_size: padding_border_size,
+        min_size: min_size,
+        max_size: max_size,
+        preferred_size: preferred_size,
+        scrollbar_gutter: scrollbar_gutter,
+        is_scroll_container: is_scroll_container,
+        content_box_inset: content_box_inset,
+        align_content: align_content,
+        justify_content: justify_content,
+        align_items: align_items,
+        justify_items: justify_items,
+        available_grid_space: available_grid_space,
+        outer_node_size: outer_node_size,
+        inner_min_size: inner_min_size,
+        inner_max_size: inner_max_size,
+        inner_node_size: inner_node_size,
+    };
+}
+
+/// Some(size) as definite space, else fallback.
+fn definite_or(value: ?f32, fallback: sty.AvailableSpace) -> sty.AvailableSpace {
+    match value {
+        some(v) => { return sty.AvailableSpace.definite(v); }
+        none => { return fallback; }
+    }
+}
+
+/// The base sizes of the tracks summed, as Rust sums f32s.
+fn base_size_sum(tracks: []gt.GridTrack) -> f32 {
+    var sum: f32 = gt.sum_zero();
+    for track in tracks {
+        sum = sum + track.base_size;
+    }
+    return sum;
+}
+
+/// compute_grid_layout: lays out a grid container in four phases: the
+/// explicit grid; item placement, which finds the implicit grid; track
+/// sizing; alignment and the final placing of the items.
+pub fn compute_grid_layout(tree: &mut dyn lt.LayoutTree, node: lt.NodeId, inputs: lt.LayoutInput) -> lt.LayoutOutput {
+    let a = tree.allocator();
+    let known_dimensions = inputs.known_dimensions;
+    let run_mode = inputs.run_mode;
+
+    let style = tree.get_style(node);
+    let constants = compute_container_constants(style, inputs);
+    let direction = constants.direction;
+    let contain = constants.contain;
+    let containing_block_claims = constants.containing_block_claims;
+    let padding = constants.padding;
+    let border = constants.border;
+    let padding_border_size = constants.padding_border_size;
+    let min_size = constants.min_size;
+    let max_size = constants.max_size;
+    let preferred_size = constants.preferred_size;
+    let scrollbar_gutter = constants.scrollbar_gutter;
+    let is_scroll_container = constants.is_scroll_container;
+    let content_box_inset = constants.content_box_inset;
+    let align_content = constants.align_content;
+    let justify_content = constants.justify_content;
+    let align_items = constants.align_items;
+    let justify_items = constants.justify_items;
+    let available_grid_space = constants.available_grid_space;
+    let outer_node_size = constants.outer_node_size;
+    let inner_min_size = constants.inner_min_size;
+    let inner_max_size = constants.inner_max_size;
+    var inner_node_size = constants.inner_node_size;
+
+    // When only the size is asked for and the styles decide it, it is
+    // known already.
+    if run_mode == lt.RunMode.ComputeSize {
+        match outer_node_size.width {
+            some(width) => {
+                match outer_node_size.height {
+                    some(height) => { return lt.LayoutOutput.from_outer_size(geo.Size(f32) { width: width, height: height }); }
+                    none => { }
+                }
+            }
+            none => { }
+        }
+
+        // Likewise when only the width is asked for and it is known.
+        if inputs.axis == lt.RequestedAxis.Horizontal {
+            match outer_node_size.width {
+                some(width) => { return lt.LayoutOutput.from_outer_size(geo.Size(f32) { width: width, height: 0.0 }); }
+                none => { }
+            }
+        }
+    }
+
+    // 2. The explicit grid.
+
+    // inner_node_size, or failing it a min or max size of the container.
+    let auto_fit_container_size = outer_node_size.fallback(max_size).fallback(min_size).maybe_clamp(min: min_size, max: max_size).maybe_max_f(padding_border_size).maybe_sub_f(content_box_inset.sum_axes());
+
+    // With a definite size or max size in the axis, the most repetitions
+    // that do not overflow the content box; else, with a definite min size,
+    // the fewest that fill it; else the track list repeats once.
+    let fit_basis = outer_node_size.fallback(max_size);
+    var width_strategy = explicit.AutoRepeatStrategy.MinRepetitionsThatDoOverflow;
+    if util.is_some(fit_basis.width) {
+        width_strategy = explicit.AutoRepeatStrategy.MaxRepetitionsThatDoNotOverflow;
+    }
+    var height_strategy = explicit.AutoRepeatStrategy.MinRepetitionsThatDoOverflow;
+    if util.is_some(fit_basis.height) {
+        height_strategy = explicit.AutoRepeatStrategy.MaxRepetitionsThatDoNotOverflow;
+    }
+
+    // The rows and columns of the explicit grid's template (those of
+    // grid-template-areas come below).
+    let col_size = explicit.compute_explicit_grid_size_in_axis(style, auto_fit_container_size.width, width_strategy, geo.AbsoluteAxis.Horizontal);
+    let row_size = explicit.compute_explicit_grid_size_in_axis(style, auto_fit_container_size.height, height_strategy, geo.AbsoluteAxis.Vertical);
+    let col_auto_repetition_count = col_size.auto_repetition_count;
+    let grid_template_col_count = col_size.track_count;
+    let row_auto_repetition_count = row_size.auto_repetition_count;
+    let grid_template_row_count = row_size.track_count;
+
+    var name_resolver = named.NamedLineResolver.new(style, column_auto_repetitions: col_auto_repetition_count, row_auto_repetitions: row_auto_repetition_count, tree: tree, a: a);
+
+    // The explicit grid clamped to MAX_GRID_TRACKS tracks in each axis.
+    // https://www.w3.org/TR/css-grid-1/#overlarge-grids
+    let explicit_col_count = min_u16(x: max_u16(x: grid_template_col_count, y: name_resolver.area_column_count()), y: sgrid.MAX_GRID_TRACKS);
+    let explicit_row_count = min_u16(x: max_u16(x: grid_template_row_count, y: name_resolver.area_row_count()), y: sgrid.MAX_GRID_TRACKS);
+
+    name_resolver.set_explicit_column_count(explicit_col_count);
+    name_resolver.set_explicit_row_count(explicit_row_count);
+
+    // 3. The grid items, in document order, their named lines resolved.
+    // Absolutely positioned children take no part in placement and make no
+    // implicit tracks, so they are left out. Each child's style is read and
+    // its names resolved once; the grid size estimate and placement both
+    // use the result.
+    let child_count = tree.child_count(node);
+    var items = alloc.List(gi.GridItem).with_capacity(a, child_count);
+    var placements = alloc.List(placement.ItemPlacement).with_capacity(a, child_count);
+    var index: usize = 0;
+    while index < child_count : (index += 1) {
+        let child_node = tree.get_child_id(node, index);
+        let child_style = tree.get_style(child_node);
+        if child_style.box_generation_mode() == sty.BoxGenerationMode.None or child_style.position.is_out_of_flow() {
+            continue;
+        }
+        placements.push(placement.ItemPlacement {
+            horizontal: name_resolver.resolve_column_names(child_style.grid_column, tree).into_origin_zero(explicit_col_count),
+            vertical: name_resolver.resolve_row_names(child_style.grid_row, tree).into_origin_zero(explicit_row_count),
+        });
+        items.push(gi.GridItem.new_with_style_and_order(child_node, child_style, parent_align_items: align_items, parent_justify_items: justify_items, source_order: index as u16));
+    }
+
+    // 4. The implicit grid's track counts, estimated: placement needs them,
+    // and knowing them early saves allocations.
+    let estimate = implicit.compute_grid_size_estimate(explicit_col_count: explicit_col_count, explicit_row_count: explicit_row_count, placements: placements.items());
+
+    // 5. Placement: every item gets a definite area (row start and end,
+    // column start and end).
+    var cell_occupancy_matrix = cell.CellOccupancyMatrix.with_track_counts(columns: estimate.columns, rows: estimate.rows, a: a);
+    // items stay in document order: placement only fills in their areas.
+    // Track sizing and the baselines sort indexes, not the items.
+    placement.place_grid_items(&mut cell_occupancy_matrix, items.items_mut(), placements.items(), style.grid_auto_flow);
+
+    // The final track counts (auto-placement may add tracks).
+    let final_col_counts = cell_occupancy_matrix.track_counts(geo.AbsoluteAxis.Horizontal);
+    let final_row_counts = cell_occupancy_matrix.track_counts(geo.AbsoluteAxis.Vertical);
+
+    // 5. The explicit and implicit tracks and the gutters, their sizing
+    // functions resolved.
+    var columns = alloc.List(gt.GridTrack).init(a);
+    var rows = alloc.List(gt.GridTrack).init(a);
+    explicit.initialize_grid_tracks(&mut columns, final_col_counts, style, geo.AbsoluteAxis.Horizontal, col_auto_repetition_count, fn [&cell_occupancy_matrix](column_index: usize) -> bool { return cell_occupancy_matrix.column_is_occupied(column_index); });
+    explicit.initialize_grid_tracks(&mut rows, final_row_counts, style, geo.AbsoluteAxis.Vertical, row_auto_repetition_count, fn [&cell_occupancy_matrix](row_index: usize) -> bool { return cell_occupancy_matrix.row_is_occupied(row_index); });
+
+    // 6. Track sizing.
+
+    // The items' placements as GridTrack indexes: they need the final
+    // negative implicit counts, so they are found once, here.
+    sizing.resolve_item_track_indexes(items.items_mut(), column_counts: final_col_counts, row_counts: final_row_counts);
+    // Whether each item crosses a flexible (fr) or intrinsic track, in
+    // each axis, for track sizing.
+    sizing.determine_if_item_crosses_flexible_or_intrinsic_tracks(items.items_mut(), columns: columns.items(), rows: rows.items());
+
+    // Whether any item is baseline-aligned.
+    var has_baseline_aligned_item = false;
+    for item in items.items() {
+        if item.participates_in_baseline_alignment() {
+            has_baseline_aligned_item = true;
+            break;
+        }
+    }
+
+    // The inline axis.
+    sizing.track_sizing_algorithm(tree, geo.AbstractAxis.Inline, axis_min_size: inner_min_size.get(geo.AbstractAxis.Inline), axis_max_size: inner_max_size.get(geo.AbstractAxis.Inline), axis_alignment: justify_content, other_axis_alignment: align_content, available_grid_space: available_grid_space, inner_node_size: inner_node_size, axis_tracks: columns.items_mut(), other_axis_tracks: rows.items_mut(), items: items.items_mut(), get_track_size_estimate: gt.TrackSizeEstimate.MaxTrackDefiniteValue, has_baseline_aligned_item: has_baseline_aligned_item);
+    let initial_column_sum = base_size_sum(columns.items());
+    if util.is_none(inner_node_size.width) {
+        inner_node_size.width = some(initial_column_sum);
+    }
+
+    // When only the width is asked for, the rows need no sizing (nor the
+    // items measuring in height): column sizing does not rerun for a size
+    // only. The width known up front returned above.
+    if run_mode == lt.RunMode.ComputeSize and inputs.axis == lt.RequestedAxis.Horizontal {
+        let width = util.f32_max(a: util.f32_maybe_clamp(initial_column_sum + content_box_inset.horizontal_axis_sum(), min: min_size.width, max: max_size.width), b: padding_border_size.width);
+        return lt.LayoutOutput.from_outer_size(geo.Size(f32) { width: width, height: 0.0 });
+    }
+
+    for item in items.items_mut() {
+        item.grid_area_size_cache = none;
+    }
+
+    // The block axis (baseline alignment in it is not supported yet).
+    sizing.track_sizing_algorithm(tree, geo.AbstractAxis.Block, axis_min_size: inner_min_size.get(geo.AbstractAxis.Block), axis_max_size: inner_max_size.get(geo.AbstractAxis.Block), axis_alignment: align_content, other_axis_alignment: justify_content, available_grid_space: available_grid_space, inner_node_size: inner_node_size, axis_tracks: rows.items_mut(), other_axis_tracks: columns.items_mut(), items: items.items_mut(), get_track_size_estimate: gt.TrackSizeEstimate.BaseSize, has_baseline_aligned_item: false);
+    let initial_row_sum = base_size_sum(rows.items());
+
+    // 6. The container's size.
+    let resolved_style_size = known_dimensions.fallback(preferred_size);
+    var container_border_box = geo.Size(f32) {
+        width: util.f32_max(a: util.f32_maybe_clamp(util.unwrap_or(resolved_style_size.get(geo.AbstractAxis.Inline), initial_column_sum + content_box_inset.horizontal_axis_sum()), min: min_size.width, max: max_size.width), b: padding_border_size.width),
+        height: util.f32_max(a: util.f32_maybe_clamp(util.unwrap_or(resolved_style_size.get(geo.AbstractAxis.Block), initial_row_sum + content_box_inset.vertical_axis_sum()), min: min_size.height, max: max_size.height), b: padding_border_size.height),
+    };
+    var container_content_box = geo.Size(f32) {
+        width: util.f32_max(a: 0.0, b: container_border_box.width - content_box_inset.horizontal_axis_sum()),
+        height: util.f32_max(a: 0.0, b: container_border_box.height - content_box_inset.vertical_axis_sum()),
+    };
+
+    // Only the size asked for.
+    if run_mode == lt.RunMode.ComputeSize {
+        return lt.LayoutOutput.from_outer_size(container_border_box);
+    }
+
+    // The container's size is known now, so percentages resolve against
+    // its content box when tracks are sized again (no change when it was
+    // known up front).
+    inner_node_size = container_content_box.map_some();
+
+    // Columns are sized again (once) when the container's width was
+    // indefinite and a column has a percentage sizing function, or when
+    // the min-content width contribution of an item crossing an intrinsic
+    // track changed. (taffy: TODO, rerun only the tracks that need it.)
+    var rerun_column_sizing = false;
+    var intrinsic_column_contribution_changed = false;
+
+    var has_percentage_column = false;
+    for track in columns.items() {
+        if track.uses_percentage() {
+            has_percentage_column = true;
+            break;
+        }
+    }
+    var has_percentage_row = false;
+    for track in rows.items() {
+        if track.uses_percentage() {
+            has_percentage_row = true;
+            break;
+        }
+    }
+    let parent_width_indefinite = util.is_none(outer_node_size.width);
+    rerun_column_sizing = parent_width_indefinite and has_percentage_column;
+
+    if not rerun_column_sizing {
+        // Every item is visited, as each updates its caches.
+        var any_changed = false;
+        for item in items.items_mut() {
+            if not item.crosses_intrinsic_column {
+                continue;
+            }
+            let grid_area_size = item.grid_area_size(geo.AbstractAxis.Inline, axis_tracks: columns.items(), other_axis_tracks: rows.items(), available_space: inner_node_size, get_track_size_estimate: gt.TrackSizeEstimate.BaseSize);
+            let available_space = grid_area_size.with(geo.AbstractAxis.Inline, none);
+            let new_min_content_contribution = item.min_content_contribution(geo.AbstractAxis.Inline, tree, grid_area_size: grid_area_size, available_space: available_space);
+
+            let has_changed = not gi.option_eq(a: some(new_min_content_contribution), b: item.min_content_contribution_cache.width);
+
+            item.grid_area_size_cache = some(grid_area_size);
+            item.min_content_contribution_cache.width = some(new_min_content_contribution);
+            item.max_content_contribution_cache.width = none;
+            item.minimum_contribution_cache.width = none;
+
+            any_changed = any_changed or has_changed;
+        }
+        intrinsic_column_contribution_changed = any_changed;
+        rerun_column_sizing = intrinsic_column_contribution_changed;
+    } else {
+        // The width caches cleared.
+        for item in items.items_mut() {
+            item.grid_area_size_cache = none;
+            item.min_content_contribution_cache.width = none;
+            item.max_content_contribution_cache.width = none;
+            item.minimum_contribution_cache.width = none;
+        }
+    }
+
+    // Rows are sized again (once) when the container's height was
+    // indefinite and a row has a percentage sizing function, or when
+    // columns were and the min-content height contribution of an item
+    // crossing an intrinsic track changed.
+    let parent_height_indefinite = util.is_none(outer_node_size.height);
+    var rerun_row_sizing = parent_height_indefinite and has_percentage_row;
+    var intrinsic_row_contribution_changed = false;
+
+    if rerun_row_sizing {
+        // The height caches cleared.
+        for item in items.items_mut() {
+            item.grid_area_size_cache = none;
+            item.min_content_contribution_cache.height = none;
+            item.max_content_contribution_cache.height = none;
+            item.minimum_contribution_cache.height = none;
+        }
+    }
+
+    if rerun_column_sizing {
+        // The inline axis again.
+        sizing.track_sizing_algorithm(tree, geo.AbstractAxis.Inline, axis_min_size: inner_min_size.get(geo.AbstractAxis.Inline), axis_max_size: inner_max_size.get(geo.AbstractAxis.Inline), axis_alignment: justify_content, other_axis_alignment: align_content, available_grid_space: available_grid_space, inner_node_size: inner_node_size, axis_tracks: columns.items_mut(), other_axis_tracks: rows.items_mut(), items: items.items_mut(), get_track_size_estimate: gt.TrackSizeEstimate.BaseSize, has_baseline_aligned_item: has_baseline_aligned_item);
+
+        // The columns may have changed, so the items' intrinsic height
+        // contributions are found again (unless rows are sized again
+        // anyway, their caches already cleared).
+        if not rerun_row_sizing {
+            // Every item is visited, as each updates its caches.
+            var any_changed = false;
+            for item in items.items_mut() {
+                if not item.crosses_intrinsic_row {
+                    continue;
+                }
+                let grid_area_size = item.grid_area_size(geo.AbstractAxis.Block, axis_tracks: rows.items(), other_axis_tracks: columns.items(), available_space: inner_node_size, get_track_size_estimate: gt.TrackSizeEstimate.BaseSize);
+                let available_space = grid_area_size.with(geo.AbstractAxis.Block, none);
+                let new_min_content_contribution = item.min_content_contribution(geo.AbstractAxis.Block, tree, grid_area_size: grid_area_size, available_space: available_space);
+
+                let has_changed = not gi.option_eq(a: some(new_min_content_contribution), b: item.min_content_contribution_cache.height);
+
+                item.grid_area_size_cache = some(grid_area_size);
+                item.min_content_contribution_cache.height = some(new_min_content_contribution);
+                item.max_content_contribution_cache.height = none;
+                item.minimum_contribution_cache.height = none;
+
+                any_changed = any_changed or has_changed;
+            }
+            intrinsic_row_contribution_changed = any_changed;
+            rerun_row_sizing = intrinsic_row_contribution_changed;
+        }
+    }
+
+    if rerun_row_sizing {
+        // The block axis again.
+        sizing.track_sizing_algorithm(tree, geo.AbstractAxis.Block, axis_min_size: inner_min_size.get(geo.AbstractAxis.Block), axis_max_size: inner_max_size.get(geo.AbstractAxis.Block), axis_alignment: align_content, other_axis_alignment: justify_content, available_grid_space: available_grid_space, inner_node_size: inner_node_size, axis_tracks: rows.items_mut(), other_axis_tracks: columns.items_mut(), items: items.items_mut(), get_track_size_estimate: gt.TrackSizeEstimate.BaseSize, has_baseline_aligned_item: false);
+    }
+
+    if (intrinsic_column_contribution_changed and not has_percentage_column) or (intrinsic_row_contribution_changed and not has_percentage_row) {
+        let final_column_sum = base_size_sum(columns.items());
+        let final_row_sum = base_size_sum(rows.items());
+
+        if intrinsic_column_contribution_changed and not has_percentage_column {
+            container_border_box.width = util.f32_max(a: util.f32_maybe_clamp(util.unwrap_or(resolved_style_size.get(geo.AbstractAxis.Inline), final_column_sum + content_box_inset.horizontal_axis_sum()), min: min_size.width, max: max_size.width), b: padding_border_size.width);
+            container_content_box.width = util.f32_max(a: 0.0, b: container_border_box.width - content_box_inset.horizontal_axis_sum());
+        }
+
+        if intrinsic_row_contribution_changed and not has_percentage_row {
+            container_border_box.height = util.f32_max(a: util.f32_maybe_clamp(util.unwrap_or(resolved_style_size.get(geo.AbstractAxis.Block), final_row_sum + content_box_inset.vertical_axis_sum()), min: min_size.height, max: max_size.height), b: padding_border_size.height);
+            container_content_box.height = util.f32_max(a: 0.0, b: container_border_box.height - content_box_inset.vertical_axis_sum());
+        }
+    }
+
+    // Only the size asked for.
+    if run_mode == lt.RunMode.ComputeSize {
+        return lt.LayoutOutput.from_outer_size(container_border_box);
+    }
+
+    // 8. Track alignment.
+
+    // The columns.
+    let inline_size_without_scrollbar = util.f32_max(a: 0.0, b: container_border_box.width - padding_border_size.width);
+    let inline_scrollbar_gutter_for_alignment = util.f32_min(a: scrollbar_gutter.x, b: inline_size_without_scrollbar);
+    var column_padding = geo.Line(f32) { start: padding.left + 0.0, end: padding.right + inline_scrollbar_gutter_for_alignment };
+    if direction.is_rtl() {
+        column_padding = geo.Line(f32) { start: padding.left + inline_scrollbar_gutter_for_alignment, end: padding.right + 0.0 };
+    }
+    galign.align_tracks(container_content_box.get(geo.AbstractAxis.Inline), padding: column_padding, border: geo.Line(f32) { start: border.left, end: border.right }, tracks: columns.items_mut(), track_alignment_style: justify_content, axis_is_reversed: direction.is_rtl());
+    // The rows.
+    galign.align_tracks(container_content_box.get(geo.AbstractAxis.Block), padding: geo.Line(f32) { start: padding.top, end: padding.bottom }, border: geo.Line(f32) { start: border.top, end: border.bottom }, tracks: rows.items_mut(), track_alignment_style: align_content, axis_is_reversed: false);
+
+    // 9. The items sized, aligned and placed.
+
+    var item_overflow_rect = geo.rect_zero();
+
+    // Out-of-flow candidates in document order: the grid's own out-of-flow
+    // children among those that in-flow children's subtrees surfaced.
+    // The out-of-flow pass (compute_oof_layout) lays them out after this
+    // algorithm.
+    var oof_candidates = lt.OofCandidates.new();
+
+    let container_alignment_styles = geo.InBothAbsAxis(sty.AlignItems) { horizontal: justify_items, vertical: align_items };
+
+    // The in-flow children (the items).
+    let column_tracks = columns.items();
+    let row_tracks = rows.items();
+    for (item_index, item) in items.items_mut() {
+        // Tracks are in logical order; in rtl offsets run right to left, so
+        // an item's left edge comes from its logical end line and its right
+        // edge from its start line.
+        var left = column_tracks[(item.column_indexes.start as usize) + 1].offset;
+        var right = column_tracks[item.column_indexes.end as usize].offset;
+        if direction.is_rtl() {
+            left = column_tracks[(item.column_indexes.end as usize) - 1].offset;
+            right = column_tracks[item.column_indexes.start as usize].offset;
+        }
+        let grid_area = geo.Rect(f32) {
+            left: left,
+            right: right,
+            top: row_tracks[(item.row_indexes.start as usize) + 1].offset,
+            bottom: row_tracks[item.row_indexes.end as usize].offset,
+        };
+        let positioned = galign.align_and_position_item(tree, item.node, item_index as u32, grid_area: grid_area, containing_block_size: geo.Size(f32) { width: grid_area.right - grid_area.left, height: grid_area.bottom - grid_area.top }, container_alignment_styles: container_alignment_styles, baseline_shim: item.baseline_shim, direction: direction, container_border_box_width: container_border_box.width, container_border: border, container_is_scroll_container: is_scroll_container, bubbled_candidates: &mut item.oof_candidates);
+        item.y_position = positioned.y_position;
+        item.height = positioned.height;
+
+        item_overflow_rect = item_overflow_rect.union(positioned.overflow_contribution);
+    }
+
+    // The hidden and absolutely positioned children, with the candidates
+    // of the in-flow children's subtrees merged in (items are in child
+    // order).
+    var order = items.len() as u32;
+    var next_item: usize = 0;
+    var child_index: usize = 0;
+    while child_index < tree.child_count(node) : (child_index += 1) {
+        if next_item < items.len() and (items.items()[next_item].source_order as usize) == child_index {
+            oof_candidates.append(&mut items.items_mut()[next_item].oof_candidates);
+            next_item += 1;
+            continue;
+        }
+
+        let child = tree.get_child_id(node, child_index);
+        let child_style = tree.get_style(child);
+
+        // A hidden child.
+        if child_style.box_generation_mode() == sty.BoxGenerationMode.None {
+            let hidden_layout = lt.Layout.with_order(order);
+            tree.set_unrounded_layout(child, &hidden_layout);
+            _ = lt.perform_child_layout(tree, child, known_dimensions: geo.size_none(), parent_size: geo.size_none(), available_space: geo.size_max_content(), sizing_mode: lt.SizingMode.InherentSize, vertical_margins_are_collapsible: geo.line_false());
+            order += 1;
+            continue;
+        }
+
+        // An out-of-flow child becomes a candidate of the out-of-flow pass
+        // (compute_oof_layout), which lays out those whose containing block
+        // this grid is after this algorithm.
+        if child_style.position.is_out_of_flow() {
+            let position = child_style.position;
+            let item_direction = child_style.direction;
+            var justify_style = justify_items;
+            match child_style.justify_self {
+                some(x) => { justify_style = x; }
+                none => { }
+            }
+            let justify_self = justify_style.resolve_self_relative(item_direction: item_direction, container_direction: direction, axis_is_inline: true);
+            var align_style = align_items;
+            match child_style.align_self {
+                some(x) => { align_style = x; }
+                none => { }
+            }
+            let align_self = align_style.resolve_self_relative(item_direction: item_direction, container_direction: direction, axis_is_inline: false);
+
+            // The static-position rectangle: the grid area of the
+            // grid-placement properties when this grid is the child's
+            // containing block; otherwise the grid's content box, as if
+            // the child were the only item, in an area at the grid's
+            // content edges (placement does not apply then).
+            // https://www.w3.org/TR/css-grid-1/#static-position
+            var area = geo.rect_zero();
+            if containing_block_claims.for_position(position) {
+                area = resolve_static_position_grid_area(grid_row: child_style.grid_row, grid_column: child_style.grid_column, name_resolver: &name_resolver, final_row_counts: final_row_counts, final_col_counts: final_col_counts, rows: rows.items(), columns: columns.items(), direction: direction, border: border, scrollbar_gutter: scrollbar_gutter, container_border_box: container_border_box, tree: tree);
+            } else {
+                var rtl_gutter: f32 = 0.0;
+                var ltr_gutter = scrollbar_gutter.x;
+                if direction.is_rtl() {
+                    rtl_gutter = scrollbar_gutter.x;
+                    ltr_gutter = 0.0;
+                }
+                area = geo.Rect(f32) {
+                    left: border.left + padding.left + rtl_gutter,
+                    right: container_border_box.width - border.right - padding.right - ltr_gutter,
+                    top: border.top + padding.top,
+                    bottom: container_border_box.height - border.bottom - padding.bottom - scrollbar_gutter.y,
+                };
+            }
+
+            oof_candidates.push(lt.OofCandidate {
+                node: child,
+                order: order,
+                position: position,
+                static_position: geo.Point(lt.AxisStaticPosition) {
+                    x: lt.AxisStaticPosition.from_alignment(justify_self, geo.Line(f32) { start: area.left, end: area.right }, direction.is_rtl()),
+                    y: lt.AxisStaticPosition.from_alignment(align_self, geo.Line(f32) { start: area.top, end: area.bottom }, false),
+                },
+            }, a);
+
+            order += 1;
+        }
+    }
+
+    var rtl_inset: f32 = 0.0;
+    var ltr_inset = scrollbar_gutter.x;
+    if direction.is_rtl() {
+        rtl_inset = scrollbar_gutter.x;
+        ltr_inset = 0.0;
+    }
+    let absolute_position_inset = border.add(geo.Rect(f32) { left: rtl_inset, right: ltr_inset, top: 0.0, bottom: scrollbar_gutter.y });
+    let absolute_position_area = container_border_box.sub(absolute_position_inset.sum_axes());
+    let absolute_position_offset = geo.Point(f32) { x: absolute_position_inset.left, y: absolute_position_inset.top };
+
+    let oof_positioning_area: ?lt.OofPositioningArea = some(lt.OofPositioningArea { size: absolute_position_area, offset: absolute_position_offset });
+
+    // A scroll container's own end padding is part of its scrollable
+    // overflow; other boxes do not extend theirs by their padding.
+    var overflow_rect = item_overflow_rect;
+    if is_scroll_container {
+        if direction.is_rtl() {
+            overflow_rect.right = overflow_rect.right + padding.left;
+        } else {
+            overflow_rect.right = overflow_rect.right + padding.right;
+        }
+        overflow_rect.bottom = overflow_rect.bottom + padding.bottom;
+    }
+
+    // Without in-flow items: the size and the overflow, no baseline.
+    if items.len() == 0 {
+        var empty_output = lt.LayoutOutput.from_sizes(container_border_box, overflow_rect);
+        empty_output.oof_candidates = oof_candidates;
+        empty_output.oof_positioning_area = oof_positioning_area;
+        return empty_output;
+    }
+
+    // The container's first baseline (only that one yet); layout
+    // containment suppresses it.
+    var grid_container_baseline: ?f32 = none;
+    if not contain.suppresses_baseline() {
+        // The first row holding items.
+        var first_row = items.items()[0].row_indexes.start;
+        for item in items.items() {
+            if item.row_indexes.start < first_row {
+                first_row = item.row_indexes.start;
+            }
+        }
+
+        // The first item of that row taking part in baseline alignment
+        // (an auto block margin keeps an item out:
+        // https://www.w3.org/TR/css-align-3/#baseline-align-self), or else
+        // its first item.
+        var first_item: usize = 0;
+        var found_first = false;
+        var chosen: usize = 0;
+        var found_chosen = false;
+        for (i, item) in items.items() {
+            if item.row_indexes.start != first_row {
+                continue;
+            }
+            if not found_first {
+                first_item = i;
+                found_first = true;
+            }
+            if item.participates_in_baseline_alignment() {
+                chosen = i;
+                found_chosen = true;
+                break;
+            }
+        }
+        if not found_chosen {
+            chosen = first_item;
+        }
+        let item = &items.items()[chosen];
+        grid_container_baseline = some(item.y_position + util.unwrap_or(item.baseline, item.height));
+    }
+
+    var output = lt.LayoutOutput.from_sizes_and_baselines(container_border_box, overflow_rect, lt.Baselines.from_first(grid_container_baseline));
+    output.oof_candidates = oof_candidates;
+    output.oof_positioning_area = oof_positioning_area;
+    return output;
+}
+
+/// resolve_static_position_grid_area: the static-position rectangle of an
+/// out-of-flow child of a positioned grid, the grid area of its
+/// grid-placement properties. Content alignment may put space before,
+/// between or after tracks, so the lines of an absolutely positioned item
+/// resolve to the edges of the tracks beside them, not to the gutters: as
+/// a start edge, to the start of the track after the line; as an end edge,
+/// to the end of the track before it.
+fn resolve_static_position_grid_area(grid_row: geo.Line(sgrid.GridPlacement), grid_column: geo.Line(sgrid.GridPlacement), name_resolver: &named.NamedLineResolver, final_row_counts: counts.TrackCounts, final_col_counts: counts.TrackCounts, rows: []gt.GridTrack, columns: []gt.GridTrack, direction: sty.Direction, border: geo.Rect(f32), scrollbar_gutter: geo.Point(f32), container_border_box: geo.Size(f32), tree: &dyn lt.LayoutTree) -> geo.Rect(f32) {
+    // grid-column-start and -end as indexes into the columns, none for auto
+    // or a span that cannot resolve; and the same for the rows.
+    let col_lines = name_resolver.resolve_column_names(grid_column, tree).into_origin_zero(final_col_counts.explicit).resolve_absolutely_positioned_grid_tracks();
+    let maybe_col_start = track_index_of(col_lines.start, final_col_counts);
+    let maybe_col_end = track_index_of(col_lines.end, final_col_counts);
+    let row_lines = name_resolver.resolve_row_names(grid_row, tree).into_origin_zero(final_row_counts.explicit).resolve_absolutely_positioned_grid_tracks();
+    let maybe_row_start = track_index_of(row_lines.start, final_row_counts);
+    let maybe_row_end = track_index_of(row_lines.end, final_row_counts);
+
+    // In rtl the item's left edge comes from its logical end line, its
+    // right edge from its start line.
+    var grid_area_left: f32 = 0.0;
+    var grid_area_right: f32 = 0.0;
+    if direction.is_rtl() {
+        grid_area_left = border.left + scrollbar_gutter.x;
+        match maybe_col_end {
+            some(index) => { grid_area_left = rtl_line_as_end_edge(columns, index); }
+            none => { }
+        }
+        grid_area_right = container_border_box.width - border.right;
+        match maybe_col_start {
+            some(index) => { grid_area_right = rtl_line_as_start_edge(columns, index); }
+            none => { }
+        }
+    } else {
+        grid_area_left = border.left;
+        match maybe_col_start {
+            some(index) => { grid_area_left = line_as_start_edge(columns, index); }
+            none => { }
+        }
+        grid_area_right = container_border_box.width - border.right - scrollbar_gutter.x;
+        match maybe_col_end {
+            some(index) => { grid_area_right = line_as_end_edge(columns, index); }
+            none => { }
+        }
+    }
+
+    var top = border.top;
+    match maybe_row_start {
+        some(index) => { top = line_as_start_edge(rows, index); }
+        none => { }
+    }
+    var bottom = container_border_box.height - border.bottom - scrollbar_gutter.y;
+    match maybe_row_end {
+        some(index) => { bottom = line_as_end_edge(rows, index); }
+        none => { }
+    }
+
+    return geo.Rect(f32) { left: grid_area_left, right: grid_area_right, top: top, bottom: bottom };
+}
+
+/// A line as a track index, none when there is no line or it is outside
+/// the grid.
+fn track_index_of(line: ?sgrid.OriginZeroLine, track_counts: counts.TrackCounts) -> ?usize {
+    match line {
+        some(l) => { return counts.try_into_track_vec_index(l, track_counts); }
+        none => { return none; }
+    }
+}
+
+/// A line (by track index) as a start edge.
+fn line_as_start_edge(tracks: []gt.GridTrack, index: usize) -> f32 {
+    if index + 1 < tracks.len() {
+        return tracks[index + 1].offset;
+    }
+    return tracks[index].offset;
+}
+
+/// A line (by track index) as an end edge.
+fn line_as_end_edge(tracks: []gt.GridTrack, index: usize) -> f32 {
+    if index == 0 {
+        if tracks.len() > 1 {
+            return tracks[1].offset;
+        }
+        return tracks[0].offset;
+    }
+    return tracks[index].offset;
+}
+
+/// In rtl, tracks stay in logical order but their offsets run right to
+/// left: a line as an inline-start edge is the right edge of the track
+/// after it (its gutter's offset).
+fn rtl_line_as_start_edge(tracks: []gt.GridTrack, index: usize) -> f32 {
+    if tracks.len() > index + 1 {
+        // The gutter's offset is the right edge of the track after the
+        // line.
+        return tracks[index].offset;
+    }
+    if index == 0 {
+        return tracks[0].offset;
+    }
+    // No track after the line: the line itself, the left edge of the track
+    // before it (the trailing gutter gets its offset before any alignment
+    // offset, so it cannot serve).
+    return tracks[index - 1].offset;
+}
+
+/// In rtl, a line as an inline-end edge is the left edge (the offset) of
+/// the track before it.
+fn rtl_line_as_end_edge(tracks: []gt.GridTrack, index: usize) -> f32 {
+    if index == 0 {
+        return tracks[0].offset;
+    }
+    return tracks[index - 1].offset;
+}
+
+/// core::cmp::min for u16.
+fn min_u16(x: u16, y: u16) -> u16 {
+    if y < x {
+        return y;
+    }
+    return x;
+}
+
+/// core::cmp::max for u16.
+fn max_u16(x: u16, y: u16) -> u16 {
+    if y > x {
+        return y;
+    }
+    return x;
+}

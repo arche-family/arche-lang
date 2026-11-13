@@ -1,0 +1,694 @@
+/// compute.grid.types.grid_item: taffy 0.15's
+/// compute/grid/types/grid_item.rs, one in-flow grid item while the grid is
+/// laid out: its styles, its placement and the caches of its intrinsic
+/// size contributions.
+///
+/// taffy passes a calc resolver to these methods; calc() resolves itself
+/// here, so the methods that needed the tree only for it do without it.
+import layout.compute.common.sizing_keyword as kw;
+import layout.compute.grid.types.grid_track as gt;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.style.grid as sgrid;
+import layout.tree as lt;
+import layout.util;
+
+/// The known dimensions computed for a grid area size
+/// (KnownDimensionsCacheEntry).
+pub type KnownDimensionsCacheEntry = struct {
+    /// The grid area size they were computed for.
+    grid_area_size: geo.Size(?f32),
+    /// The known dimensions.
+    known_dimensions: geo.Size(?f32),
+}
+
+/// One in-flow grid item (GridItem). Move-only, for its candidates.
+pub type GridItem = struct {
+    /// Its node.
+    pub node: lt.NodeId,
+    /// Its index among the container's children.
+    pub source_order: u16,
+    /// Its row-start and row-end lines, set by placement.
+    pub row: geo.Line(sgrid.OriginZeroLine),
+    /// Its column-start and column-end lines, set by placement.
+    pub column: geo.Line(sgrid.OriginZeroLine),
+    /// Whether it is a compressible replaced element.
+    pub is_compressible_replaced: bool,
+    /// Whether it is a replaced element (not stretched by normal).
+    pub is_replaced: bool,
+    /// Its overflow.
+    pub overflow: geo.Point(sty.Overflow),
+    /// Its box-sizing.
+    pub box_sizing: sty.BoxSizing,
+    /// Its size.
+    pub size: geo.Size(sty.Dimension),
+    /// Its min size.
+    pub min_size: geo.Size(sty.LengthPercentageAuto),
+    /// Its max size.
+    pub max_size: geo.Size(sty.LengthPercentageAuto),
+    /// Its aspect ratio.
+    pub aspect_ratio: ?f32,
+    /// Its padding.
+    pub padding: geo.Rect(sty.LengthPercentage),
+    /// Its border.
+    pub border: geo.Rect(sty.LengthPercentage),
+    /// Its margin.
+    pub margin: geo.Rect(sty.LengthPercentageAuto),
+    /// Its align-self, or the container's align-items.
+    pub align_self: sty.AlignSelf,
+    /// Its justify-self, or the container's justify-items.
+    pub justify_self: sty.AlignSelf,
+    /// Its first baseline.
+    pub baseline: ?f32,
+    /// What baseline alignment adds above it, as an extra top margin.
+    pub baseline_shim: f32,
+    /// row as GridTrackVec indexes.
+    pub row_indexes: geo.Line(u16),
+    /// column as GridTrackVec indexes.
+    pub column_indexes: geo.Line(u16),
+    /// Whether it crosses a flexible row.
+    pub crosses_flexible_row: bool,
+    /// Whether it crosses a flexible column.
+    pub crosses_flexible_column: bool,
+    /// Whether it crosses an intrinsic row.
+    pub crosses_intrinsic_row: bool,
+    /// Whether it crosses an intrinsic column.
+    pub crosses_intrinsic_column: bool,
+    /// The grid area size, for one run of track sizing.
+    pub grid_area_size_cache: ?geo.Size(?f32),
+    /// The known dimensions of the intrinsic measurements and the grid
+    /// area size they are for; cleared when baseline_shim changes.
+    pub known_dimensions_cache: ?KnownDimensionsCacheEntry,
+    /// The min-content contribution in each axis.
+    pub min_content_contribution_cache: geo.Size(?f32),
+    /// The minimum contribution in each axis.
+    pub minimum_contribution_cache: geo.Size(?f32),
+    /// The max-content contribution in each axis.
+    pub max_content_contribution_cache: geo.Size(?f32),
+    /// Its final y, for the container's baseline.
+    pub y_position: f32,
+    /// Its final height, for the container's baseline.
+    pub height: f32,
+    /// Candidates its subtree surfaced, from the container's border box.
+    pub oof_candidates: lt.OofCandidates,
+
+    /// An item from its style; placement fills in row and column
+    /// (new_with_style_and_order).
+    pub fn new_with_style_and_order(node: lt.NodeId, style: &sty.Style, parent_align_items: sty.AlignItems, parent_justify_items: sty.AlignItems, source_order: u16) -> GridItem {
+        let unplaced = geo.Line(sgrid.OriginZeroLine) { start: sgrid.OriginZeroLine { value: 0 }, end: sgrid.OriginZeroLine { value: 0 } };
+        var align_self = parent_align_items;
+        match style.align_self {
+            some(x) => { align_self = x; }
+            none => { }
+        }
+        var justify_self = parent_justify_items;
+        match style.justify_self {
+            some(x) => { justify_self = x; }
+            none => { }
+        }
+        return GridItem {
+            node: node,
+            source_order: source_order,
+            row: unplaced,
+            column: unplaced,
+            is_compressible_replaced: style.is_compressible_replaced(),
+            is_replaced: style.is_replaced(),
+            overflow: style.overflow,
+            box_sizing: style.box_sizing,
+            size: style.size,
+            min_size: style.min_size,
+            max_size: style.max_size,
+            aspect_ratio: style.aspect_ratio,
+            padding: style.padding,
+            border: style.border,
+            margin: style.margin,
+            align_self: align_self,
+            justify_self: justify_self,
+            baseline: none,
+            baseline_shim: 0.0,
+            row_indexes: geo.Line(u16) { start: 0, end: 0 },
+            column_indexes: geo.Line(u16) { start: 0, end: 0 },
+            crosses_flexible_row: false,
+            crosses_flexible_column: false,
+            crosses_intrinsic_row: false,
+            crosses_intrinsic_column: false,
+            grid_area_size_cache: none,
+            known_dimensions_cache: none,
+            min_content_contribution_cache: geo.size_none(),
+            minimum_contribution_cache: geo.size_none(),
+            max_content_contribution_cache: geo.size_none(),
+            y_position: 0.0,
+            height: 0.0,
+            oof_candidates: lt.OofCandidates.new(),
+        };
+    }
+
+    /// Whether a block-axis margin is auto.
+    pub fn has_auto_block_margin(self: &GridItem) -> bool {
+        return self.margin.top.is_auto() or self.margin.bottom.is_auto();
+    }
+
+    /// Whether its block size depends on its rows' sizes, which baseline
+    /// alignment changes; such an item uses its fallback alignment.
+    /// <https://www.w3.org/TR/css-grid-1/#row-align>
+    pub fn has_cyclic_block_size_dependency(self: &GridItem) -> bool {
+        return self.size.height.inner.uses_percentage() and (self.crosses_intrinsic_row or self.crosses_flexible_row);
+    }
+
+    /// Whether it takes part in baseline alignment: align-self baseline
+    /// and no auto block-axis margin.
+    /// <https://www.w3.org/TR/css-align-3/#baseline-align-self>
+    pub fn participates_in_baseline_alignment(self: &GridItem) -> bool {
+        return self.align_self.keyword == sty.AlignItemsKeyword.Baseline and not self.has_auto_block_margin() and not self.has_cyclic_block_size_dependency();
+    }
+
+    /// Its placement in an axis, in origin-zero lines.
+    pub fn placement(self: &GridItem, axis: geo.AbstractAxis) -> geo.Line(sgrid.OriginZeroLine) {
+        match axis {
+            .Block => { return self.row; }
+            .Inline => { return self.column; }
+        }
+    }
+
+    /// Its placement in an axis as GridTrackVec indexes.
+    pub fn placement_indexes(self: &GridItem, axis: geo.AbstractAxis) -> geo.Line(u16) {
+        match axis {
+            .Block => { return self.row_indexes; }
+            .Inline => { return self.column_indexes; }
+        }
+    }
+
+    /// The GridTrackVec indexes of the tracks and lines it spans, without
+    /// the lines around it, as start..end.
+    pub fn track_range_excluding_lines(self: &GridItem, axis: geo.AbstractAxis) -> geo.Line(usize) {
+        let indexes = self.placement_indexes(axis);
+        return geo.Line(usize) { start: (indexes.start as usize) + 1, end: indexes.end as usize };
+    }
+
+    /// Whether a track it spans in the axis satisfies predicate.
+    pub fn spans_track_matching(self: &GridItem, axis: geo.AbstractAxis, axis_tracks: []gt.GridTrack, predicate: &dyn fn(&gt.GridTrack) -> bool) -> bool {
+        let range = self.track_range_excluding_lines(axis);
+        for track in axis_tracks[range.start..range.end] {
+            if predicate(track) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The tracks it spans in the axis.
+    pub fn span(self: &GridItem, axis: geo.AbstractAxis) -> u16 {
+        match axis {
+            .Block => { return self.row.span(); }
+            .Inline => { return self.column.span(); }
+        }
+    }
+
+    /// Whether it crosses a flexible track in the axis.
+    pub fn crosses_flexible_track(self: &GridItem, axis: geo.AbstractAxis) -> bool {
+        match axis {
+            .Inline => { return self.crosses_flexible_column; }
+            .Block => { return self.crosses_flexible_row; }
+        }
+    }
+
+    /// Whether it crosses an intrinsic track in the axis.
+    pub fn crosses_intrinsic_track(self: &GridItem, axis: geo.AbstractAxis) -> bool {
+        match axis {
+            .Inline => { return self.crosses_intrinsic_column; }
+            .Block => { return self.crosses_intrinsic_row; }
+        }
+    }
+
+    /// The limit of its limited contributions when it spans several
+    /// tracks: the sum of the definite limits of the max track sizing
+    /// functions it spans, when they all have one.
+    pub fn spanned_track_limit(self: &GridItem, axis: geo.AbstractAxis, axis_tracks: []gt.GridTrack, axis_parent_size: ?f32) -> ?f32 {
+        let range = self.track_range_excluding_lines(axis);
+        let spanned_tracks = axis_tracks[range.start..range.end];
+        for track in spanned_tracks {
+            if util.is_none(track.max_track_sizing_function.definite_limit(axis_parent_size)) {
+                return none;
+            }
+        }
+        var limit: f32 = gt.sum_zero();
+        for track in spanned_tracks {
+            limit = limit + (track.max_track_sizing_function.definite_limit(axis_parent_size) orelse unreachable());
+        }
+        return limit;
+    }
+
+    /// As spanned_track_limit, without fit-content() limits: the clamp of
+    /// its automatic minimum contributions.
+    pub fn spanned_fixed_track_limit(self: &GridItem, axis: geo.AbstractAxis, axis_tracks: []gt.GridTrack, axis_parent_size: ?f32) -> ?f32 {
+        let range = self.track_range_excluding_lines(axis);
+        let spanned_tracks = axis_tracks[range.start..range.end];
+        for track in spanned_tracks {
+            if util.is_none(track.max_track_sizing_function.definite_value(axis_parent_size)) {
+                return none;
+            }
+        }
+        var limit: f32 = gt.sum_zero();
+        for track in spanned_tracks {
+            limit = limit + (track.max_track_sizing_function.definite_value(axis_parent_size) orelse unreachable());
+        }
+        return limit;
+    }
+
+    /// The known dimensions for a grid area size, from the cache or
+    /// computed; the min- and max-content contributions share them.
+    fn known_dimensions_cached(self: &mut GridItem, grid_area_size: geo.Size(?f32)) -> geo.Size(?f32) {
+        match self.known_dimensions_cache {
+            some(entry) => {
+                if size_option_eq(a: entry.grid_area_size, b: grid_area_size) {
+                    return entry.known_dimensions;
+                }
+            }
+            none => { }
+        }
+        let known_dimensions = self.known_dimensions(grid_area_size);
+        self.known_dimensions_cache = some(KnownDimensionsCacheEntry { grid_area_size: grid_area_size, known_dimensions: known_dimensions });
+        return known_dimensions;
+    }
+
+    /// Whether an alignment stretches it: stretch, or normal unless it is
+    /// replaced.
+    fn is_stretch_aligned(self: &GridItem, alignment: sty.AlignSelf) -> bool {
+        match alignment.keyword {
+            .Stretch => { return true; }
+            .Normal => { return not self.is_replaced; }
+            _ => { return false; }
+        }
+    }
+
+    /// The known dimensions given to the child when its contributions are
+    /// measured: chiefly stretch alignment, so that percentages further
+    /// down resolve.
+    fn known_dimensions(self: &GridItem, grid_area_size: geo.Size(?f32)) -> geo.Size(?f32) {
+        let margins = self.margins_axis_sums_with_baseline_shims(grid_area_size.width);
+
+        let aspect_ratio = self.aspect_ratio;
+        // Percentage padding and border resolve against the inline size of
+        // the containing block: the grid area's width when definite.
+        // https://www.w3.org/TR/css-grid-1/#item-margins
+        // https://www.w3.org/TR/CSS22/box.html#padding-properties
+        let padding = self.padding.resolve_or_zero(grid_area_size.width);
+        let border = self.border.resolve_or_zero(grid_area_size.width);
+        let padding_border_size = padding.add(border).sum_axes();
+        var box_sizing_adjustment = geo.size_zero();
+        if self.box_sizing == sty.BoxSizing.ContentBox {
+            box_sizing_adjustment = padding_border_size;
+        }
+        let inherent_size = self.size.maybe_resolve(grid_area_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+        // The item's size is floored by its padding and border.
+        let min_size = self.min_size.maybe_resolve(grid_area_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment).fallback(padding_border_size.map_some()).maybe_max_f(padding_border_size);
+        let max_size = self.max_size.maybe_resolve(grid_area_size).maybe_apply_aspect_ratio(aspect_ratio).maybe_add_f(box_sizing_adjustment);
+
+        let grid_area_minus_item_margins_size = grid_area_size.maybe_sub_f(margins).maybe_max_f(geo.size_zero());
+
+        var width = inherent_size.width;
+        if util.is_none(width) {
+            if self.size.width.is_sizing_keyword() {
+                // A sizing keyword is not auto, so it does not stretch;
+                // stretch resolves to an exact width, the others when the
+                // content is measured.
+                match kw.resolve_sizing_keyword(self.size.width, stretch_size: grid_area_minus_item_margins_size.width, percent_resolution_basis: grid_area_size.width) {
+                    some(resolution) => {
+                        match resolution {
+                            .Exact { size } => { width = some(size); }
+                            _ => { }
+                        }
+                    }
+                    none => { }
+                }
+            } else if not self.margin.left.is_auto() and not self.margin.right.is_auto() and self.is_stretch_aligned(self.justify_self) {
+                // Stretch (or normal, as stretch here whatever the item's
+                // size or ratio; replaced items excepted), without auto
+                // margins in the axis.
+                width = grid_area_minus_item_margins_size.width;
+            }
+        }
+        // The aspect ratio again, after the stretch.
+        let after_width = geo.Size(?f32) { width: width, height: inherent_size.height }.maybe_apply_aspect_ratio(aspect_ratio);
+
+        var height = after_width.height;
+        if util.is_none(height) {
+            if self.size.height.is_sizing_keyword() {
+                match kw.resolve_sizing_keyword(self.size.height, stretch_size: grid_area_minus_item_margins_size.height, percent_resolution_basis: grid_area_size.height) {
+                    some(resolution) => {
+                        match resolution {
+                            .Exact { size } => { height = some(size); }
+                            _ => { }
+                        }
+                    }
+                    none => { }
+                }
+            } else if not self.margin.top.is_auto() and not self.margin.bottom.is_auto() and self.is_stretch_aligned(self.align_self) {
+                height = grid_area_minus_item_margins_size.height;
+            }
+        }
+        // The aspect ratio again, after the stretch.
+        let after_height = geo.Size(?f32) { width: after_width.width, height: height }.maybe_apply_aspect_ratio(aspect_ratio);
+
+        // Clamped by the min and max sizes.
+        return after_height.maybe_clamp(min: min_size, max: max_size);
+    }
+
+    /// The grid area's size in the axis, when every track it spans has a
+    /// definite fixed size, and the estimate of the other axis's tracks.
+    /// While tracks are sized, an item's percentages resolve against its
+    /// grid area, which stays indefinite until its tracks are.
+    /// https://www.w3.org/TR/css-grid-1/#grid-item-sizing
+    /// https://www.w3.org/TR/css-grid-1/#algo-overview
+    pub fn grid_area_size(self: &GridItem, axis: geo.AbstractAxis, axis_tracks: []gt.GridTrack, other_axis_tracks: []gt.GridTrack, available_space: geo.Size(?f32), get_track_size_estimate: gt.TrackSizeEstimate) -> geo.Size(?f32) {
+        var size = geo.size_none();
+
+        let range = self.track_range_excluding_lines(axis);
+        var axis_sum: ?f32 = some(gt.sum_zero());
+        for track in axis_tracks[range.start..range.end] {
+            let min_size = track.min_track_sizing_function.definite_value(available_space.get(axis));
+            let max_size = track.max_track_sizing_function.definite_value(available_space.get(axis));
+            var each: ?f32 = none;
+            match min_size {
+                some(lo) => {
+                    match max_size {
+                        some(hi) => {
+                            if lo == hi {
+                                each = some(track.base_size);
+                            }
+                        }
+                        none => { }
+                    }
+                }
+                none => { }
+            }
+            match each {
+                some(v) => { axis_sum = util.maybe_add_f(axis_sum, v); }
+                none => {
+                    axis_sum = none;
+                    break;
+                }
+            }
+        }
+        size.set(axis, axis_sum);
+
+        let other = axis.other();
+        let other_range = self.track_range_excluding_lines(other);
+        var other_sum: ?f32 = some(gt.sum_zero());
+        for track in other_axis_tracks[other_range.start..other_range.end] {
+            match get_track_size_estimate.estimate(track, available_space.get(other)) {
+                some(estimate) => { other_sum = util.maybe_add_f(other_sum, estimate + track.content_alignment_adjustment); }
+                none => {
+                    other_sum = none;
+                    break;
+                }
+            }
+        }
+        size.set(other, other_sum);
+
+        return size;
+    }
+
+    /// The grid area size from the cache, or computed and cached.
+    pub fn grid_area_size_cached(self: &mut GridItem, axis: geo.AbstractAxis, axis_tracks: []gt.GridTrack, other_axis_tracks: []gt.GridTrack, available_space: geo.Size(?f32), get_track_size_estimate: gt.TrackSizeEstimate) -> geo.Size(?f32) {
+        match self.grid_area_size_cache {
+            some(cached) => { return cached; }
+            none => { }
+        }
+        let grid_area_size = self.grid_area_size(axis, axis_tracks: axis_tracks, other_axis_tracks: other_axis_tracks, available_space: available_space, get_track_size_estimate: get_track_size_estimate);
+        self.grid_area_size_cache = some(grid_area_size);
+        return grid_area_size;
+    }
+
+    /// Its margins, summed per axis, with the baseline shim, for its size
+    /// contributions. Horizontal percentage margins resolve to zero, as an
+    /// indefinite container would make them cyclic.
+    pub fn margins_axis_sums_with_baseline_shims(self: &GridItem, inner_node_width: ?f32) -> geo.Size(f32) {
+        let margins = geo.Rect(f32) {
+            left: self.margin.left.resolve_or_zero(some(0.0)),
+            right: self.margin.right.resolve_or_zero(some(0.0)),
+            top: self.margin.top.resolve_or_zero(inner_node_width) + self.baseline_shim,
+            bottom: self.margin.bottom.resolve_or_zero(inner_node_width),
+        };
+        return margins.sum_axes();
+    }
+
+    /// Its min-content contribution.
+    pub fn min_content_contribution(self: &mut GridItem, axis: geo.AbstractAxis, tree: &mut dyn lt.LayoutTree, grid_area_size: geo.Size(?f32), available_space: geo.Size(?f32)) -> f32 {
+        let known_dimensions = self.known_dimensions_cached(grid_area_size);
+        // A size already known is the contribution; the child is not asked.
+        match known_dimensions.get(axis) {
+            some(size) => { return size; }
+            none => { }
+        }
+        // The child sees the grid area as its containing block while
+        // measured, so its percentages resolve against it when definite.
+        // https://www.w3.org/TR/css-grid-1/#grid-item-sizing
+        // https://www.w3.org/TR/css-grid-1/#algo-overview
+        let minus_margins = self.available_space_minus_margins(grid_area_size: grid_area_size, available_space: available_space);
+        let space = geo.Size(sty.AvailableSpace) { width: definite_or(minus_margins.width, sty.AvailableSpace.MinContent), height: definite_or(minus_margins.height, sty.AvailableSpace.MinContent) };
+        let adjusted = self.keyword_adjusted_available_space(grid_area_size, space);
+        return lt.measure_child_size(tree, self.node, known_dimensions: known_dimensions, parent_size: grid_area_size, available_space: adjusted, sizing_mode: lt.SizingMode.InherentSize, axis: axis.as_abs_naive(), vertical_margins_are_collapsible: geo.line_false());
+    }
+
+    /// The min-content contribution from the cache, or computed and
+    /// cached.
+    pub fn min_content_contribution_cached(self: &mut GridItem, axis: geo.AbstractAxis, tree: &mut dyn lt.LayoutTree, grid_area_size: geo.Size(?f32), available_space: geo.Size(?f32)) -> f32 {
+        match self.min_content_contribution_cache.get(axis) {
+            some(cached) => { return cached; }
+            none => { }
+        }
+        let size = self.min_content_contribution(axis, tree, grid_area_size: grid_area_size, available_space: available_space);
+        self.min_content_contribution_cache.set(axis, some(size));
+        return size;
+    }
+
+    /// Its max-content contribution.
+    pub fn max_content_contribution(self: &mut GridItem, axis: geo.AbstractAxis, tree: &mut dyn lt.LayoutTree, grid_area_size: geo.Size(?f32), available_space: geo.Size(?f32)) -> f32 {
+        let known_dimensions = self.known_dimensions_cached(grid_area_size);
+        match known_dimensions.get(axis) {
+            some(size) => { return size; }
+            none => { }
+        }
+        // As the min-content contribution, measured with the grid area as
+        // the basis.
+        let minus_margins = self.available_space_minus_margins(grid_area_size: grid_area_size, available_space: available_space);
+        let space = geo.Size(sty.AvailableSpace) { width: definite_or(minus_margins.width, sty.AvailableSpace.MaxContent), height: definite_or(minus_margins.height, sty.AvailableSpace.MaxContent) };
+        let adjusted = self.keyword_adjusted_available_space(grid_area_size, space);
+        return lt.measure_child_size(tree, self.node, known_dimensions: known_dimensions, parent_size: grid_area_size, available_space: adjusted, sizing_mode: lt.SizingMode.InherentSize, axis: axis.as_abs_naive(), vertical_margins_are_collapsible: geo.line_false());
+    }
+
+    /// The available space less the item's margins (and baseline shim) in
+    /// its definite axes: the space given to the item. Margins resolve
+    /// against the grid area's width, auto as zero.
+    fn available_space_minus_margins(self: &GridItem, grid_area_size: geo.Size(?f32), available_space: geo.Size(?f32)) -> geo.Size(?f32) {
+        if util.is_none(available_space.width) and util.is_none(available_space.height) {
+            return available_space;
+        }
+        let margin = self.margin.resolve_or_zero(grid_area_size.width);
+        var width: ?f32 = none;
+        match available_space.width {
+            some(w) => { width = some(util.f32_max(a: 0.0, b: w - margin.horizontal_axis_sum())); }
+            none => { }
+        }
+        var height: ?f32 = none;
+        match available_space.height {
+            some(h) => { height = some(util.f32_max(a: 0.0, b: h - margin.vertical_axis_sum() - self.baseline_shim)); }
+            none => { }
+        }
+        return geo.Size(?f32) { width: width, height: height };
+    }
+
+    /// The available space, overridden in each axis whose size is a sizing
+    /// keyword measured under its own constraint (min-content,
+    /// max-content, fit-content, fit-content(...)).
+    fn keyword_adjusted_available_space(self: &GridItem, grid_area_size: geo.Size(?f32), available_space: geo.Size(sty.AvailableSpace)) -> geo.Size(sty.AvailableSpace) {
+        if not self.size.width.is_sizing_keyword() and not self.size.height.is_sizing_keyword() {
+            return available_space;
+        }
+        let margins = self.margins_axis_sums_with_baseline_shims(grid_area_size.width);
+        var adjusted = available_space;
+        let axes: [2]geo.AbstractAxis = [geo.AbstractAxis.Inline, geo.AbstractAxis.Block];
+        var k: usize = 0;
+        while k < 2 : (k += 1) {
+            let axis = axes[k];
+            let size_style = self.size.get(axis);
+            if not size_style.is_sizing_keyword() {
+                continue;
+            }
+            let stretch_size = util.maybe_max_f(util.maybe_sub_f(grid_area_size.get(axis), margins.get(axis)), 0.0);
+            match kw.resolve_sizing_keyword(size_style, stretch_size: stretch_size, percent_resolution_basis: grid_area_size.get(axis)) {
+                some(resolution) => {
+                    match resolution {
+                        .Measure { space } => { adjusted.set(axis, space); }
+                        _ => { }
+                    }
+                }
+                none => { }
+            }
+        }
+        return adjusted;
+    }
+
+    /// The max-content contribution from the cache, or computed and
+    /// cached.
+    pub fn max_content_contribution_cached(self: &mut GridItem, axis: geo.AbstractAxis, tree: &mut dyn lt.LayoutTree, grid_area_size: geo.Size(?f32), available_space: geo.Size(?f32)) -> f32 {
+        match self.max_content_contribution_cache.get(axis) {
+            some(cached) => { return cached; }
+            none => { }
+        }
+        let size = self.max_content_contribution(axis, tree, grid_area_size: grid_area_size, available_space: available_space);
+        self.max_content_contribution_cache.set(axis, some(size));
+        return size;
+    }
+
+    /// Its minimum contribution, the smallest outer size it can have: with
+    /// a preferred size that behaves as auto or depends on the containing
+    /// block, the size its used minimum size gives; otherwise its
+    /// min-content contribution. It often depends on the content, so it is
+    /// an intrinsic contribution.
+    /// See: https://www.w3.org/TR/css-grid-1/#min-size-auto
+    pub fn minimum_contribution(self: &mut GridItem, tree: &mut dyn lt.LayoutTree, axis: geo.AbstractAxis, axis_tracks: []gt.GridTrack, grid_area_size: geo.Size(?f32), inner_node_size: geo.Size(?f32)) -> f32 {
+        let padding = self.padding.resolve_or_zero(grid_area_size.width);
+        let border = self.border.resolve_or_zero(grid_area_size.width);
+        let padding_border_size = padding.add(border).sum_axes();
+        var box_sizing_adjustment = geo.size_zero();
+        if self.box_sizing == sty.BoxSizing.ContentBox {
+            box_sizing_adjustment = padding_border_size;
+        }
+
+        // A definite preferred size, clamped by the min and max sizes; a
+        // compressible replaced element resolves an indefinite percentage
+        // max size against zero.
+        match self.size.maybe_resolve(grid_area_size).maybe_apply_aspect_ratio(self.aspect_ratio).maybe_add_f(box_sizing_adjustment).get(axis) {
+            some(size) => {
+                let min_style = self.min_size.get(axis);
+                let max_style = self.max_size.get(axis);
+                if min_style.is_auto() and max_style.is_auto() {
+                    return size;
+                }
+                let basis = grid_area_size.get(axis);
+                var max_size_basis = basis;
+                if self.is_compressible_replaced {
+                    max_size_basis = util.opt_or(value: basis, alt: some(0.0));
+                }
+                let adjustment = box_sizing_adjustment.get(axis);
+                let min_resolved = min_style.maybe_resolve(basis);
+                let max_resolved = max_style.maybe_resolve(max_size_basis);
+                return util.f32_maybe_clamp(size, min: util.maybe_add_f(min_resolved, adjustment), max: util.maybe_add_f(max_resolved, adjustment));
+            }
+            none => { }
+        }
+
+        // A sizing keyword other than stretch does not behave as auto: the
+        // min-content contribution.
+        let size_style = self.size.get(axis);
+        if size_style.is_sizing_keyword() and not size_style.is_stretch() {
+            return self.min_content_contribution_cached(axis, tree, grid_area_size: grid_area_size, available_space: grid_area_size);
+        }
+
+        let zero_basis = geo.Size(f32) { width: util.unwrap_or(grid_area_size.width, 0.0), height: util.unwrap_or(grid_area_size.height, 0.0) };
+        match self.min_size.maybe_resolve_f(zero_basis).maybe_apply_aspect_ratio(self.aspect_ratio).maybe_add_f(box_sizing_adjustment).get(axis) {
+            some(size) => { return size; }
+            none => { }
+        }
+
+        var overflow = self.overflow.x;
+        if axis == geo.AbstractAxis.Block {
+            overflow = self.overflow.y;
+        }
+        match overflow.maybe_into_automatic_min_size() {
+            some(size) => { return size; }
+            none => { }
+        }
+
+        // The automatic minimum size
+        // (https://www.w3.org/TR/css-grid-1/#min-size-auto): the
+        // content-based minimum size when the item is not a scroll
+        // container (above), spans a track whose min track sizing function
+        // is auto, and spans no flexible track if it spans more than one;
+        // otherwise zero.
+        let range = self.track_range_excluding_lines(axis);
+        let item_axis_tracks = axis_tracks[range.start..range.end];
+
+        var spans_auto_min_track = false;
+        for track in item_axis_tracks {
+            if track.min_track_sizing_function.behaves_as_auto(inner_node_size.get(axis)) {
+                spans_auto_min_track = true;
+                break;
+            }
+        }
+
+        let only_span_one_track = item_axis_tracks.len() == 1;
+        var spans_flexible = false;
+        for track in item_axis_tracks {
+            if track.max_track_sizing_function.is_fr() {
+                spans_flexible = true;
+                break;
+            }
+        }
+        let use_content_based_minimum = spans_auto_min_track and (only_span_one_track or not spans_flexible);
+
+        if not use_content_based_minimum {
+            return 0.0;
+        }
+        var minimum_contribution = self.min_content_contribution_cached(axis, tree, grid_area_size: grid_area_size, available_space: grid_area_size);
+
+        // A compressible replaced element with a definite preferred or max
+        // size has its size suggestion capped by them, indefinite
+        // percentages resolved against zero.
+        if self.is_compressible_replaced {
+            let size = self.size.get(axis).maybe_resolve(some(0.0));
+            let max_size = self.max_size.get(axis).maybe_resolve(some(0.0));
+            minimum_contribution = util.f32_maybe_min(util.f32_maybe_min(minimum_contribution, size), max_size);
+        }
+
+        // The content-based minimum is also clamped by the fixed max track
+        // sizing functions of the tracks it spans (not by fit-content()
+        // arguments), a stretch fit into the limit: never below the padding
+        // and border.
+        var limit: ?f32 = none;
+        match self.spanned_fixed_track_limit(axis, axis_tracks, inner_node_size.get(axis)) {
+            some(l) => { limit = some(util.f32_max(a: l, b: padding_border_size.get(axis))); }
+            none => { }
+        }
+        return util.f32_maybe_min(minimum_contribution, limit);
+    }
+
+    /// The minimum contribution from the cache, or computed and cached.
+    pub fn minimum_contribution_cached(self: &mut GridItem, tree: &mut dyn lt.LayoutTree, axis: geo.AbstractAxis, axis_tracks: []gt.GridTrack, grid_area_size: geo.Size(?f32), inner_node_size: geo.Size(?f32)) -> f32 {
+        match self.minimum_contribution_cache.get(axis) {
+            some(cached) => { return cached; }
+            none => { }
+        }
+        let size = self.minimum_contribution(tree, axis, axis_tracks, grid_area_size: grid_area_size, inner_node_size: inner_node_size);
+        self.minimum_contribution_cache.set(axis, some(size));
+        return size;
+    }
+}
+
+/// Some(size) as definite space, none as fallback.
+fn definite_or(value: ?f32, fallback: sty.AvailableSpace) -> sty.AvailableSpace {
+    match value {
+        some(v) => { return sty.AvailableSpace.definite(v); }
+        none => { return fallback; }
+    }
+}
+
+/// Option<f32>'s ==: both none, or both some and equal as f32s.
+pub fn option_eq(a: ?f32, b: ?f32) -> bool {
+    match a {
+        some(x) => {
+            match b {
+                some(y) => { return x == y; }
+                none => { return false; }
+            }
+        }
+        none => { return util.is_none(b); }
+    }
+}
+
+/// Size<Option<f32>>'s ==.
+pub fn size_option_eq(a: geo.Size(?f32), b: geo.Size(?f32)) -> bool {
+    return option_eq(a: a.width, b: b.width) and option_eq(a: a.height, b: b.height);
+}

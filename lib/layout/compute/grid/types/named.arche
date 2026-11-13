@@ -1,0 +1,652 @@
+/// compute.grid.types.named: taffy 0.15's compute/grid/types/named.rs, the
+/// resolution of named grid lines and areas into line numbers.
+///
+/// taffy keys its maps by the text of a name (StrHasher); here the maps are
+/// lists searched by text, which own their keys, since a name like
+/// `foo-start` also names the area `foo`, which no Symbol may hold. The
+/// order of a map's entries never shows in a result. Names come from the
+/// style as alloc.Symbol, and the tree gives their text
+/// (LayoutTree.ident_text).
+///
+/// taffy's per-line name lists for DetailedGridInfo (GridLineNames,
+/// detailed_line_names, populate_detailed_line_resolvers) are left out with
+/// DetailedGridInfo itself.
+import alloc;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.style.grid as sgrid;
+import layout.tree as lt;
+
+/// The edges of a named area in both axes, as one-indexed lines; 0 is no
+/// line (AreaLines).
+pub type AreaLines = struct {
+    /// The first line starting the area in the row axis.
+    row_start: u32,
+    /// The first line ending the area in the row axis.
+    row_end: u32,
+    /// The first line starting the area in the column axis.
+    column_start: u32,
+    /// The first line ending the area in the column axis.
+    column_end: u32,
+
+    /// AreaLines::default: no lines.
+    fn zero() -> AreaLines {
+        return AreaLines { row_start: 0, row_end: 0, column_start: 0, column_end: 0 };
+    }
+
+    /// The raw line of an edge, 0 when there is none.
+    fn raw(self: AreaLines, axis: sgrid.GridAreaAxis, end: sgrid.GridAreaEnd) -> u32 {
+        match axis {
+            .Row => {
+                match end {
+                    .Start => { return self.row_start; }
+                    .End => { return self.row_end; }
+                }
+            }
+            .Column => {
+                match end {
+                    .Start => { return self.column_start; }
+                    .End => { return self.column_end; }
+                }
+            }
+        }
+    }
+
+    /// The line of an edge, if there is one (AreaLines::line).
+    fn line(self: AreaLines, axis: sgrid.GridAreaAxis, end: sgrid.GridAreaEnd) -> ?u32 {
+        let value = self.raw(axis, end);
+        if value == 0 {
+            return none;
+        }
+        return value;
+    }
+
+    /// Sets the line of an edge (through AreaLines::line_mut).
+    fn set(self: &mut AreaLines, axis: sgrid.GridAreaAxis, end: sgrid.GridAreaEnd, value: u32) {
+        match axis {
+            .Row => {
+                match end {
+                    .Start => { self.row_start = value; }
+                    .End => { self.row_end = value; }
+                }
+            }
+            .Column => {
+                match end {
+                    .Start => { self.column_start = value; }
+                    .End => { self.column_end = value; }
+                }
+            }
+        }
+    }
+}
+
+/// One entry of a NamedGridLinesMap: a name and its one-indexed lines.
+type NamedLines = struct {
+    /// The name.
+    name: alloc.String,
+    /// Its lines, sorted and without repeats once the resolver is built.
+    lines: alloc.List(u32),
+}
+
+/// Line names to their one-indexed lines (NamedGridLinesMap).
+pub type NamedGridLinesMap = struct {
+    /// The entries.
+    entries: alloc.List(NamedLines),
+
+    /// An empty map.
+    fn init(a: alloc.Allocator) -> NamedGridLinesMap {
+        return NamedGridLinesMap { entries: alloc.List(NamedLines).init(a) };
+    }
+
+    /// The index of the entry of a name.
+    fn find(self: &NamedGridLinesMap, name: str) -> ?usize {
+        for (i, entry) in self.entries.items() {
+            if entry.name.view().eq(name) {
+                return i;
+            }
+        }
+        return none;
+    }
+}
+
+/// One entry of a GridAreasMap: an area's name and edges.
+type NamedArea = struct {
+    /// The name.
+    name: alloc.String,
+    /// Its edges.
+    lines: AreaLines,
+}
+
+/// Area names to the lines of their edges (GridAreasMap): the areas of
+/// grid-template-areas and those implied by lines named `<area>-start` and
+/// `<area>-end`.
+pub type GridAreasMap = struct {
+    /// The entries.
+    entries: alloc.List(NamedArea),
+
+    /// An empty map.
+    fn init(a: alloc.Allocator) -> GridAreasMap {
+        return GridAreasMap { entries: alloc.List(NamedArea).init(a) };
+    }
+
+    /// The index of the entry of a name.
+    fn find(self: &GridAreasMap, name: str) -> ?usize {
+        for (i, entry) in self.entries.items() {
+            if entry.name.view().eq(name) {
+                return i;
+            }
+        }
+        return none;
+    }
+}
+
+/// A line name split into an area name, its first area_len bytes, and an
+/// edge.
+type AreaEdgeName = struct {
+    /// The length of the area name.
+    area_len: usize,
+    /// The edge.
+    end: sgrid.GridAreaEnd,
+}
+
+/// split_area_edge_name: `<area>-start` or `<area>-end` as the area name
+/// and the edge.
+fn split_area_edge_name(name: str) -> ?AreaEdgeName {
+    let b = name.bytes();
+    let n = b.len();
+    if n >= 6 and is_suffix(b, "-start") {
+        return AreaEdgeName { area_len: n - 6, end: sgrid.GridAreaEnd.Start };
+    }
+    if n >= 4 and is_suffix(b, "-end") {
+        return AreaEdgeName { area_len: n - 4, end: sgrid.GridAreaEnd.End };
+    }
+    return none;
+}
+
+/// Whether the bytes end with suffix.
+fn is_suffix(b: []u8, suffix: str) -> bool {
+    let s = suffix.bytes();
+    if s.len() > b.len() {
+        return false;
+    }
+    let from = b.len() - s.len();
+    var i: usize = 0;
+    while i < s.len() : (i += 1) {
+        if b[from + i] != s[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// upsert_line_name_map: records that the line `value` has the name key.
+/// A name `foo-start` or `foo-end` is also an edge of the area `foo`,
+/// recorded if it is the first such line; the line the area generated, if
+/// any, then joins the name's lines.
+fn upsert_line_name_map(map: &mut NamedGridLinesMap, areas: &mut GridAreasMap, axis: sgrid.GridAreaAxis, key: str, value: u32, a: alloc.Allocator) {
+    var area_line: u32 = 0;
+    match split_area_edge_name(key) {
+        some(edge) => {
+            let area_name = key[0..edge.area_len];
+            var index: usize = 0;
+            match areas.find(area_name) {
+                some(found) => { index = found; }
+                none => {
+                    areas.entries.push(NamedArea { name: alloc.String.from(area_name, a), lines: AreaLines.zero() });
+                    index = areas.entries.len() - 1;
+                }
+            }
+            let current = areas.entries.items()[index].lines.raw(axis, edge.end);
+            area_line = current;
+            var next = value;
+            if current != 0 {
+                next = min_u32(a: current, b: value);
+            }
+            areas.entries.items_mut()[index].lines.set(axis, edge.end, next);
+        }
+        none => { }
+    }
+
+    match map.find(key) {
+        some(index) => { map.entries.items_mut()[index].lines.push(value); }
+        none => {
+            var lines = alloc.List(u32).init(a);
+            if area_line == 0 {
+                lines.push(value);
+            } else {
+                lines.push(area_line);
+                lines.push(value);
+            }
+            map.entries.push(NamedLines { name: alloc.String.from(key, a), lines: lines });
+        }
+    }
+}
+
+/// The named lines of one axis and the explicit track count, for
+/// resolving placements (NamedLineResolverAxis, its maps passed beside
+/// it).
+type ResolverAxis = struct {
+    /// The axis.
+    axis: sgrid.GridAreaAxis,
+    /// The explicit tracks of the axis.
+    explicit_track_count: u16,
+
+    /// The line of an edge of a named area in this axis, if any.
+    fn area_line(self: ResolverAxis, areas: &GridAreasMap, area_name: str, end: sgrid.GridAreaEnd) -> ?u32 {
+        match areas.find(area_name) {
+            some(index) => { return areas.entries.items()[index].lines.line(self.axis, end); }
+            none => { return none; }
+        }
+    }
+
+    /// Resolves named lines and spans into numbered placements
+    /// (resolve_line_names).
+    fn resolve_line_names(self: ResolverAxis, lines: &NamedGridLinesMap, areas: &GridAreasMap, line: geo.Line(sgrid.GridPlacement), tree: &dyn lt.LayoutTree, a: alloc.Allocator) -> geo.Line(sgrid.NonNamedGridPlacement) {
+        var start_line_resolved = line.start;
+        match line.start {
+            .NamedLine { name, index } => {
+                start_line_resolved = sgrid.GridPlacement.Line { line: self.find_named_line(lines, areas, name, idx: index, end: sgrid.GridAreaEnd.Start, tree: tree, a: a) };
+            }
+            _ => { }
+        }
+        var end_line_resolved = line.end;
+        match line.end {
+            .NamedLine { name, index } => {
+                end_line_resolved = sgrid.GridPlacement.Line { line: self.find_named_line(lines, areas, name, idx: index, end: sgrid.GridAreaEnd.End, tree: tree, a: a) };
+            }
+            _ => { }
+        }
+
+        // Both lines given: the span is implicit; a span given: it is
+        // explicit; otherwise it is 1.
+        // <https://drafts.csswg.org/css-grid-2/#grid-span>
+        match start_line_resolved {
+            .Line { line: start_line } => {
+                match end_line_resolved {
+                    .NamedSpan { name, span } => {
+                        if start_line.as_i16() != 0 {
+                            let after_start_line = start_line.into_origin_zero_line(self.explicit_track_count).add_u16(1);
+                            let named = self.lines_named(lines, areas, tree.ident_text(name), a);
+                            let end_line = self.nth_line_forwards(named.items(), first_line: after_start_line, n: max_u16(x: span, y: 1) as i32);
+                            return geo.Line(sgrid.NonNamedGridPlacement) {
+                                start: sgrid.NonNamedGridPlacement.Line { line: start_line },
+                                end: sgrid.NonNamedGridPlacement.Line { line: end_line.into_grid_line(self.explicit_track_count) },
+                            };
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            .NamedSpan { name, span } => {
+                match end_line_resolved {
+                    .Line { line: end_line } => {
+                        if end_line.as_i16() != 0 {
+                            let before_end_line = end_line.into_origin_zero_line(self.explicit_track_count).sub_u16(1);
+                            let named = self.lines_named(lines, areas, tree.ident_text(name), a);
+                            let start_line = self.nth_line_backwards(named.items(), last_line: before_end_line, n: max_u16(x: span, y: 1) as i32);
+                            return geo.Line(sgrid.NonNamedGridPlacement) {
+                                start: sgrid.NonNamedGridPlacement.Line { line: start_line.into_grid_line(self.explicit_track_count) },
+                                end: sgrid.NonNamedGridPlacement.Line { line: end_line },
+                            };
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        return geo.Line(sgrid.NonNamedGridPlacement) { start: non_named(start_line_resolved), end: non_named(end_line_resolved) };
+    }
+
+    /// The line of a named line (`<custom-ident>` or `<integer>
+    /// <custom-ident>`); an index of 0 means none was given
+    /// (find_named_line).
+    /// <https://drafts.csswg.org/css-grid-2/#line-placement>
+    fn find_named_line(self: ResolverAxis, lines: &NamedGridLinesMap, areas: &GridAreasMap, name: alloc.Symbol, idx: i16, end: sgrid.GridAreaEnd, tree: &dyn lt.LayoutTree, a: alloc.Allocator) -> sgrid.GridLine {
+        let text = tree.ident_text(name);
+
+        // A name alone first matches the edge of a named area: the first
+        // line named `<name>-start` (or `-end`); otherwise it is as if 1
+        // were given with it.
+        if idx == 0 {
+            match self.area_line(areas, area_name: text, end: end) {
+                some(first_line) => {
+                    return sgrid.OriginZeroLine.clamped(oz_line(first_line)).into_grid_line(self.explicit_track_count);
+                }
+                none => { }
+            }
+        }
+
+        let named = self.lines_named(lines, areas, text, a);
+        var found = sgrid.OriginZeroLine { value: 0 };
+        if idx >= 0 {
+            found = self.nth_line_forwards(named.items(), first_line: sgrid.OriginZeroLine { value: 0 }, n: max_i32(a: idx as i32, b: 1));
+        } else {
+            found = self.nth_line_backwards(named.items(), last_line: self.last_explicit_line(), n: 0 - (idx as i32));
+        }
+        return found.into_grid_line(self.explicit_track_count);
+    }
+
+    /// The sorted lines of a name (lines_named); a line an area generated
+    /// counts when some line was given the same name explicitly, otherwise
+    /// it comes from the area's edges. A copy, where taffy gives a slice.
+    fn lines_named(self: ResolverAxis, lines: &NamedGridLinesMap, areas: &GridAreasMap, name: str, a: alloc.Allocator) -> alloc.List(u32) {
+        var out = alloc.List(u32).init(a);
+        match lines.find(name) {
+            some(index) => {
+                for l in lines.entries.items()[index].lines.items() {
+                    out.push(l.*);
+                }
+            }
+            none => {
+                match split_area_edge_name(name) {
+                    some(edge) => {
+                        match self.area_line(areas, area_name: name[0..edge.area_len], end: edge.end) {
+                            some(l) => { out.push(l); }
+                            none => { }
+                        }
+                    }
+                    none => { }
+                }
+            }
+        }
+        return out;
+    }
+
+    /// The line at the end of the explicit grid.
+    fn last_explicit_line(self: ResolverAxis) -> sgrid.OriginZeroLine {
+        return sgrid.OriginZeroLine { value: self.explicit_track_count as i16 };
+    }
+
+    /// The nth of lines (searching forwards) not before first_line; when
+    /// there are too few, every implicit line after the explicit grid
+    /// counts as one of them.
+    /// <https://drafts.csswg.org/css-grid-2/#grid-placement-int>
+    fn nth_line_forwards(self: ResolverAxis, lines: []u32, first_line: sgrid.OriginZeroLine, n: i32) -> sgrid.OriginZeroLine {
+        let first = max_i32(a: first_line.value as i32, b: 0);
+        var skip: usize = 0;
+        while skip < lines.len() and oz_line(lines[skip]) < first {
+            skip += 1;
+        }
+        let remaining = lines.len() - skip;
+        let wanted = (n as usize) - 1;
+        var found: i32 = 0;
+        if wanted < remaining {
+            found = oz_line(lines[skip + wanted]);
+        } else {
+            found = max_i32(a: first, b: (self.last_explicit_line().value as i32) + 1) + (n - (remaining as i32)) - 1;
+        }
+        return sgrid.OriginZeroLine.clamped(found);
+    }
+
+    /// The nth of lines (searching backwards) not after last_line; when
+    /// there are too few, every implicit line before the explicit grid
+    /// counts as one of them.
+    /// <https://drafts.csswg.org/css-grid-2/#grid-placement-int>
+    fn nth_line_backwards(self: ResolverAxis, lines: []u32, last_line: sgrid.OriginZeroLine, n: i32) -> sgrid.OriginZeroLine {
+        let last = min_i32(a: last_line.value as i32, b: self.last_explicit_line().value as i32);
+        var count: usize = 0;
+        while count < lines.len() and oz_line(lines[count]) <= last {
+            count += 1;
+        }
+        var found: i32 = 0;
+        if count >= (n as usize) {
+            found = oz_line(lines[count - (n as usize)]);
+        } else {
+            found = min_i32(a: last, b: -1) - (n - (count as i32)) + 1;
+        }
+        return sgrid.OriginZeroLine.clamped(found);
+    }
+}
+
+/// A placement with its named lines already resolved, as a
+/// NonNamedGridPlacement; a named span alone is a span of 1.
+fn non_named(placement: sgrid.GridPlacement) -> sgrid.NonNamedGridPlacement {
+    match placement {
+        .Auto => { return sgrid.NonNamedGridPlacement.Auto; }
+        .Line { line } => { return sgrid.NonNamedGridPlacement.Line { line: line }; }
+        .Span { span } => { return sgrid.NonNamedGridPlacement.Span { span: span }; }
+        .NamedSpan { .. } => { return sgrid.NonNamedGridPlacement.Span { span: 1 }; }
+        .NamedLine { .. } => { unreachable(); }
+    }
+}
+
+/// A one-indexed line of the named-line maps as an origin-zero line
+/// (oz_line).
+fn oz_line(line: u32) -> i32 {
+    return (line as i32) - 1;
+}
+
+/// Resolves the named lines and areas of grid placements into line
+/// numbers (NamedLineResolver).
+pub type NamedLineResolver = struct {
+    /// Row line names to their lines.
+    row_lines: NamedGridLinesMap,
+    /// Column line names to their lines.
+    column_lines: NamedGridLinesMap,
+    /// Area names to their edges.
+    areas: GridAreasMap,
+    /// The columns of grid-template-areas (taffy's area_column_count).
+    area_columns: u16,
+    /// The rows of grid-template-areas (taffy's area_row_count).
+    area_rows: u16,
+    /// The explicit columns, an input for the fallback line of a missing
+    /// name.
+    explicit_column_count: u16,
+    /// The explicit rows, likewise.
+    explicit_row_count: u16,
+    /// Where the lists go.
+    a: alloc.Allocator,
+
+    /// NamedLineResolver::new: the names of the container's template, its
+    /// auto repetitions repeated as many times as given.
+    pub fn new(style: &sty.Style, column_auto_repetitions: u16, row_auto_repetitions: u16, tree: &dyn lt.LayoutTree, a: alloc.Allocator) -> NamedLineResolver {
+        var column_lines = NamedGridLinesMap.init(a);
+        var row_lines = NamedGridLinesMap.init(a);
+        var areas = GridAreasMap.init(a);
+
+        // The template may be larger than its named areas, for its `.`
+        // cells, so the counts come from the style.
+        let area_column_count = style.grid_template_area_column_count();
+        let area_row_count = style.grid_template_area_row_count();
+        match &style.grid_template_areas {
+            some(template) => {
+                for area in template.areas.items() {
+                    let lines = AreaLines {
+                        row_start: area.row_start as u32,
+                        row_end: area.row_end as u32,
+                        column_start: area.column_start as u32,
+                        column_end: area.column_end as u32,
+                    };
+                    let text = tree.ident_text(area.name);
+                    match areas.find(text) {
+                        some(index) => { areas.entries.items_mut()[index].lines = lines; }
+                        none => { areas.entries.push(NamedArea { name: alloc.String.from(text, a), lines: lines }); }
+                    }
+                }
+            }
+            none => { }
+        }
+
+        add_template_line_names(&mut column_lines, &mut areas, sgrid.GridAreaAxis.Column, style.grid_template_columns.items(), style.grid_template_column_names.items(), column_auto_repetitions, tree, a);
+        add_template_line_names(&mut row_lines, &mut areas, sgrid.GridAreaAxis.Row, style.grid_template_rows.items(), style.grid_template_row_names.items(), row_auto_repetitions, tree, a);
+
+        // Sort each name's lines and drop repeats.
+        for entry in column_lines.entries.items_mut() {
+            sort_dedup(&mut entry.lines, a);
+        }
+        for entry in row_lines.entries.items_mut() {
+            sort_dedup(&mut entry.lines, a);
+        }
+
+        return NamedLineResolver {
+            row_lines: row_lines,
+            column_lines: column_lines,
+            areas: areas,
+            area_columns: area_column_count,
+            area_rows: area_row_count,
+            explicit_column_count: 0,
+            explicit_row_count: 0,
+            a: a,
+        };
+    }
+
+    /// Resolves the named lines of a row placement.
+    pub fn resolve_row_names(self: &NamedLineResolver, line: geo.Line(sgrid.GridPlacement), tree: &dyn lt.LayoutTree) -> geo.Line(sgrid.NonNamedGridPlacement) {
+        return self.resolve_line_names(line, sgrid.GridAreaAxis.Row, tree);
+    }
+
+    /// Resolves the named lines of a column placement.
+    pub fn resolve_column_names(self: &NamedLineResolver, line: geo.Line(sgrid.GridPlacement), tree: &dyn lt.LayoutTree) -> geo.Line(sgrid.NonNamedGridPlacement) {
+        return self.resolve_line_names(line, sgrid.GridAreaAxis.Column, tree);
+    }
+
+    /// Resolves the named lines of a placement in an axis.
+    pub fn resolve_line_names(self: &NamedLineResolver, line: geo.Line(sgrid.GridPlacement), axis: sgrid.GridAreaAxis, tree: &dyn lt.LayoutTree) -> geo.Line(sgrid.NonNamedGridPlacement) {
+        match axis {
+            .Row => {
+                let resolver = ResolverAxis { axis: axis, explicit_track_count: self.explicit_row_count };
+                return resolver.resolve_line_names(&self.row_lines, &self.areas, line, tree, self.a);
+            }
+            .Column => {
+                let resolver = ResolverAxis { axis: axis, explicit_track_count: self.explicit_column_count };
+                return resolver.resolve_line_names(&self.column_lines, &self.areas, line, tree, self.a);
+            }
+        }
+    }
+
+    /// The columns grid-template-areas defines.
+    pub fn area_column_count(self: &NamedLineResolver) -> u16 {
+        return self.area_columns;
+    }
+
+    /// The rows grid-template-areas defines.
+    pub fn area_row_count(self: &NamedLineResolver) -> u16 {
+        return self.area_rows;
+    }
+
+    /// Sets the number of explicit columns.
+    pub fn set_explicit_column_count(self: &mut NamedLineResolver, count: u16) {
+        self.explicit_column_count = count;
+    }
+
+    /// Sets the number of explicit rows.
+    pub fn set_explicit_row_count(self: &mut NamedLineResolver, count: u16) {
+        self.explicit_row_count = count;
+    }
+}
+
+/// Records the line names of one axis's template: name set i names line
+/// i, and a repeat() after it adds its own names for each repetition, the
+/// last set of one repetition the same line as the first of the next.
+fn add_template_line_names(map: &mut NamedGridLinesMap, areas: &mut GridAreasMap, axis: sgrid.GridAreaAxis, tracks: []sgrid.GridTemplateComponent, names: []alloc.List(alloc.Symbol), auto_repetitions: u16, tree: &dyn lt.LayoutTree, a: alloc.Allocator) {
+    var current_line: u32 = 0;
+    var next_track: usize = 0;
+    for line_names in names {
+        current_line += 1;
+        for line_name in line_names.items() {
+            upsert_line_name_map(map, areas, axis, key: tree.ident_text(line_name.*), value: current_line, a: a);
+        }
+
+        if next_track >= tracks.len() {
+            continue;
+        }
+        let component = &tracks[next_track];
+        next_track += 1;
+        match component {
+            .Single { .. } => { }
+            .Repeat { repetition } => {
+                var repeat_count: u16 = 0;
+                match repetition.count {
+                    .Count { count } => { repeat_count = count; }
+                    .AutoFill => { repeat_count = auto_repetitions; }
+                    .AutoFit => { repeat_count = auto_repetitions; }
+                }
+
+                // Name sets are positional; there are none, or one per line
+                // of a repetition (track count + 1).
+                let line_name_set_count = repetition.line_names.len() as u32;
+                let lines_per_repetition = repetition.track_count() as u32;
+                if not (line_name_set_count == 0 or line_name_set_count == lines_per_repetition + 1) {
+                    panic("grid template repetition must have no line name sets or exactly track count + 1 of them");
+                }
+
+                var r: u16 = 0;
+                while r < repeat_count : (r += 1) {
+                    var line = current_line;
+                    for line_name_set in repetition.line_names.items() {
+                        for line_name in line_name_set.items() {
+                            upsert_line_name_map(map, areas, axis, key: tree.ident_text(line_name.*), value: line, a: a);
+                        }
+                        line += 1;
+                    }
+                    current_line += lines_per_repetition;
+
+                    // Names of lines past the track limit never resolve.
+                    if current_line > (sgrid.MAX_GRID_TRACKS as u32) {
+                        break;
+                    }
+                }
+                // The last name set collapses with the next one.
+                if repeat_count > 0 and current_line > 0 {
+                    current_line -= 1;
+                }
+            }
+        }
+    }
+}
+
+/// Sorts a list of lines and drops repeats (sort_unstable, dedup).
+fn sort_dedup(lines: &mut alloc.List(u32), a: alloc.Allocator) {
+    let items = lines.items_mut();
+    var i: usize = 1;
+    while i < items.len() : (i += 1) {
+        let x = items[i];
+        var j = i;
+        while j > 0 and items[j - 1] > x {
+            items[j] = items[j - 1];
+            j -= 1;
+        }
+        items[j] = x;
+    }
+    var out = alloc.List(u32).init(a);
+    for l in lines.items() {
+        let n = out.len();
+        if n == 0 or out.items()[n - 1] != l.* {
+            out.push(l.*);
+        }
+    }
+    lines.* = out;
+}
+
+/// core::cmp::min for u32.
+fn min_u32(a: u32, b: u32) -> u32 {
+    if b < a {
+        return b;
+    }
+    return a;
+}
+
+/// core::cmp::max for u16.
+fn max_u16(x: u16, y: u16) -> u16 {
+    if y > x {
+        return y;
+    }
+    return x;
+}
+
+/// core::cmp::max for i32.
+fn max_i32(a: i32, b: i32) -> i32 {
+    if b > a {
+        return b;
+    }
+    return a;
+}
+
+/// core::cmp::min for i32.
+fn min_i32(a: i32, b: i32) -> i32 {
+    if b < a {
+        return b;
+    }
+    return a;
+}
