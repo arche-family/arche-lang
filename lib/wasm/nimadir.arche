@@ -6,13 +6,16 @@
 /// and 65536 widgets sent in a frame. Past one the app is stopped, and the
 /// shell says which.
 import alloc;
+import core.float;
 import core.utf8;
 import image.jpeg;
 import image.png;
+import layout.geometry as geo;
 import std;
 import wasm.component as c;
 import wasm.css;
 import wasm.exec;
+import wasm.page;
 import wasm.select;
 import wasm.style;
 import wasm.wasip2;
@@ -74,13 +77,13 @@ pub type Widget = struct {
     pub index: u32,
 }
 
-/// Where a node was laid out: x, y, width, height; width below 0 for
-/// nowhere.
+/// Where a node was laid out: x, y, width, height, in logical pixels;
+/// width below 0 for nowhere.
 type Box = struct {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
 }
 
 /// An element, or a run of text when tag is empty.
@@ -1888,33 +1891,6 @@ fn name_byte(b: u8) -> bool {
     return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '-' or b == '_' or b == ':';
 }
 
-/// A whole number as an f32's bits.
-fn f32_of(v: i32) -> c.Val {
-    if v == 0 {
-        return c.Val.F32 { bits: 0 };
-    }
-    var sign: u32 = 0;
-    var m = v as i64;
-    if m < 0 {
-        sign = 0x80000000;
-        m = -m;
-    }
-    var e: u32 = 0;
-    var t = m;
-    while t > 1 {
-        t = t >> 1;
-        e += 1;
-    }
-    // The bits below the leading one, in the 23 of the mantissa.
-    var frac: u64 = 0;
-    if e <= 23 {
-        frac = ((m as u64) << (23 - e)) & 0x7FFFFF;
-    } else {
-        frac = ((m as u64) >> (e - 23)) & 0x7FFFFF;
-    }
-    return c.Val.F32 { bits: sign | ((e + 127) << 23) | (frac as u32) };
-}
-
 /// The class name added to n's class attribute, or taken away.
 fn toggle_class(ui: &mut Ui, n: u32, name: str, on: bool) {
     var kept = alloc.String.init(ui.a);
@@ -2798,13 +2774,13 @@ fn dom(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val {
         return c.Val.Str { v: text };
     }
     if func.eq("bounds") {
-        if (node as usize) < ui.boxes.len() and ui.boxes.items()[node as usize].w >= 0 {
+        if (node as usize) < ui.boxes.len() and ui.boxes.items()[node as usize].w >= 0.0 {
             let b = ui.boxes.items()[node as usize];
             var fields = alloc.List(c.Val).init(a);
-            fields.push(f32_of(b.x));
-            fields.push(f32_of(b.y));
-            fields.push(f32_of(b.w));
-            fields.push(f32_of(b.h));
+            fields.push(c.Val.F32 { bits: float.bits32(b.x) });
+            fields.push(c.Val.F32 { bits: float.bits32(b.y) });
+            fields.push(c.Val.F32 { bits: float.bits32(b.w) });
+            fields.push(c.Val.F32 { bits: float.bits32(b.h) });
             return some_val(c.Val.List { items: fields }, a);
         }
         return nothing(a);
@@ -3100,10 +3076,54 @@ pub fn stylesheet(ui: &Ui, i: u32) -> str {
 
 /// Where the shell laid n out, for bounds to say.
 pub fn set_box(ui: &mut Ui, n: u32, x: i32, y: i32, width: i32, height: i32) {
+    put_box(ui, n: n, b: Box { x: x as f32, y: y as f32, w: width as f32, h: height as f32 });
+}
+
+/// n's box, from 0 a nowhere box where there is none yet.
+fn put_box(ui: &mut Ui, n: u32, b: Box) {
     while ui.boxes.len() <= n as usize {
-        ui.boxes.push(Box { x: 0, y: 0, w: -1, h: 0 });
+        ui.boxes.push(Box { x: 0.0, y: 0.0, w: -1.0, h: 0.0 });
     }
-    ui.boxes.items_mut()[n as usize] = Box { x: x, y: y, w: width, h: height };
+    ui.boxes.items_mut()[n as usize] = b;
+}
+
+/// Lays the page out as Nimadir's shell does after every frame (its
+/// layout_page, host/src/dom/layout.rs ported in wasm.page): styled for
+/// env, on a page env.width by env.height, its text measured by
+/// page.Approx, the stand-in fonts of a shell with no window, its images
+/// by their size. Each node's box (an element's border box, a run of
+/// text's paragraph) is kept for bounds to answer next frame, and for
+/// box_of; a node with none has none. The work is a's.
+pub fn lay_out(ui: &mut Ui, env: css.Env, a: alloc.Allocator) {
+    let styles = compute_styles(ui, env: env, a: a);
+    let pictures = &ui.pictures;
+    let images = fn [pictures](h: u32) -> ?geo.Size(f32) {
+        if (h as usize) < pictures.len() {
+            let p = &pictures.items()[h as usize];
+            return geo.Size(f32) { width: p.width as f32, height: p.height as f32 };
+        }
+        return none;
+    };
+    let laid = page.lay_out(page.Approx, ui, styles: &styles, fonts: page.Approx {}, images: &images, width: env.width, height: env.height, a: a);
+    ui.boxes.clear();
+    let count = ui.nodes.len() as u32;
+    var n: u32 = 0;
+    while n < count : (n += 1) {
+        match page.rect_of(&laid, n: n) {
+            some(r) => { put_box(ui, n: n, b: Box { x: r.x, y: r.y, w: r.w, h: r.h }); }
+            none => { put_box(ui, n: n, b: Box { x: 0.0, y: 0.0, w: -1.0, h: 0.0 }); }
+        }
+    }
+}
+
+/// Where n was laid out last, as x, y, width and height; none for
+/// nowhere.
+pub fn box_of(ui: &Ui, n: u32) -> ?[4]f32 {
+    if (n as usize) < ui.boxes.len() and ui.boxes.items()[n as usize].w >= 0.0 {
+        let b = ui.boxes.items()[n as usize];
+        return [b.x, b.y, b.w, b.h];
+    }
+    return none;
 }
 
 /// Something the user did to target: it goes to target, or its nearest
@@ -3604,11 +3624,33 @@ pub fn write_outline(ui: &Ui, n: u32, depth: u32, out: &mut alloc.String) {
 
 /// The page as write_outline prints it, each element followed by what its
 /// rules set (style.describe), as Nimadir's headless runner prints it with
-/// --styles: `#3 h1 | font-size: 28px; font-weight: 700`. (A node's box,
-/// with --boxes, goes before the bar, once the page is laid out.)
+/// --styles: `#3 h1 | font-size: 28px; font-weight: 700`.
 pub fn write_styled_outline(ui: &Ui, styles: &style.Styles, n: u32, depth: u32, out: &mut alloc.String, a: alloc.Allocator) {
+    write_outline_with(ui, styles: styles, show_styles: true, show_boxes: false, n: n, depth: depth, out: out, a: a);
+}
+
+/// The page as write_outline prints it, as Nimadir's headless runner's
+/// outline_with does: with show_boxes, each node's box from the last
+/// layout (lay_out), `#6 input @16,74 300x39`; with show_styles, then what
+/// each element's rules set, ` | display: flex; gap: 16px`.
+pub fn write_outline_with(ui: &Ui, styles: &style.Styles, show_styles: bool, show_boxes: bool, n: u32, depth: u32, out: &mut alloc.String, a: alloc.Allocator) {
     write_line(ui, n: n, depth: depth, out: out);
-    if style.has_style(styles, n: n) {
+    if show_boxes {
+        match box_of(ui, n: n) {
+            some(b) => {
+                out.push_str(" @");
+                css.write_number(b[0], out: out);
+                out.push_str(",");
+                css.write_number(b[1], out: out);
+                out.push_str(" ");
+                css.write_number(b[2], out: out);
+                out.push_str("x");
+                css.write_number(b[3], out: out);
+            }
+            none => { }
+        }
+    }
+    if show_styles and style.has_style(styles, n: n) {
         let parent = ui.nodes.items()[n as usize].parent;
         var said = alloc.String.init(a);
         style.describe(style: style.style_of(styles, n: n), parent: style.style_of(styles, n: parent), tag: ui.nodes.items()[n as usize].tag.view(), out: &mut said, a: a);
@@ -3619,7 +3661,7 @@ pub fn write_styled_outline(ui: &Ui, styles: &style.Styles, n: u32, depth: u32, 
     }
     out.push_str("\n");
     for x in ui.nodes.items()[n as usize].children.items() {
-        write_styled_outline(ui, styles: styles, n: x.*, depth: depth + 1, out: out, a: a);
+        write_outline_with(ui, styles: styles, show_styles: show_styles, show_boxes: show_boxes, n: x.*, depth: depth + 1, out: out, a: a);
     }
 }
 

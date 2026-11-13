@@ -1,0 +1,2253 @@
+/// page: Nimadir's host/src/dom/layout.rs in Arche (docs/sprints.md S40):
+/// the styled page turned into boxes on the page by lib/layout (taffy
+/// 0.15): block, flex, grid, absolute positioning and floats.
+///
+/// Text is measured through Fonts, which a renderer implements with its
+/// own fonts, and Approx stands in where there is none (the headless
+/// shell), so line breaks are the renderer's while layout stays here.
+///
+/// Inline content is simplified as Nimadir's is: a run of text and inline
+/// elements becomes one paragraph, styled runs laid out together and
+/// wrapping as a whole, and a run that also holds boxes (a button in a
+/// sentence) becomes a wrapping row of paragraphs and those boxes. Inline
+/// elements give their text its look, not boxes of their own.
+///
+/// The taffy tree lives for one layout; what is kept (Layout) is plain
+/// data. Its node ids are the indices of its boxes, in the order Nimadir's
+/// tree makes them, and every f32 operation is Nimadir's, in its order.
+///
+/// The tree holds the fonts by value, as a view cannot be held (A§5.4):
+/// Laying(F) is the tree with the fonts F, and it implements
+/// layout.tree.LayoutTree for each fonts type this module knows, Approx
+/// for now (a one-line impl per method, the work is generic).
+import alloc;
+import core.utf8;
+import layout.compute as compute;
+import layout.compute.block as block;
+import layout.compute.flexbox as flexbox;
+import layout.compute.grid as grid;
+import layout.compute.leaf as leaf;
+import layout.compute.oof as oof;
+import layout.geometry as geo;
+import layout.style as sty;
+import layout.style.grid as sgrid;
+import layout.tree as lt;
+import layout.tree.cache as tcache;
+import layout.util;
+import wasm.css;
+import wasm.select;
+import wasm.style;
+import wasm.values;
+
+/// No box: what by_node and by_text hold for a node without one.
+pub const NONE: u32 = 0xFFFFFFFF;
+
+/// The body: the page's root (Nimadir's ROOT).
+pub const ROOT: u32 = 1;
+
+// ---- text ------------------------------------------------------------------
+
+/// The look of one run of text (Font).
+pub type Font = struct {
+    /// The size, in pixels.
+    pub size: f32,
+    /// font-weight 600 or more.
+    pub bold: bool,
+    /// Italic.
+    pub italic: bool,
+    /// A monospaced family.
+    pub mono: bool,
+    /// The color, RGBA.
+    pub color: u32,
+    /// style.UNDERLINE | LINE_THROUGH | OVERLINE.
+    pub decoration: u8,
+    /// letter-spacing, in pixels.
+    pub letter_spacing: f32,
+    /// The line height its element asks for, in pixels.
+    pub line: f32,
+    /// Behind the text: the background of the inline element it sits in,
+    /// filled in when painted.
+    pub background: u32,
+}
+
+/// Font::of: the look of the text of an element of style s.
+pub fn font_of(s: &style.Style) -> Font {
+    return Font {
+        size: s.font_size,
+        bold: s.font_weight >= 600,
+        italic: s.italic,
+        mono: s.monospace,
+        color: s.color,
+        decoration: s.text_decoration,
+        letter_spacing: s.letter_spacing,
+        line: style.line_height_px(s.line_height, size: s.font_size),
+        background: values.TRANSPARENT,
+    };
+}
+
+/// A piece of text in one font, and the node it came from: what a tap on
+/// it lands on (Run).
+pub type Run = struct {
+    /// The text.
+    pub text: alloc.String,
+    /// Its look.
+    pub font: Font,
+    /// The text node, or the br, it came from.
+    pub node: u32,
+}
+
+/// How a paragraph's lines are aligned (Align).
+pub type Align = enum {
+    /// To the left.
+    Left,
+    /// Centred.
+    Center,
+    /// To the right.
+    Right,
+}
+
+/// Inline content laid out as one block of text (Paragraph).
+pub type Paragraph = struct {
+    /// Its runs, in order.
+    pub runs: alloc.List(Run),
+    /// How its lines are aligned.
+    pub align: Align,
+    /// Whether it wraps.
+    pub wrap: bool,
+    /// The tallest line height its runs ask for.
+    pub line_height: f32,
+    /// Cut with "…" where it overflows, rather than wrapped or clipped.
+    pub ellipsis: bool,
+}
+
+/// A copy of p, in memory from a.
+pub fn clone_paragraph(p: &Paragraph, a: alloc.Allocator) -> Paragraph {
+    var runs = alloc.List(Run).init(a);
+    for r in p.runs.items() {
+        runs.push(Run { text: r.text.clone(), font: r.font, node: r.node });
+    }
+    return Paragraph { runs: runs, align: p.align, wrap: p.wrap, line_height: p.line_height, ellipsis: p.ellipsis };
+}
+
+/// Paragraph::text: its runs' text, one after another, at the end of out.
+pub fn paragraph_text(p: &Paragraph, out: &mut alloc.String) {
+    for r in p.runs.items() {
+        out.push_str(r.text.view());
+    }
+}
+
+/// How the renderer's fonts measure text (Fonts).
+pub type Fonts = interface {
+    /// The size of p laid out at most width wide, or as wide as it likes
+    /// for none.
+    fn measure(self: &Self, p: &Paragraph, width: ?f32) -> geo.Size(f32);
+    /// The narrowest p can be: its widest word.
+    fn min_width(self: &Self, p: &Paragraph) -> f32;
+    /// Which run is at (x, y) from the corner of p laid out width wide:
+    /// what a tap there lands on.
+    fn run_at(self: &Self, p: &Paragraph, width: f32, x: f32, y: f32) -> ?usize;
+}
+
+/// Fonts for where there are none (Approx): each glyph a fixed share of
+/// its size, lines broken at spaces. Deterministic, so a test can read
+/// boxes.
+pub type Approx = struct {}
+
+/// Approx::advance: how far c moves the pen in font f.
+pub fn approx_advance(c: u32, f: &Font) -> f32 {
+    var share: f32 = 0.5;
+    if f.mono {
+        share = 0.6;
+    } else if (c >= 'A' as u32 and c <= 'Z' as u32) or c == 'm' as u32 or c == 'w' as u32 {
+        share = 0.65;
+    } else if narrow(c) {
+        share = 0.3;
+    }
+    var weight: f32 = 1.0;
+    if f.bold {
+        weight = 1.05;
+    }
+    return f.size * share * weight + f.letter_spacing;
+}
+
+/// Whether c is one of " .,:;'!|il", the narrow ones.
+fn narrow(c: u32) -> bool {
+    for b in " .,:;'!|il".bytes() {
+        if c == b.* as u32 {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The code point at b[at] and its length; a byte that is not UTF-8 as
+/// itself, one long (the DOM's text is UTF-8).
+fn char_at(b: []u8, at: usize) -> utf8.Decoded {
+    match utf8.decode(b, at) {
+        some(d) => { return d; }
+        none => { return utf8.Decoded { code: b[at] as u32, len: 1 }; }
+    }
+}
+
+/// Approx::measure's state: the widest line so far, how many lines, the
+/// line being filled, and the word being read, wrapped as a whole when it
+/// does not fit.
+type Lines = struct {
+    widest: f32,
+    lines: usize,
+    line: f32,
+    word: f32,
+}
+
+/// Approx::measure's flush: the word read joins the line, on a new one
+/// when it does not fit in limit.
+fn flush_word(st: &mut Lines, limit: ?f32) {
+    if st.word > 0.0 {
+        var over = false;
+        if st.line > 0.0 {
+            match limit {
+                some(l) => { over = st.line + st.word > l + 0.01; }
+                none => { }
+            }
+        }
+        if over {
+            st.widest = util.f32_max(a: st.widest, b: st.line);
+            st.lines += 1;
+            st.line = 0.0;
+        }
+        st.line = st.line + st.word;
+        st.word = 0.0;
+    }
+}
+
+/// x as Rust's `as usize` makes it: NaN and below 0 are 0, past the end
+/// the largest.
+fn saturating_usize(x: f32) -> usize {
+    if x != x or x <= 0.0 {
+        return 0;
+    }
+    if x >= 18446744073709551615.0 {
+        return 18446744073709551615;
+    }
+    return x as usize;
+}
+
+impl Fonts for Approx {
+    fn measure(self: &Approx, p: &Paragraph, width: ?f32) -> geo.Size(f32) {
+        var limit: ?f32 = none;
+        if p.wrap {
+            limit = width;
+        }
+        var st = Lines { widest: 0.0, lines: 1, line: 0.0, word: 0.0 };
+        for run in p.runs.items() {
+            let b = run.text.view().bytes();
+            var at: usize = 0;
+            while at < b.len() {
+                let d = char_at(b, at: at);
+                at += d.len;
+                let c = d.code;
+                if c == '\n' as u32 {
+                    flush_word(&mut st, limit: limit);
+                    st.widest = util.f32_max(a: st.widest, b: st.line);
+                    st.line = 0.0;
+                    st.lines += 1;
+                } else if c == ' ' as u32 {
+                    flush_word(&mut st, limit: limit);
+                    // A space that ends a line is not drawn on the next.
+                    if not (st.line == 0.0 and st.lines > 1) {
+                        st.line = st.line + approx_advance(c, f: &run.font);
+                    }
+                } else {
+                    st.word = st.word + approx_advance(c, f: &run.font);
+                }
+            }
+        }
+        flush_word(&mut st, limit: limit);
+        st.widest = util.f32_max(a: st.widest, b: st.line);
+        if p.ellipsis {
+            match width {
+                some(w) => { st.widest = util.f32_min(a: st.widest, b: w); }
+                none => { }
+            }
+        }
+        return geo.Size(f32) { width: st.widest.ceil(), height: (st.lines as f32) * p.line_height };
+    }
+
+    fn min_width(self: &Approx, p: &Paragraph) -> f32 {
+        if not p.wrap {
+            return self.measure(p, width: none).width;
+        }
+        // The widest of the words: runs of what is not a space or a
+        // break, across runs.
+        var widest: f32 = 0.0;
+        var in_word = false;
+        var word: f32 = 0.0;
+        for run in p.runs.items() {
+            let b = run.text.view().bytes();
+            var at: usize = 0;
+            while at < b.len() {
+                let d = char_at(b, at: at);
+                at += d.len;
+                if d.code == '\n' as u32 or d.code == ' ' as u32 {
+                    if in_word {
+                        widest = util.f32_max(a: widest, b: word);
+                        in_word = false;
+                    }
+                    continue;
+                }
+                let w = approx_advance(d.code, f: &run.font);
+                if in_word {
+                    word = word + w;
+                } else {
+                    word = w;
+                    in_word = true;
+                }
+            }
+        }
+        if in_word {
+            widest = util.f32_max(a: widest, b: word);
+        }
+        return widest.ceil();
+    }
+
+    fn run_at(self: &Approx, p: &Paragraph, width: f32, x: f32, y: f32) -> ?usize {
+        if x < 0.0 or y < 0.0 {
+            return none;
+        }
+        let want_line = saturating_usize(y / p.line_height);
+        var line: usize = 0;
+        var at: f32 = 0.0;
+        var i: usize = 0;
+        while i < p.runs.len() : (i += 1) {
+            let run = &p.runs.items()[i];
+            let b = run.text.view().bytes();
+            var k: usize = 0;
+            while k < b.len() {
+                let d = char_at(b, at: k);
+                k += d.len;
+                let c = d.code;
+                if c == '\n' as u32 {
+                    line += 1;
+                    at = 0.0;
+                    continue;
+                }
+                let w = approx_advance(c, f: &run.font);
+                if p.wrap and at > 0.0 and at + w > width + 0.01 and c != ' ' as u32 {
+                    line += 1;
+                    at = 0.0;
+                }
+                if line == want_line and x >= at and x < at + w {
+                    return i;
+                }
+                at = at + w;
+            }
+        }
+        return none;
+    }
+}
+
+// ---- boxes -----------------------------------------------------------------
+
+/// A box on the page, in logical pixels from the page's top-left corner
+/// (Rect).
+pub type Rect = struct {
+    /// The left edge.
+    pub x: f32,
+    /// The top edge.
+    pub y: f32,
+    /// The width.
+    pub w: f32,
+    /// The height.
+    pub h: f32,
+
+    /// Rect::default: all zero.
+    pub fn zero() -> Rect {
+        return Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    }
+
+    /// Whether (x, y) is in it.
+    pub fn contains(self: Rect, x: f32, y: f32) -> bool {
+        return x >= self.x and y >= self.y and x < self.x + self.w and y < self.y + self.h;
+    }
+
+    /// Shrunk by [top, right, bottom, left].
+    pub fn inset(self: Rect, e: [4]f32) -> Rect {
+        return Rect {
+            x: self.x + e[3],
+            y: self.y + e[0],
+            w: util.f32_max(a: 0.0, b: self.w - e[1] - e[3]),
+            h: util.f32_max(a: 0.0, b: self.h - e[0] - e[2]),
+        };
+    }
+
+    /// Where it and o overlap.
+    pub fn intersect(self: Rect, o: Rect) -> Rect {
+        let x = util.f32_max(a: self.x, b: o.x);
+        let y = util.f32_max(a: self.y, b: o.y);
+        let r = util.f32_min(a: self.x + self.w, b: o.x + o.w);
+        let b = util.f32_min(a: self.y + self.h, b: o.y + o.h);
+        return Rect { x: x, y: y, w: util.f32_max(a: 0.0, b: r - x), h: util.f32_max(a: 0.0, b: b - y) };
+    }
+}
+
+/// What a box holds (Content).
+pub type Content = enum {
+    /// An element.
+    Element { node: u32 },
+    /// Anonymous: inline content, as text.
+    Text { paragraph: Paragraph },
+    /// Anonymous: inline content with boxes in it, as a wrapping row.
+    Line,
+}
+
+/// A copy of c, in memory from a.
+fn clone_content(c: &Content, a: alloc.Allocator) -> Content {
+    match c {
+        .Element { node } => { return Content.Element { node: node.* }; }
+        .Text { paragraph } => { return Content.Text { paragraph: clone_paragraph(paragraph, a: a) }; }
+        .Line => { return Content.Line; }
+    }
+}
+
+/// One box, laid out (Placed).
+pub type Placed = struct {
+    /// What it holds.
+    pub content: Content,
+    /// The border box, on the page.
+    pub rect: Rect,
+    /// top, right, bottom, left.
+    pub border: [4]f32,
+    /// top, right, bottom, left.
+    pub padding: [4]f32,
+    /// Its children's boxes, in the order they are drawn: the tree's, then
+    /// by z-index.
+    pub children: alloc.List(usize),
+    /// How far its content reaches from the padding box's corner, across
+    /// and down: more than the padding box when it overflows.
+    pub extent: [2]f32,
+    /// A list item's number among its siblings, from 1.
+    pub ordinal: u32,
+
+    /// The padding box.
+    pub fn padding_rect(self: &Placed) -> Rect {
+        return self.rect.inset(self.border);
+    }
+
+    /// The content box.
+    pub fn content_rect(self: &Placed) -> Rect {
+        return self.padding_rect().inset(self.padding);
+    }
+}
+
+/// The page, laid out (Layout): boxes in a tree from boxes[0], the root.
+pub type Layout = struct {
+    /// The boxes.
+    pub boxes: alloc.List(Placed),
+    /// Each element's box, by node; NONE for none.
+    pub by_node: alloc.List(u32),
+    /// Each text node's paragraph's box, by node; NONE for none.
+    pub by_text: alloc.List(u32),
+    /// The page's size: its root's box.
+    pub width: f32,
+    /// The page's height.
+    pub height: f32,
+}
+
+/// Layout::default: no boxes.
+pub fn empty_layout(a: alloc.Allocator) -> Layout {
+    return Layout { boxes: alloc.List(Placed).init(a), by_node: alloc.List(u32).init(a), by_text: alloc.List(u32).init(a), width: 0.0, height: 0.0 };
+}
+
+/// Layout::rect_of: an element's border box, or a text node's
+/// paragraph's; none for a node that has no box.
+pub fn rect_of(laid: &Layout, n: u32) -> ?Rect {
+    var k = NONE;
+    if (n as usize) < laid.by_node.len() {
+        k = laid.by_node.items()[n as usize];
+    }
+    if k == NONE and (n as usize) < laid.by_text.len() {
+        k = laid.by_text.items()[n as usize];
+    }
+    if k == NONE {
+        return none;
+    }
+    return laid.boxes.items()[k as usize].rect;
+}
+
+/// What a leaf element measures as: the controls and images that have a
+/// size of their own (Replaced).
+type Replaced = enum {
+    /// Nothing of its own.
+    None,
+    /// A text field: lines of text, width wide before CSS says.
+    Field { lines: f32, line: f32, width: f32 },
+    /// An image of its size.
+    Image { w: f32, h: f32 },
+    /// A control of a fixed size.
+    Fixed { w: f32, h: f32 },
+
+    /// Whether it is None.
+    fn is_none(self: Replaced) -> bool {
+        match self {
+            .None => { return true; }
+            _ => { return false; }
+        }
+    }
+}
+
+/// A width asked for, rounded, and the size the text came to at it.
+type MemoEntry = struct {
+    key: ?f32,
+    size: geo.Size(f32),
+}
+
+/// What a box's text measured at the widths asked so far, the last eight:
+/// taffy asks the same width again under other constraints, and a measure
+/// is the dear part.
+type Memo = struct {
+    entries: [8]MemoEntry,
+    len: usize,
+}
+
+/// An empty memo.
+fn empty_memo() -> Memo {
+    let e = MemoEntry { key: none, size: geo.size_zero() };
+    return Memo { entries: [e; 8], len: 0 };
+}
+
+/// Paint before or after its siblings: z-index, and whether it is
+/// positioned at all; ordered as Rust orders (i32, bool).
+type Z = struct {
+    index: i32,
+    positioned: bool,
+}
+
+/// Whether x sorts before y.
+fn z_less(x: Z, y: Z) -> bool {
+    if x.index != y.index {
+        return x.index < y.index;
+    }
+    return (not x.positioned) and y.positioned;
+}
+
+/// One box of the taffy tree (TBox).
+type TBox = struct {
+    content: Content,
+    style: sty.Style,
+    children: alloc.List(usize),
+    hoisted: alloc.List(lt.NodeId),
+    cache: tcache.Cache,
+    unrounded: lt.Layout,
+    final_layout: lt.Layout,
+    replaced: Replaced,
+    min_width: ?f32,
+    memo: Memo,
+    ordinal: u32,
+    z: Z,
+}
+
+/// The taffy tree, without its fonts (Tree): the boxes, each element's,
+/// and where they are.
+type Tree = struct {
+    boxes: alloc.List(TBox),
+    by_node: alloc.List(u32),
+    names: alloc.Interner,
+    a: alloc.Allocator,
+}
+
+/// The taffy tree with the fonts that measure its text.
+type Laying(comptime F: type) = struct where F: Fonts {
+    tree: Tree,
+    fonts: F,
+}
+
+/// An item of a block container's content, before it is grouped (Item).
+type Item = enum {
+    /// A block-level element.
+    Block { node: u32 },
+    /// Inline content.
+    Inline { piece: Piece },
+}
+
+/// A piece of inline content (Piece).
+type Piece = enum {
+    /// A text node's text, in its parent's look and white-space.
+    Text { text: alloc.String, font: Font, node: u32, ws: u8, transform: u8 },
+    /// A br.
+    Break { font: Font, node: u32 },
+    /// An inline-level box: an inline-block, a control.
+    Atomic { node: u32 },
+}
+
+/// Lays out doc on a page width by height, with styles computed for it,
+/// its text measured by fonts. images gives an image's size by its
+/// image-load number. The layout's memory is a's.
+pub fn lay_out(comptime F: type, doc: &dyn select.Doc, styles: &style.Styles, fonts: F, images: &dyn fn(u32) -> ?geo.Size(f32), width: f32, height: f32, a: alloc.Allocator) -> Layout where F: Fonts {
+    var by_node = alloc.List(u32).init(a);
+    let size = doc.doc_size();
+    var n: u32 = 0;
+    while n < size : (n += 1) {
+        by_node.push(NONE);
+    }
+    var t = Laying(F) { tree: Tree { boxes: alloc.List(TBox).init(a), by_node: by_node, names: alloc.Interner.init(a), a: a }, fonts: fonts };
+    if not style.has_style(styles, n: ROOT) {
+        return empty_layout(a);
+    }
+    let root = element(&mut t.tree, doc: doc, styles: styles, images: images, id: ROOT);
+    let root_id = lt.NodeId.from_usize(root);
+    compute.compute_root_layout(&mut t, root_id, geo.Size(sty.AvailableSpace) { width: sty.AvailableSpace.definite(width), height: sty.AvailableSpace.definite(height) });
+    compute.round_layout(&mut t, root_id);
+
+    // Where each box is on the page, the way taffy rounded it: in-flow
+    // children from their parent, out-of-flow ones from the containing
+    // block that took them.
+    let count = t.tree.boxes.len();
+    var rects = alloc.List(Rect).init(a);
+    var k: usize = 0;
+    while k < count : (k += 1) {
+        rects.push(Rect.zero());
+    }
+    var stack = alloc.List(Visit).init(a);
+    stack.push(Visit { at: root, px: 0.0, py: 0.0 });
+    while stack.len() > 0 {
+        let v = stack.pop() orelse break;
+        let l = t.tree.boxes.items()[v.at].final_layout;
+        let x = finite(v.px + l.location.x);
+        let y = finite(v.py + l.location.y);
+        rects[v.at] = Rect { x: x, y: y, w: util.f32_max(a: 0.0, b: finite(l.size.width)), h: util.f32_max(a: 0.0, b: finite(l.size.height)) };
+        for c in t.tree.boxes.items()[v.at].children.items() {
+            if not t.tree.boxes.items()[c.*].style.position.is_out_of_flow() {
+                stack.push(Visit { at: c.*, px: x, py: y });
+            }
+        }
+        for h in t.tree.boxes.items()[v.at].hoisted.items() {
+            stack.push(Visit { at: h.to_usize(), px: x, py: y });
+        }
+    }
+
+    var boxes = alloc.List(Placed).init(a);
+    var i: usize = 0;
+    while i < count : (i += 1) {
+        let b = &t.tree.boxes.items()[i];
+        let l = b.final_layout;
+        var children = alloc.List(usize).init(a);
+        for c in b.children.items() {
+            children.push(c.*);
+        }
+        sort_by_z(&mut children, boxes: &t.tree.boxes);
+        let ov = l.scrollable_overflow_rect;
+        boxes.push(Placed {
+            content: clone_content(&b.content, a: a),
+            rect: rects.items()[i],
+            border: [finite(l.border.top), finite(l.border.right), finite(l.border.bottom), finite(l.border.left)],
+            padding: [finite(l.padding.top), finite(l.padding.right), finite(l.padding.bottom), finite(l.padding.left)],
+            children: children,
+            extent: [util.f32_max(a: 0.0, b: finite(ov.right - l.border.left)), util.f32_max(a: 0.0, b: finite(ov.bottom - l.border.top))],
+            ordinal: b.ordinal,
+        });
+    }
+    var by_text = alloc.List(u32).init(a);
+    n = 0;
+    while n < size : (n += 1) {
+        by_text.push(NONE);
+    }
+    i = 0;
+    while i < count : (i += 1) {
+        match &boxes.items()[i].content {
+            .Text { paragraph } => {
+                for r in paragraph.runs.items() {
+                    if (r.node as usize) < by_text.len() and by_text.items()[r.node as usize] == NONE {
+                        by_text[r.node as usize] = i as u32;
+                    }
+                }
+            }
+            _ => { }
+        }
+    }
+    let page_w = rects.items()[root].w;
+    let page_h = rects.items()[root].h;
+    return Layout { boxes: boxes, by_node: t.tree.by_node, by_text: by_text, width: page_w, height: page_h };
+}
+
+/// A box to place, and its parent's corner on the page.
+type Visit = struct {
+    at: usize,
+    px: f32,
+    py: f32,
+}
+
+/// children sorted by their boxes' z, stably (sort_by_key).
+fn sort_by_z(children: &mut alloc.List(usize), boxes: &alloc.List(TBox)) {
+    let n = children.len();
+    var i: usize = 1;
+    while i < n : (i += 1) {
+        let x = children.items()[i];
+        let zx = boxes.items()[x].z;
+        var j = i;
+        while j > 0 and z_less(x: zx, y: boxes.items()[children.items()[j - 1]].z) {
+            let prev = children.items()[j - 1];
+            children.items_mut()[j] = prev;
+            j -= 1;
+        }
+        children.items_mut()[j] = x;
+    }
+}
+
+/// A number layout produced, or 0 if its arithmetic ran off the end: what
+/// is drawn, scrolled and hit-tested is never NaN or infinite.
+fn finite(v: f32) -> f32 {
+    if util.is_finite(v) {
+        return v;
+    }
+    return 0.0;
+}
+
+// ---- the box tree ----------------------------------------------------------
+
+/// A new box (Tree::push); its index.
+fn push_box(t: &mut Tree, content: Content, ts: sty.Style, replaced: Replaced) -> usize {
+    t.boxes.push(TBox {
+        content: content,
+        style: ts,
+        children: alloc.List(usize).init(t.a),
+        hoisted: alloc.List(lt.NodeId).init(t.a),
+        cache: tcache.Cache.new(),
+        unrounded: lt.Layout.with_order(0),
+        final_layout: lt.Layout.with_order(0),
+        replaced: replaced,
+        min_width: none,
+        memo: empty_memo(),
+        ordinal: 0,
+        z: Z { index: 0, positioned: false },
+    });
+    return t.boxes.len() - 1;
+}
+
+/// Whether display lays its children out as flex or grid items.
+fn is_flex_or_grid(display: u8) -> bool {
+    return display == style.DISPLAY_FLEX or display == style.DISPLAY_INLINE_FLEX or display == style.DISPLAY_GRID or display == style.DISPLAY_INLINE_GRID;
+}
+
+/// The box of element id and what is under it (Tree::element).
+fn element(t: &mut Tree, doc: &dyn select.Doc, styles: &style.Styles, images: &dyn fn(u32) -> ?geo.Size(f32), id: u32) -> usize {
+    let s = style.style_of(styles, n: id);
+    let replaced = replaced_of(doc, id: id, s: s, images: images, a: t.a);
+    var ts = taffy_style(s, a: t.a);
+    match replaced {
+        .Image { w, h } => {
+            if not s.has_aspect_ratio and w > 0.0 and h > 0.0 {
+                ts.aspect_ratio = some(w / h);
+            }
+            ts.item_is_replaced = true;
+        }
+        _ => { }
+    }
+    let at = push_box(t, content: Content.Element { node: id }, ts: ts, replaced: replaced);
+    t.by_node[id as usize] = at as u32;
+    var z_index: i32 = 0;
+    if s.has_z_index {
+        z_index = s.z_index;
+    }
+    t.boxes[at].z = Z { index: z_index, positioned: s.position != style.POSITION_STATIC };
+    if not replaced.is_none() or is_leaf_control(doc.doc_tag(id)) {
+        return at;
+    }
+    var children = alloc.List(usize).init(t.a);
+    if is_flex_or_grid(s.display) {
+        children = items(t, doc: doc, styles: styles, images: images, id: id);
+    } else {
+        children = blocks(t, doc: doc, styles: styles, images: images, id: id);
+    }
+    // Number list items among their siblings.
+    var number: u32 = 0;
+    for c in children.items() {
+        var cid = NONE;
+        match &t.boxes.items()[c.*].content {
+            .Element { node } => { cid = node.*; }
+            _ => { }
+        }
+        if cid != NONE and style.has_style(styles, n: cid) and style.style_of(styles, n: cid).display == style.DISPLAY_LIST_ITEM {
+            number += 1;
+            t.boxes[c.*].ordinal = number;
+        }
+    }
+    t.boxes[at].children = children;
+    return at;
+}
+
+/// The children of id, with display: contents taken out of the way and
+/// display: none left out (Tree::flat_children).
+fn flat_children(doc: &dyn select.Doc, styles: &style.Styles, id: u32, out: &mut alloc.List(u32)) {
+    for c in doc.doc_children(id) {
+        if style.has_style(styles, n: c.*) {
+            let d = style.style_of(styles, n: c.*).display;
+            if d == style.DISPLAY_NONE {
+                continue;
+            }
+            if d == style.DISPLAY_CONTENTS {
+                flat_children(doc, styles: styles, id: c.*, out: out);
+                continue;
+            }
+        }
+        out.push(c.*);
+    }
+}
+
+/// Whether node n is a run of text.
+fn is_text(doc: &dyn select.Doc, n: u32) -> bool {
+    return doc.doc_tag(n).len() == 0;
+}
+
+/// A flex or grid container's items: each element a box, each run of text
+/// between them a paragraph (Tree::items).
+fn items(t: &mut Tree, doc: &dyn select.Doc, styles: &style.Styles, images: &dyn fn(u32) -> ?geo.Size(f32), id: u32) -> alloc.List(usize) {
+    let s = style.style_of(styles, n: id);
+    var kids = alloc.List(u32).init(t.a);
+    flat_children(doc, styles: styles, id: id, out: &mut kids);
+    var out = alloc.List(usize).init(t.a);
+    var pending = alloc.List(Piece).init(t.a);
+    for c in kids.items() {
+        if is_text(doc, n: c.*) {
+            pending.push(text_piece(doc.doc_text(c.*), parent: s, node: c.*, a: t.a));
+            continue;
+        }
+        let taken = pending;
+        pending = alloc.List(Piece).init(t.a);
+        match paragraph_box(t, pieces: taken, s: s, first: true, last: true) {
+            some(b) => { out.push(b); }
+            none => { }
+        }
+        out.push(element(t, doc: doc, styles: styles, images: images, id: c.*));
+    }
+    match paragraph_box(t, pieces: pending, s: s, first: true, last: true) {
+        some(b) => { out.push(b); }
+        none => { }
+    }
+    return out;
+}
+
+/// A block container's children: block-level boxes, with the inline
+/// content between them gathered into paragraphs and lines
+/// (Tree::blocks).
+fn blocks(t: &mut Tree, doc: &dyn select.Doc, styles: &style.Styles, images: &dyn fn(u32) -> ?geo.Size(f32), id: u32) -> alloc.List(usize) {
+    let s = style.style_of(styles, n: id);
+    var kids = alloc.List(u32).init(t.a);
+    flat_children(doc, styles: styles, id: id, out: &mut kids);
+    var found = alloc.List(Item).init(t.a);
+    for c in kids.items() {
+        classify(doc, styles: styles, id: c.*, parent: s, out: &mut found, a: t.a);
+    }
+    var out = alloc.List(usize).init(t.a);
+    var run = alloc.List(Piece).init(t.a);
+    // Taken from the front, in order.
+    var rev = alloc.List(Item).init(t.a);
+    while found.len() > 0 {
+        let x = found.pop() orelse break;
+        rev.push(x);
+    }
+    while rev.len() > 0 {
+        let item = rev.pop() orelse break;
+        match item {
+            .Inline { piece } => { run.push(piece); }
+            .Block { node } => {
+                let taken = run;
+                run = alloc.List(Piece).init(t.a);
+                flush(t, doc: doc, styles: styles, images: images, run: taken, s: s, out: &mut out);
+                out.push(element(t, doc: doc, styles: styles, images: images, id: node));
+            }
+        }
+    }
+    flush(t, doc: doc, styles: styles, images: images, run: run, s: s, out: &mut out);
+    return out;
+}
+
+/// Whether a piece is an inline-level box.
+fn is_atomic(p: &Piece) -> bool {
+    match p {
+        .Atomic { .. } => { return true; }
+        _ => { return false; }
+    }
+}
+
+/// Inline content as boxes: one paragraph, or a wrapping row of
+/// paragraphs and the boxes among them (Tree::flush).
+fn flush(t: &mut Tree, doc: &dyn select.Doc, styles: &style.Styles, images: &dyn fn(u32) -> ?geo.Size(f32), run: alloc.List(Piece), s: &style.Style, out: &mut alloc.List(usize)) {
+    if run.len() == 0 {
+        return;
+    }
+    var any_atomic = false;
+    for p in run.items() {
+        if is_atomic(p) {
+            any_atomic = true;
+        }
+    }
+    if not any_atomic {
+        match paragraph_box(t, pieces: run, s: s, first: true, last: true) {
+            some(b) => { out.push(b); }
+            none => { }
+        }
+        return;
+    }
+    var line_style = sty.Style.default(t.a);
+    line_style.display = sty.Display.Flex;
+    line_style.flex_wrap = sty.FlexWrap.Wrap;
+    line_style.align_items = sty.AlignItems.center();
+    if s.text_align == style.TEXT_CENTER {
+        line_style.justify_content = sty.AlignContent.center();
+    } else if s.text_align == style.TEXT_RIGHT or s.text_align == style.TEXT_END {
+        line_style.justify_content = sty.AlignContent.flex_end();
+    } else {
+        line_style.justify_content = sty.AlignContent.flex_start();
+    }
+    let line = push_box(t, content: Content.Line, ts: line_style, replaced: Replaced.None);
+    var children = alloc.List(usize).init(t.a);
+    var segment = alloc.List(Piece).init(t.a);
+    var first = true;
+    var rev = alloc.List(Piece).init(t.a);
+    var pieces = run;
+    while pieces.len() > 0 {
+        let x = pieces.pop() orelse break;
+        rev.push(x);
+    }
+    while rev.len() > 0 {
+        let p = rev.pop() orelse break;
+        var atomic = NONE;
+        match &p {
+            .Atomic { node } => { atomic = node.*; }
+            _ => { }
+        }
+        if atomic == NONE {
+            segment.push(p);
+            continue;
+        }
+        let taken = segment;
+        segment = alloc.List(Piece).init(t.a);
+        match paragraph_box(t, pieces: taken, s: s, first: first, last: false) {
+            some(b) => { children.push(b); }
+            none => { }
+        }
+        first = false;
+        children.push(element(t, doc: doc, styles: styles, images: images, id: atomic));
+    }
+    match paragraph_box(t, pieces: segment, s: s, first: first, last: true) {
+        some(b) => { children.push(b); }
+        none => { }
+    }
+    t.boxes[line].children = children;
+    out.push(line);
+}
+
+/// A paragraph's box, or none if the text is only spaces that collapse
+/// away (Tree::paragraph_box). first and last say whether its edges are
+/// the edges of a line, where spaces go.
+fn paragraph_box(t: &mut Tree, pieces: alloc.List(Piece), s: &style.Style, first: bool, last: bool) -> ?usize {
+    let p = paragraph_of(pieces, container: s, first: first, last: last, a: t.a) orelse return none;
+    var ps = sty.Style.default(t.a);
+    ps.display = sty.Display.Block;
+    return push_box(t, content: Content.Text { paragraph: p }, ts: ps, replaced: Replaced.None);
+}
+
+// ---- the computed style as taffy reads it ----------------------------------
+
+/// A length as taffy's LengthPercentageAuto.
+fn lpa(l: values.Length) -> sty.LengthPercentageAuto {
+    if l.kind == values.PX {
+        return sty.LengthPercentageAuto.length(l.px);
+    }
+    if l.kind == values.PERCENT {
+        return sty.LengthPercentageAuto.percent(l.percent / 100.0);
+    }
+    if l.kind == values.CALC {
+        return sty.LengthPercentageAuto.calc(sty.Calc { px: l.px, percent: l.percent });
+    }
+    return sty.LengthPercentageAuto.auto();
+}
+
+/// A length as taffy's LengthPercentage: auto as 0.
+fn lp(l: values.Length) -> sty.LengthPercentage {
+    if l.kind == values.PX {
+        return sty.LengthPercentage.length(l.px);
+    }
+    if l.kind == values.PERCENT {
+        return sty.LengthPercentage.percent(l.percent / 100.0);
+    }
+    if l.kind == values.CALC {
+        return sty.LengthPercentage.calc(sty.Calc { px: l.px, percent: l.percent });
+    }
+    return sty.LengthPercentage.length(0.0);
+}
+
+/// A length as taffy's Dimension.
+fn dim(l: values.Length) -> sty.Dimension {
+    if l.kind == values.PX {
+        return sty.Dimension.length(l.px);
+    }
+    if l.kind == values.PERCENT {
+        return sty.Dimension.percent(l.percent / 100.0);
+    }
+    if l.kind == values.CALC {
+        return sty.Dimension.calc(sty.Calc { px: l.px, percent: l.percent });
+    }
+    return sty.Dimension.auto();
+}
+
+/// A track's minimum sizing function.
+fn min_track(t: &style.Track) -> sgrid.MinTrackSizingFunction {
+    if t.kind == style.TRACK_FIXED {
+        if t.len.kind == values.PX {
+            return sgrid.MinTrackSizingFunction.length(t.len.px);
+        }
+        if t.len.kind == values.PERCENT {
+            return sgrid.MinTrackSizingFunction.percent(t.len.percent / 100.0);
+        }
+        if t.len.kind == values.CALC {
+            return sgrid.MinTrackSizingFunction.calc(sty.Calc { px: t.len.px, percent: t.len.percent });
+        }
+    }
+    if t.kind == style.TRACK_MIN_CONTENT {
+        return sgrid.MinTrackSizingFunction.min_content();
+    }
+    if t.kind == style.TRACK_MAX_CONTENT {
+        return sgrid.MinTrackSizingFunction.max_content();
+    }
+    return sgrid.MinTrackSizingFunction.auto();
+}
+
+/// A track's maximum sizing function.
+fn max_track(t: &style.Track) -> sgrid.MaxTrackSizingFunction {
+    if t.kind == style.TRACK_FIXED {
+        if t.len.kind == values.PX {
+            return sgrid.MaxTrackSizingFunction.length(t.len.px);
+        }
+        if t.len.kind == values.PERCENT {
+            return sgrid.MaxTrackSizingFunction.percent(t.len.percent / 100.0);
+        }
+        if t.len.kind == values.CALC {
+            return sgrid.MaxTrackSizingFunction.calc(sty.Calc { px: t.len.px, percent: t.len.percent });
+        }
+    }
+    if t.kind == style.TRACK_FR {
+        return sgrid.MaxTrackSizingFunction.fr(t.fr);
+    }
+    if t.kind == style.TRACK_MIN_CONTENT {
+        return sgrid.MaxTrackSizingFunction.min_content();
+    }
+    if t.kind == style.TRACK_MAX_CONTENT {
+        return sgrid.MaxTrackSizingFunction.max_content();
+    }
+    if t.kind == style.TRACK_FIT_CONTENT {
+        if t.len.kind == values.PX {
+            return sgrid.MaxTrackSizingFunction.fit_content_px(t.len.px);
+        }
+        if t.len.kind == values.PERCENT {
+            return sgrid.MaxTrackSizingFunction.fit_content_percent(t.len.percent / 100.0);
+        }
+    }
+    return sgrid.MaxTrackSizingFunction.auto();
+}
+
+/// A track as taffy's sizing function: minmax()'s two ends, or the track
+/// at both.
+fn track_function(t: &style.Track) -> sgrid.TrackSizingFunction {
+    if t.kind == style.TRACK_MINMAX and t.sub.len() == 2 {
+        return sgrid.TrackSizingFunction { min: min_track(&t.sub.items()[0]), max: max_track(&t.sub.items()[1]) };
+    }
+    return sgrid.TrackSizingFunction { min: min_track(t), max: max_track(t) };
+}
+
+/// grid-template-columns or -rows as taffy's components.
+fn template(list: &alloc.List(style.TrackEntry), a: alloc.Allocator) -> alloc.List(sgrid.GridTemplateComponent) {
+    var out = alloc.List(sgrid.GridTemplateComponent).init(a);
+    for e in list.items() {
+        if not e.repeat {
+            if e.tracks.len() > 0 {
+                out.push(sgrid.GridTemplateComponent.Single { track: track_function(&e.tracks.items()[0]) });
+            }
+            continue;
+        }
+        var tracks = alloc.List(sgrid.TrackSizingFunction).init(a);
+        for x in e.tracks.items() {
+            tracks.push(track_function(x));
+        }
+        var names = alloc.List(alloc.List(alloc.Symbol)).init(a);
+        var k: usize = 0;
+        while k <= tracks.len() : (k += 1) {
+            names.push(alloc.List(alloc.Symbol).init(a));
+        }
+        var count = sgrid.RepetitionCount.Count { count: e.count };
+        if e.count_kind == style.REPEAT_AUTO_FILL {
+            count = sgrid.RepetitionCount.AutoFill;
+        } else if e.count_kind == style.REPEAT_AUTO_FIT {
+            count = sgrid.RepetitionCount.AutoFit;
+        }
+        out.push(sgrid.GridTemplateComponent.Repeat { repetition: sgrid.GridTemplateRepetition { count: count, tracks: tracks, line_names: names } });
+    }
+    return out;
+}
+
+/// One end of a grid placement as taffy's.
+fn grid_line(l: style.Line) -> sgrid.GridPlacement {
+    if l.kind == style.LINE_INDEX {
+        return sgrid.GridPlacement.from_line_index(l.n as i16);
+    }
+    if l.kind == style.LINE_SPAN {
+        return sgrid.GridPlacement.from_span(l.n as u16);
+    }
+    return sgrid.GridPlacement.Auto;
+}
+
+/// overflow as taffy's: scroll and auto both scroll.
+fn overflow_of(o: u8) -> sty.Overflow {
+    if o == style.OVERFLOW_HIDDEN {
+        return sty.Overflow.Hidden;
+    }
+    if o == style.OVERFLOW_CLIP {
+        return sty.Overflow.Clip;
+    }
+    if o == style.OVERFLOW_SCROLL or o == style.OVERFLOW_AUTO {
+        return sty.Overflow.Scroll;
+    }
+    return sty.Overflow.Visible;
+}
+
+/// An alignment as taffy's align-items or align-self; none for one it has
+/// not (normal, auto, the distributions).
+fn items_align(k: u8) -> ?sty.AlignItems {
+    if k == style.ALIGN_START or k == style.ALIGN_LEFT {
+        return sty.AlignItems.start();
+    }
+    if k == style.ALIGN_END or k == style.ALIGN_RIGHT {
+        return sty.AlignItems.end();
+    }
+    if k == style.ALIGN_FLEX_START {
+        return sty.AlignItems.flex_start();
+    }
+    if k == style.ALIGN_FLEX_END {
+        return sty.AlignItems.flex_end();
+    }
+    if k == style.ALIGN_SELF_START {
+        return sty.AlignItems.self_start();
+    }
+    if k == style.ALIGN_SELF_END {
+        return sty.AlignItems.self_end();
+    }
+    if k == style.ALIGN_CENTER {
+        return sty.AlignItems.center();
+    }
+    if k == style.ALIGN_STRETCH {
+        return sty.AlignItems.stretch();
+    }
+    if k == style.ALIGN_BASELINE {
+        return sty.AlignItems.baseline();
+    }
+    return none;
+}
+
+/// An alignment as taffy's align-content or justify-content; none for one
+/// it has not.
+fn content_align(k: u8) -> ?sty.AlignContent {
+    if k == style.ALIGN_START or k == style.ALIGN_LEFT {
+        return sty.AlignContent.start();
+    }
+    if k == style.ALIGN_END or k == style.ALIGN_RIGHT {
+        return sty.AlignContent.end();
+    }
+    if k == style.ALIGN_FLEX_START {
+        return sty.AlignContent.flex_start();
+    }
+    if k == style.ALIGN_FLEX_END {
+        return sty.AlignContent.flex_end();
+    }
+    if k == style.ALIGN_CENTER {
+        return sty.AlignContent.center();
+    }
+    if k == style.ALIGN_STRETCH {
+        return sty.AlignContent.stretch();
+    }
+    if k == style.ALIGN_SPACE_BETWEEN {
+        return sty.AlignContent.space_between();
+    }
+    if k == style.ALIGN_SPACE_AROUND {
+        return sty.AlignContent.space_around();
+    }
+    if k == style.ALIGN_SPACE_EVENLY {
+        return sty.AlignContent.space_evenly();
+    }
+    return none;
+}
+
+/// The computed style s as taffy reads it (Tree::taffy_style).
+pub fn taffy_style(s: &style.Style, a: alloc.Allocator) -> sty.Style {
+    var ts = sty.Style.default(a);
+    if s.display == style.DISPLAY_NONE {
+        ts.display = sty.Display.None;
+    } else if s.display == style.DISPLAY_FLEX or s.display == style.DISPLAY_INLINE_FLEX {
+        ts.display = sty.Display.Flex;
+    } else if s.display == style.DISPLAY_GRID or s.display == style.DISPLAY_INLINE_GRID {
+        ts.display = sty.Display.Grid;
+    } else {
+        ts.display = sty.Display.Block;
+    }
+    if s.box_sizing == style.BOX_BORDER {
+        ts.box_sizing = sty.BoxSizing.BorderBox;
+    } else {
+        ts.box_sizing = sty.BoxSizing.ContentBox;
+    }
+    ts.overflow = geo.Point(sty.Overflow) { x: overflow_of(s.overflow[0]), y: overflow_of(s.overflow[1]) };
+    ts.scrollbar_width = 0.0;
+    if s.float == style.FLOAT_LEFT {
+        ts.float = sty.Float.Left;
+    } else if s.float == style.FLOAT_RIGHT {
+        ts.float = sty.Float.Right;
+    } else {
+        ts.float = sty.Float.None;
+    }
+    if s.clear == style.CLEAR_LEFT {
+        ts.clear = sty.Clear.Left;
+    } else if s.clear == style.CLEAR_RIGHT {
+        ts.clear = sty.Clear.Right;
+    } else if s.clear == style.CLEAR_BOTH {
+        ts.clear = sty.Clear.Both;
+    } else {
+        ts.clear = sty.Clear.None;
+    }
+    if s.position == style.POSITION_RELATIVE or s.position == style.POSITION_STICKY {
+        ts.position = sty.Position.Relative;
+    } else if s.position == style.POSITION_ABSOLUTE or s.position == style.POSITION_FIXED {
+        ts.position = sty.Position.Absolute;
+    } else {
+        ts.position = sty.Position.Static;
+    }
+    ts.inset = geo.Rect(sty.LengthPercentageAuto) { left: lpa(s.inset[3]), right: lpa(s.inset[1]), top: lpa(s.inset[0]), bottom: lpa(s.inset[2]) };
+    ts.size = geo.Size(sty.Dimension) { width: dim(s.width), height: dim(s.height) };
+    ts.min_size = geo.Size(sty.LengthPercentageAuto) { width: lpa(s.min_width), height: lpa(s.min_height) };
+    ts.max_size = geo.Size(sty.LengthPercentageAuto) { width: lpa(s.max_width), height: lpa(s.max_height) };
+    if s.has_aspect_ratio {
+        ts.aspect_ratio = some(s.aspect_ratio);
+    }
+    ts.margin = geo.Rect(sty.LengthPercentageAuto) { left: lpa(s.margin[3]), right: lpa(s.margin[1]), top: lpa(s.margin[0]), bottom: lpa(s.margin[2]) };
+    ts.padding = geo.Rect(sty.LengthPercentage) { left: lp(s.padding[3]), right: lp(s.padding[1]), top: lp(s.padding[0]), bottom: lp(s.padding[2]) };
+    ts.border = geo.Rect(sty.LengthPercentage) { left: sty.LengthPercentage.length(s.border_width[3]), right: sty.LengthPercentage.length(s.border_width[1]), top: sty.LengthPercentage.length(s.border_width[0]), bottom: sty.LengthPercentage.length(s.border_width[2]) };
+    ts.align_items = items_align(s.align_items) orelse sty.AlignItems.normal();
+    ts.align_self = items_align(s.align_self);
+    ts.justify_items = items_align(s.justify_items) orelse sty.AlignItems.normal();
+    ts.justify_self = items_align(s.justify_self);
+    ts.align_content = content_align(s.align_content) orelse sty.AlignContent.normal();
+    ts.justify_content = content_align(s.justify_content) orelse sty.AlignContent.normal();
+    ts.gap = geo.Size(sty.LengthPercentage) { width: lp(s.gap[1]), height: lp(s.gap[0]) };
+    if s.flex_direction == style.FLEX_ROW_REVERSE {
+        ts.flex_direction = sty.FlexDirection.RowReverse;
+    } else if s.flex_direction == style.FLEX_COLUMN {
+        ts.flex_direction = sty.FlexDirection.Column;
+    } else if s.flex_direction == style.FLEX_COLUMN_REVERSE {
+        ts.flex_direction = sty.FlexDirection.ColumnReverse;
+    } else {
+        ts.flex_direction = sty.FlexDirection.Row;
+    }
+    if s.flex_wrap == style.WRAP_WRAP {
+        ts.flex_wrap = sty.FlexWrap.Wrap;
+    } else if s.flex_wrap == style.WRAP_REVERSE {
+        ts.flex_wrap = sty.FlexWrap.WrapReverse;
+    } else {
+        ts.flex_wrap = sty.FlexWrap.NoWrap;
+    }
+    ts.flex_basis = dim(s.flex_basis);
+    ts.flex_grow = s.flex_grow;
+    ts.flex_shrink = s.flex_shrink;
+    ts.grid_template_columns = template(&s.grid_template_columns, a: a);
+    ts.grid_template_rows = template(&s.grid_template_rows, a: a);
+    var auto_columns = alloc.List(sgrid.TrackSizingFunction).init(a);
+    for x in s.grid_auto_columns.items() {
+        auto_columns.push(track_function(x));
+    }
+    ts.grid_auto_columns = auto_columns;
+    var auto_rows = alloc.List(sgrid.TrackSizingFunction).init(a);
+    for x in s.grid_auto_rows.items() {
+        auto_rows.push(track_function(x));
+    }
+    ts.grid_auto_rows = auto_rows;
+    if s.grid_auto_flow_column and s.grid_auto_flow_dense {
+        ts.grid_auto_flow = sgrid.GridAutoFlow.ColumnDense;
+    } else if s.grid_auto_flow_column {
+        ts.grid_auto_flow = sgrid.GridAutoFlow.Column;
+    } else if s.grid_auto_flow_dense {
+        ts.grid_auto_flow = sgrid.GridAutoFlow.RowDense;
+    } else {
+        ts.grid_auto_flow = sgrid.GridAutoFlow.Row;
+    }
+    ts.grid_row = geo.Line(sgrid.GridPlacement) { start: grid_line(s.grid_row.start), end: grid_line(s.grid_row.end) };
+    ts.grid_column = geo.Line(sgrid.GridPlacement) { start: grid_line(s.grid_column.start), end: grid_line(s.grid_column.end) };
+    return ts;
+}
+
+// ---- laying out ------------------------------------------------------------
+
+/// Lays out one box, as taffy asks (Tree::compute): a hidden run hidden,
+/// else the cache in front of the algorithm, with the parent's block
+/// context when inherited.
+fn compute_node(comptime F: type, t: &mut Laying(F), node: lt.NodeId, inputs: lt.LayoutInput, inherited: bool, bfc: &mut block.BlockFormattingContext, block_ctx: &mut block.BlockContext) -> lt.LayoutOutput where F: Fonts {
+    if inputs.run_mode == lt.RunMode.PerformHiddenLayout {
+        return compute.compute_hidden_layout(t, node);
+    }
+    // compute.compute_cached_layout, written out, so that the block
+    // context reaches the algorithm.
+    let i = node.to_usize();
+    match t.tree.boxes[i].cache.get(&inputs) {
+        some(cached) => { return cached; }
+        none => { }
+    }
+    let computed = compute_uncached(F, t, node: node, inputs: inputs, inherited: inherited, bfc: bfc, block_ctx: block_ctx);
+    t.tree.boxes[i].cache.store(&inputs, computed.clone());
+    return computed;
+}
+
+/// The algorithm for a box by its display, then the out-of-flow pass of a
+/// full layout.
+fn compute_uncached(comptime F: type, t: &mut Laying(F), node: lt.NodeId, inputs: lt.LayoutInput, inherited: bool, bfc: &mut block.BlockFormattingContext, block_ctx: &mut block.BlockContext) -> lt.LayoutOutput where F: Fonts {
+    let i = node.to_usize();
+    let display = t.tree.boxes.items()[i].style.display;
+    let has_children = t.tree.boxes.items()[i].children.len() > 0;
+    var output = lt.LayoutOutput.hidden();
+    if display == sty.Display.None {
+        output = compute.compute_hidden_layout(t, node);
+    } else if has_children and display == sty.Display.Flex {
+        output = flexbox.compute_flexbox_layout(t, node, inputs);
+    } else if has_children and display == sty.Display.Grid {
+        output = grid.compute_grid_layout(t, node, inputs);
+    } else if has_children {
+        if inherited {
+            output = block.compute_block_layout_in(t, node, inputs, bfc, block_ctx);
+        } else {
+            output = block.compute_block_layout(t, node, inputs);
+        }
+    } else {
+        var memo = t.tree.boxes.items()[i].memo;
+        var min_w = t.tree.boxes.items()[i].min_width;
+        let b = &t.tree.boxes.items()[i];
+        let fonts: &dyn Fonts = &t.fonts;
+        output = leaf.compute_leaf_layout(inputs, &b.style, fn [b, fonts, &mut memo, &mut min_w](known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+            return measure_box(b, fonts: fonts, memo: &mut memo, min_w: &mut min_w, known: known, available: available);
+        });
+        t.tree.boxes[i].memo = memo;
+        t.tree.boxes[i].min_width = min_w;
+    }
+    if inputs.run_mode == lt.RunMode.PerformLayout {
+        oof.compute_oof_layout(t, node, &mut output);
+    }
+    return output;
+}
+
+/// The paragraph's narrowest width, from the box's cache once measured.
+fn min_of(p: &Paragraph, fonts: &dyn Fonts, min_w: &mut ?f32) -> f32 {
+    match min_w.* {
+        some(m) => { return m; }
+        none => { }
+    }
+    let m = fonts.min_width(p);
+    min_w.* = some(m);
+    return m;
+}
+
+/// Whether two memo keys are equal, as Option<f32>'s == says.
+fn same_key(x: ?f32, y: ?f32) -> bool {
+    match x {
+        some(u) => {
+            match y {
+                some(v) => { return u == v; }
+                none => { return false; }
+            }
+        }
+        none => {
+            match y {
+                some(_) => { return false; }
+                none => { return true; }
+            }
+        }
+    }
+}
+
+/// fonts.measure(p, width), from the memo when that width, rounded to a
+/// 64th, has been asked before (memo).
+fn memo_size(memo: &mut Memo, width: ?f32, p: &Paragraph, fonts: &dyn Fonts) -> geo.Size(f32) {
+    var key: ?f32 = none;
+    match width {
+        some(w) => { key = some(values.round(w * 64.0) / 64.0); }
+        none => { }
+    }
+    var k: usize = 0;
+    while k < memo.len : (k += 1) {
+        if same_key(x: memo.entries[k].key, y: key) {
+            return memo.entries[k].size;
+        }
+    }
+    let size = fonts.measure(p, width: width);
+    if memo.len >= 8 {
+        var j: usize = 1;
+        while j < memo.len : (j += 1) {
+            memo.entries[j - 1] = memo.entries[j];
+        }
+        memo.len -= 1;
+    }
+    memo.entries[memo.len] = MemoEntry { key: key, size: size };
+    memo.len += 1;
+    return size;
+}
+
+/// What a leaf measures as, given what taffy already knows (measure).
+fn measure_box(b: &TBox, fonts: &dyn Fonts, memo: &mut Memo, min_w: &mut ?f32, known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+    match known.width {
+        some(kw) => {
+            match known.height {
+                some(kh) => { return geo.Size(f32) { width: kw, height: kh }; }
+                none => { }
+            }
+        }
+        none => { }
+    }
+    match &b.content {
+        .Text { paragraph } => {
+            // Rust's or() and unwrap_or() take their argument as it is,
+            // so the narrowest width is asked for whenever min-content is.
+            var asked: ?f32 = none;
+            var narrowest: f32 = 0.0;
+            match available.width {
+                .Definite { value } => { asked = some(value); }
+                .MinContent => {
+                    narrowest = min_of(paragraph, fonts: fonts, min_w: min_w);
+                    asked = some(narrowest);
+                }
+                .MaxContent => { }
+            }
+            var width: ?f32 = asked;
+            match known.width {
+                some(kw) => { width = some(kw); }
+                none => { }
+            }
+            let size = memo_size(memo, width: width, p: paragraph, fonts: fonts);
+            var w = size.width;
+            match available.width {
+                .MinContent => { w = min_of(paragraph, fonts: fonts, min_w: min_w); }
+                _ => { }
+            }
+            return geo.Size(f32) { width: known.width orelse w, height: known.height orelse size.height };
+        }
+        _ => { }
+    }
+    var w: f32 = 0.0;
+    var h: f32 = 0.0;
+    match b.replaced {
+        .None => { }
+        .Field { lines, line, width } => {
+            w = width;
+            h = lines * line;
+        }
+        .Fixed { w: fw, h: fh } => {
+            w = fw;
+            h = fh;
+        }
+        .Image { w: iw, h: ih } => {
+            w = iw;
+            h = ih;
+            match known.width {
+                some(kw) => {
+                    match known.height {
+                        some(_) => { }
+                        none => {
+                            if iw > 0.0 {
+                                w = kw;
+                                h = kw * ih / iw;
+                            }
+                        }
+                    }
+                }
+                none => {
+                    match known.height {
+                        some(kh) => {
+                            if ih > 0.0 {
+                                w = kh * iw / ih;
+                                h = kh;
+                            }
+                        }
+                        none => { }
+                    }
+                }
+            }
+        }
+    }
+    return geo.Size(f32) { width: known.width orelse w, height: known.height orelse h };
+}
+
+// ---- elements ---------------------------------------------------------------
+
+/// Controls whose content is the host's to draw, not their children
+/// (is_leaf_control).
+fn is_leaf_control(tag: str) -> bool {
+    return tag.eq("input") or tag.eq("textarea") or tag.eq("img") or tag.eq("progress") or tag.eq("select") or tag.eq("br") or tag.eq("hr");
+}
+
+
+/// s without white space at either end, as Rust's str::trim.
+fn trim_space(s: str) -> str {
+    let b = s.bytes();
+    var start: usize = 0;
+    while start < b.len() {
+        let d = char_at(b, at: start);
+        if not css.is_space(d.code) {
+            break;
+        }
+        start += d.len;
+    }
+    var end = b.len();
+    while end > start {
+        // Back to the start of the last character.
+        var at = end - 1;
+        while at > start and (b[at] & 0xC0) == 0x80 {
+            at -= 1;
+        }
+        let d = char_at(b, at: at);
+        if not css.is_space(d.code) {
+            break;
+        }
+        end = at;
+    }
+    return s[start..end];
+}
+
+/// Whether x and y are the same, ASCII letters in any case.
+fn eq_ascii_case(x: str, y: str) -> bool {
+    let p = x.bytes();
+    let q = y.bytes();
+    if p.len() != q.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < p.len() : (i += 1) {
+        if css.lower_byte(p[i]) != css.lower_byte(q[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Element::input_type: an input's type, in lower case; "text" when
+/// missing or unknown.
+fn input_type(doc: &dyn select.Doc, n: u32) -> str {
+    let k = select.attr_at(doc, n: n, name: "type") orelse return "text";
+    let given = trim_space(doc.doc_attr_value(n, k: k));
+    if eq_ascii_case(x: given, y: "checkbox") {
+        return "checkbox";
+    }
+    if eq_ascii_case(x: given, y: "radio") {
+        return "radio";
+    }
+    if eq_ascii_case(x: given, y: "password") {
+        return "password";
+    }
+    if eq_ascii_case(x: given, y: "search") {
+        return "search";
+    }
+    if eq_ascii_case(x: given, y: "range") {
+        return "range";
+    }
+    if eq_ascii_case(x: given, y: "number") {
+        return "number";
+    }
+    return "text";
+}
+
+/// The number of characters of s.
+fn char_count(s: str) -> usize {
+    return utf8.count(s);
+}
+
+/// Document::text_content: the text of n and all under it, in order.
+fn text_content(doc: &dyn select.Doc, n: u32, out: &mut alloc.String) {
+    if is_text(doc, n: n) {
+        out.push_str(doc.doc_text(n));
+        return;
+    }
+    for c in doc.doc_children(n) {
+        text_content(doc, n: c.*, out: out);
+    }
+}
+
+/// The longest option label of a select, in characters (Document::options,
+/// counted); none without options.
+fn longest_option(doc: &dyn select.Doc, n: u32, a: alloc.Allocator) -> ?usize {
+    var longest: ?usize = none;
+    var stack = alloc.List(u32).init(a);
+    let kids = doc.doc_children(n);
+    var k = kids.len();
+    while k > 0 : (k -= 1) {
+        stack.push(kids[k - 1]);
+    }
+    while stack.len() > 0 {
+        let c = stack.pop() orelse break;
+        let tag = doc.doc_tag(c);
+        if tag.eq("option") {
+            var label = alloc.String.init(a);
+            text_content(doc, n: c, out: &mut label);
+            let count = char_count(trim_space(label.view()));
+            match longest {
+                some(m) => {
+                    if count > m {
+                        longest = some(count);
+                    }
+                }
+                none => { longest = some(count); }
+            }
+        } else if tag.eq("optgroup") {
+            let sub = doc.doc_children(c);
+            var j = sub.len();
+            while j > 0 : (j -= 1) {
+                stack.push(sub[j - 1]);
+            }
+        }
+    }
+    return longest;
+}
+
+/// s as Rust's str::parse::<u32> reads it: an optional +, then digits.
+fn parse_u32(s: str) -> ?u32 {
+    var b = s.bytes();
+    if b.len() > 0 and b[0] == '+' {
+        b = b[1..b.len()];
+    }
+    if b.len() == 0 {
+        return none;
+    }
+    var v: u64 = 0;
+    for c in b {
+        if c.* < '0' or c.* > '9' {
+            return none;
+        }
+        v = v * 10 + (c.* - '0') as u64;
+        if v > 0xFFFFFFFF {
+            return none;
+        }
+    }
+    return v as u32;
+}
+
+/// x clamped to [lo, hi], as Rust's f32::clamp: a NaN stays NaN.
+fn clamp_f32(x: f32, lo: f32, hi: f32) -> f32 {
+    var v = x;
+    if v < lo {
+        v = lo;
+    }
+    if v > hi {
+        v = hi;
+    }
+    return v;
+}
+
+/// What element id measures as, if anything of its own (replaced).
+fn replaced_of(doc: &dyn select.Doc, id: u32, s: &style.Style, images: &dyn fn(u32) -> ?geo.Size(f32), a: alloc.Allocator) -> Replaced {
+    let line = style.line_height_px(s.line_height, size: s.font_size);
+    let tag = doc.doc_tag(id);
+    if tag.eq("select") {
+        // As wide as its longest option, roughly; the arrow is in its
+        // padding.
+        let longest = longest_option(doc, n: id, a: a) orelse 4;
+        return Replaced.Field { lines: 1.0, line: line, width: (longest as f32) * s.font_size * 0.55 };
+    }
+    if tag.eq("img") {
+        match select.attr_at(doc, n: id, name: "src") {
+            some(k) => {
+                match parse_u32(trim_space(doc.doc_attr_value(id, k: k))) {
+                    some(h) => {
+                        match images(h) {
+                            some(size) => { return Replaced.Image { w: size.width, h: size.height }; }
+                            none => { }
+                        }
+                    }
+                    none => { }
+                }
+            }
+            none => { }
+        }
+        return Replaced.Fixed { w: 0.0, h: 0.0 };
+    }
+    if tag.eq("textarea") {
+        var rows: f32 = 3.0;
+        match select.attr_at(doc, n: id, name: "rows") {
+            some(k) => {
+                match css.parse_float(doc.doc_attr_value(id, k: k), a) {
+                    some(v) => { rows = v; }
+                    none => { }
+                }
+            }
+            none => { }
+        }
+        return Replaced.Field { lines: clamp_f32(x: rows, lo: 1.0, hi: 100.0), line: line, width: s.font_size * 16.0 };
+    }
+    if tag.eq("input") {
+        let kind = input_type(doc, n: id);
+        if kind.eq("checkbox") or kind.eq("radio") {
+            return Replaced.Fixed { w: 0.0, h: 0.0 };
+        }
+        if kind.eq("range") {
+            return Replaced.Fixed { w: 160.0, h: 16.0 };
+        }
+        return Replaced.Field { lines: 1.0, line: line, width: s.font_size * 11.0 };
+    }
+    if tag.eq("progress") {
+        return Replaced.Fixed { w: 160.0, h: 8.0 };
+    }
+    return Replaced.None;
+}
+
+/// A text node as a piece of inline content, in its parent's style
+/// (text_piece).
+fn text_piece(text: str, parent: &style.Style, node: u32, a: alloc.Allocator) -> Piece {
+    return Piece.Text { text: alloc.String.from(text, a), font: font_of(parent), node: node, ws: parent.white_space, transform: parent.text_transform };
+}
+
+/// Where a block container's child goes: a block of its own, or into the
+/// inline content around it, an inline element as the pieces of its text
+/// (classify).
+fn classify(doc: &dyn select.Doc, styles: &style.Styles, id: u32, parent: &style.Style, out: &mut alloc.List(Item), a: alloc.Allocator) {
+    if is_text(doc, n: id) {
+        out.push(Item.Inline { piece: text_piece(doc.doc_text(id), parent: parent, node: id, a: a) });
+        return;
+    }
+    if not style.has_style(styles, n: id) {
+        return;
+    }
+    let s = style.style_of(styles, n: id);
+    let out_of_flow = s.float != style.FLOAT_NONE or s.position == style.POSITION_ABSOLUTE or s.position == style.POSITION_FIXED;
+    let d = s.display;
+    let tag = doc.doc_tag(id);
+    if d == style.DISPLAY_NONE {
+        return;
+    }
+    if d == style.DISPLAY_CONTENTS {
+        for c in doc.doc_children(id) {
+            classify(doc, styles: styles, id: c.*, parent: s, out: out, a: a);
+        }
+        return;
+    }
+    if out_of_flow {
+        out.push(Item.Block { node: id });
+        return;
+    }
+    if d == style.DISPLAY_INLINE and tag.eq("br") {
+        out.push(Item.Inline { piece: Piece.Break { font: font_of(s), node: id } });
+        return;
+    }
+    if d == style.DISPLAY_INLINE and not is_leaf_control(tag) {
+        for c in doc.doc_children(id) {
+            classify(doc, styles: styles, id: c.*, parent: s, out: out, a: a);
+        }
+        return;
+    }
+    if d == style.DISPLAY_INLINE or d == style.DISPLAY_INLINE_BLOCK or d == style.DISPLAY_INLINE_FLEX or d == style.DISPLAY_INLINE_GRID {
+        out.push(Item.Inline { piece: Piece.Atomic { node: id } });
+        return;
+    }
+    out.push(Item.Block { node: id });
+}
+
+// ---- paragraphs --------------------------------------------------------------
+
+/// Whether s ends with a space or a line break.
+fn ends_with_space(s: str) -> bool {
+    let b = s.bytes();
+    return b.len() > 0 and (b[b.len() - 1] == ' ' or b[b.len() - 1] == '\n');
+}
+
+/// s without the spaces at its end.
+fn without_trailing_spaces(s: str) -> str {
+    let b = s.bytes();
+    var n = b.len();
+    while n > 0 and b[n - 1] == ' ' {
+        n -= 1;
+    }
+    return s[0..n];
+}
+
+/// Inline pieces as a paragraph, spaces collapsed as each piece's
+/// white-space says and text transformed; none if nothing is left
+/// (paragraph).
+fn paragraph_of(pieces: alloc.List(Piece), container: &style.Style, first: bool, last: bool, a: alloc.Allocator) -> ?Paragraph {
+    var runs = alloc.List(Run).init(a);
+    // At a line's start, a collapsible space goes.
+    var prev_space = first;
+    for p in pieces.items() {
+        match p {
+            .Atomic { .. } => { }
+            .Break { font, node } => {
+                trim_end(&mut runs, a: a);
+                runs.push(Run { text: alloc.String.from("\n", a), font: font.*, node: node.* });
+                prev_space = true;
+            }
+            .Text { text, font, node, ws, transform } => {
+                var out = alloc.String.init(a);
+                let src = text.view();
+                if ws.* == style.WS_PRE or ws.* == style.WS_PRE_WRAP {
+                    let b = src.bytes();
+                    var from: usize = 0;
+                    var i: usize = 0;
+                    while i < b.len() : (i += 1) {
+                        if b[i] == '\t' {
+                            out.push_str(src[from..i]);
+                            out.push_str("    ");
+                            from = i + 1;
+                        }
+                    }
+                    out.push_str(src[from..b.len()]);
+                    prev_space = ends_with_space(out.view());
+                } else {
+                    let keep_newlines = ws.* == style.WS_PRE_LINE;
+                    let b = src.bytes();
+                    var at: usize = 0;
+                    while at < b.len() {
+                        let d = char_at(b, at: at);
+                        let c = d.code;
+                        if c == '\n' as u32 and keep_newlines {
+                            let kept = alloc.String.from(without_trailing_spaces(out.view()), a);
+                            out = kept;
+                            out.push_str("\n");
+                            prev_space = true;
+                        } else if css.is_space(c) {
+                            if not prev_space {
+                                out.push_str(" ");
+                                prev_space = true;
+                            }
+                        } else {
+                            out.push_str(src[at..at + d.len]);
+                            prev_space = false;
+                        }
+                        at += d.len;
+                    }
+                }
+                var shown = alloc.String.init(a);
+                if transform.* == style.TRANSFORM_UPPERCASE {
+                    shown = upper_text(out.view(), a: a);
+                } else if transform.* == style.TRANSFORM_LOWERCASE {
+                    shown = lower_text(out.view(), a: a);
+                } else if transform.* == style.TRANSFORM_CAPITALIZE {
+                    shown = capitalize(out.view(), a: a);
+                } else {
+                    shown = out;
+                }
+                if shown.len() > 0 {
+                    runs.push(Run { text: shown, font: font.*, node: node.* });
+                }
+            }
+        }
+    }
+    if last {
+        trim_end(&mut runs, a: a);
+    }
+    var all_blank = true;
+    var any_break = false;
+    for r in runs.items() {
+        if not blank(r.text.view()) {
+            all_blank = false;
+        }
+        if has_newline(r.text.view()) {
+            any_break = true;
+        }
+    }
+    if all_blank and not any_break {
+        // Spaces alone between two boxes still part them, like a word.
+        if first or last or runs.len() == 0 {
+            return none;
+        }
+    }
+    var line_height = style.line_height_px(container.line_height, size: container.font_size);
+    for r in runs.items() {
+        line_height = util.f32_max(a: line_height, b: r.font.line);
+    }
+    var align = Align.Left;
+    if container.text_align == style.TEXT_CENTER {
+        align = Align.Center;
+    } else if container.text_align == style.TEXT_RIGHT or container.text_align == style.TEXT_END {
+        align = Align.Right;
+    }
+    return Paragraph {
+        runs: runs,
+        align: align,
+        wrap: not (container.white_space == style.WS_NOWRAP or container.white_space == style.WS_PRE),
+        line_height: line_height,
+        ellipsis: container.text_overflow == style.OVERFLOW_TEXT_ELLIPSIS and container.overflow[0] != style.OVERFLOW_VISIBLE,
+    };
+}
+
+/// Whether s is all white space (str::trim().is_empty()).
+fn blank(s: str) -> bool {
+    return trim_space(s).len() == 0;
+}
+
+/// Whether s holds a line break.
+fn has_newline(s: str) -> bool {
+    for b in s.bytes() {
+        if b.* == '\n' {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The trailing spaces of a line go (trim_end): from the last run, and
+/// the run with them when nothing else is left of it.
+fn trim_end(runs: &mut alloc.List(Run), a: alloc.Allocator) {
+    while runs.len() > 0 {
+        let k = runs.len() - 1;
+        let text = runs.items()[k].text.view();
+        let kept = without_trailing_spaces(text);
+        if kept.len() == 0 {
+            _ = runs.pop();
+            continue;
+        }
+        if kept.len() < text.len() {
+            let fresh = alloc.String.from(kept, a);
+            runs.items_mut()[k].text = fresh;
+        }
+        break;
+    }
+}
+
+// ---- text-transform -----------------------------------------------------------
+
+/// capitalize: the first letter of each word in upper case, a word
+/// starting after white space.
+fn capitalize(s: str, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    var start = true;
+    let b = s.bytes();
+    var at: usize = 0;
+    while at < b.len() {
+        let d = char_at(b, at: at);
+        if start and is_alphabetic(d.code) {
+            push_upper(d.code, out: &mut out);
+            start = false;
+        } else {
+            out.push_str(s[at..at + d.len]);
+            if css.is_space(d.code) {
+                start = true;
+            }
+        }
+        at += d.len;
+    }
+    return out;
+}
+
+/// s in upper case (str::to_uppercase).
+fn upper_text(s: str, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    let b = s.bytes();
+    var at: usize = 0;
+    while at < b.len() {
+        let d = char_at(b, at: at);
+        push_upper(d.code, out: &mut out);
+        at += d.len;
+    }
+    return out;
+}
+
+/// s in lower case (str::to_lowercase).
+fn lower_text(s: str, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    let b = s.bytes();
+    var at: usize = 0;
+    while at < b.len() {
+        let d = char_at(b, at: at);
+        push_lower(d.code, out: &mut out);
+        at += d.len;
+    }
+    return out;
+}
+
+/// Whether c is in [lo, hi] and lo's parity is c's.
+fn pair_of(c: u32, lo: u32, hi: u32) -> bool {
+    return c >= lo and c <= hi and (c - lo) % 2 == 0;
+}
+
+/// c in upper case at the end of out, as Rust's char::to_uppercase maps
+/// it: ASCII, Latin-1, Latin Extended-A and Additional, Greek, Cyrillic,
+/// Armenian, the Latin ligatures and the full-width letters, the
+/// mappings to more than one character among them. A character outside
+/// those stays as it is.
+fn push_upper(c: u32, out: &mut alloc.String) {
+    var u = c;
+    if c >= 'a' as u32 and c <= 'z' as u32 {
+        u = c - 32;
+    } else if c < 0x80 {
+        u = c;
+    } else if c == 0xB5 {
+        u = 0x39C;
+    } else if c == 0xDF {
+        out.push_str("SS");
+        return;
+    } else if c >= 0xE0 and c <= 0xFE and c != 0xF7 {
+        u = c - 32;
+    } else if c == 0xFF {
+        u = 0x178;
+    } else if c == 0x131 {
+        u = 'I' as u32;
+    } else if c == 0x149 {
+        out.push_str("\u{2BC}N");
+        return;
+    } else if c == 0x17F {
+        u = 'S' as u32;
+    } else if pair_of(c: c, lo: 0x101, hi: 0x12F) or pair_of(c: c, lo: 0x133, hi: 0x137) or pair_of(c: c, lo: 0x13A, hi: 0x148) or pair_of(c: c, lo: 0x14B, hi: 0x177) or pair_of(c: c, lo: 0x17A, hi: 0x17E) {
+        u = c - 1;
+    } else if c == 0x1F0 {
+        out.push_str("J\u{30C}");
+        return;
+    } else if c == 0x390 {
+        out.push_str("\u{399}\u{308}\u{301}");
+        return;
+    } else if c == 0x3B0 {
+        out.push_str("\u{3A5}\u{308}\u{301}");
+        return;
+    } else if c == 0x3C2 {
+        u = 0x3A3;
+    } else if (c >= 0x3B1 and c <= 0x3C1) or (c >= 0x3C3 and c <= 0x3CB) {
+        u = c - 32;
+    } else if c == 0x3AC {
+        u = 0x386;
+    } else if c >= 0x3AD and c <= 0x3AF {
+        u = c - 37;
+    } else if c == 0x3CC {
+        u = 0x38C;
+    } else if c >= 0x3CD and c <= 0x3CE {
+        u = c - 63;
+    } else if c >= 0x430 and c <= 0x44F {
+        u = c - 32;
+    } else if c >= 0x450 and c <= 0x45F {
+        u = c - 80;
+    } else if pair_of(c: c, lo: 0x461, hi: 0x481) or pair_of(c: c, lo: 0x48B, hi: 0x4BF) or pair_of(c: c, lo: 0x4C2, hi: 0x4CE) or pair_of(c: c, lo: 0x4D1, hi: 0x52F) {
+        u = c - 1;
+    } else if c == 0x4CF {
+        u = 0x4C0;
+    } else if c >= 0x561 and c <= 0x586 {
+        u = c - 48;
+    } else if c == 0x587 {
+        out.push_str("\u{535}\u{552}");
+        return;
+    } else if c == 0x1E96 {
+        out.push_str("H\u{331}");
+        return;
+    } else if c == 0x1E97 {
+        out.push_str("T\u{308}");
+        return;
+    } else if c == 0x1E98 {
+        out.push_str("W\u{30A}");
+        return;
+    } else if c == 0x1E99 {
+        out.push_str("Y\u{30A}");
+        return;
+    } else if c == 0x1E9A {
+        out.push_str("A\u{2BE}");
+        return;
+    } else if c == 0x1E9B {
+        u = 0x1E60;
+    } else if pair_of(c: c, lo: 0x1E01, hi: 0x1E95) or pair_of(c: c, lo: 0x1EA1, hi: 0x1EFF) {
+        u = c - 1;
+    } else if c >= 0xFB00 and c <= 0xFB06 {
+        out.push_str(ligature(c));
+        return;
+    } else if c >= 0xFF41 and c <= 0xFF5A {
+        u = c - 32;
+    }
+    css.push_char(out, cp: u);
+}
+
+/// The Latin ligature c (U+FB00 to U+FB06) in upper case.
+fn ligature(c: u32) -> str {
+    if c == 0xFB00 {
+        return "FF";
+    }
+    if c == 0xFB01 {
+        return "FI";
+    }
+    if c == 0xFB02 {
+        return "FL";
+    }
+    if c == 0xFB03 {
+        return "FFI";
+    }
+    if c == 0xFB04 {
+        return "FFL";
+    }
+    return "ST";
+}
+
+/// c in lower case at the end of out, as Rust's char::to_lowercase maps
+/// it, over the same characters as push_upper.
+fn push_lower(c: u32, out: &mut alloc.String) {
+    var u = c;
+    if c >= 'A' as u32 and c <= 'Z' as u32 {
+        u = c + 32;
+    } else if c < 0x80 {
+        u = c;
+    } else if c >= 0xC0 and c <= 0xDE and c != 0xD7 {
+        u = c + 32;
+    } else if c == 0x130 {
+        out.push_str("i\u{307}");
+        return;
+    } else if pair_of(c: c, lo: 0x100, hi: 0x12E) or pair_of(c: c, lo: 0x132, hi: 0x136) or pair_of(c: c, lo: 0x139, hi: 0x147) or pair_of(c: c, lo: 0x14A, hi: 0x176) or pair_of(c: c, lo: 0x179, hi: 0x17D) {
+        u = c + 1;
+    } else if c == 0x178 {
+        u = 0xFF;
+    } else if (c >= 0x391 and c <= 0x3A1) or (c >= 0x3A3 and c <= 0x3AB) {
+        u = c + 32;
+    } else if c == 0x386 {
+        u = 0x3AC;
+    } else if c >= 0x388 and c <= 0x38A {
+        u = c + 37;
+    } else if c == 0x38C {
+        u = 0x3CC;
+    } else if c >= 0x38E and c <= 0x38F {
+        u = c + 63;
+    } else if c >= 0x410 and c <= 0x42F {
+        u = c + 32;
+    } else if c >= 0x400 and c <= 0x40F {
+        u = c + 80;
+    } else if pair_of(c: c, lo: 0x460, hi: 0x480) or pair_of(c: c, lo: 0x48A, hi: 0x4BE) or pair_of(c: c, lo: 0x4C1, hi: 0x4CD) or pair_of(c: c, lo: 0x4D0, hi: 0x52E) {
+        u = c + 1;
+    } else if c == 0x4C0 {
+        u = 0x4CF;
+    } else if c >= 0x531 and c <= 0x556 {
+        u = c + 48;
+    } else if c == 0x1E9E {
+        u = 0xDF;
+    } else if pair_of(c: c, lo: 0x1E00, hi: 0x1E94) or pair_of(c: c, lo: 0x1EA0, hi: 0x1EFE) {
+        u = c + 1;
+    } else if c == 0x2126 {
+        u = 0x3C9;
+    } else if c == 0x212A {
+        u = 'k' as u32;
+    } else if c == 0x212B {
+        u = 0xE5;
+    } else if c >= 0xFF21 and c <= 0xFF3A {
+        u = c + 32;
+    }
+    css.push_char(out, cp: u);
+}
+
+/// Whether c is a letter, as Rust's char::is_alphabetic says: ASCII's
+/// letters, and past ASCII every character but the punctuation, symbols,
+/// digits, marks and spaces of the common blocks.
+fn is_alphabetic(c: u32) -> bool {
+    if c < 0x80 {
+        return (c >= 'a' as u32 and c <= 'z' as u32) or (c >= 'A' as u32 and c <= 'Z' as u32);
+    }
+    if c <= 0xBF {
+        return c == 0xAA or c == 0xB5 or c == 0xBA;
+    }
+    if c == 0xD7 or c == 0xF7 {
+        return false;
+    }
+    if (c >= 0x2C2 and c <= 0x2C5) or (c >= 0x2D2 and c <= 0x2DF) or (c >= 0x2E5 and c <= 0x2EB) or c == 0x2ED or (c >= 0x2EF and c <= 0x2FF) {
+        return false;
+    }
+    if c >= 0x300 and c <= 0x36F {
+        return c == 0x345;
+    }
+    if c == 0x375 or c == 0x37E or c == 0x384 or c == 0x385 or c == 0x387 or c == 0x3F6 or (c >= 0x482 and c <= 0x489) {
+        return false;
+    }
+    if (c >= 0x55A and c <= 0x55F) or c == 0x589 or c == 0x58A {
+        return false;
+    }
+    if (c >= 0x660 and c <= 0x669) or (c >= 0x6F0 and c <= 0x6F9) or (c >= 0x966 and c <= 0x96F) {
+        return false;
+    }
+    if c >= 0x2000 and c <= 0x2BFF {
+        return c == 0x2071 or c == 0x207F or (c >= 0x2090 and c <= 0x209C) or c == 0x2102 or c == 0x2107 or (c >= 0x210A and c <= 0x2113) or c == 0x2115 or (c >= 0x2119 and c <= 0x211D) or c == 0x2124 or c == 0x2126 or c == 0x2128 or (c >= 0x212A and c <= 0x212D) or (c >= 0x212F and c <= 0x2139) or (c >= 0x213C and c <= 0x213F) or (c >= 0x2145 and c <= 0x2149) or c == 0x214E or (c >= 0x2160 and c <= 0x2188) or (c >= 0x24B6 and c <= 0x24E9);
+    }
+    if (c >= 0x2E00 and c <= 0x2E7F) or (c >= 0x3000 and c <= 0x3004) or (c >= 0x3008 and c <= 0x3020) or c == 0x3030 or c == 0x3036 or c == 0x3037 or (c >= 0x303D and c <= 0x303F) {
+        return false;
+    }
+    if (c >= 0xE000 and c <= 0xF8FF) or (c >= 0xFE00 and c <= 0xFE6F) or (c >= 0xFF00 and c <= 0xFF20) or (c >= 0xFF3B and c <= 0xFF40) or (c >= 0xFF5B and c <= 0xFF65) or (c >= 0xFFF0 and c <= 0xFFFF) {
+        return false;
+    }
+    if (c >= 0x1F000 and c <= 0x1FAFF) or c >= 0xE0000 {
+        return false;
+    }
+    return true;
+}
+
+// ---- the tree, as taffy sees it ---------------------------------------------
+
+impl lt.LayoutTree for Laying(Approx) {
+    fn child_count(self: &Laying(Approx), parent_node_id: lt.NodeId) -> usize {
+        return self.tree.boxes.items()[parent_node_id.to_usize()].children.len();
+    }
+
+    fn get_child_id(self: &Laying(Approx), parent_node_id: lt.NodeId, child_index: usize) -> lt.NodeId {
+        return lt.NodeId.from_usize(self.tree.boxes.items()[parent_node_id.to_usize()].children.items()[child_index]);
+    }
+
+    fn get_style(self: &Laying(Approx), node_id: lt.NodeId) -> &sty.Style {
+        return &self.tree.boxes.items()[node_id.to_usize()].style;
+    }
+
+    fn set_unrounded_layout(self: &mut Laying(Approx), node_id: lt.NodeId, layout: &lt.Layout) {
+        self.tree.boxes[node_id.to_usize()].unrounded = layout.*;
+    }
+
+    fn compute_child_layout(self: &mut Laying(Approx), node_id: lt.NodeId, inputs: lt.LayoutInput) -> lt.LayoutOutput {
+        var no_bfc = block.BlockFormattingContext.new(self.tree.a);
+        var no_ctx = block.BlockContext.root();
+        return compute_node(Approx, self, node: node_id, inputs: inputs, inherited: false, bfc: &mut no_bfc, block_ctx: &mut no_ctx);
+    }
+
+    fn compute_block_child_layout(self: &mut Laying(Approx), node_id: lt.NodeId, inputs: lt.LayoutInput, bfc: &mut block.BlockFormattingContext, block_ctx: &mut block.BlockContext) -> lt.LayoutOutput {
+        return compute_node(Approx, self, node: node_id, inputs: inputs, inherited: true, bfc: bfc, block_ctx: block_ctx);
+    }
+
+    fn clear_hoisted_children(self: &mut Laying(Approx), node_id: lt.NodeId) {
+        self.tree.boxes[node_id.to_usize()].hoisted.clear();
+    }
+
+    fn add_hoisted_children(self: &mut Laying(Approx), node_id: lt.NodeId, hoisted: []lt.NodeId) {
+        for h in hoisted {
+            self.tree.boxes[node_id.to_usize()].hoisted.push(h.*);
+        }
+    }
+
+    fn cache_get(self: &mut Laying(Approx), node_id: lt.NodeId, input: &lt.LayoutInput) -> ?lt.LayoutOutput {
+        return self.tree.boxes[node_id.to_usize()].cache.get(input);
+    }
+
+    fn cache_store(self: &mut Laying(Approx), node_id: lt.NodeId, input: &lt.LayoutInput, layout_output: lt.LayoutOutput) {
+        self.tree.boxes[node_id.to_usize()].cache.store(input, layout_output);
+    }
+
+    fn cache_clear(self: &mut Laying(Approx), node_id: lt.NodeId) {
+        _ = self.tree.boxes[node_id.to_usize()].cache.clear();
+    }
+
+    fn get_unrounded_layout(self: &Laying(Approx), node_id: lt.NodeId) -> lt.Layout {
+        return self.tree.boxes.items()[node_id.to_usize()].unrounded;
+    }
+
+    fn set_final_layout(self: &mut Laying(Approx), node_id: lt.NodeId, layout: &lt.Layout) {
+        self.tree.boxes[node_id.to_usize()].final_layout = layout.*;
+    }
+
+    fn is_out_of_flow(self: &Laying(Approx), node_id: lt.NodeId) -> bool {
+        return self.tree.boxes.items()[node_id.to_usize()].style.position.is_out_of_flow();
+    }
+
+    fn hoisted_child_count(self: &Laying(Approx), node_id: lt.NodeId) -> usize {
+        return self.tree.boxes.items()[node_id.to_usize()].hoisted.len();
+    }
+
+    fn get_hoisted_child_id(self: &Laying(Approx), node_id: lt.NodeId, index: usize) -> lt.NodeId {
+        return self.tree.boxes.items()[node_id.to_usize()].hoisted.items()[index];
+    }
+
+    fn allocator(self: &Laying(Approx)) -> alloc.Allocator {
+        return self.tree.a;
+    }
+
+    fn ident_text(self: &Laying(Approx), ident: alloc.Symbol) -> str {
+        return self.tree.names.text(ident);
+    }
+}

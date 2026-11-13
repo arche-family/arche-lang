@@ -5,7 +5,7 @@
 ///       [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]...
 ///       [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]...
 ///       [--locale tag] [--time-zone name] [--utc-offset minutes]
-///       [--styles] [--dark] [--viewport WxH]
+///       [--styles] [--boxes] [--dark] [--viewport WxH]
 ///                                        a Nimadir mini-app, with no window, as
 ///                                        Nimadir's headless runner runs it
 ///   arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>
@@ -48,7 +48,7 @@ fn usage(sys: &mut std.System) -> !void {
     sys.stderr.write("       arche-wasm component <core.wasm> <world.wit> <world> <out.wasm>\n");
     sys.stderr.write("       arche-wasm bindgen <world.wit> <world> <out-dir>\n");
     sys.stderr.write("       arche-wasm echo <component.wasm>\n");
-    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]... [--add instance#func[=numbered|true|false|n|[]|none]]... [--locale tag] [--time-zone name] [--utc-offset minutes] [--now-millis ms] [--share instance=folder] [--styles] [--dark] [--viewport WxH]\n");
+    sys.stderr.write("       arche-wasm nimadir <app.component.wasm> [--jit] [--frames n] [--script f:b,...] [--input f:i=text]... [--submit f:i,...] [--click f:n,...] [--type f:n=text]... [--enter f:n,...] [--registry apps.list] [--confirm] [--deny func]... [--add instance#func[=numbered|true|false|n|[]|none]]... [--locale tag] [--time-zone name] [--utc-offset minutes] [--now-millis ms] [--share instance=folder] [--styles] [--boxes] [--dark] [--viewport WxH]\n");
     sys.proc.exit(2);
 }
 
@@ -567,11 +567,12 @@ fn run_app(sys: &mut std.System) -> !void {
     // phone's tests have it (arche-os docs/sprints.md T7): a calendar's
     // month the same whenever the run is; -1 for the clock's.
     var fixed_ms: i64 = -1;
-    // What the page is shown on, for @media and vw/vh, and whether to
-    // print each element's computed style, as Nimadir's shell's --dark,
-    // --viewport and --styles say.
+    // What the page is shown on, for @media, vw/vh and layout, and whether
+    // to print each element's computed style and each node's box, as
+    // Nimadir's shell's --dark, --viewport, --styles and --boxes say.
     var env = css.default_env();
     var show_styles = false;
+    var show_boxes = false;
     var i: usize = 3;
     while i < sys.args.len() : (i += 1) {
         let arg = sys.args.get(i);
@@ -635,6 +636,8 @@ fn run_app(sys: &mut std.System) -> !void {
             i += 1;
         } else if arg.eq("--styles") {
             show_styles = true;
+        } else if arg.eq("--boxes") {
+            show_boxes = true;
         } else if arg.eq("--dark") {
             env.dark = true;
         } else if arg.eq("--viewport") and more {
@@ -837,14 +840,20 @@ fn run_app(sys: &mut std.System) -> !void {
         out.write("]) ---\n");
         out.write(acted.view());
         if nimadir.has_page(&app.ui) {
+            // Laid out after every frame, with stand-in fonts, as Nimadir's
+            // shell lays out what it draws: bounds answers from it next
+            // frame.
+            region r {
+                nimadir.lay_out(&mut app.ui, env: env, a: r);
+            }
             out.write("   [page] ");
             out.write_u64(nimadir.live_nodes(&app.ui) as u64);
             out.write(" nodes\n");
             var page = alloc.String.init(a);
-            if show_styles {
+            if show_styles or show_boxes {
                 region r {
                     let styles = nimadir.compute_styles(&app.ui, env: env, a: r);
-                    nimadir.write_styled_outline(&app.ui, styles: &styles, n: 1, depth: 0, out: &mut page, a: r);
+                    nimadir.write_outline_with(&app.ui, styles: &styles, show_styles: show_styles, show_boxes: show_boxes, n: 1, depth: 0, out: &mut page, a: r);
                 }
             } else {
                 nimadir.write_outline(&app.ui, n: 1, depth: 0, out: &mut page);

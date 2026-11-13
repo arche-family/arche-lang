@@ -15,8 +15,10 @@ start function.
 `world.wit` is its contract, `nimadir:shell@1.2.0`, as Nimadir has it.
 `registry.list` is Nimadir's registry at that commit (`apps.json`, in the
 `apps.list` form). `cases.txt` names the cases of Nimadir's `run-tests.sh` that
-drive these apps headlessly (with its section "CSS (ADR-4)" and more cases of
-the cascade, the arguments read as the shell reads them, quotes and all), and
+drive these apps headlessly (with its sections "CSS (ADR-4)" and "layout and
+paint (ADR-4)", the boxes `--boxes` prints and what `bounds` answers, and more
+cases of the cascade and of layout, the arguments read as the shell reads
+them, quotes and all), and
 `expected/` holds what Nimadir's own shell said to each, normalized by
 `normalize.sh`; `make-expected.sh` writes them again from a Nimadir checkout.
 `nimadir-check.sh` holds arche-wasm to them.
