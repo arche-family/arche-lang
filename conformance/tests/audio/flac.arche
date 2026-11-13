@@ -1,0 +1,78 @@
+// test: run
+// spec: audio.flac
+// stage0: skip
+// stdout: sweep-mono-44k-16.flac 44100 Hz 1 ch 16 bits 26460 10783229271113288000
+// stdout: chord-stereo-48k-24.flac 48000 Hz 2 ch 24 bits 38400 6402284526160796183
+// stdout: mixed-stereo-44k-16.flac 44100 Hz 2 ch 16 bits 35280 15931209981589929573
+// stdout: noise-mono-96k-24.flac 96000 Hz 1 ch 24 bits 9600 14149339246633302319
+// stdout: odd-8bit-stereo.flac 32000 Hz 2 ch 8 bits 15312 2303586834388232856
+// stdout: odd-12bit-variable.flac 22050 Hz 1 ch 12 bits 84129 13227688361759809781
+// stdout: odd-20bit-escaped.flac 44100 Hz 3 ch 20 bits 12288 2630169123109048674
+// stdout: odd-32bit-sides.flac 48000 Hz 2 ch 32 bits 4608 14048229746441204720
+import alloc;
+import audio.flac;
+import std;
+
+// FLAC files of _media (make.sh), each decoded and its samples hashed:
+// the hashes are those of ffmpeg's decoding, so every sample is as
+// ffmpeg's. ffmpeg's encoder made the first four: LPC of order up to 12,
+// fixed predictors, Rice2, verbatim and constant subframes, the three
+// stereo decorrelations, and blocks of 1000 samples. make_flac.py made
+// the rest, for what that encoder never writes: depths of 8, 12, 20 and
+// 32 bits, every block size code, a variable block size, rates written
+// three ways, escaped partitions, wasted bits, partitions of order 8,
+// three channels, LPC of order up to 32, sides of 33 bits, metadata
+// blocks of every kind and an ID3v2 tag in front.
+
+/// FNV-1a of each sample as 32 bits, as make.sh hashes ffmpeg's.
+fn hash(samples: []i32) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for s in samples {
+        h = (h ^ ((s.* as% u32) as u64)) *% 0x100000001b3;
+    }
+    return h;
+}
+
+/// One file's line.
+fn show(sys: &mut std.System, name: str) -> !void {
+    var path = alloc.String.init(sys.alloc);
+    path.push_str("_media/");
+    path.push_str(name);
+    let bytes = try sys.fs.read_bytes(path.view(), sys.alloc);
+    let out = &mut sys.stdout;
+    out.write(name);
+    match flac.decode(bytes.items(), max_samples: 1 << 24, sys.alloc) {
+        ok(d) => {
+            out.write(" ");
+            out.write_u64(d.rate as u64);
+            out.write(" Hz ");
+            out.write_u64(d.channels as u64);
+            out.write(" ch ");
+            out.write_u64(d.bits as u64);
+            out.write(" bits ");
+            out.write_u64(d.samples.len() as u64);
+            out.write(" ");
+            out.write_u64(hash(d.samples.items()));
+        }
+        err(e) => {
+            if e == flac.FlacError.BadChecksum {
+                out.write(" refused: checksum");
+            } else {
+                out.write(" refused");
+            }
+        }
+    }
+    out.write("\n");
+}
+
+/// Every file's line.
+fn main(sys: &mut std.System) -> !void {
+    try show(sys, name: "sweep-mono-44k-16.flac");
+    try show(sys, name: "chord-stereo-48k-24.flac");
+    try show(sys, name: "mixed-stereo-44k-16.flac");
+    try show(sys, name: "noise-mono-96k-24.flac");
+    try show(sys, name: "odd-8bit-stereo.flac");
+    try show(sys, name: "odd-12bit-variable.flac");
+    try show(sys, name: "odd-20bit-escaped.flac");
+    try show(sys, name: "odd-32bit-sides.flac");
+}

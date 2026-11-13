@@ -1,0 +1,194 @@
+/// Fuzzes lib/audio (arche-os docs/sprints.md T9): the FLAC, Ogg Vorbis
+/// and MP3 files of conformance/tests/audio/_media with bytes changed,
+/// cut, repeated, or noise written over a run, and then, mostly, every Ogg
+/// page's CRC made right again, so the changes reach Vorbis's headers and
+/// packets rather than stopping at the checksum. Each input goes to all
+/// three decoders and to audio.codec, which sniffs it: every one must give
+/// an error or sound; a panic is a bug.
+///
+/// usage: audio_fuzz <seconds> [seed] <file>... The seed printed first
+/// repeats a run with the same files.
+import alloc;
+import audio.codec;
+import audio.flac;
+import audio.mp3;
+import audio.vorbis;
+import core.rand;
+import std;
+
+/// The decimal number in s.
+fn number(s: str) -> u64 {
+    var n: u64 = 0;
+    for c in s.bytes() {
+        if c.* >= '0' and c.* <= '9' {
+            n = n * 10 + (c.* - '0') as u64;
+        }
+    }
+    return n;
+}
+
+/// The table of Ogg's CRC-32: 0x04C11DB7, most significant bit first.
+fn crc_table() -> [256]u32 {
+    var t: [256]u32 = [0; 256];
+    var i: u32 = 0;
+    while i < 256 : (i += 1) {
+        var c = i << 24;
+        var k: u32 = 0;
+        while k < 8 : (k += 1) {
+            if (c & 0x80000000) != 0 {
+                c = (c << 1) ^ 0x04C11DB7;
+            } else {
+                c = c << 1;
+            }
+        }
+        t[i as usize] = c;
+    }
+    return t;
+}
+
+/// Every whole Ogg page's CRC, as it should be for what it now holds.
+fn fix_ogg(b: []mut u8, table: []u32) {
+    var at: usize = 0;
+    while b.len() - at >= 27 and b[at] == 'O' and b[at + 1] == 'g' and b[at + 2] == 'g' and b[at + 3] == 'S' {
+        let segs = b[at + 26] as usize;
+        if b.len() - at - 27 < segs {
+            return;
+        }
+        var size: usize = 0;
+        var i: usize = 0;
+        while i < segs : (i += 1) {
+            size += b[at + 27 + i] as usize;
+        }
+        let end = at + 27 + segs + size;
+        if end > b.len() {
+            return;
+        }
+        i = 0;
+        while i < 4 : (i += 1) {
+            b[at + 22 + i] = 0;
+        }
+        var crc: u32 = 0;
+        i = at;
+        while i < end : (i += 1) {
+            crc = (crc << 8) ^ table[(((crc >> 24) ^ (b[i] as u32)) & 0xFF) as usize];
+        }
+        i = 0;
+        while i < 4 : (i += 1) {
+            b[at + 22 + i] = ((crc >> (8 * (i as u32))) & 0xFF) as u8;
+        }
+        at = end;
+    }
+}
+
+/// A copy of data, damaged one to four times.
+fn mangle(data: []u8, g: &mut rand.Seeded, table: []u32, a: alloc.Allocator) -> alloc.List(u8) {
+    var out = alloc.List(u8).with_capacity(a, data.len());
+    for x in data {
+        out.push(x.*);
+    }
+    let rounds = g.below(4) + 1;
+    var k: u64 = 0;
+    while k < rounds and out.len() > 0 : (k += 1) {
+        let n = out.len() as u64;
+        let how = g.below(12);
+        if how < 6 {
+            let at = g.below(n) as usize;
+            out.items_mut()[at] = (g.next_u64() & 0xff) as u8;
+        } else if how < 8 {
+            let at = g.below(n) as usize;
+            let one: u8 = 1;
+            let flipped = out.items()[at] ^ (one << (g.below(8) as u32));
+            out.items_mut()[at] = flipped;
+        } else if how == 8 {
+            let at = g.below(n) as usize;
+            let len = g.below(64) as usize;
+            var i = at;
+            while i < at + len and i < out.len() : (i += 1) {
+                out.items_mut()[i] = (g.next_u64() & 0xff) as u8;
+            }
+        } else if how == 9 {
+            // A run repeated: a frame or page that comes twice.
+            let at = g.below(n) as usize;
+            var len = g.below(2048) as usize;
+            if len > out.len() - at {
+                len = out.len() - at;
+            }
+            var i: usize = 0;
+            while i < len : (i += 1) {
+                let v = out.items()[at + i];
+                out.push(v);
+            }
+        } else {
+            let keep = g.below(n + 1);
+            while out.len() as u64 > keep {
+                _ = out.pop();
+            }
+        }
+    }
+    if g.below(10) < 9 {
+        fix_ogg(out.items_mut(), table: table);
+    }
+    return out;
+}
+
+/// Runs the fuzzer.
+fn main(sys: &mut std.System) -> !void {
+    if sys.args.len() < 3 {
+        sys.stderr.write("usage: audio_fuzz <seconds> [seed] <file>...\n");
+        sys.proc.exit(2);
+    }
+    let seconds = number(sys.args.get(1));
+    var seed = sys.rand.next_u64() % 1000000000;
+    var first: usize = 2;
+    let second = sys.args.get(2).bytes();
+    if second.len() > 0 and second[0] >= '0' and second[0] <= '9' {
+        seed = number(sys.args.get(2));
+        first = 3;
+    }
+    var files = alloc.List(alloc.List(u8)).init(sys.alloc);
+    var i = first;
+    while i < sys.args.len() : (i += 1) {
+        files.push(try sys.fs.read_bytes(sys.args.get(i), sys.alloc));
+    }
+    if files.len() == 0 {
+        sys.stderr.write("audio_fuzz: no files\n");
+        sys.proc.exit(2);
+    }
+    sys.stdout.write("seed ");
+    sys.stdout.write_u64(seed);
+    sys.stdout.write("\n");
+    sys.stdout.flush();
+    let table = crc_table();
+    var g = rand.Seeded.init(seed);
+    let start = sys.clock.monotonic_ns();
+    var cases: u64 = 0;
+    var decoded: u64 = 0;
+    let most: u64 = 1 << 22;
+    while sys.clock.monotonic_ns() - start < seconds * 1000000000 : (cases += 1) {
+        let which = g.below(files.len() as u64) as usize;
+        region r {
+            let input = mangle(files.items()[which].items(), g: &mut g, table: table[0..256], a: r);
+            let b = input.items();
+            match codec.decode(b, max_samples: most, r) {
+                ok(_) => { decoded += 1; }
+                err(_) => { }
+            }
+            match flac.decode(b, max_samples: most, r) {
+                ok(_) => { }
+                err(_) => { }
+            }
+            match vorbis.decode(b, max_samples: most, r) {
+                ok(_) => { }
+                err(_) => { }
+            }
+            match mp3.decode(b, max_samples: most, r) {
+                ok(_) => { }
+                err(_) => { }
+            }
+        }
+    }
+    sys.stdout.write_u64(cases);
+    sys.stdout.write(" cases, ");
+    sys.stdout.write_u64(decoded);
+    sys.stdout.write(" decoded, no panic\n");
+}

@@ -1,0 +1,1658 @@
+/// Ogg Vorbis I (the Vorbis I specification of the Xiph.Org Foundation),
+/// the lossy music of arche-os's music app (arche-os docs/sprints.md T9),
+/// decoded to interleaved 16-bit samples: the three headers, codebooks of
+/// every lookup type, floors 0 and 1, residues 0, 1 and 2, mappings with
+/// submaps and channel coupling, both block sizes and their windows, the
+/// inverse MDCT, by an FFT of a quarter of the block, and overlap-add.
+///
+/// The output is ffmpeg's: the first packet only primes the overlap, the
+/// last is cut where the last page's granule position says the stream
+/// ends, as ffmpeg's Ogg reader works it out, channels beyond two are put
+/// in the order WAV and FLAC use, and each sample is made 16 bits as
+/// ffmpeg's float conversion makes it (fmath.sample16). Arithmetic is
+/// f64, so a file decodes the same, bit for bit, on every target.
+///
+/// A file comes from outside, so every read is checked, the tables a
+/// header may ask for are bounded, and the samples a file may give are
+/// bounded by the caller: a broken file gives an error, never a panic
+/// (fuzz/audio_fuzz.arche). A packet that ends early is decoded as far as
+/// it goes, as the specification says.
+import alloc;
+import audio.fmath;
+import audio.ogg;
+
+/// What is wrong with an Ogg Vorbis file.
+pub type VorbisError = error {
+    /// Not an Ogg Vorbis stream, or one that breaks its rules.
+    Malformed,
+    /// Tables larger than this decoder keeps.
+    Unsupported,
+    /// More samples than the caller allows.
+    TooLarge,
+}
+
+/// A stream decoded: rate frames a second of channels samples each,
+/// interleaved: a frame's channels in order, then the next frame's.
+pub type Audio = struct {
+    pub rate: u32,
+    pub channels: u32,
+    pub samples: alloc.List(i16),
+}
+
+/// The mark of a leaf in a codebook's tree: the rest is its entry.
+const LEAF: u32 = 0x80000000;
+/// No codebook, where a header may name none.
+const NO_BOOK: u32 = 0xFFFFFFFF;
+/// Entries one codebook may have (ffmpeg's bound too).
+const MAX_ENTRIES: u32 = 65536;
+/// Entries all the codebooks of a stream may have together.
+const ALL_ENTRIES: u64 = 1 << 20;
+/// Vector values all the codebooks of a stream may have together.
+const ALL_VALUES: u64 = 1 << 22;
+
+// ---- bits ------------------------------------------------------------------
+
+/// A reader of bits, the lowest of each byte first, over a packet the
+/// caller passes to every read. Past the packet's end it reads zeros and
+/// says so in over.
+type Bits = struct {
+    at: usize,
+    acc: u64,
+    count: u32,
+    over: bool,
+
+    /// The next n bits, n at most 32, the first read the lowest.
+    fn read(self: &mut Bits, b: []u8, n: u32) -> u32 {
+        if n == 0 {
+            return 0;
+        }
+        while self.count < n {
+            if self.at < b.len() {
+                self.acc = self.acc | ((b[self.at] as u64) << self.count);
+                self.at += 1;
+            } else {
+                self.over = true;
+            }
+            self.count += 8;
+        }
+        let one: u64 = 1;
+        let v = (self.acc & ((one << n) - 1)) as u32;
+        self.acc = self.acc >> n;
+        self.count -= n;
+        return v;
+    }
+
+    /// The next bit, as a bool.
+    fn flag(self: &mut Bits, b: []u8) -> bool {
+        return self.read(b, n: 1) == 1;
+    }
+}
+
+/// A reader at the start of a packet.
+fn new_bits() -> Bits {
+    return Bits { at: 0, acc: 0, count: 0, over: false };
+}
+
+/// The bits x needs: 0 for 0, 1 for 1, 3 for 7, 4 for 8.
+fn ilog(x: u32) -> u32 {
+    var n: u32 = 0;
+    var v = x;
+    while v > 0 : (v = v >> 1) {
+        n += 1;
+    }
+    return n;
+}
+
+// ---- codebooks --------------------------------------------------------------
+
+/// A codebook: its tree of codewords, read a bit at a time, and the
+/// vector of each entry when it has them.
+type Codebook = struct {
+    dims: u32,
+    entries: u32,
+    /// Two slots a node, for a 0 bit and a 1 bit: 0 when no codeword goes
+    /// that way, LEAF and an entry where one ends, else the next node.
+    tree: alloc.List(u32),
+    /// entries × dims values, entry by entry; empty without a lookup.
+    values: alloc.List(f64),
+
+    /// The entry of the next codeword; none at the packet's end or where
+    /// no codeword goes.
+    fn entry(self: &Codebook, r: &mut Bits, b: []u8) -> ?u32 {
+        var node: usize = 0;
+        var depth: u32 = 0;
+        while depth < 33 : (depth += 1) {
+            let bit = r.read(b, n: 1) as usize;
+            if r.over {
+                return none;
+            }
+            let v = self.tree[node * 2 + bit];
+            if v == 0 {
+                return none;
+            }
+            if (v & LEAF) != 0 {
+                return v & ~LEAF;
+            }
+            node = v as usize;
+        }
+        return none;
+    }
+}
+
+/// A float of a codebook's header: 21 bits of mantissa, a sign and an
+/// exponent biased by 788.
+fn unpack_float(x: u32) -> f64 {
+    var mantissa = (x & 0x1FFFFF) as f64;
+    if (x & 0x80000000) != 0 {
+        mantissa = -mantissa;
+    }
+    let exponent = ((x & 0x7FE00000) >> 21) as i32;
+    return fmath.ldexp(mantissa, e: exponent - 788);
+}
+
+/// The largest r with r^dims at most entries.
+fn lookup1_values(entries: u32, dims: u32) -> u32 {
+    var r: u32 = 0;
+    while true {
+        // Is (r + 1)^dims at most entries?
+        let next = (r + 1) as u64;
+        var p: u64 = 1;
+        var i: u32 = 0;
+        while i < dims and p <= entries as u64 : (i += 1) {
+            p = p * next;
+        }
+        if p > entries as u64 {
+            return r;
+        }
+        r += 1;
+    }
+}
+
+/// The tree of codewords of these lengths (0 for an entry not used): each
+/// entry in turn takes the first free codeword of its length, as the
+/// specification assigns them. A set of lengths that over- or, but for a
+/// single entry, under-fills the tree is refused.
+fn build_tree(lengths: []u8, a: alloc.Allocator) -> VorbisError!alloc.List(u32) {
+    var tree = alloc.List(u32).init(a);
+    tree.push(0);
+    tree.push(0);
+    // free[l]: a free codeword of l bits, its first bit the lowest, or 0.
+    var free: [33]u32 = [0; 33];
+    var used: u32 = 0;
+    var e: usize = 0;
+    while e < lengths.len() : (e += 1) {
+        let len = lengths[e] as u32;
+        if len == 0 {
+            continue;
+        }
+        var code: u32 = 0;
+        if used == 0 {
+            var i: u32 = 0;
+            while i < len : (i += 1) {
+                free[(i + 1) as usize] = 1 << i;
+            }
+        } else {
+            var l = len;
+            while l > 0 and free[l as usize] == 0 {
+                l -= 1;
+            }
+            if l == 0 {
+                return VorbisError.Malformed;
+            }
+            code = free[l as usize];
+            free[l as usize] = 0;
+            var j = l + 1;
+            while j <= len : (j += 1) {
+                free[j as usize] = code + (1 << (j - 1));
+            }
+        }
+        used += 1;
+        // The codeword into the tree, its lowest bit first.
+        var node: usize = 0;
+        var d: u32 = 0;
+        while d < len : (d += 1) {
+            let slot = node * 2 + ((code >> d) & 1) as usize;
+            let v = tree.items()[slot];
+            if d + 1 == len {
+                if v != 0 {
+                    return VorbisError.Malformed;
+                }
+                tree.items_mut()[slot] = LEAF | (e as u32);
+            } else {
+                if (v & LEAF) != 0 {
+                    return VorbisError.Malformed;
+                }
+                if v == 0 {
+                    let fresh = (tree.len() / 2) as u32;
+                    tree.items_mut()[slot] = fresh;
+                    tree.push(0);
+                    tree.push(0);
+                    node = fresh as usize;
+                } else {
+                    node = v as usize;
+                }
+            }
+        }
+    }
+    if used > 1 {
+        var l: usize = 1;
+        while l <= 32 : (l += 1) {
+            if free[l] != 0 {
+                return VorbisError.Malformed;
+            }
+        }
+    }
+    return tree;
+}
+
+/// A codebook of the setup header; budget counts the entries and the
+/// values of the books before it.
+fn read_codebook(r: &mut Bits, b: []u8, budget: &mut [2]u64, a: alloc.Allocator) -> VorbisError!Codebook {
+    if r.read(b, n: 24) != 0x564342 {
+        return VorbisError.Malformed;
+    }
+    let dims = r.read(b, n: 16);
+    let entries = r.read(b, n: 24);
+    if entries == 0 or r.over {
+        return VorbisError.Malformed;
+    }
+    if entries > MAX_ENTRIES {
+        return VorbisError.Unsupported;
+    }
+    budget.*[0] += entries as u64;
+    if budget.*[0] > ALL_ENTRIES {
+        return VorbisError.Unsupported;
+    }
+    var lengths = alloc.List(u8).init(a);
+    lengths.grow_zeroed(entries as usize);
+    if not r.flag(b) {
+        let sparse = r.flag(b);
+        var e: usize = 0;
+        while e < entries as usize : (e += 1) {
+            if not sparse or r.flag(b) {
+                lengths.items_mut()[e] = (r.read(b, n: 5) + 1) as u8;
+            }
+            if r.over {
+                return VorbisError.Malformed;
+            }
+        }
+    } else {
+        var len = r.read(b, n: 5) + 1;
+        var e: u32 = 0;
+        while e < entries {
+            let count = r.read(b, n: ilog(entries - e));
+            if count > entries - e or len > 32 or r.over {
+                return VorbisError.Malformed;
+            }
+            var k: u32 = 0;
+            while k < count : (k += 1) {
+                lengths.items_mut()[(e + k) as usize] = len as u8;
+            }
+            e += count;
+            len += 1;
+        }
+    }
+    let tree = try build_tree(lengths.items(), a: a);
+    var values = alloc.List(f64).init(a);
+    let lookup = r.read(b, n: 4);
+    if lookup == 1 or lookup == 2 {
+        let minimum = unpack_float(r.read(b, n: 32));
+        let delta = unpack_float(r.read(b, n: 32));
+        let value_bits = r.read(b, n: 4) + 1;
+        let sequence = r.flag(b);
+        if dims == 0 {
+            return VorbisError.Malformed;
+        }
+        var count: u64 = (entries as u64) * (dims as u64);
+        if lookup == 1 {
+            count = lookup1_values(entries: entries, dims: dims) as u64;
+        }
+        // Each multiplicand takes value_bits bits of what is left.
+        if count * (value_bits as u64) > ((b.len() - r.at) as u64) * 8 + 64 {
+            return VorbisError.Malformed;
+        }
+        let total = (entries as u64) * (dims as u64);
+        budget.*[1] += total;
+        if budget.*[1] > ALL_VALUES {
+            return VorbisError.Unsupported;
+        }
+        var mults = alloc.List(u32).init(a);
+        var m: u64 = 0;
+        while m < count : (m += 1) {
+            mults.push(r.read(b, n: value_bits));
+        }
+        if r.over {
+            return VorbisError.Malformed;
+        }
+        let mv = mults.items();
+        values.grow_zeroed(total as usize);
+        let vv = values.items_mut();
+        var e: u64 = 0;
+        while e < entries as u64 : (e += 1) {
+            var last: f64 = 0.0;
+            var divisor: u64 = 1;
+            var i: u64 = 0;
+            while i < dims as u64 : (i += 1) {
+                var off = e * (dims as u64) + i;
+                if lookup == 1 {
+                    off = (e / divisor) % count;
+                    divisor = divisor * count;
+                }
+                let v = (mv[off as usize] as f64) * delta + minimum + last;
+                if sequence {
+                    last = v;
+                }
+                vv[(e * (dims as u64) + i) as usize] = v;
+            }
+        }
+    } else if lookup != 0 {
+        return VorbisError.Malformed;
+    }
+    return Codebook { dims: dims, entries: entries, tree: tree, values: values };
+}
+
+// ---- floors, residues, mappings, modes ----------------------------------------
+
+/// A floor of either type; only the fields of its type mean anything.
+type Floor = struct {
+    kind: u32,
+    // Floor 1.
+    /// Each partition's class.
+    classes: alloc.List(u32),
+    dims: [16]u32,
+    subs: [16]u32,
+    master: [16]u32,
+    /// Each class's eight subclass books, NO_BOOK for none.
+    books: [128]u32,
+    multiplier: u32,
+    /// The X of each value, and the order of the X's.
+    xs: alloc.List(u32),
+    sorted: alloc.List(u32),
+    low: alloc.List(u32),
+    high: alloc.List(u32),
+    // Floor 0.
+    order: u32,
+    rate: u32,
+    bark_size: u32,
+    amp_bits: u32,
+    amp_offset: u32,
+    vq: alloc.List(u32),
+}
+
+/// A residue: which vectors it decodes, and with which books.
+type Residue = struct {
+    kind: u32,
+    begin: u32,
+    end: u32,
+    size: u32,
+    classes: u32,
+    classbook: u32,
+    /// Each class's book for each of the eight passes, NO_BOOK for none.
+    books: [512]u32,
+}
+
+/// A mapping: the channels coupled, and each submap's floor and residue.
+type Mapping = struct {
+    submaps: u32,
+    magnitude: alloc.List(u32),
+    angle: alloc.List(u32),
+    /// Each channel's submap.
+    mux: alloc.List(u32),
+    floors: [16]u32,
+    residues: [16]u32,
+}
+
+/// A mode: the block it uses and its mapping.
+type Mode = struct {
+    long: bool,
+    mapping: u32,
+}
+
+/// What the three headers say.
+type Setup = struct {
+    channels: u32,
+    rate: u32,
+    sizes: [2]u32,
+    books: alloc.List(Codebook),
+    floors: alloc.List(Floor),
+    residues: alloc.List(Residue),
+    mappings: alloc.List(Mapping),
+    modes: alloc.List(Mode),
+}
+
+/// Whether a packet begins with type and "vorbis".
+fn is_header(p: []u8, kind: u8) -> bool {
+    if p.len() < 7 or p[0] != kind {
+        return false;
+    }
+    let name = "vorbis".bytes();
+    var i: usize = 0;
+    while i < 6 : (i += 1) {
+        if p[i + 1] != name[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The identification header.
+fn read_identification(p: []u8, a: alloc.Allocator) -> VorbisError!Setup {
+    if not is_header(p, kind: 1) {
+        return VorbisError.Malformed;
+    }
+    var r = new_bits();
+    r.at = 7;
+    let version = r.read(p, n: 32);
+    let channels = r.read(p, n: 8);
+    let rate = r.read(p, n: 32);
+    _ = r.read(p, n: 32);
+    _ = r.read(p, n: 32);
+    _ = r.read(p, n: 32);
+    let short = r.read(p, n: 4);
+    let long = r.read(p, n: 4);
+    let framing = r.flag(p);
+    if version != 0 or channels == 0 or rate == 0 or short < 6 or long > 13 or short > long or not framing or r.over {
+        return VorbisError.Malformed;
+    }
+    let one: u32 = 1;
+    return Setup {
+        channels: channels,
+        rate: rate,
+        sizes: [one << short, one << long],
+        books: alloc.List(Codebook).init(a),
+        floors: alloc.List(Floor).init(a),
+        residues: alloc.List(Residue).init(a),
+        mappings: alloc.List(Mapping).init(a),
+        modes: alloc.List(Mode).init(a),
+    };
+}
+
+/// A book number the header gives, checked against the books there are.
+fn book_index(r: &mut Bits, b: []u8, s: &Setup) -> VorbisError!u32 {
+    let k = r.read(b, n: 8);
+    if k as usize >= s.books.len() {
+        return VorbisError.Malformed;
+    }
+    return k;
+}
+
+/// A floor of type 1.
+fn read_floor1(r: &mut Bits, b: []u8, s: &Setup, a: alloc.Allocator) -> VorbisError!Floor {
+    var f = new_floor(kind: 1, a: a);
+    let partitions = r.read(b, n: 5);
+    var most: u32 = 0;
+    var p: u32 = 0;
+    while p < partitions : (p += 1) {
+        let c = r.read(b, n: 4);
+        f.classes.push(c);
+        if c + 1 > most {
+            most = c + 1;
+        }
+    }
+    var c: u32 = 0;
+    while c < most : (c += 1) {
+        f.dims[c as usize] = r.read(b, n: 3) + 1;
+        f.subs[c as usize] = r.read(b, n: 2);
+        if f.subs[c as usize] > 0 {
+            f.master[c as usize] = try book_index(r, b, s: s);
+        }
+        let one: u32 = 1;
+        var k: u32 = 0;
+        while k < (one << f.subs[c as usize]) : (k += 1) {
+            let book = r.read(b, n: 8);
+            if book == 0 {
+                f.books[(c * 8 + k) as usize] = NO_BOOK;
+            } else if (book - 1) as usize >= s.books.len() {
+                return VorbisError.Malformed;
+            } else {
+                f.books[(c * 8 + k) as usize] = book - 1;
+            }
+        }
+    }
+    f.multiplier = r.read(b, n: 2) + 1;
+    let range_bits = r.read(b, n: 4);
+    let one: u32 = 1;
+    let range = one << range_bits;
+    if (range_bits == 0 and partitions > 0) or range > s.sizes[1] / 2 {
+        return VorbisError.Malformed;
+    }
+    f.xs.push(0);
+    f.xs.push(range);
+    p = 0;
+    while p < partitions : (p += 1) {
+        let cls = f.classes.items()[p as usize];
+        var k: u32 = 0;
+        while k < f.dims[cls as usize] : (k += 1) {
+            f.xs.push(r.read(b, n: range_bits));
+        }
+    }
+    if r.over or f.xs.len() > 65 {
+        return VorbisError.Malformed;
+    }
+    // The X's in order, which must differ, and each value's neighbours:
+    // the nearest X below and above it among those before it.
+    let xs = f.xs.items();
+    let n = xs.len();
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        var place: usize = 0;
+        while place < f.sorted.len() and xs[f.sorted.items()[place] as usize] < xs[i] {
+            place += 1;
+        }
+        if place < f.sorted.len() and xs[f.sorted.items()[place] as usize] == xs[i] {
+            return VorbisError.Malformed;
+        }
+        f.sorted.push(0);
+        var j = f.sorted.len() - 1;
+        while j > place : (j -= 1) {
+            let moved = f.sorted.items()[j - 1];
+            f.sorted.items_mut()[j] = moved;
+        }
+        f.sorted.items_mut()[place] = i as u32;
+        var lo: usize = 0;
+        var hi: usize = 1;
+        if i >= 2 {
+            var k: usize = 0;
+            var lo_x: u32 = 0;
+            var hi_x: u32 = 0xFFFFFFFF;
+            while k < i : (k += 1) {
+                if xs[k] < xs[i] and xs[k] >= lo_x {
+                    lo = k;
+                    lo_x = xs[k];
+                }
+                if xs[k] > xs[i] and xs[k] < hi_x {
+                    hi = k;
+                    hi_x = xs[k];
+                }
+            }
+        }
+        f.low.push(lo as u32);
+        f.high.push(hi as u32);
+    }
+    return f;
+}
+
+/// A floor with nothing read yet.
+fn new_floor(kind: u32, a: alloc.Allocator) -> Floor {
+    return Floor {
+        kind: kind,
+        classes: alloc.List(u32).init(a),
+        dims: [0; 16],
+        subs: [0; 16],
+        master: [0; 16],
+        books: [NO_BOOK; 128],
+        multiplier: 1,
+        xs: alloc.List(u32).init(a),
+        sorted: alloc.List(u32).init(a),
+        low: alloc.List(u32).init(a),
+        high: alloc.List(u32).init(a),
+        order: 0,
+        rate: 0,
+        bark_size: 0,
+        amp_bits: 0,
+        amp_offset: 0,
+        vq: alloc.List(u32).init(a),
+    };
+}
+
+/// A floor of type 0.
+fn read_floor0(r: &mut Bits, b: []u8, s: &Setup, a: alloc.Allocator) -> VorbisError!Floor {
+    var f = new_floor(kind: 0, a: a);
+    f.order = r.read(b, n: 8);
+    f.rate = r.read(b, n: 16);
+    f.bark_size = r.read(b, n: 16);
+    f.amp_bits = r.read(b, n: 6);
+    f.amp_offset = r.read(b, n: 8);
+    let books = r.read(b, n: 4) + 1;
+    var k: u32 = 0;
+    while k < books : (k += 1) {
+        let book = try book_index(r, b, s: s);
+        if s.books.items()[book as usize].dims == 0 or s.books.items()[book as usize].values.len() == 0 {
+            return VorbisError.Malformed;
+        }
+        f.vq.push(book);
+    }
+    if f.order == 0 or f.rate == 0 or f.bark_size == 0 or f.amp_bits == 0 or r.over {
+        return VorbisError.Malformed;
+    }
+    return f;
+}
+
+/// A residue of the setup header.
+fn read_residue(r: &mut Bits, b: []u8, s: &Setup) -> VorbisError!Residue {
+    var res = Residue { kind: r.read(b, n: 16), begin: 0, end: 0, size: 0, classes: 0, classbook: 0, books: [NO_BOOK; 512] };
+    if res.kind > 2 {
+        return VorbisError.Malformed;
+    }
+    res.begin = r.read(b, n: 24);
+    res.end = r.read(b, n: 24);
+    res.size = r.read(b, n: 24) + 1;
+    res.classes = r.read(b, n: 6) + 1;
+    res.classbook = try book_index(r, b, s: s);
+    if res.begin > res.end {
+        return VorbisError.Malformed;
+    }
+    var cascade: [64]u32 = [0; 64];
+    var c: u32 = 0;
+    while c < res.classes : (c += 1) {
+        var bits = r.read(b, n: 3);
+        if r.flag(b) {
+            bits = bits | (r.read(b, n: 5) << 3);
+        }
+        cascade[c as usize] = bits;
+    }
+    c = 0;
+    while c < res.classes : (c += 1) {
+        var pass: u32 = 0;
+        while pass < 8 : (pass += 1) {
+            if (cascade[c as usize] & (1 << pass)) != 0 {
+                res.books[(c * 8 + pass) as usize] = try book_index(r, b, s: s);
+            }
+        }
+    }
+    if r.over {
+        return VorbisError.Malformed;
+    }
+    return res;
+}
+
+/// A mapping of the setup header.
+fn read_mapping(r: &mut Bits, b: []u8, s: &Setup, a: alloc.Allocator) -> VorbisError!Mapping {
+    if r.read(b, n: 16) != 0 {
+        return VorbisError.Malformed;
+    }
+    var m = Mapping { submaps: 1, magnitude: alloc.List(u32).init(a), angle: alloc.List(u32).init(a), mux: alloc.List(u32).init(a), floors: [0; 16], residues: [0; 16] };
+    if r.flag(b) {
+        m.submaps = r.read(b, n: 4) + 1;
+    }
+    if r.flag(b) {
+        let steps = r.read(b, n: 8) + 1;
+        let bits = ilog(s.channels - 1);
+        var k: u32 = 0;
+        while k < steps : (k += 1) {
+            let mag = r.read(b, n: bits);
+            let ang = r.read(b, n: bits);
+            if mag == ang or mag >= s.channels or ang >= s.channels {
+                return VorbisError.Malformed;
+            }
+            m.magnitude.push(mag);
+            m.angle.push(ang);
+        }
+    }
+    if r.read(b, n: 2) != 0 {
+        return VorbisError.Malformed;
+    }
+    var c: u32 = 0;
+    while c < s.channels : (c += 1) {
+        var sub: u32 = 0;
+        if m.submaps > 1 {
+            sub = r.read(b, n: 4);
+            if sub >= m.submaps {
+                return VorbisError.Malformed;
+            }
+        }
+        m.mux.push(sub);
+    }
+    var k: u32 = 0;
+    while k < m.submaps : (k += 1) {
+        _ = r.read(b, n: 8);
+        let fl = r.read(b, n: 8);
+        let rs = r.read(b, n: 8);
+        if fl as usize >= s.floors.len() or rs as usize >= s.residues.len() {
+            return VorbisError.Malformed;
+        }
+        m.floors[k as usize] = fl;
+        m.residues[k as usize] = rs;
+    }
+    if r.over {
+        return VorbisError.Malformed;
+    }
+    return m;
+}
+
+/// The setup header, onto s.
+fn read_setup(p: []u8, s: &mut Setup, a: alloc.Allocator) -> VorbisError!void {
+    if not is_header(p, kind: 5) {
+        return VorbisError.Malformed;
+    }
+    var r = new_bits();
+    r.at = 7;
+    var budget: [2]u64 = [0, 0];
+    let books = r.read(p, n: 8) + 1;
+    var k: u32 = 0;
+    while k < books : (k += 1) {
+        let cb = try read_codebook(&mut r, p, budget: &mut budget, a: a);
+        s.books.push(cb);
+    }
+    let times = r.read(p, n: 6) + 1;
+    k = 0;
+    while k < times : (k += 1) {
+        if r.read(p, n: 16) != 0 {
+            return VorbisError.Malformed;
+        }
+    }
+    let floors = r.read(p, n: 6) + 1;
+    k = 0;
+    while k < floors : (k += 1) {
+        let kind = r.read(p, n: 16);
+        if kind == 0 {
+            let f = try read_floor0(&mut r, p, s: s, a: a);
+            s.floors.push(f);
+        } else if kind == 1 {
+            let f = try read_floor1(&mut r, p, s: s, a: a);
+            s.floors.push(f);
+        } else {
+            return VorbisError.Malformed;
+        }
+    }
+    let residues = r.read(p, n: 6) + 1;
+    k = 0;
+    while k < residues : (k += 1) {
+        let res = try read_residue(&mut r, p, s: s);
+        s.residues.push(res);
+    }
+    let mappings = r.read(p, n: 6) + 1;
+    k = 0;
+    while k < mappings : (k += 1) {
+        let m = try read_mapping(&mut r, p, s: s, a: a);
+        s.mappings.push(m);
+    }
+    let modes = r.read(p, n: 6) + 1;
+    k = 0;
+    while k < modes : (k += 1) {
+        let long = r.flag(p);
+        let window = r.read(p, n: 16);
+        let transform = r.read(p, n: 16);
+        let mapping = r.read(p, n: 8);
+        if window != 0 or transform != 0 or mapping as usize >= s.mappings.len() {
+            return VorbisError.Malformed;
+        }
+        s.modes.push(Mode { long: long, mapping: mapping });
+    }
+    if not r.flag(p) or r.over {
+        return VorbisError.Malformed;
+    }
+}
+
+// ---- the inverse MDCT ---------------------------------------------------------------
+
+/// What the inverse MDCT of a block of n samples needs, made once: the
+/// twiddles before and after an FFT of n/4 points, the FFT's own, its bit
+/// reversal, and the rise of the window over n/2.
+type Transform = struct {
+    n: usize,
+    /// e^(-iπk/M) and e^(-iπ(k + 1/4)/M), M = n/2, for k below n/4, as
+    /// cos and sin pairs.
+    pre: alloc.List(f64),
+    post: alloc.List(f64),
+    /// e^(-2πik/(n/4)) for k below n/8, as cos and sin pairs.
+    roots: alloc.List(f64),
+    reversed: alloc.List(u32),
+    /// The window's rise over n/2 samples.
+    slope: alloc.List(f64),
+}
+
+/// The transform of blocks of n samples.
+fn new_transform(n: usize, a: alloc.Allocator) -> Transform {
+    var t = Transform { n: n, pre: alloc.List(f64).init(a), post: alloc.List(f64).init(a), roots: alloc.List(f64).init(a), reversed: alloc.List(u32).init(a), slope: alloc.List(f64).init(a) };
+    let pi = fmath.pi();
+    let m = (n / 2) as f64;
+    let quarter = n / 4;
+    var k: usize = 0;
+    while k < quarter : (k += 1) {
+        let kf = k as f64;
+        t.pre.push(fmath.cos(pi * kf / m));
+        t.pre.push(-fmath.sin(pi * kf / m));
+        t.post.push(fmath.cos(pi * (kf + 0.25) / m));
+        t.post.push(-fmath.sin(pi * (kf + 0.25) / m));
+    }
+    k = 0;
+    while k < quarter / 2 : (k += 1) {
+        let angle = 2.0 * pi * (k as f64) / (quarter as f64);
+        t.roots.push(fmath.cos(angle));
+        t.roots.push(-fmath.sin(angle));
+    }
+    let bits = ilog(quarter as u32) - 1;
+    k = 0;
+    while k < quarter : (k += 1) {
+        var rev: u32 = 0;
+        var i: u32 = 0;
+        while i < bits : (i += 1) {
+            rev = (rev << 1) | (((k as u32) >> i) & 1);
+        }
+        t.reversed.push(rev);
+    }
+    let w = n / 2;
+    k = 0;
+    while k < w : (k += 1) {
+        let x = fmath.sin(((k as f64) + 0.5) / (w as f64) * pi * 0.5);
+        t.slope.push(fmath.sin(pi * 0.5 * x * x));
+    }
+    return t;
+}
+
+/// The inverse MDCT of x, n/2 coefficients, into y, n samples:
+/// y[j] = Σ x[k]·cos(2π/n·(j + 1/2 + n/4)·(k + 1/2)). It is a DCT-IV of
+/// n/2 points, made by an FFT of n/4, then unfolded by its symmetries.
+/// re, im and dct hold n/4, n/4 and n/2 values of scratch.
+fn imdct(t: &Transform, x: []f64, y: []mut f64, re: []mut f64, im: []mut f64, dct: []mut f64) {
+    let m = t.n / 2;
+    let h = m / 2;
+    let pre = t.pre.items();
+    let post = t.post.items();
+    let rev = t.reversed.items();
+    var k: usize = 0;
+    while k < h : (k += 1) {
+        let u = x[2 * k];
+        let v = x[m - 1 - 2 * k];
+        let c = pre[2 * k];
+        let s = pre[2 * k + 1];
+        let at = rev[k] as usize;
+        re[at] = u * c - v * s;
+        im[at] = u * s + v * c;
+    }
+    // The FFT, radix 2, in place.
+    let roots = t.roots.items();
+    var size: usize = 2;
+    while size <= h : (size *= 2) {
+        let half = size / 2;
+        let step = h / size;
+        var start: usize = 0;
+        while start < h : (start += size) {
+            var j: usize = 0;
+            while j < half : (j += 1) {
+                let wr = roots[2 * j * step];
+                let wi = roots[2 * j * step + 1];
+                let p = start + j;
+                let q = p + half;
+                let tr = re[q] * wr - im[q] * wi;
+                let ti = re[q] * wi + im[q] * wr;
+                re[q] = re[p] - tr;
+                im[q] = im[p] - ti;
+                re[p] = re[p] + tr;
+                im[p] = im[p] + ti;
+            }
+        }
+    }
+    k = 0;
+    while k < h : (k += 1) {
+        let c = post[2 * k];
+        let s = post[2 * k + 1];
+        dct[2 * k] = re[k] * c - im[k] * s;
+        dct[m - 1 - 2 * k] = -(re[k] * s + im[k] * c);
+    }
+    let q = m / 2;
+    var j: usize = 0;
+    while j < q : (j += 1) {
+        y[j] = dct[j + q];
+    }
+    while j < 3 * q : (j += 1) {
+        y[j] = -dct[3 * q - 1 - j];
+    }
+    while j < 2 * m : (j += 1) {
+        y[j] = -dct[j - 3 * q];
+    }
+}
+
+/// One channel's output from the last block's centre to this one's, into
+/// out: the last block's right half, saved, of a block of last samples,
+/// and this block's inverse MDCT, y, of n, crossed over the rise of the
+/// shorter one's window, slope.
+fn overlap(saved: []f64, y: []f64, slope: []f64, out: []mut f64, last: usize, n: usize) {
+    let produced = (last + n) / 4;
+    let wlen = slope.len();
+    let centre = last / 4;
+    let rise = centre - wlen / 2;
+    var j: usize = 0;
+    while j < produced : (j += 1) {
+        if j < rise {
+            out[j] = saved[j];
+        } else if j < rise + wlen {
+            let q = j - rise;
+            out[j] = saved[j] * slope[wlen - 1 - q] + y[n / 4 + j - centre] * slope[q];
+        } else {
+            out[j] = y[n / 4 + j - centre];
+        }
+    }
+}
+
+// ---- floors in a packet ----------------------------------------------------------
+
+/// The floor 1 curve of a packet into out, n/2 values; false when the
+/// channel's floor is unused.
+fn floor1(f: &Floor, s: &Setup, r: &mut Bits, b: []u8, out: []mut f64, db: []f64) -> bool {
+    if not r.flag(b) or r.over {
+        return false;
+    }
+    let ranges: [4]i32 = [256, 128, 86, 64];
+    let range = ranges[(f.multiplier - 1) as usize];
+    let bits = ilog((range - 1) as u32);
+    var ys: [65]i32 = [0; 65];
+    ys[0] = r.read(b, n: bits) as i32;
+    ys[1] = r.read(b, n: bits) as i32;
+    var offset: usize = 2;
+    let books = s.books.items();
+    for cls in f.classes.items() {
+        let c = cls.* as usize;
+        let cdim = f.dims[c] as usize;
+        let cbits = f.subs[c];
+        let one: u32 = 1;
+        let csub = (one << cbits) - 1;
+        var cval: u32 = 0;
+        if cbits > 0 {
+            cval = books[f.master[c] as usize].entry(r, b) orelse return false;
+        }
+        var j: usize = 0;
+        while j < cdim : (j += 1) {
+            let book = f.books[c * 8 + (cval & csub) as usize];
+            cval = cval >> cbits;
+            if book != NO_BOOK {
+                ys[offset + j] = (books[book as usize].entry(r, b) orelse return false) as i32;
+            }
+        }
+        offset += cdim;
+    }
+    // The values the others are predicted from, and the curve through them.
+    let xs = f.xs.items();
+    let n = xs.len();
+    var final_y: [65]i32 = [0; 65];
+    var step2: [65]bool = [false; 65];
+    final_y[0] = ys[0];
+    final_y[1] = ys[1];
+    step2[0] = true;
+    step2[1] = true;
+    var i: usize = 2;
+    while i < n : (i += 1) {
+        let lo = f.low.items()[i] as usize;
+        let hi = f.high.items()[i] as usize;
+        let predicted = render_point(x0: xs[lo] as i32, y0: final_y[lo], x1: xs[hi] as i32, y1: final_y[hi], x: xs[i] as i32);
+        let val = ys[i];
+        let high_room = range - predicted;
+        let low_room = predicted;
+        var room = low_room * 2;
+        if high_room < low_room {
+            room = high_room * 2;
+        }
+        if val != 0 {
+            step2[lo] = true;
+            step2[hi] = true;
+            step2[i] = true;
+            if val >= room {
+                if high_room > low_room {
+                    final_y[i] = val - low_room + predicted;
+                } else {
+                    final_y[i] = predicted - val + high_room - 1;
+                }
+            } else if (val & 1) != 0 {
+                final_y[i] = predicted - (val + 1) / 2;
+            } else {
+                final_y[i] = predicted + val / 2;
+            }
+        } else {
+            final_y[i] = predicted;
+        }
+    }
+    let half = out.len() as i32;
+    let mult = f.multiplier as i32;
+    var lx: i32 = 0;
+    var ly = final_y[f.sorted.items()[0] as usize] * mult;
+    var hx: i32 = 0;
+    var hy: i32 = 0;
+    var k: usize = 1;
+    while k < n : (k += 1) {
+        let at = f.sorted.items()[k] as usize;
+        if step2[at] {
+            hy = final_y[at] * mult;
+            hx = xs[at] as i32;
+            render_line(x0: lx, y0: ly, x1: hx, y1: hy, out: out, db: db);
+            lx = hx;
+            ly = hy;
+        }
+    }
+    if hx < half {
+        render_line(x0: hx, y0: hy, x1: half, y1: hy, out: out, db: db);
+    }
+    return true;
+}
+
+/// The Y at x of the line from (x0, y0) to (x1, y1), as the
+/// specification rounds it.
+fn render_point(x0: i32, y0: i32, x1: i32, y1: i32, x: i32) -> i32 {
+    let dy = (y1 as i64) - (y0 as i64);
+    let adx = (x1 as i64) - (x0 as i64);
+    var ady = dy;
+    if ady < 0 {
+        ady = -ady;
+    }
+    if adx <= 0 {
+        return y0;
+    }
+    let off = ady * ((x as i64) - (x0 as i64)) / adx;
+    if dy < 0 {
+        return ((y0 as i64) - off) as i32;
+    }
+    return ((y0 as i64) + off) as i32;
+}
+
+/// The line from (x0, y0) to (x1, y1), x1 not included, onto out as the
+/// floor's amplitudes: each Y through the table of decibels.
+fn render_line(x0: i32, y0: i32, x1: i32, y1: i32, out: []mut f64, db: []f64) {
+    let dy = y1 - y0;
+    let adx = x1 - x0;
+    if adx <= 0 {
+        return;
+    }
+    var ady = dy;
+    if ady < 0 {
+        ady = -ady;
+    }
+    let base = dy / adx;
+    var sy = base + 1;
+    if dy < 0 {
+        sy = base - 1;
+    }
+    var abase = base;
+    if abase < 0 {
+        abase = -abase;
+    }
+    ady = ady - abase * adx;
+    var y = y0;
+    var frac: i32 = 0;
+    var x = x0;
+    let n = out.len() as i32;
+    while x < x1 and x < n : (x += 1) {
+        if x > x0 {
+            frac += ady;
+            if frac >= adx {
+                frac -= adx;
+                y += sy;
+            } else {
+                y += base;
+            }
+        }
+        var v = y;
+        if v < 0 {
+            v = 0;
+        } else if v > 255 {
+            v = 255;
+        }
+        out[x as usize] = db[v as usize];
+    }
+}
+
+/// The floor 0 curve of a packet into out, n/2 values; false when the
+/// channel's floor is unused.
+fn floor0(f: &Floor, s: &Setup, r: &mut Bits, b: []u8, out: []mut f64, coefs: &mut alloc.List(f64)) -> bool {
+    let amplitude = r.read(b, n: f.amp_bits);
+    if amplitude == 0 or r.over {
+        return false;
+    }
+    let number = r.read(b, n: ilog(f.vq.len() as u32));
+    if number as usize >= f.vq.len() or r.over {
+        return false;
+    }
+    let book = &s.books.items()[f.vq.items()[number as usize] as usize];
+    let dims = book.dims as usize;
+    coefs.clear();
+    var last: f64 = 0.0;
+    while coefs.len() < f.order as usize {
+        let e = book.entry(r, b) orelse return false;
+        var i: usize = 0;
+        while i < dims : (i += 1) {
+            coefs.push(book.values.items()[(e as usize) * dims + i] + last);
+        }
+        last = coefs.items()[coefs.len() - 1];
+    }
+    let pi = fmath.pi();
+    let n = out.len();
+    let order = f.order as usize;
+    let cs = coefs.items();
+    let bark_size = f.bark_size as f64;
+    let top = bark(0.5 * (f.rate as f64));
+    let amp_max = fmath.ldexp(1.0, e: f.amp_bits as i32) - 1.0;
+    var i: usize = 0;
+    var prev_map: i64 = -1;
+    var value: f64 = 0.0;
+    while i < n : (i += 1) {
+        var mapped = (bark((f.rate as f64) * (i as f64) / (2.0 * (n as f64))) * bark_size / top).floor();
+        if mapped > bark_size - 1.0 {
+            mapped = bark_size - 1.0;
+        }
+        let map = mapped as i64;
+        if map != prev_map {
+            let w = pi * mapped / bark_size;
+            let cw = fmath.cos(w);
+            var p: f64 = 1.0;
+            var q: f64 = 1.0;
+            var j: usize = 0;
+            while j + 1 < order : (j += 2) {
+                let dq = fmath.cos(cs[j]) - cw;
+                let dp = fmath.cos(cs[j + 1]) - cw;
+                q = q * 4.0 * dq * dq;
+                p = p * 4.0 * dp * dp;
+            }
+            if (order & 1) != 0 {
+                let dq = fmath.cos(cs[order - 1]) - cw;
+                q = q * 4.0 * dq * dq;
+                p = p * (1.0 - cw * cw);
+                q = q * 0.25;
+            } else {
+                p = p * (1.0 - cw) * 0.5;
+                q = q * (1.0 + cw) * 0.5;
+            }
+            let offset = f.amp_offset as f64;
+            value = fmath.exp(0.11512925 * ((amplitude as f64) * offset / (amp_max * (p + q).sqrt()) - offset));
+            prev_map = map;
+        }
+        out[i] = value;
+    }
+    return true;
+}
+
+/// The Bark scale of a frequency.
+fn bark(x: f64) -> f64 {
+    return 13.1 * fmath.atan(0.00074 * x) + 2.24 * fmath.atan(0.0000000185 * x * x) + 0.0001 * x;
+}
+
+// ---- residues in a packet ---------------------------------------------------------
+
+/// Where a packet's vectors are: residues holds max_half values a channel,
+/// channel after channel.
+type Work = struct {
+    max_half: usize,
+    residues: alloc.List(f64),
+    curves: alloc.List(f64),
+    classes: alloc.List(u32),
+}
+
+/// The residue res of a packet, for the channels chans of a submap (their
+/// numbers in the stream), each vector half values long; skip says which
+/// of them not to decode.
+fn residue(res: &Residue, s: &Setup, r: &mut Bits, b: []u8, w: &mut Work, chans: []u32, skip: []bool, half: usize) {
+    let ch = chans.len();
+    if ch == 0 {
+        return;
+    }
+    var size = half;
+    if res.kind == 2 {
+        var all = true;
+        for x in skip {
+            if not x.* {
+                all = false;
+            }
+        }
+        if all {
+            return;
+        }
+        size = half * ch;
+    }
+    var begin = res.begin as usize;
+    var end = res.end as usize;
+    if begin > size {
+        begin = size;
+    }
+    if end > size {
+        end = size;
+    }
+    let psize = res.size as usize;
+    let parts = (end - begin) / psize;
+    if parts == 0 {
+        return;
+    }
+    let books = s.books.items();
+    let classbook = &books[res.classbook as usize];
+    let per = classbook.dims as usize;
+    if per == 0 {
+        return;
+    }
+    // The classifications, each channel's in a row of parts + per.
+    let row = parts + per;
+    var vectors = ch;
+    if res.kind == 2 {
+        vectors = 1;
+    }
+    w.classes.clear();
+    w.classes.grow_zeroed(row * vectors);
+    var pass: u32 = 0;
+    while pass < 8 : (pass += 1) {
+        var count: usize = 0;
+        while count < parts {
+            if pass == 0 {
+                var j: usize = 0;
+                while j < vectors : (j += 1) {
+                    if res.kind == 2 or not skip[j] {
+                        var temp = classbook.entry(r, b) orelse return;
+                        var i = per;
+                        while i > 0 : (i -= 1) {
+                            w.classes.items_mut()[j * row + i - 1 + count] = temp % res.classes;
+                            temp = temp / res.classes;
+                        }
+                    }
+                }
+            }
+            var i: usize = 0;
+            while i < per and count < parts : (i += 1) {
+                var j: usize = 0;
+                while j < vectors : (j += 1) {
+                    if res.kind == 2 or not skip[j] {
+                        let class = w.classes.items()[j * row + count];
+                        let book = res.books[(class * 8 + pass) as usize];
+                        if book != NO_BOOK {
+                            let cb = &books[book as usize];
+                            if cb.values.len() > 0 {
+                                let at = begin + count * psize;
+                                if not partition(res.kind, cb: cb, r: r, b: b, w: w, chans: chans, j: j, at: at, psize: psize, half: half) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                count += 1;
+            }
+        }
+    }
+}
+
+/// One partition of psize values at at, decoded with cb and added to
+/// vector j (type 0 and 1) or to the interleaved vector of all of chans
+/// (type 2); false at the packet's end.
+fn partition(kind: u32, cb: &Codebook, r: &mut Bits, b: []u8, w: &mut Work, chans: []u32, j: usize, at: usize, psize: usize, half: usize) -> bool {
+    let dims = cb.dims as usize;
+    let values = cb.values.items();
+    let out = w.residues.items_mut();
+    let max_half = w.max_half;
+    if kind == 0 {
+        let step = psize / dims;
+        let base = (chans[j] as usize) * max_half;
+        var k: usize = 0;
+        while k < step : (k += 1) {
+            let e = cb.entry(r, b) orelse return false;
+            var l: usize = 0;
+            while l < dims : (l += 1) {
+                let pos = at + k + l * step;
+                if pos < half {
+                    out[base + pos] = out[base + pos] + values[(e as usize) * dims + l];
+                }
+            }
+        }
+        return true;
+    }
+    var i: usize = 0;
+    while i < psize {
+        let e = cb.entry(r, b) orelse return false;
+        var l: usize = 0;
+        while l < dims : (l += 1) {
+            let pos = at + i;
+            if kind == 1 {
+                if pos < half {
+                    let base = (chans[j] as usize) * max_half;
+                    out[base + pos] = out[base + pos] + values[(e as usize) * dims + l];
+                }
+            } else {
+                let c = pos % chans.len();
+                let k = pos / chans.len();
+                if k < half {
+                    let base = (chans[c] as usize) * max_half;
+                    out[base + k] = out[base + k] + values[(e as usize) * dims + l];
+                }
+            }
+            i += 1;
+        }
+    }
+    return true;
+}
+
+// ---- decoding -------------------------------------------------------------------
+
+/// The table of floor 1's amplitudes, from the specification.
+fn decibels() -> [256]f32 {
+    return [
+        0.00000010649863, 0.00000011341951, 0.00000012079015, 0.00000012863978,
+        0.00000013699951, 0.00000014590251, 0.00000015538408, 0.00000016548181,
+        0.00000017623575, 0.00000018768855, 0.00000019988561, 0.0000002128753,
+        0.00000022670913, 0.00000024144197, 0.00000025713223, 0.00000027384213,
+        0.00000029163793, 0.00000031059021, 0.00000033077411, 0.00000035226968,
+        0.00000037516214, 0.00000039954229, 0.0000004255068, 0.00000045315863,
+        0.00000048260743, 0.00000051396998, 0.00000054737065, 0.00000058294187,
+        0.00000062082472, 0.00000066116941, 0.00000070413592, 0.00000074989464,
+        0.00000079862701, 0.0000008505263, 0.00000090579828, 0.00000096466216,
+        0.0000010273513, 0.0000010941144, 0.0000011652161, 0.0000012409384,
+        0.0000013215816, 0.0000014074654, 0.0000014989305, 0.0000015963394,
+        0.0000017000785, 0.0000018105592, 0.0000019282195, 0.0000020535261,
+        0.0000021869758, 0.0000023290978, 0.0000024804557, 0.0000026416497,
+        0.000002813319, 0.0000029961443, 0.0000031908506, 0.0000033982101,
+        0.0000036190449, 0.0000038542308, 0.0000041047004, 0.000004371447,
+        0.0000046555282, 0.0000049580707, 0.000005280274, 0.000005623416,
+        0.0000059888572, 0.0000063780469, 0.0000067925283, 0.0000072339451,
+        0.0000077040476, 0.0000082047, 0.0000087378876, 0.0000093057248,
+        0.0000099104632, 0.000010554501, 0.000011240392, 0.000011970856,
+        0.000012748789, 0.000013577278, 0.000014459606, 0.000015399272,
+        0.000016400004, 0.000017465768, 0.000018600792, 0.000019809576,
+        0.000021096914, 0.000022467911, 0.000023928002, 0.000025482978,
+        0.000027139006, 0.000028902651, 0.000030780908, 0.000032781225,
+        0.000034911534, 0.000037180282, 0.000039596466, 0.000042169667,
+        0.00004491009, 0.000047828601, 0.000050936773, 0.000054246931,
+        0.000057772202, 0.000061526565, 0.000065524908, 0.000069783085,
+        0.000074317983, 0.000079147585, 0.00008429104, 0.000089768747,
+        0.000095602426, 0.00010181521, 0.00010843174, 0.00011547824,
+        0.00012298267, 0.00013097477, 0.00013948625, 0.00014855085,
+        0.00015820453, 0.00016848555, 0.00017943469, 0.00019109536,
+        0.00020351382, 0.00021673929, 0.00023082423, 0.00024582449,
+        0.00026179955, 0.00027881276, 0.00029693158, 0.00031622787,
+        0.00033677814, 0.00035866388, 0.00038197188, 0.00040679456,
+        0.00043323036, 0.00046138411, 0.00049136745, 0.00052329927,
+        0.00055730621, 0.00059352311, 0.00063209358, 0.00067317058,
+        0.000716917, 0.0007635063, 0.00081312324, 0.00086596457,
+        0.00092223983, 0.00098217216, 0.0010459992, 0.0011139742,
+        0.0011863665, 0.0012634633, 0.0013455702, 0.0014330129,
+        0.0015261382, 0.0016253153, 0.0017309374, 0.0018434235,
+        0.0019632195, 0.0020908006, 0.0022266726, 0.0023713743,
+        0.0025254795, 0.0026895994, 0.0028643847, 0.0030505286,
+        0.0032487691, 0.0034598925, 0.0036847358, 0.0039241906,
+        0.0041792066, 0.004450795, 0.0047400328, 0.0050480668,
+        0.0053761186, 0.0057254891, 0.0060975636, 0.0064938176,
+        0.0069158225, 0.0073652516, 0.0078438871, 0.0083536271,
+        0.0088964928, 0.009474637, 0.010090352, 0.01074608,
+        0.011444421, 0.012188144, 0.012980198, 0.013823725,
+        0.014722068, 0.015678791, 0.016697687, 0.017782797,
+        0.018938423, 0.020169149, 0.021479854, 0.022875735,
+        0.02436233, 0.025945531, 0.027631618, 0.029427276,
+        0.031339626, 0.033376252, 0.035545228, 0.037855157,
+        0.040315199, 0.042935108, 0.045725273, 0.048696758,
+        0.051861348, 0.055231591, 0.05882085, 0.062643361,
+        0.066714279, 0.071049749, 0.075666962, 0.080584227,
+        0.085821044, 0.091398179, 0.097337747, 0.1036633,
+        0.11039993, 0.11757434, 0.12521498, 0.13335215,
+        0.14201813, 0.15124727, 0.16107617, 0.1715438,
+        0.18269168, 0.19456402, 0.20720788, 0.22067342,
+        0.23501402, 0.25028656, 0.26655159, 0.28387361,
+        0.30232132, 0.32196786, 0.34289114, 0.36517414,
+        0.38890521, 0.41417847, 0.44109412, 0.4697589,
+        0.50028648, 0.53279791, 0.56742212, 0.6042964,
+        0.64356699, 0.68538959, 0.72993007, 0.77736504,
+        0.8278826, 0.88168307, 0.9389798, 1.0,
+    ];
+}
+
+/// Which of the stream's channels each output channel is: Vorbis orders
+/// three to eight channels otherwise than WAV and FLAC do (left, centre,
+/// right, ...), and these put them in that order, as ffmpeg does.
+fn channel_of(channels: u32, out: u32) -> u32 {
+    let t: [64]u8 = [
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 1, 0, 0, 0, 0, 0, 0,
+        0, 2, 1, 0, 0, 0, 0, 0,
+        0, 1, 2, 3, 0, 0, 0, 0,
+        0, 2, 1, 3, 4, 0, 0, 0,
+        0, 2, 1, 5, 3, 4, 0, 0,
+        0, 2, 1, 6, 5, 3, 4, 0,
+        0, 2, 1, 7, 5, 6, 3, 4,
+    ];
+    if channels > 8 {
+        return out;
+    }
+    return t[((channels - 1) * 8 + out) as usize] as u32;
+}
+
+/// How many samples a packet's block adds, as ffmpeg's parser reckons it
+/// from the packet's first byte; the parser's last block size is prev.
+fn duration(p: []u8, s: &Setup, prev: &mut u32) -> u32 {
+    if p.len() == 0 or (p[0] & 1) != 0 {
+        return 0;
+    }
+    let bits = ilog((s.modes.len() - 1) as u32);
+    let one: u32 = 1;
+    let mode = ((p[0] as u32) >> 1) & ((one << bits) - 1);
+    if mode as usize >= s.modes.len() {
+        return 0;
+    }
+    let long = s.modes.items()[mode as usize].long;
+    var before = prev.*;
+    if long {
+        before = s.sizes[(((p[0] as u32) >> (bits + 1)) & 1) as usize];
+    }
+    var size = s.sizes[0];
+    if long {
+        size = s.sizes[1];
+    }
+    prev.* = size;
+    return (before + size) / 4;
+}
+
+/// The first logical stream of an Ogg file, decoded as Vorbis; at most
+/// max_samples samples, counting each channel's.
+pub fn decode(bytes: []u8, max_samples: u64, a: alloc.Allocator) -> VorbisError!Audio {
+    var stream = ogg.first_stream(bytes, a) catch return VorbisError.Malformed;
+    let data = stream.data.items();
+    let packets = stream.packets.items();
+    if packets.len() < 3 {
+        return VorbisError.Malformed;
+    }
+    let p0 = packets[0];
+    var s = try read_identification(data[p0.start..p0.start + p0.len], a: a);
+    let p1 = packets[1];
+    if not is_header(data[p1.start..p1.start + p1.len], kind: 3) {
+        return VorbisError.Malformed;
+    }
+    let p2 = packets[2];
+    try read_setup(data[p2.start..p2.start + p2.len], s: &mut s, a: a);
+    var out = Audio { rate: s.rate, channels: s.channels, samples: alloc.List(i16).init(a) };
+    let channels = s.channels as usize;
+
+    // How much ffmpeg cuts from the last packet: where the page before
+    // the last one ends, plus what the last page's packets add, past
+    // where the last page says the stream ends.
+    var cut: i64 = 0;
+    let last = packets[packets.len() - 1];
+    if last.eos and last.granule >= 0 and packets.len() > 3 {
+        var before: i64 = 0;
+        var added: i64 = 0;
+        var prev = s.sizes[0];
+        if s.modes.items()[0].long {
+            prev = s.sizes[1];
+        }
+        var k: usize = 0;
+        while k < packets.len() : (k += 1) {
+            let pk = packets[k];
+            var d: u32 = 0;
+            if k >= 3 {
+                d = duration(data[pk.start..pk.start + pk.len], s: &s, prev: &mut prev);
+            }
+            if pk.page == last.page {
+                added += d as i64;
+            } else if pk.granule != -1 {
+                before = pk.granule;
+            }
+        }
+        cut = before + added - last.granule;
+    }
+
+    var db: [256]f64 = [0.0; 256];
+    let table = decibels();
+    var k: usize = 0;
+    while k < 256 : (k += 1) {
+        db[k] = table[k] as f64;
+    }
+    let short = new_transform(s.sizes[0] as usize, a: a);
+    let long = new_transform(s.sizes[1] as usize, a: a);
+    let max_half = (s.sizes[1] / 2) as usize;
+    var w = Work { max_half: max_half, residues: alloc.List(f64).init(a), curves: alloc.List(f64).init(a), classes: alloc.List(u32).init(a) };
+    w.residues.grow_zeroed(channels * max_half);
+    w.curves.grow_zeroed(channels * max_half);
+    // The right half of each channel's last block, not yet windowed.
+    var saved = alloc.List(f64).init(a);
+    saved.grow_zeroed(channels * max_half);
+    var y = alloc.List(f64).init(a);
+    y.grow_zeroed(2 * max_half);
+    var re = alloc.List(f64).init(a);
+    re.grow_zeroed(max_half / 2);
+    var im = alloc.List(f64).init(a);
+    im.grow_zeroed(max_half / 2);
+    var dct = alloc.List(f64).init(a);
+    dct.grow_zeroed(max_half);
+    var mixed = alloc.List(f64).init(a);
+    mixed.grow_zeroed(channels * max_half);
+    var used = alloc.List(bool).init(a);
+    var skip = alloc.List(bool).init(a);
+    var chans = alloc.List(u32).init(a);
+    var coefs = alloc.List(f64).init(a);
+    var prev_size: usize = 0;
+    var first = true;
+
+    var n_packet: usize = 3;
+    while n_packet < packets.len() : (n_packet += 1) {
+        let pk = packets[n_packet];
+        let p = data[pk.start..pk.start + pk.len];
+        var r = new_bits();
+        if p.len() == 0 or r.flag(p) {
+            continue;
+        }
+        let mode_bits = ilog((s.modes.len() - 1) as u32);
+        let mode_number = r.read(p, n: mode_bits);
+        if mode_number as usize >= s.modes.len() or r.over {
+            continue;
+        }
+        let mode = s.modes.items()[mode_number as usize];
+        let mapping = &s.mappings.items()[mode.mapping as usize];
+        var n = s.sizes[0] as usize;
+        if mode.long {
+            n = s.sizes[1] as usize;
+            _ = r.read(p, n: 2);
+        }
+        let half = n / 2;
+        // Floors.
+        used.clear();
+        var c: usize = 0;
+        while c < channels : (c += 1) {
+            let sub = mapping.mux.items()[c] as usize;
+            let f = &s.floors.items()[mapping.floors[sub] as usize];
+            let curve = w.curves.items_mut()[c * max_half..c * max_half + half];
+            var on = false;
+            if f.kind == 1 {
+                on = floor1(f, s: &s, r: &mut r, b: p, out: curve, db: db[0..256]);
+            } else {
+                on = floor0(f, s: &s, r: &mut r, b: p, out: curve, coefs: &mut coefs);
+            }
+            used.push(on);
+        }
+        // A channel coupled with one whose floor is used has a residue.
+        var nonzero = alloc.List(bool).init(a);
+        for u in used.items() {
+            nonzero.push(u.*);
+        }
+        var step = mapping.magnitude.len();
+        while step > 0 : (step -= 1) {
+            let mag = mapping.magnitude.items()[step - 1] as usize;
+            let ang = mapping.angle.items()[step - 1] as usize;
+            if nonzero.items()[mag] or nonzero.items()[ang] {
+                nonzero.items_mut()[mag] = true;
+                nonzero.items_mut()[ang] = true;
+            }
+        }
+        // Residues, a submap at a time.
+        let res_all = w.residues.items_mut();
+        var i: usize = 0;
+        while i < channels * max_half : (i += 1) {
+            res_all[i] = 0.0;
+        }
+        var sub: u32 = 0;
+        while sub < mapping.submaps : (sub += 1) {
+            chans.clear();
+            skip.clear();
+            c = 0;
+            while c < channels : (c += 1) {
+                if mapping.mux.items()[c] == sub {
+                    chans.push(c as u32);
+                    skip.push(not nonzero.items()[c]);
+                }
+            }
+            let res = &s.residues.items()[mapping.residues[sub as usize] as usize];
+            residue(res, s: &s, r: &mut r, b: p, w: &mut w, chans: chans.items(), skip: skip.items(), half: half);
+        }
+        // Coupling undone, the last step first.
+        step = mapping.magnitude.len();
+        while step > 0 : (step -= 1) {
+            let mbase = (mapping.magnitude.items()[step - 1] as usize) * max_half;
+            let abase = (mapping.angle.items()[step - 1] as usize) * max_half;
+            let v = w.residues.items_mut();
+            var j: usize = 0;
+            while j < half : (j += 1) {
+                let m = v[mbase + j];
+                let an = v[abase + j];
+                if m > 0.0 {
+                    if an > 0.0 {
+                        v[abase + j] = m - an;
+                    } else {
+                        v[abase + j] = m;
+                        v[mbase + j] = m + an;
+                    }
+                } else if an > 0.0 {
+                    v[abase + j] = m + an;
+                } else {
+                    v[abase + j] = m;
+                    v[mbase + j] = m - an;
+                }
+            }
+        }
+        // Each channel's spectrum, its inverse MDCT, and the overlap with
+        // the block before.
+        var produced: usize = 0;
+        if not first {
+            produced = (prev_size + n) / 4;
+        }
+        c = 0;
+        while c < channels : (c += 1) {
+            let spectrum = w.curves.items_mut()[c * max_half..c * max_half + half];
+            let resv = w.residues.items()[c * max_half..c * max_half + half];
+            var j: usize = 0;
+            while j < half : (j += 1) {
+                if used.items()[c] {
+                    spectrum[j] = spectrum[j] * resv[j];
+                } else {
+                    spectrum[j] = 0.0;
+                }
+            }
+            if mode.long {
+                imdct(&long, x: spectrum, y: y.items_mut()[0..n], re: re.items_mut(), im: im.items_mut(), dct: dct.items_mut());
+            } else {
+                imdct(&short, x: spectrum, y: y.items_mut()[0..n], re: re.items_mut(), im: im.items_mut(), dct: dct.items_mut());
+            }
+            let yv = y.items();
+            let sv = saved.items_mut()[c * max_half..c * max_half + max_half];
+            if not first {
+                let into = mixed.items_mut()[c * max_half..c * max_half + max_half];
+                if n == prev_size and mode.long {
+                    overlap(saved: sv, y: yv, slope: long.slope.items(), out: into, last: prev_size, n: n);
+                } else {
+                    overlap(saved: sv, y: yv, slope: short.slope.items(), out: into, last: prev_size, n: n);
+                }
+            }
+            j = 0;
+            while j < half : (j += 1) {
+                sv[j] = yv[half + j];
+            }
+        }
+        if not first {
+            var keep = produced;
+            if n_packet == packets.len() - 1 and cut > 0 and (cut as u64) <= produced as u64 {
+                keep = produced - (cut as usize);
+            }
+            if (out.samples.len() as u64) + (keep as u64) * (channels as u64) > max_samples {
+                return VorbisError.TooLarge;
+            }
+            let mv = mixed.items();
+            var j: usize = 0;
+            while j < keep : (j += 1) {
+                var o: u32 = 0;
+                while o < s.channels : (o += 1) {
+                    let from = channel_of(channels: s.channels, out: o) as usize;
+                    out.samples.push(fmath.sample16(mv[from * max_half + j]));
+                }
+            }
+        }
+        first = false;
+        prev_size = n;
+    }
+    return out;
+}

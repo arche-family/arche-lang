@@ -1,0 +1,237 @@
+/// The float functions the lossy decoders make their tables with, and the
+/// conversion of their output to 16 bits. core has only the operators,
+/// the square root and rounding toward an integer; these are written with
+/// those alone, so a table is the same, bit for bit, on every target
+/// (spec/arche.md §2.2: no contraction, no reordering). Each is accurate to
+/// within a few units in the last place over the arguments a decoder
+/// gives it, which is far more than 16-bit output can show.
+import core.float;
+
+/// π.
+pub fn pi() -> f64 {
+    return 3.14159265358979311600;
+}
+
+/// x times 2^e.
+pub fn ldexp(x: f64, e: i32) -> f64 {
+    var v = x;
+    var k = e;
+    // 2^±1000 at most a step, so every step's factor is a normal float.
+    while k > 1000 {
+        v = v * float.from_bits64((1023 + 1000) << 52);
+        k -= 1000;
+    }
+    while k < -1000 {
+        v = v * float.from_bits64((1023 - 1000) << 52);
+        k += 1000;
+    }
+    return v * float.from_bits64(((1023 + k) as u64) << 52);
+}
+
+/// The integer nearest x, ties to even, as a float; x is finite and less
+/// than 2^52 in magnitude.
+pub fn round_even(x: f64) -> f64 {
+    let f = x.floor();
+    let d = x - f;
+    if d > 0.5 {
+        return f + 1.0;
+    }
+    if d < 0.5 {
+        return f;
+    }
+    let half = f * 0.5;
+    if half.floor() == half {
+        return f;
+    }
+    return f + 1.0;
+}
+
+/// x, a sample between -1 and 1, as 16 bits: rounded to single precision,
+/// scaled by 32768, rounded to the nearest integer, ties to even, and
+/// clipped, as ffmpeg's conversion from float to 16 bits does. NaN is 0.
+pub fn sample16(x: f64) -> i16 {
+    let s = ((x as f32) as f64) * 32768.0;
+    if s != s {
+        return 0;
+    }
+    if s >= 32767.0 {
+        return 32767;
+    }
+    if s <= -32768.0 {
+        return -32768;
+    }
+    return round_even(s) as i16;
+}
+
+/// sin(r) and cos(r) for |r| at most π/4, by their series.
+fn kernel(r: f64) -> [2]f64 {
+    let r2 = r * r;
+    var s = r;
+    var c: f64 = 1.0;
+    var ts = r;
+    var tc: f64 = 1.0;
+    var k: f64 = 1.0;
+    var n: u32 = 0;
+    while n < 11 : (n += 1) {
+        ts = -ts * r2 / ((2.0 * k) * (2.0 * k + 1.0));
+        tc = -tc * r2 / ((2.0 * k - 1.0) * (2.0 * k));
+        s = s + ts;
+        c = c + tc;
+        k = k + 1.0;
+    }
+    return [s, c];
+}
+
+/// sin(x) and cos(x), for |x| below 2^30.
+fn sincos(x: f64) -> [2]f64 {
+    // x = k·π/2 + r, π/2 in two parts so that k·π/2 is nearly exact.
+    let k = round_even(x * 0.636619772367581382433);
+    let r = (x - k * 1.57079632673412561417) - k * 0.0000000000607710050650619224932;
+    let sc = kernel(r);
+    let q = (k - 4.0 * (k * 0.25).floor()) as u32;
+    if q == 0 {
+        return sc;
+    }
+    if q == 1 {
+        return [sc[1], -sc[0]];
+    }
+    if q == 2 {
+        return [-sc[0], -sc[1]];
+    }
+    return [-sc[1], sc[0]];
+}
+
+/// sin(x), for |x| below 2^30.
+pub fn sin(x: f64) -> f64 {
+    return sincos(x)[0];
+}
+
+/// cos(x), for |x| below 2^30.
+pub fn cos(x: f64) -> f64 {
+    return sincos(x)[1];
+}
+
+/// e^x; 0 below -745, infinity above 709.
+pub fn exp(x: f64) -> f64 {
+    if x != x {
+        return x;
+    }
+    if x > 709.0 {
+        return 1.0 / 0.0;
+    }
+    if x < -745.0 {
+        return 0.0;
+    }
+    // x = k·ln 2 + r, |r| at most ln 2 / 2.
+    let k = round_even(x * 1.44269504088896338700);
+    let r = (x - k * 0.693147180369123816490) - k * 0.000000000190821492927058770002;
+    var sum: f64 = 1.0;
+    var term: f64 = 1.0;
+    var n: f64 = 1.0;
+    while n < 18.0 : (n = n + 1.0) {
+        term = term * r / n;
+        sum = sum + term;
+    }
+    return ldexp(sum, e: k as i32);
+}
+
+/// The natural logarithm of x > 0; -infinity at 0, NaN below.
+pub fn log(x: f64) -> f64 {
+    if x != x or x < 0.0 {
+        return 0.0 / 0.0;
+    }
+    if x == 0.0 {
+        return -1.0 / 0.0;
+    }
+    if x > 1.7976931348623157e308 {
+        return x;
+    }
+    // x = m · 2^e with m in [√½, √2).
+    var m = x;
+    var e: i32 = 0;
+    if m < 2.2250738585072014e-308 {
+        m = m * 18014398509481984.0;
+        e = -54;
+    }
+    let bits = float.bits64(m);
+    e += ((bits >> 52) & 0x7FF) as i32 - 1023;
+    m = float.from_bits64((bits & 0x000FFFFFFFFFFFFF) | 0x3FF0000000000000);
+    if m > 1.41421356237309504880 {
+        m = m * 0.5;
+        e += 1;
+    }
+    // log m = 2·atanh(s), s = (m - 1) / (m + 1).
+    let s = (m - 1.0) / (m + 1.0);
+    let s2 = s * s;
+    var sum: f64 = 0.0;
+    var p = s;
+    var n: f64 = 1.0;
+    while n < 40.0 : (n = n + 2.0) {
+        sum = sum + p / n;
+        p = p * s2;
+    }
+    let ef = e as f64;
+    return ef * 0.693147180369123816490 + (ef * 0.000000000190821492927058770002 + 2.0 * sum);
+}
+
+/// x^y for x > 0.
+pub fn pow(x: f64, y: f64) -> f64 {
+    return exp(y * log(x));
+}
+
+/// The cube root of x ≥ 0.
+pub fn cbrt(x: f64) -> f64 {
+    if x == 0.0 {
+        return 0.0;
+    }
+    var y = exp(log(x) / 3.0);
+    // Newton's steps take it to the last bit or so.
+    var n: u32 = 0;
+    while n < 3 : (n += 1) {
+        y = y - (y * y * y - x) / (3.0 * y * y);
+    }
+    return y;
+}
+
+/// The arc tangent of x, in radians.
+pub fn atan(x: f64) -> f64 {
+    if x != x {
+        return x;
+    }
+    var v = x;
+    var sign: f64 = 1.0;
+    if v < 0.0 {
+        v = -v;
+        sign = -1.0;
+    }
+    var base: f64 = 0.0;
+    var flip = false;
+    if v > 1.0 {
+        v = 1.0 / v;
+        flip = true;
+    }
+    if v > 0.41421356237309503 {
+        // atan v = π/4 + atan((v - 1) / (v + 1)).
+        v = (v - 1.0) / (v + 1.0);
+        base = 0.785398163397448309616;
+    }
+    let v2 = v * v;
+    var sum: f64 = 0.0;
+    var p = v;
+    var n: f64 = 1.0;
+    var neg = false;
+    while n < 60.0 : (n = n + 2.0) {
+        if neg {
+            sum = sum - p / n;
+        } else {
+            sum = sum + p / n;
+        }
+        neg = not neg;
+        p = p * v2;
+    }
+    var r = base + sum;
+    if flip {
+        r = 1.57079632679489661923 - r;
+    }
+    return sign * r;
+}

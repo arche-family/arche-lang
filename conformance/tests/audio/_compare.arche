@@ -1,0 +1,71 @@
+/// What the lossy tests print: a decoding's 16-bit samples against
+/// ffmpeg's, which make.sh keeps losslessly as _media/<name>.ref.flac.
+import alloc;
+import audio.flac;
+import std;
+
+/// One line: name, rate, channels and how many samples were decoded;
+/// "of" and ffmpeg's count when they are not the same; then, over the
+/// samples both have, "within 2" when none is more than 2 units of 16
+/// bits from ffmpeg's, else how many differ and by how much at most.
+///
+/// Why 2: ffmpeg decodes in single precision, these decoders in double,
+/// so where ffmpeg's float lands near the middle of two 16-bit values the
+/// two can round apart: by 1 at most in every file here, 2 is the margin
+/// for an ffmpeg that rounds a little differently. A real fault, a wrong
+/// table entry or a misplaced band, is hundreds or thousands.
+pub fn compare(sys: &mut std.System, name: str, rate: u32, channels: u32, samples: []i16) -> !void {
+    var path = alloc.String.init(sys.alloc);
+    path.push_str("_media/");
+    path.push_str(name);
+    path.push_str(".ref.flac");
+    let bytes = try sys.fs.read_bytes(path.view(), sys.alloc);
+    let reference = try flac.decode(bytes.items(), max_samples: 1 << 26, sys.alloc);
+    let want = reference.samples.items();
+    let out = &mut sys.stdout;
+    out.write(name);
+    out.write(" ");
+    out.write_u64(rate as u64);
+    out.write(" Hz ");
+    out.write_u64(channels as u64);
+    out.write(" ch ");
+    out.write_u64(samples.len() as u64);
+    out.write(" samples");
+    if samples.len() != want.len() or reference.rate != rate or reference.channels != channels {
+        out.write(" of ");
+        out.write_u64(want.len() as u64);
+        out.write(" at ");
+        out.write_u64(reference.rate as u64);
+        out.write(" Hz ");
+        out.write_u64(reference.channels as u64);
+        out.write(" ch");
+    }
+    var n = samples.len();
+    if want.len() < n {
+        n = want.len();
+    }
+    var differ: u64 = 0;
+    var most: i64 = 0;
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        var d = (samples[i] as i64) - (want[i] as i64);
+        if d < 0 {
+            d = -d;
+        }
+        if d != 0 {
+            differ += 1;
+        }
+        if d > most {
+            most = d;
+        }
+    }
+    if most <= 2 {
+        out.write(", within 2 of ffmpeg's\n");
+        return;
+    }
+    out.write(", ");
+    out.write_u64(differ);
+    out.write(" differ, by at most ");
+    out.write_u64(most as u64);
+    out.write("\n");
+}

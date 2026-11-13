@@ -1,0 +1,187 @@
+/// Ogg (RFC 3533), the container of Vorbis: pages, each with its CRC
+/// checked, put back together into the packets of one logical stream.
+/// Pages of other streams multiplexed with it are passed over; a stream
+/// chained after it, which starts once it has ended, is not read.
+///
+/// A file comes from outside, so every read is checked: a broken file
+/// gives an error, never a panic (fuzz/audio_fuzz.arche).
+import alloc;
+
+/// What is wrong with an Ogg file.
+pub type OggError = error {
+    /// Not an Ogg file, or one that breaks its rules.
+    Malformed,
+    /// A page whose CRC is not its own.
+    BadChecksum,
+}
+
+/// A packet of a stream: where its bytes are in the stream's data, and
+/// what the page it ends on says.
+pub type Packet = struct {
+    pub start: usize,
+    pub len: usize,
+    /// The granule position of the page it ends on, when it is the last
+    /// packet that ends there; -1 otherwise.
+    pub granule: i64,
+    /// Which of the stream's pages it ends on, counting from 0.
+    pub page: u32,
+    /// Whether the page it ends on is the stream's last.
+    pub eos: bool,
+}
+
+/// One logical stream's packets: their bytes one after another, and
+/// where each is.
+pub type Stream = struct {
+    pub serial: u32,
+    pub data: alloc.List(u8),
+    pub packets: alloc.List(Packet),
+}
+
+/// The table of Ogg's CRC-32: the polynomial 0x04C11DB7, most significant
+/// bit first, from zero, without a final inversion.
+fn crc_table() -> [256]u32 {
+    var t: [256]u32 = [0; 256];
+    var i: u32 = 0;
+    while i < 256 : (i += 1) {
+        var c = i << 24;
+        var k: u32 = 0;
+        while k < 8 : (k += 1) {
+            if (c & 0x80000000) != 0 {
+                c = (c << 1) ^ 0x04C11DB7;
+            } else {
+                c = c << 1;
+            }
+        }
+        t[i as usize] = c;
+    }
+    return t;
+}
+
+/// The little-endian number of n bytes at b[at..].
+fn le(b: []u8, at: usize, n: usize) -> u64 {
+    var v: u64 = 0;
+    var i = n;
+    while i > 0 : (i -= 1) {
+        v = (v << 8) | (b[at + i - 1] as u64);
+    }
+    return v;
+}
+
+/// The packets of the first logical stream of bytes: the stream whose
+/// first page comes first. The packets of its pages are joined across
+/// pages; a packet still unfinished when the stream or the file ends is
+/// dropped.
+pub fn first_stream(bytes: []u8, a: alloc.Allocator) -> OggError!Stream {
+    let table = crc_table();
+    var s = Stream { serial: 0, data: alloc.List(u8).init(a), packets: alloc.List(Packet).init(a) };
+    var at: usize = 0;
+    var pages: u32 = 0;
+    // Where the packet being put together started in data, if one is.
+    var open = false;
+    var start: usize = 0;
+    while at < bytes.len() {
+        if bytes.len() - at < 27 {
+            return OggError.Malformed;
+        }
+        if bytes[at] != 'O' or bytes[at + 1] != 'g' or bytes[at + 2] != 'g' or bytes[at + 3] != 'S' or bytes[at + 4] != 0 {
+            return OggError.Malformed;
+        }
+        let flags = bytes[at + 5];
+        let granule = le(bytes, at: at + 6, n: 8) as% i64;
+        let serial = le(bytes, at: at + 14, n: 4) as u32;
+        let crc = le(bytes, at: at + 22, n: 4) as u32;
+        let segments = bytes[at + 26] as usize;
+        if bytes.len() - at - 27 < segments {
+            return OggError.Malformed;
+        }
+        var body: usize = 0;
+        var i: usize = 0;
+        while i < segments : (i += 1) {
+            body += bytes[at + 27 + i] as usize;
+        }
+        let size = 27 + segments + body;
+        if bytes.len() - at < size {
+            return OggError.Malformed;
+        }
+        // The CRC of the page with its own CRC field as zeros.
+        var c: u32 = 0;
+        var k: usize = 0;
+        while k < size : (k += 1) {
+            var x = bytes[at + k] as u32;
+            if k >= 22 and k < 26 {
+                x = 0;
+            }
+            c = (c << 8) ^ table[(((c >> 24) ^ x) & 0xFF) as usize];
+        }
+        if c != crc {
+            return OggError.BadChecksum;
+        }
+        if pages == 0 {
+            if (flags & 0x02) == 0 {
+                return OggError.Malformed;
+            }
+            s.serial = serial;
+        }
+        if serial != s.serial {
+            // A page of another stream, multiplexed with this one.
+            at += size;
+            continue;
+        }
+        if pages > 0 and (flags & 0x02) != 0 {
+            return OggError.Malformed;
+        }
+        let continued = (flags & 0x01) != 0;
+        // A page that does not continue the packet being put together, or
+        // one that continues a packet whose start is lost: the packet is
+        // dropped, as the rest of it is.
+        var skipping = continued and not open;
+        if open and not continued {
+            while s.data.len() > start {
+                _ = s.data.pop();
+            }
+            open = false;
+        }
+        let eos = (flags & 0x04) != 0;
+        var from = at + 27 + segments;
+        var last_on_page: usize = s.packets.len();
+        var ended = false;
+        i = 0;
+        while i < segments : (i += 1) {
+            let n = bytes[at + 27 + i] as usize;
+            if skipping {
+                from += n;
+                if n < 255 {
+                    skipping = false;
+                }
+                continue;
+            }
+            if not open {
+                start = s.data.len();
+                open = true;
+            }
+            var j: usize = 0;
+            while j < n : (j += 1) {
+                s.data.push(bytes[from + j]);
+            }
+            from += n;
+            if n < 255 {
+                last_on_page = s.packets.len();
+                s.packets.push(Packet { start: start, len: s.data.len() - start, granule: -1, page: pages, eos: eos });
+                open = false;
+                ended = true;
+            }
+        }
+        if ended {
+            s.packets.items_mut()[last_on_page].granule = granule;
+        }
+        pages += 1;
+        at += size;
+        if eos {
+            break;
+        }
+    }
+    if pages == 0 {
+        return OggError.Malformed;
+    }
+    return s;
+}

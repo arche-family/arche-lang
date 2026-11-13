@@ -1,0 +1,116 @@
+/// Music files of every format lib/audio reads, told apart by their first
+/// bytes and decoded the same way, so the music app (arche-os
+/// docs/sprints.md T9) treats them alike: FLAC (audio.flac), Ogg Vorbis
+/// (audio.vorbis) and MP3 (audio.mp3), each to interleaved 16-bit samples
+/// at its own rate and channels, which the caller converts to what its
+/// sound card plays, as it does a WAV file's.
+///
+/// A file comes from outside: one that is broken, or larger than the
+/// caller allows, is an error, never a panic.
+import alloc;
+import audio.flac;
+import audio.mp3;
+import audio.vorbis;
+
+/// The formats.
+pub type Format = enum {
+    Flac,
+    Vorbis,
+    Mp3,
+}
+
+/// Why a file gives no sound.
+pub type CodecError = error {
+    /// Not a format this reads.
+    Unknown,
+    /// Of a format this reads, but broken, or using what its decoder does
+    /// not read.
+    Malformed,
+    /// More samples than the caller allows.
+    TooLarge,
+}
+
+/// A file decoded: rate frames a second of channels samples each,
+/// interleaved: a frame's channels in order, then the next frame's.
+pub type Decoded = struct {
+    pub format: Format,
+    pub rate: u32,
+    pub channels: u32,
+    pub samples: alloc.List(i16),
+}
+
+/// The format of the file in bytes: FLAC by "fLaC" (after an ID3v2 tag,
+/// if there is one), Ogg Vorbis by an Ogg page whose first packet is
+/// Vorbis's identification header, MP3 by Layer III frames, one after
+/// the other, near the start (after an ID3v2 tag, if there is one).
+pub fn sniff(bytes: []u8) -> ?Format {
+    let at = mp3.after_id3(bytes);
+    if bytes.len() - at >= 4 and bytes[at] == 'f' and bytes[at + 1] == 'L' and bytes[at + 2] == 'a' and bytes[at + 3] == 'C' {
+        return Format.Flac;
+    }
+    if bytes.len() >= 28 and bytes[0] == 'O' and bytes[1] == 'g' and bytes[2] == 'g' and bytes[3] == 'S' {
+        // The page header, its segment table, then the first packet.
+        let start = 27 + (bytes[26] as usize);
+        if bytes.len() >= start + 7 and bytes[start] == 1 and bytes[start + 1] == 'v' and bytes[start + 2] == 'o' and bytes[start + 3] == 'r' and bytes[start + 4] == 'b' and bytes[start + 5] == 'i' and bytes[start + 6] == 's' {
+            return Format.Vorbis;
+        }
+        return none;
+    }
+    if mp3.probe(bytes) {
+        return Format.Mp3;
+    }
+    return none;
+}
+
+/// The file in bytes, of any format sniff knows, decoded to 16 bits: FLAC
+/// of more than 16 bits loses its lowest bits, as ffmpeg's conversion
+/// drops them, and of fewer gains zeros. At most max_samples samples,
+/// counting each channel's.
+pub fn decode(bytes: []u8, max_samples: u64, a: alloc.Allocator) -> CodecError!Decoded {
+    let format = sniff(bytes) orelse return CodecError.Unknown;
+    if format == Format.Flac {
+        match flac.decode(bytes, max_samples: max_samples, a) {
+            ok(d) => {
+                var out = Decoded { format: format, rate: d.rate, channels: d.channels, samples: alloc.List(i16).with_capacity(a, d.samples.len()) };
+                for s in d.samples.items() {
+                    if d.bits > 16 {
+                        out.samples.push((s.* >> (d.bits - 16)) as i16);
+                    } else {
+                        out.samples.push((s.* << (16 - d.bits)) as i16);
+                    }
+                }
+                return out;
+            }
+            err(e) => {
+                if e == flac.FlacError.TooLarge {
+                    return CodecError.TooLarge;
+                }
+                return CodecError.Malformed;
+            }
+        }
+    }
+    if format == Format.Vorbis {
+        match vorbis.decode(bytes, max_samples: max_samples, a) {
+            ok(d) => {
+                return Decoded { format: format, rate: d.rate, channels: d.channels, samples: d.samples };
+            }
+            err(e) => {
+                if e == vorbis.VorbisError.TooLarge {
+                    return CodecError.TooLarge;
+                }
+                return CodecError.Malformed;
+            }
+        }
+    }
+    match mp3.decode(bytes, max_samples: max_samples, a) {
+        ok(d) => {
+            return Decoded { format: format, rate: d.rate, channels: d.channels, samples: d.samples };
+        }
+        err(e) => {
+            if e == mp3.Mp3Error.TooLarge {
+                return CodecError.TooLarge;
+            }
+            return CodecError.Malformed;
+        }
+    }
+}

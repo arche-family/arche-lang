@@ -1,0 +1,1860 @@
+/// MPEG audio Layer III (ISO/IEC 11172-3 and 13818-3), MP3, the most
+/// common music of arche-os's music app (arche-os docs/sprints.md T9),
+/// decoded to interleaved 16-bit samples: MPEG-1, MPEG-2 and MPEG-2.5,
+/// every bit rate, constant or variable, mono, stereo, dual channel and
+/// joint stereo with M/S and intensity stereo, long, short and mixed
+/// blocks, the bit reservoir, Huffman decoding, requantization, the
+/// reordering of short blocks, alias reduction, the inverse MDCT and the
+/// polyphase synthesis filter bank.
+///
+/// The output is ffmpeg's: an ID3v2 tag in front and an ID3v1 tag at the
+/// end are passed over, a Xing, Info or VBRI frame in front is not sound,
+/// and where a LAME tag gives the encoder's delay and padding, those and
+/// the decoder's own 529 samples are cut as ffmpeg's MP3 reader cuts
+/// them. Where the standard leaves a choice (mixed blocks at 8 kHz, an
+/// intensity position past the table, a count1 quadruple that runs past
+/// part2_3_length) this does what ffmpeg does. Each sample is made 16 bits
+/// as ffmpeg's float conversion makes it (fmath.sample16). Arithmetic is
+/// f64, so a file decodes the same, bit for bit, on every target.
+///
+/// A file comes from outside, so every read is checked and the samples a
+/// file may give are bounded by the caller: a broken file gives an error,
+/// or the sound of its good frames, never a panic (fuzz/audio_fuzz.arche).
+/// A frame whose side information breaks the rules is dropped, as ffmpeg
+/// drops it; a frame whose main data begins before the data there is is
+/// silence. Free-format streams (bit rate index 0) and Layers I and II are
+/// not read.
+import alloc;
+import audio.fmath;
+import core.float;
+
+/// What is wrong with an MP3 file.
+pub type Mp3Error = error {
+    /// No MPEG audio Layer III frames in it.
+    Malformed,
+    /// More samples than the caller allows.
+    TooLarge,
+}
+
+/// A stream decoded: rate frames a second of channels samples each,
+/// interleaved: a frame's channels in order, then the next frame's.
+pub type Audio = struct {
+    pub rate: u32,
+    pub channels: u32,
+    pub samples: alloc.List(i16),
+}
+
+/// The mark of a leaf in a Huffman tree: the rest is its symbol.
+const LEAF: u32 = 0x80000000;
+/// No Huffman table: the big values of table_select 0, 4 and 14 are zero.
+const NO_TREE: u32 = 0xFF;
+/// The tree of count1 table A, after the fifteen of the big values.
+const QUADS: u32 = 15;
+/// The most bytes a frame's main data may begin before the frame's own:
+/// main_data_begin has 9 bits.
+const BACK: usize = 511;
+/// Bytes of the bit reservoir: what a frame may reach back to, and the
+/// most main data a frame has (1441 bytes at 320 kbit/s and 32 kHz).
+const RESERVOIR: usize = 2048;
+
+// ---- bits and headers ---------------------------------------------------------
+
+/// A reader of bits, the highest of each byte first, over bytes the
+/// caller passes to every read; past their end it reads zeros.
+type Bits = struct {
+    pos: usize,
+
+    /// The next bit.
+    fn bit(self: &mut Bits, b: []u8) -> u32 {
+        let byte = self.pos >> 3;
+        var v: u32 = 0;
+        if byte < b.len() {
+            v = ((b[byte] as u32) >> (7 - ((self.pos & 7) as u32))) & 1;
+        }
+        self.pos += 1;
+        return v;
+    }
+
+    /// The next n bits, n at most 31, as a number.
+    fn read(self: &mut Bits, b: []u8, n: u32) -> u32 {
+        var v: u32 = 0;
+        var k: u32 = 0;
+        while k < n : (k += 1) {
+            v = (v << 1) | self.bit(b);
+        }
+        return v;
+    }
+}
+
+/// What a frame's four header bytes say.
+type Header = struct {
+    /// MPEG-2 or MPEG-2.5: one granule a frame, the low rates' tables.
+    lsf: bool,
+    /// The sampling rate's row in the tables, 0 to 8: MPEG-1's three,
+    /// then MPEG-2's, then MPEG-2.5's.
+    rate_index: u32,
+    rate: u32,
+    /// A CRC-16 follows the header.
+    crc: bool,
+    /// 0 stereo, 1 joint stereo, 2 dual channel, 3 mono.
+    mode: u32,
+    /// Joint stereo's mode extension: 1 intensity, 2 M/S; 0 otherwise.
+    mode_ext: u32,
+    channels: u32,
+    /// The whole frame, header included, in bytes.
+    size: usize,
+}
+
+/// The header at data[at..], if one is there: Layer III, of a version,
+/// bit rate and sampling rate that are not reserved, not free format.
+fn header_at(data: []u8, at: usize) -> ?Header {
+    if data.len() < 4 or at > data.len() - 4 {
+        return none;
+    }
+    let h = ((data[at] as u32) << 24) | ((data[at + 1] as u32) << 16) | ((data[at + 2] as u32) << 8) | (data[at + 3] as u32);
+    if (h >> 21) != 0x7FF {
+        return none;
+    }
+    // Version: 0 MPEG-2.5, 1 reserved, 2 MPEG-2, 3 MPEG-1; layer 1 is III.
+    let version = (h >> 19) & 3;
+    let layer = (h >> 17) & 3;
+    let kbps_index = ((h >> 12) & 15) as usize;
+    let sr = (h >> 10) & 3;
+    if version == 1 or layer != 1 or kbps_index == 0 or kbps_index == 15 or sr == 3 {
+        return none;
+    }
+    let rates: [3]u32 = [44100, 48000, 32000];
+    var rate_index = sr;
+    var rate = rates[sr as usize];
+    if version == 2 {
+        rate_index += 3;
+        rate = rate / 2;
+    } else if version == 0 {
+        rate_index += 6;
+        rate = rate / 4;
+    }
+    let lsf = version != 3;
+    let padding = ((h >> 9) & 1) as usize;
+    var size: usize = 0;
+    if lsf {
+        let kbps: [15]u32 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+        size = (72000 * kbps[kbps_index] / rate) as usize + padding;
+    } else {
+        let kbps: [15]u32 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+        size = (144000 * kbps[kbps_index] / rate) as usize + padding;
+    }
+    let mode = (h >> 6) & 3;
+    var ext: u32 = 0;
+    if mode == 1 {
+        ext = (h >> 4) & 3;
+    }
+    var channels: u32 = 2;
+    if mode == 3 {
+        channels = 1;
+    }
+    return Header { lsf: lsf, rate_index: rate_index, rate: rate, crc: ((h >> 16) & 1) == 0, mode: mode, mode_ext: ext, channels: channels, size: size };
+}
+
+/// Whether two headers are of one stream: the same version, sampling rate
+/// and channels.
+fn same_stream(a: &Header, other: &Header) -> bool {
+    return a.lsf == other.lsf and a.rate_index == other.rate_index and a.channels == other.channels;
+}
+
+/// Whether a frame is at data[at..] that either ends the data or has
+/// another of its stream after it: so a stream starts there, not a sync
+/// word in a tag or in noise.
+fn starts_stream(data: []u8, at: usize) -> bool {
+    let h = header_at(data, at: at) orelse return false;
+    let next = at + h.size;
+    if next > data.len() {
+        return false;
+    }
+    if next == data.len() {
+        return true;
+    }
+    let n = header_at(data, at: next) orelse return false;
+    return same_stream(a: &h, other: &n);
+}
+
+/// Where the data starts: after the ID3v2 tags in front of it, if any.
+pub fn after_id3(bytes: []u8) -> usize {
+    var at: usize = 0;
+    while bytes.len() - at >= 10 and bytes[at] == 'I' and bytes[at + 1] == 'D' and bytes[at + 2] == '3' {
+        var size: usize = 0;
+        var i: usize = 6;
+        while i < 10 : (i += 1) {
+            size = (size << 7) | ((bytes[at + i] & 0x7F) as usize);
+        }
+        size += 10;
+        if (bytes[at + 5] & 0x10) != 0 {
+            size += 10;
+        }
+        if size > bytes.len() - at {
+            return at;
+        }
+        at += size;
+    }
+    return at;
+}
+
+/// Whether b[at..] begins with s.
+fn has(b: []u8, at: usize, s: str) -> bool {
+    let t = s.bytes();
+    if at > b.len() or b.len() - at < t.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < t.len() : (i += 1) {
+        if b[at + i] != t[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The big-endian 32 bits at b[at..], which the caller has checked.
+fn be32(b: []u8, at: usize) -> u64 {
+    return ((b[at] as u64) << 24) | ((b[at + 1] as u64) << 16) | ((b[at + 2] as u64) << 8) | (b[at + 3] as u64);
+}
+
+/// What a Xing, Info or VBRI frame in front of the sound says.
+type Tag = struct {
+    /// The first frame is the tag, not sound: it gives a count of frames
+    /// or bytes, as ffmpeg's reader asks.
+    found: bool,
+    /// The frames of sound, if the tag says.
+    frames: u64,
+    /// A LAME tag (written by LAME or ffmpeg) is there, with the encoder's
+    /// delay and padding, in samples.
+    lame: bool,
+    delay: u64,
+    padding: u64,
+}
+
+/// The tag in the frame at data[at..], h its header; the caller has
+/// checked that the frame is all there.
+fn tag_of(data: []u8, at: usize, h: &Header) -> Tag {
+    var tag = Tag { found: false, frames: 0, lame: false, delay: 0, padding: 0 };
+    let f = data[at..at + h.size];
+    // The tag follows the side information; ffmpeg does not count a CRC.
+    var x: usize = 4 + 32;
+    if h.lsf {
+        x = 4 + 17;
+        if h.channels == 1 {
+            x = 4 + 9;
+        }
+    } else if h.channels == 1 {
+        x = 4 + 17;
+    }
+    if has(f, at: x, s: "Xing") or has(f, at: x, s: "Info") {
+        if x + 8 > f.len() {
+            return tag;
+        }
+        let flags = be32(f, at: x + 4);
+        var p = x + 8;
+        var bytes: u64 = 0;
+        if (flags & 1) != 0 {
+            if p + 4 > f.len() {
+                return tag;
+            }
+            tag.frames = be32(f, at: p);
+            p += 4;
+        }
+        if (flags & 2) != 0 {
+            if p + 4 > f.len() {
+                return tag;
+            }
+            bytes = be32(f, at: p);
+            p += 4;
+        }
+        if (flags & 4) != 0 {
+            p += 100;
+        }
+        if (flags & 8) != 0 {
+            p += 4;
+        }
+        tag.found = tag.frames != 0 or bytes != 0;
+        // The LAME tag: a version of nine bytes, and 21 bytes after its
+        // start the delay and the padding, twelve bits each.
+        if p + 24 <= f.len() and (has(f, at: p, s: "LAME") or has(f, at: p, s: "Lavf") or has(f, at: p, s: "Lavc")) {
+            let v = ((f[p + 21] as u64) << 16) | ((f[p + 22] as u64) << 8) | (f[p + 23] as u64);
+            tag.lame = true;
+            tag.delay = v >> 12;
+            tag.padding = v & 0xFFF;
+        }
+        return tag;
+    }
+    // VBRI, 32 bytes after the header: version 1, then the delay, the
+    // quality, the bytes and the frames.
+    if f.len() >= 54 and has(f, at: 36, s: "VBRI") and f[40] == 0 and f[41] == 1 {
+        let bytes = be32(f, at: 46);
+        tag.frames = be32(f, at: 50);
+        tag.found = tag.frames != 0 or bytes != 0;
+    }
+    return tag;
+}
+
+// ---- side information and scale factors -------------------------------------
+
+/// What the side information says of one granule of one channel, and
+/// its scale factors.
+type Granule = struct {
+    part23: u32,
+    big_values: u32,
+    global_gain: u32,
+    compress: u32,
+    block_type: u32,
+    mixed: bool,
+    tables: [3]u32,
+    subblock_gain: [3]u32,
+    /// Where the big values' regions 0 and 1 end, in lines.
+    region0: u32,
+    region1: u32,
+    preflag: bool,
+    /// 1 or 2: the scale factors' step is 2^(-shift/2).
+    shift: u32,
+    count1_b: bool,
+    /// The second granule's four scfsi bits, the first group highest.
+    scfsi: u32,
+    /// The long bands, and the first short band, as ffmpeg counts them:
+    /// 22 and 13 for long blocks, 0 and 0 for short, 8 (or 6) and 3 for
+    /// mixed.
+    long_end: u32,
+    short_start: u32,
+    /// The scale factors: the long bands', then each short band's three
+    /// windows'.
+    sf: [40]u32,
+}
+
+/// A granule with nothing read yet.
+fn new_granule() -> Granule {
+    return Granule {
+        part23: 0,
+        big_values: 0,
+        global_gain: 0,
+        compress: 0,
+        block_type: 0,
+        mixed: false,
+        tables: [0, 0, 0],
+        subblock_gain: [0, 0, 0],
+        region0: 0,
+        region1: 0,
+        preflag: false,
+        shift: 1,
+        count1_b: false,
+        scfsi: 0,
+        long_end: 22,
+        short_start: 13,
+        sf: [0; 40],
+    };
+}
+
+/// The side information of one granule of one channel, from r; false
+/// where it breaks the rules.
+fn granule_info(r: &mut Bits, b: []u8, h: &Header, t: &Tables, g: &mut Granule) -> bool {
+    g.part23 = r.read(b, n: 12);
+    g.big_values = r.read(b, n: 9);
+    if g.big_values > 288 {
+        return false;
+    }
+    g.global_gain = r.read(b, n: 8);
+    if h.lsf {
+        g.compress = r.read(b, n: 9);
+    } else {
+        g.compress = r.read(b, n: 4);
+    }
+    if r.bit(b) == 1 {
+        g.block_type = r.read(b, n: 2);
+        if g.block_type == 0 {
+            return false;
+        }
+        g.mixed = r.bit(b) == 1;
+        g.tables[0] = r.read(b, n: 5);
+        g.tables[1] = r.read(b, n: 5);
+        g.tables[2] = 0;
+        var k: usize = 0;
+        while k < 3 : (k += 1) {
+            g.subblock_gain[k] = r.read(b, n: 3);
+        }
+        if g.block_type == 2 {
+            g.region0 = 36;
+            if h.rate_index == 8 {
+                g.region0 = 72;
+            }
+        } else if h.rate_index <= 2 {
+            g.region0 = 36;
+        } else if h.rate_index != 8 {
+            g.region0 = 54;
+        } else {
+            g.region0 = 108;
+        }
+        g.region1 = 576;
+        if g.block_type == 2 {
+            if g.mixed {
+                g.long_end = 6;
+                if h.rate_index <= 2 {
+                    g.long_end = 8;
+                }
+                g.short_start = 3;
+            } else {
+                g.long_end = 0;
+                g.short_start = 0;
+            }
+        }
+    } else {
+        var k: usize = 0;
+        while k < 3 : (k += 1) {
+            g.tables[k] = r.read(b, n: 5);
+        }
+        let r0 = r.read(b, n: 4) as usize;
+        let r1 = r.read(b, n: 3) as usize;
+        g.region0 = t.long_start[r0 + 1];
+        var l = r0 + r1 + 2;
+        if l > 22 {
+            l = 22;
+        }
+        g.region1 = t.long_start[l];
+    }
+    let lines = g.big_values * 2;
+    if g.region0 > lines {
+        g.region0 = lines;
+    }
+    if g.region1 > lines {
+        g.region1 = lines;
+    }
+    if not h.lsf {
+        g.preflag = r.bit(b) == 1;
+    }
+    g.shift = r.bit(b) + 1;
+    g.count1_b = r.bit(b) == 1;
+    return true;
+}
+
+/// MPEG-2's scale factor lengths: sf split into digits of bases n1, n2
+/// and n3 (0 for none), the last digit last.
+fn expand(sf: u32, n1: u32, n2: u32, n3: u32) -> [4]u32 {
+    var v = sf;
+    var out: [4]u32 = [0, 0, 0, 0];
+    if n3 != 0 {
+        out[3] = v % n3;
+        v = v / n3;
+    }
+    if n2 != 0 {
+        out[2] = v % n2;
+        v = v / n2;
+    }
+    out[1] = v % n1;
+    out[0] = v / n1;
+    return out;
+}
+
+/// MPEG-2's scale factors in each of four parts (ISO/IEC 13818-3,
+/// nr_of_sfb_block): six rows, three kinds of block (long, short, mixed)
+/// in each, four parts in each.
+fn partitions() -> [72]u8 {
+    return [
+        6, 5, 5, 5, 9, 9, 9, 9, 6, 9, 9, 9,
+        6, 5, 7, 3, 9, 9, 12, 6, 6, 9, 12, 6,
+        11, 10, 0, 0, 18, 18, 0, 0, 15, 18, 0, 0,
+        7, 7, 7, 0, 12, 12, 12, 0, 6, 15, 12, 0,
+        6, 6, 6, 3, 12, 9, 9, 6, 6, 12, 9, 6,
+        8, 8, 5, 0, 15, 12, 9, 0, 6, 18, 9, 0,
+    ];
+}
+
+/// The scale factors of g, channel ch, from r: MPEG-1's by slen1 and
+/// slen2, the groups scfsi marks copied from first, the first granule's;
+/// MPEG-2's by the partitions of 13818-3, intensity stereo's own for the
+/// right channel.
+fn scale_factors(r: &mut Bits, b: []u8, h: &Header, ch: usize, g: &mut Granule, first: &Granule) {
+    var j: usize = 0;
+    if not h.lsf {
+        let slen1: [16]u32 = [0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4];
+        let slen2: [16]u32 = [0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3];
+        let s1 = slen1[g.compress as usize];
+        let s2 = slen2[g.compress as usize];
+        if g.block_type == 2 {
+            var n: usize = 18;
+            if g.mixed {
+                n = 17;
+            }
+            var i: usize = 0;
+            while i < n : (i += 1) {
+                g.sf[j] = r.read(b, n: s1);
+                j += 1;
+            }
+            i = 0;
+            while i < 18 : (i += 1) {
+                g.sf[j] = r.read(b, n: s2);
+                j += 1;
+            }
+            i = 0;
+            while i < 3 : (i += 1) {
+                g.sf[j] = 0;
+                j += 1;
+            }
+            return;
+        }
+        var k: u32 = 0;
+        while k < 4 : (k += 1) {
+            var n: usize = 5;
+            if k == 0 {
+                n = 6;
+            }
+            var s = s1;
+            if k >= 2 {
+                s = s2;
+            }
+            let copy = (g.scfsi & (8 >> k)) != 0;
+            var i: usize = 0;
+            while i < n : (i += 1) {
+                if copy {
+                    g.sf[j] = first.sf[j];
+                } else {
+                    g.sf[j] = r.read(b, n: s);
+                }
+                j += 1;
+            }
+        }
+        g.sf[j] = 0;
+        return;
+    }
+    var kind: usize = 0;
+    if g.block_type == 2 {
+        kind = 1;
+        if g.mixed {
+            kind = 2;
+        }
+    }
+    var slen: [4]u32 = [0, 0, 0, 0];
+    var row: usize = 0;
+    if (h.mode_ext & 1) != 0 and ch == 1 {
+        let sfc = g.compress >> 1;
+        if sfc < 180 {
+            slen = expand(sf: sfc, n1: 6, n2: 6, n3: 0);
+            row = 3;
+        } else if sfc < 244 {
+            slen = expand(sf: sfc - 180, n1: 4, n2: 4, n3: 0);
+            row = 4;
+        } else {
+            slen = expand(sf: sfc - 244, n1: 3, n2: 0, n3: 0);
+            row = 5;
+        }
+    } else {
+        let sfc = g.compress;
+        if sfc < 400 {
+            slen = expand(sf: sfc, n1: 5, n2: 4, n3: 4);
+        } else if sfc < 500 {
+            slen = expand(sf: sfc - 400, n1: 5, n2: 4, n3: 0);
+            row = 1;
+        } else {
+            slen = expand(sf: sfc - 500, n1: 3, n2: 0, n3: 0);
+            row = 2;
+            g.preflag = true;
+        }
+    }
+    let parts = partitions();
+    var k: usize = 0;
+    while k < 4 : (k += 1) {
+        let n = parts[row * 12 + kind * 4 + k] as usize;
+        var i: usize = 0;
+        while i < n : (i += 1) {
+            g.sf[j] = r.read(b, n: slen[k]);
+            j += 1;
+        }
+    }
+    while j < 40 : (j += 1) {
+        g.sf[j] = 0;
+    }
+}
+
+// ---- the spectrum -----------------------------------------------------------------
+
+/// 2^(e/4), for e above -4096.
+fn quarter_power(e: i32) -> f64 {
+    let q: [4]f64 = [1.0, 1.18920711500272106672, 1.41421356237309504880, 1.68179283050742908606];
+    let u = (e + 4096) as u32;
+    return fmath.ldexp(q[(u & 3) as usize], e: ((u >> 2) as i32) - 1024);
+}
+
+/// Each line's factor, 2^(e/4), e its exponent from the global gain, the
+/// scale factors with pre-emphasis, and the subblock gains, as ffmpeg
+/// works them out; ms takes M/S stereo's 1/√2 into the gain.
+fn exponents(g: &Granule, t: &Tables, ms: bool, out: []mut f64) {
+    let pretab: [22]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 2, 0];
+    var gain = (g.global_gain as i32) - 210;
+    if ms {
+        gain -= 2;
+    }
+    var pos: usize = 0;
+    var i: usize = 0;
+    while i < g.long_end as usize : (i += 1) {
+        var s = g.sf[i];
+        if g.preflag {
+            s += pretab[i];
+        }
+        let f = quarter_power(gain - ((s << g.shift) as i32));
+        var j: usize = 0;
+        while j < t.long[i] : (j += 1) {
+            out[pos] = f;
+            pos += 1;
+        }
+    }
+    var k = g.long_end as usize;
+    i = g.short_start as usize;
+    while i < 13 : (i += 1) {
+        var w: usize = 0;
+        while w < 3 : (w += 1) {
+            let e = gain - ((g.subblock_gain[w] << 3) as i32) - ((g.sf[k] << g.shift) as i32);
+            k += 1;
+            let f = quarter_power(e);
+            var j: usize = 0;
+            while j < t.short[i] : (j += 1) {
+                out[pos] = f;
+                pos += 1;
+            }
+        }
+    }
+}
+
+/// The granule's 576 lines from its Huffman codes at r, which end at end,
+/// the bit after its part2_3_length, each requantized by scale, its
+/// line's 2^(exponent/4).
+fn spectrum(g: &Granule, t: &Tables, r: &mut Bits, b: []u8, end: usize, scale: []f64, xr: []mut f64) {
+    let trees: [32]u32 = [NO_TREE, 0, 1, 2, NO_TREE, 3, 4, 5, 6, 7, 8, 9, 10, 11, NO_TREE, 12, 13, 13, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 14, 14];
+    let linbits: [32]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 6, 8, 10, 13, 4, 5, 6, 7, 8, 9, 11, 13];
+    let dims: [15]u32 = [2, 3, 3, 4, 4, 6, 6, 6, 8, 8, 8, 16, 16, 16, 16];
+    // Reads stop where the data stops, if before end.
+    var limit = end;
+    if limit > b.len() * 8 {
+        limit = b.len() * 8;
+    }
+    let stops: [3]usize = [g.region0 as usize, g.region1 as usize, (g.big_values * 2) as usize];
+    var s: usize = 0;
+    var over = false;
+    var part: usize = 0;
+    while part < 3 and not over : (part += 1) {
+        let stop = stops[part];
+        let sel = g.tables[part] as usize;
+        let tree = trees[sel];
+        if tree == NO_TREE {
+            while s < stop : (s += 1) {
+                xr[s] = 0.0;
+            }
+            continue;
+        }
+        let lin = linbits[sel];
+        let dim = dims[tree as usize];
+        while s < stop : (s += 2) {
+            if r.pos >= limit {
+                over = true;
+                break;
+            }
+            let sym = t.symbol(tree, r: r, b: b);
+            var x = sym / dim;
+            var y = sym % dim;
+            if x == 15 {
+                x += r.read(b, n: lin);
+            }
+            var vx: f64 = 0.0;
+            if x != 0 {
+                vx = t.pow43.items()[x as usize] * scale[s];
+                if r.bit(b) == 1 {
+                    vx = -vx;
+                }
+            }
+            if y == 15 {
+                y += r.read(b, n: lin);
+            }
+            var vy: f64 = 0.0;
+            if y != 0 {
+                vy = t.pow43.items()[y as usize] * scale[s + 1];
+                if r.bit(b) == 1 {
+                    vy = -vy;
+                }
+            }
+            xr[s] = vx;
+            xr[s + 1] = vy;
+        }
+    }
+    // The count1 region: quadruples of -1, 0 and 1, until the data ends;
+    // one that runs past it is dropped, as ffmpeg drops it.
+    if not over {
+        var last: usize = 0;
+        var any = false;
+        while s <= 572 {
+            let pos = r.pos;
+            if pos >= limit {
+                if pos > end and any {
+                    s -= 4;
+                    r.pos = last;
+                }
+                break;
+            }
+            last = pos;
+            any = true;
+            var q: u32 = 0;
+            if g.count1_b {
+                q = 15 - r.read(b, n: 4);
+            } else {
+                q = t.symbol(QUADS, r: r, b: b);
+            }
+            var k: u32 = 0;
+            while k < 4 : (k += 1) {
+                var v: f64 = 0.0;
+                if (q & (8 >> k)) != 0 {
+                    v = scale[s + k as usize];
+                    if r.bit(b) == 1 {
+                        v = -v;
+                    }
+                }
+                xr[s + k as usize] = v;
+            }
+            s += 4;
+        }
+    }
+    while s < 576 : (s += 1) {
+        xr[s] = 0.0;
+    }
+}
+
+/// Whether any of xr is not zero.
+fn nonzero(xr: []f64) -> bool {
+    for v in xr {
+        if v.* != 0.0 {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Intensity stereo on len lines at at: the left channel's values, by kl
+/// and by kr, become the left's and the right's.
+fn intensity(xr: []mut f64, at: usize, len: usize, kl: f64, kr: f64) {
+    var j: usize = 0;
+    while j < len : (j += 1) {
+        let v = xr[at + j];
+        xr[at + j] = v * kl;
+        xr[576 + at + j] = v * kr;
+    }
+}
+
+/// M/S stereo on len lines at at.
+fn mid_side(xr: []mut f64, at: usize, len: usize) {
+    let isqrt2: f64 = 0.70710678118654752440;
+    var j: usize = 0;
+    while j < len : (j += 1) {
+        let m = xr[at + j];
+        let s = xr[576 + at + j];
+        xr[at + j] = (m + s) * isqrt2;
+        xr[576 + at + j] = (m - s) * isqrt2;
+    }
+}
+
+/// Joint stereo undone on a granule's two channels, xr the left's 576
+/// lines then the right's, before short blocks are reordered: intensity
+/// stereo in the bands above the right channel's last that is not zero
+/// (in each window of a short block), M/S in the others where the mode
+/// extension says, as ffmpeg works it out. g1 is the right channel's
+/// side information; with M/S alone, its 1/√2 is already in the gain.
+fn stereo(h: &Header, g1: &Granule, t: &Tables, xr: []mut f64) {
+    let ms = (h.mode_ext & 2) != 0;
+    if (h.mode_ext & 1) == 0 {
+        if ms {
+            var i: usize = 0;
+            while i < 576 : (i += 1) {
+                let m = xr[i];
+                let s = xr[576 + i];
+                xr[i] = m + s;
+                xr[576 + i] = m - s;
+            }
+        }
+        return;
+    }
+    // Each intensity position's two factors, and the first position that
+    // means none.
+    var kl: [16]f64 = [0.0; 16];
+    var kr: [16]f64 = [0.0; 16];
+    var limit: u32 = 7;
+    if h.lsf {
+        limit = 16;
+        let step = (g1.compress & 1) + 1;
+        var p: u32 = 0;
+        while p < 16 : (p += 1) {
+            let f = quarter_power(-((step * ((p + 1) >> 1)) as i32));
+            if (p & 1) == 1 {
+                kl[p as usize] = f;
+                kr[p as usize] = 1.0;
+            } else {
+                kl[p as usize] = 1.0;
+                kr[p as usize] = f;
+            }
+        }
+    } else {
+        var p: usize = 0;
+        while p < 7 : (p += 1) {
+            kl[p] = t.is_ratio[p];
+            kr[p] = t.is_ratio[6 - p];
+        }
+    }
+    var pos: usize = 576;
+    var found: [3]bool = [false, false, false];
+    // The short bands, from the top; the last, which has no scale factor
+    // of its own, takes the one below's.
+    var k = (((13 - g1.short_start) * 3 + g1.long_end) as i32) - 3;
+    var band: i32 = 12;
+    while band >= (g1.short_start as i32) : (band -= 1) {
+        if band != 11 {
+            k -= 3;
+        }
+        let len = t.short[band as usize];
+        var w: i32 = 2;
+        while w >= 0 : (w -= 1) {
+            pos -= len;
+            var joint = true;
+            if not found[w as usize] {
+                if nonzero(xr[576 + pos..576 + pos + len]) {
+                    found[w as usize] = true;
+                } else {
+                    let sf = g1.sf[(k + w) as usize];
+                    if sf < limit {
+                        intensity(xr, at: pos, len: len, kl: kl[sf as usize], kr: kr[sf as usize]);
+                        joint = false;
+                    }
+                }
+            }
+            if joint and ms {
+                mid_side(xr, at: pos, len: len);
+            }
+        }
+    }
+    var above = found[0] or found[1] or found[2];
+    band = (g1.long_end as i32) - 1;
+    while band >= 0 : (band -= 1) {
+        let len = t.long[band as usize];
+        pos -= len;
+        var joint = true;
+        if not above {
+            if nonzero(xr[576 + pos..576 + pos + len]) {
+                above = true;
+            } else {
+                var at = band as usize;
+                if at == 21 {
+                    at = 20;
+                }
+                let sf = g1.sf[at];
+                if sf < limit {
+                    intensity(xr, at: pos, len: len, kl: kl[sf as usize], kr: kr[sf as usize]);
+                    joint = false;
+                }
+            }
+        }
+        if joint and ms {
+            mid_side(xr, at: pos, len: len);
+        }
+    }
+}
+
+// ---- the hybrid filter bank -------------------------------------------------------
+
+/// One channel's granule from its 576 lines in xr to 18 times 32 subband
+/// samples in out, time by time: short blocks reordered, aliases reduced,
+/// each subband's inverse MDCT windowed by its block type and overlapped
+/// with the granule before's (overlap, the channel's), and every other
+/// sample of every other subband negated.
+fn hybrid(g: &Granule, h: &Header, t: &Tables, xr: []mut f64, overlap: []mut f64, out: []mut f64) {
+    if g.block_type == 2 {
+        // Each short band's three windows, one after the other, become
+        // their lines' three values side by side.
+        var p: usize = 0;
+        if g.mixed {
+            p = 36;
+            if h.rate_index == 8 {
+                p = 72;
+            }
+        }
+        var tmp: [576]f64 = [0.0; 576];
+        var i = g.short_start as usize;
+        while i < 13 : (i += 1) {
+            let len = t.short[i];
+            var j: usize = 0;
+            while j < len : (j += 1) {
+                tmp[3 * j] = xr[p + j];
+                tmp[3 * j + 1] = xr[p + len + j];
+                tmp[3 * j + 2] = xr[p + 2 * len + j];
+            }
+            j = 0;
+            while j < 3 * len : (j += 1) {
+                xr[p + j] = tmp[j];
+            }
+            p += 3 * len;
+        }
+    }
+    var bounds: usize = 31;
+    if g.block_type == 2 {
+        bounds = 0;
+        if g.mixed {
+            bounds = 1;
+        }
+    }
+    var sb: usize = 1;
+    while sb <= bounds : (sb += 1) {
+        var i: usize = 0;
+        while i < 8 : (i += 1) {
+            let lo = 18 * sb - 1 - i;
+            let hi = 18 * sb + i;
+            let a0 = xr[lo];
+            let b0 = xr[hi];
+            xr[lo] = a0 * t.cs[i] - b0 * t.ca[i];
+            xr[hi] = b0 * t.cs[i] + a0 * t.ca[i];
+        }
+    }
+    var long_bands: usize = 32;
+    if g.block_type == 2 {
+        long_bands = 0;
+        if g.mixed {
+            long_bands = 2;
+        }
+    }
+    var kind = g.block_type as usize;
+    if g.mixed {
+        kind = 0;
+    }
+    // The subbands up to the last with a line that is not zero, as
+    // ffmpeg finds it, by the bits, so -0 (intensity stereo's) counts: at
+    // least two.
+    var limit: usize = 2;
+    var line: usize = 576;
+    while line > 36 : (line -= 1) {
+        if float.bits64(xr[line - 1]) != 0 {
+            limit = (line - 1) / 18 + 1;
+            break;
+        }
+    }
+    let cos36 = t.cos36.items();
+    let wins = t.windows.items();
+    sb = 0;
+    while sb < 32 : (sb += 1) {
+        var z: [36]f64 = [0.0; 36];
+        let x = xr[18 * sb..18 * sb + 18];
+        if nonzero(x) {
+            if sb < long_bands {
+                var i: usize = 0;
+                while i < 36 : (i += 1) {
+                    var sum: f64 = 0.0;
+                    var k: usize = 0;
+                    while k < 18 : (k += 1) {
+                        sum = sum + x[k] * cos36[i * 18 + k];
+                    }
+                    z[i] = sum * wins[kind * 36 + i];
+                }
+            } else {
+                var w: usize = 0;
+                while w < 3 : (w += 1) {
+                    var i: usize = 0;
+                    while i < 12 : (i += 1) {
+                        var sum: f64 = 0.0;
+                        var k: usize = 0;
+                        while k < 6 : (k += 1) {
+                            sum = sum + x[3 * k + w] * t.cos12[i * 6 + k];
+                        }
+                        z[6 + 6 * w + i] = z[6 + 6 * w + i] + sum * wins[2 * 36 + i];
+                    }
+                }
+            }
+        }
+        // A short block takes the last 6 values of the overlap as zero,
+        // which they are after a start block; ffmpeg takes them so where
+        // the stream breaks the order of block types too, in the subbands
+        // up to the last that is not zero (but at least two).
+        var kept: usize = 18;
+        if sb >= long_bands and sb < limit {
+            kept = 12;
+        }
+        var i: usize = 0;
+        while i < 18 : (i += 1) {
+            var v = z[i];
+            if i < kept {
+                v = v + overlap[18 * sb + i];
+            }
+            if (sb & 1) == 1 and (i & 1) == 1 {
+                v = -v;
+            }
+            out[i * 32 + sb] = v;
+            overlap[18 * sb + i] = z[18 + i];
+        }
+    }
+}
+
+/// 18 times 32 subband samples of one channel, s, through the polyphase
+/// synthesis filter bank to 576 samples in pcm; v is the channel's 1024
+/// values of V, a ring whose first is at off.
+fn synthesis(t: &Tables, s: []f64, v: []mut f64, off: &mut usize, pcm: []mut f64) {
+    let dct = t.dct.items();
+    let d = t.d.items();
+    var slot: usize = 0;
+    while slot < 18 : (slot += 1) {
+        let x = s[slot * 32..slot * 32 + 32];
+        // V[i] = Σ cos((16 + i)(2k + 1)π/64) S[k] has 32 values of the
+        // 32-point DCT-II, C, in it: C[16..32], 0, -C[31..0], -C[1..16].
+        var c: [32]f64 = [0.0; 32];
+        if nonzero(x) {
+            var m: usize = 0;
+            while m < 32 : (m += 1) {
+                var sum: f64 = 0.0;
+                var k: usize = 0;
+                while k < 32 : (k += 1) {
+                    sum = sum + x[k] * dct[m * 32 + k];
+                }
+                c[m] = sum;
+            }
+        }
+        off.* = (off.* + 1024 - 64) & 1023;
+        let o = off.*;
+        var i: usize = 0;
+        while i < 16 : (i += 1) {
+            v[(o + i) & 1023] = c[i + 16];
+        }
+        v[(o + 16) & 1023] = 0.0;
+        i = 17;
+        while i < 49 : (i += 1) {
+            v[(o + i) & 1023] = -c[48 - i];
+        }
+        i = 49;
+        while i < 64 : (i += 1) {
+            v[(o + i) & 1023] = -c[i - 48];
+        }
+        var j: usize = 0;
+        while j < 32 : (j += 1) {
+            var sum: f64 = 0.0;
+            var n: usize = 0;
+            while n < 8 : (n += 1) {
+                sum = sum + v[(o + 128 * n + j) & 1023] * d[64 * n + j];
+                sum = sum + v[(o + 128 * n + 96 + j) & 1023] * d[64 * n + 32 + j];
+            }
+            pcm[slot * 32 + j] = sum;
+        }
+    }
+}
+
+// ---- tables -----------------------------------------------------------------------
+
+/// The tables of a stream, made once: the Huffman trees, x^(4/3), the
+/// bands of its sampling rate, and those of the filter banks.
+type Tables = struct {
+    /// Two slots a node, for a 0 bit and a 1 bit: 0 where no codeword
+    /// goes, LEAF and a symbol where one ends, else the next node.
+    nodes: alloc.List(u32),
+    /// The root of each tree: the fifteen tables of the big values in
+    /// order (1, 2, 3, 5, …, 13, 15, 16, 24), then count1 table A.
+    roots: [16]u32,
+    /// x^(4/3) for x up to 15 + 2^13 - 1.
+    pow43: alloc.List(f64),
+    /// Each long and short band's lines, at the stream's rate, and where
+    /// each long band starts.
+    long: [22]usize,
+    short: [13]usize,
+    long_start: [23]u32,
+    /// The inverse MDCTs' cosines: 36 rows of 18, 12 rows of 6.
+    cos36: alloc.List(f64),
+    cos12: [72]f64,
+    /// The windows of block types 0 to 3, 36 values each (type 2's 12).
+    windows: alloc.List(f64),
+    /// cos(m(2k + 1)π/64), 32 rows of 32: the synthesis's DCT.
+    dct: alloc.List(f64),
+    /// The synthesis window D, 512 values.
+    d: alloc.List(f64),
+    /// Alias reduction's butterflies.
+    cs: [8]f64,
+    ca: [8]f64,
+    /// MPEG-1 intensity stereo: tan(pπ/12) / (1 + tan(pπ/12)), 1 at 6.
+    is_ratio: [7]f64,
+
+    /// The symbol of the next codeword of tree at r.
+    fn symbol(self: &Tables, tree: u32, r: &mut Bits, b: []u8) -> u32 {
+        var node = self.roots[tree as usize] as usize;
+        let nodes = self.nodes.items();
+        var depth: u32 = 0;
+        while depth < 24 : (depth += 1) {
+            let v = nodes[node * 2 + r.bit(b) as usize];
+            if (v & LEAF) != 0 {
+                return v & ~LEAF;
+            }
+            if v == 0 {
+                return 0;
+            }
+            node = v as usize;
+        }
+        return 0;
+    }
+}
+
+/// Adds the tree of a table to nodes, each of codes its codeword's length
+/// in the top byte and the codeword below, and gives its root.
+fn add_tree(nodes: &mut alloc.List(u32), codes: []u32) -> u32 {
+    let root = (nodes.len() / 2) as u32;
+    nodes.push(0);
+    nodes.push(0);
+    var sym: usize = 0;
+    while sym < codes.len() : (sym += 1) {
+        let len = codes[sym] >> 24;
+        let code = codes[sym] & 0xFFFFFF;
+        var node = root as usize;
+        var k = len;
+        while k > 0 : (k -= 1) {
+            let slot = node * 2 + ((code >> (k - 1)) & 1) as usize;
+            if k == 1 {
+                nodes.items_mut()[slot] = LEAF | (sym as u32);
+            } else {
+                var next = nodes.items()[slot];
+                if next == 0 {
+                    next = (nodes.len() / 2) as u32;
+                    nodes.push(0);
+                    nodes.push(0);
+                    nodes.items_mut()[slot] = next;
+                }
+                node = next as usize;
+            }
+        }
+    }
+    return root;
+}
+
+/// The tables of a stream at the sampling rate of row rate_index.
+fn new_tables(rate_index: u32, a: alloc.Allocator) -> Tables {
+    var t = Tables {
+        nodes: alloc.List(u32).init(a),
+        roots: [0; 16],
+        pow43: alloc.List(f64).init(a),
+        long: [0; 22],
+        short: [0; 13],
+        long_start: [0; 23],
+        cos36: alloc.List(f64).init(a),
+        cos12: [0.0; 72],
+        windows: alloc.List(f64).init(a),
+        dct: alloc.List(f64).init(a),
+        d: alloc.List(f64).init(a),
+        cs: [0.0; 8],
+        ca: [0.0; 8],
+        is_ratio: [0.0; 7],
+    };
+    let t1 = table1();
+    t.roots[0] = add_tree(&mut t.nodes, codes: t1[0..4]);
+    let t2 = table2();
+    t.roots[1] = add_tree(&mut t.nodes, codes: t2[0..9]);
+    let t3 = table3();
+    t.roots[2] = add_tree(&mut t.nodes, codes: t3[0..9]);
+    let t5 = table5();
+    t.roots[3] = add_tree(&mut t.nodes, codes: t5[0..16]);
+    let t6 = table6();
+    t.roots[4] = add_tree(&mut t.nodes, codes: t6[0..16]);
+    let t7 = table7();
+    t.roots[5] = add_tree(&mut t.nodes, codes: t7[0..36]);
+    let t8 = table8();
+    t.roots[6] = add_tree(&mut t.nodes, codes: t8[0..36]);
+    let t9 = table9();
+    t.roots[7] = add_tree(&mut t.nodes, codes: t9[0..36]);
+    let t10 = table10();
+    t.roots[8] = add_tree(&mut t.nodes, codes: t10[0..64]);
+    let t11 = table11();
+    t.roots[9] = add_tree(&mut t.nodes, codes: t11[0..64]);
+    let t12 = table12();
+    t.roots[10] = add_tree(&mut t.nodes, codes: t12[0..64]);
+    let t13 = table13();
+    t.roots[11] = add_tree(&mut t.nodes, codes: t13[0..256]);
+    let t15 = table15();
+    t.roots[12] = add_tree(&mut t.nodes, codes: t15[0..256]);
+    let t16 = table16();
+    t.roots[13] = add_tree(&mut t.nodes, codes: t16[0..256]);
+    let t24 = table24();
+    t.roots[14] = add_tree(&mut t.nodes, codes: t24[0..256]);
+    // Count1 table A: vwxy, v the highest bit.
+    let quads: [16]u32 = [
+        0x1000001, 0x4000005, 0x4000004, 0x5000005, 0x4000006, 0x6000005, 0x5000004, 0x6000004,
+        0x4000007, 0x5000003, 0x5000006, 0x6000000, 0x5000007, 0x6000002, 0x6000003, 0x6000001,
+    ];
+    t.roots[15] = add_tree(&mut t.nodes, codes: quads[0..16]);
+
+    var x: u32 = 0;
+    while x < 8207 : (x += 1) {
+        let f = x as f64;
+        t.pow43.push(f * fmath.cbrt(f));
+    }
+
+    let longs: [198]u8 = [
+        4, 4, 4, 4, 4, 4, 6, 6, 8, 8, 10, 12, 16, 20, 24, 28, 34, 42, 50, 54, 76, 158,
+        4, 4, 4, 4, 4, 4, 6, 6, 6, 8, 10, 12, 16, 18, 22, 28, 34, 40, 46, 54, 54, 192,
+        4, 4, 4, 4, 4, 4, 6, 6, 8, 10, 12, 16, 20, 24, 30, 38, 46, 56, 68, 84, 102, 26,
+        6, 6, 6, 6, 6, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 38, 46, 52, 60, 68, 58, 54,
+        6, 6, 6, 6, 6, 6, 8, 10, 12, 14, 16, 18, 22, 26, 32, 38, 46, 54, 62, 70, 76, 36,
+        6, 6, 6, 6, 6, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 38, 46, 52, 60, 68, 58, 54,
+        6, 6, 6, 6, 6, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 38, 46, 52, 60, 68, 58, 54,
+        6, 6, 6, 6, 6, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 38, 46, 52, 60, 68, 58, 54,
+        12, 12, 12, 12, 12, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 76, 90, 2, 2, 2, 2, 2,
+    ];
+    let shorts: [117]u8 = [
+        4, 4, 4, 4, 6, 8, 10, 12, 14, 18, 22, 30, 56,
+        4, 4, 4, 4, 6, 6, 10, 12, 14, 16, 20, 26, 66,
+        4, 4, 4, 4, 6, 8, 12, 16, 20, 26, 34, 42, 12,
+        4, 4, 4, 6, 6, 8, 10, 14, 18, 26, 32, 42, 18,
+        4, 4, 4, 6, 8, 10, 12, 14, 18, 24, 32, 44, 12,
+        4, 4, 4, 6, 8, 10, 12, 14, 18, 24, 30, 40, 18,
+        4, 4, 4, 6, 8, 10, 12, 14, 18, 24, 30, 40, 18,
+        4, 4, 4, 6, 8, 10, 12, 14, 18, 24, 30, 40, 18,
+        8, 8, 8, 12, 16, 20, 24, 28, 36, 2, 2, 2, 26,
+    ];
+    let row = rate_index as usize;
+    var i: usize = 0;
+    var start: u32 = 0;
+    while i < 22 : (i += 1) {
+        t.long[i] = longs[row * 22 + i] as usize;
+        t.long_start[i] = start;
+        start += longs[row * 22 + i] as u32;
+    }
+    t.long_start[22] = start;
+    i = 0;
+    while i < 13 : (i += 1) {
+        t.short[i] = shorts[row * 13 + i] as usize;
+    }
+
+    let pi = fmath.pi();
+    i = 0;
+    while i < 36 : (i += 1) {
+        var k: usize = 0;
+        while k < 18 : (k += 1) {
+            t.cos36.push(fmath.cos(pi / 72.0 * ((2 * i + 19) as f64) * ((2 * k + 1) as f64)));
+        }
+    }
+    i = 0;
+    while i < 12 : (i += 1) {
+        var k: usize = 0;
+        while k < 6 : (k += 1) {
+            t.cos12[i * 6 + k] = fmath.cos(pi / 24.0 * ((2 * i + 7) as f64) * ((2 * k + 1) as f64));
+        }
+    }
+    t.windows.grow_zeroed(144);
+    let w = t.windows.items_mut();
+    i = 0;
+    while i < 36 : (i += 1) {
+        let long_sin = fmath.sin(pi / 36.0 * ((i as f64) + 0.5));
+        w[i] = long_sin;
+        if i < 18 {
+            w[36 + i] = long_sin;
+        } else if i < 24 {
+            w[36 + i] = 1.0;
+        } else if i < 30 {
+            w[36 + i] = fmath.sin(pi / 12.0 * (((i - 18) as f64) + 0.5));
+        }
+        if i < 12 {
+            w[72 + i] = fmath.sin(pi / 12.0 * ((i as f64) + 0.5));
+        }
+        if i >= 6 and i < 12 {
+            w[108 + i] = fmath.sin(pi / 12.0 * (((i - 6) as f64) + 0.5));
+        } else if i >= 12 and i < 18 {
+            w[108 + i] = 1.0;
+        } else if i >= 18 {
+            w[108 + i] = long_sin;
+        }
+    }
+    var m: usize = 0;
+    while m < 32 : (m += 1) {
+        var k: usize = 0;
+        while k < 32 : (k += 1) {
+            t.dct.push(fmath.cos(pi / 64.0 * ((m * (2 * k + 1)) as f64)));
+        }
+    }
+    let half = window_half();
+    t.d.grow_zeroed(512);
+    let dv = t.d.items_mut();
+    i = 0;
+    while i <= 256 : (i += 1) {
+        let f = (half[i] as f64) / 65536.0;
+        dv[i] = f;
+        if i > 0 and i < 256 {
+            if (i & 63) == 0 {
+                dv[512 - i] = f;
+            } else {
+                dv[512 - i] = -f;
+            }
+        }
+    }
+    let ci: [8]f64 = [-0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037];
+    i = 0;
+    while i < 8 : (i += 1) {
+        let sq = (1.0 + ci[i] * ci[i]).sqrt();
+        t.cs[i] = 1.0 / sq;
+        t.ca[i] = ci[i] / sq;
+    }
+    i = 0;
+    while i < 7 : (i += 1) {
+        if i == 6 {
+            t.is_ratio[i] = 1.0;
+        } else {
+            let angle = (i as f64) * pi / 12.0;
+            let tan = fmath.sin(angle) / fmath.cos(angle);
+            t.is_ratio[i] = tan / (1.0 + tan);
+        }
+    }
+    return t;
+}
+
+// ---- decoding ---------------------------------------------------------------------
+
+/// The last main data, which a frame's may begin in.
+type Reservoir = struct {
+    bytes: [2048]u8,
+    len: usize,
+}
+
+/// What decoding keeps from granule to granule.
+type State = struct {
+    /// Each channel's 576 lines.
+    xr: alloc.List(f64),
+    /// Each channel's second halves of its last inverse MDCTs, 576.
+    overlap: alloc.List(f64),
+    /// One channel's subband samples, 18 times 32.
+    sb: alloc.List(f64),
+    /// Each channel's synthesis ring, 1024, and where it starts.
+    v: alloc.List(f64),
+    off: [2]usize,
+    /// Each channel's samples of the frame, 1152.
+    pcm: alloc.List(f64),
+}
+
+/// The frame at data[at..], h its header, decoded into st.pcm; false
+/// where its side information breaks the rules, so it is dropped.
+fn frame(data: []u8, at: usize, h: &Header, t: &Tables, res: &mut Reservoir, st: &mut State) -> bool {
+    var side_at = at + 4;
+    if h.crc {
+        side_at += 2;
+    }
+    let mono = h.channels == 1;
+    var side_len: usize = 32;
+    if h.lsf {
+        side_len = 17;
+        if mono {
+            side_len = 9;
+        }
+    } else if mono {
+        side_len = 17;
+    }
+    let end = at + h.size;
+    if side_at + side_len > end {
+        return false;
+    }
+    let nch = h.channels as usize;
+    var ngr: usize = 2;
+    var back: usize = 0;
+    var r = Bits { pos: side_at * 8 };
+    var gi: [4]Granule = [new_granule(), new_granule(), new_granule(), new_granule()];
+    if h.lsf {
+        ngr = 1;
+        back = r.read(data, n: 8) as usize;
+        _ = r.read(data, n: 2 - h.channels % 2);
+    } else {
+        back = r.read(data, n: 9) as usize;
+        if mono {
+            _ = r.read(data, n: 5);
+        } else {
+            _ = r.read(data, n: 3);
+        }
+        var c: usize = 0;
+        while c < nch : (c += 1) {
+            gi[2 + c].scfsi = r.read(data, n: 4);
+        }
+    }
+    var gr: usize = 0;
+    while gr < ngr : (gr += 1) {
+        var c: usize = 0;
+        while c < nch : (c += 1) {
+            if not granule_info(&mut r, b: data, h: h, t: t, g: &mut gi[gr * 2 + c]) {
+                return false;
+            }
+        }
+    }
+
+    // The main data: the reservoir's last BACK bytes, then this frame's.
+    let body = data[side_at + side_len..end];
+    var keep = res.len;
+    if keep > BACK {
+        keep = BACK;
+    }
+    var i: usize = 0;
+    while i < keep : (i += 1) {
+        res.bytes[i] = res.bytes[res.len - keep + i];
+    }
+    var n = body.len();
+    if n > RESERVOIR - keep {
+        n = RESERVOIR - keep;
+    }
+    i = 0;
+    while i < n : (i += 1) {
+        res.bytes[keep + i] = body[i];
+    }
+    res.len = keep + n;
+    let have = back <= keep;
+    let rb = res.bytes[0..res.len];
+    var m = Bits { pos: 0 };
+    if have {
+        m.pos = (keep - back) * 8;
+    }
+    let ms_only = h.mode == 1 and (h.mode_ext & 3) == 2;
+    var scale: [576]f64 = [0.0; 576];
+    gr = 0;
+    while gr < ngr : (gr += 1) {
+        var c: usize = 0;
+        while c < nch : (c += 1) {
+            let xr = st.xr.items_mut()[c * 576..c * 576 + 576];
+            if have {
+                let stop = m.pos + (gi[gr * 2 + c].part23 as usize);
+                let first = gi[c];
+                scale_factors(&mut m, b: rb, h: h, ch: c, g: &mut gi[gr * 2 + c], first: &first);
+                exponents(&gi[gr * 2 + c], t: t, ms: ms_only, out: scale[0..576]);
+                spectrum(&gi[gr * 2 + c], t: t, r: &mut m, b: rb, end: stop, scale: scale[0..576], xr: xr);
+                m.pos = stop;
+            } else {
+                i = 0;
+                while i < 576 : (i += 1) {
+                    xr[i] = 0.0;
+                }
+            }
+        }
+        if nch == 2 and h.mode == 1 {
+            stereo(h, g1: &gi[gr * 2 + 1], t: t, xr: st.xr.items_mut());
+        }
+        c = 0;
+        while c < nch : (c += 1) {
+            hybrid(&gi[gr * 2 + c], h: h, t: t, xr: st.xr.items_mut()[c * 576..c * 576 + 576], overlap: st.overlap.items_mut()[c * 576..c * 576 + 576], out: st.sb.items_mut());
+            synthesis(t, s: st.sb.items(), v: st.v.items_mut()[c * 1024..c * 1024 + 1024], off: &mut st.off[c], pcm: st.pcm.items_mut()[c * 1152 + gr * 576..c * 1152 + gr * 576 + 576]);
+        }
+    }
+    return true;
+}
+
+/// Whether bytes look like an MP3 stream: Layer III frames, one after the
+/// other, starting in the first 64 KiB after an ID3v2 tag.
+pub fn probe(bytes: []u8) -> bool {
+    let begin = after_id3(bytes);
+    var end = bytes.len();
+    if end - begin > 65536 {
+        end = begin + 65536;
+    }
+    var at = begin;
+    while at < end : (at += 1) {
+        if starts_stream(bytes, at: at) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The MP3 stream in bytes, decoded; at most max_samples samples,
+/// counting each channel's.
+pub fn decode(bytes: []u8, max_samples: u64, a: alloc.Allocator) -> Mp3Error!Audio {
+    let begin = after_id3(bytes);
+    var end = bytes.len();
+    if end - begin >= 128 and has(bytes, at: end - 128, s: "TAG") {
+        end -= 128;
+    }
+    let data = bytes[0..end];
+    var at = begin;
+    while at < end and not starts_stream(data, at: at) {
+        at += 1;
+    }
+    let h0 = header_at(data, at: at) orelse return Mp3Error.Malformed;
+    let tag = tag_of(data, at: at, h: &h0);
+    if tag.found {
+        at += h0.size;
+    }
+    var spf: u64 = 1152;
+    if h0.lsf {
+        spf = 576;
+    }
+    // What ffmpeg cuts: the delay and the decoder's 529 samples in front,
+    // and from the padding on to the end of the frames the tag counts.
+    let never: u64 = 0xFFFFFFFFFFFFFFFF;
+    var skip: u64 = 0;
+    var cut_from = never;
+    var cut_to = never;
+    if tag.lame {
+        skip = tag.delay + 529;
+        if tag.frames > 0 and tag.frames < (1 << 40) {
+            cut_to = tag.frames * spf;
+            cut_from = 0;
+            if cut_to + 529 > tag.padding {
+                cut_from = cut_to + 529 - tag.padding;
+            }
+        }
+    }
+
+    let t = new_tables(h0.rate_index, a: a);
+    var res = Reservoir { bytes: [0; 2048], len: 0 };
+    var st = State {
+        xr: alloc.List(f64).init(a),
+        overlap: alloc.List(f64).init(a),
+        sb: alloc.List(f64).init(a),
+        v: alloc.List(f64).init(a),
+        off: [0, 0],
+        pcm: alloc.List(f64).init(a),
+    };
+    st.xr.grow_zeroed(1152);
+    st.overlap.grow_zeroed(1152);
+    st.sb.grow_zeroed(576);
+    st.v.grow_zeroed(2048);
+    st.pcm.grow_zeroed(2304);
+    var out = Audio { rate: h0.rate, channels: h0.channels, samples: alloc.List(i16).init(a) };
+    let nch = h0.channels as usize;
+    var made: u64 = 0;
+    while at < end {
+        var next = at + 1;
+        match header_at(data, at: at) {
+            some(h) => {
+                if same_stream(a: &h0, other: &h) and h.size <= end - at {
+                    next = at + h.size;
+                    if frame(data, at: at, h: &h, t: &t, res: &mut res, st: &mut st) {
+                        if (out.samples.len() as u64) + spf * (nch as u64) > max_samples {
+                            return Mp3Error.TooLarge;
+                        }
+                        let pcm = st.pcm.items();
+                        var i: u64 = 0;
+                        while i < spf : (i += 1) {
+                            let when = made + i;
+                            if when >= skip and (when < cut_from or when >= cut_to) {
+                                var c: usize = 0;
+                                while c < nch : (c += 1) {
+                                    out.samples.push(fmath.sample16(pcm[c * 1152 + i as usize]));
+                                }
+                            }
+                        }
+                    }
+                    made += spf;
+                } else {
+                    next = at + 1;
+                }
+            }
+            none => {}
+        }
+        if next == at + 1 {
+            // Lost: on to where the stream goes on.
+            while next < end and not starts_stream(data, at: next) {
+                next += 1;
+            }
+        }
+        at = next;
+    }
+    return out;
+}
+
+// ---- the standard's tables ----------------------------------------------------------
+
+/// The synthesis window's first 257 values (ISO/IEC 11172-3 table 3-B.3)
+/// in units of 2^-16; the rest follow from them (new_tables).
+fn window_half() -> [257]i32 {
+    return [
+        0, -1, -1, -1, -1, -1, -1, -2, -2, -2, -2, -3,
+        -3, -4, -4, -5, -5, -6, -7, -7, -8, -9, -10, -11,
+        -13, -14, -16, -17, -19, -21, -24, -26, -29, -31, -35, -38,
+        -41, -45, -49, -53, -58, -63, -68, -73, -79, -85, -91, -97,
+        -104, -111, -117, -125, -132, -139, -147, -154, -161, -169, -176, -183,
+        -190, -196, -202, -208, 213, 218, 222, 225, 227, 228, 228, 227,
+        224, 221, 215, 208, 200, 189, 177, 163, 146, 127, 106, 83,
+        57, 29, -2, -36, -72, -111, -153, -197, -244, -294, -347, -401,
+        -459, -519, -581, -645, -711, -779, -848, -919, -991, -1064, -1137, -1210,
+        -1283, -1356, -1428, -1498, -1567, -1634, -1698, -1759, -1817, -1870, -1919, -1962,
+        -2001, -2032, -2057, -2075, -2085, -2087, -2080, -2063, 2037, 2000, 1952, 1893,
+        1822, 1739, 1644, 1535, 1414, 1280, 1131, 970, 794, 605, 402, 185,
+        -45, -288, -545, -814, -1095, -1388, -1692, -2006, -2330, -2663, -3004, -3351,
+        -3705, -4063, -4425, -4788, -5153, -5517, -5879, -6237, -6589, -6935, -7271, -7597,
+        -7910, -8209, -8491, -8755, -8998, -9219, -9416, -9585, -9727, -9838, -9916, -9959,
+        -9966, -9935, -9863, -9750, -9592, -9389, -9139, -8840, -8492, -8092, -7640, -7134,
+        6574, 5959, 5288, 4561, 3776, 2935, 2037, 1082, 70, -998, -2122, -3300,
+        -4533, -5818, -7154, -8540, -9975, -11455, -12980, -14548, -16155, -17799, -19478, -21189,
+        -22929, -24694, -26482, -28289, -30112, -31947, -33791, -35640, -37489, -39336, -41176, -43006,
+        -44821, -46617, -48390, -50137, -51853, -53534, -55178, -56778, -58333, -59838, -61289, -62684,
+        -64019, -65290, -66494, -67629, -68692, -69679, -70590, -71420, -72169, -72835, -73415, -73908,
+        -74313, -74630, -74856, -74992, 75038,
+    ];
+}
+
+/// Huffman table 1 (ISO/IEC 11172-3 table 3-B.7): for each pair x·2 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table1() -> [4]u32 {
+    return [
+        0x1000001, 0x3000001, 0x2000001, 0x3000000,
+    ];
+}
+
+/// Huffman table 2 (ISO/IEC 11172-3 table 3-B.7): for each pair x·3 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table2() -> [9]u32 {
+    return [
+        0x1000001, 0x3000002, 0x6000001, 0x3000003, 0x3000001, 0x5000001, 0x5000003, 0x5000002,
+        0x6000000,
+    ];
+}
+
+/// Huffman table 3 (ISO/IEC 11172-3 table 3-B.7): for each pair x·3 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table3() -> [9]u32 {
+    return [
+        0x2000003, 0x2000002, 0x6000001, 0x3000001, 0x2000001, 0x5000001, 0x5000003, 0x5000002,
+        0x6000000,
+    ];
+}
+
+/// Huffman table 5 (ISO/IEC 11172-3 table 3-B.7): for each pair x·4 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table5() -> [16]u32 {
+    return [
+        0x1000001, 0x3000002, 0x6000006, 0x7000005, 0x3000003, 0x3000001, 0x6000004, 0x7000004,
+        0x6000007, 0x6000005, 0x7000007, 0x8000001, 0x7000006, 0x6000001, 0x7000001, 0x8000000,
+    ];
+}
+
+/// Huffman table 6 (ISO/IEC 11172-3 table 3-B.7): for each pair x·4 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table6() -> [16]u32 {
+    return [
+        0x3000007, 0x3000003, 0x5000005, 0x7000001, 0x3000006, 0x2000002, 0x4000003, 0x5000002,
+        0x4000005, 0x4000004, 0x5000004, 0x6000001, 0x6000003, 0x5000003, 0x6000002, 0x7000000,
+    ];
+}
+
+/// Huffman table 7 (ISO/IEC 11172-3 table 3-B.7): for each pair x·6 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table7() -> [36]u32 {
+    return [
+        0x1000001, 0x3000002, 0x600000A, 0x8000013, 0x8000010, 0x900000A, 0x3000003, 0x4000003,
+        0x6000007, 0x700000A, 0x7000005, 0x8000003, 0x600000B, 0x5000004, 0x700000D, 0x8000011,
+        0x8000008, 0x9000004, 0x700000C, 0x700000B, 0x8000012, 0x900000F, 0x900000B, 0x9000002,
+        0x7000007, 0x7000006, 0x8000009, 0x900000E, 0x9000003, 0xA000001, 0x8000006, 0x8000004,
+        0x9000005, 0xA000003, 0xA000002, 0xA000000,
+    ];
+}
+
+/// Huffman table 8 (ISO/IEC 11172-3 table 3-B.7): for each pair x·6 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table8() -> [36]u32 {
+    return [
+        0x2000003, 0x3000004, 0x6000006, 0x8000012, 0x800000C, 0x9000005, 0x3000005, 0x2000001,
+        0x4000002, 0x8000010, 0x8000009, 0x8000003, 0x6000007, 0x4000003, 0x6000005, 0x800000E,
+        0x8000007, 0x9000003, 0x8000013, 0x8000011, 0x800000F, 0x900000D, 0x900000A, 0xA000004,
+        0x800000D, 0x7000005, 0x8000008, 0x900000B, 0xA000005, 0xA000001, 0x900000C, 0x8000004,
+        0x9000004, 0x9000001, 0xB000001, 0xB000000,
+    ];
+}
+
+/// Huffman table 9 (ISO/IEC 11172-3 table 3-B.7): for each pair x·6 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table9() -> [36]u32 {
+    return [
+        0x3000007, 0x3000005, 0x5000009, 0x600000E, 0x800000F, 0x9000007, 0x3000006, 0x3000004,
+        0x4000005, 0x5000005, 0x6000006, 0x8000007, 0x4000007, 0x4000006, 0x5000008, 0x6000008,
+        0x7000008, 0x8000005, 0x600000F, 0x5000006, 0x6000009, 0x700000A, 0x7000005, 0x8000001,
+        0x700000B, 0x6000007, 0x7000009, 0x7000006, 0x8000004, 0x9000001, 0x800000E, 0x7000004,
+        0x8000006, 0x8000002, 0x9000006, 0x9000000,
+    ];
+}
+
+/// Huffman table 10 (ISO/IEC 11172-3 table 3-B.7): for each pair x·8 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table10() -> [64]u32 {
+    return [
+        0x1000001, 0x3000002, 0x600000A, 0x8000017, 0x9000023, 0x900001E, 0x900000C, 0xA000011,
+        0x3000003, 0x4000003, 0x6000008, 0x700000C, 0x8000012, 0x9000015, 0x800000C, 0x8000007,
+        0x600000B, 0x6000009, 0x700000F, 0x8000015, 0x9000020, 0xA000028, 0x9000013, 0x9000006,
+        0x700000E, 0x700000D, 0x8000016, 0x9000022, 0xA00002E, 0xA000017, 0x9000012, 0xA000007,
+        0x8000014, 0x8000013, 0x9000021, 0xA00002F, 0xA00001B, 0xA000016, 0xA000009, 0xA000003,
+        0x900001F, 0x9000016, 0xA000029, 0xA00001A, 0xB000015, 0xB000014, 0xA000005, 0xB000003,
+        0x800000E, 0x800000D, 0x900000A, 0xA00000B, 0xA000010, 0xA000006, 0xB000005, 0xB000001,
+        0x9000009, 0x8000008, 0x9000007, 0xA000008, 0xA000004, 0xB000004, 0xB000002, 0xB000000,
+    ];
+}
+
+/// Huffman table 11 (ISO/IEC 11172-3 table 3-B.7): for each pair x·8 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table11() -> [64]u32 {
+    return [
+        0x2000003, 0x3000004, 0x500000A, 0x7000018, 0x8000022, 0x9000021, 0x8000015, 0x900000F,
+        0x3000005, 0x3000003, 0x4000004, 0x600000A, 0x8000020, 0x8000011, 0x700000B, 0x800000A,
+        0x500000B, 0x5000007, 0x600000D, 0x7000012, 0x800001E, 0x900001F, 0x8000014, 0x8000005,
+        0x7000019, 0x600000B, 0x7000013, 0x900003B, 0x800001B, 0xA000012, 0x800000C, 0x9000005,
+        0x8000023, 0x8000021, 0x800001F, 0x900003A, 0x900001E, 0xA000010, 0x9000007, 0xA000005,
+        0x800001C, 0x800001A, 0x9000020, 0xA000013, 0xA000011, 0xB00000F, 0xA000008, 0xB00000E,
+        0x800000E, 0x700000C, 0x7000009, 0x800000D, 0x900000E, 0xA000009, 0xA000004, 0xA000001,
+        0x800000B, 0x7000004, 0x8000006, 0x9000006, 0xA000006, 0xA000003, 0xA000002, 0xA000000,
+    ];
+}
+
+/// Huffman table 12 (ISO/IEC 11172-3 table 3-B.7): for each pair x·8 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table12() -> [64]u32 {
+    return [
+        0x4000009, 0x3000006, 0x5000010, 0x7000021, 0x8000029, 0x9000027, 0x9000026, 0x900001A,
+        0x3000007, 0x3000005, 0x4000006, 0x5000009, 0x7000017, 0x7000010, 0x800001A, 0x800000B,
+        0x5000011, 0x4000007, 0x500000B, 0x600000E, 0x7000015, 0x800001E, 0x700000A, 0x8000007,
+        0x6000011, 0x500000A, 0x600000F, 0x600000C, 0x7000012, 0x800001C, 0x800000E, 0x8000005,
+        0x7000020, 0x600000D, 0x7000016, 0x7000013, 0x8000012, 0x8000010, 0x8000009, 0x9000005,
+        0x8000028, 0x7000011, 0x800001F, 0x800001D, 0x8000011, 0x900000D, 0x8000004, 0x9000002,
+        0x800001B, 0x700000C, 0x700000B, 0x800000F, 0x800000A, 0x9000007, 0x9000004, 0xA000001,
+        0x900001B, 0x800000C, 0x8000008, 0x900000C, 0x9000006, 0x9000003, 0x9000001, 0xA000000,
+    ];
+}
+
+/// Huffman table 13 (ISO/IEC 11172-3 table 3-B.7): for each pair x·16 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table13() -> [256]u32 {
+    return [
+        0x1000001, 0x4000005, 0x600000E, 0x7000015, 0x8000022, 0x9000033, 0x900002E, 0xA000047,
+        0x900002A, 0xA000034, 0xB000044, 0xB000034, 0xC000043, 0xC00002C, 0xD00002B, 0xD000013,
+        0x3000003, 0x4000004, 0x600000C, 0x7000013, 0x800001F, 0x800001A, 0x900002C, 0x9000021,
+        0x900001F, 0x9000018, 0xA000020, 0xA000018, 0xB00001F, 0xC000023, 0xC000016, 0xC00000E,
+        0x600000F, 0x600000D, 0x7000017, 0x8000024, 0x900003B, 0x9000031, 0xA00004D, 0xA000041,
+        0x900001D, 0xA000028, 0xA00001E, 0xB000028, 0xB00001B, 0xC000021, 0xD00002A, 0xD000010,
+        0x7000016, 0x7000014, 0x8000025, 0x900003D, 0x9000038, 0xA00004F, 0xA000049, 0xA000040,
+        0xA00002B, 0xB00004C, 0xB000038, 0xB000025, 0xB00001A, 0xC00001F, 0xD000019, 0xD00000E,
+        0x8000023, 0x7000010, 0x900003C, 0x9000039, 0xA000061, 0xA00004B, 0xB000072, 0xB00005B,
+        0xA000036, 0xB000049, 0xB000037, 0xC000029, 0xC000030, 0xD000035, 0xD000017, 0xE000018,
+        0x900003A, 0x800001B, 0x9000032, 0xA000060, 0xA00004C, 0xA000046, 0xB00005D, 0xB000054,
+        0xB00004D, 0xB00003A, 0xC00004F, 0xB00001D, 0xD00004A, 0xD000031, 0xE000029, 0xE000011,
+        0x900002F, 0x900002D, 0xA00004E, 0xA00004A, 0xB000073, 0xB00005E, 0xB00005A, 0xB00004F,
+        0xB000045, 0xC000053, 0xC000047, 0xC000032, 0xD00003B, 0xD000026, 0xE000024, 0xE00000F,
+        0xA000048, 0x9000022, 0xA000038, 0xB00005F, 0xB00005C, 0xB000055, 0xC00005B, 0xC00005A,
+        0xC000056, 0xC000049, 0xD00004D, 0xD000041, 0xD000033, 0xE00002C, 0x1000002B, 0x1000002A,
+        0x900002B, 0x8000014, 0x900001E, 0xA00002C, 0xA000037, 0xB00004E, 0xB000048, 0xC000057,
+        0xC00004E, 0xC00003D, 0xC00002E, 0xD000036, 0xD000025, 0xE00001E, 0xF000014, 0xF000010,
+        0xA000035, 0x9000019, 0xA000029, 0xA000025, 0xB00002C, 0xB00003B, 0xB000036, 0xD000051,
+        0xC000042, 0xD00004C, 0xD000039, 0xE000036, 0xE000025, 0xE000012, 0x10000027, 0xF00000B,
+        0xA000023, 0xA000021, 0xA00001F, 0xB000039, 0xB00002A, 0xC000052, 0xC000048, 0xD000050,
+        0xC00002F, 0xD00003A, 0xE000037, 0xD000015, 0xE000016, 0xF00001A, 0x10000026, 0x11000016,
+        0xB000035, 0xA000019, 0xA000017, 0xB000026, 0xC000046, 0xC00003C, 0xC000033, 0xC000024,
+        0xD000037, 0xD00001A, 0xD000022, 0xE000017, 0xF00001B, 0xF00000E, 0xF000009, 0x10000007,
+        0xB000022, 0xB000020, 0xB00001C, 0xC000027, 0xC000031, 0xD00004B, 0xC00001E, 0xD000034,
+        0xE000030, 0xE000028, 0xF000034, 0xF00001C, 0xF000012, 0x10000011, 0x10000009, 0x10000005,
+        0xC00002D, 0xB000015, 0xC000022, 0xD000040, 0xD000038, 0xD000032, 0xE000031, 0xE00002D,
+        0xE00001F, 0xE000013, 0xE00000C, 0xF00000F, 0x1000000A, 0xF000007, 0x10000006, 0x10000003,
+        0xD000030, 0xC000017, 0xC000014, 0xD000027, 0xD000024, 0xD000023, 0xF000035, 0xE000015,
+        0xE000010, 0x11000017, 0xF00000D, 0xF00000A, 0xF000006, 0x11000001, 0x10000004, 0x10000002,
+        0xC000010, 0xC00000F, 0xD000011, 0xE00001B, 0xE000019, 0xE000014, 0xF00001D, 0xE00000B,
+        0xF000011, 0xF00000C, 0x10000010, 0x10000008, 0x13000001, 0x12000001, 0x13000000, 0x10000001,
+    ];
+}
+
+/// Huffman table 15 (ISO/IEC 11172-3 table 3-B.7): for each pair x·16 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table15() -> [256]u32 {
+    return [
+        0x3000007, 0x400000C, 0x5000012, 0x7000035, 0x700002F, 0x800004C, 0x900007C, 0x900006C,
+        0x9000059, 0xA00007B, 0xA00006C, 0xB000077, 0xB00006B, 0xB000051, 0xC00007A, 0xD00003F,
+        0x400000D, 0x3000005, 0x5000010, 0x600001B, 0x700002E, 0x7000024, 0x800003D, 0x8000033,
+        0x800002A, 0x9000046, 0x9000034, 0xA000053, 0xA000041, 0xA000029, 0xB00003B, 0xB000024,
+        0x5000013, 0x5000011, 0x500000F, 0x6000018, 0x7000029, 0x7000022, 0x800003B, 0x8000030,
+        0x8000028, 0x9000040, 0x9000032, 0xA00004E, 0xA00003E, 0xB000050, 0xB000038, 0xB000021,
+        0x600001D, 0x600001C, 0x6000019, 0x700002B, 0x7000027, 0x800003F, 0x8000037, 0x900005D,
+        0x900004C, 0x900003B, 0xA00005D, 0xA000048, 0xA000036, 0xB00004B, 0xB000032, 0xB00001D,
+        0x7000034, 0x6000016, 0x700002A, 0x7000028, 0x8000043, 0x8000039, 0x900005F, 0x900004F,
+        0x9000048, 0x9000039, 0xA000059, 0xA000045, 0xA000031, 0xB000042, 0xB00002E, 0xB00001B,
+        0x800004D, 0x7000025, 0x7000023, 0x8000042, 0x800003A, 0x8000034, 0x900005B, 0x900004A,
+        0x900003E, 0x9000030, 0xA00004F, 0xA00003F, 0xB00005A, 0xB00003E, 0xB000028, 0xC000026,
+        0x900007D, 0x7000020, 0x800003C, 0x8000038, 0x8000032, 0x900005C, 0x900004E, 0x9000041,
+        0x9000037, 0xA000057, 0xA000047, 0xA000033, 0xB000049, 0xB000033, 0xC000046, 0xC00001E,
+        0x900006D, 0x8000035, 0x8000031, 0x900005E, 0x9000058, 0x900004B, 0x9000042, 0xA00007A,
+        0xA00005B, 0xA000049, 0xA000038, 0xA00002A, 0xB000040, 0xB00002C, 0xB000015, 0xC000019,
+        0x900005A, 0x800002B, 0x8000029, 0x900004D, 0x9000049, 0x900003F, 0x9000038, 0xA00005C,
+        0xA00004D, 0xA000042, 0xA00002F, 0xB000043, 0xB000030, 0xC000035, 0xC000024, 0xC000014,
+        0x9000047, 0x8000022, 0x9000043, 0x900003C, 0x900003A, 0x9000031, 0xA000058, 0xA00004C,
+        0xA000043, 0xB00006A, 0xB000047, 0xB000036, 0xB000026, 0xC000027, 0xC000017, 0xC00000F,
+        0xA00006D, 0x9000035, 0x9000033, 0x900002F, 0xA00005A, 0xA000052, 0xA00003A, 0xA000039,
+        0xA000030, 0xB000048, 0xB000039, 0xB000029, 0xB000017, 0xC00001B, 0xD00003E, 0xC000009,
+        0xA000056, 0x900002A, 0x9000028, 0x9000025, 0xA000046, 0xA000040, 0xA000034, 0xA00002B,
+        0xB000046, 0xB000037, 0xB00002A, 0xB000019, 0xC00001D, 0xC000012, 0xC00000B, 0xD00000B,
+        0xB000076, 0xA000044, 0x900001E, 0xA000037, 0xA000032, 0xA00002E, 0xB00004A, 0xB000041,
+        0xB000031, 0xB000027, 0xB000018, 0xB000010, 0xC000016, 0xC00000D, 0xD00000E, 0xD000007,
+        0xB00005B, 0xA00002C, 0xA000027, 0xA000026, 0xA000022, 0xB00003F, 0xB000034, 0xB00002D,
+        0xB00001F, 0xC000034, 0xC00001C, 0xC000013, 0xC00000E, 0xC000008, 0xD000009, 0xD000003,
+        0xC00007B, 0xB00003C, 0xB00003A, 0xB000035, 0xB00002F, 0xB00002B, 0xB000020, 0xB000016,
+        0xC000025, 0xC000018, 0xC000011, 0xC00000C, 0xD00000F, 0xD00000A, 0xC000002, 0xD000001,
+        0xC000047, 0xB000025, 0xB000022, 0xB00001E, 0xB00001C, 0xB000014, 0xB000011, 0xC00001A,
+        0xC000015, 0xC000010, 0xC00000A, 0xC000006, 0xD000008, 0xD000006, 0xD000002, 0xD000000,
+    ];
+}
+
+/// Huffman table 16 (ISO/IEC 11172-3 table 3-B.7): for each pair x·16 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table16() -> [256]u32 {
+    return [
+        0x1000001, 0x4000005, 0x600000E, 0x800002C, 0x900004A, 0x900003F, 0xA00006E, 0xA00005D,
+        0xB0000AC, 0xB000095, 0xB00008A, 0xC0000F2, 0xC0000E1, 0xC0000C3, 0xD000178, 0x9000011,
+        0x3000003, 0x4000004, 0x600000C, 0x7000014, 0x8000023, 0x900003E, 0x9000035, 0x900002F,
+        0xA000053, 0xA00004B, 0xA000044, 0xB000077, 0xC0000C9, 0xB00006B, 0xC0000CF, 0x8000009,
+        0x600000F, 0x600000D, 0x7000017, 0x8000026, 0x9000043, 0x900003A, 0xA000067, 0xA00005A,
+        0xB0000A1, 0xA000048, 0xB00007F, 0xB000075, 0xB00006E, 0xC0000D1, 0xC0000CE, 0x9000010,
+        0x800002D, 0x7000015, 0x8000027, 0x9000045, 0x9000040, 0xA000072, 0xA000063, 0xA000057,
+        0xB00009E, 0xB00008C, 0xC0000FC, 0xC0000D4, 0xC0000C7, 0xD000183, 0xD00016D, 0xA00001A,
+        0x900004B, 0x8000024, 0x9000044, 0x9000041, 0xA000073, 0xA000065, 0xB0000B3, 0xB0000A4,
+        0xB00009B, 0xC000108, 0xC0000F6, 0xC0000E2, 0xD00018B, 0xD00017E, 0xD00016A, 0x9000009,
+        0x9000042, 0x800001E, 0x900003B, 0x9000038, 0xA000066, 0xB0000B9, 0xB0000AD, 0xC000109,
+        0xB00008E, 0xC0000FD, 0xC0000E8, 0xD000190, 0xD000184, 0xD00017A, 0xE0001BD, 0xA000010,
+        0xA00006F, 0x9000036, 0x9000034, 0xA000064, 0xB0000B8, 0xB0000B2, 0xB0000A0, 0xB000085,
+        0xC000101, 0xC0000F4, 0xC0000E4, 0xC0000D9, 0xD000181, 0xD00016E, 0xE0002CB, 0xA00000A,
+        0xA000062, 0x9000030, 0xA00005B, 0xA000058, 0xB0000A5, 0xB00009D, 0xB000094, 0xC000105,
+        0xC0000F8, 0xD000197, 0xD00018D, 0xD000174, 0xD00017C, 0xF000379, 0xF000374, 0xA000008,
+        0xA000055, 0xA000054, 0xA000051, 0xB00009F, 0xB00009C, 0xB00008F, 0xC000104, 0xC0000F9,
+        0xD0001AB, 0xD000191, 0xD000188, 0xD00017F, 0xE0002D7, 0xE0002C9, 0xE0002C4, 0xA000007,
+        0xB00009A, 0xA00004C, 0xA000049, 0xB00008D, 0xB000083, 0xC000100, 0xC0000F5, 0xD0001AA,
+        0xD000196, 0xD00018A, 0xD000180, 0xE0002DF, 0xD000167, 0xE0002C6, 0xD000160, 0xB00000B,
+        0xB00008B, 0xB000081, 0xA000043, 0xB00007D, 0xC0000F7, 0xC0000E9, 0xC0000E5, 0xC0000DB,
+        0xD000189, 0xE0002E7, 0xE0002E1, 0xE0002D0, 0xF000375, 0xF000372, 0xE0001B7, 0xA000004,
+        0xC0000F3, 0xB000078, 0xB000076, 0xB000073, 0xC0000E3, 0xC0000DF, 0xD00018C, 0xE0002EA,
+        0xE0002E6, 0xE0002E0, 0xE0002D1, 0xE0002C8, 0xE0002C2, 0xD0000DF, 0xE0001B4, 0xB000006,
+        0xC0000CA, 0xC0000E0, 0xC0000DE, 0xC0000DA, 0xC0000D8, 0xD000185, 0xD000182, 0xD00017D,
+        0xD00016C, 0xF000378, 0xE0001BB, 0xE0002C3, 0xE0001B8, 0xE0001B5, 0x100006C0, 0xB000004,
+        0xE0002EB, 0xC0000D3, 0xC0000D2, 0xC0000D0, 0xD000172, 0xD00017B, 0xE0002DE, 0xE0002D3,
+        0xE0002CA, 0x100006C7, 0xF000373, 0xF00036D, 0xF00036C, 0x11000D83, 0xF000361, 0xB000002,
+        0xD000179, 0xD000171, 0xB000066, 0xC0000BB, 0xE0002D6, 0xE0002D2, 0xD000166, 0xE0002C7,
+        0xE0002C5, 0xF000362, 0x100006C6, 0xF000367, 0x11000D82, 0xF000366, 0xE0001B2, 0xB000000,
+        0x900000C, 0x800000A, 0x8000007, 0x900000B, 0x900000A, 0xA000011, 0xA00000B, 0xA000009,
+        0xB00000D, 0xB00000C, 0xB00000A, 0xB000007, 0xB000005, 0xB000003, 0xB000001, 0x8000003,
+    ];
+}
+
+/// Huffman table 24 (ISO/IEC 11172-3 table 3-B.7): for each pair x·16 + y,
+/// its codeword's length in the top byte and the codeword below.
+fn table24() -> [256]u32 {
+    return [
+        0x400000F, 0x400000D, 0x600002E, 0x7000050, 0x8000092, 0x9000106, 0x90000F8, 0xA0001B2,
+        0xA0001AA, 0xB00029D, 0xB00028D, 0xB000289, 0xB00026D, 0xB000205, 0xC000408, 0x9000058,
+        0x400000E, 0x400000C, 0x5000015, 0x6000026, 0x7000047, 0x8000082, 0x800007A, 0x90000D8,
+        0x90000D1, 0x90000C6, 0xA000147, 0xA000159, 0xA00013F, 0xA000129, 0xA000117, 0x800002A,
+        0x600002F, 0x5000016, 0x6000029, 0x700004A, 0x7000044, 0x8000080, 0x8000078, 0x90000DD,
+        0x90000CF, 0x90000C2, 0x90000B6, 0xA000154, 0xA00013B, 0xA000127, 0xB00021D, 0x7000012,
+        0x7000051, 0x6000027, 0x700004B, 0x7000046, 0x8000086, 0x800007D, 0x8000074, 0x90000DC,
+        0x90000CC, 0x90000BE, 0x90000B2, 0xA000145, 0xA000137, 0xA000125, 0xA00010F, 0x7000010,
+        0x8000093, 0x7000048, 0x7000045, 0x8000087, 0x800007F, 0x8000076, 0x8000070, 0x90000D2,
+        0x90000C8, 0x90000BC, 0xA000160, 0xA000143, 0xA000132, 0xA00011D, 0xB00021C, 0x700000E,
+        0x9000107, 0x7000042, 0x8000081, 0x800007E, 0x8000077, 0x8000072, 0x90000D6, 0x90000CA,
+        0x90000C0, 0x90000B4, 0xA000155, 0xA00013D, 0xA00012D, 0xA000119, 0xA000106, 0x700000C,
+        0x90000F9, 0x800007B, 0x8000079, 0x8000075, 0x8000071, 0x90000D7, 0x90000CE, 0x90000C3,
+        0x90000B9, 0xA00015B, 0xA00014A, 0xA000134, 0xA000123, 0xA000110, 0xB000208, 0x700000A,
+        0xA0001B3, 0x8000073, 0x800006F, 0x800006D, 0x90000D3, 0x90000CB, 0x90000C4, 0x90000BB,
+        0xA000161, 0xA00014C, 0xA000139, 0xA00012A, 0xA00011B, 0xB000213, 0xB00017D, 0x8000011,
+        0xA0001AB, 0x90000D4, 0x90000D0, 0x90000CD, 0x90000C9, 0x90000C1, 0x90000BA, 0x90000B1,
+        0x90000A9, 0xA000140, 0xA00012F, 0xA00011E, 0xA00010C, 0xB000202, 0xB000179, 0x8000010,
+        0xA00014F, 0x90000C7, 0x90000C5, 0x90000BF, 0x90000BD, 0x90000B5, 0x90000AE, 0xA00014D,
+        0xA000141, 0xA000131, 0xA000121, 0xA000113, 0xB000209, 0xB00017B, 0xB000173, 0x800000B,
+        0xB00029C, 0x90000B8, 0x90000B7, 0x90000B3, 0x90000AF, 0xA000158, 0xA00014B, 0xA00013A,
+        0xA000130, 0xA000122, 0xA000115, 0xB000212, 0xB00017F, 0xB000175, 0xB00016E, 0x800000A,
+        0xB00028C, 0xA00015A, 0x90000AB, 0x90000A8, 0x90000A4, 0xA00013E, 0xA000135, 0xA00012B,
+        0xA00011F, 0xA000114, 0xA000107, 0xB000201, 0xB000177, 0xB000170, 0xB00016A, 0x8000006,
+        0xB000288, 0xA000142, 0xA00013C, 0xA000138, 0xA000133, 0xA00012E, 0xA000124, 0xA00011C,
+        0xA00010D, 0xA000105, 0xB000200, 0xB000178, 0xB000172, 0xB00016C, 0xB000167, 0x8000004,
+        0xB00026C, 0xA00012C, 0xA000128, 0xA000126, 0xA000120, 0xA00011A, 0xA000111, 0xA00010A,
+        0xB000203, 0xB00017C, 0xB000176, 0xB000171, 0xB00016D, 0xB000169, 0xB000165, 0x8000002,
+        0xC000409, 0xA000118, 0xA000116, 0xA000112, 0xA00010B, 0xA000108, 0xA000103, 0xB00017E,
+        0xB00017A, 0xB000174, 0xB00016F, 0xB00016B, 0xB000168, 0xB000166, 0xB000164, 0x8000000,
+        0x800002B, 0x7000014, 0x7000013, 0x7000011, 0x700000F, 0x700000D, 0x700000B, 0x7000009,
+        0x7000007, 0x7000006, 0x7000004, 0x8000007, 0x8000005, 0x8000003, 0x8000001, 0x4000003,
+    ];
+}
+

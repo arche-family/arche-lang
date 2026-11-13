@@ -1,0 +1,51 @@
+// test: run
+// spec: audio.vorbis
+// stage0: skip
+// stdout: q2-stereo-44k.ogg 44100 Hz 2 ch 87944 samples, within 2 of ffmpeg's
+// stdout: q8-mono-48k.ogg 48000 Hz 1 ch 28672 samples, within 2 of ffmpeg's
+// stdout: clicks-q-1-stereo-22k.ogg 22050 Hz 2 ch 35328 samples, within 2 of ffmpeg's
+// stdout: noise-q5-stereo-44k.ogg 44100 Hz 2 ch 35328 samples, within 2 of ffmpeg's
+// stdout: native-stereo-44k.ogg 44100 Hz 2 ch 45056 samples, within 2 of ffmpeg's
+// stdout: sweep-q0-6ch-44k.ogg 44100 Hz 6 ch 78612 samples, within 2 of ffmpeg's
+import alloc;
+import audio.vorbis;
+import std;
+import _compare;
+
+// Ogg Vorbis files of _media (make.sh), each decoded and compared with
+// ffmpeg's decoding (_compare), or libvorbis's where ffmpeg's departs from
+// the specification: libvorbis at qualities -1 to 8, mono, stereo and six
+// channels, short blocks, noise; and ffmpeg's own encoder's.
+
+/// One file's line.
+fn show(sys: &mut std.System, name: str) -> !void {
+    var path = alloc.String.init(sys.alloc);
+    path.push_str("_media/");
+    path.push_str(name);
+    let bytes = try sys.fs.read_bytes(path.view(), sys.alloc);
+    match vorbis.decode(bytes.items(), max_samples: 1 << 24, sys.alloc) {
+        ok(d) => {
+            try _compare.compare(sys, name: name, rate: d.rate, channels: d.channels, samples: d.samples.items());
+        }
+        err(e) => {
+            sys.stdout.write(name);
+            if e == vorbis.VorbisError.Unsupported {
+                sys.stdout.write(" refused: unsupported\n");
+            } else if e == vorbis.VorbisError.TooLarge {
+                sys.stdout.write(" refused: too large\n");
+            } else {
+                sys.stdout.write(" refused\n");
+            }
+        }
+    }
+}
+
+/// Every file's line.
+fn main(sys: &mut std.System) -> !void {
+    try show(sys, name: "q2-stereo-44k.ogg");
+    try show(sys, name: "q8-mono-48k.ogg");
+    try show(sys, name: "clicks-q-1-stereo-22k.ogg");
+    try show(sys, name: "noise-q5-stereo-44k.ogg");
+    try show(sys, name: "native-stereo-44k.ogg");
+    try show(sys, name: "sweep-q0-6ch-44k.ogg");
+}

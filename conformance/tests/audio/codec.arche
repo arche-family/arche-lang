@@ -1,0 +1,99 @@
+// test: run
+// spec: audio
+// stage0: skip
+// stdout: chord-stereo-48k-24.flac: Flac 48000 Hz 2 ch
+// stdout: q8-mono-48k.ogg: Vorbis 48000 Hz 1 ch
+// stdout: cbr64-mono-32k.mp3: Mp3 32000 Hz 1 ch
+// stdout: id3-stereo-22k.mp3: Mp3 22050 Hz 2 ch
+// stdout: not a music file: refused
+// stdout: too many samples: refused
+// stdout: cut short and damaged: no panic
+/// audio.codec (arche-os docs/sprints.md T9): a file of each format told
+/// apart by its first bytes and decoded alike; one of none refused, one
+/// larger than allowed refused; and every file cut at many places, and
+/// with bytes changed, decoded or refused, never a panic.
+import alloc;
+import audio.codec;
+import std;
+
+const FILES: str = "chord-stereo-48k-24.flac q8-mono-48k.ogg cbr64-mono-32k.mp3 id3-stereo-22k.mp3";
+
+fn format_name(f: codec.Format) -> str {
+    match f {
+        .Flac => { return "Flac"; }
+        .Vorbis => { return "Vorbis"; }
+        .Mp3 => { return "Mp3"; }
+    }
+}
+
+/// The bytes of a test file.
+fn media(sys: &mut std.System, name: str, a: alloc.Allocator) -> alloc.List(u8) {
+    var path = alloc.String.from("conformance/tests/audio/_media/", a);
+    path.push_str(name);
+    if not sys.fs.exists(path.view()) {
+        // The runner may run the test from its own folder.
+        path = alloc.String.from("_media/", a);
+        path.push_str(name);
+    }
+    return sys.fs.read_bytes(path.view(), a) catch panic("no test file");
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    var all = alloc.List(alloc.List(u8)).init(a);
+    var at: usize = 0;
+    let names = FILES;
+    while at < names.len() {
+        var end = at;
+        while end < names.len() and names.bytes()[end] != ' ' {
+            end += 1;
+        }
+        let name = names[at..end];
+        let bytes = media(sys, name: name, a: a);
+        match codec.decode(bytes.items(), max_samples: 10000000, a: a) {
+            ok(d) => {
+                sys.stdout.write(name);
+                sys.stdout.write(": ");
+                sys.stdout.write(format_name(d.format));
+                sys.stdout.write(" ");
+                sys.stdout.write_u64(d.rate as u64);
+                sys.stdout.write(" Hz ");
+                sys.stdout.write_u64(d.channels as u64);
+                sys.stdout.write(" ch\n");
+            }
+            err(_) => {
+                sys.stdout.write(name);
+                sys.stdout.write(": not decoded\n");
+            }
+        }
+        all.push(bytes);
+        at = end + 1;
+    }
+    let text = "RIFF but not a music file at all";
+    match codec.decode(text.bytes(), max_samples: 10000000, a: a) {
+        ok(_) => { sys.stdout.write("not a music file: decoded\n"); }
+        err(_) => { sys.stdout.write("not a music file: refused\n"); }
+    }
+    match codec.decode(all.items()[0].items(), max_samples: 100, a: a) {
+        ok(_) => { sys.stdout.write("too many samples: decoded\n"); }
+        err(_) => { sys.stdout.write("too many samples: refused\n"); }
+    }
+    // Each file cut at 40 places, and with 40 bytes changed in turn.
+    for f in all.items() {
+        let b = f.items();
+        var k: usize = 1;
+        while k <= 40 : (k += 1) {
+            let cut = b.len() * k / 41;
+            _ = codec.decode(b[0..cut], max_samples: 10000000, a: a) catch codec.Decoded { format: codec.Format.Flac, rate: 0, channels: 0, samples: alloc.List(i16).init(a) };
+            var changed = alloc.List(u8).init(a);
+            for x in b {
+                changed.push(x.*);
+            }
+            let place = (b.len() * k / 41 + k * 7) % b.len();
+            let flipped = changed.items()[place] ^ 0x5A;
+            changed.items_mut()[place] = flipped;
+            _ = codec.decode(changed.items(), max_samples: 10000000, a: a) catch codec.Decoded { format: codec.Format.Flac, rate: 0, channels: 0, samples: alloc.List(i16).init(a) };
+        }
+    }
+    sys.stdout.write("cut short and damaged: no panic\n");
+}

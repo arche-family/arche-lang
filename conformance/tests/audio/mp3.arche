@@ -1,0 +1,77 @@
+// test: run
+// spec: audio.mp3
+// stage0: skip
+// stdout: cbr128-joint-44k.mp3 44100 Hz 2 ch 44100 samples, within 2 of ffmpeg's
+// stdout: vbr-clicks-48k.mp3 48000 Hz 2 ch 48000 samples, within 2 of ffmpeg's
+// stdout: cbr64-mono-32k.mp3 32000 Hz 1 ch 16000 samples, within 2 of ffmpeg's
+// stdout: lr-noxing-44k.mp3 44100 Hz 2 ch 39168 samples, within 2 of ffmpeg's
+// stdout: noise320-stereo-44k.mp3 44100 Hz 2 ch 26460 samples, within 2 of ffmpeg's
+// stdout: id3-stereo-22k.mp3 22050 Hz 2 ch 26460 samples, within 2 of ffmpeg's
+// stdout: clicks-stereo-24k.mp3 24000 Hz 2 ch 24000 samples, within 2 of ffmpeg's
+// stdout: vbr-mono-16k.mp3 16000 Hz 1 ch 8000 samples, within 2 of ffmpeg's
+// stdout: mpeg25-mono-8k.mp3 8000 Hz 1 ch 4800 samples, within 2 of ffmpeg's
+// stdout: mpeg25-stereo-11k.mp3 11025 Hz 2 ch 13230 samples, within 2 of ffmpeg's
+// stdout: shine-stereo-44k.mp3 44100 Hz 2 ch 35806 samples, within 2 of ffmpeg's
+// stdout: ms-joint-44k.mp3 44100 Hz 2 ch 44100 samples, within 2 of ffmpeg's
+// stdout: hand-joint-48k.mp3 48000 Hz 2 ch 55296 samples, within 2 of ffmpeg's
+// stdout: hand-dual-32k.mp3 32000 Hz 2 ch 27648 samples, within 2 of ffmpeg's
+// stdout: hand-joint-24k.mp3 24000 Hz 2 ch 27648 samples, within 2 of ffmpeg's
+// stdout: hand-joint-11k.mp3 11025 Hz 2 ch 18432 samples, within 2 of ffmpeg's
+// stdout: hand-mono-44k.mp3 44100 Hz 1 ch 13824 samples, within 2 of ffmpeg's
+import alloc;
+import audio.mp3;
+import std;
+import _compare;
+
+// MP3 files of _media (make.sh), each decoded and compared with ffmpeg's
+// float decoder's decoding (_compare): MPEG-1 at 32, 44.1 and 48 kHz,
+// MPEG-2 at 16, 22.05 and 24 kHz, MPEG-2.5 at 8 and 11.025 kHz; constant
+// and variable bit rates; joint (M/S), plain and mono; short blocks; big
+// values with linbits; Xing frames with LAME's delay and padding, and none;
+// ID3v2 and ID3v1 tags; libmp3lame's and libshine's. make_mp3.py made the
+// hand-* files, for what libmp3lame never writes: intensity stereo
+// (MPEG-1's and MPEG-2's, alone and with M/S), mixed blocks, CRCs, dual
+// channel, block types out of order, scfsi, pre-emphasis, count1 table B,
+// every Huffman table, and quadruples past part2_3_length.
+
+/// One file's line.
+fn show(sys: &mut std.System, name: str) -> !void {
+    var path = alloc.String.init(sys.alloc);
+    path.push_str("_media/");
+    path.push_str(name);
+    let bytes = try sys.fs.read_bytes(path.view(), sys.alloc);
+    match mp3.decode(bytes.items(), max_samples: 1 << 24, sys.alloc) {
+        ok(d) => {
+            try _compare.compare(sys, name: name, rate: d.rate, channels: d.channels, samples: d.samples.items());
+        }
+        err(e) => {
+            sys.stdout.write(name);
+            if e == mp3.Mp3Error.TooLarge {
+                sys.stdout.write(" refused: too large\n");
+            } else {
+                sys.stdout.write(" refused\n");
+            }
+        }
+    }
+}
+
+/// Every file's line.
+fn main(sys: &mut std.System) -> !void {
+    try show(sys, name: "cbr128-joint-44k.mp3");
+    try show(sys, name: "vbr-clicks-48k.mp3");
+    try show(sys, name: "cbr64-mono-32k.mp3");
+    try show(sys, name: "lr-noxing-44k.mp3");
+    try show(sys, name: "noise320-stereo-44k.mp3");
+    try show(sys, name: "id3-stereo-22k.mp3");
+    try show(sys, name: "clicks-stereo-24k.mp3");
+    try show(sys, name: "vbr-mono-16k.mp3");
+    try show(sys, name: "mpeg25-mono-8k.mp3");
+    try show(sys, name: "mpeg25-stereo-11k.mp3");
+    try show(sys, name: "shine-stereo-44k.mp3");
+    try show(sys, name: "ms-joint-44k.mp3");
+    try show(sys, name: "hand-joint-48k.mp3");
+    try show(sys, name: "hand-dual-32k.mp3");
+    try show(sys, name: "hand-joint-24k.mp3");
+    try show(sys, name: "hand-joint-11k.mp3");
+    try show(sys, name: "hand-mono-44k.mp3");
+}
