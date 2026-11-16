@@ -51,6 +51,10 @@ pub const STATX: i64 = 291;
 pub const UNLINKAT: i64 = 35;
 pub const ACCEPT4: i64 = 242;
 pub const GETRANDOM: i64 = 278;
+pub const SETPRIORITY: i64 = 140;
+pub const FCNTL: i64 = 25;
+pub const CLOCK_SETTIME: i64 = 112;
+pub const MADVISE: i64 = 233;
 
 pub const AT_FDCWD: i64 = -100;
 
@@ -98,8 +102,12 @@ pub unsafe fn dup2(from: i64, to: i64) -> i64 {
     return syscall(24, [from, to, 0, 0, 0, 0]);
 }
 
-/// poll, of count entries, waiting at most timeout_ms: ppoll takes a time.
+/// poll, of count entries, waiting at most timeout_ms, or as long as it
+/// takes when that is negative: ppoll takes a time, and no time for that.
 pub unsafe fn poll(fds: i64, count: i64, timeout_ms: i64) -> i64 {
+    if timeout_ms < 0 {
+        return syscall(73, [fds, count, 0, 0, 0, 0]);
+    }
     var spec: [2]i64 = [timeout_ms / 1000, (timeout_ms % 1000) * 1000000];
     return syscall(73, [fds, count, arg(i64, &spec[0] as *i64), 0, 0, 0]);
 }

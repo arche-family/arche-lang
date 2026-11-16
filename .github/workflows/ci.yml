@@ -230,6 +230,17 @@ jobs:
           key: linux-${{ hashFiles('interop/linux/kernel.sh', 'interop/linux/phone.config') }}
       - name: An Arche init as Linux's first process, drawing through DRM, hearing evdev
         run: ./interop/linux/run.sh
+      # S39: the same on ARM64, in QEMU's virt machine, emulated; the kernel
+      # cross-compiled by LLVM.
+      - name: Install LLVM's binutils, lld and QEMU for ARM64
+        run: sudo apt-get install -y clang lld llvm qemu-system-arm
+      - name: The phone's Linux kernel for ARM64, kept between runs
+        uses: actions/cache@v4
+        with:
+          path: build/linux/Image-aarch64-*
+          key: linux-aarch64-${{ hashFiles('interop/linux/kernel.sh', 'interop/linux/phone.config', 'interop/linux/phone-aarch64.config', 'interop/linux/patches/*') }}
+      - name: The Arche init on ARM64, drawing through DRM, hearing evdev
+        run: ./interop/linux/run.sh aarch64
 
   # docs/sprints.md S24, S25: the build driver and the package manager. A
   # build from the cache is bit-identical to a clean one, every conformance

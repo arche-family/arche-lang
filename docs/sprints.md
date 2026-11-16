@@ -2,9 +2,9 @@
 
 > 2026-11-10 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S39.
+**Joriy sprint:** yo'q. Ochiq sprintlar ikkita: S19 (Windows) va S37 (macOS). Ikkalasi ham o'z mashinasini kutadi.
 
-**Yopilgan:** S0–S36, S38, S40. Til yakuniy qabuldan o'tdi (S34).
+**Yopilgan:** S0–S36, S38–S40. Til yakuniy qabuldan o'tdi (S34).
 
 - Compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da; full-Arche paketlarida generics (monomorphization), comptime interpreter, interface'lar (`impl`, `where`, `&dyn`), `for`, closure'lar (`&dyn fn(P) -> R`), `region` (arena, E0901), `unsafe` va raw pointer'lar, `if`/`match` ifoda sifatida, labeled loop'lar, `f32`/`f64`, `requires`/`ensures`, `nopanic` va error return trace ishlaydi.
 - Manifest (`package.arche`) o'qiladi: `needs` (E0801), `strict_unsafe` (E0920), `panic_handler`, xato manifest E0802/E0803.
@@ -582,11 +582,25 @@ S38 yopildi: Nimadir world'idagi Arche ilovalari (`arche-app`, `arche-bindings`)
 
 **Qabul:** WASM spec testsuite'i ARM64 JIT bilan o'tadi; QEMU aarch64'da Linux kernel ustida Arche `init` DRM framebuffer'ga matn chizadi va evdev'dan input oladi.
 
-Qilingani (sprint davom etmoqda):
+Qilingani:
 - JIT ikki qismga bo'lindi. `lib/wasm/jit.arche`da hamma protsessorga umumiy qism qoldi: kontekst, exit'lar, `Asm`, `length`. Mashina kodi `wasm.jit_arch` modulida. Uning faylini compiler target'ga qarab tanlaydi, `std.linux`nikidek (`compiler/program.arche`, `jit_arch_file`): x86-64 uchun `jit_arch.arche`, ARM64 uchun `jit_arch-aarch64.arche`. x86-64'ning kodi o'zgarmadi: spec testsuite'ining 3439 modulida JIT avvalgi baytlarni yozadi. Region'ga kirish (`jit.enter`) va yozilgan kodni protsessorga ko'rsatish (`jit.sync`) ham shu modulga o'tdi. x86-64'da bular `call` va hech narsa. ARM64'da `blr`, keyin `dc cvau`, `ic ivau`, `dsb ish` va `isb`; cache qatorining o'lchami `CTR_EL0`dan olinadi.
 - ARM64 JIT x86-64'niki compile qiladigan instruksiyalarning hammasini o'sha yo'l bilan compile qiladi. Chaqiruv AAPCS64 bo'yicha. Frame, memory, uning o'lchami va kontekst x19–x22'da turadi: bu registrlarni AAPCS64 chaqiruvlar orasida saqlaydi. Stack 16 baytga tekis qoladi. Instruksiyaga sig'magan immediate movz/movk bilan yuklanadi, sig'magan offset esa x17 orqali qo'shiladi. pc'larga sakrash `b` bilan (±128 MiB). Float'lar odatdagi FPCR bilan hisoblanadi, shuning uchun NaN'lar WASM'ning canonical va arithmetic qoidalariga mos chiqadi.
 - Spec testsuite'i (27416 tekshiruv) aarch64'da QEMU'ning user mode'ida interpreter'da ham, JIT bilan ham o'tadi, debug va release build'da. Mashina kodi x86-64'dagi kabi 368884 marta ishlaydi va interpreter'ga o'sha 135562 instruksiyani beradi. `spec.sh` endi JIT haqiqatan ishlaganini ham tekshiradi. CI'ning `cross` job'iga (aarch64) shu qadam qo'shildi.
 - `wasm/main.arche` kod region'ini x86-64'ning `mmap` raqami (9) bilan so'rardi; aarch64'da bu boshqa syscall bo'lgani uchun region berilmas va `--jit` indamay interpreter'da ishlardi. Endi `linux.MMAP` bilan so'raydi (arche-os'ning `phone/host.arche`ida ham). `wasm/spec.sh` mashina kodi ishlamagan JIT ishga tushishini xato deb biladi.
+- ARM64 uchun Linux: `interop/linux/kernel.sh aarch64` QEMU'ning `virt` mashinasi uchun kernel build qiladi. Asos — arm64 defconfig (modullarsiz) va `virt.config`, ustidan `phone.config` va `phone-aarch64.config` (PCI host bridge, virtio-mmio, PL011 konsol, PL031 soat, PSCI). Build LLVM bilan cross-compile, o'z source daraxtida, `Image` sifatida. `interop/linux/run.sh aarch64` Arche `init`ini `qemu-system-aarch64`da (TCG) ishga tushiradi. U DRM'ga chizadi va evdev'dan touch hamda tugma oladi; ekran x86-64'dagi bilan bitma-bit bir xil. CI'ga qadam qo'shildi.
+- `std.linux`ga `SETPRIORITY`, `FCNTL`, `CLOCK_SETTIME` va `MADVISE` konstantalari qo'shildi. aarch64 va riscv64'da `poll` timeout manfiy bo'lsa cheksiz kutadi (ppoll'ga vaqt berilmaydi). arche-os telefon kodidagi x86-64 syscall raqamlari shu konstantalarga o'tdi.
+- Telefon aarch64'da (arche-os T9): `phone/build.sh aarch64` uni `build/phone-aarch64`ga build qiladi, iwd esa Ubuntu'ning arm64 paketlaridan olinadi. `tests/phone-arm64.sh` telefonni emulatsiyada sinaydi:
+  - bosh ekran x86-64'dagi golden'ga teng;
+  - kalkulyator ARM64 JIT'ning mashina kodi bilan javob beradi;
+  - Wi-Fi tarmog'iga ulanadi;
+  - power tugmasi (virt'ning `gpio-keys`i) telefonni uxlatadi, ilovaning alarm'i uni uyg'otadi.
+
+  `PHONE_ARCH=aarch64 ./phone.sh` telefonni oynada ochadi.
+
+S39 yopildi: qabul bajarildi. WASM spec testsuite'i ARM64 JIT bilan o'tadi. QEMU aarch64'da Linux ustida Arche `init` DRM'ga chizadi va evdev'dan input oladi, telefonning o'zi ham to'liq yuklanadi. Qolganlar:
+- JIT'da W^X yo'q: region bir vaqtda yoziladi va bajariladi.
+- riscv64 uchun JIT yo'q.
+- aarch64 hozircha faqat emulatsiyada (KVM'siz) sinalgan; haqiqiy qurilma arche-os T9'da.
 
 ### S40. CSS va layout, Nimadir'nikidek
 

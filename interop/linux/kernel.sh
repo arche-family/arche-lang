@@ -7,12 +7,27 @@
 # only when the version, the config or the patches change. Prints the
 # bzImage's path.
 #
+# With aarch64 as its argument (S39), the kernel for QEMU's virt machine
+# on ARM64: arm64's defconfig without its modules (they would all be
+# built in) and virt.config, with phone.config and phone-aarch64.config on
+# top, built by LLVM (clang, lld and LLVM's binutils), in a source tree of
+# its own; prints the Image's path.
+#
 # Needs make, patch, gcc, flex, bison, bc, perl and libelf's headers; KBUILD_TOOLS
 # names a directory where they were unpacked without installing them
 # (usr/bin, usr/include, usr/lib/x86_64-linux-gnu), as on a machine
 # without root.
+# Usage: kernel.sh [x86_64|aarch64]
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
+arch=${1:-x86_64}
+case $arch in
+x86_64 | aarch64) ;;
+*)
+    echo "kernel: no $arch, only x86_64 and aarch64" >&2
+    exit 2
+    ;;
+esac
 version=6.12.116
 sha256=cb3ed3dfdd47e6ade49dc933db334fd86e24cadee920da612c262b0e9b6a511b
 dir=${LINUX_DIR:-$here/../../build/linux}
@@ -26,11 +41,18 @@ if ! echo "$sha256  $tarball" | sha256sum -c --status; then
     echo "kernel: linux-$version.tar.xz is not the one kernel.org lists" >&2
     exit 1
 fi
-src=$dir/linux-$version
 patches=$(ls "$here"/patches/*.patch)
 patched=$(cat $patches | sha256sum | cut -c1-16)
-stamp=$(cat "$here/phone.config" $patches | sha256sum | cut -c1-16)
-image=$dir/bzImage-$version-$stamp
+if [ "$arch" = x86_64 ]; then
+    tree=$dir
+    stamp=$(cat "$here/phone.config" $patches | sha256sum | cut -c1-16)
+    image=$dir/bzImage-$version-$stamp
+else
+    tree=$dir/aarch64
+    stamp=$(cat "$here/phone.config" "$here/phone-aarch64.config" $patches | sha256sum | cut -c1-16)
+    image=$dir/Image-aarch64-$version-$stamp
+fi
+src=$tree/linux-$version
 if [ -f "$image" ]; then
     echo "$image"
     exit 0
@@ -41,7 +63,8 @@ if [ -d "$src" ] && [ "$(cat "$src/.arche-patches" 2>/dev/null)" != "$patched" ]
     rm -rf "$src"
 fi
 if [ ! -d "$src" ]; then
-    tar -xJf "$tarball" -C "$dir"
+    mkdir -p "$tree"
+    tar -xJf "$tarball" -C "$tree"
     for p in $patches; do
         patch -s -p1 -d "$src" < "$p"
     done
@@ -55,12 +78,27 @@ if [ -n "${KBUILD_TOOLS:-}" ]; then
     set -- HOSTCFLAGS="-I$KBUILD_TOOLS/usr/include" HOSTLDFLAGS="-L$KBUILD_TOOLS/usr/lib/x86_64-linux-gnu"
 fi
 cd "$src"
-make -s x86_64_defconfig kvm_guest.config "$@" > "$dir/config.log" 2>&1
-scripts/kconfig/merge_config.sh -m .config "$here/phone.config" >> "$dir/config.log" 2>&1
-make -s olddefconfig "$@" >> "$dir/config.log" 2>&1
-if ! make -j"$(nproc)" bzImage "$@" > "$dir/build.log" 2>&1; then
-    tail -20 "$dir/build.log" >&2
-    exit 1
+if [ "$arch" = x86_64 ]; then
+    make -s x86_64_defconfig kvm_guest.config "$@" > "$tree/config.log" 2>&1
+    scripts/kconfig/merge_config.sh -m .config "$here/phone.config" >> "$tree/config.log" 2>&1
+    make -s olddefconfig "$@" >> "$tree/config.log" 2>&1
+    if ! make -j"$(nproc)" bzImage "$@" > "$tree/build.log" 2>&1; then
+        tail -20 "$tree/build.log" >&2
+        exit 1
+    fi
+    cp arch/x86/boot/bzImage "$image"
+else
+    # LLVM cross-compiles for any processor clang knows. LLVM is Linux's
+    # own variable: -21 says the tools are clang-21, ld.lld-21 and so on.
+    set -- "$@" ARCH=arm64 LLVM="${LLVM:-1}"
+    grep -v '=m$' arch/arm64/configs/defconfig > arch/arm64/configs/arche_defconfig
+    make -s arche_defconfig virt.config "$@" > "$tree/config.log" 2>&1
+    scripts/kconfig/merge_config.sh -m .config "$here/phone.config" "$here/phone-aarch64.config" >> "$tree/config.log" 2>&1
+    make -s olddefconfig "$@" >> "$tree/config.log" 2>&1
+    if ! make -j"$(nproc)" Image "$@" > "$tree/build.log" 2>&1; then
+        tail -20 "$tree/build.log" >&2
+        exit 1
+    fi
+    cp arch/arm64/boot/Image "$image"
 fi
-cp arch/x86/boot/bzImage "$image"
 echo "$image"

@@ -6,8 +6,15 @@
 # held to the golden hash below. A touch and a key, sent through QEMU's
 # monitor, come to init through evdev. LINUX_IMAGE names a kernel built
 # already; KBUILD_TOOLS is kernel.sh's.
+#
+# With aarch64 as its argument (S39), the same on ARM64: init built for
+# linux-aarch64, kernel.sh's aarch64 kernel, in qemu-system-aarch64's virt
+# machine, emulated (TCG), its serial console the PL011's; the same
+# devices on its PCI bus, and the same screen, to the bit.
+# Usage: run.sh [x86_64|aarch64]
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
+arch=${1:-x86_64}
 build=${WORK:-$here/../../build/interop}
 mkdir -p "$build"
 work=$(mktemp -d)
@@ -16,20 +23,44 @@ cleanup() {
     rm -rf "$work"
 }
 trap cleanup EXIT
-kernel=${LINUX_IMAGE:-$("$here/kernel.sh")}
-"$here/../../compiler/arche-build" "$here/init.arche" "$build/linux-init"
+kernel=${LINUX_IMAGE:-$("$here/kernel.sh" "$arch")}
+case $arch in
+x86_64)
+    "$here/../../compiler/arche-build" "$here/init.arche" "$build/linux-init"
+    set -- qemu-system-x86_64 -cpu max -vga none
+    console=ttyS0
+    # 30 seconds at most for each step.
+    limit=300
+    ;;
+aarch64)
+    build=$build/aarch64
+    mkdir -p "$build"
+    ARCHE_TARGET=linux-aarch64 "$here/../../compiler/arche-build" "$here/init.arche" "$build/linux-init"
+    # pauth-impdef: QEMU's own hash for pointer authentication, which it
+    # emulates many times faster than the architected one.
+    set -- qemu-system-aarch64 -machine virt -cpu max,pauth-impdef=on -smp 2
+    console=ttyAMA0
+    # Emulated: three minutes at most for each step.
+    limit=1800
+    ;;
+*)
+    echo "linux: no $arch, only x86_64 and aarch64" >&2
+    exit 2
+    ;;
+esac
 python3 -I "$here/cpio.py" "$work/initramfs" "init=$build/linux-init" "font.ttf=$here/../fonts/DejaVuSans.ttf"
-qemu-system-x86_64 -cpu max -m 256M -kernel "$kernel" -initrd "$work/initramfs" \
-    -append "console=ttyS0 rdinit=/init panic=-1 quiet" \
-    -vga none -device virtio-gpu-pci,xres=720,yres=1440 -device virtio-tablet-pci -device virtio-keyboard-pci \
+"$@" -m 256M -kernel "$kernel" -initrd "$work/initramfs" \
+    -append "console=$console rdinit=/init panic=-1 quiet" \
+    -device virtio-gpu-pci,xres=720,yres=1440 -device virtio-tablet-pci -device virtio-keyboard-pci \
     -display none -serial stdio -qmp "unix:$work/qmp,server,nowait" -no-reboot > "$work/serial" 2>&1 &
 qemu=$!
-# Waits until the serial console says $1, for at most 30 seconds.
+# Waits until the serial console says $1, for at most $limit tenths of a
+# second.
 wait_for() {
     tries=0
     while ! grep -qF "$1" "$work/serial" 2>/dev/null; do
         tries=$((tries + 1))
-        if [ "$tries" -gt 300 ] || ! kill -0 "$qemu" 2>/dev/null; then
+        if [ "$tries" -gt "$limit" ] || ! kill -0 "$qemu" 2>/dev/null; then
             echo "linux: never said: $1"
             cat "$work/serial"
             exit 1
@@ -80,4 +111,4 @@ if [ "$hash" != "$want" ]; then
     fine=0
 fi
 [ "$fine" -eq 1 ] || exit 1
-echo "linux: Arche's init drew on the screen through DRM and heard a touch and a key through evdev"
+echo "linux: Arche's init drew on the screen through DRM and heard a touch and a key through evdev ($arch)"
