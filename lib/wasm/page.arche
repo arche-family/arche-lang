@@ -18,10 +18,12 @@
 ///
 /// The tree holds the fonts by value, as a view cannot be held (A§5.4):
 /// Laying(F) is the tree with the fonts F, and it implements
-/// layout.tree.LayoutTree for each fonts type this module knows, Approx
-/// for now (a one-line impl per method, the work is generic).
+/// layout.tree.LayoutTree for each fonts type this module knows: Approx,
+/// and Face, a TrueType font's (a one-line impl per method, the work is
+/// generic).
 import alloc;
 import core.utf8;
+import font as truetype;
 import layout.compute as compute;
 import layout.compute.block as block;
 import layout.compute.flexbox as flexbox;
@@ -346,6 +348,582 @@ impl Fonts for Approx {
     }
 }
 
+// ---- a TrueType font -------------------------------------------------------
+
+/// Fonts from a TrueType font (Face): text measured as a renderer that
+/// draws with lib/font draws it, each run at its size on the screen in
+/// whole pixels (rounded down), scale screen pixels to a layout pixel,
+/// the pen in 1/256 of a pixel moved as font.place moves it. Lines break
+/// as Nimadir's renderer breaks them with its real fonts (egui's galleys,
+/// gui_dom.rs): at spaces, and a word too wide for a line of its own
+/// between its letters; each line is the paragraph's line height. Where
+/// a line wraps, its spaces hang past its end. One font draws every run,
+/// bold, italic and monospace too.
+pub type Face = struct {
+    /// The font, its one item: lent to a layout, which holds its fonts by
+    /// value (A§5.4), and given back (lay_out_face).
+    fonts: alloc.List(truetype.Font),
+    /// Screen pixels to a layout pixel.
+    pub scale: f32,
+}
+
+/// A Face of f, drawn scale screen pixels to a layout pixel.
+pub fn face_of(f: truetype.Font, scale: f32, a: alloc.Allocator) -> Face {
+    var fonts = alloc.List(truetype.Font).init(a);
+    fonts.push(f);
+    return Face { fonts: fonts, scale: scale };
+}
+
+/// The face's font.
+pub fn face_font(face: &Face) -> &truetype.Font {
+    return &face.fonts.items()[0];
+}
+
+/// The size text of font f is drawn at on the screen, in whole pixels,
+/// rounded down as a phone sizes the rest of its text; 0 draws nothing.
+pub fn pixel_size(face: &Face, f: &Font) -> u32 {
+    let s = (f.size * face.scale + 0.001).floor();
+    if not (s >= 1.0) {
+        return 0;
+    }
+    if s > 1024.0 {
+        return 1024;
+    }
+    return s as u32;
+}
+
+/// A layout width as the screen's, in 1/256 of a pixel, and the 2/256
+/// that text measured at that width may come to over it when rounded.
+pub fn screen_width(face: &Face, width: f32) -> i64 {
+    return (width * face.scale * 256.0).floor() as% i64 + 2;
+}
+
+/// A length in 1/256 of a screen pixel as the layout's.
+fn layout_px(face: &Face, v: i64) -> f32 {
+    return (v as f32) / (256.0 * face.scale);
+}
+
+/// v font units at size pixels to the em, in 1/256 of a pixel, rounded as
+/// font.place rounds them.
+fn font_units(f: &truetype.Font, v: i32, size: u32) -> i64 {
+    let n = (v as i64) * (size as i64) * 256;
+    let d = f.units_per_em as i64;
+    if n >= 0 {
+        return (n + d / 2) / d;
+    }
+    return 0 - ((d / 2 - n) / d);
+}
+
+/// What a glyph is to a line: a letter, a space, a line break; and what
+/// walk says when a line ends.
+const LETTER: u8 = 0;
+const SPACE: u8 = 1;
+const BREAK: u8 = 2;
+const LINE_END: u8 = 3;
+
+/// A glyph read from a run (Next): what it is, where its bytes end, the
+/// glyph, how far it moves the pen and how far kerning moves it first,
+/// in 1/256 of a screen pixel.
+type Next = struct {
+    kind: u8,
+    to: usize,
+    g: u32,
+    adv: i64,
+    kern: i64,
+}
+
+/// The glyph at byte at of run r of p, kerned against prev, the glyph
+/// before it on its line in the same run, if any. Bytes that are not
+/// UTF-8 are U+FFFD, as font.place draws them.
+fn read(face: &Face, f: &truetype.Font, p: &Paragraph, r: usize, at: usize, prev: ?u32) -> Next {
+    let run = &p.runs.items()[r];
+    let b = run.text.view().bytes();
+    var cp: u32 = 0xFFFD;
+    var len: usize = 1;
+    match utf8.decode(b, at) {
+        some(d) => {
+            cp = d.code;
+            len = d.len;
+        }
+        none => { }
+    }
+    if cp == '\n' as u32 {
+        return Next { kind: BREAK, to: at + len, g: 0, adv: 0, kern: 0 };
+    }
+    var kind = LETTER;
+    if cp == ' ' as u32 or cp == '\t' as u32 {
+        kind = SPACE;
+    }
+    let size = pixel_size(face, f: &run.font);
+    let g = truetype.glyph_of(f, cp: cp);
+    let spacing = values.round(run.font.letter_spacing * face.scale * 256.0) as% i64;
+    let adv = font_units(f, v: truetype.advance(f, g: g), size: size) + spacing;
+    var kern: i64 = 0;
+    match prev {
+        some(left) => { kern = font_units(f, v: truetype.kerning(f, left: left, right: g), size: size); }
+        none => { }
+    }
+    return Next { kind: kind, to: at + len, g: g, adv: adv, kern: kern };
+}
+
+/// How far "…" moves the pen in font fo.
+fn ellipsis_advance(face: &Face, f: &truetype.Font, fo: &Font) -> i64 {
+    let g = truetype.glyph_of(f, cp: 0x2026);
+    return font_units(f, v: truetype.advance(f, g: g), size: pixel_size(face, f: fo));
+}
+
+/// What walk tells: a glyph placed, its kind, where it is (its run, its
+/// bytes, its line, its pen after kerning, how far it moves the pen); or
+/// with kind LINE_END, that line ended, w its width.
+type Step = struct {
+    kind: u8,
+    run: u32,
+    from: u32,
+    to: u32,
+    line: u32,
+    x: i64,
+    w: i64,
+}
+
+/// Where walk is: the line, the pen, where its last letter ends, whether
+/// anything is on it, and the run and glyph placed last.
+type Pen = struct {
+    line: u32,
+    x: i64,
+    content_end: i64,
+    has: bool,
+    last_run: usize,
+    last_g: u32,
+}
+
+/// The glyph before the next on pen's line, when it is of run r.
+fn before(pen: &Pen, r: usize) -> ?u32 {
+    if pen.has and pen.last_run == r {
+        return some(pen.last_g);
+    }
+    return none;
+}
+
+/// A line ended at width w; the next begins.
+fn next_line(pen: &mut Pen, w: i64, sink: &dyn fn(Step)) {
+    sink(Step { kind: LINE_END, run: 0, from: 0, to: 0, line: pen.line, x: 0, w: w });
+    pen.line += 1;
+    pen.x = 0;
+    pen.content_end = 0;
+    pen.has = false;
+    pen.last_run = NONE as usize;
+}
+
+/// The run and byte where the next glyph is, from (r, at): past the ends
+/// of runs; r is p.runs.len() at the end.
+fn settle(p: &Paragraph, r: usize, at: usize) -> [2]usize {
+    var rr = r;
+    var aa = at;
+    while rr < p.runs.len() and aa >= p.runs.items()[rr].text.len() {
+        rr += 1;
+        aa = 0;
+    }
+    return [rr, aa];
+}
+
+/// p's glyphs placed in lines at most limit wide (1/256 of a screen
+/// pixel; none for no limit), each told to sink in order, and each line's
+/// end with its width: up to its last letter where it wraps, up to its
+/// pen where it breaks or the text ends.
+fn walk(face: &Face, p: &Paragraph, limit: ?i64, sink: &dyn fn(Step)) {
+    let f = face_font(face);
+    var pen = Pen { line: 0, x: 0, content_end: 0, has: false, last_run: NONE as usize, last_g: 0 };
+    var r: usize = 0;
+    var at: usize = 0;
+    while true {
+        let here = settle(p, r: r, at: at);
+        r = here[0];
+        at = here[1];
+        if r >= p.runs.len() {
+            break;
+        }
+        let c = read(face, f: f, p: p, r: r, at: at, prev: before(&pen, r: r));
+        if c.kind == BREAK {
+            sink(Step { kind: BREAK, run: r as u32, from: at as u32, to: c.to as u32, line: pen.line, x: pen.x, w: 0 });
+            next_line(&mut pen, w: pen.x, sink: sink);
+            at = c.to;
+            continue;
+        }
+        if c.kind == SPACE {
+            let sx = pen.x + c.kern;
+            sink(Step { kind: SPACE, run: r as u32, from: at as u32, to: c.to as u32, line: pen.line, x: sx, w: c.adv });
+            pen.x = sx + c.adv;
+            pen.has = true;
+            pen.last_run = r;
+            pen.last_g = c.g;
+            at = c.to;
+            continue;
+        }
+        // A word: how wide it is placed after what the line has.
+        var wr = r;
+        var wa = at;
+        var w_prev = before(&pen, r: r);
+        var wide: i64 = 0;
+        var first_kern: i64 = 0;
+        var first = true;
+        while true {
+            let w_here = settle(p, r: wr, at: wa);
+            if w_here[0] != wr {
+                w_prev = none;
+            }
+            wr = w_here[0];
+            wa = w_here[1];
+            if wr >= p.runs.len() {
+                break;
+            }
+            let d = read(face, f: f, p: p, r: wr, at: wa, prev: w_prev);
+            if d.kind != LETTER {
+                break;
+            }
+            if first {
+                first_kern = d.kern;
+                first = false;
+            }
+            wide = wide + d.kern + d.adv;
+            w_prev = some(d.g);
+            wa = d.to;
+        }
+        var overlong = false;
+        match limit {
+            some(l) => {
+                if pen.has and pen.x + wide > l {
+                    next_line(&mut pen, w: pen.content_end, sink: sink);
+                    wide = wide - first_kern;
+                }
+                overlong = pen.x + wide > l;
+            }
+            none => { }
+        }
+        // Its letters, a line broken between them where one is too wide.
+        while true {
+            let l_here = settle(p, r: r, at: at);
+            r = l_here[0];
+            at = l_here[1];
+            if r >= p.runs.len() {
+                break;
+            }
+            var d = read(face, f: f, p: p, r: r, at: at, prev: before(&pen, r: r));
+            if d.kind != LETTER {
+                break;
+            }
+            if overlong and pen.has {
+                match limit {
+                    some(l) => {
+                        if pen.x + d.kern + d.adv > l {
+                            next_line(&mut pen, w: pen.content_end, sink: sink);
+                            d.kern = 0;
+                        }
+                    }
+                    none => { }
+                }
+            }
+            let lx = pen.x + d.kern;
+            sink(Step { kind: LETTER, run: r as u32, from: at as u32, to: d.to as u32, line: pen.line, x: lx, w: d.adv });
+            pen.x = lx + d.adv;
+            pen.content_end = pen.x;
+            pen.has = true;
+            pen.last_run = r;
+            pen.last_g = d.g;
+            at = d.to;
+        }
+    }
+    sink(Step { kind: LINE_END, run: 0, from: 0, to: 0, line: pen.line, x: 0, w: pen.x });
+}
+
+/// The widest line and how many there are, for p at most limit wide.
+fn extent(face: &Face, p: &Paragraph, limit: ?i64) -> [2]i64 {
+    var widest: i64 = 0;
+    var lines: i64 = 0;
+    let sink = fn [&mut widest, &mut lines](s: Step) {
+        if s.kind == LINE_END {
+            if s.w > widest {
+                widest = s.w;
+            }
+            lines += 1;
+        }
+    };
+    walk(face, p: p, limit: limit, sink: &sink);
+    return [widest, lines];
+}
+
+/// Where the line of p cut with "…" at limit ends, and the run whose font
+/// draws the "…": the last letter of its first line, wrapped at limit,
+/// that leaves room for it.
+fn cut_at(face: &Face, p: &Paragraph, limit: i64) -> [2]i64 {
+    let f = face_font(face);
+    var end: i64 = 0;
+    var by: i64 = 0;
+    let sink = fn [face, f, p, limit, &mut end, &mut by](s: Step) {
+        if s.kind == LETTER and s.line == 0 {
+            let room = limit - ellipsis_advance(face, f: f, fo: &p.runs.items()[s.run as usize].font);
+            if s.x + s.w <= room {
+                end = s.x + s.w;
+                by = s.run as i64;
+            }
+        }
+    };
+    walk(face, p: p, limit: some(limit), sink: &sink);
+    return [end, by];
+}
+
+/// Whether p, as wide as it likes, is one line no wider than limit: not
+/// cut.
+fn fits_whole(face: &Face, p: &Paragraph, limit: i64) -> bool {
+    let e = extent(face, p: p, limit: none);
+    return e[1] == 1 and e[0] <= limit;
+}
+
+/// How wide p may be, in 1/256 of a screen pixel, at a layout width of
+/// width: no limit when it neither wraps nor is cut; at least a pixel.
+fn limit_of(face: &Face, p: &Paragraph, width: ?f32) -> ?i64 {
+    if not (p.wrap or p.ellipsis) {
+        return none;
+    }
+    match width {
+        some(w) => { return some(screen_width(face, width: util.f32_max(a: w, b: 1.0))); }
+        none => { return none; }
+    }
+}
+
+/// One piece of a paragraph laid out by a Face (Span): bytes from to to
+/// of a run's text on one line, its pen from x, in 1/256 of a screen
+/// pixel from the line's start, w wide; or, with ellipsis, the "…" that
+/// ends a cut line, in the run's font.
+pub type Span = struct {
+    pub run: u32,
+    pub from: u32,
+    pub to: u32,
+    pub line: u32,
+    pub x: i64,
+    pub w: i64,
+    pub ellipsis: bool,
+}
+
+/// A paragraph laid out by a Face (Shaped): its spans in order, and each
+/// line's width, in 1/256 of a screen pixel; limit is how wide it was
+/// laid out, the width lines are aligned in.
+pub type Shaped = struct {
+    pub spans: alloc.List(Span),
+    pub widths: alloc.List(i64),
+    pub limit: i64,
+}
+
+/// p laid out width wide, as the Face measured it, for a renderer to draw:
+/// glyphs of a run next to each other on a line make one span, a line
+/// break none.
+pub fn shape(face: &Face, p: &Paragraph, width: f32, a: alloc.Allocator) -> Shaped {
+    let limit = limit_of(face, p: p, width: some(width));
+    var steps = alloc.List(Step).init(a);
+    var cut: i64 = -1;
+    var cut_run: u32 = 0;
+    var lim = limit;
+    if p.ellipsis {
+        match limit {
+            some(l) => {
+                if not fits_whole(face, p: p, limit: l) {
+                    let c = cut_at(face, p: p, limit: l);
+                    cut = c[0];
+                    cut_run = c[1] as u32;
+                }
+            }
+            none => { }
+        }
+        if cut < 0 {
+            lim = none;
+        }
+    }
+    let sink = fn [&mut steps](s: Step) {
+        steps.push(s);
+    };
+    walk(face, p: p, limit: lim, sink: &sink);
+    var spans = alloc.List(Span).init(a);
+    var widths = alloc.List(i64).init(a);
+    for s in steps.items() {
+        if s.kind == LINE_END {
+            if cut < 0 or s.line == 0 {
+                widths.push(s.w);
+            }
+            continue;
+        }
+        if s.kind == BREAK {
+            continue;
+        }
+        if cut >= 0 and (s.line > 0 or s.x + s.w > cut) {
+            continue;
+        }
+        let n = spans.len();
+        if n > 0 {
+            let last = spans.items()[n - 1];
+            if last.run == s.run and last.line == s.line and last.to == s.from and last.x + last.w == s.x {
+                spans.items_mut()[n - 1].to = s.to;
+                spans.items_mut()[n - 1].w = last.w + s.w;
+                continue;
+            }
+        }
+        spans.push(Span { run: s.run, from: s.from, to: s.to, line: s.line, x: s.x, w: s.w, ellipsis: false });
+    }
+    if cut >= 0 {
+        let f = face_font(face);
+        let ew = ellipsis_advance(face, f: f, fo: &p.runs.items()[cut_run as usize].font);
+        spans.push(Span { run: cut_run, from: 0, to: 0, line: 0, x: cut, w: ew, ellipsis: true });
+        widths.clear();
+        widths.push(cut + ew);
+    }
+    var at: i64 = 0;
+    match limit {
+        some(l) => { at = l; }
+        none => {
+            for w in widths.items() {
+                if w.* > at {
+                    at = w.*;
+                }
+            }
+        }
+    }
+    return Shaped { spans: spans, widths: widths, limit: at };
+}
+
+/// How far a line w wide is from the left of a paragraph laid out limit
+/// wide, as p aligns it, in 1/256 of a screen pixel.
+pub fn line_offset(p: &Paragraph, limit: i64, w: i64) -> i64 {
+    match p.align {
+        .Left => { return 0; }
+        .Center => { return (limit - w) / 2; }
+        .Right => { return limit - w; }
+    }
+}
+
+impl Fonts for Face {
+    fn measure(self: &Face, p: &Paragraph, width: ?f32) -> geo.Size(f32) {
+        let limit = limit_of(self, p: p, width: width);
+        if p.ellipsis {
+            match limit {
+                some(l) => {
+                    if not fits_whole(self, p: p, limit: l) {
+                        let c = cut_at(self, p: p, limit: l);
+                        let ew = ellipsis_advance(self, f: face_font(self), fo: &p.runs.items()[c[1] as usize].font);
+                        return geo.Size(f32) { width: layout_px(self, v: c[0] + ew).ceil(), height: p.line_height.ceil() };
+                    }
+                    let whole = extent(self, p: p, limit: none);
+                    return geo.Size(f32) { width: layout_px(self, v: whole[0]).ceil(), height: ((whole[1] as f32) * p.line_height).ceil() };
+                }
+                none => { }
+            }
+        }
+        let e = extent(self, p: p, limit: limit);
+        return geo.Size(f32) { width: layout_px(self, v: e[0]).ceil(), height: ((e[1] as f32) * p.line_height).ceil() };
+    }
+
+    fn min_width(self: &Face, p: &Paragraph) -> f32 {
+        if not p.wrap {
+            return self.measure(p, width: none).width;
+        }
+        // The widest word, its letters together: egui's galley at no width
+        // breaks inside a word, which would make that the widest letter.
+        var widest: i64 = 0;
+        var start: i64 = 0;
+        var in_word = false;
+        let sink = fn [&mut widest, &mut start, &mut in_word](s: Step) {
+            if s.kind == LETTER {
+                if not in_word {
+                    start = s.x;
+                    in_word = true;
+                }
+                if s.x + s.w - start > widest {
+                    widest = s.x + s.w - start;
+                }
+            } else {
+                in_word = false;
+            }
+        };
+        walk(self, p: p, limit: none, sink: &sink);
+        return layout_px(self, v: widest).ceil();
+    }
+
+    fn run_at(self: &Face, p: &Paragraph, width: f32, x: f32, y: f32) -> ?usize {
+        if p.runs.len() == 0 or not (p.line_height > 0.0) {
+            return none;
+        }
+        let limit = limit_of(self, p: p, width: some(width));
+        let e = extent(self, p: p, limit: limit);
+        let lines = e[1];
+        let full = screen_width(self, width: width) - 2;
+        // The text's bounds, its lines aligned, two pixels around.
+        let px = values.round(x * self.scale * 256.0) as% i64;
+        let slack = (2.0 * self.scale * 256.0) as% i64;
+        var left: i64 = 0;
+        match p.align {
+            .Left => { }
+            .Center => { left = (full - e[0]) / 2; }
+            .Right => { left = full - e[0]; }
+        }
+        if px < left - slack or px > left + e[0] + slack or y < -2.0 or y > (lines as f32) * p.line_height + 2.0 {
+            return none;
+        }
+        var want = (y / p.line_height).floor() as% i64;
+        if want < 0 {
+            want = 0;
+        }
+        if want >= lines {
+            want = lines - 1;
+        }
+        // The wanted line's width, for where it is aligned.
+        var line_w: i64 = 0;
+        let widths = fn [want, &mut line_w](s: Step) {
+            if s.kind == LINE_END and (s.line as i64) == want {
+                line_w = s.w;
+            }
+        };
+        walk(self, p: p, limit: limit, sink: &widths);
+        let lx = px - line_offset(p, limit: full, w: line_w);
+        // As egui's cursor: before the first glyph whose middle is past x,
+        // else after the line's last, which is the next one's run.
+        var found: i64 = -1;
+        var after_line = false;
+        var last_on: i64 = -1;
+        let pick = fn [want, lx, &mut found, &mut after_line, &mut last_on](s: Step) {
+            if s.kind == LINE_END or found >= 0 {
+                return;
+            }
+            if (s.line as i64) == want {
+                last_on = s.run as i64;
+                if lx < s.x + s.w / 2 {
+                    found = s.run as i64;
+                }
+            } else if (s.line as i64) > want and last_on >= 0 and not after_line {
+                after_line = true;
+                found = s.run as i64;
+            }
+        };
+        walk(self, p: p, limit: limit, sink: &pick);
+        if found >= 0 {
+            return found as usize;
+        }
+        return p.runs.len() - 1;
+    }
+}
+
+/// Lays doc out as lay_out does, its text measured by face, whose font is
+/// lent to the layout and given back.
+pub fn lay_out_face(doc: &dyn select.Doc, styles: &style.Styles, face: &mut Face, images: &dyn fn(u32) -> ?geo.Size(f32), width: f32, height: f32, a: alloc.Allocator) -> Layout {
+    var lent = Face { fonts: alloc.List(truetype.Font).init(a), scale: face.scale };
+    match face.fonts.pop() {
+        some(f) => { lent.fonts.push(f); }
+        none => { return empty_layout(a); }
+    }
+    var done = laid_out(Face, doc: doc, styles: styles, fonts: lent, images: images, width: width, height: height, compressible: true, a: a);
+    match done.fonts.fonts.pop() {
+        some(f) => { face.fonts.push(f); }
+        none => { }
+    }
+    return done.layout;
+}
+
 // ---- boxes -----------------------------------------------------------------
 
 /// A box on the page, in logical pixels from the page's top-left corner
@@ -552,6 +1130,10 @@ type Tree = struct {
     boxes: alloc.List(TBox),
     by_node: alloc.List(u32),
     names: alloc.Interner,
+    /// Whether an image sized by a percentage of its container gives it
+    /// no min-content width, as a browser's does (compressible replaced
+    /// elements, css-sizing-3): a Face's layout, not Nimadir's.
+    compressible: bool,
     a: alloc.Allocator,
 }
 
@@ -583,15 +1165,27 @@ type Piece = enum {
 /// its text measured by fonts. images gives an image's size by its
 /// image-load number. The layout's memory is a's.
 pub fn lay_out(comptime F: type, doc: &dyn select.Doc, styles: &style.Styles, fonts: F, images: &dyn fn(u32) -> ?geo.Size(f32), width: f32, height: f32, a: alloc.Allocator) -> Layout where F: Fonts {
+    let done = laid_out(F, doc: doc, styles: styles, fonts: fonts, images: images, width: width, height: height, compressible: false, a: a);
+    return done.layout;
+}
+
+/// A layout, and the fonts that measured it, given back.
+type Done(comptime F: type) = struct where F: Fonts {
+    layout: Layout,
+    fonts: F,
+}
+
+/// lay_out's work, the fonts given back with the layout.
+fn laid_out(comptime F: type, doc: &dyn select.Doc, styles: &style.Styles, fonts: F, images: &dyn fn(u32) -> ?geo.Size(f32), width: f32, height: f32, compressible: bool, a: alloc.Allocator) -> Done(F) where F: Fonts {
     var by_node = alloc.List(u32).init(a);
     let size = doc.doc_size();
     var n: u32 = 0;
     while n < size : (n += 1) {
         by_node.push(NONE);
     }
-    var t = Laying(F) { tree: Tree { boxes: alloc.List(TBox).init(a), by_node: by_node, names: alloc.Interner.init(a), a: a }, fonts: fonts };
+    var t = Laying(F) { tree: Tree { boxes: alloc.List(TBox).init(a), by_node: by_node, names: alloc.Interner.init(a), compressible: compressible, a: a }, fonts: fonts };
     if not style.has_style(styles, n: ROOT) {
-        return empty_layout(a);
+        return Done(F) { layout: empty_layout(a), fonts: t.fonts };
     }
     let root = element(&mut t.tree, doc: doc, styles: styles, images: images, id: ROOT);
     let root_id = lt.NodeId.from_usize(root);
@@ -666,7 +1260,7 @@ pub fn lay_out(comptime F: type, doc: &dyn select.Doc, styles: &style.Styles, fo
     }
     let page_w = rects.items()[root].w;
     let page_h = rects.items()[root].h;
-    return Layout { boxes: boxes, by_node: t.tree.by_node, by_text: by_text, width: page_w, height: page_h };
+    return Done(F) { layout: Layout { boxes: boxes, by_node: t.tree.by_node, by_text: by_text, width: page_w, height: page_h }, fonts: t.fonts };
 }
 
 /// A box to place, and its parent's corner on the page.
@@ -1323,10 +1917,11 @@ fn compute_uncached(comptime F: type, t: &mut Laying(F), node: lt.NodeId, inputs
     } else {
         var memo = t.tree.boxes.items()[i].memo;
         var min_w = t.tree.boxes.items()[i].min_width;
+        let compressible = t.tree.compressible;
         let b = &t.tree.boxes.items()[i];
         let fonts: &dyn Fonts = &t.fonts;
-        output = leaf.compute_leaf_layout(inputs, &b.style, fn [b, fonts, &mut memo, &mut min_w](known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
-            return measure_box(b, fonts: fonts, memo: &mut memo, min_w: &mut min_w, known: known, available: available);
+        output = leaf.compute_leaf_layout(inputs, &b.style, fn [b, fonts, compressible, &mut memo, &mut min_w](known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+            return measure_box(b, fonts: fonts, compressible: compressible, memo: &mut memo, min_w: &mut min_w, known: known, available: available);
         });
         t.tree.boxes[i].memo = memo;
         t.tree.boxes[i].min_width = min_w;
@@ -1393,8 +1988,10 @@ fn memo_size(memo: &mut Memo, width: ?f32, p: &Paragraph, fonts: &dyn Fonts) -> 
     return size;
 }
 
-/// What a leaf measures as, given what taffy already knows (measure).
-fn measure_box(b: &TBox, fonts: &dyn Fonts, memo: &mut Memo, min_w: &mut ?f32, known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
+/// What a leaf measures as, given what taffy already knows (measure); a
+/// compressible tree's image sized by a percentage is no width at
+/// min-content.
+fn measure_box(b: &TBox, fonts: &dyn Fonts, compressible: bool, memo: &mut Memo, min_w: &mut ?f32, known: geo.Size(?f32), available: geo.Size(sty.AvailableSpace)) -> geo.Size(f32) {
     match known.width {
         some(kw) => {
             match known.height {
@@ -1446,6 +2043,18 @@ fn measure_box(b: &TBox, fonts: &dyn Fonts, memo: &mut Memo, min_w: &mut ?f32, k
             h = fh;
         }
         .Image { w: iw, h: ih } => {
+            let wide = b.style.size.width.inner;
+            var min_content = false;
+            match available.width {
+                .MinContent => { min_content = true; }
+                _ => { }
+            }
+            if compressible and min_content and (wide.tag() == sty.PERCENT_TAG or wide.is_plain_calc()) {
+                match known.width {
+                    some(_) => { }
+                    none => { return geo.Size(f32) { width: 0.0, height: known.height orelse 0.0 }; }
+                }
+            }
             w = iw;
             h = ih;
             match known.width {
@@ -2248,6 +2857,84 @@ impl lt.LayoutTree for Laying(Approx) {
     }
 
     fn ident_text(self: &Laying(Approx), ident: alloc.Symbol) -> str {
+        return self.tree.names.text(ident);
+    }
+}
+
+impl lt.LayoutTree for Laying(Face) {
+    fn child_count(self: &Laying(Face), parent_node_id: lt.NodeId) -> usize {
+        return self.tree.boxes.items()[parent_node_id.to_usize()].children.len();
+    }
+
+    fn get_child_id(self: &Laying(Face), parent_node_id: lt.NodeId, child_index: usize) -> lt.NodeId {
+        return lt.NodeId.from_usize(self.tree.boxes.items()[parent_node_id.to_usize()].children.items()[child_index]);
+    }
+
+    fn get_style(self: &Laying(Face), node_id: lt.NodeId) -> &sty.Style {
+        return &self.tree.boxes.items()[node_id.to_usize()].style;
+    }
+
+    fn set_unrounded_layout(self: &mut Laying(Face), node_id: lt.NodeId, layout: &lt.Layout) {
+        self.tree.boxes[node_id.to_usize()].unrounded = layout.*;
+    }
+
+    fn compute_child_layout(self: &mut Laying(Face), node_id: lt.NodeId, inputs: lt.LayoutInput) -> lt.LayoutOutput {
+        var no_bfc = block.BlockFormattingContext.new(self.tree.a);
+        var no_ctx = block.BlockContext.root();
+        return compute_node(Face, self, node: node_id, inputs: inputs, inherited: false, bfc: &mut no_bfc, block_ctx: &mut no_ctx);
+    }
+
+    fn compute_block_child_layout(self: &mut Laying(Face), node_id: lt.NodeId, inputs: lt.LayoutInput, bfc: &mut block.BlockFormattingContext, block_ctx: &mut block.BlockContext) -> lt.LayoutOutput {
+        return compute_node(Face, self, node: node_id, inputs: inputs, inherited: true, bfc: bfc, block_ctx: block_ctx);
+    }
+
+    fn clear_hoisted_children(self: &mut Laying(Face), node_id: lt.NodeId) {
+        self.tree.boxes[node_id.to_usize()].hoisted.clear();
+    }
+
+    fn add_hoisted_children(self: &mut Laying(Face), node_id: lt.NodeId, hoisted: []lt.NodeId) {
+        for h in hoisted {
+            self.tree.boxes[node_id.to_usize()].hoisted.push(h.*);
+        }
+    }
+
+    fn cache_get(self: &mut Laying(Face), node_id: lt.NodeId, input: &lt.LayoutInput) -> ?lt.LayoutOutput {
+        return self.tree.boxes[node_id.to_usize()].cache.get(input);
+    }
+
+    fn cache_store(self: &mut Laying(Face), node_id: lt.NodeId, input: &lt.LayoutInput, layout_output: lt.LayoutOutput) {
+        self.tree.boxes[node_id.to_usize()].cache.store(input, layout_output);
+    }
+
+    fn cache_clear(self: &mut Laying(Face), node_id: lt.NodeId) {
+        _ = self.tree.boxes[node_id.to_usize()].cache.clear();
+    }
+
+    fn get_unrounded_layout(self: &Laying(Face), node_id: lt.NodeId) -> lt.Layout {
+        return self.tree.boxes.items()[node_id.to_usize()].unrounded;
+    }
+
+    fn set_final_layout(self: &mut Laying(Face), node_id: lt.NodeId, layout: &lt.Layout) {
+        self.tree.boxes[node_id.to_usize()].final_layout = layout.*;
+    }
+
+    fn is_out_of_flow(self: &Laying(Face), node_id: lt.NodeId) -> bool {
+        return self.tree.boxes.items()[node_id.to_usize()].style.position.is_out_of_flow();
+    }
+
+    fn hoisted_child_count(self: &Laying(Face), node_id: lt.NodeId) -> usize {
+        return self.tree.boxes.items()[node_id.to_usize()].hoisted.len();
+    }
+
+    fn get_hoisted_child_id(self: &Laying(Face), node_id: lt.NodeId, index: usize) -> lt.NodeId {
+        return self.tree.boxes.items()[node_id.to_usize()].hoisted.items()[index];
+    }
+
+    fn allocator(self: &Laying(Face)) -> alloc.Allocator {
+        return self.tree.a;
+    }
+
+    fn ident_text(self: &Laying(Face), ident: alloc.Symbol) -> str {
         return self.tree.names.text(ident);
     }
 }
