@@ -70,6 +70,9 @@ if [ ! -d "$src" ]; then
     done
     echo "$patched" > "$src/.arche-patches"
 fi
+# What make is given past its targets: nothing yet (the processor's name,
+# this script's argument, is no target of make's).
+set --
 if [ -n "${KBUILD_TOOLS:-}" ]; then
     PATH=$KBUILD_TOOLS/usr/bin:$PATH
     BISON_PKGDATADIR=$KBUILD_TOOLS/usr/share/bison
@@ -78,10 +81,19 @@ if [ -n "${KBUILD_TOOLS:-}" ]; then
     set -- HOSTCFLAGS="-I$KBUILD_TOOLS/usr/include" HOSTLDFLAGS="-L$KBUILD_TOOLS/usr/lib/x86_64-linux-gnu"
 fi
 cd "$src"
+: > "$tree/config.log"
+# A step of the configuration, its output in config.log, whose end is
+# shown when it fails.
+configure() {
+    if ! "$@" >> "$tree/config.log" 2>&1; then
+        tail -20 "$tree/config.log" >&2
+        exit 1
+    fi
+}
 if [ "$arch" = x86_64 ]; then
-    make -s x86_64_defconfig kvm_guest.config "$@" > "$tree/config.log" 2>&1
-    scripts/kconfig/merge_config.sh -m .config "$here/phone.config" >> "$tree/config.log" 2>&1
-    make -s olddefconfig "$@" >> "$tree/config.log" 2>&1
+    configure make -s x86_64_defconfig kvm_guest.config "$@"
+    configure scripts/kconfig/merge_config.sh -m .config "$here/phone.config"
+    configure make -s olddefconfig "$@"
     if ! make -j"$(nproc)" bzImage "$@" > "$tree/build.log" 2>&1; then
         tail -20 "$tree/build.log" >&2
         exit 1
@@ -92,9 +104,9 @@ else
     # own variable: -21 says the tools are clang-21, ld.lld-21 and so on.
     set -- "$@" ARCH=arm64 LLVM="${LLVM:-1}"
     grep -v '=m$' arch/arm64/configs/defconfig > arch/arm64/configs/arche_defconfig
-    make -s arche_defconfig virt.config "$@" > "$tree/config.log" 2>&1
-    scripts/kconfig/merge_config.sh -m .config "$here/phone.config" "$here/phone-aarch64.config" >> "$tree/config.log" 2>&1
-    make -s olddefconfig "$@" >> "$tree/config.log" 2>&1
+    configure make -s arche_defconfig virt.config "$@"
+    configure scripts/kconfig/merge_config.sh -m .config "$here/phone.config" "$here/phone-aarch64.config"
+    configure make -s olddefconfig "$@"
     if ! make -j"$(nproc)" Image "$@" > "$tree/build.log" 2>&1; then
         tail -20 "$tree/build.log" >&2
         exit 1
