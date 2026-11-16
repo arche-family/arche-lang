@@ -1,0 +1,161 @@
+/// The Arche phone's app kit (arche-os docs/sprints.md T10, D6): the look
+/// the default apps share, as one stylesheet an app adds before its own,
+/// and what its pages need to fill it in. The classes:
+///
+/// - .app, a page as tall as the screen at least, its .content growing and
+///   its .tabs, if any, at the bottom; .fab, a round button over it.
+/// - .head, a row along the top, its .actions at its right, each an
+///   .iconbtn; .big, a page's large title.
+/// - .search, a pill with a field in it.
+/// - .group, a card of rows; .row, one of them (a button where a tap on it
+///   does something, or a field's), a hairline above it but for the first: its .avatar (a name's first letter on a color, avatar_color)
+///   or .tile (an icon on a color), its .lines (.primary over .secondary),
+///   its .trail and .chev at its right. .label, a section's name over a
+///   card.
+/// - .tabs, the bottom's sections, each a .tab (an .icon over its name);
+///   .tab.on, the one shown.
+/// - .empty, what a page with nothing in it says, an .icon over its words.
+/// - .btn, a pill button, .btn.primary in the accent; .chips, a row of
+///   .chip, .chip.on the chosen.
+/// - .compose, a field and its .send button along the bottom.
+/// - .icon, a glyph of the icon font by its name (Material Symbols', as
+///   the phone draws them); .icon.fill, filled.
+///
+/// Its colors are variables, light and dark (prefers-color-scheme), the
+/// page's ground grey and its cards white, as HyperOS's and iOS's are.
+import alloc;
+
+/// The kit's stylesheet.
+pub fn css(a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str(":root { --kit-ground: #f2f3f7; --kit-card: #ffffff; --kit-line: #e5e5ea; --kit-text: #1c1c1e; --kit-muted: #8a8a8e; --kit-accent: #2f80ed; --kit-wash: #e6efff; --kit-danger: #ff3b30; --kit-good: #2db55d; }\n");
+    s.push_str("@media (prefers-color-scheme: dark) { :root { --kit-ground: #0e0e12; --kit-card: #1c1c22; --kit-line: #2c2c34; --kit-text: #f2f2f7; --kit-muted: #8e8e93; --kit-accent: #4a90ff; --kit-wash: #1b2a44; --kit-danger: #ff5a52; --kit-good: #34c759; } }\n");
+    s.push_str("body { background: var(--kit-ground); color: var(--kit-text); padding: 0; margin: 0; font-size: 16px; }\n");
+    s.push_str(".icon { font-family: icons; font-size: 24px; line-height: 1; font-weight: 400; }\n");
+    s.push_str(".icon.fill { font-variation-settings: 'FILL' 1; }\n");
+    s.push_str(".app { display: flex; flex-direction: column; min-height: 100vh; position: relative; }\n");
+    s.push_str(".content { flex-grow: 1; display: flex; flex-direction: column; padding-bottom: 12px; }\n");
+    s.push_str(".head { display: flex; flex-direction: row; align-items: center; justify-content: space-between; padding: 12px 12px 0 20px; min-height: 52px; }\n");
+    s.push_str(".head .title { font-size: 20px; font-weight: 500; }\n");
+    s.push_str(".actions { display: flex; flex-direction: row; gap: 4px; }\n");
+    s.push_str(".iconbtn { width: 44px; height: 44px; border-radius: 22px; display: flex; align-items: center; justify-content: center; padding: 0; border: 0; background: transparent; color: var(--kit-text); }\n");
+    s.push_str(".big { font-size: 32px; font-weight: 400; padding: 4px 20px 14px; }\n");
+    s.push_str(".search { display: flex; flex-direction: row; align-items: center; gap: 8px; margin: 0 14px 14px; padding: 0 14px; height: 44px; border-radius: 22px; background: var(--kit-card); color: var(--kit-muted); }\n");
+    s.push_str(".search input { flex-grow: 1; border: 0; padding: 0; background: transparent; font-size: 16px; color: var(--kit-text); }\n");
+    s.push_str(".label { font-size: 13px; color: var(--kit-muted); padding: 6px 34px 6px; }\n");
+    s.push_str(".group { display: flex; flex-direction: column; margin: 0 14px 14px; border-radius: 18px; background: var(--kit-card); overflow: hidden; }\n");
+    s.push_str(".row { display: flex; flex-direction: row; align-items: center; gap: 14px; padding: 10px 16px; min-height: 60px; box-sizing: border-box; }\n");
+    s.push_str(".row + .row { border-top: 1px solid var(--kit-line); }\n");
+    s.push_str("button.row { width: 100%; border: 0; border-radius: 0; background: transparent; text-align: left; font-weight: 400; color: var(--kit-text); }\n");
+    s.push_str(".row input { flex-grow: 1; border: 0; padding: 0; background: transparent; font-size: 16px; color: var(--kit-text); }\n");
+    s.push_str(".avatar { width: 42px; height: 42px; border-radius: 21px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #ffffff; font-size: 18px; font-weight: 500; }\n");
+    s.push_str(".tile { width: 34px; height: 34px; border-radius: 10px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #ffffff; }\n");
+    s.push_str(".tile .icon { font-size: 22px; }\n");
+    s.push_str(".lines { display: flex; flex-direction: column; flex-grow: 1; min-width: 0; gap: 2px; }\n");
+    s.push_str(".primary { font-size: 16px; color: var(--kit-text); }\n");
+    s.push_str(".secondary { font-size: 13px; color: var(--kit-muted); }\n");
+    s.push_str(".trail { font-size: 14px; color: var(--kit-muted); flex-shrink: 0; }\n");
+    s.push_str(".chev { color: var(--kit-muted); font-size: 22px; flex-shrink: 0; }\n");
+    s.push_str(".tabs { display: flex; flex-direction: row; justify-content: space-around; padding: 6px 0 6px; background: var(--kit-ground); border-top: 1px solid var(--kit-line); }\n");
+    s.push_str(".tab { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 4px 14px; border: 0; background: transparent; color: var(--kit-muted); font-size: 12px; font-weight: 500; }\n");
+    s.push_str(".tab.on { color: var(--kit-text); }\n");
+    s.push_str(".tab.on .icon { font-variation-settings: 'FILL' 1; }\n");
+    s.push_str(".fab { position: absolute; right: 20px; bottom: 84px; width: 58px; height: 58px; border-radius: 29px; border: 0; padding: 0; display: flex; align-items: center; justify-content: center; background: var(--kit-accent); color: #ffffff; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25); }\n");
+    s.push_str(".fab .icon { font-size: 28px; }\n");
+    s.push_str(".empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 96px 32px; color: var(--kit-muted); font-size: 15px; text-align: center; }\n");
+    s.push_str(".empty .icon { font-size: 64px; color: var(--kit-line); }\n");
+    s.push_str(".btn { padding: 12px 22px; border-radius: 24px; border: 0; font-size: 16px; font-weight: 500; background: var(--kit-card); color: var(--kit-text); }\n");
+    s.push_str(".btn.primary { background: var(--kit-accent); color: #ffffff; }\n");
+    s.push_str(".btn.danger { color: var(--kit-danger); }\n");
+    s.push_str(".chips { display: flex; flex-direction: row; gap: 8px; padding: 0 14px 12px; }\n");
+    s.push_str(".chip { padding: 8px 16px; border-radius: 18px; border: 0; font-size: 14px; font-weight: 500; background: var(--kit-card); color: var(--kit-text); }\n");
+    s.push_str(".chip.on { background: var(--kit-accent); color: #ffffff; }\n");
+    s.push_str(".compose { display: flex; flex-direction: row; align-items: center; gap: 8px; padding: 8px 12px; background: var(--kit-ground); }\n");
+    s.push_str(".compose input { flex-grow: 1; height: 44px; border-radius: 22px; border: 0; padding: 0 16px; background: var(--kit-card); color: var(--kit-text); font-size: 16px; }\n");
+    s.push_str(".send { width: 44px; height: 44px; border-radius: 22px; border: 0; padding: 0; flex-shrink: 0; display: flex; align-items: center; justify-content: center; background: var(--kit-accent); color: #ffffff; }\n");
+    return s;
+}
+
+/// The color of an avatar for a name, as CSS: one of eight, the same for
+/// the same name each time.
+pub fn avatar_color(name: str) -> str {
+    var sum: u32 = 0;
+    for c in name.bytes() {
+        sum = sum *% 31 +% (c.* as u32);
+    }
+    let k = sum % 8;
+    if k == 0 {
+        return "#2f80ed";
+    }
+    if k == 1 {
+        return "#2db55d";
+    }
+    if k == 2 {
+        return "#f2994a";
+    }
+    if k == 3 {
+        return "#8e5cf7";
+    }
+    if k == 4 {
+        return "#eb5757";
+    }
+    if k == 5 {
+        return "#00a6a6";
+    }
+    if k == 6 {
+        return "#f0476a";
+    }
+    return "#4c6ef5";
+}
+
+/// A name's first letter, upper case where it is ASCII; "#" for a name
+/// that starts with no letter (a number).
+pub fn initial(name: str, a: alloc.Allocator) -> alloc.String {
+    let b = name.bytes();
+    var out = alloc.String.init(a);
+    var i: usize = 0;
+    while i < b.len() and (b[i] == ' ' or b[i] == '+') : (i += 1) {
+    }
+    if i >= b.len() or (b[i] >= '0' and b[i] <= '9') {
+        out.push_str("#");
+        return out;
+    }
+    if b[i] >= 'a' and b[i] <= 'z' {
+        out.push_ascii(b[i] - 32);
+        return out;
+    }
+    var end = i + 1;
+    while end < b.len() and (b[end] & 0xC0) == 0x80 {
+        end += 1;
+    }
+    out.push_str(name[i..end]);
+    return out;
+}
+
+/// s written into out as HTML text, what HTML reads as markup written as
+/// its entities: for names and words an app puts in its markup.
+pub fn escaped(out: &mut alloc.String, s: str) {
+    let b = s.bytes();
+    var from: usize = 0;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        var entity = "";
+        if b[i] == '<' {
+            entity = "&lt;";
+        } else if b[i] == '>' {
+            entity = "&gt;";
+        } else if b[i] == '&' {
+            entity = "&amp;";
+        } else if b[i] == '\'' {
+            entity = "&#39;";
+        } else if b[i] == '"' {
+            entity = "&quot;";
+        }
+        if entity.len() > 0 {
+            out.push_str(s[from..i]);
+            out.push_str(entity);
+            from = i + 1;
+        }
+    }
+    out.push_str(s[from..b.len()]);
+}
