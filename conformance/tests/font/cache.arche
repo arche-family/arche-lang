@@ -1,0 +1,66 @@
+// test: run
+// spec: font
+// stage0: skip
+// stdout: font a, glyph 1: .....######.............
+// stdout: font b, glyph 1: ....##..................
+// stdout: one cache keeps them apart: true
+/// Fonts that share a cache (a phone's text in three weights and its
+/// icons): glyph 1 of one is not glyph 1 of another, drawn at the same
+/// size, so the cache keeps each font's apart.
+import alloc;
+import font;
+import std;
+import _ttf;
+
+/// The first row of a's drawing of text that has ink, as # and spaces.
+fn row_of(c: &font.Canvas, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    var y: u32 = 0;
+    while y < c.height : (y += 1) {
+        var any = false;
+        var x: u32 = 0;
+        while x < c.width : (x += 1) {
+            if c.alpha.items()[(y * c.width + x) as usize] > 127 {
+                any = true;
+            }
+        }
+        if any {
+            x = 0;
+            while x < c.width : (x += 1) {
+                if c.alpha.items()[(y * c.width + x) as usize] > 127 {
+                    out.push_str("#");
+                } else {
+                    out.push_str(".");
+                }
+            }
+            return out;
+        }
+    }
+    return out;
+}
+
+fn main(sys: &mut std.System) -> !void {
+    let a = sys.alloc;
+    let one = _ttf.build(false, a);
+    let two = _ttf.build_swapped(a);
+    let fa = font.parse(one.items(), a) catch panic("font a");
+    let fb = font.parse(two.items(), a) catch panic("font b");
+    var cache = font.new_cache(a);
+    // "O" is glyph 1 of both: O's outline in a, L's in b; both drawn at 20.
+    var ca = font.new_canvas(width: 24, height: 24, a: a);
+    _ = font.draw(&fa, cache: &mut cache, text: "O", size: 20, x: 2, y: 20, into: &mut ca) catch panic("draw a");
+    var cb = font.new_canvas(width: 24, height: 24, a: a);
+    _ = font.draw(&fb, cache: &mut cache, text: "O", size: 20, x: 2, y: 20, into: &mut cb) catch panic("draw b");
+    let ra = row_of(&ca, a: a);
+    let rb = row_of(&cb, a: a);
+    sys.stdout.write("font a, glyph 1: ");
+    sys.stdout.write(ra.view());
+    sys.stdout.write("\nfont b, glyph 1: ");
+    sys.stdout.write(rb.view());
+    sys.stdout.write("\none cache keeps them apart: ");
+    if ra.view().eq(rb.view()) {
+        sys.stdout.write("false\n");
+    } else {
+        sys.stdout.write("true\n");
+    }
+}

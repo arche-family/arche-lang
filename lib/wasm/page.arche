@@ -55,6 +55,11 @@ pub type Font = struct {
     pub size: f32,
     /// font-weight 600 or more.
     pub bold: bool,
+    /// font-weight itself: a face with more than one font picks by it.
+    pub weight: u16,
+    /// An icon font's run: NO_ICONS, or ICONS and FILLED_ICONS, its words
+    /// icons by their names (style.icons, icon_fill).
+    pub icons: u8,
     /// Italic.
     pub italic: bool,
     /// A monospaced family.
@@ -72,11 +77,31 @@ pub type Font = struct {
     pub background: u32,
 }
 
+/// A run not in an icon font.
+pub const NO_ICONS: u8 = 0;
+/// A run in the icon font, outlined.
+pub const ICONS: u8 = 1;
+/// A run in the icon font, filled.
+pub const FILLED_ICONS: u8 = 2;
+
+/// Which icons a style's text is in, if any.
+fn icons_of(s: &style.Style) -> u8 {
+    if not s.icons {
+        return NO_ICONS;
+    }
+    if s.icon_fill {
+        return FILLED_ICONS;
+    }
+    return ICONS;
+}
+
 /// Font::of: the look of the text of an element of style s.
 pub fn font_of(s: &style.Style) -> Font {
     return Font {
         size: s.font_size,
         bold: s.font_weight >= 600,
+        weight: s.font_weight,
+        icons: icons_of(s),
         italic: s.italic,
         mono: s.monospace,
         color: s.color,
@@ -357,26 +382,141 @@ impl Fonts for Approx {
 /// as Nimadir's renderer breaks them with its real fonts (egui's galleys,
 /// gui_dom.rs): at spaces, and a word too wide for a line of its own
 /// between its letters; each line is the paragraph's line height. Where
-/// a line wraps, its spaces hang past its end. One font draws every run,
-/// bold, italic and monospace too.
+/// a line wraps, its spaces hang past its end. A face of one font draws
+/// every run with it, bold, italic and monospace too; one of more picks
+/// each run's by its weight and whether it is in the icon font (font_index).
 pub type Face = struct {
-    /// The font, its one item: lent to a layout, which holds its fonts by
-    /// value (A§5.4), and given back (lay_out_face).
+    /// The fonts, REGULAR's first: lent to a layout, which holds its fonts
+    /// by value (A§5.4), and given back (lay_out_face).
     fonts: alloc.List(truetype.Font),
+    /// The icon font's icons by name, sorted by it: a word of an icon run
+    /// that is one of them is drawn as its icon, as the font's ligatures
+    /// would draw it.
+    names: alloc.List(IconName),
     /// Screen pixels to a layout pixel.
     pub scale: f32,
 }
+
+/// An icon's name and its character in the icon font.
+pub type IconName = struct {
+    pub name: alloc.String,
+    pub code: u32,
+}
+
+/// Where a face's fonts are (face_with): the text's at weights 400, 500
+/// and 600, the icons outlined and filled.
+pub const REGULAR: usize = 0;
+pub const MEDIUM: usize = 1;
+pub const SEMIBOLD: usize = 2;
+pub const ICON_FONT: usize = 3;
+pub const FILLED_ICON_FONT: usize = 4;
 
 /// A Face of f, drawn scale screen pixels to a layout pixel.
 pub fn face_of(f: truetype.Font, scale: f32, a: alloc.Allocator) -> Face {
     var fonts = alloc.List(truetype.Font).init(a);
     fonts.push(f);
-    return Face { fonts: fonts, scale: scale };
+    return Face { fonts: fonts, names: alloc.List(IconName).init(a), scale: scale };
 }
 
-/// The face's font.
+/// A Face of fonts, in the order REGULAR to FILLED_ICON_FONT (as many as
+/// there are, REGULAR's at least), and the icons' names, in any order.
+pub fn face_with(fonts: alloc.List(truetype.Font), names: alloc.List(IconName), scale: f32, a: alloc.Allocator) -> Face {
+    var sorted = alloc.List(IconName).init(a);
+    for n in names.items() {
+        var at = sorted.len();
+        while at > 0 and name_order(x: sorted.items()[at - 1].name.view(), y: n.name.view()) > 0 : (at -= 1) {
+        }
+        sorted.push(IconName { name: alloc.String.init(a), code: 0 });
+        var k = sorted.len() - 1;
+        while k > at : (k -= 1) {
+            let moved = IconName { name: sorted.items()[k - 1].name.clone(), code: sorted.items()[k - 1].code };
+            sorted.items_mut()[k] = moved;
+        }
+        sorted.items_mut()[at] = IconName { name: n.name.clone(), code: n.code };
+    }
+    return Face { fonts: fonts, names: sorted, scale: scale };
+}
+
+/// The face's first font: REGULAR's.
 pub fn face_font(face: &Face) -> &truetype.Font {
-    return &face.fonts.items()[0];
+    return &face.fonts.items()[REGULAR];
+}
+
+/// Which of the face's fonts draws a run of font f: the icons' for an
+/// icon run, else the heaviest of the text's not above its weight;
+/// REGULAR where the face has none of those.
+pub fn font_index(face: &Face, f: &Font) -> usize {
+    let n = face.fonts.len();
+    if f.icons == FILLED_ICONS and n > FILLED_ICON_FONT {
+        return FILLED_ICON_FONT;
+    }
+    if f.icons != NO_ICONS and n > ICON_FONT {
+        return ICON_FONT;
+    }
+    if f.weight >= 600 and n > SEMIBOLD {
+        return SEMIBOLD;
+    }
+    if f.weight >= 500 and n > MEDIUM {
+        return MEDIUM;
+    }
+    return REGULAR;
+}
+
+/// The face's font i (font_index).
+pub fn font_at(face: &Face, i: usize) -> &truetype.Font {
+    return &face.fonts.items()[i];
+}
+
+/// Whether a run of font f is drawn bolder than its font draws it (twice,
+/// a pixel apart): bold, and the face has no font of that weight.
+pub fn fake_bold(face: &Face, f: &Font) -> bool {
+    return f.bold and f.icons == NO_ICONS and face.fonts.len() <= SEMIBOLD;
+}
+
+/// The character an icon run's text names, when it is a whole name the
+/// face knows: what the run draws in its place.
+pub fn icon_named(face: &Face, f: &Font, text: str) -> ?u32 {
+    if f.icons == NO_ICONS {
+        return none;
+    }
+    return icon_code(face, name: text);
+}
+
+/// The icon font's character for the icon of that name, if the face has
+/// the icon font and knows the name.
+pub fn icon_code(face: &Face, name: str) -> ?u32 {
+    let text = name;
+    if face.names.len() == 0 or face.fonts.len() <= ICON_FONT {
+        return none;
+    }
+    var lo: usize = 0;
+    var hi = face.names.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let c = name_order(x: face.names.items()[mid].name.view(), y: text);
+        if c == 0 {
+            return some(face.names.items()[mid].code);
+        }
+        if c < 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return none;
+}
+
+/// x against y, byte by byte: below 0 when x comes first.
+fn name_order(x: str, y: str) -> i32 {
+    let a = x.bytes();
+    let b = y.bytes();
+    var i: usize = 0;
+    while i < a.len() and i < b.len() : (i += 1) {
+        if a[i] != b[i] {
+            return (a[i] as i32) - (b[i] as i32);
+        }
+    }
+    return (a.len() as i32) - (b.len() as i32);
 }
 
 /// The size text of font f is drawn at on the screen, in whole pixels,
@@ -450,6 +590,17 @@ fn read(face: &Face, f: &truetype.Font, p: &Paragraph, r: usize, at: usize, prev
     if cp == '\n' as u32 {
         return Next { kind: BREAK, to: at + len, g: 0, adv: 0, kern: 0 };
     }
+    // A word of an icon run that names an icon: one glyph, the icon.
+    if at == 0 {
+        match icon_named(face, f: &run.font, text: run.text.view()) {
+            some(code) => {
+                let ig = truetype.glyph_of(f, cp: code);
+                let icon_size = pixel_size(face, f: &run.font);
+                return Next { kind: LETTER, to: b.len(), g: ig, adv: font_units(f, v: truetype.advance(f, g: ig), size: icon_size), kern: 0 };
+            }
+            none => { }
+        }
+    }
     var kind = LETTER;
     if cp == ' ' as u32 or cp == '\t' as u32 {
         kind = SPACE;
@@ -467,7 +618,8 @@ fn read(face: &Face, f: &truetype.Font, p: &Paragraph, r: usize, at: usize, prev
 }
 
 /// How far "…" moves the pen in font fo.
-fn ellipsis_advance(face: &Face, f: &truetype.Font, fo: &Font) -> i64 {
+fn ellipsis_advance(face: &Face, fo: &Font) -> i64 {
+    let f = font_at(face, i: font_index(face, f: fo));
     let g = truetype.glyph_of(f, cp: 0x2026);
     return font_units(f, v: truetype.advance(f, g: g), size: pixel_size(face, f: fo));
 }
@@ -531,7 +683,6 @@ fn settle(p: &Paragraph, r: usize, at: usize) -> [2]usize {
 /// end with its width: up to its last letter where it wraps, up to its
 /// pen where it breaks or the text ends.
 fn walk(face: &Face, p: &Paragraph, limit: ?i64, sink: &dyn fn(Step)) {
-    let f = face_font(face);
     var pen = Pen { line: 0, x: 0, content_end: 0, has: false, last_run: NONE as usize, last_g: 0 };
     var r: usize = 0;
     var at: usize = 0;
@@ -542,7 +693,7 @@ fn walk(face: &Face, p: &Paragraph, limit: ?i64, sink: &dyn fn(Step)) {
         if r >= p.runs.len() {
             break;
         }
-        let c = read(face, f: f, p: p, r: r, at: at, prev: before(&pen, r: r));
+        let c = read(face, f: font_at(face, i: font_index(face, f: &p.runs.items()[r].font)), p: p, r: r, at: at, prev: before(&pen, r: r));
         if c.kind == BREAK {
             sink(Step { kind: BREAK, run: r as u32, from: at as u32, to: c.to as u32, line: pen.line, x: pen.x, w: 0 });
             next_line(&mut pen, w: pen.x, sink: sink);
@@ -576,7 +727,7 @@ fn walk(face: &Face, p: &Paragraph, limit: ?i64, sink: &dyn fn(Step)) {
             if wr >= p.runs.len() {
                 break;
             }
-            let d = read(face, f: f, p: p, r: wr, at: wa, prev: w_prev);
+            let d = read(face, f: font_at(face, i: font_index(face, f: &p.runs.items()[wr].font)), p: p, r: wr, at: wa, prev: w_prev);
             if d.kind != LETTER {
                 break;
             }
@@ -607,7 +758,7 @@ fn walk(face: &Face, p: &Paragraph, limit: ?i64, sink: &dyn fn(Step)) {
             if r >= p.runs.len() {
                 break;
             }
-            var d = read(face, f: f, p: p, r: r, at: at, prev: before(&pen, r: r));
+            var d = read(face, f: font_at(face, i: font_index(face, f: &p.runs.items()[r].font)), p: p, r: r, at: at, prev: before(&pen, r: r));
             if d.kind != LETTER {
                 break;
             }
@@ -655,12 +806,11 @@ fn extent(face: &Face, p: &Paragraph, limit: ?i64) -> [2]i64 {
 /// draws the "…": the last letter of its first line, wrapped at limit,
 /// that leaves room for it.
 fn cut_at(face: &Face, p: &Paragraph, limit: i64) -> [2]i64 {
-    let f = face_font(face);
     var end: i64 = 0;
     var by: i64 = 0;
-    let sink = fn [face, f, p, limit, &mut end, &mut by](s: Step) {
+    let sink = fn [face, p, limit, &mut end, &mut by](s: Step) {
         if s.kind == LETTER and s.line == 0 {
-            let room = limit - ellipsis_advance(face, f: f, fo: &p.runs.items()[s.run as usize].font);
+            let room = limit - ellipsis_advance(face, fo: &p.runs.items()[s.run as usize].font);
             if s.x + s.w <= room {
                 end = s.x + s.w;
                 by = s.run as i64;
@@ -768,8 +918,7 @@ pub fn shape(face: &Face, p: &Paragraph, width: f32, a: alloc.Allocator) -> Shap
         spans.push(Span { run: s.run, from: s.from, to: s.to, line: s.line, x: s.x, w: s.w, ellipsis: false });
     }
     if cut >= 0 {
-        let f = face_font(face);
-        let ew = ellipsis_advance(face, f: f, fo: &p.runs.items()[cut_run as usize].font);
+        let ew = ellipsis_advance(face, fo: &p.runs.items()[cut_run as usize].font);
         spans.push(Span { run: cut_run, from: 0, to: 0, line: 0, x: cut, w: ew, ellipsis: true });
         widths.clear();
         widths.push(cut + ew);
@@ -806,7 +955,7 @@ impl Fonts for Face {
                 some(l) => {
                     if not fits_whole(self, p: p, limit: l) {
                         let c = cut_at(self, p: p, limit: l);
-                        let ew = ellipsis_advance(self, f: face_font(self), fo: &p.runs.items()[c[1] as usize].font);
+                        let ew = ellipsis_advance(self, fo: &p.runs.items()[c[1] as usize].font);
                         return geo.Size(f32) { width: layout_px(self, v: c[0] + ew).ceil(), height: p.line_height.ceil() };
                     }
                     let whole = extent(self, p: p, limit: none);
@@ -911,17 +1060,42 @@ impl Fonts for Face {
 /// Lays doc out as lay_out does, its text measured by face, whose font is
 /// lent to the layout and given back.
 pub fn lay_out_face(doc: &dyn select.Doc, styles: &style.Styles, face: &mut Face, images: &dyn fn(u32) -> ?geo.Size(f32), width: f32, height: f32, a: alloc.Allocator) -> Layout {
-    var lent = Face { fonts: alloc.List(truetype.Font).init(a), scale: face.scale };
-    match face.fonts.pop() {
-        some(f) => { lent.fonts.push(f); }
-        none => { return empty_layout(a); }
+    if face.fonts.len() == 0 {
+        return empty_layout(a);
     }
+    var lent = Face { fonts: alloc.List(truetype.Font).init(a), names: alloc.List(IconName).init(a), scale: face.scale };
+    move_fonts(from: &mut face.fonts, to: &mut lent.fonts, a: a);
+    move_names(from: &mut face.names, to: &mut lent.names, a: a);
     var done = laid_out(Face, doc: doc, styles: styles, fonts: lent, images: images, width: width, height: height, compressible: true, a: a);
-    match done.fonts.fonts.pop() {
-        some(f) => { face.fonts.push(f); }
-        none => { }
-    }
+    move_fonts(from: &mut done.fonts.fonts, to: &mut face.fonts, a: a);
+    move_names(from: &mut done.fonts.names, to: &mut face.names, a: a);
     return done.layout;
+}
+
+/// Every font of from moved to the end of to, in their order.
+fn move_fonts(from: &mut alloc.List(truetype.Font), to: &mut alloc.List(truetype.Font), a: alloc.Allocator) {
+    var held = alloc.List(truetype.Font).init(a);
+    while true {
+        let f = from.pop() orelse break;
+        held.push(f);
+    }
+    while true {
+        let f = held.pop() orelse break;
+        to.push(f);
+    }
+}
+
+/// Every name of from moved to the end of to, in their order.
+fn move_names(from: &mut alloc.List(IconName), to: &mut alloc.List(IconName), a: alloc.Allocator) {
+    var held = alloc.List(IconName).init(a);
+    while true {
+        let n = from.pop() orelse break;
+        held.push(n);
+    }
+    while true {
+        let n = held.pop() orelse break;
+        to.push(n);
+    }
 }
 
 // ---- boxes -----------------------------------------------------------------

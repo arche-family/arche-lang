@@ -228,10 +228,24 @@ fn format12(a: alloc.Allocator) -> alloc.List(u8) {
 
 /// The font: format 12 in its cmap too when wide.
 pub fn build(wide: bool, a: alloc.Allocator) -> alloc.List(u8) {
+    return made(wide: wide, swapped: false, a: a);
+}
+
+/// The narrow font with glyphs 1 and 2 swapped: its glyph 1 is L's, 2 O's.
+pub fn build_swapped(a: alloc.Allocator) -> alloc.List(u8) {
+    return made(wide: false, swapped: true, a: a);
+}
+
+fn made(wide: bool, swapped: bool, a: alloc.Allocator) -> alloc.List(u8) {
     var glyphs = alloc.List(alloc.List(u8)).init(a);
     glyphs.push(notdef(a));
-    glyphs.push(letter_o(a));
-    glyphs.push(letter_l(a));
+    if swapped {
+        glyphs.push(letter_l(a));
+        glyphs.push(letter_o(a));
+    } else {
+        glyphs.push(letter_o(a));
+        glyphs.push(letter_l(a));
+    }
     glyphs.push(letter_d(a));
     glyphs.push(composite(a));
     glyphs.push(alloc.List(u8).init(a));

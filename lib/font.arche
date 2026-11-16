@@ -47,6 +47,10 @@ pub type Font = struct {
     /// many; 0 when the font has none.
     kern_pairs: usize,
     kern_count: u32,
+    /// A mark of its bytes, 24 bits: glyphs of fonts that share a cache
+    /// are kept apart by it (a phone's text in three weights and its
+    /// icons).
+    mark: u64,
 }
 
 /// A glyph drawn: coverage, 0 to 255, a byte a pixel, row by row. left is
@@ -276,6 +280,7 @@ pub fn parse(bytes: []u8, a: alloc.Allocator) -> FontError!Font {
         cmap_format: m.format,
         kern_pairs: kern_pairs,
         kern_count: kern_count,
+        mark: mark_of(bytes),
     };
 }
 
@@ -983,10 +988,19 @@ fn floor_div(n: i64, d: i64) -> i64 {
 
 // ---- text --------------------------------------------------------------------------
 
+/// FNV-1a of a font's bytes, folded to 24 bits: its mark (Font.mark).
+fn mark_of(bytes: []u8) -> u64 {
+    var h: u64 = 14695981039346656037;
+    for b in bytes {
+        h = (h ^ (b.* as u64)) *% 1099511628211;
+    }
+    return (h ^ (h >> 24) ^ (h >> 48)) & 0xFFFFFF;
+}
+
 /// Glyph g at size, from the cache, drawn the first time it is asked for:
 /// its number in the cache.
 fn cached(f: &Font, c: &mut Cache, g: u32, size: u32) -> FontError!u32 {
-    let key = ((g as u64) << 16) | (size as u64);
+    let key = (f.mark << 40) | (((g as u64) & 0xFFFFFF) << 16) | ((size as u64) & 0xFFFF);
     match c.index.get(key) {
         some(i) => { return i; }
         none => { }

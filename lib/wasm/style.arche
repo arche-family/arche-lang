@@ -479,6 +479,11 @@ pub type Style = struct {
     pub font_weight: u16,
     pub italic: bool,
     pub monospace: bool,
+    /// font-family names an icon font (Material Symbols), whose words are
+    /// icons by their names: an embedder's real fonts draw them so.
+    pub icons: bool,
+    /// font-variation-settings asks for 'FILL' 1: the filled icons.
+    pub icon_fill: bool,
     pub line_height: LineHeight,
     pub text_align: u8,
     pub white_space: u8,
@@ -555,6 +560,8 @@ pub fn initial(a: alloc.Allocator) -> Style {
         font_weight: 400,
         italic: false,
         monospace: false,
+        icons: false,
+        icon_fill: false,
         line_height: LineHeight { kind: LINE_NORMAL, v: 0.0 },
         text_align: TEXT_START,
         white_space: WS_NORMAL,
@@ -585,6 +592,8 @@ fn copy_inherited(s: &mut Style, from: &Style) {
     s.font_weight = from.font_weight;
     s.italic = from.italic;
     s.monospace = from.monospace;
+    s.icons = from.icons;
+    s.icon_fill = from.icon_fill;
     s.line_height = from.line_height;
     s.text_align = from.text_align;
     s.white_space = from.white_space;
@@ -1776,6 +1785,11 @@ fn apply(s: &mut Style, parent: &Style, init: &Style, name: str, value: []css.To
     }
     if name.eq("font-family") {
         s.monospace = monospace(value, a: a);
+        s.icons = icon_family(value, a: a);
+        return;
+    }
+    if name.eq("font-variation-settings") {
+        s.icon_fill = fill_asked(value);
         return;
     }
     if name.eq("font") {
@@ -2460,6 +2474,53 @@ fn font_weight(t: []css.Token, parent: u16, a: alloc.Allocator) -> ?u16 {
     return none;
 }
 
+/// Whether a family list names an icon font: Material Symbols or Icons,
+/// or icons itself.
+fn icon_family(t: []css.Token, a: alloc.Allocator) -> bool {
+    for n in family_names(t, a: a).items() {
+        let v = n.view();
+        if v.eq("icons") or v.eq("material symbols rounded") or v.eq("material symbols outlined") or v.eq("material symbols sharp") or v.eq("material symbols") or v.eq("material icons") or v.eq("material icons round") {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether font-variation-settings asks for the FILL axis at 1 (at least
+/// a half): Material Symbols' filled icons.
+fn fill_asked(t: []css.Token) -> bool {
+    var i: usize = 0;
+    while i < t.len() : (i += 1) {
+        if t[i].kind == css.STR and t[i].text.view().eq("FILL") {
+            var j = i + 1;
+            while j < t.len() and t[j].kind == css.SPACE : (j += 1) {
+            }
+            return j < t.len() and t[j].kind == css.NUMBER and t[j].n >= 0.5;
+        }
+    }
+    return false;
+}
+
+/// A family list's names, lowercased, without their quotes.
+fn family_names(t: []css.Token, a: alloc.Allocator) -> alloc.List(alloc.String) {
+    var out = alloc.List(alloc.String).init(a);
+    let comma = css.plain(css.COMMA, a);
+    let parts = css.split_top(t, sep: &comma, a: a);
+    for p in parts.items() {
+        var text = alloc.String.init(a);
+        css.to_css(css.trim(t[p.from..p.to]), out: &mut text);
+        var v = text.view();
+        while v.len() > 0 and v.bytes()[0] == '"' {
+            v = v[1..v.len()];
+        }
+        while v.len() > 0 and v.bytes()[v.len() - 1] == '"' {
+            v = v[0..v.len() - 1];
+        }
+        out.push(css.lowercase(v, a));
+    }
+    return out;
+}
+
 /// Whether a family list asks for a fixed-width font: monospace, or one of
 /// the names people reach for when they mean it.
 fn monospace(t: []css.Token, a: alloc.Allocator) -> bool {
@@ -2555,11 +2616,12 @@ fn font(s: &mut Style, parent: &Style, value: []css.Token, w: []css.Span, cx: va
         s.line_height = line_height(css.trim(t[sp1.from..sp1.to]), cx: lcx, a: a) orelse s.line_height;
     }
     s.monospace = monospace(value[w[at].to..value.len()], a: a);
+    s.icons = icon_family(value[w[at].to..value.len()], a: a);
 }
 
 /// Whether a property inherits.
 fn is_inherited(name: str) -> bool {
-    return one_of(word: name, list: "color font font-size font-weight font-style font-family line-height text-align white-space text-transform letter-spacing visibility cursor list-style list-style-type pointer-events");
+    return one_of(word: name, list: "color font font-size font-weight font-style font-family line-height text-align white-space text-transform letter-spacing visibility cursor list-style list-style-type pointer-events font-variation-settings");
 }
 
 /// A copy of a list of tracks.
@@ -2672,11 +2734,15 @@ fn copy_property(s: &mut Style, from: &Style, name: str, a: alloc.Allocator) {
         s.italic = from.italic;
     } else if name.eq("font-family") {
         s.monospace = from.monospace;
+        s.icons = from.icons;
+    } else if name.eq("font-variation-settings") {
+        s.icon_fill = from.icon_fill;
     } else if name.eq("font") {
         s.font_size = from.font_size;
         s.font_weight = from.font_weight;
         s.italic = from.italic;
         s.monospace = from.monospace;
+        s.icons = from.icons;
         s.line_height = from.line_height;
     } else if name.eq("line-height") {
         s.line_height = from.line_height;
