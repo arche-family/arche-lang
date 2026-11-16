@@ -345,8 +345,8 @@ fn compute_block_layout_impl(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, i
     // container establish an independent formatting context, and so do
     // layout and paint containment (css-contain-2).
     let establishes_new_bfc = is_scroll_container
-        or style.align_content.keyword != sty.AlignContentKeyword.Normal
-        or contain.establishes_independent_formatting_context();
+    or style.align_content.keyword != sty.AlignContentKeyword.Normal
+    or contain.establishes_independent_formatting_context();
     let aspect_ratio = style.aspect_ratio;
     let padding = style.padding.resolve_or_zero(parent_size.width);
     let border = style.border.resolve_or_zero(parent_size.width);
@@ -475,8 +475,8 @@ fn compute_inner(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, inputs: lt.La
     let overflow = style.overflow;
     let is_scroll_container = overflow.x.is_scroll_container() or overflow.y.is_scroll_container();
     let establishes_new_bfc = is_scroll_container
-        or style.align_content.keyword != sty.AlignContentKeyword.Normal
-        or style.contain.establishes_independent_formatting_context();
+    or style.align_content.keyword != sty.AlignContentKeyword.Normal
+    or style.contain.establishes_independent_formatting_context();
     let position = style.position;
 
     // Margin collapsing: whether a child's margins could collapse through
@@ -484,28 +484,28 @@ fn compute_inner(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, inputs: lt.La
     // neither border nor padding on that side).
     let children_margins_adjoin_own_edges = geo.Line(bool) {
         start: vertical_margins_are_collapsible.start
-            and not establishes_new_bfc
-            and not position.is_out_of_flow()
-            and padding.top == 0.0
-            and border.top == 0.0,
+        and not establishes_new_bfc
+        and not position.is_out_of_flow()
+        and padding.top == 0.0
+        and border.top == 0.0,
         end: vertical_margins_are_collapsible.end
-            and not establishes_new_bfc
-            and not position.is_out_of_flow()
-            and padding.bottom == 0.0
-            and border.bottom == 0.0,
+        and not establishes_new_bfc
+        and not position.is_out_of_flow()
+        and padding.bottom == 0.0
+        and border.bottom == 0.0,
     };
     let own_margins_collapse_with_children = geo.Line(bool) {
         start: children_margins_adjoin_own_edges.start,
         end: children_margins_adjoin_own_edges.end and util.is_none(size.height),
     };
     let has_styles_preventing_being_collapsed_through = not style.is_block()
-        or block_ctx.is_bfc_root()
-        or establishes_new_bfc
-        or position.is_out_of_flow()
-        or padding.top > 0.0
-        or padding.bottom > 0.0
-        or border.top > 0.0
-        or border.bottom > 0.0;
+    or block_ctx.is_bfc_root()
+    or establishes_new_bfc
+    or position.is_out_of_flow()
+    or padding.top > 0.0
+    or padding.bottom > 0.0
+    or border.top > 0.0
+    or border.bottom > 0.0;
 
     let text_align = style.text_align;
     let align_content = style.align_content;
@@ -670,8 +670,8 @@ fn compute_inner(tree: &mut dyn lt.LayoutTree, node_id: lt.NodeId, inputs: lt.La
     // is zero, so height, min-height and max-height count by what they
     // resolve to.
     let can_be_collapsed_through = not has_styles_preventing_being_collapsed_through
-        and container_outer_height == 0.0
-        and all_in_flow_children_can_be_collapsed_through;
+    and container_outer_height == 0.0
+    and all_in_flow_children_can_be_collapsed_through;
 
     var top_margin = first_child_top_margin_set;
     if not own_margins_collapse_with_children.start {
@@ -816,12 +816,12 @@ fn generate_item_list(tree: &dyn lt.LayoutTree, node: lt.NodeId, node_inner_size
         let contain = child_style.contain;
 
         let is_in_same_bfc = is_block
-            and not is_table
-            and not position.is_out_of_flow()
-            and is_not_floated
-            and not is_scroll_container
-            and not contain.establishes_independent_formatting_context()
-            and child_style.align_content.keyword == sty.AlignContentKeyword.Normal;
+        and not is_table
+        and not position.is_out_of_flow()
+        and is_not_floated
+        and not is_scroll_container
+        and not contain.establishes_independent_formatting_context()
+        and child_style.align_content.keyword == sty.AlignContentKeyword.Normal;
 
         items.push(BlockItem {
             node_id: child_node_id,

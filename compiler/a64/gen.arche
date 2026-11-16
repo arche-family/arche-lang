@@ -939,7 +939,13 @@ fn gen_asm(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, i: ir.Inst) {
             var free: u8 = 0;
             while free < 16 and taken[free as usize] : (free += 1) {
             }
-            if free >= 16 {
+            // Past x0 to x15, x18: no value of this backend's lives in it,
+            // and Linux keeps it for no one. A call through a register that
+            // clobbers all the rest needs it (lib/wasm/jit_arch-aarch64.arche).
+            if free >= 16 and not taken[18] {
+                free = 18;
+            }
+            if free >= 16 and free != 18 {
                 uu.say_problem(&mut g.u, f, what: "an asm with too many operands");
                 return;
             }

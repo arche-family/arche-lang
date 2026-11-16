@@ -59,16 +59,16 @@ pub fn compute_leaf_layout(inputs: lt.LayoutInput, style: &sty.Style, measure_fu
     content_box_inset.bottom = content_box_inset.bottom + scrollbar_gutter.y;
 
     let has_styles_preventing_being_collapsed_through = not style.is_block()
-        or style.overflow.x.is_scroll_container()
-        or style.overflow.y.is_scroll_container()
-        or style.position.is_out_of_flow()
-        or style.contain.establishes_independent_formatting_context()
-        or padding.top > 0.0
-        or padding.bottom > 0.0
-        or border.top > 0.0
-        or border.bottom > 0.0
-        or is_positive(node_size.height)
-        or is_positive(node_min_size.height);
+    or style.overflow.x.is_scroll_container()
+    or style.overflow.y.is_scroll_container()
+    or style.position.is_out_of_flow()
+    or style.contain.establishes_independent_formatting_context()
+    or padding.top > 0.0
+    or padding.bottom > 0.0
+    or border.top > 0.0
+    or border.bottom > 0.0
+    or is_positive(node_size.height)
+    or is_positive(node_min_size.height);
 
     // Both sizes known: done.
     if run_mode == lt.RunMode.ComputeSize and has_styles_preventing_being_collapsed_through {
@@ -95,17 +95,17 @@ pub fn compute_leaf_layout(inputs: lt.LayoutInput, style: &sty.Style, measure_fu
     let max_height = node_max_size.height;
     let content_space = geo.Size(sty.AvailableSpace) {
         width: from_known(known_dimensions.width, available_space.width)
-            .maybe_set(known_dimensions.width)
-            .maybe_set(node_size.width)
-            .map_definite_value(fn [min_width, max_width, inner_width](size: f32) -> f32 {
-                return util.f32_maybe_clamp(size, min: min_width, max: max_width) - inner_width;
-            }),
+        .maybe_set(known_dimensions.width)
+        .maybe_set(node_size.width)
+        .map_definite_value(fn [min_width, max_width, inner_width](size: f32) -> f32 {
+            return util.f32_maybe_clamp(size, min: min_width, max: max_width) - inner_width;
+        }),
         height: from_known(known_dimensions.height, available_space.height)
-            .maybe_set(known_dimensions.height)
-            .maybe_set(node_size.height)
-            .map_definite_value(fn [min_height, max_height, inner_height](size: f32) -> f32 {
-                return util.f32_maybe_clamp(size, min: min_height, max: max_height) - inner_height;
-            }),
+        .maybe_set(known_dimensions.height)
+        .maybe_set(node_size.height)
+        .map_definite_value(fn [min_height, max_height, inner_height](size: f32) -> f32 {
+            return util.f32_maybe_clamp(size, min: min_height, max: max_height) - inner_height;
+        }),
     };
 
     // Measure the content.

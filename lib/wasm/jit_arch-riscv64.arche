@@ -1,0 +1,32 @@
+/// The baseline JIT's machine code for RISC-V 64 (lib/wasm/jit.arche): none
+/// yet. The module wasm.jit_arch on a RISC-V 64 target
+/// (compiler/program.arche) compiles no instruction, so every function runs
+/// in the interpreter, as a function the JIT does not compile does on the
+/// other processors; the entry stub is never called.
+import alloc;
+import wasm.jit;
+import wasm.module as m;
+
+/// No stubs: the region is left empty, its exit where it starts.
+pub fn stubs(x: &mut jit.Asm) -> u32 {
+    return x.bytes.len() as u32;
+}
+
+/// No code for any instruction of f: none of them is a place to resume at.
+pub fn compile(f: &m.Func, globals: []u32, global_stride: u32, global_value: u32, base: u32, exit_at: u32, x: &mut jit.Asm, a: alloc.Allocator) -> jit.Compiled {
+    var out = jit.Compiled { resume: alloc.List(u32).init(a) };
+    var i: usize = 0;
+    while i < f.code.len() : (i += 1) {
+        out.resume.push(m.UNREACHED);
+    }
+    return out;
+}
+
+/// Never called: no function has machine code to enter.
+pub unsafe fn enter(entry: u64, context: u64) -> u64 {
+    panic("the WASM JIT has no machine code on RISC-V 64");
+}
+
+/// Nothing to make fetchable: no code is written.
+pub unsafe fn sync(at: u64, size: u64) {
+}

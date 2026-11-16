@@ -156,6 +156,66 @@ pub fn assemble(c: &mut nb.Code, text: str, operands: []u8, problem: &mut alloc.
             }
             continue;
         }
+        // A barrier, a call or jump through a register, and the cache
+        // maintenance a JIT does (lib/wasm/jit_arch-aarch64.arche): CTR_EL0
+        // read, a data cache line cleaned, an instruction cache line
+        // invalidated.
+        if name.eq("dsb") {
+            if rest.eq("ish") {
+                cd.word(c, 0xD5033B9F);
+            } else if rest.eq("sy") {
+                cd.word(c, 0xD5033F9F);
+            } else {
+                return fail(problem, what: "this backend's assembler does not know", instruction: line);
+            }
+            continue;
+        }
+        if name.eq("blr") or name.eq("br") {
+            let target = operand_register(rest, operands);
+            if target == NO_REG {
+                return fail(problem, what: "this backend's assembler reads registers in", instruction: line);
+            }
+            if name.eq("blr") {
+                cd.word(c, 0xD63F0000 | ((target as u32) << 5));
+            } else {
+                cd.word(c, 0xD61F0000 | ((target as u32) << 5));
+            }
+            continue;
+        }
+        if name.eq("mrs") or name.eq("dc") or name.eq("ic") {
+            var comma = rest.len();
+            q = 0;
+            while q < rest.len() : (q += 1) {
+                if rest[q] == ',' {
+                    comma = q;
+                    break;
+                }
+            }
+            if comma == rest.len() {
+                return fail(problem, what: "this backend's assembler does not know", instruction: line);
+            }
+            let first = trim(rest[0..comma]);
+            let second = trim(rest[comma + 1..rest.len()]);
+            var base: u32 = 0;
+            var reg = NO_REG;
+            if name.eq("mrs") and second.eq("ctr_el0") {
+                base = 0xD53B0020;
+                reg = operand_register(first, operands);
+            } else if name.eq("dc") and first.eq("cvau") {
+                base = 0xD50B7B20;
+                reg = operand_register(second, operands);
+            } else if name.eq("ic") and first.eq("ivau") {
+                base = 0xD50B7520;
+                reg = operand_register(second, operands);
+            } else {
+                return fail(problem, what: "this backend's assembler does not know", instruction: line);
+            }
+            if reg == NO_REG {
+                return fail(problem, what: "this backend's assembler reads registers in", instruction: line);
+            }
+            cd.word(c, base | reg as u32);
+            continue;
+        }
         // rd, rn, rm or rd, rm.
         var parts: [3]u8 = [NO_REG, NO_REG, NO_REG];
         var count: usize = 0;

@@ -391,6 +391,19 @@ pub fn assemble(c: &mut nb.Code, text: str, operands: []u8, problem: &mut alloc.
             }
             continue;
         }
+        // A call through a register (lib/wasm/jit_arch.arche's): FF /2.
+        if (name.eq("call") or name.eq("callq")) and rest[0] == '*' {
+            let target = operand_register(rest[1..rest.len()], operands);
+            if target == NO_REG {
+                return fail(problem, what: "this backend's assembler reads registers in", instruction: line);
+            }
+            if target >= 8 {
+                cd.raw(c, 0x41);
+            }
+            cd.raw(c, 0xFF);
+            cd.raw(c, 0xD0 | (target & 7));
+            continue;
+        }
         if not two_operand(c, name: name, line: line, rest: rest, operands: operands, problem: problem) {
             return false;
         }
