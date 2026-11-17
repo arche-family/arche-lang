@@ -1066,7 +1066,7 @@ pub fn lay_out_face(doc: &dyn select.Doc, styles: &style.Styles, face: &mut Face
     var lent = Face { fonts: alloc.List(truetype.Font).init(a), names: alloc.List(IconName).init(a), scale: face.scale };
     move_fonts(from: &mut face.fonts, to: &mut lent.fonts, a: a);
     move_names(from: &mut face.names, to: &mut lent.names, a: a);
-    var done = laid_out(Face, doc: doc, styles: styles, fonts: lent, images: images, width: width, height: height, compressible: true, a: a);
+    var done = laid_out(Face, doc: doc, styles: styles, fonts: lent, images: images, width: width, height: height, compressible: true, fixed: true, a: a);
     move_fonts(from: &mut done.fonts.fonts, to: &mut face.fonts, a: a);
     move_names(from: &mut done.fonts.names, to: &mut face.names, a: a);
     return done.layout;
@@ -1308,6 +1308,10 @@ type Tree = struct {
     /// no min-content width, as a browser's does (compressible replaced
     /// elements, css-sizing-3): a Face's layout, not Nimadir's.
     compressible: bool,
+    /// Whether a fixed box is placed on the viewport, as a browser places
+    /// it (arche-os T12: the phone's screen), or as an absolute one, as
+    /// Nimadir's taffy does.
+    fixed: bool,
     a: alloc.Allocator,
 }
 
@@ -1339,7 +1343,7 @@ type Piece = enum {
 /// its text measured by fonts. images gives an image's size by its
 /// image-load number. The layout's memory is a's.
 pub fn lay_out(comptime F: type, doc: &dyn select.Doc, styles: &style.Styles, fonts: F, images: &dyn fn(u32) -> ?geo.Size(f32), width: f32, height: f32, a: alloc.Allocator) -> Layout where F: Fonts {
-    let done = laid_out(F, doc: doc, styles: styles, fonts: fonts, images: images, width: width, height: height, compressible: false, a: a);
+    let done = laid_out(F, doc: doc, styles: styles, fonts: fonts, images: images, width: width, height: height, compressible: false, fixed: false, a: a);
     return done.layout;
 }
 
@@ -1350,14 +1354,14 @@ type Done(comptime F: type) = struct where F: Fonts {
 }
 
 /// lay_out's work, the fonts given back with the layout.
-fn laid_out(comptime F: type, doc: &dyn select.Doc, styles: &style.Styles, fonts: F, images: &dyn fn(u32) -> ?geo.Size(f32), width: f32, height: f32, compressible: bool, a: alloc.Allocator) -> Done(F) where F: Fonts {
+fn laid_out(comptime F: type, doc: &dyn select.Doc, styles: &style.Styles, fonts: F, images: &dyn fn(u32) -> ?geo.Size(f32), width: f32, height: f32, compressible: bool, fixed: bool, a: alloc.Allocator) -> Done(F) where F: Fonts {
     var by_node = alloc.List(u32).init(a);
     let size = doc.doc_size();
     var n: u32 = 0;
     while n < size : (n += 1) {
         by_node.push(NONE);
     }
-    var t = Laying(F) { tree: Tree { boxes: alloc.List(TBox).init(a), by_node: by_node, names: alloc.Interner.init(a), compressible: compressible, a: a }, fonts: fonts };
+    var t = Laying(F) { tree: Tree { boxes: alloc.List(TBox).init(a), by_node: by_node, names: alloc.Interner.init(a), compressible: compressible, fixed: fixed, a: a }, fonts: fonts };
     if not style.has_style(styles, n: ROOT) {
         return Done(F) { layout: empty_layout(a), fonts: t.fonts };
     }
@@ -1501,6 +1505,9 @@ fn element(t: &mut Tree, doc: &dyn select.Doc, styles: &style.Styles, images: &d
     let s = style.style_of(styles, n: id);
     let replaced = replaced_of(doc, id: id, s: s, images: images, a: t.a);
     var ts = taffy_style(s, a: t.a);
+    if ts.position == sty.Position.Fixed and not t.fixed {
+        ts.position = sty.Position.Absolute;
+    }
     match replaced {
         .Image { w, h } => {
             if not s.has_aspect_ratio and w > 0.0 and h > 0.0 {
@@ -1981,8 +1988,11 @@ pub fn taffy_style(s: &style.Style, a: alloc.Allocator) -> sty.Style {
     }
     if s.position == style.POSITION_RELATIVE or s.position == style.POSITION_STICKY {
         ts.position = sty.Position.Relative;
-    } else if s.position == style.POSITION_ABSOLUTE or s.position == style.POSITION_FIXED {
+    } else if s.position == style.POSITION_ABSOLUTE {
         ts.position = sty.Position.Absolute;
+    } else if s.position == style.POSITION_FIXED {
+        // Placed on the viewport, whatever is positioned around it.
+        ts.position = sty.Position.Fixed;
     } else {
         ts.position = sty.Position.Static;
     }

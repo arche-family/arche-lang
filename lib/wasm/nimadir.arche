@@ -270,6 +270,13 @@ fn copy_val(v: &c.Val, a: alloc.Allocator) -> c.Val {
             }
             return c.Val.List { items: out };
         }
+        .Bytes { v: given } => {
+            var out = alloc.List(u8).init(a);
+            for b in given.items() {
+                out.push(b.*);
+            }
+            return c.Val.Bytes { v: out };
+        }
         .Variant { case, payload } => {
             var out = alloc.List(c.Val).init(a);
             for x in payload.items() {
@@ -306,7 +313,7 @@ pub fn share(ui: &mut Ui, instance: str, folder: std.Fs) {
 
 /// Whether func is one a shared folder answers.
 fn shared_func(func: str) -> bool {
-    return func.eq("list") or func.eq("read") or func.eq("write") or func.eq("make-folder") or func.eq("remove");
+    return func.eq("list") or func.eq("read") or func.eq("write") or func.eq("make-folder") or func.eq("remove") or func.eq("read-part") or func.eq("image");
 }
 
 /// Whether path is one a shared folder answers.
@@ -388,15 +395,59 @@ fn shared_call(ui: &mut Ui, func: str, args: &alloc.List(c.Val), a: alloc.Alloca
         if allowed and path.len() > 0 {
             match ui.shared.items()[0].read_bytes(path, a) {
                 ok(bytes) => {
-                    var items = alloc.List(c.Val).init(a);
-                    for b in bytes.items() {
-                        items.push(c.Val.Int { v: b.* as u64 });
-                    }
                     var payload = alloc.List(c.Val).init(a);
-                    payload.push(c.Val.List { items: items });
+                    payload.push(c.Val.Bytes { v: bytes });
                     return c.Val.Variant { case: 1, payload: payload };
                 }
                 err(_) => { }
+            }
+        }
+        return c.Val.Variant { case: 0, payload: alloc.List(c.Val).init(a) };
+    }
+    if func.eq("read-part") {
+        // Part of a file (arche-os T12): a song's tags without the song.
+        if allowed and path.len() > 0 and args.len() >= 3 {
+            let from = int_arg(args, i: 1);
+            var len = int_arg(args, i: 2);
+            if len > MAX_PART {
+                len = MAX_PART;
+            }
+            match ui.shared.items()[0].open_read(path) {
+                ok(opened) => {
+                    var file = opened;
+                    var buf = alloc.List(u8).init(a);
+                    buf.grow_zeroed(len as usize);
+                    var got: usize = 0;
+                    match file.read_at(from, into: buf.items_mut()) {
+                        ok(n) => { got = n; }
+                        err(_) => { }
+                    }
+                    file.close();
+                    var part = alloc.List(u8).with_capacity(a, n: got);
+                    var k: usize = 0;
+                    while k < got : (k += 1) {
+                        part.push(buf.items()[k]);
+                    }
+                    var payload = alloc.List(c.Val).init(a);
+                    payload.push(c.Val.Bytes { v: part });
+                    return c.Val.Variant { case: 1, payload: payload };
+                }
+                err(_) => { }
+            }
+        }
+        return c.Val.Variant { case: 0, payload: alloc.List(c.Val).init(a) };
+    }
+    if func.eq("image") {
+        // A picture decoded here, fitted, its thumbnail kept (T12).
+        if allowed and path.len() > 0 and args.len() >= 3 {
+            let into = int_arg(args, i: 2);
+            match shared_image(ui, path: path, most: int_arg(args, i: 1) as u32, into: into, a: a) {
+                some(h) => {
+                    var payload = alloc.List(c.Val).init(a);
+                    payload.push(c.Val.Int { v: h });
+                    return c.Val.Variant { case: 1, payload: payload };
+                }
+                none => { }
             }
         }
         return c.Val.Variant { case: 0, payload: alloc.List(c.Val).init(a) };
@@ -409,6 +460,11 @@ fn shared_call(ui: &mut Ui, func: str, args: &alloc.List(c.Val), a: alloc.Alloca
         var data = alloc.List(u8).init(a);
         if args.len() > 1 {
             match &args.items()[1] {
+                .Bytes { v: given } => {
+                    for b in given.items() {
+                        data.push(b.*);
+                    }
+                }
                 .List { items: values } => {
                     for v in values.items() {
                         match v {
@@ -434,6 +490,271 @@ fn shared_call(ui: &mut Ui, func: str, args: &alloc.List(c.Val), a: alloc.Alloca
     match f.remove(path) {
         ok(_) => { return c.Val.Bool { v: true }; }
         err(_) => { return c.Val.Bool { v: false }; }
+    }
+}
+
+/// The most read-part reads at once.
+const MAX_PART: u64 = 1 << 20;
+
+/// Where a thumbnail is kept, in the shared folder: the picture's path
+/// and size hashed, and the side it was fitted to.
+const THUMBS: str = ".thumbnails";
+
+/// The picture at path in the shared folder (PNG or JPEG), decoded here,
+/// turned as its EXIF says, and fitted within most pixels a side (arche-os
+/// T12): an app's gallery shows a phone camera's 12 megapixels without
+/// holding them. One fitted to 512 or less is kept in .thumbnails, and
+/// read from there the next time. Put in the place of the picture into,
+/// when that is one, else a new one; its number. None for what is no
+/// picture, or past the pixels an app may hold.
+fn shared_image(ui: &mut Ui, path: str, most: u32, into: u64, a: alloc.Allocator) -> ?u64 {
+    if most == 0 or most > MAX_IMAGE_SIDE {
+        return none;
+    }
+    let f = &ui.shared.items()[0];
+    let size = (f.info(path) catch return none).size;
+    var kept = alloc.String.init(a);
+    if most <= 512 {
+        var h: u64 = 0xcbf29ce484222325;
+        for b in path.bytes() {
+            h = (h ^ (b.* as u64)) *% 0x100000001b3;
+        }
+        h = (h ^ size) *% 0x100000001b3;
+        kept.push_str(THUMBS);
+        kept.push_str("/");
+        push_hex64(&mut kept, v: h);
+        kept.push_str("-");
+        kept.push_u64(most as u64);
+        kept.push_str(".rgba");
+        match f.read_bytes(kept.view(), a) {
+            ok(b) => {
+                let bytes = b.items();
+                if bytes.len() >= 8 {
+                    let w = le32(bytes, at: 0);
+                    let ht = le32(bytes, at: 4);
+                    if (w as usize) * (ht as usize) * 4 + 8 == bytes.len() {
+                        var img = png.Image { width: w, height: ht, rgba: alloc.List(u8).init(ui.a) };
+                        img.rgba.grow_zeroed(bytes.len() - 8);
+                        var k: usize = 0;
+                        while k < bytes.len() - 8 : (k += 1) {
+                            img.rgba.items_mut()[k] = bytes[k + 8];
+                        }
+                        return keep_picture(ui, image: img, into: into);
+                    }
+                }
+            }
+            err(_) => { }
+        }
+    }
+    var fitted = png.Image { width: 0, height: 0, rgba: alloc.List(u8).init(ui.a) };
+    region whole {
+        let bytes = f.read_bytes(path, whole) catch return none;
+        let b = bytes.items();
+        let is_jpeg = b.len() >= 3 and b[0] == 0xFF and b[1] == 0xD8 and b[2] == 0xFF;
+        var img = png.Image { width: 0, height: 0, rgba: alloc.List(u8).init(whole) };
+        if is_jpeg {
+            img = jpeg.decode(b, max_pixels: (MAX_IMAGE_SIDE as u64) * (MAX_IMAGE_SIDE as u64), whole) catch return none;
+        } else {
+            img = png.decode(b, max_pixels: (MAX_IMAGE_SIDE as u64) * (MAX_IMAGE_SIDE as u64), whole) catch return none;
+        }
+        var turn: u32 = 1;
+        if is_jpeg {
+            turn = exif_orientation(b);
+        }
+        fitted = fit_within(&img, most: most, turn: turn, a: ui.a);
+    }
+    if kept.len() > 0 {
+        // Kept for the next time, as a header of its size and its pixels.
+        var out = alloc.List(u8).init(a);
+        put_le32(&mut out, v: fitted.width);
+        put_le32(&mut out, v: fitted.height);
+        for p in fitted.rgba.items() {
+            out.push(p.*);
+        }
+        match f.make_dir(THUMBS) {
+            ok(_) => { }
+            err(_) => { }
+        }
+        match f.write_bytes(path: kept.view(), data: out.items()) {
+            ok(_) => { }
+            err(_) => { }
+        }
+    }
+    return keep_picture(ui, image: fitted, into: into);
+}
+
+/// image among the app's pictures: in the place of into when that is one
+/// of them, else a new one.
+fn keep_picture(ui: &mut Ui, image: png.Image, into: u64) -> ?u64 {
+    var at = into;
+    if at >= ui.pictures.len() as u64 {
+        at = 0xFFFFFFFF;
+    }
+    return put_picture(ui, at: at, image: image);
+}
+
+/// img made at most most pixels a side, keeping its shape, each pixel the
+/// mean of those it stands for; turned first as EXIF's orientation says
+/// (1 upright, 3 upside down, 6 a quarter turn right, 8 left).
+fn fit_within(img: &png.Image, most: u32, turn: u32, a: alloc.Allocator) -> png.Image {
+    let sw = img.width;
+    let sh = img.height;
+    // The turned picture's sides.
+    var tw = sw;
+    var th = sh;
+    if turn == 6 or turn == 8 {
+        tw = sh;
+        th = sw;
+    }
+    var w = tw;
+    var h = th;
+    if w > most or h > most {
+        if w >= h {
+            h = ((th as u64) * (most as u64) / (tw as u64)) as u32;
+            w = most;
+        } else {
+            w = ((tw as u64) * (most as u64) / (th as u64)) as u32;
+            h = most;
+        }
+    }
+    if w == 0 {
+        w = 1;
+    }
+    if h == 0 {
+        h = 1;
+    }
+    var out = png.Image { width: w, height: h, rgba: alloc.List(u8).init(a) };
+    out.rgba.grow_zeroed((w as usize) * (h as usize) * 4);
+    let src = img.rgba.items();
+    let dst = out.rgba.items_mut();
+    var y: u32 = 0;
+    while y < h : (y += 1) {
+        // The rows and columns of the turned picture this pixel covers.
+        let y0 = (y as u64) * (th as u64) / (h as u64);
+        var y1 = ((y + 1) as u64) * (th as u64) / (h as u64);
+        if y1 <= y0 {
+            y1 = y0 + 1;
+        }
+        var x: u32 = 0;
+        while x < w : (x += 1) {
+            let x0 = (x as u64) * (tw as u64) / (w as u64);
+            var x1 = ((x + 1) as u64) * (tw as u64) / (w as u64);
+            if x1 <= x0 {
+                x1 = x0 + 1;
+            }
+            // At most four by four of them, spread over the box: the mean
+            // of those.
+            var sum: [4]u64 = [0; 4];
+            var n: u64 = 0;
+            var ky: u64 = 0;
+            while ky < 4 : (ky += 1) {
+                let ty = y0 + (y1 - y0) * ky / 4 + (y1 - y0) / 8;
+                var kx: u64 = 0;
+                while kx < 4 : (kx += 1) {
+                    let tx = x0 + (x1 - x0) * kx / 4 + (x1 - x0) / 8;
+                    // Where (tx, ty) of the turned picture is in img.
+                    var px = tx;
+                    var py = ty;
+                    if turn == 3 {
+                        px = (sw as u64) - 1 - tx;
+                        py = (sh as u64) - 1 - ty;
+                    } else if turn == 6 {
+                        px = ty;
+                        py = (sh as u64) - 1 - tx;
+                    } else if turn == 8 {
+                        px = (sw as u64) - 1 - ty;
+                        py = tx;
+                    }
+                    if px < sw as u64 and py < sh as u64 {
+                        let at = ((py * (sw as u64) + px) * 4) as usize;
+                        sum[0] += src[at] as u64;
+                        sum[1] += src[at + 1] as u64;
+                        sum[2] += src[at + 2] as u64;
+                        sum[3] += src[at + 3] as u64;
+                        n += 1;
+                    }
+                }
+            }
+            let o = (((y as usize) * (w as usize)) + (x as usize)) * 4;
+            if n > 0 {
+                dst[o] = (sum[0] / n) as u8;
+                dst[o + 1] = (sum[1] / n) as u8;
+                dst[o + 2] = (sum[2] / n) as u8;
+                dst[o + 3] = (sum[3] / n) as u8;
+            }
+        }
+    }
+    return out;
+}
+
+/// The orientation a JPEG's EXIF gives it (tag 0x0112 of its first IFD),
+/// 1 to 8; 1, upright, when it gives none.
+fn exif_orientation(b: []u8) -> u32 {
+    var at: usize = 2;
+    while at + 4 <= b.len() and b[at] == 0xFF {
+        let marker = b[at + 1];
+        let len = ((b[at + 2] as usize) << 8) | (b[at + 3] as usize);
+        if marker == 0xDA or len < 2 {
+            return 1;
+        }
+        // APP1 with "Exif\0\0", then a TIFF header.
+        if marker == 0xE1 and at + 4 + len - 2 <= b.len() and len >= 16 and b[at + 4] == 'E' and b[at + 5] == 'x' and b[at + 6] == 'i' and b[at + 7] == 'f' {
+            let t = at + 10;
+            let little = b[t] == 'I';
+            let ifd = t + (read32(b, at: t + 4, little: little) as usize);
+            if ifd + 2 > b.len() {
+                return 1;
+            }
+            let count = read16(b, at: ifd, little: little) as usize;
+            var k: usize = 0;
+            while k < count and ifd + 2 + k * 12 + 12 <= b.len() : (k += 1) {
+                let e = ifd + 2 + k * 12;
+                if read16(b, at: e, little: little) == 0x0112 {
+                    let v = read16(b, at: e + 8, little: little);
+                    if v >= 1 and v <= 8 {
+                        return v;
+                    }
+                    return 1;
+                }
+            }
+            return 1;
+        }
+        at = at + 2 + len;
+    }
+    return 1;
+}
+
+fn read16(b: []u8, at: usize, little: bool) -> u32 {
+    if little {
+        return (b[at] as u32) | ((b[at + 1] as u32) << 8);
+    }
+    return ((b[at] as u32) << 8) | (b[at + 1] as u32);
+}
+
+fn read32(b: []u8, at: usize, little: bool) -> u32 {
+    if little {
+        return (b[at] as u32) | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24);
+    }
+    return ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | (b[at + 3] as u32);
+}
+
+fn le32(b: []u8, at: usize) -> u32 {
+    return (b[at] as u32) | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24);
+}
+
+fn put_le32(out: &mut alloc.List(u8), v: u32) {
+    out.push((v & 0xFF) as u8);
+    out.push(((v >> 8) & 0xFF) as u8);
+    out.push(((v >> 16) & 0xFF) as u8);
+    out.push(((v >> 24) & 0xFF) as u8);
+}
+
+fn push_hex64(s: &mut alloc.String, v: u64) {
+    let digits = "0123456789abcdef";
+    var shift: u64 = 64;
+    while shift > 0 {
+        shift -= 4;
+        s.push_ascii(digits.bytes()[((v >> shift) & 0xF) as usize]);
     }
 }
 
@@ -845,6 +1166,11 @@ fn outgoing_of(args: &alloc.List(c.Val), id: u32, a: alloc.Allocator) -> Outgoin
                     _ => { }
                 }
                 match &items.items()[3] {
+                    .Bytes { v: given } => {
+                        for byte in given.items() {
+                            out.body.push(byte.*);
+                        }
+                    }
                     .List { items: bytes } => {
                         for byte in bytes.items() {
                             match byte {
@@ -1710,6 +2036,11 @@ fn host_api(ui: &mut Ui, func: str, args: &alloc.List(c.Val)) -> exec.Trap!c.Val
     if func.eq("image-load") {
         var bytes = alloc.List(u8).init(a);
         match &args.items()[0] {
+            .Bytes { v: given } => {
+                for b in given.items() {
+                    bytes.push(b.*);
+                }
+            }
             .List { items } => {
                 for v in items.items() {
                     match v {
@@ -3339,6 +3670,25 @@ fn inside_tag(ui: &Ui, n: u32, tag: str) -> bool {
 /// itself: a checkbox flips, a radio is picked, a field takes the
 /// keyboard, a label acts for its control, a link is followed (into
 /// open_request), a button in a form submits it.
+/// Whether the page takes Back itself (arche-os T12): its root says so
+/// with a data-back attribute, as an Android app's OnBackPressedCallback
+/// is enabled while it has a page of its own to go back from.
+pub fn takes_back(ui: &Ui) -> bool {
+    if ui.nodes.len() <= 1 {
+        return false;
+    }
+    return has_attr(ui, n: 1, name: "data-back");
+}
+
+/// Back, as a "back" event at the page's root, for the app to go back
+/// within itself (takes_back).
+pub fn back_node(ui: &mut Ui) {
+    if ui.nodes.len() <= 1 {
+        return;
+    }
+    _ = dispatch(ui, kind: "back", target: 1, value: "");
+}
+
 pub fn click_node(ui: &mut Ui, n: u32) {
     let target = live_element(ui, n: n);
     if target == 0 {

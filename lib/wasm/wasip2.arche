@@ -246,6 +246,19 @@ fn output_stream(w: &mut Wasi, func: str, args: &alloc.List(c.Val), a: alloc.All
         return exec.Trap.HostTrap;
     }
     match &args.items()[1] {
+        .Bytes { v: given } => {
+            if given.len() as u64 > left {
+                return exec.Trap.HostTrap;
+            }
+            if h == STDOUT {
+                w.stdout_used += given.len() as u64;
+            } else {
+                w.stderr_used += given.len() as u64;
+            }
+            for b in given.items() {
+                put(w, h: h, byte: b.*);
+            }
+        }
         .List { items } => {
             // More than check-write allowed: WASI has the host trap.
             if items.len() as u64 > left {

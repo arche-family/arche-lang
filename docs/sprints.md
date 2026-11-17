@@ -4,7 +4,7 @@
 
 **Joriy sprint:** yo'q. Ochiq sprintlar ikkita: S19 (Windows) va S37 (macOS). Ikkalasi ham o'z mashinasini kutadi.
 
-**Yopilgan:** S0–S36, S38–S41. Til yakuniy qabuldan o'tdi (S34).
+**Yopilgan:** S0–S36, S38–S42. Til yakuniy qabuldan o'tdi (S34).
 
 - Compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da; full-Arche paketlarida generics (monomorphization), comptime interpreter, interface'lar (`impl`, `where`, `&dyn`), `for`, closure'lar (`&dyn fn(P) -> R`), `region` (arena, E0901), `unsafe` va raw pointer'lar, `if`/`match` ifoda sifatida, labeled loop'lar, `f32`/`f64`, `requires`/`ensures`, `nopanic` va error return trace ishlaydi.
 - Manifest (`package.arche`) o'qiladi: `needs` (E0801), `strict_unsafe` (E0920), `panic_handler`, xato manifest E0802/E0803.
@@ -446,6 +446,17 @@ Qilingani:
   - `bench/baseline.md` (2026-11-17): o'z backend'ida release debug'dan va optimizer IR'ining `clang -O0` build'idan uchdan bir tez (to'rt dastur jami 1533 ms, 2215 ms va 2217 ms), LLVM `-O1`dan (984 ms) esa sekin. `bench/run.sh` endi o'z backend'ni ham o'lchaydi va hozirgi runtime obyektini ishlatadi (eski `rt.o`ni emas).
 
 S41 yopildi.
+
+### S42. Telefonning haqiqiy ilovalari uchun kutubxona (arche-os T12)
+
+arche-os T12'da telefon ilovalari haqiqiy telefon bilan solishtirildi va haqiqiy suratlar, qo'shiqlar hamda videolar bilan ishlatildi. Kutubxonada bunga xalaqit beradigan to'rtta narsa bor edi.
+
+Qilingani:
+- `wasm.component`: `list<u8>` endi `Val.Bytes` bo'lib, baytlarning o'zi sifatida o'tadi. Avval har bir bayt alohida `Val.Int` edi: ilova o'qigan 256 KB million qiymatga aylanardi, Music ilovasi esa 15 ta qo'shiqning teglarini o'qiyotganda xotira yetmay to'xtardi. Lifting, lowering, `nimadir` (o'qish, yozish, `image-load`, `fetch`'ning tanasi) va WASI oqimlari uni qabul qiladi.
+- `wasm.nimadir`: ulashilgan papka endi ikkita yangi funksiyaga javob beradi. `read-part` faylning bir qismini o'qiydi (megabaytgacha). `image` PNG yoki JPEG suratni dekod qiladi, EXIF'dagi orientatsiya bo'yicha buradi, `max` pikselga sig'diradi va 512 gacha bo'lganini `.thumbnails`ga saqlaydi: galereya kameraning 12 megapikselli suratlarini xotirada butunlay ushlamasdan ko'rsatadi. Telefonning Back tugmasi sahifaga `back` hodisasi bo'lib keladi, agar sahifa root'iga `data-back` qo'ygan bo'lsa (`takes_back`, `back_node`), xuddi Android'dagi `OnBackPressedCallback` kabi.
+- `wasm.page`: CSS'dagi `position: fixed` endi Taffy'ning `Fixed`'iga o'tadi va viewport'ga joylashadi (`lay_out_face`, telefon ekrani). Avval u `absolute` qilinardi: FAB, pastki tablar va mini pleyer uzun sahifaning oxiriga tushib qolardi. Headless `lay_out` Nimadir'ning shell'idagidek `absolute`'ligicha qoladi.
+- `appkit`: `.appbar` (sarlavha va harakatlar bir qatorda), `.big` endi har ilovada bir xil joyda turadi, `.tabs` va `.fab` ekranga bog'langan (`.app.tabbed`), chekkalar 16px.
+
 
 ## 8. Web va WASM
 

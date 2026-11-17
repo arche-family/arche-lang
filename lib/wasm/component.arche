@@ -68,6 +68,9 @@ pub type Val = enum {
     Char { v: u32 },
     Str { v: alloc.String },
     List { items: alloc.List(Val) },
+    /// A list<u8>, its bytes as they are (arche-os T12): a file a megabyte
+    /// long is a megabyte, not a million values.
+    Bytes { v: alloc.List(u8) },
     Variant { case: u32, payload: alloc.List(Val) },
     Flags { bits: u64 },
 }
@@ -744,6 +747,16 @@ fn lift_list(c: &Component, s: &exec.Store, memory: u32, t: u32, ptr: u64, len: 
     if ptr + len * size > s.memories.items()[memory as usize].data.len() as u64 {
         return exec.Trap.MemoryOutOfBounds;
     }
+    if c.types.items()[elem as usize].kind == U8 {
+        // Bytes, as they are.
+        var bytes = alloc.List(u8).with_capacity(c.a, n: len as usize);
+        let data = s.memories.items()[memory as usize].data.items();
+        var k: u64 = 0;
+        while k < len : (k += 1) {
+            bytes.push(data[(ptr + k) as usize]);
+        }
+        return Val.Bytes { v: bytes };
+    }
     var items = alloc.List(Val).init(c.a);
     var i: u64 = 0;
     while i < len : (i += 1) {
@@ -859,6 +872,23 @@ fn lower_seq(c: &Component, s: &mut exec.Store, memory: u32, realloc: u32, t: u3
     match x {
         .Str { v } => {
             let b = v.view().bytes();
+            let at = try allocate(c, s, realloc: realloc, align: 1, size: b.len() as u64);
+            let data = s.memories.items_mut()[memory as usize].data.items_mut();
+            if at + b.len() as u64 > data.len() as u64 {
+                return exec.Trap.MemoryOutOfBounds;
+            }
+            var i: usize = 0;
+            while i < b.len() : (i += 1) {
+                data[at as usize + i] = b[i];
+            }
+            ptr.* = at;
+            len.* = b.len() as u64;
+        }
+        .Bytes { v } => {
+            if ty.kind != LIST {
+                return exec.Trap.HostTrap;
+            }
+            let b = v.items();
             let at = try allocate(c, s, realloc: realloc, align: 1, size: b.len() as u64);
             let data = s.memories.items_mut()[memory as usize].data.items_mut();
             if at + b.len() as u64 > data.len() as u64 {

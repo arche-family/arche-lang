@@ -3,9 +3,14 @@
 /// and what its pages need to fill it in. The classes:
 ///
 /// - .app, a page as tall as the screen at least, its .content growing and
-///   its .tabs, if any, at the bottom; .fab, a round button over it.
-/// - .head, a row along the top, its .actions at its right, each an
-///   .iconbtn; .big, a page's large title.
+///   its .tabs, if any, fixed at the bottom of the screen (.app.tabbed
+///   leaves them room); .fab, a round button fixed over it, above the
+///   tabs when it comes after them.
+/// - .appbar, a page's top (arche-os T12): its .big title at the left
+///   and its .actions at the right, each an .iconbtn, as one row as high
+///   as a phone's; .big alone stands as high, so that a title is where
+///   every app's is. .head, a row along the top of a page that is not the
+///   first: Back's .iconbtn, a .title, its .actions.
 /// - .search, a pill with a field in it.
 /// - .group, a card of rows; .row, one of them (a button where a tap on it
 ///   does something, or a field's), a hairline above it but for the first: its .avatar (a name's first letter on a color, avatar_color)
@@ -39,11 +44,13 @@ pub fn css(a: alloc.Allocator) -> alloc.String {
     s.push_str(".head .title { font-size: 20px; font-weight: 500; }\n");
     s.push_str(".actions { display: flex; flex-direction: row; gap: 4px; }\n");
     s.push_str(".iconbtn { width: 44px; height: 44px; border-radius: 22px; display: flex; align-items: center; justify-content: center; padding: 0; border: 0; background: transparent; color: var(--kit-text); }\n");
-    s.push_str(".big { font-size: 32px; font-weight: 400; padding: 4px 20px 14px; }\n");
-    s.push_str(".search { display: flex; flex-direction: row; align-items: center; gap: 8px; margin: 0 14px 14px; padding: 0 14px; height: 44px; border-radius: 22px; background: var(--kit-card); color: var(--kit-muted); }\n");
+    s.push_str(".appbar { display: flex; flex-direction: row; align-items: center; justify-content: space-between; min-height: 64px; padding: 0 8px 0 24px; box-sizing: border-box; }\n");
+    s.push_str(".big { font-size: 30px; font-weight: 400; line-height: 40px; padding: 12px 24px; }\n");
+    s.push_str(".appbar .big { padding: 0; }\n");
+    s.push_str(".search { display: flex; flex-direction: row; align-items: center; gap: 8px; margin: 0 16px 12px; padding: 0 14px; height: 44px; border-radius: 22px; background: var(--kit-card); color: var(--kit-muted); }\n");
     s.push_str(".search input { flex-grow: 1; border: 0; padding: 0; background: transparent; font-size: 16px; color: var(--kit-text); }\n");
-    s.push_str(".label { font-size: 13px; color: var(--kit-muted); padding: 6px 34px 6px; }\n");
-    s.push_str(".group { display: flex; flex-direction: column; margin: 0 14px 14px; border-radius: 18px; background: var(--kit-card); overflow: hidden; }\n");
+    s.push_str(".label { font-size: 13px; color: var(--kit-muted); padding: 6px 32px 6px; }\n");
+    s.push_str(".group { display: flex; flex-direction: column; margin: 0 16px 12px; border-radius: 18px; background: var(--kit-card); overflow: hidden; }\n");
     s.push_str(".row { display: flex; flex-direction: row; align-items: center; gap: 14px; padding: 10px 16px; min-height: 60px; box-sizing: border-box; }\n");
     s.push_str(".row + .row { border-top: 1px solid var(--kit-line); }\n");
     s.push_str("button.row { width: 100%; border: 0; border-radius: 0; background: transparent; text-align: left; font-weight: 400; color: var(--kit-text); }\n");
@@ -56,12 +63,14 @@ pub fn css(a: alloc.Allocator) -> alloc.String {
     s.push_str(".secondary { font-size: 13px; color: var(--kit-muted); }\n");
     s.push_str(".trail { font-size: 14px; color: var(--kit-muted); flex-shrink: 0; }\n");
     s.push_str(".chev { color: var(--kit-muted); font-size: 22px; flex-shrink: 0; }\n");
-    s.push_str(".tabs { display: flex; flex-direction: row; justify-content: space-around; padding: 6px 0 6px; background: var(--kit-ground); border-top: 1px solid var(--kit-line); }\n");
+    s.push_str(".tabs { position: fixed; left: 0; right: 0; bottom: 0; display: flex; flex-direction: row; justify-content: space-around; padding: 6px 0 6px; background: var(--kit-ground); border-top: 1px solid var(--kit-line); }\n");
+    s.push_str(".tabbed .content { padding-bottom: 76px; }\n");
     s.push_str(".tab { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 4px 14px; border: 0; background: transparent; color: var(--kit-muted); font-size: 12px; font-weight: 500; }\n");
     s.push_str(".tab.on { color: var(--kit-text); }\n");
     s.push_str(".tab.on .icon { font-variation-settings: 'FILL' 1; }\n");
-    s.push_str(".fab { position: absolute; right: 20px; bottom: 84px; width: 58px; height: 58px; border-radius: 29px; border: 0; padding: 0; display: flex; align-items: center; justify-content: center; background: var(--kit-accent); color: #ffffff; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25); }\n");
+    s.push_str(".fab { position: fixed; right: 20px; bottom: 24px; width: 58px; height: 58px; border-radius: 29px; border: 0; padding: 0; display: flex; align-items: center; justify-content: center; background: var(--kit-accent); color: #ffffff; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25); }\n");
     s.push_str(".fab .icon { font-size: 28px; }\n");
+    s.push_str(".tabs + .fab { bottom: 88px; }\n");
     s.push_str(".empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 96px 32px; color: var(--kit-muted); font-size: 15px; text-align: center; }\n");
     s.push_str(".empty .icon { font-size: 64px; color: var(--kit-line); }\n");
     s.push_str(".btn { padding: 12px 22px; border-radius: 24px; border: 0; font-size: 16px; font-weight: 500; background: var(--kit-card); color: var(--kit-text); }\n");

@@ -23,6 +23,13 @@ fn copy(val: &c.Val, a: alloc.Allocator) -> c.Val {
     match val {
         .Str { v } => { return c.Val.Str { v: alloc.String.from(v.view(), a) }; }
         .List { items } => { return c.Val.List { items: copy_all(items, a: a) }; }
+        .Bytes { v } => {
+            var bytes = alloc.List(u8).init(a);
+            for b in v.items() {
+                bytes.push(b.*);
+            }
+            return c.Val.Bytes { v: bytes };
+        }
         .Variant { case, payload } => { return c.Val.Variant { case: case.*, payload: copy_all(payload, a: a) }; }
         .Unit => { return c.Val.Unit; }
         .Bool { v } => { return c.Val.Bool { v: v.* }; }
