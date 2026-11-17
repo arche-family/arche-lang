@@ -1,0 +1,61 @@
+// test: run
+// spec: std
+// stage0: skip
+// stdout: read 11 bytes: hello world
+// stdout: size 11, from 6: world
+// stdout: written: false
+// stdout: a missing file: refused
+// wasm: skip
+import alloc;
+import std;
+
+fn say_bytes(out: &mut std.Output, b: []u8) {
+    for c in b {
+        out.write_byte(c.*);
+    }
+}
+
+// Fs.open_read: a file opened only to read, at any offset; writing to it is
+// refused, and a missing one is not opened.
+fn main(sys: &mut std.System) -> !void {
+    let dir = try sys.fs.temp_dir(env: &sys.env, sys.alloc);
+    var path = alloc.String.from(dir.view(), sys.alloc);
+    path.push_str("/arche-open-read-");
+    path.push_u64(sys.proc.pid() as u64);
+    try sys.fs.write_file(path: path.view(), data: "hello world");
+    var f = try sys.fs.open_read(path.view());
+    var buf: [32]u8 = [0; 32];
+    let n = try f.read_at(0, into: buf[0..32]);
+    sys.stdout.write("read ");
+    sys.stdout.write_u64(n as u64);
+    sys.stdout.write(" bytes: ");
+    say_bytes(&mut sys.stdout, b: buf[0..n]);
+    sys.stdout.write("\n");
+    let size = try f.size();
+    let m = try f.read_at(6, into: buf[0..32]);
+    sys.stdout.write("size ");
+    sys.stdout.write_u64(size);
+    sys.stdout.write(", from 6: ");
+    say_bytes(&mut sys.stdout, b: buf[0..m]);
+    sys.stdout.write("\n");
+    var written = true;
+    match f.write_at(0, data: "j".bytes()) {
+        ok(_) => { }
+        err(_) => { written = false; }
+    }
+    sys.stdout.write("written: ");
+    if written {
+        sys.stdout.write("true\n");
+    } else {
+        sys.stdout.write("false\n");
+    }
+    f.close();
+    var missing = alloc.String.from(path.view(), sys.alloc);
+    missing.push_str(".none");
+    sys.stdout.write("a missing file: ");
+    match sys.fs.open_read(missing.view()) {
+        ok(_) => { sys.stdout.write("opened\n"); }
+        err(_) => { sys.stdout.write("refused\n"); }
+    }
+    try sys.fs.remove(path.view());
+}

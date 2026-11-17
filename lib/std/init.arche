@@ -35,6 +35,28 @@ pub fn mount(fs: &std.Fs, source: str, target: str, kind: str) -> InitError!void
     }
 }
 
+/// As mount, with flags (MS_RDONLY, 1, for read only) and the file
+/// system's own options in data: as a folder a virtual machine shares
+/// (9p: "trans=virtio,version=9p2000.L") is mounted.
+pub fn mount_with(fs: &std.Fs, source: str, target: str, kind: str, flags: u64, data: str) -> InitError!void {
+    var src: [256]u8 = [0; 256];
+    var dst: [4096]u8 = [0; 4096];
+    var typ: [64]u8 = [0; 64];
+    var opts: [512]u8 = [0; 512];
+    if not linux.c_path(source, src[0..256]) or not linux.c_path(target, dst[0..4096]) or not linux.c_path(kind, typ[0..64]) or not linux.c_path(data, opts[0..512]) {
+        return InitError.Refused;
+    }
+    _ = fs;
+    var r: i64 = 0;
+    unsafe {
+        // SAFETY: four NUL-terminated strings.
+        r = linux.syscall(linux.MOUNT, [linux.arg(u8, &src[0] as *u8), linux.arg(u8, &dst[0] as *u8), linux.arg(u8, &typ[0] as *u8), flags as i64, linux.arg(u8, &opts[0] as *u8), 0]);
+    }
+    if linux.errno(r) != 0 {
+        return InitError.Refused;
+    }
+}
+
 /// What is at source, a directory or a file, shown at target too (a bind
 /// mount): as the phone's first process puts the programs of the system
 /// slot it boots in place (arche-os T8).

@@ -612,6 +612,25 @@ pub type Fs = struct {
         return File { fd: fd, unique: core.Unique { } };
     }
 
+    /// A file opened only to read, anywhere in it: one of a folder that
+    /// may not be written, as a read-only one shared with a virtual
+    /// machine. Its write_at is refused.
+    pub fn open_read(self: &Fs, path: str) -> FsError!File {
+        var buf: [4096]u8 = [0; 4096];
+        if not linux.c_path(path, buf[0..4096]) {
+            return FsError.NotFound;
+        }
+        var fd: i64 = 0;
+        unsafe {
+            // SAFETY: the path is NUL-terminated in buf; O_RDONLY | O_CLOEXEC.
+            fd = linux.file_syscall(linux.OPENAT, [self.dir, linux.arg(u8, &buf[0] as *u8), 0x80000, 0, 0, 0]);
+        }
+        if linux.errno(fd) != 0 {
+            return errno_error(linux.errno(fd));
+        }
+        return File { fd: fd, unique: core.Unique { } };
+    }
+
     pub fn make_dir(self: &Fs, path: str) -> FsError!void {
         try self.make_dir_with(path, mode: 0x1ED);
     }

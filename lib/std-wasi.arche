@@ -416,6 +416,17 @@ pub type Fs = struct {
         return File { fd: fd, unique: core.Unique { } };
     }
 
+    /// A file opened to read, anywhere in it. The rights are the
+    /// preopened directory's: what it lets write, write_at does.
+    pub fn open_read(self: &Fs, path: str) -> FsError!File {
+        var fd: u32 = 0;
+        let e = open_path(path, oflags: 0, fd: &mut fd);
+        if e != 0 {
+            return fs_error(e);
+        }
+        return File { fd: fd, unique: core.Unique { } };
+    }
+
     pub fn sync(self: &Fs, path: str) -> FsError!void {
         var kind: u8 = 0;
         let found = kind_of(path, kind: &mut kind);
