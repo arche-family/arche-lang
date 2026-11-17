@@ -81,6 +81,8 @@ pub type Ranges = struct {
     /// still to be ordered.
     pub moves: alloc.List(Move),
     pending: alloc.List(Move),
+    /// The order the blocks are written in (plan).
+    pub layout: alloc.List(u32),
 }
 
 pub fn new_ranges(a: alloc.Allocator) -> Ranges {
@@ -116,6 +118,7 @@ pub fn new_ranges(a: alloc.Allocator) -> Ranges {
         frame: 0,
         moves: alloc.List(Move).init(a),
         pending: alloc.List(Move).init(a),
+        layout: alloc.List(u32).init(a),
     };
 }
 
@@ -283,10 +286,13 @@ pub fn plan(r: &mut Ranges, f: &ir.Function) {
         settle_addresses(r, f);
     }
 
-    // Positions, definitions and uses, in the order of the blocks.
+    lay_out(r, f);
+
+    // Positions, definitions and uses, in the order the blocks are written.
     var pos: u32 = 2;
-    var b: usize = 0;
-    while b < nblocks : (b += 1) {
+    var li: usize = 0;
+    while li < nblocks : (li += 1) {
+        let b = r.layout[li] as usize;
         r.block_starts[b] = pos;
         let ids = f.blocks[b].insts.items();
         var k: usize = 0;
@@ -327,7 +333,7 @@ pub fn plan(r: &mut Ranges, f: &ir.Function) {
     }
 
     // A comparison its branch reads alone is done by the branch.
-    b = 0;
+    var b: usize = 0;
     while b < nblocks : (b += 1) {
         let ids = f.blocks[b].insts.items();
         if ids.len() >= 2 {
@@ -338,7 +344,128 @@ pub fn plan(r: &mut Ranges, f: &ir.Function) {
             }
         }
     }
+    b = 0;
+    while b < nblocks : (b += 1) {
+        fuse_overflow(r, f, b: b as u32);
+    }
     liveness(r, f);
+}
+
+/// The order the blocks are written in. A debug build's, theirs. An
+/// optimized function's, so that the code that runs falls through more and
+/// jumps less: from the first, each block followed by a successor not yet
+/// written, the branch's true one first, else by the first not yet written;
+/// those that end in unreachable, a trap's, last. block_starts marks those
+/// written until the positions are counted.
+fn lay_out(r: &mut Ranges, f: &ir.Function) {
+    let nblocks = f.blocks.len() as u32;
+    r.layout.clear();
+    var b: u32 = 0;
+    if not f.ssa {
+        while b < nblocks : (b += 1) {
+            r.layout.push(b);
+        }
+        return;
+    }
+    var cur: u32 = 0;
+    var first: u32 = 1;
+    while cur != NONE {
+        r.layout.push(cur);
+        r.block_starts[cur as usize] = 1;
+        let ids = f.blocks[cur as usize].insts.items();
+        let term = f.insts[ids[ids.len() - 1] as usize];
+        var next = NONE;
+        if term.op == ir.Op.Br and hot_and_new(r, f, b: term.a) {
+            next = term.a;
+        } else if term.op == ir.Op.CondBr {
+            if hot_and_new(r, f, b: term.b) {
+                next = term.b;
+            } else if hot_and_new(r, f, b: term.c) {
+                next = term.c;
+            }
+        }
+        while next == NONE and first < nblocks {
+            if hot_and_new(r, f, b: first) {
+                next = first;
+            }
+            first += 1;
+        }
+        cur = next;
+    }
+    b = 1;
+    while b < nblocks : (b += 1) {
+        if r.block_starts[b as usize] == 0 {
+            r.layout.push(b);
+        }
+    }
+}
+
+fn hot_and_new(r: &Ranges, f: &ir.Function, b: u32) -> bool {
+    return r.block_starts[b as usize] == 0 and not ends_unreachable(f, b);
+}
+
+fn ends_unreachable(f: &ir.Function, b: u32) -> bool {
+    let ids = f.blocks[b as usize].insts.items();
+    return ids.len() > 0 and f.insts[ids[ids.len() - 1] as usize].op == ir.Op.Unreachable;
+}
+
+/// BinKind.Xor's number (ir/ir.arche).
+const BIN_XOR: u32 = 9;
+
+/// Whether an instruction writes no code where it stands: a constant, a
+/// parameter, a stack slot's or a global's address.
+fn no_code(op: ir.Op) -> bool {
+    return op == ir.Op.Const or op == ir.Op.Param or op == ir.Op.Alloca or op == ir.Op.Global or op == ir.Op.VTable;
+}
+
+/// The position in ids of the instruction with code before at; at itself
+/// when none is.
+fn code_before(f: &ir.Function, ids: []u32, at: usize) -> usize {
+    var k = at;
+    while k > 0 : (k -= 1) {
+        if not no_code(f.insts[ids[k - 1] as usize].op) {
+            return k - 1;
+        }
+    }
+    return at;
+}
+
+/// An overflow's bit its branch reads alone, right after the operation,
+/// flipped by an xor with 1 or not, is what the operation left in the
+/// flags, or in a register: the branch reads it there (each backend's
+/// gen_overflow), and the bit and the xor take no place. Instructions with
+/// no code between them, a constant, change nothing.
+fn fuse_overflow(r: &mut Ranges, f: &ir.Function, b: u32) {
+    let ids = f.blocks[b as usize].insts.items();
+    let n = ids.len();
+    if n < 3 {
+        return;
+    }
+    let term = f.insts[ids[n - 1] as usize];
+    var at = code_before(f, ids: ids, at: n - 1);
+    if term.op != ir.Op.CondBr or at == n - 1 or ids[at] != term.a or r.uses[term.a as usize] != 1 {
+        return;
+    }
+    var bit = term.a;
+    let c = f.insts[bit as usize];
+    if c.op == ir.Op.Bin and c.flag == BIN_XOR and r.kinds[c.b as usize] == V_CONST and f.insts[c.b as usize].imm & 1 == 1 {
+        let k = code_before(f, ids: ids, at: at);
+        if k == at or ids[k] != c.a {
+            return;
+        }
+        bit = c.a;
+        at = k;
+    }
+    let i = f.insts[bit as usize];
+    let k = code_before(f, ids: ids, at: at);
+    if i.op != ir.Op.OverflowBit or k == at or ids[k] != i.a or r.uses[bit as usize] != 1 {
+        return;
+    }
+    if r.overflow_bit[i.a as usize] != bit or r.next_bit[bit as usize] != NONE {
+        return;
+    }
+    r.kinds[bit as usize] = V_FUSED;
+    r.kinds[term.a as usize] = V_FUSED;
 }
 
 /// The addresses of an optimized function whose root is numbered after them,

@@ -1,7 +1,8 @@
 #!/bin/sh
 # The baseline of docs/sprints.md S26: how fast the compiler compiles, and
-# how fast its programs run, in a debug and a release build. Prints a
-# Markdown table; bench/baseline.md keeps one.
+# how fast its programs run, in a debug and a release build, through LLVM
+# and by the compiler's own backend (S41). Prints a Markdown table;
+# bench/baseline.md keeps one.
 # Usage: bench/run.sh
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
@@ -61,4 +62,19 @@ for level in O0 O1; do
         done
         echo "| $name (ms, clang -$level) | $bd | $br |"
     done
+done
+# The compiler's own backend, with no LLVM (S27, S41): its debug build, and
+# its release build of the optimizer's IR.
+ARCHE_BACKEND=own "$root/compiler/arche-build" programs.arche "$work/own"
+ARCHE_BACKEND=own ARCHE_FLAGS=--release "$root/compiler/arche-build" programs.arche "$work/ownr"
+for name in fib sieve map sort; do
+    bd=""
+    br=""
+    for _ in 1 2 3; do
+        t=$("$work/own" | sed -n "s/^$name \([0-9]*\) ms.*/\1/p")
+        if [ -z "$bd" ] || [ "$t" -lt "$bd" ]; then bd=$t; fi
+        t=$("$work/ownr" | sed -n "s/^$name \([0-9]*\) ms.*/\1/p")
+        if [ -z "$br" ] || [ "$t" -lt "$br" ]; then br=$t; fi
+    done
+    echo "| $name (ms, own backend) | $bd | $br |"
 done

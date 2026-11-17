@@ -41,6 +41,9 @@ pub type Gen = struct {
     outgoing: u32,
     /// The block being written: where an edge's moves come from.
     block: u32,
+    /// The flags' condition that says the last overflow overflowed, for its
+    /// branch to read (native/ranges.arche, fuse_overflow).
+    overflow_cc: u8,
     /// What place_of found beside its base register.
     place_disp: i32,
     a: alloc.Allocator,
@@ -366,6 +369,7 @@ fn gen_overflow(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
             cc = cd.LO;
         }
         cd.cset(&mut g.code, cc: cc, rd: S1);
+        g.overflow_cc = cc;
     } else if size == 8 {
         let x = use_int(g, f, i.a, scratch: S0);
         let y = use_int(g, f, i.b, scratch: S1);
@@ -381,6 +385,7 @@ fn gen_overflow(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
             cd.cmp(&mut g.code, 8, rn: S2, rm: cd.ZR);
         }
         cd.cset(&mut g.code, cc: cd.NE, rd: S1);
+        g.overflow_cc = cd.NE;
     } else if size == 4 {
         let x = use_int(g, f, i.a, scratch: S0);
         let y = use_int(g, f, i.b, scratch: S1);
@@ -393,6 +398,7 @@ fn gen_overflow(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
         }
         cd.cmp(&mut g.code, 8, rn: S2, rm: S0);
         cd.cset(&mut g.code, cc: cd.NE, rd: S1);
+        g.overflow_cc = cd.NE;
     } else {
         // Bytes and halves: the whole result, compared with its low part.
         let x = use_extended(g, f, i.a, scratch: S0, signed: signed);
@@ -411,6 +417,7 @@ fn gen_overflow(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
         }
         cd.cmp(&mut g.code, 4, rn: S2, rm: S0);
         cd.cset(&mut g.code, cc: cd.NE, rd: S1);
+        g.overflow_cc = cd.NE;
     }
     end_int(g, id, S0);
     var b = bit;
@@ -1100,7 +1107,16 @@ fn gen_terminator(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst, next: u32) 
             }
             var cc = cd.NE;
             if g.r.kinds[i.a as usize] == ra.V_FUSED {
-                cc = compare(g, f, f.insts[i.a as usize]);
+                // A comparison, or an overflow's bit, flipped or not: the
+                // flags its operation left.
+                let c = f.insts[i.a as usize];
+                if c.op == ir.Op.Cmp {
+                    cc = compare(g, f, c);
+                } else if c.op == ir.Op.OverflowBit {
+                    cc = g.overflow_cc;
+                } else {
+                    cc = g.overflow_cc ^ 1;
+                }
             } else {
                 let r = use_int(g, f, i.a, scratch: S0);
                 cd.test_one(&mut g.code, r);
@@ -1171,7 +1187,11 @@ fn gen_inst(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, next: u32) {
         .Store => { gen_store(g, f, i); }
         .Memcpy => { gen_memcpy(g, f, i); }
         .Memzero => { gen_memzero(g, f, i); }
-        .Bin => { gen_bin(g, f, id, i); }
+        .Bin => {
+            if g.r.kinds[id as usize] != ra.V_FUSED {
+                gen_bin(g, f, id, i);
+            }
+        }
         .Overflow => { gen_overflow(g, f, id, i); }
         .Cmp => {
             if g.r.kinds[id as usize] != ra.V_FUSED {
@@ -1322,13 +1342,16 @@ fn gen_function(g: &mut Gen, m: &ir.Module, f: &ir.Function, index: usize) {
         uu.first_row(&mut g.u, f);
         prologue(g, f);
         fill_offsets(g, f.blocks.len());
-        var b: usize = 0;
-        while b < f.blocks.len() : (b += 1) {
+        // In the order plan chose (native/ranges.arche): the next block
+        // written is the one a branch falls through to.
+        var li: usize = 0;
+        while li < g.r.layout.len() : (li += 1) {
+            let b = g.r.layout[li] as usize;
             g.block_offsets[b] = cd.here(&g.code);
             g.block = b as u32;
             var next = ra.NONE;
-            if b + 1 < f.blocks.len() {
-                next = b as u32 + 1;
+            if li + 1 < g.r.layout.len() {
+                next = g.r.layout[li + 1];
             }
             let ids = f.blocks[b].insts.items();
             var k: usize = 0;
@@ -1360,6 +1383,7 @@ pub fn object(m: &ir.Module, scope: uu.Scope, problem: &mut alloc.String, a: all
         homes: alloc.List(i32).init(a),
         outgoing: 0,
         block: 0,
+        overflow_cc: 0,
         place_disp: 0,
         a: a,
     };

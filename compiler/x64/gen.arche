@@ -42,6 +42,9 @@ pub type Gen = struct {
     outgoing: u32,
     /// The block being written: where an edge's moves come from.
     block: u32,
+    /// The flags' condition that says the last overflow overflowed, for its
+    /// branch to read (native/ranges.arche, fuse_overflow).
+    overflow_cc: u8,
     a: alloc.Allocator,
 }
 
@@ -373,17 +376,17 @@ fn gen_overflow(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
         if k == 1 or k == 3 {
             cc = cd.CC_B;
         }
-        cd.setcc(&mut g.code, cc: cc, r: cd.RCX);
+        set_bit(g, bit: bit, cc: cc);
     } else if size >= 4 or (k == 4 and size == 2) {
         to_int(g, f, i.a, target: cd.RAX);
         if k == 4 {
             let rb = use_int(g, f, i.b, scratch: cd.RCX);
             cd.imul_rr(&mut g.code, size, dst: cd.RAX, src: rb);
-            cd.setcc(&mut g.code, cc: cd.CC_O, r: cd.RCX);
+            set_bit(g, bit: bit, cc: cd.CC_O);
         } else {
             let rb = use_int(g, f, i.b, scratch: cd.RCX);
             cd.unary(&mut g.code, digit: cd.UNARY_MUL, size, r: rb);
-            cd.setcc(&mut g.code, cc: cd.CC_B, r: cd.RCX);
+            set_bit(g, bit: bit, cc: cd.CC_B);
         }
     } else {
         // Bytes, and unsigned halves: the whole product, compared with its low part.
@@ -397,16 +400,25 @@ fn gen_overflow(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
             cd.movzx(&mut g.code, dst: cd.RDX, src: cd.RAX, from: size);
         }
         cd.alu_rr(&mut g.code, op: cd.OP_CMP, 4, reg: cd.RDX, rm: cd.RAX);
-        cd.setcc(&mut g.code, cc: cd.CC_NE, r: cd.RCX);
+        set_bit(g, bit: bit, cc: cd.CC_NE);
     }
     end_int(g, id, cd.RAX);
-    if bit != ra.NONE {
+    if bit != ra.NONE and g.r.kinds[bit as usize] == ra.V_REG {
         cd.movzx(&mut g.code, dst: cd.RCX, src: cd.RCX, from: 1);
     }
     var b = bit;
     while b != ra.NONE : (b = g.r.next_bit[b as usize]) {
         end_int(g, b, cd.RCX);
     }
+}
+
+/// An overflow's condition cc: in cl when a bit of it lives, and kept for a
+/// branch that reads the flags (native/ranges.arche, fuse_overflow).
+fn set_bit(g: &mut Gen, bit: u32, cc: u8) {
+    if bit != ra.NONE and g.r.kinds[bit as usize] == ra.V_REG {
+        cd.setcc(&mut g.code, cc: cc, r: cd.RCX);
+    }
+    g.overflow_cc = cc;
 }
 
 fn cmp_condition(k: u32) -> u8 {
@@ -1157,7 +1169,16 @@ fn gen_terminator(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst, next: u32) 
             }
             var cc = cd.CC_NE;
             if g.r.kinds[i.a as usize] == ra.V_FUSED {
-                cc = compare(g, f, f.insts[i.a as usize]);
+                // A comparison, or an overflow's bit, flipped or not: the
+                // flags its operation left.
+                let c = f.insts[i.a as usize];
+                if c.op == ir.Op.Cmp {
+                    cc = compare(g, f, c);
+                } else if c.op == ir.Op.OverflowBit {
+                    cc = g.overflow_cc;
+                } else {
+                    cc = g.overflow_cc ^ 1;
+                }
             } else {
                 let r = use_int(g, f, i.a, scratch: cd.RAX);
                 cd.test_byte(&mut g.code, r: r, imm: 1);
@@ -1341,7 +1362,11 @@ fn gen_inst(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, next: u32) {
         .Store => { gen_store(g, f, i); }
         .Memcpy => { gen_memcpy(g, f, i); }
         .Memzero => { gen_memzero(g, f, i); }
-        .Bin => { gen_bin(g, f, id, i); }
+        .Bin => {
+            if g.r.kinds[id as usize] != ra.V_FUSED {
+                gen_bin(g, f, id, i);
+            }
+        }
         .Overflow => { gen_overflow(g, f, id, i); }
         .Cmp => {
             if g.r.kinds[id as usize] != ra.V_FUSED {
@@ -1443,13 +1468,16 @@ fn gen_function(g: &mut Gen, m: &ir.Module, f: &ir.Function, index: usize) {
         uu.first_row(&mut g.u, f);
         prologue(g, f);
         fill_offsets(g, f.blocks.len());
-        var b: usize = 0;
-        while b < f.blocks.len() : (b += 1) {
+        // In the order plan chose (native/ranges.arche): the next block
+        // written is the one a branch falls through to.
+        var li: usize = 0;
+        while li < g.r.layout.len() : (li += 1) {
+            let b = g.r.layout[li] as usize;
             g.block_offsets[b] = cd.here(&g.code);
             g.block = b as u32;
             var next = ra.NONE;
-            if b + 1 < f.blocks.len() {
-                next = b as u32 + 1;
+            if li + 1 < g.r.layout.len() {
+                next = g.r.layout[li + 1];
             }
             let ids = f.blocks[b].insts.items();
             var k: usize = 0;
@@ -1487,6 +1515,7 @@ pub fn object(m: &ir.Module, scope: uu.Scope, problem: &mut alloc.String, a: all
         homes: alloc.List(i32).init(a),
         outgoing: 0,
         block: 0,
+        overflow_cc: 0,
         a: a,
     };
     let fs = m.functions.items();
