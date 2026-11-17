@@ -310,7 +310,9 @@ pub fn note_call(u: &mut Unit, line: u32, at: u32) {
 }
 
 /// Where the function's variables are, as far as the debugger can be told:
-/// in the frame, or behind a pointer that came as a parameter.
+/// in the frame, or behind a pointer that came as a parameter. In an optimized
+/// function a variable the optimizer took out of memory is nowhere the
+/// debugger can be told of.
 pub fn note_places(u: &mut Unit, r: &ra.Ranges, f: &ir.Function, homes: []i32) {
     var k: usize = 0;
     while k < f.vars.len() : (k += 1) {
@@ -318,7 +320,7 @@ pub fn note_places(u: &mut Unit, r: &ra.Ranges, f: &ir.Function, homes: []i32) {
         let kind = r.kinds[addr as usize];
         if kind == ra.V_ADDR {
             let root = r.addr_root[addr as usize];
-            if f.insts[root as usize].op == ir.Op.Alloca and f.insts[root as usize].flag <= 16 {
+            if f.insts[root as usize].op == ir.Op.Alloca and f.insts[root as usize].flag <= 16 and ra.has_place(r, f, alloca: root) {
                 u.places.push(dwarf.VarPlace { index: k as u32, disp: r.disps[root as usize] + r.addr_off[addr as usize] as i32, deref: false });
             }
         } else if kind == ra.V_PARAM {

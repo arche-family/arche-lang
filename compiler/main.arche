@@ -822,9 +822,6 @@ fn native_object(opts: &program.Options, m: &ir.Module, scope: uu.Scope, problem
 }
 
 fn has_native_backend(opts: &program.Options) -> bool {
-    if opts.release {
-        return false;
-    }
     let t = opts.target;
     return t == program.Target.LinuxX86_64 or t == program.Target.LinuxAarch64 or t == program.Target.LinuxRiscv64;
 }
@@ -889,7 +886,7 @@ fn build(err_out: &mut std.Output, fs: &std.Fs, a: alloc.Allocator, path: str, o
     // An object is this compiler's own backend's work; text is for LLVM.
     if names_object(out_path) {
         if not has_native_backend(opts) {
-            err_out.write("arche: this compiler writes objects for a debug build on Linux; for the others, give it a .ll file\n");
+            err_out.write("arche: this compiler writes objects for Linux; for the others, give it a .ll file\n");
             return Failure.BadUsage;
         }
         var problem = alloc.String.init(a);
@@ -984,7 +981,7 @@ fn build_units(out: &mut std.Output, err_out: &mut std.Output, fs: &std.Fs, a: a
     }
     if objects {
         if not has_native_backend(opts) {
-            err_out.write("arche: this compiler writes objects for a debug build on Linux\n");
+            err_out.write("arche: this compiler writes objects for Linux\n");
             return Failure.BadUsage;
         }
         try write_object_units(out: out, err_out: err_out, fs, a, dir: dir, &m, unit_of: &unit_of, count: count, opts: opts);

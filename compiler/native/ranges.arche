@@ -5,6 +5,11 @@
 /// take no register; the others are numbered by position, and their ranges come
 /// from a liveness pass over the blocks. Then linear scan, over the registers a
 /// processor offers (spec: x64/gen.arche, a64/gen.arche, rv64/gen.arche).
+///
+/// An optimized function (a release build, ir/opt.arche) has phis: a phi has
+/// no code of its own, and takes its value on each edge into its block, at
+/// the end of the block the edge leaves, after its branch: edge_moves says
+/// how, and each backend writes the moves there.
 import alloc;
 import ir.ir;
 
@@ -17,6 +22,18 @@ pub const V_FUSED: u8 = 5;
 
 pub const NO_REG: u8 = 255;
 pub const NONE: u32 = 4294967295;
+
+/// A register of the backend's for a value on its way between two places,
+/// while the moves of an edge go round in a cycle.
+pub const SCRATCH: u32 = 4294967294;
+
+/// One move of an edge: the value src (or SCRATCH) to where the phi dst lives
+/// (or to SCRATCH), a float or not.
+pub type Move = struct {
+    pub src: u32,
+    pub dst: u32,
+    pub float: bool,
+}
 
 /// Everything about the function being written, kept between functions so
 /// that the compiler's one arena does not grow with each.
@@ -33,7 +50,10 @@ pub type Ranges = struct {
     pub addr_off: alloc.List(i64),
     pub disps: alloc.List(i32),
     global_index: alloc.List(u32),
+    /// An overflow's bit, and the next bit of the same overflow: the
+    /// optimizer may leave more than one.
     pub overflow_bit: alloc.List(u32),
+    pub next_bit: alloc.List(u32),
     /// By block.
     block_starts: alloc.List(u32),
     block_ends: alloc.List(u32),
@@ -57,6 +77,10 @@ pub type Ranges = struct {
     pub saved_floats: alloc.List(u8),
     /// The bytes of the frame below the frame pointer so far.
     pub frame: i32,
+    /// The moves of the edge being written, in order (edge_moves), and those
+    /// still to be ordered.
+    pub moves: alloc.List(Move),
+    pending: alloc.List(Move),
 }
 
 pub fn new_ranges(a: alloc.Allocator) -> Ranges {
@@ -73,6 +97,7 @@ pub fn new_ranges(a: alloc.Allocator) -> Ranges {
         disps: alloc.List(i32).init(a),
         global_index: alloc.List(u32).init(a),
         overflow_bit: alloc.List(u32).init(a),
+        next_bit: alloc.List(u32).init(a),
         block_starts: alloc.List(u32).init(a),
         block_ends: alloc.List(u32).init(a),
         live_in: alloc.List(u64).init(a),
@@ -89,6 +114,8 @@ pub fn new_ranges(a: alloc.Allocator) -> Ranges {
         saved_ints: alloc.List(u8).init(a),
         saved_floats: alloc.List(u8).init(a),
         frame: 0,
+        moves: alloc.List(Move).init(a),
+        pending: alloc.List(Move).init(a),
     };
 }
 
@@ -210,6 +237,7 @@ pub fn plan(r: &mut Ranges, f: &ir.Function) {
     fill_i32(&mut r.disps, n, 0);
     fill_u32(&mut r.global_index, n, NONE);
     fill_u32(&mut r.overflow_bit, n, NONE);
+    fill_u32(&mut r.next_bit, n, NONE);
     let nblocks = f.blocks.len();
     fill_u32(&mut r.block_starts, nblocks, 0);
     fill_u32(&mut r.block_ends, nblocks, 0);
@@ -217,7 +245,9 @@ pub fn plan(r: &mut Ranges, f: &ir.Function) {
     r.globals.clear();
 
     // How each value lives. Numbers go up with definitions, so an address's
-    // root is known by the time its offset is.
+    // root is known by the time its offset is; in an optimized function an
+    // operand may be numbered after its user, and the addresses whose root
+    // came later are settled after.
     var id: u32 = 0;
     while id < n as u32 : (id += 1) {
         let i = f.insts[id as usize];
@@ -247,6 +277,10 @@ pub fn plan(r: &mut Ranges, f: &ir.Function) {
                 }
             }
         }
+    }
+
+    if f.ssa {
+        settle_addresses(r, f);
     }
 
     // Positions, definitions and uses, in the order of the blocks.
@@ -288,6 +322,9 @@ pub fn plan(r: &mut Ranges, f: &ir.Function) {
         }
         r.block_ends[b] = pos;
     }
+    if f.ssa {
+        place_phis(r, f);
+    }
 
     // A comparison its branch reads alone is done by the branch.
     b = 0;
@@ -302,6 +339,197 @@ pub fn plan(r: &mut Ranges, f: &ir.Function) {
         }
     }
     liveness(r, f);
+}
+
+/// The addresses of an optimized function whose root is numbered after them,
+/// in as many rounds as their chains are long.
+fn settle_addresses(r: &mut Ranges, f: &ir.Function) {
+    var settled = false;
+    while not settled {
+        settled = true;
+        var id: u32 = 0;
+        while id < f.insts.len() as u32 : (id += 1) {
+            let i = f.insts[id as usize];
+            if i.op == ir.Op.Gep and r.kinds[id as usize] == V_REG and r.kinds[i.a as usize] == V_ADDR {
+                r.kinds[id as usize] = V_ADDR;
+                r.addr_root[id as usize] = r.addr_root[i.a as usize];
+                r.addr_off[id as usize] = r.addr_off[i.a as usize] + i.imm as i64;
+                settled = false;
+            }
+        }
+    }
+}
+
+/// Whether a block begins with phis: every edge into it has moves.
+pub fn has_phis(f: &ir.Function, b: u32) -> bool {
+    let ids = f.blocks[b as usize].insts.items();
+    return ids.len() > 0 and f.insts[ids[0] as usize].op == ir.Op.Phi;
+}
+
+/// The phis' edges: the value a phi takes on an edge is read at the end of
+/// the block it leaves, so it lives to there; and the phi is written there,
+/// so it lives from there. Each is a use, which a comparison's fusing with its
+/// branch counts. An overflow's bit and an asm's output are written with the
+/// operation (each backend's gen_overflow, gen_asm), wherever the optimizer
+/// left them: defined there. And the other values no block holds, which the
+/// optimizer took out, live nowhere.
+fn place_phis(r: &mut Ranges, f: &ir.Function) {
+    var id: usize = 0;
+    while id < f.insts.len() : (id += 1) {
+        let i = f.insts[id];
+        if r.kinds[id] == V_REG and (i.op == ir.Op.OverflowBit or i.op == ir.Op.AsmOut) and r.def_block[i.a as usize] != NONE {
+            r.def_block[id] = r.def_block[i.a as usize];
+            r.starts[id] = r.starts[i.a as usize];
+            if r.ends[id] < r.starts[id] + 1 {
+                r.ends[id] = r.starts[id] + 1;
+            }
+        }
+    }
+    id = 0;
+    while id < f.insts.len() : (id += 1) {
+        if r.kinds[id] == V_REG and r.def_block[id] == NONE {
+            r.kinds[id] = V_NONE;
+        }
+    }
+    // A stack slot is used when any address into it is (has_place).
+    id = 0;
+    while id < f.insts.len() : (id += 1) {
+        let root = r.addr_root[id];
+        if r.kinds[id] == V_ADDR and root != NONE and root != id as u32 and r.uses[id] > 0 {
+            r.uses[root as usize] += 1;
+        }
+    }
+    // The bits each overflow writes: those that live, not those the
+    // optimizer took out.
+    fill_u32(&mut r.overflow_bit, f.insts.len(), NONE);
+    id = 0;
+    while id < f.insts.len() : (id += 1) {
+        let i = f.insts[id];
+        if i.op == ir.Op.OverflowBit and r.kinds[id] == V_REG {
+            r.next_bit[id] = r.overflow_bit[i.a as usize];
+            r.overflow_bit[i.a as usize] = id as u32;
+        }
+    }
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        let ids = f.blocks[b].insts.items();
+        var k: usize = 0;
+        while k < ids.len() and f.insts[ids[k] as usize].op == ir.Op.Phi : (k += 1) {
+            let p = ids[k] as usize;
+            let i = f.insts[p];
+            var j = i.args_start;
+            while j + 1 < i.args_start + i.args_len : (j += 2) {
+                let edge = r.block_ends[f.args[j as usize] as usize];
+                let v = f.args[j as usize + 1] as usize;
+                r.uses[v] += 1;
+                if r.kinds[v] == V_REG and r.ends[v] < edge {
+                    r.ends[v] = edge;
+                }
+                if r.kinds[p] == V_REG {
+                    if r.starts[p] > edge - 1 {
+                        r.starts[p] = edge - 1;
+                    }
+                    if r.ends[p] < edge {
+                        r.ends[p] = edge;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Where a value is while an edge's moves run, for telling which overwrite
+/// which: a register of its class, a slot, or SCRATCH's register; NOWHERE
+/// for a value read where it is used (a constant, an address, a parameter).
+const NOWHERE: u64 = 18446744073709551615;
+
+fn place_of(r: &Ranges, f: &ir.Function, v: u32, float: bool) -> u64 {
+    if v == SCRATCH {
+        if float {
+            return 1099511627777;
+        }
+        return 1099511627776;
+    }
+    if r.kinds[v as usize] != V_REG {
+        return NOWHERE;
+    }
+    let reg = r.regs[v as usize];
+    if reg != NO_REG {
+        if is_float(f.insts[v as usize].ty) {
+            return 64 + reg as u64;
+        }
+        return reg as u64;
+    }
+    return 4294967296 + (r.slots[v as usize] as% u32) as u64;
+}
+
+/// The moves of the edge from → to into r.moves: each phi of to takes the
+/// value it has from from, all at once. In an order that reads every place
+/// before it is written; where they go round in a cycle, one value waits in
+/// SCRATCH. A move to where the value is already is none.
+pub fn edge_moves(r: &mut Ranges, f: &ir.Function, from: u32, to: u32) {
+    r.moves.clear();
+    r.pending.clear();
+    let ids = f.blocks[to as usize].insts.items();
+    var k: usize = 0;
+    while k < ids.len() and f.insts[ids[k] as usize].op == ir.Op.Phi : (k += 1) {
+        let p = ids[k];
+        let i = f.insts[p as usize];
+        if r.kinds[p as usize] == V_REG {
+            let float = is_float(i.ty);
+            var j = i.args_start;
+            var found = false;
+            while j + 1 < i.args_start + i.args_len and not found : (j += 2) {
+                if f.args[j as usize] == from {
+                    found = true;
+                    let v = f.args[j as usize + 1];
+                    if place_of(r, f, v: v, float: float) != place_of(r, f, v: p, float: float) {
+                        r.pending.push(Move { src: v, dst: p, float: float });
+                    }
+                }
+            }
+        }
+    }
+    while r.pending.len() > 0 {
+        // A move whose place no other reads goes first.
+        var pick = r.pending.len();
+        var m: usize = 0;
+        while m < r.pending.len() and pick == r.pending.len() : (m += 1) {
+            let target = place_of(r, f, v: r.pending[m].dst, float: r.pending[m].float);
+            var read = false;
+            var o: usize = 0;
+            while o < r.pending.len() and not read : (o += 1) {
+                if o != m and place_of(r, f, v: r.pending[o].src, float: r.pending[o].float) == target {
+                    read = true;
+                }
+            }
+            if not read {
+                pick = m;
+            }
+        }
+        if pick < r.pending.len() {
+            r.moves.push(r.pending[pick]);
+            let last = r.pending.len() - 1;
+            r.pending[pick] = r.pending[last];
+            _ = r.pending.pop();
+        } else {
+            // A cycle: what the first move's place holds waits in SCRATCH,
+            // and the moves that read it read it there.
+            let first = r.pending[0];
+            let target = place_of(r, f, v: first.dst, float: first.float);
+            var o: usize = 0;
+            var saved = false;
+            while o < r.pending.len() : (o += 1) {
+                if place_of(r, f, v: r.pending[o].src, float: r.pending[o].float) == target {
+                    if not saved {
+                        r.moves.push(Move { src: r.pending[o].src, dst: SCRATCH, float: first.float });
+                        saved = true;
+                    }
+                    r.pending[o].src = SCRATCH;
+                }
+            }
+        }
+    }
 }
 
 fn successors_into(r: &mut Ranges, i: ir.Inst) {
@@ -333,6 +561,11 @@ fn liveness(r: &mut Ranges, f: &ir.Function) {
                 }
             }
         }
+    }
+    // A phi's value from an edge is used at the end of the block it leaves:
+    // outside its own block when it is defined elsewhere.
+    if f.ssa {
+        each_phi_use(r, f, mark: true, words: 0);
     }
     if r.globals.len() == 0 {
         return;
@@ -366,6 +599,9 @@ fn liveness(r: &mut Ranges, f: &ir.Function) {
                 r.kill_bits[word] = r.kill_bits[word] | (one << (gd as u64 % 64));
             }
         }
+    }
+    if f.ssa {
+        each_phi_use(r, f, mark: false, words: words);
     }
     var changed = true;
     while changed {
@@ -413,6 +649,41 @@ fn liveness(r: &mut Ranges, f: &ir.Function) {
                 }
                 if r.starts[v] > r.block_ends[b] {
                     r.starts[v] = r.block_ends[b];
+                }
+            }
+        }
+    }
+}
+
+/// Each value a phi takes on an edge, defined outside the block the edge
+/// leaves: with mark, made one of the values the bit sets follow; without, a
+/// use at that block's end, so live into it.
+fn each_phi_use(r: &mut Ranges, f: &ir.Function, mark: bool, words: usize) {
+    let one: u64 = 1;
+    var b: usize = 0;
+    while b < f.blocks.len() : (b += 1) {
+        let ids = f.blocks[b].insts.items();
+        var k: usize = 0;
+        while k < ids.len() and f.insts[ids[k] as usize].op == ir.Op.Phi : (k += 1) {
+            let i = f.insts[ids[k] as usize];
+            var j = i.args_start;
+            while j + 1 < i.args_start + i.args_len : (j += 2) {
+                let from = f.args[j as usize];
+                let v = f.args[j as usize + 1];
+                if r.kinds[v as usize] == V_REG and r.def_block[v as usize] != from {
+                    if mark {
+                        if r.global_index[v as usize] == NONE {
+                            r.global_index[v as usize] = r.globals.len() as u32;
+                            r.globals.push(v);
+                        }
+                    } else {
+                        let gi = r.global_index[v as usize];
+                        let word = from as usize * words + gi as usize / 64;
+                        let bit = one << (gi as u64 % 64);
+                        if r.kill_bits[word] & bit == 0 {
+                            r.gen_bits[word] = r.gen_bits[word] | bit;
+                        }
+                    }
                 }
             }
         }
@@ -558,13 +829,20 @@ fn align_up(v: i32, to: i32) -> i32 {
     return (v + to - 1) / to * to;
 }
 
+/// Whether a stack slot takes room in the frame: every one of a debug build;
+/// of an optimized function, those still used, not those the optimizer took
+/// out of memory.
+pub fn has_place(r: &Ranges, f: &ir.Function, alloca: u32) -> bool {
+    return not f.ssa or r.uses[alloca as usize] > 0;
+}
+
 /// The stack slots, below what the frame holds so far. Past 16 bytes of
 /// alignment the frame cannot promise it: room to round the address.
 pub fn place_allocas(r: &mut Ranges, f: &ir.Function) {
     var id: u32 = 0;
     while id < f.insts.len() as u32 : (id += 1) {
         let i = f.insts[id as usize];
-        if i.op == ir.Op.Alloca {
+        if i.op == ir.Op.Alloca and has_place(r, f, alloca: id) {
             var al = i.flag as i32;
             if al < 1 {
                 al = 1;

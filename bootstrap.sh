@@ -153,12 +153,21 @@ if [ "$ARCHE_TARGET" = linux-x86_64 ]; then
     }
     own_chain own ""
     own_chain own-lib --lib-std
-    mkdir -p "$work/own/check"
+    # A release by the own backend (S41): the optimizer's phis, on their edges.
+    own_chain own-release --release
+    mkdir -p "$work/own/check" "$work/own-release/check"
     (cd "$root/compiler" && "$work/own/stage3/arche" --lib ../lib/ build main.arche "$work/own/check/arche.ll")
     if cmp -s "$work/own/check/arche.ll" "$work/stage3/arche.ll"; then
         echo "bootstrap: the compiler the own backend built builds what the others do"
     else
         echo "bootstrap: the compiler the own backend built writes other LLVM IR"
+        exit 1
+    fi
+    (cd "$root/compiler" && "$work/own-release/stage3/arche" --lib ../lib/ build main.arche "$work/own-release/check/arche.ll")
+    if cmp -s "$work/own-release/check/arche.ll" "$work/stage3/arche.ll"; then
+        echo "bootstrap: the release compiler the own backend built builds what the others do"
+    else
+        echo "bootstrap: the release compiler the own backend built writes other LLVM IR"
         exit 1
     fi
 fi

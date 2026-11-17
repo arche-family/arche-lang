@@ -1,5 +1,6 @@
 /// The compiler's own ARM64 backend (docs/sprints.md S28): an IR module as an
-/// ELF object, with no LLVM between them. How values live and which registers
+/// ELF object, with no LLVM between them, for a debug build and a release
+/// build (S41: an optimized function's phis take their values on its edges). How values live and which registers
 /// they get is every backend's (native/ranges.arche); this file is what is
 /// ARM64's.
 ///
@@ -38,6 +39,8 @@ pub type Gen = struct {
     fix_block: alloc.List(u32),
     homes: alloc.List(i32),
     outgoing: u32,
+    /// The block being written: where an edge's moves come from.
+    block: u32,
     /// What place_of found beside its base register.
     place_disp: i32,
     a: alloc.Allocator,
@@ -410,8 +413,9 @@ fn gen_overflow(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
         cd.cset(&mut g.code, cc: cd.NE, rd: S1);
     }
     end_int(g, id, S0);
-    if bit != ra.NONE {
-        end_int(g, bit, S1);
+    var b = bit;
+    while b != ra.NONE : (b = g.r.next_bit[b as usize]) {
+        end_int(g, b, S1);
     }
 }
 
@@ -1037,24 +1041,61 @@ fn epilogue(g: &mut Gen) {
     cd.ret(&mut g.code);
 }
 
-fn gen_terminator(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst, next: u32) {
-    match i.op {
-        .Br => {
-            if i.a != next {
-                let at = cd.b(&mut g.code);
-                jump_to(g, at: at, block: i.a);
+/// The phis of block to take their values on the edge from the block being
+/// written (native/ranges.arche): x9 and d16 carry a value between two
+/// places, x11 and d17 hold one while a cycle of moves goes round.
+fn edge(g: &mut Gen, f: &ir.Function, to: u32) {
+    ra.edge_moves(&mut g.r, f, from: g.block, to: to);
+    var k: usize = 0;
+    while k < g.r.moves.len() : (k += 1) {
+        let mv = g.r.moves[k];
+        if mv.float {
+            var x = FS1;
+            if mv.src != ra.SCRATCH {
+                x = use_float(g, f, mv.src, scratch: FS0);
+            }
+            if mv.dst == ra.SCRATCH {
+                if x != FS1 {
+                    cd.fmov(&mut g.code, 8, rd: FS1, rn: x);
+                }
+            } else {
+                end_float(g, f, mv.dst, x);
+            }
+        } else {
+            var r = S2;
+            if mv.src != ra.SCRATCH {
+                r = use_int(g, f, mv.src, scratch: S0);
+            }
+            if mv.dst == ra.SCRATCH {
+                if r != S2 {
+                    cd.mov(&mut g.code, rd: S2, rm: r);
+                }
+            } else {
+                end_int(g, mv.dst, r);
             }
         }
+    }
+}
+
+/// To block: its phis' moves, then the branch, unless it comes next.
+fn go_to(g: &mut Gen, f: &ir.Function, to: u32, next: u32) {
+    edge(g, f, to: to);
+    if to != next {
+        let at = cd.b(&mut g.code);
+        jump_to(g, at: at, block: to);
+    }
+}
+
+fn gen_terminator(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst, next: u32) {
+    match i.op {
+        .Br => { go_to(g, f, to: i.a, next: next); }
         .CondBr => {
             if g.r.kinds[i.a as usize] == ra.V_CONST {
                 var target = i.c;
                 if const_bits(f, i.a) & 1 == 1 {
                     target = i.b;
                 }
-                if target != next {
-                    let at = cd.b(&mut g.code);
-                    jump_to(g, at: at, block: target);
-                }
+                go_to(g, f, to: target, next: next);
                 return;
             }
             var cc = cd.NE;
@@ -1064,7 +1105,26 @@ fn gen_terminator(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst, next: u32) 
                 let r = use_int(g, f, i.a, scratch: S0);
                 cd.test_one(&mut g.code, r);
             }
-            if i.b == next {
+            // An edge with moves: the branch first, on the flags, and the
+            // moves on its way.
+            let moves_b = ra.has_phis(f, i.b);
+            let moves_c = ra.has_phis(f, i.c);
+            if moves_b and moves_c {
+                let skip = cd.b_cond(&mut g.code, cc ^ 1);
+                edge(g, f, to: i.b);
+                let at = cd.b(&mut g.code);
+                jump_to(g, at: at, block: i.b);
+                cd.patch_here(&mut g.code, at: skip);
+                go_to(g, f, to: i.c, next: next);
+            } else if moves_b {
+                let at = cd.b_cond(&mut g.code, cc ^ 1);
+                jump_to(g, at: at, block: i.c);
+                go_to(g, f, to: i.b, next: next);
+            } else if moves_c {
+                let at = cd.b_cond(&mut g.code, cc);
+                jump_to(g, at: at, block: i.b);
+                go_to(g, f, to: i.c, next: next);
+            } else if i.b == next {
                 let at = cd.b_cond(&mut g.code, cc ^ 1);
                 jump_to(g, at: at, block: i.c);
             } else {
@@ -1158,7 +1218,9 @@ fn gen_inst(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, next: u32) {
                 cd.dmb(&mut g.code);
             }
         }
-        .Phi => { uu.say_problem(&mut g.u, f, what: "an optimized function: a release build goes through LLVM"); }
+        .Phi => {
+            // Its value came on the edge (edge).
+        }
         .Br | .CondBr | .Ret | .RetVoid | .Unreachable => { gen_terminator(g, f, id: id, i, next: next); }
     }
 }
@@ -1263,6 +1325,7 @@ fn gen_function(g: &mut Gen, m: &ir.Module, f: &ir.Function, index: usize) {
         var b: usize = 0;
         while b < f.blocks.len() : (b += 1) {
             g.block_offsets[b] = cd.here(&g.code);
+            g.block = b as u32;
             var next = ra.NONE;
             if b + 1 < f.blocks.len() {
                 next = b as u32 + 1;
@@ -1296,6 +1359,7 @@ pub fn object(m: &ir.Module, scope: uu.Scope, problem: &mut alloc.String, a: all
         fix_block: alloc.List(u32).init(a),
         homes: alloc.List(i32).init(a),
         outgoing: 0,
+        block: 0,
         place_disp: 0,
         a: a,
     };

@@ -2,8 +2,8 @@
 # The bootstrap on another processor (docs/sprints.md S28): stage1, on this
 # machine, builds the compiler for the target; QEMU's user mode runs that
 # stage2, which builds stage3 from the same source. stage2 and stage3 must be
-# bit-identical, through LLVM and by the compiler's own backend.
-# Needs clang and qemu-user.
+# bit-identical, through LLVM and by the compiler's own backend, in a debug
+# build and in a release build (S41). Needs clang and qemu-user.
 # Usage: ./cross-bootstrap.sh <aarch64 | riscv64> [work dir], anywhere.
 set -eu
 root=$(cd "$(dirname "$0")" && pwd)
@@ -38,18 +38,23 @@ else
     exit 1
 fi
 
-mkdir -p "$work/own/stage2" "$work/own/stage3"
 "$stage1" import "$rt" "$work/rt.ao"
-echo "cross-bootstrap: $arch: stage2, built by stage1's own backend and linker"
-(cd "$root/compiler" && "$stage1" $TARGET_FLAG --lib ../lib/ build main.arche "$work/own/stage2/arche.ao")
-"$stage1" link "$work/own/stage2/arche" "$work/own/stage2/arche.ao" "$work/rt.ao"
-echo "cross-bootstrap: $arch: stage3, built by stage2 under QEMU"
-(cd "$root/compiler" && $qemu "$work/own/stage2/arche" $TARGET_FLAG --lib ../lib/ build main.arche "$work/own/stage3/arche.ao")
-$qemu "$work/own/stage2/arche" link "$work/own/stage3/arche" "$work/own/stage3/arche.ao" "$work/rt.ao"
-if cmp -s "$work/own/stage2/arche" "$work/own/stage3/arche"; then
-    echo "cross-bootstrap: $arch: by its own backend, stage2 and stage3 are bit-identical"
-    sha256sum "$work/own/stage3/arche"
-else
-    echo "cross-bootstrap: $arch: by its own backend, stage2 and stage3 differ"
-    exit 1
-fi
+# By the own backend: a directory, then the flags of the build.
+own_chain() {
+    mkdir -p "$work/$1/stage2" "$work/$1/stage3"
+    echo "cross-bootstrap: $arch: stage2 ($1), built by stage1's own backend and linker"
+    (cd "$root/compiler" && "$stage1" $TARGET_FLAG $2 --lib ../lib/ build main.arche "$work/$1/stage2/arche.ao")
+    "$stage1" link "$work/$1/stage2/arche" "$work/$1/stage2/arche.ao" "$work/rt.ao"
+    echo "cross-bootstrap: $arch: stage3 ($1), built by stage2 under QEMU"
+    (cd "$root/compiler" && $qemu "$work/$1/stage2/arche" $TARGET_FLAG $2 --lib ../lib/ build main.arche "$work/$1/stage3/arche.ao")
+    $qemu "$work/$1/stage2/arche" link "$work/$1/stage3/arche" "$work/$1/stage3/arche.ao" "$work/rt.ao"
+    if cmp -s "$work/$1/stage2/arche" "$work/$1/stage3/arche"; then
+        echo "cross-bootstrap: $arch: by its own backend ($1), stage2 and stage3 are bit-identical"
+        sha256sum "$work/$1/stage3/arche"
+    else
+        echo "cross-bootstrap: $arch: by its own backend ($1), stage2 and stage3 differ"
+        exit 1
+    fi
+}
+own_chain own ""
+own_chain own-release --release

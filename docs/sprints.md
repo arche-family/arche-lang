@@ -2,7 +2,7 @@
 
 > 2026-11-10 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** yo'q. Ochiq sprintlar ikkita: S19 (Windows) va S37 (macOS). Ikkalasi ham o'z mashinasini kutadi.
+**Joriy sprint:** S41 (o'z backend'ida release). Bundan tashqari ochiq sprintlar ikkita: S19 (Windows) va S37 (macOS). Ikkalasi ham o'z mashinasini kutadi.
 
 **Yopilgan:** S0–S36, S38–S40. Til yakuniy qabuldan o'tdi (S34).
 
@@ -416,6 +416,16 @@ Bosqich natijasi: to'liq spec bor va compiler concurrency hamda past darajadan t
 - Arche → WASM, stack codegen.
 
 **Qabul:** compiler va `std` testlarining WASM'da ishlay oladigan qismi mavjud WASM runtime'da o'tadi.
+
+### S41. O'z backend'ida release
+
+S27–S28'da o'z backend'i faqat debug build'ni chiqarardi: release IR'ini optimizer (S26) SSA'ga o'tkazadi, phi'larni esa backend bilmasdi, shuning uchun release LLVM orqali qolgan edi. Benchmark'dan keyin (2026-11-17) qo'shildi.
+
+- Optimizer'ning phi'lari x64, ARM64 va RISC-V'da. Phi'ning o'z kodi yo'q: u qiymatini har qirrada, qirra chiqadigan blok oxirida, branch'dan keyin oladi. Bir qirraning nusxalari bir vaqtda bajarilgandek tartiblanadi (`native/ranges.arche`, `edge_moves`).
+- Liveness va registr taqsimlash phi'larni hisobga oladi. Optimizatsiyalangan IR'ning debug'da uchramaydigan shakllari ham qo'llanadi.
+- Release'ning tezligi o'z backend'ida o'lchanadi va kod sifati yaxshilanadi.
+
+**Qabul:** conformance testlari o'z backend'i va release bilan x64, ARM64 va RISC-V'da (QEMU user-mode) o'tadi. O'z backend'i bilan release'da ham stage2 == stage3, x64'da va cross-bootstrap'da. Release'ning tezligi `bench/`da qayd etiladi.
 
 ## 8. Web va WASM
 

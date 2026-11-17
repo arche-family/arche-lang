@@ -1,5 +1,7 @@
 /// The compiler's own x86-64 backend (docs/sprints.md S27): an IR module as an
-/// ELF object, with no LLVM between them, for a debug build on the host.
+/// ELF object, with no LLVM between them, for a debug build and a release
+/// build (S41: an optimized function's phis take their values on its edges,
+/// native/ranges.arche).
 ///
 /// Each function goes through four steps. plan() says how each value lives:
 /// constants, stack addresses and parameters are read where they are used and
@@ -38,6 +40,8 @@ pub type Gen = struct {
     fix_block: alloc.List(u32),
     homes: alloc.List(i32),
     outgoing: u32,
+    /// The block being written: where an edge's moves come from.
+    block: u32,
     a: alloc.Allocator,
 }
 
@@ -398,7 +402,10 @@ fn gen_overflow(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst) {
     end_int(g, id, cd.RAX);
     if bit != ra.NONE {
         cd.movzx(&mut g.code, dst: cd.RCX, src: cd.RCX, from: 1);
-        end_int(g, bit, cd.RCX);
+    }
+    var b = bit;
+    while b != ra.NONE : (b = g.r.next_bit[b as usize]) {
+        end_int(g, b, cd.RCX);
     }
 }
 
@@ -1093,24 +1100,59 @@ fn jump_to(g: &mut Gen, at: u64, block: u32) {
     g.fix_block.push(block);
 }
 
-fn gen_terminator(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst, next: u32) {
-    match i.op {
-        .Br => {
-            if i.a != next {
-                let at = cd.jmp(&mut g.code);
-                jump_to(g, at: at, block: i.a);
+/// The phis of block to take their values on the edge from the block being
+/// written (native/ranges.arche): rax and xmm14 carry a value between two
+/// places, r10 and xmm15 hold one while a cycle of moves goes round.
+fn edge(g: &mut Gen, f: &ir.Function, to: u32) {
+    ra.edge_moves(&mut g.r, f, from: g.block, to: to);
+    var k: usize = 0;
+    while k < g.r.moves.len() : (k += 1) {
+        let mv = g.r.moves[k];
+        if mv.float {
+            var x = XMM_SCRATCH2;
+            if mv.src != ra.SCRATCH {
+                x = use_float(g, f, mv.src, scratch: XMM_SCRATCH);
+            }
+            if mv.dst == ra.SCRATCH {
+                move_xmm(g, dst: XMM_SCRATCH2, src: x);
+            } else {
+                end_float(g, f, mv.dst, x);
+            }
+        } else {
+            var r = cd.R10;
+            if mv.src != ra.SCRATCH {
+                r = use_int(g, f, mv.src, scratch: cd.RAX);
+            }
+            if mv.dst == ra.SCRATCH {
+                if r != cd.R10 {
+                    cd.mov_rr(&mut g.code, dst: cd.R10, src: r);
+                }
+            } else {
+                end_int(g, mv.dst, r);
             }
         }
+    }
+}
+
+/// To block: its phis' moves, then the jump, unless it comes next.
+fn go_to(g: &mut Gen, f: &ir.Function, to: u32, next: u32) {
+    edge(g, f, to: to);
+    if to != next {
+        let at = cd.jmp(&mut g.code);
+        jump_to(g, at: at, block: to);
+    }
+}
+
+fn gen_terminator(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst, next: u32) {
+    match i.op {
+        .Br => { go_to(g, f, to: i.a, next: next); }
         .CondBr => {
             if g.r.kinds[i.a as usize] == ra.V_CONST {
                 var target = i.c;
                 if const_bits(f, i.a) & 1 == 1 {
                     target = i.b;
                 }
-                if target != next {
-                    let at = cd.jmp(&mut g.code);
-                    jump_to(g, at: at, block: target);
-                }
+                go_to(g, f, to: target, next: next);
                 return;
             }
             var cc = cd.CC_NE;
@@ -1120,7 +1162,27 @@ fn gen_terminator(g: &mut Gen, f: &ir.Function, id: u32, i: ir.Inst, next: u32) 
                 let r = use_int(g, f, i.a, scratch: cd.RAX);
                 cd.test_byte(&mut g.code, r: r, imm: 1);
             }
-            if i.b == next {
+            // An edge with moves: the branch first, on the flags, and the
+            // moves on its way; the condition's opposite is its number with
+            // the low bit changed.
+            let moves_b = ra.has_phis(f, i.b);
+            let moves_c = ra.has_phis(f, i.c);
+            if moves_b and moves_c {
+                let skip = cd.jcc(&mut g.code, cc ^ 1);
+                edge(g, f, to: i.b);
+                let at = cd.jmp(&mut g.code);
+                jump_to(g, at: at, block: i.b);
+                cd.patch(&mut g.code, at: skip, target: cd.here(&g.code));
+                go_to(g, f, to: i.c, next: next);
+            } else if moves_b {
+                let at = cd.jcc(&mut g.code, cc ^ 1);
+                jump_to(g, at: at, block: i.c);
+                go_to(g, f, to: i.b, next: next);
+            } else if moves_c {
+                let at = cd.jcc(&mut g.code, cc);
+                jump_to(g, at: at, block: i.b);
+                go_to(g, f, to: i.c, next: next);
+            } else if i.b == next {
                 // The condition's opposite is its number with the low bit changed.
                 let at = cd.jcc(&mut g.code, cc ^ 1);
                 jump_to(g, at: at, block: i.c);
@@ -1343,7 +1405,9 @@ fn gen_inst(g: &mut Gen, m: &ir.Module, f: &ir.Function, id: u32, next: u32) {
                 cd.mfence(&mut g.code);
             }
         }
-        .Phi => { uu.say_problem(&mut g.u, f, what: "an optimized function: a release build goes through LLVM"); }
+        .Phi => {
+            // Its value came on the edge (edge).
+        }
         .Br | .CondBr | .Ret | .RetVoid | .Unreachable => { gen_terminator(g, f, id: id, i, next: next); }
     }
 }
@@ -1382,6 +1446,7 @@ fn gen_function(g: &mut Gen, m: &ir.Module, f: &ir.Function, index: usize) {
         var b: usize = 0;
         while b < f.blocks.len() : (b += 1) {
             g.block_offsets[b] = cd.here(&g.code);
+            g.block = b as u32;
             var next = ra.NONE;
             if b + 1 < f.blocks.len() {
                 next = b as u32 + 1;
@@ -1421,6 +1486,7 @@ pub fn object(m: &ir.Module, scope: uu.Scope, problem: &mut alloc.String, a: all
         fix_block: alloc.List(u32).init(a),
         homes: alloc.List(i32).init(a),
         outgoing: 0,
+        block: 0,
         a: a,
     };
     let fs = m.functions.items();
