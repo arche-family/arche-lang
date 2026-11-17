@@ -2,9 +2,9 @@
 
 > 2026-11-10 holati. Asos: [plan.md](plan.md) va [spec/arche-0.md](../spec/arche-0.md). Bootstrap "Real dunyoda ishga tushirish" variantida: stage0 C11'da, release backend LLVM `.ll` orqali. Arche OS sprintlari bu yerda yo'q.
 
-**Joriy sprint:** S41 (o'z backend'ida release). Bundan tashqari ochiq sprintlar ikkita: S19 (Windows) va S37 (macOS). Ikkalasi ham o'z mashinasini kutadi.
+**Joriy sprint:** yo'q. Ochiq sprintlar ikkita: S19 (Windows) va S37 (macOS). Ikkalasi ham o'z mashinasini kutadi.
 
-**Yopilgan:** S0–S36, S38–S40. Til yakuniy qabuldan o'tdi (S34).
+**Yopilgan:** S0–S36, S38–S41. Til yakuniy qabuldan o'tdi (S34).
 
 - Compiler o'zini build qiladi (stage2 == stage3), stage0 `stage0-frozen` tag'i bilan muzlatilgan, to'liq til spec'i `spec/arche.md`'da; full-Arche paketlarida generics (monomorphization), comptime interpreter, interface'lar (`impl`, `where`, `&dyn`), `for`, closure'lar (`&dyn fn(P) -> R`), `region` (arena, E0901), `unsafe` va raw pointer'lar, `if`/`match` ifoda sifatida, labeled loop'lar, `f32`/`f64`, `requires`/`ensures`, `nopanic` va error return trace ishlaydi.
 - Manifest (`package.arche`) o'qiladi: `needs` (E0801), `strict_unsafe` (E0920), `panic_handler`, xato manifest E0802/E0803.
@@ -81,10 +81,11 @@
 - S26'da optimizer module chegarasidan o'tib inline qiladi, lekin faqat barg funksiyalarni, load'larni LICM ko'tarmaydi, `arche-driver` hali `--release` bermaydi, `ctcheck` faqat debug build'ni o'lchaydi, `nopanic` isboti optimizer natijasidan foydalanmaydi.
 - S19'da Windows'da standart kirishni o'qish butun dasturni to'xtatadi (netpoller faqat socket'larni kuzatadi; Linux'da fayllar alohida thread'da o'qiladi), `std.path` yo'l ajratuvchisi sifatida faqat `/`ni biladi (`is_absolute` disk nomini ham tanidi), kripto/TLS/HTTP interop (OpenSSL, curl, Chrome), `ctcheck`, freestanding QEMU va parser fuzzing CI'da Linux job'ida qoladi, Windows'da UTF-8 konsol uchun code page o'zgartiriladi, MSYS shell'i native programmaga `/` bilan boshlanadigan argumentni yo'l deb o'zgartiradi (shuning uchun linker flag'lari chiziqcha bilan va `pkg-check.sh`'da `MSYS2_ARG_CONV_EXCL`), runner'ning o'z selftest'i Windows'da o'tkazib yuboriladi (mock compiler ham, u yozgan "dastur" ham shell skript — Windows ularni o'zi ishga tushirmaydi; runner'ning o'zi conformance to'plami bilan sinaladi).
 - S36'da server hujjatni butunligicha oladi (incremental sync yo'q), `rename` va workspace bo'yicha qidiruv yo'q, editor plaginlari bu repo'da emas.
-- S27'da release build, Windows va freestanding LLVM orqali qoladi (o'z backend'i optimizer'ning phi'larini olmaydi), `rt.c` hali clang bilan build qilinadi, `arche-driver`da default LLVM (`lld` tarqatish bilan S34'da keladi), DWARF'da scope yo'q (o'zgaruvchi butun funksiyada ko'rinadi), assembler faqat `nop`, `ret`, `pause`, `syscall`, `rdtsc`, `cpuid`, `hlt`, `mfence`, `ud2`, 32 va 64 bitli `mov`, `add`, `sub`, `and`, `or`, `xor`, `cmp`, `jmp` va shartli jump'larni biladi.
-- S28'da o'z backend'i faqat Linux'ning debug build'lari uchun (freestanding ARM64 va RISC-V LLVM orqali), RISC-V'da statik dastur 2 GB'dan past turadi, ARM64'ning shartli branch'i va RISC-V'ning jump'i ±1 MB'dan uzoqqa yetmasa compiler xato beradi, assembler'lar kichik (faqat `svc`, `ecall`, `nop`, `ret`, `wfi`, `mov`/`mv`, `li`, `add` va shu kabi registr amallari); `extern "c"`ga manfiy `i8`/`i16` x86-64 va RISC-V'da nol bilan kengaytirilib boradi, chunki IR ishorani bilmaydi.
+- S27'da Windows va freestanding LLVM orqali qoladi (release build S41'dan beri o'z backend'ida ham bor), `rt.c` hali clang bilan build qilinadi, `arche-driver`da default LLVM (`lld` tarqatish bilan S34'da keladi), DWARF'da scope yo'q (o'zgaruvchi butun funksiyada ko'rinadi), assembler faqat `nop`, `ret`, `pause`, `syscall`, `rdtsc`, `cpuid`, `hlt`, `mfence`, `ud2`, 32 va 64 bitli `mov`, `add`, `sub`, `and`, `or`, `xor`, `cmp`, `jmp` va shartli jump'larni biladi.
+- S28'da o'z backend'i faqat Linux uchun (freestanding ARM64 va RISC-V LLVM orqali), RISC-V'da statik dastur 2 GB'dan past turadi, ARM64'ning shartli branch'i va RISC-V'ning jump'i ±1 MB'dan uzoqqa yetmasa compiler xato beradi, assembler'lar kichik (faqat `svc`, `ecall`, `nop`, `ret`, `wfi`, `mov`/`mv`, `li`, `add` va shu kabi registr amallari); `extern "c"`ga manfiy `i8`/`i16` x86-64 va RISC-V'da nol bilan kengaytirilib boradi, chunki IR ishorani bilmaydi.
 - S29'da runtime (`rt.c`) hali clang bilan bir marta build qilinadi (tarqatish bilan S34'da keladi), freestanding va Windows `lld`/`lld-link` bilan qoladi (linker script yo'q), ishlatilmagan section'lar tashlanmaydi, satrlar birlashtirilmaydi, RISC-V relaxation yo'q (clang `-mno-relax` bilan), `.ax`'da debug info yo'q, unga Arche OS loader'i hali yo'q (sinov uchun `compiler/tests/ax-load.c`), `arche-driver`ning kesh qiladigan modul build'lari LLVM orqali qoladi, kompozit qiymatlar plandagidek register'da emas, xotirada qaytariladi (`docs/plan.md` shunga moslandi).
-- S30'da WASM uchun release build yo'q (optimizer'ning phi'lari), `arche test` yo'q (runner har testni child process'da ishga tushiradi), DWARF yo'q (faqat `name` section), task, Proc, Net va `asm` yo'q, `Fs.current_dir` `.` qaytaradi, kod `loop` + `br_table` shakli sabab sekinroq (structured control flow yozilmagan), import'lar faqat `wasi_snapshot_preview1`.
+- S41'da o'z backend'i qiymatlarni faqat chaqiruv saqlaydigan registrlarda tutadi (x86-64'da beshta, ARM64'da o'nta, RISC-V'da o'n bitta), parametrlarni frame'dan o'qiydi, load'larni sikldan ko'tarmaydi (alias tahlili yo'q) va konstantani instruksiyaning immediate'iga qo'ymay registrga yuklaydi. Shu sabab release LLVM'ning `-O1`idan hali taxminan 1.5 baravar sekin. Parametrlarni registrga olish sinab ko'rildi: x86-64'ning beshta registri bilan sekinroq chiqdi, chunki uzoq yashaydigan parametr sikl qiymatlarini registrdan siqib chiqaradi.
+- S30'da WASM uchun release build yo'q (optimizer'ning phi'lari; o'z backend'i S41'da ularni oldi, WASM backend'i hali olmaydi), `arche test` yo'q (runner har testni child process'da ishga tushiradi), DWARF yo'q (faqat `name` section), task, Proc, Net va `asm` yo'q, `Fs.current_dir` `.` qaytaradi, kod `loop` + `br_table` shakli sabab sekinroq (structured control flow yozilmagan), import'lar faqat `wasi_snapshot_preview1`.
 
 ## Qoidalar
 
@@ -426,6 +427,24 @@ S27–S28'da o'z backend'i faqat debug build'ni chiqarardi: release IR'ini optim
 - Release'ning tezligi o'z backend'ida o'lchanadi va kod sifati yaxshilanadi.
 
 **Qabul:** conformance testlari o'z backend'i va release bilan x64, ARM64 va RISC-V'da (QEMU user-mode) o'tadi. O'z backend'i bilan release'da ham stage2 == stage3, x64'da va cross-bootstrap'da. Release'ning tezligi `bench/`da qayd etiladi.
+
+Qilingani:
+- Phi'lar (`native/ranges.arche`). Phi'ning kodi yo'q. Uning qiymati har qirrada, qirra chiqadigan blok oxirida, branch'dan keyin yoziladi. `edge_moves` bir qirraning nusxalarini bir vaqtda bajarilgandek tartiblaydi: boshqa nusxa o'qiydigan joyga u o'qib bo'lingach yoziladi. Nusxalar aylana hosil qilsa, bitta qiymat scratch registrda kutadi (x64'da r10/xmm15, ARM64'da x11/d17, RISC-V'da t2/f1). Liveness phi'ning qirradagi qiymatini qirra chiqadigan blok oxirigacha, phi'ni esa o'sha joydan boshlab tirik deb oladi. Shartli o'tishda branch avval bajariladi, nusxalar esa uning yo'lida yoziladi: ikkala qirrada ham nusxa bo'lsa, bittasi qisqa sakrash bilan aylanib o'tiladi.
+- Optimizatsiyalangan IR'da debug'da uchramaydigan shakllar bor, ularning hammasi qo'llanadi:
+  - manzilning ildizi undan keyin raqamlangan bo'lishi mumkin;
+  - optimizer ba'zi qiymatlarni hamma bloklardan chiqarib tashlaydi;
+  - `OverflowBit` o'z `Overflow`idan boshqa blokda yoki hech qaysi blokda bo'lmasligi mumkin, bitta `Overflow`ga bir nechta bit ham kelishi mumkin. Backend endi har tirik bitni `Overflow` bilan birga yozadi. Birinchi yurishda 23 test aynan shu sababli yiqilgan edi: o'lik nusxa tirik bitning o'rnini egallab qolgan edi.
+- Optimizer registrga o'tkazgan stack slot'lari frame'da joy olmaydi va DWARF'da ko'rsatilmaydi.
+- Tezlik:
+  - Overflow tekshiruvi (`Overflow`, `OverflowBit`, `xor 1`, `CondBr`) endi to'g'ridan-to'g'ri operatsiya qoldirgan flaglar bo'yicha branch qiladi (x64, ARM64); RISC-V'da bit qolgan registr bo'yicha. Bu debug build'da ham ishlaydi.
+  - Optimizatsiyalangan funksiyada bloklar zanjir tartibida yoziladi: har blokdan keyin hali yozilmagan vorisi (branch'ning true tomoni birinchi), trap'li bloklar esa oxirida.
+- Qabul bajarildi:
+  - conformance (2162 test) x64'da o'z backend bilan debug'da ham, release'da ham o'tadi; testrunner, differential (897 dastur), `own-check` (gdb bilan) va `make check` ham o'tadi.
+  - ARM64 va RISC-V'da QEMU user-mode'da 2156 test o'tadi. To'rttasi (`std/spawn-*`, `proc`, `broken-pipe`) bu mashinada binfmt yo'qligi uchun debug'da ham, LLVM orqali ham yiqiladi; CI'da binfmt bor.
+  - `bootstrap.sh`: o'z backend bilan release'da stage2 == stage3, va bu kompilyator boshqalari qurgan IR'ni bit-bit qayta quradi. `cross-bootstrap.sh` aarch64 va riscv64'da ham release zanjirini tekshiradi: stage2 == stage3.
+  - `bench/baseline.md` (2026-11-17): o'z backend'ida release debug'dan va optimizer IR'ining `clang -O0` build'idan uchdan bir tez (to'rt dastur jami 1533 ms, 2215 ms va 2217 ms), LLVM `-O1`dan (984 ms) esa sekin. `bench/run.sh` endi o'z backend'ni ham o'lchaydi va hozirgi runtime obyektini ishlatadi (eski `rt.o`ni emas).
+
+S41 yopildi.
 
 ## 8. Web va WASM
 

@@ -22,6 +22,27 @@ The baseline of docs/sprints.md S26, measured on 2026-11-05 with `bench/run.sh`:
 
 With clang -O0 a program's speed is the Arche optimizer's work alone, as it will be for the compiler's own back end (sprint S27); with -O1, LLVM's passes run after it and do the same work again. The compiler is itself a release build's input: `bootstrap.sh` checks that a release compiler builds itself bit-identically and builds what the debug compiler does.
 
+## The compiler's own backend
+
+docs/sprints.md S41, measured on 2026-11-17 with `bench/run.sh` on the same machine: the programs built by the compiler's own backend, with no LLVM, in a debug build and in a release build, which takes the optimizer's IR (its phis, on their edges). LLVM's rows are of the same run, for comparison. Times are the best of three runs, in milliseconds.
+
+| What | Debug | Release |
+| --- | ---: | ---: |
+| fib (ms, own backend) | 43 | 28 |
+| sieve (ms, own backend) | 393 | 292 |
+| map (ms, own backend) | 477 | 379 |
+| sort (ms, own backend) | 1302 | 834 |
+| fib (ms, clang -O0) | 73 | 42 |
+| sieve (ms, clang -O0) | 478 | 457 |
+| map (ms, clang -O0) | 705 | 494 |
+| sort (ms, clang -O0) | 1631 | 1224 |
+| fib (ms, clang -O1) | 29 | 30 |
+| sieve (ms, clang -O1) | 206 | 209 |
+| map (ms, clang -O1) | 210 | 205 |
+| sort (ms, clang -O1) | 558 | 540 |
+
+A release by the own backend is a third faster than its debug build, and than the optimizer's IR through clang -O0. Its branches on an overflow read the flags the operation left, and an optimized function's blocks are laid out so that the code that runs falls through, traps last. It is still slower than LLVM's passes (-O1): it keeps values in five registers (x86-64's that a call keeps), and reads parameters from the frame. Keeping them in registers too was tried, and was slower with five: a parameter lives long and pushes the loop's values out.
+
 ## The web server
 
 The baseline of docs/sprints.md S33, measured on 2026-11-09 with `bench/web/run.sh`: one worker in the clear, 16 keep-alive HTTP/1.1 connections of 2000 requests each, made by `bench/web/load.arche`, which times each request from its first byte sent to its last byte received.

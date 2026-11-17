@@ -12,7 +12,11 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 make -s -C "$root/stage0"
 make -s -C "$root/compiler"
-rt=$root/compiler/build/rt.o
+# The runtime's object for this machine, as arche-build makes it: built by
+# the first build below when it is not there yet or older than rt.c.
+. "$root/compiler/target.sh"
+"$root/compiler/arche-build" "$here/programs.arche" "$work/first" > /dev/null
+rt=$root/compiler/build/rt-$ARCHE_TARGET.o
 
 # The best of three runs of a command, in milliseconds.
 best_ms() {

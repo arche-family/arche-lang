@@ -259,7 +259,7 @@ Bugun bu reja bajarilsa, faqat bootstrap va infratuzilma qismlari mavjud vosital
 | Seed monitor + macro assembler | kerak emas: Linux yoki Windows host |
 | stage0 assembly'da | stage0 C11'da (taxminan 5–8k qator): Arche-0'ni C'ga tarjima qiladi, natijani gcc, clang yoki tcc build qiladi; C'ning hex0'dan boshlanadigan to'liq bootstrap zanjiri Arche'ga ham o'tadi |
 | `std` monitor backend'i | `std` host backend'i (Linux syscall'lari) |
-| O'z release backend'i | o'z IR → LLVM textual `.ll` → `clang` / `llc`; debug va WASM uchun o'z backend'i |
+| O'z release backend'i | o'z IR → LLVM textual `.ll` → `clang` / `llc`, yoki LLVM'siz o'z backend'i (x86-64, ARM64, RISC-V 64; debug va release); WASM uchun o'z backend'i |
 | O'z linker'i, `.ao` format | `.ao` va o'z linker'i bor; host'da u ELF yozadi, Arche OS uchun `.ax`; freestanding va Windows PE hozircha `lld` bilan |
 | O'z client/server juftligi bilan interop | OpenSSL, curl va brauzerlar bilan interop testlari |
 
