@@ -27,6 +27,10 @@ pub const BTN_TOUCH: u32 = 0x14A;
 pub const ABS_X: u32 = 0;
 pub const ABS_Y: u32 = 1;
 
+/// A phone's alert slider's position (SND_PROFILE_*: silent, vibrate,
+/// ring).
+pub const ABS_SND_PROFILE: u32 = 0x22;
+
 /// A multi-touch screen's (protocol B): the slot the events after it are
 /// of, a finger's place, and its tracking id, -1 when it lifted.
 pub const ABS_MT_SLOT: u32 = 0x2F;
@@ -41,10 +45,13 @@ pub type Event = struct {
     pub value: i32,
 }
 
-/// An absolute axis's range.
+/// An absolute axis's range, and its value now: the device says a value
+/// only when it changes, so one that has not since it was opened is read
+/// here.
 pub type Range = struct {
     pub min: i32,
     pub max: i32,
+    pub value: i32,
 }
 
 /// An input device.
@@ -101,7 +108,7 @@ pub fn range(i: &Input, axis: u32) -> InputError!Range {
     if r < 0 {
         return InputError.Refused;
     }
-    return Range { min: get_i32(info[0..24], at: 4), max: get_i32(info[0..24], at: 8) };
+    return Range { min: get_i32(info[0..24], at: 4), max: get_i32(info[0..24], at: 8), value: get_i32(info[0..24], at: 0) };
 }
 
 fn get_i32(b: []u8, at: usize) -> i32 {
