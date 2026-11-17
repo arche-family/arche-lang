@@ -442,6 +442,7 @@ Qilingani:
   - conformance (2162 test) x64'da o'z backend bilan debug'da ham, release'da ham o'tadi; testrunner, differential (897 dastur), `own-check` (gdb bilan) va `make check` ham o'tadi.
   - ARM64 va RISC-V'da QEMU user-mode'da 2156 test o'tadi. To'rttasi (`std/spawn-*`, `proc`, `broken-pipe`) bu mashinada binfmt yo'qligi uchun debug'da ham, LLVM orqali ham yiqiladi; CI'da binfmt bor.
   - `bootstrap.sh`: o'z backend bilan release'da stage2 == stage3, va bu kompilyator boshqalari qurgan IR'ni bit-bit qayta quradi. `cross-bootstrap.sh` aarch64 va riscv64'da ham release zanjirini tekshiradi: stage2 == stage3.
+  - WebAssembly backend ham `native/ranges.arche`ning `plan`idan foydalanadi. Overflow birlashtirish uni buzgan edi (`e6aea6f` WASM build'ini yiqitdi), shuning uchun endi u faqat mashina backend'lari so'raganda yoqiladi (`fuse_overflows`). WASM conformance (2035 test) va `wasm-check.sh` (WASM'da stage2 == stage3) o'tadi.
   - `bench/baseline.md` (2026-11-17): o'z backend'ida release debug'dan va optimizer IR'ining `clang -O0` build'idan uchdan bir tez (to'rt dastur jami 1533 ms, 2215 ms va 2217 ms), LLVM `-O1`dan (984 ms) esa sekin. `bench/run.sh` endi o'z backend'ni ham o'lchaydi va hozirgi runtime obyektini ishlatadi (eski `rt.o`ni emas).
 
 S41 yopildi.

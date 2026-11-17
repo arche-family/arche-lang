@@ -83,6 +83,10 @@ pub type Ranges = struct {
     pending: alloc.List(Move),
     /// The order the blocks are written in (plan).
     pub layout: alloc.List(u32),
+    /// Whether the backend branches on the flags or the register an
+    /// overflow left (fuse_overflow): the machine backends do, WebAssembly's
+    /// does not.
+    pub fuse_overflows: bool,
 }
 
 pub fn new_ranges(a: alloc.Allocator) -> Ranges {
@@ -119,6 +123,7 @@ pub fn new_ranges(a: alloc.Allocator) -> Ranges {
         moves: alloc.List(Move).init(a),
         pending: alloc.List(Move).init(a),
         layout: alloc.List(u32).init(a),
+        fuse_overflows: false,
     };
 }
 
@@ -344,9 +349,11 @@ pub fn plan(r: &mut Ranges, f: &ir.Function) {
             }
         }
     }
-    b = 0;
-    while b < nblocks : (b += 1) {
-        fuse_overflow(r, f, b: b as u32);
+    if r.fuse_overflows {
+        b = 0;
+        while b < nblocks : (b += 1) {
+            fuse_overflow(r, f, b: b as u32);
+        }
     }
     liveness(r, f);
 }
