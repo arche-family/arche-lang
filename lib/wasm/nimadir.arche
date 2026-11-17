@@ -500,6 +500,47 @@ const MAX_PART: u64 = 1 << 20;
 /// and size hashed, and the side it was fitted to.
 const THUMBS: str = ".thumbnails";
 
+/// Where the thumbnail of the file at path (in the shared folder), size
+/// bytes long, is kept: in THUMBS, its path and size hashed, then tail
+/// (the side it was fitted to, or "poster" for the picture a phone made
+/// of a video, T12), as a header of its width and height and its RGBA.
+pub fn kept_name(path: str, size: u64, tail: str, a: alloc.Allocator) -> alloc.String {
+    var h: u64 = 0xcbf29ce484222325;
+    for b in path.bytes() {
+        h = (h ^ (b.* as u64)) *% 0x100000001b3;
+    }
+    h = (h ^ size) *% 0x100000001b3;
+    var kept = alloc.String.from(THUMBS, a);
+    kept.push_str("/");
+    push_hex64(&mut kept, v: h);
+    kept.push_str("-");
+    kept.push_str(tail);
+    kept.push_str(".rgba");
+    return kept;
+}
+
+/// The picture kept at name in f (kept_name's), in a; none when there is
+/// none, or it is not whole.
+fn read_kept(f: &std.Fs, name: str, a: alloc.Allocator) -> ?png.Image {
+    let b = f.read_bytes(name, a) catch return none;
+    let bytes = b.items();
+    if bytes.len() < 8 {
+        return none;
+    }
+    let w = le32(bytes, at: 0);
+    let ht = le32(bytes, at: 4);
+    if (w as usize) * (ht as usize) * 4 + 8 != bytes.len() {
+        return none;
+    }
+    var img = png.Image { width: w, height: ht, rgba: alloc.List(u8).init(a) };
+    img.rgba.grow_zeroed(bytes.len() - 8);
+    var k: usize = 0;
+    while k < bytes.len() - 8 : (k += 1) {
+        img.rgba.items_mut()[k] = bytes[k + 8];
+    }
+    return img;
+}
+
 /// The picture at path in the shared folder (PNG or JPEG), decoded here,
 /// turned as its EXIF says, and fitted within most pixels a side (arche-os
 /// T12): an app's gallery shows a phone camera's 12 megapixels without
@@ -515,38 +556,30 @@ fn shared_image(ui: &mut Ui, path: str, most: u32, into: u64, a: alloc.Allocator
     let size = (f.info(path) catch return none).size;
     var kept = alloc.String.init(a);
     if most <= 512 {
-        var h: u64 = 0xcbf29ce484222325;
-        for b in path.bytes() {
-            h = (h ^ (b.* as u64)) *% 0x100000001b3;
-        }
-        h = (h ^ size) *% 0x100000001b3;
-        kept.push_str(THUMBS);
-        kept.push_str("/");
-        push_hex64(&mut kept, v: h);
-        kept.push_str("-");
-        kept.push_u64(most as u64);
-        kept.push_str(".rgba");
-        match f.read_bytes(kept.view(), a) {
-            ok(b) => {
-                let bytes = b.items();
-                if bytes.len() >= 8 {
-                    let w = le32(bytes, at: 0);
-                    let ht = le32(bytes, at: 4);
-                    if (w as usize) * (ht as usize) * 4 + 8 == bytes.len() {
-                        var img = png.Image { width: w, height: ht, rgba: alloc.List(u8).init(ui.a) };
-                        img.rgba.grow_zeroed(bytes.len() - 8);
-                        var k: usize = 0;
-                        while k < bytes.len() - 8 : (k += 1) {
-                            img.rgba.items_mut()[k] = bytes[k + 8];
-                        }
-                        return keep_picture(ui, image: img, into: into);
-                    }
-                }
-            }
-            err(_) => { }
+        var side = alloc.String.init(a);
+        side.push_u64(most as u64);
+        kept = kept_name(path: path, size: size, tail: side.view(), a: a);
+        match read_kept(f, name: kept.view(), a: ui.a) {
+            some(img) => { return keep_picture(ui, image: img, into: into); }
+            none => { }
         }
     }
     var fitted = png.Image { width: 0, height: 0, rgba: alloc.List(u8).init(ui.a) };
+    // A video's picture, the poster the phone made of it (T12), fitted.
+    var made = false;
+    region posters {
+        let name = kept_name(path: path, size: size, tail: "poster", a: posters);
+        match read_kept(f, name: name.view(), a: posters) {
+            some(poster) => {
+                fitted = fit_within(&poster, most: most, turn: 1, a: ui.a);
+                made = true;
+            }
+            none => { }
+        }
+    }
+    if made {
+        return keep_picture(ui, image: fitted, into: into);
+    }
     region whole {
         let bytes = f.read_bytes(path, whole) catch return none;
         let b = bytes.items();
