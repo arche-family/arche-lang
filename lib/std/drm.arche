@@ -1,8 +1,9 @@
 /// A screen through Linux's DRM/KMS (docs/sprints.md S35): the first
-/// connected connector, its preferred mode, and a dumb buffer, 32 bits a
-/// pixel (XRGB8888), mapped for the program to draw into and shown on that
-/// connector; flush tells the driver what changed, which a virtual GPU
-/// needs to copy it to the host. The program must be DRM master, as the
+/// connected connector, the mode the kernel's command line asked for, else
+/// its preferred one, and a dumb buffer, 32 bits a pixel (XRGB8888), mapped
+/// for the program to draw into and shown on that connector; flush tells
+/// the driver what changed, which a virtual GPU needs to copy it to the
+/// host. The program must be DRM master, as the
 /// only one that opened the device is: what the phone's UI server is.
 import alloc;
 import core.mem;
@@ -143,14 +144,26 @@ pub fn open(fs: &std.Fs, path: str, a: alloc.Allocator) -> DrmError!Screen {
         if got == 0 or got > modes {
             continue;
         }
-        // The preferred mode (DRM_MODE_TYPE_PREFERRED), else the first.
+        // The mode the kernel's command line asked for (video=, which
+        // Linux marks DRM_MODE_TYPE_USERDEF), else the preferred one
+        // (DRM_MODE_TYPE_PREFERRED), else the first. A virtual GPU's
+        // preferred mode follows the size of the host's window; the one
+        // asked for does not.
         let ms = mode_list.items();
         var pick: usize = 0;
+        var picked_rank: u32 = 0;
         var m: usize = 0;
         while m < got as usize : (m += 1) {
-            if (get32(ms, at: m * MODE + 32) & 8) != 0 {
+            let kind = get32(ms, at: m * MODE + 32);
+            var rank: u32 = 0;
+            if (kind & 32) != 0 {
+                rank = 2;
+            } else if (kind & 8) != 0 {
+                rank = 1;
+            }
+            if rank > picked_rank {
                 pick = m;
-                break;
+                picked_rank = rank;
             }
         }
         var i: usize = 0;
